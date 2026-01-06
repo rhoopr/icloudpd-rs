@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p dist
+rm -fr dist/*
+python3 -m pip wheel . -w dist --no-deps --no-build-isolation
