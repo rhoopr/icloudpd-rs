@@ -1,1 +1,0 @@
-.version |= $version  | (.optionalDependencies |= with_entries(.value |= $version))? // .

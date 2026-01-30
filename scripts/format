@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-echo "Formatting..."
-# autopep8 -r --in-place --aggressive --aggressive src/ --exclude src/pyicloud_ipd
-ruff check --select I --fix
-ruff format

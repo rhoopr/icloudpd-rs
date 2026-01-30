@@ -1,29 +1,5 @@
-.DS_Store
-build/
-dist/
-wheelhouse/
-icloudpd.egg-info
-tests/fixtures/**
-__pycache__
-.pytest_cache
-.cache
-*.pyc
-.idea
-.coverage
-.coverage.*
-htmlcov
-*.whl
-.venv
-venv
-*.spec
-# docs
-docs/_build
-# exclude since there is no js development, just for local testing npm packaging
-node_modules/
-/package.json
-/package-lock.json
-# used for local troubleshooting
-.photos
-.cookies/
-
 .claude/
+CLAUDE.md
+
+# Rust
+/target
