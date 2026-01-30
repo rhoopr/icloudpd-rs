@@ -1,76 +1,68 @@
-# !!!! [Looking for MAINTAINER for this project](https://github.com/icloud-photos-downloader/icloud_photos_downloader/issues/1305) !!!!
+# icloudpd-rs
 
-# iCloud Photos Downloader [![Quality Checks](https://github.com/icloud-photos-downloader/icloud_photos_downloader/workflows/Quality%20Checks/badge.svg)](https://github.com/icloud-photos-downloader/icloud_photos_downloader/actions/workflows/quality-checks.yml) [![Build and Package](https://github.com/icloud-photos-downloader/icloud_photos_downloader/workflows/Produce%20Artifacts/badge.svg)](https://github.com/icloud-photos-downloader/icloud_photos_downloader/actions/workflows/produce-artifacts.yml) [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+A Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (`icloudpd`).
 
-- A command-line tool to download all your iCloud photos.
-- Works on Linux, Windows, and macOS; laptop, desktop, and NAS
-- Available as an executable for direct downloading and through package managers/ecosystems ([Docker](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#docker), [PyPI](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#pypi), [AUR](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#aur), [npm](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#npm))
-- Developed and maintained by volunteers (we are always looking for [help](CONTRIBUTING.md)). 
+## Status
 
-See [Documentation](https://icloud-photos-downloader.github.io/icloud_photos_downloader/) for more details. Also, check [Issues](https://github.com/icloud-photos-downloader/icloud_photos_downloader/issues)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
+[![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
+[![Status](https://img.shields.io/badge/Status-Early%20Development-blue.svg)]()
 
-We aim to release new versions once a week (Friday), if there is something worth delivering.
+Early development. Core authentication (SRP, 2FA) and photo download are functional.
 
-## iCloud Prerequisites
+## Build
 
-To make iCloud Photo Downloader work, ensure the iCloud account is configured with the following settings, otherwise Apple Servers will return an ACCESS_DENIED error:
+```sh
+cargo build --release
+```
 
-- **Enable Access iCloud Data on the Web:** On your iPhone / iPad, enable `Settings > Apple ID > iCloud > Access iCloud Data on the Web`
-- **Disable Advanced Data Protection:** On your iPhone /iPad disable `Settings > Apple ID > iCloud > Advanced Data Protection`
-
-
-## Install and Run
-
-There are three ways to run `icloudpd`:
-1. Download executable for your platform from the GitHub [Release](https://github.com/icloud-photos-downloader/icloud_photos_downloader/releases/tag/v1.32.2) and run it
-1. Use package manager to install, update, and, in some cases, run ([Docker](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#docker), [PyPI](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#pypi), [AUR](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#aur), [npm](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#npm))
-1. Build and run from the source
-
-See [Documentation](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html) for more details
-
-## Features
-
-<!-- start features -->
-
-- Three modes of operation:
-  - **Copy** - download new photos from iCloud (default mode)
-  - **Sync** - download new photos from iCloud and delete local files that were removed in iCloud (`--auto-delete` option)
-  - **Move** - download new photos from iCloud and delete photos in iCloud (`--keep-icloud-recent-days` option)
-- Support for Live Photos (image and video as separate files) and RAW images (including RAW+JPEG)
-- Automatic de-duplication of photos with the same name
-- One time download and an option to monitor for iCloud changes continuously (`--watch-with-interval` option)
-- Optimizations for incremental runs (`--until-found` and `--recent` options)
-- Photo metadata (EXIF) updates (`--set-exif-datetime` option)
-- ... and many more (use `--help` option to get full list)
-
-<!-- end features -->
-
-## Experimental Mode
-
-Some changes are added to the experimental mode before they graduate into the main package. [Details](EXPERIMENTAL.md)
+Binary: `target/release/icloudpd-rs`
 
 ## Usage
 
-To keep your iCloud photo collection synchronized to your local system:
-
-```
-icloudpd --directory /data --username my@email.address --watch-with-interval 3600
+```sh
+icloudpd-rs --username my@email.address --directory /photos
 ```
 
-> [!IMPORTANT]
-> It is `icloudpd`, not `icloud` executable
+## CLI Flags
 
-> [!TIP]
-> Synchronization logic can be adjusted with command-line parameters. Run `icloudpd --help` to get full list.
+| Flag | Purpose | Status |
+|------|---------|--------|
+| `-u, --username` | Apple ID email | Working |
+| `-p, --password` | iCloud password (or `ICLOUD_PASSWORD` env) | Working |
+| `-d, --directory` | Local download directory | Working |
+| `--auth-only` | Only authenticate, don't download | Working |
+| `-l, --list-albums` | List available albums | Working |
+| `--list-libraries` | List available libraries | Working |
+| `-a, --album` | Album(s) to download | Working |
+| `--library` | Library to download (default: PrimarySync) | Parsed, not implemented |
+| `--size` | Image size: original, medium, thumb | Working |
+| `--live-photo-size` | Live photo video size | Parsed, not implemented |
+| `--recent` | Download only N most recent photos | Parsed, not implemented |
+| `--until-found` | Stop after N consecutive existing photos | Working |
+| `--skip-videos` | Don't download videos | Working |
+| `--skip-photos` | Don't download photos | Working |
+| `--skip-live-photos` | Don't download live photos | Parsed, not implemented |
+| `--force-size` | Only download requested size, no fallback | Parsed, not implemented |
+| `--auto-delete` | Delete local files removed from iCloud | Parsed, not implemented |
+| `--folder-structure` | Folder template (default: `%Y/%m/%d`) | Working |
+| `--set-exif-datetime` | Write EXIF DateTimeOriginal if missing | Working |
+| `--dry-run` | Preview without modifying files or iCloud | Working |
+| `--domain` | iCloud domain: com or cn | Working |
+| `--watch-with-interval` | Run continuously every N seconds | Working |
+| `--log-level` | Log verbosity | Working |
+| `--no-progress-bar` | Disable progress bar | Parsed, not implemented |
+| `--cookie-directory` | Session/cookie storage (default: `~/.icloudpd-rs`) | Working |
+| `--keep-unicode-in-filenames` | Preserve Unicode in filenames | Parsed, not implemented |
+| `--live-photo-mov-filename-policy` | MOV naming: suffix, original | Parsed, not implemented |
+| `--align-raw` | RAW treatment: as-is, alternative | Parsed, not implemented |
+| `--file-match-policy` | Dedup policy | Parsed, not implemented |
+| `--skip-created-before` | Skip assets before date/interval | Working |
+| `--skip-created-after` | Skip assets after date/interval | Working |
+| `--delete-after-download` | Delete from iCloud after download | Parsed, not implemented |
+| `--keep-icloud-recent-days` | Keep N recent days in iCloud | Parsed, not implemented |
+| `--only-print-filenames` | Print filenames without downloading | Parsed, not implemented |
 
-To independently create and authorize a session (and complete 2SA/2FA validation if needed) on your local system:
+## License
 
-```
-icloudpd --username my@email.address --password my_password --auth-only
-```
-> [!TIP]
-> This feature can also be used to check and verify that the session is still authenticated. 
-
-## Contributing
-
-Want to contribute to iCloud Photos Downloader? Awesome! Check out the [contributing guidelines](CONTRIBUTING.md) to get involved.
+MIT - see [LICENSE.md](LICENSE.md)
