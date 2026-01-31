@@ -12,7 +12,6 @@ mod smart_folders;
 pub mod types;
 
 pub use album::PhotoAlbum;
-#[allow(unused_imports)]
 pub use asset::PhotoAsset;
 pub use library::PhotoLibrary;
 pub use session::PhotosSession;

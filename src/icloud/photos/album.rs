@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 
 use serde_json::{json, Value};
+use tokio_stream::Stream;
 use tracing::debug;
 
 use super::asset::PhotoAsset;
@@ -96,86 +98,158 @@ impl PhotoAlbum {
         Ok(count)
     }
 
-    /// Fetch all photos in this album, handling pagination.
-    /// If `limit` is `Some(n)`, stops after `n` photos.
+    /// Convenience wrapper over `photo_stream()` that collects all assets
+    /// into a `Vec`. Prefer `photo_stream()` when memory is a concern.
     pub async fn photos(&self, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
-        self.fetch_photos("ASCENDING", limit).await
+        use tokio_stream::StreamExt;
+        self.photo_stream(limit).collect::<Result<Vec<_>, _>>().await
     }
 
-    async fn fetch_photos(&self, direction: &str, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
-        let mut all_assets: Vec<PhotoAsset> = Vec::new();
-        let mut offset: u64 = 0;
-        tracing::info!("Fetching photos from iCloud...");
+    /// Stream photos page-by-page without buffering the full album in memory.
+    ///
+    /// A background tokio task drives pagination and sends assets through an
+    /// `mpsc` channel whose buffer equals `page_size`. This gives natural
+    /// 1-page prefetch: while the consumer processes page N, the producer
+    /// is already fetching page N+1 — overlapping API latency with work.
+    pub fn photo_stream(
+        &self,
+        limit: Option<u32>,
+    ) -> Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + '_>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<PhotoAsset>>(self.page_size);
 
-        loop {
-            let url = format!(
-                "{}/records/query?{}",
-                self.service_endpoint,
-                encode_params(&self.params)
-            );
-            let body = self.list_query(offset, direction);
-            debug!("Album '{}' POST URL: {}", self.name, url);
-            let response = super::session::retry_post(
-                self.session.as_ref(),
-                &url,
-                &body.to_string(),
-                &[("Content-type", "text/plain")],
-            )
-            .await?;
-            debug!("Album '{}' response: {}", self.name, serde_json::to_string_pretty(&response).unwrap_or_default());
+        // The spawned task must be 'static, so clone all needed state.
+        let session = self.session.clone_box();
+        let service_endpoint = self.service_endpoint.clone();
+        let params = self.params.clone();
+        let name = self.name.clone();
+        let list_type = self.list_type.clone();
+        let query_filter = self.query_filter.clone();
+        let page_size = self.page_size;
+        let zone_id = self.zone_id.clone();
 
-            let query: super::cloudkit::QueryResponse = serde_json::from_value(response)?;
-            let records = query.records;
+        tokio::spawn(async move {
+            let mut offset: u64 = 0;
+            let mut total_sent: u64 = 0;
+            tracing::info!("Fetching photos from iCloud...");
 
-            debug!(
-                "Album '{}': got {} records at offset {}",
-                self.name,
-                records.len(),
-                offset
-            );
-
-            let mut asset_records: HashMap<String, super::cloudkit::Record> = HashMap::new();
-            let mut master_records: Vec<super::cloudkit::Record> = Vec::new();
-
-            for rec in records {
-                debug!("  record type: {}", rec.record_type);
-                if rec.record_type == "CPLAsset" {
-                    if let Some(master_id) =
-                        rec.fields["masterRef"]["value"]["recordName"].as_str()
-                    {
-                        let master_id = master_id.to_string();
-                        asset_records.insert(master_id, rec);
+            loop {
+                let url = format!(
+                    "{}/records/query?{}",
+                    service_endpoint,
+                    encode_params(&params)
+                );
+                let body = Self::build_list_query(
+                    &list_type,
+                    &query_filter,
+                    page_size,
+                    &zone_id,
+                    offset,
+                    "ASCENDING",
+                );
+                debug!("Album '{}' POST URL: {}", name, url);
+                let response = match super::session::retry_post(
+                    session.as_ref(),
+                    &url,
+                    &body.to_string(),
+                    &[("Content-type", "text/plain")],
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
                     }
-                } else if rec.record_type == "CPLMaster" {
-                    master_records.push(rec);
+                };
+                debug!(
+                    "Album '{}' response: {}",
+                    name,
+                    serde_json::to_string_pretty(&response).unwrap_or_default()
+                );
+
+                let query: super::cloudkit::QueryResponse = match serde_json::from_value(response)
+                {
+                    Ok(q) => q,
+                    Err(e) => {
+                        let _ = tx.send(Err(e.into())).await;
+                        return;
+                    }
+                };
+                let records = query.records;
+
+                debug!(
+                    "Album '{}': got {} records at offset {}",
+                    name,
+                    records.len(),
+                    offset
+                );
+
+                let mut asset_records: HashMap<String, super::cloudkit::Record> = HashMap::new();
+                let mut master_records: Vec<super::cloudkit::Record> = Vec::new();
+
+                for rec in records {
+                    debug!("  record type: {}", rec.record_type);
+                    if rec.record_type == "CPLAsset" {
+                        if let Some(master_id) =
+                            rec.fields["masterRef"]["value"]["recordName"].as_str()
+                        {
+                            let master_id = master_id.to_string();
+                            asset_records.insert(master_id, rec);
+                        }
+                    } else if rec.record_type == "CPLMaster" {
+                        master_records.push(rec);
+                    }
                 }
-            }
 
-            if master_records.is_empty() {
-                break;
-            }
-
-            for master in master_records {
-                if let Some(asset_rec) = asset_records.remove(&master.record_name) {
-                    all_assets.push(PhotoAsset::from_records(master, asset_rec));
-                }
-                offset += 1;
-            }
-
-            tracing::info!("  fetched {} photos so far...", all_assets.len());
-
-            if let Some(n) = limit {
-                if all_assets.len() >= n as usize {
-                    all_assets.truncate(n as usize);
+                if master_records.is_empty() {
                     break;
                 }
-            }
-        }
 
-        Ok(all_assets)
+                for master in master_records {
+                    if let Some(asset_rec) = asset_records.remove(&master.record_name) {
+                        let asset = PhotoAsset::from_records(master, asset_rec);
+                        if tx.send(Ok(asset)).await.is_err() {
+                            // Receiver dropped — consumer is done
+                            return;
+                        }
+                        total_sent += 1;
+                    }
+                    offset += 1;
+                }
+
+                tracing::info!("  fetched {} photos so far...", total_sent);
+
+                if let Some(n) = limit {
+                    if total_sent >= n as u64 {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 
+    #[cfg(test)]
     fn list_query(&self, offset: u64, direction: &str) -> Value {
+        Self::build_list_query(
+            &self.list_type,
+            &self.query_filter,
+            self.page_size,
+            &self.zone_id,
+            offset,
+            direction,
+        )
+    }
+
+    fn build_list_query(
+        list_type: &str,
+        query_filter: &Option<Value>,
+        page_size: usize,
+        zone_id: &Value,
+        offset: u64,
+        direction: &str,
+    ) -> Value {
         let desired_keys = &*DESIRED_KEYS_VALUES;
 
         let mut filter_by = vec![
@@ -191,7 +265,7 @@ impl PhotoAlbum {
             }),
         ];
 
-        if let Some(qf) = &self.query_filter {
+        if let Some(qf) = query_filter {
             if let Some(arr) = qf.as_array() {
                 filter_by.extend(arr.iter().cloned());
             }
@@ -199,21 +273,26 @@ impl PhotoAlbum {
 
         let query_part = json!({
             "filterBy": &filter_by,
-            "recordType": &self.list_type,
+            "recordType": list_type,
         });
-        debug!("list_query filterBy ({} items): {}", filter_by.len(), serde_json::to_string(&query_part).unwrap_or_default());
-        debug!("list_query zoneID: {}", serde_json::to_string(&self.zone_id).unwrap_or_default());
+        debug!(
+            "list_query filterBy ({} items): {}",
+            filter_by.len(),
+            serde_json::to_string(&query_part).unwrap_or_default()
+        );
+        debug!(
+            "list_query zoneID: {}",
+            serde_json::to_string(zone_id).unwrap_or_default()
+        );
 
-        // resultsLimit is 2x page_size because each photo returns both a
-        // CPLMaster and CPLAsset record — we need both to build a PhotoAsset.
         json!({
             "query": {
                 "filterBy": filter_by,
-                "recordType": &self.list_type,
+                "recordType": list_type,
             },
-            "resultsLimit": self.page_size * 2,
+            "resultsLimit": page_size * 2,
             "desiredKeys": desired_keys,
-            "zoneID": self.zone_id,
+            "zoneID": zone_id,
         })
     }
 }
@@ -227,10 +306,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PhotosSession for StubSession {
-        async fn post(&self, _url: &str, _body: &str, _headers: &[(&str, &str)]) -> anyhow::Result<Value> {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
             unimplemented!("stub")
         }
-        async fn get(&self, _url: &str, _headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response> {
+        async fn get(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<reqwest::Response> {
             unimplemented!("stub")
         }
         fn clone_box(&self) -> Box<dyn PhotosSession> {

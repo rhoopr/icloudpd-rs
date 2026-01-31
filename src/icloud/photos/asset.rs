@@ -5,20 +5,18 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use tracing::warn;
 
-use super::error::PhotosError;
 use super::queries::{item_type_from_str, PHOTO_VERSION_LOOKUP, VIDEO_VERSION_LOOKUP};
 use super::types::{AssetItemType, AssetVersion, AssetVersionSize};
 
 #[derive(Debug, Clone)]
 pub struct PhotoAsset {
     record_name: String,
-    master_fields: Value,
-    asset_fields: Value,
     filename: Option<String>,
     item_type_val: Option<AssetItemType>,
     asset_date_ms: Option<f64>,
     added_date_ms: Option<f64>,
     original_size: u64,
+    versions: HashMap<AssetVersionSize, AssetVersion>,
 }
 
 /// Decode filename from CloudKit's `filenameEnc` field.
@@ -68,6 +66,87 @@ fn resolve_item_type(fields: &Value, filename: &Option<String>) -> Option<AssetI
     Some(AssetItemType::Movie)
 }
 
+/// Pre-parse version URLs at construction so `PhotoAsset` carries no raw
+/// JSON — reducing per-asset memory and making `versions()` infallible.
+/// Incomplete entries (missing URL or checksum) are logged and skipped;
+/// the caller sees an empty map rather than a runtime error.
+fn extract_versions(
+    item_type: Option<AssetItemType>,
+    master_fields: &Value,
+    asset_fields: &Value,
+    record_name: &str,
+) -> HashMap<AssetVersionSize, AssetVersion> {
+    let lookup = if item_type == Some(AssetItemType::Movie) {
+        VIDEO_VERSION_LOOKUP
+    } else {
+        PHOTO_VERSION_LOOKUP
+    };
+
+    let mut versions = HashMap::new();
+    for (key, prefix) in lookup {
+        let res_field = format!("{prefix}Res");
+        let type_field = format!("{prefix}FileType");
+
+        // Asset record has adjusted versions; master has originals.
+        // Prefer asset record so adjusted/edited versions take priority.
+        let fields = if !asset_fields[&res_field].is_null() {
+            asset_fields
+        } else if !master_fields[&res_field].is_null() {
+            master_fields
+        } else {
+            continue;
+        };
+
+        let res_entry = &fields[&res_field]["value"];
+        if res_entry.is_null() {
+            continue;
+        }
+
+        let size = res_entry["size"].as_u64().unwrap_or(0);
+
+        let url = match res_entry["downloadURL"].as_str() {
+            Some(u) => u.to_string(),
+            None => {
+                warn!(
+                    "Asset {}: missing {prefix}Res.downloadURL, skipping version",
+                    record_name
+                );
+                continue;
+            }
+        };
+
+        let checksum = match res_entry["fileChecksum"].as_str() {
+            Some(c) => c.to_string(),
+            None => {
+                warn!(
+                    "Asset {}: missing {prefix}Res.fileChecksum, skipping version",
+                    record_name
+                );
+                continue;
+            }
+        };
+
+        let asset_type = fields[&type_field]["value"]
+            .as_str()
+            .unwrap_or_else(|| {
+                tracing::warn!("Missing expected field: {type_field}");
+                ""
+            })
+            .to_string();
+
+        versions.insert(
+            *key,
+            AssetVersion {
+                size,
+                url,
+                asset_type,
+                checksum,
+            },
+        );
+    }
+    versions
+}
+
 impl PhotoAsset {
     /// Construct from raw JSON values (used by tests).
     #[cfg(test)]
@@ -85,15 +164,15 @@ impl PhotoAsset {
         let original_size = master_fields["resOriginalRes"]["value"]["size"]
             .as_u64()
             .unwrap_or(0);
+        let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
         Self {
             record_name,
-            master_fields,
-            asset_fields,
             filename,
             item_type_val,
             asset_date_ms,
             added_date_ms,
             original_size,
+            versions,
         }
     }
 
@@ -109,15 +188,15 @@ impl PhotoAsset {
         let original_size = master.fields["resOriginalRes"]["value"]["size"]
             .as_u64()
             .unwrap_or(0);
+        let versions = extract_versions(item_type_val, &master.fields, &asset.fields, &master.record_name);
         Self {
             record_name: master.record_name,
-            master_fields: master.fields,
-            asset_fields: asset.fields,
             filename,
             item_type_val,
             asset_date_ms,
             added_date_ms,
             original_size,
+            versions,
         }
     }
 
@@ -155,72 +234,10 @@ impl PhotoAsset {
         self.item_type_val
     }
 
-    /// Build the map of available versions for this asset.
-    ///
-    /// Returns an error if a version entry is missing required `downloadURL`
-    /// or `fileChecksum` fields.
-    pub fn versions(&self) -> Result<HashMap<AssetVersionSize, AssetVersion>, PhotosError> {
-        let lookup = if self.item_type() == Some(AssetItemType::Movie) {
-            VIDEO_VERSION_LOOKUP
-        } else {
-            PHOTO_VERSION_LOOKUP
-        };
-
-        let mut versions = HashMap::new();
-        for (key, prefix) in lookup {
-            let res_field = format!("{prefix}Res");
-            let type_field = format!("{prefix}FileType");
-
-            // Asset record has adjusted versions; master has originals.
-            // Prefer asset record so adjusted/edited versions take priority.
-            let fields = if !self.asset_fields[&res_field].is_null() {
-                &self.asset_fields
-            } else if !self.master_fields[&res_field].is_null() {
-                &self.master_fields
-            } else {
-                continue;
-            };
-
-            let res_entry = &fields[&res_field]["value"];
-            if res_entry.is_null() {
-                continue;
-            }
-
-            let size = res_entry["size"].as_u64().unwrap_or(0);
-            let url = res_entry["downloadURL"]
-                .as_str()
-                .ok_or_else(|| PhotosError::MissingField {
-                    asset_id: self.record_name.clone(),
-                    field: format!("{prefix}Res.downloadURL"),
-                })?
-                .to_string();
-            let checksum = res_entry["fileChecksum"]
-                .as_str()
-                .ok_or_else(|| PhotosError::MissingField {
-                    asset_id: self.record_name.clone(),
-                    field: format!("{prefix}Res.fileChecksum"),
-                })?
-                .to_string();
-
-            let asset_type = fields[&type_field]["value"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    tracing::warn!("Missing expected field: {type_field}");
-                    ""
-                })
-                .to_string();
-
-            versions.insert(
-                *key,
-                AssetVersion {
-                    size,
-                    url,
-                    asset_type,
-                    checksum,
-                },
-            );
-        }
-        Ok(versions)
+    /// Available download versions, keyed by size variant. Pre-parsed at
+    /// construction so no JSON traversal happens at download time.
+    pub fn versions(&self) -> &HashMap<AssetVersionSize, AssetVersion> {
+        &self.versions
     }
 }
 
@@ -329,7 +346,7 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        let versions = asset.versions().unwrap();
+        let versions = asset.versions();
         assert!(versions.contains_key(&AssetVersionSize::Original));
         let orig = &versions[&AssetVersionSize::Original];
         assert_eq!(orig.url, "https://example.com/orig");
@@ -355,8 +372,8 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        let err = asset.versions().unwrap_err();
-        assert!(err.to_string().contains("downloadURL"));
+        // Missing downloadURL now results in empty versions map (logged at construction)
+        assert!(asset.versions().is_empty());
     }
 
     #[test]
@@ -372,8 +389,8 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        let err = asset.versions().unwrap_err();
-        assert!(err.to_string().contains("fileChecksum"));
+        // Missing checksum now results in empty versions map (logged at construction)
+        assert!(asset.versions().is_empty());
     }
 
     #[test]
@@ -405,8 +422,88 @@ mod tests {
         assert_eq!(asset.item_type(), Some(AssetItemType::Image));
         assert_eq!(asset.size(), 5000);
         assert_eq!(asset.asset_date().format("%Y-%m-%d").to_string(), "2025-01-15");
-        let versions = asset.versions().unwrap();
+        let versions = asset.versions();
         assert!(versions.contains_key(&AssetVersionSize::Original));
+    }
+
+    #[test]
+    fn test_versions_prefers_asset_record_over_master() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://master.example.com/orig",
+                    "fileChecksum": "master_ck"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {
+                "resOriginalRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://asset.example.com/adjusted",
+                    "fileChecksum": "asset_ck"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+        );
+        let orig = &asset.versions()[&AssetVersionSize::Original];
+        assert_eq!(orig.url, "https://asset.example.com/adjusted");
+        assert_eq!(orig.size, 2000);
+    }
+
+    #[test]
+    fn test_versions_video_uses_video_lookup() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/video",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"},
+                "resVidMedRes": {"value": {
+                    "size": 10000,
+                    "downloadURL": "https://example.com/vid_med",
+                    "fileChecksum": "vid_med_ck"
+                }},
+                "resVidMedFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {}}),
+        );
+        let versions = asset.versions();
+        assert!(versions.contains_key(&AssetVersionSize::Original));
+        assert!(versions.contains_key(&AssetVersionSize::Medium));
+        // PHOTO_VERSION_LOOKUP maps Medium to resJPEGMed, but for videos
+        // VIDEO_VERSION_LOOKUP maps Medium to resVidMed — verify the right one was used
+        assert_eq!(versions[&AssetVersionSize::Medium].url, "https://example.com/vid_med");
+    }
+
+    #[test]
+    fn test_versions_multiple_photo_sizes() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "ck_orig"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 100,
+                    "downloadURL": "https://example.com/thumb",
+                    "fileChecksum": "ck_thumb"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        let versions = asset.versions();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[&AssetVersionSize::Original].size, 5000);
+        assert_eq!(versions[&AssetVersionSize::Thumb].size, 100);
     }
 
     #[test]
