@@ -1,6 +1,7 @@
-//! Download engine: filters iCloud photos, downloads with retry, and stamps
-//! EXIF metadata. Uses a three-phase approach (filter → download → cleanup)
-//! to handle expired CDN URLs gracefully on large libraries.
+//! Download engine — streaming pipeline that starts downloading as soon as
+//! the first API page returns, rather than enumerating the entire library
+//! upfront. Uses a two-phase approach: (1) stream-and-download with bounded
+//! concurrency, then (2) cleanup pass with fresh CDN URLs for any failures.
 
 pub mod error;
 pub mod exif;
@@ -9,7 +10,7 @@ pub mod paths;
 
 use std::fs::FileTimes;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
@@ -48,10 +49,10 @@ struct DownloadTask {
     created_local: DateTime<Local>,
 }
 
-/// Fetch photos from all albums and build filtered download tasks.
+/// Eagerly enumerate all albums and build a complete task list.
 ///
-/// This re-contacts the iCloud API, so each call yields fresh download URLs.
-/// Files that already exist on disk are skipped automatically.
+/// Used only by the Phase 2 cleanup pass — re-contacts the API so each call
+/// yields fresh CDN URLs that haven't expired during a long download session.
 async fn build_download_tasks(
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
@@ -67,60 +68,8 @@ async fn build_download_tasks(
         let assets = album_result?;
 
         for asset in &assets {
-            if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
-                continue;
-            }
-            if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
-                continue;
-            }
-
-            let created_utc = asset.created();
-            if let Some(before) = &config.skip_created_before {
-                if created_utc < *before {
-                    continue;
-                }
-            }
-            if let Some(after) = &config.skip_created_after {
-                if created_utc > *after {
-                    continue;
-                }
-            }
-
-            let filename = match asset.filename() {
-                Some(f) => f,
-                None => {
-                    tracing::warn!("Asset {} has no filename, skipping", asset.id());
-                    continue;
-                }
-            };
-
-            let created_local: DateTime<Local> = created_utc.with_timezone(&Local);
-            let download_path = paths::local_download_path(
-                &config.directory,
-                &config.folder_structure,
-                &created_local,
-                filename,
-            );
-
-            if download_path.exists() {
-                tracing::debug!("{} already exists", download_path.display());
-                continue;
-            }
-
-            let versions = match asset.versions() {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("Skipping asset {}: {}", asset.id(), e);
-                    continue;
-                }
-            };
-            if let Some(version) = versions.get(&config.size) {
-                tasks.push(DownloadTask {
-                    url: version.url.clone(),
-                    download_path,
-                    checksum: version.checksum.clone(),
-                    created_local,
-                });
+            if let Some(task) = filter_asset_to_task(asset, config) {
+                tasks.push(task);
             }
         }
     }
@@ -128,61 +77,194 @@ async fn build_download_tasks(
     Ok(tasks)
 }
 
-/// Main download loop: fetch all photos from each album, apply filters,
-/// check local existence, download missing files, and optionally stamp
-/// EXIF datetime.
+/// Apply content filters (type, date range) and local existence check,
+/// producing a download task only for assets that need fetching.
+fn filter_asset_to_task(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> Option<DownloadTask> {
+    if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
+        return None;
+    }
+    if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
+        return None;
+    }
+
+    let created_utc = asset.created();
+    if let Some(before) = &config.skip_created_before {
+        if created_utc < *before {
+            return None;
+        }
+    }
+    if let Some(after) = &config.skip_created_after {
+        if created_utc > *after {
+            return None;
+        }
+    }
+
+    let filename = match asset.filename() {
+        Some(f) => f,
+        None => {
+            tracing::warn!("Asset {} has no filename, skipping", asset.id());
+            return None;
+        }
+    };
+
+    let created_local: DateTime<Local> = created_utc.with_timezone(&Local);
+    let download_path = paths::local_download_path(
+        &config.directory,
+        &config.folder_structure,
+        &created_local,
+        filename,
+    );
+
+    if download_path.exists() {
+        tracing::debug!("{} already exists", download_path.display());
+        return None;
+    }
+
+    asset.versions().get(&config.size).map(|version| DownloadTask {
+        url: version.url.clone(),
+        download_path,
+        checksum: version.checksum.clone(),
+        created_local,
+    })
+}
+
+/// Streaming download pipeline — merges per-album streams and pipes assets
+/// directly into the download loop as they arrive from the API.
 ///
-/// Uses a three-phase approach:
-/// 1. Filter pass — builds a list of download tasks with fresh URLs
-/// 2. Parallel download — consumes tasks with bounded concurrency
-/// 3. Cleanup pass — re-fetches URLs from API and retries failures
+/// Eliminates the startup delay of full-library enumeration: the first
+/// download begins as soon as the first API page returns. Each album's
+/// background task prefetches the next page via a channel buffer, so API
+/// latency overlaps with download I/O.
+async fn stream_and_download(
+    client: &Client,
+    albums: &[PhotoAlbum],
+    config: &DownloadConfig,
+) -> Result<(usize, Vec<DownloadTask>)> {
+    // select_all interleaves across albums so no single large album
+    // starves others; each stream's background task provides prefetch.
+    let album_streams: Vec<_> = albums
+        .iter()
+        .map(|album| album.photo_stream(config.recent))
+        .collect();
+
+    let mut combined = stream::select_all(album_streams);
+
+    if config.dry_run {
+        let mut count = 0usize;
+        while let Some(result) = combined.next().await {
+            let asset = result?;
+            if filter_asset_to_task(&asset, config).is_some() {
+                let filename = asset.filename().unwrap_or("<unknown>");
+                tracing::info!("[DRY RUN] Would download {}", filename);
+                count += 1;
+            }
+        }
+        return Ok((count, Vec::new()));
+    }
+
+    let client = client.clone();
+    let retry_config = config.retry.clone();
+    let set_exif = config.set_exif_datetime;
+    let concurrency = config.concurrent_downloads;
+
+    // Stream assets → filter → download with bounded concurrency.
+    let mut downloaded = 0usize;
+    let mut failed: Vec<DownloadTask> = Vec::new();
+
+    // Use buffer_unordered on a stream of download futures.
+    let task_stream = combined.filter_map(|result| async {
+        match result {
+            Ok(asset) => filter_asset_to_task(&asset, config),
+            Err(e) => {
+                tracing::error!("Error fetching asset: {}", e);
+                None
+            }
+        }
+    });
+
+    let download_stream = task_stream
+        .map(|task| {
+            let client = client.clone();
+            let retry_config = retry_config.clone();
+            async move {
+                let result =
+                    download_single_task(&client, &task, &retry_config, set_exif).await;
+                (task, result)
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    tokio::pin!(download_stream);
+
+    while let Some((task, result)) = download_stream.next().await {
+        match result {
+            Ok(()) => downloaded += 1,
+            Err(e) => {
+                tracing::error!(
+                    "Download failed: {}: {}",
+                    task.download_path.display(),
+                    e
+                );
+                failed.push(task);
+            }
+        }
+    }
+
+    Ok((downloaded, failed))
+}
+
+/// Entry point for the download engine.
+///
+/// Phase 1: Stream assets page-by-page and download immediately with bounded
+/// concurrency — no upfront enumeration delay.
+///
+/// Phase 2 (cleanup): Re-fetch from the API to get fresh CDN URLs (the
+/// originals may have expired during a long Phase 1) and retry failures at
+/// reduced concurrency to give large files full bandwidth.
 pub async fn download_photos(
     client: &Client,
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
 ) -> Result<()> {
-    // ── Phase 1: Build download tasks ────────────────────────────────
-    let tasks = build_download_tasks(albums, config).await?;
+    let started = Instant::now();
 
-    if tasks.is_empty() {
-        tracing::info!("No new photos to download");
+    // ── Phase 1: Stream and download ───────────────────────────────
+    let (downloaded, failed_tasks) = stream_and_download(client, albums, config).await?;
+
+    if downloaded == 0 && failed_tasks.is_empty() {
+        if config.dry_run {
+            tracing::info!("── Dry Run Summary ──");
+            tracing::info!("  0 files would be downloaded");
+            tracing::info!("  destination: {}", config.directory.display());
+        } else {
+            tracing::info!("No new photos to download");
+        }
         return Ok(());
     }
-
-    tracing::info!(
-        "Found {} photos to download (concurrency: {})",
-        tasks.len(),
-        config.concurrent_downloads
-    );
 
     if config.dry_run {
-        for task in &tasks {
-            tracing::info!("[DRY RUN] Would download {}", task.download_path.display());
-        }
-        print_summary(&tasks, config);
+        tracing::info!("── Dry Run Summary ──");
+        tracing::info!("  {} files would be downloaded", downloaded);
+        tracing::info!("  destination: {}", config.directory.display());
+        tracing::info!("  concurrency: {}", config.concurrent_downloads);
         return Ok(());
     }
 
-    // ── Phase 2: Parallel download ───────────────────────────────────
-    let total = tasks.len();
-    let failed_tasks = run_download_pass(
-        client,
-        tasks,
-        &config.retry,
-        config.set_exif_datetime,
-        config.concurrent_downloads,
-    )
-    .await;
+    let total = downloaded + failed_tasks.len();
 
     if failed_tasks.is_empty() {
         tracing::info!("── Summary ──");
         tracing::info!("  {} downloaded, 0 failed, {} total", total, total);
+        tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
         return Ok(());
     }
 
-    // Phase 3: Re-fetch from API to get fresh CDN URLs (old ones may have
-    // expired during a long Phase 2), then retry at concurrency 1 to give
-    // large files full bandwidth.
+    // Phase 2: CDN URLs from Phase 1 may have expired during a long
+    // download session. Re-fetch the full task list for fresh URLs and
+    // retry at concurrency 1 to give large files full bandwidth.
     let cleanup_concurrency = 1;
     let failure_count = failed_tasks.len();
     tracing::info!(
@@ -209,7 +291,13 @@ pub async fn download_photos(
     let failed = remaining_failed.len();
     let succeeded = total - failed;
     tracing::info!("── Summary ──");
-    tracing::info!("  {} downloaded, {} failed, {} total", succeeded, failed, total);
+    tracing::info!(
+        "  {} downloaded, {} failed, {} total",
+        succeeded,
+        failed,
+        total
+    );
+    tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
 
     if failed > 0 {
         for task in &remaining_failed {
@@ -340,12 +428,20 @@ async fn download_single_task(
     Ok(())
 }
 
-/// Print a dry-run summary of what would be downloaded.
-fn print_summary(tasks: &[DownloadTask], config: &DownloadConfig) {
-    tracing::info!("── Dry Run Summary ──");
-    tracing::info!("  {} files would be downloaded", tasks.len());
-    tracing::info!("  destination: {}", config.directory.display());
-    tracing::info!("  concurrency: {}", config.concurrent_downloads);
+/// Format a Duration as a human-readable string like "1h 23m 45s" or "42s".
+fn format_duration(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if hours > 0 {
+        format!("{}h {:02}m {:02}s", hours, mins, secs)
+    } else if mins > 0 {
+        format!("{}m {:02}s", mins, secs)
+    } else {
+        format!("{}s", secs)
+    }
 }
 
 /// Set the modification and access times of a file to the given Unix
@@ -370,6 +466,8 @@ fn set_file_mtime(path: &Path, timestamp: i64) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::icloud::photos::PhotoAsset;
+    use serde_json::json;
     use std::fs;
 
     fn tmp_file(name: &str) -> PathBuf {
@@ -378,6 +476,138 @@ mod tests {
         let p = dir.join(name);
         fs::write(&p, b"test").unwrap();
         p
+    }
+
+    fn test_config() -> DownloadConfig {
+        DownloadConfig {
+            directory: PathBuf::from("/tmp/claude/download_filter_tests"),
+            folder_structure: "{:%Y/%m/%d}".to_string(),
+            size: AssetVersionSize::Original,
+            skip_videos: false,
+            skip_photos: false,
+            skip_created_before: None,
+            skip_created_after: None,
+            set_exif_datetime: false,
+            dry_run: false,
+            concurrent_downloads: 1,
+            recent: None,
+            retry: RetryConfig::default(),
+        }
+    }
+
+    fn photo_asset_with_version() -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": "TEST_1", "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        )
+    }
+
+    #[test]
+    fn test_filter_asset_produces_task() {
+        let asset = photo_asset_with_version();
+        let config = test_config();
+        let task = filter_asset_to_task(&asset, &config);
+        assert!(task.is_some());
+        let task = task.unwrap();
+        assert_eq!(task.url, "https://example.com/orig");
+        assert_eq!(task.checksum, "abc123");
+    }
+
+    #[test]
+    fn test_filter_skips_videos_when_configured() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "VID_1", "fields": {
+                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let mut config = test_config();
+        config.skip_videos = true;
+        assert!(filter_asset_to_task(&asset, &config).is_none());
+    }
+
+    #[test]
+    fn test_filter_skips_photos_when_configured() {
+        let asset = photo_asset_with_version();
+        let mut config = test_config();
+        config.skip_photos = true;
+        assert!(filter_asset_to_task(&asset, &config).is_none());
+    }
+
+    #[test]
+    fn test_filter_skips_asset_without_filename() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "NO_NAME", "fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        assert!(filter_asset_to_task(&asset, &config).is_none());
+    }
+
+    #[test]
+    fn test_filter_skips_asset_without_requested_version() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "SMALL_ONLY", "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 100,
+                    "downloadURL": "https://example.com/thumb",
+                    "fileChecksum": "th_ck"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config(); // requests Original, but only Thumb available
+        assert!(filter_asset_to_task(&asset, &config).is_none());
+    }
+
+    #[test]
+    fn test_filter_skips_existing_file() {
+        let dir = PathBuf::from("/tmp/claude/download_filter_tests");
+        fs::create_dir_all(&dir).unwrap();
+        // Create the file that would be the download target
+        let asset = photo_asset_with_version();
+        let mut config = test_config();
+        config.directory = dir.clone();
+
+        // First call should produce a task (file doesn't exist yet)
+        let task = filter_asset_to_task(&asset, &config);
+        assert!(task.is_some());
+
+        // Create the file, second call should skip
+        let task = task.unwrap();
+        fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
+        fs::write(&task.download_path, b"existing").unwrap();
+        assert!(filter_asset_to_task(&asset, &config).is_none());
+
+        // Cleanup
+        let _ = fs::remove_file(&task.download_path);
     }
 
     #[test]
