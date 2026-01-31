@@ -1,6 +1,6 @@
-use std::path::PathBuf;
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 use crate::types::*;
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
+use std::path::PathBuf;
 
 #[allow(dead_code)]
 pub struct Config {
@@ -64,17 +64,17 @@ fn expand_tilde(path: &str) -> PathBuf {
 
 impl Config {
     pub fn from_cli(cli: crate::cli::Cli) -> anyhow::Result<Self> {
-        let directory = cli.directory
-            .map(|d| expand_tilde(&d))
-            .unwrap_or_default();
+        let directory = cli.directory.map(|d| expand_tilde(&d)).unwrap_or_default();
 
         let cookie_directory = expand_tilde(&cli.cookie_directory);
 
-        let skip_created_before = cli.skip_created_before
+        let skip_created_before = cli
+            .skip_created_before
             .as_deref()
             .map(parse_date_or_interval)
             .transpose()?;
-        let skip_created_after = cli.skip_created_after
+        let skip_created_after = cli
+            .skip_created_after
             .as_deref()
             .map(parse_date_or_interval)
             .transpose()?;
@@ -162,14 +162,23 @@ mod tests {
 
     #[test]
     fn test_expand_tilde_no_prefix() {
-        assert_eq!(expand_tilde("/absolute/path"), PathBuf::from("/absolute/path"));
-        assert_eq!(expand_tilde("relative/path"), PathBuf::from("relative/path"));
+        assert_eq!(
+            expand_tilde("/absolute/path"),
+            PathBuf::from("/absolute/path")
+        );
+        assert_eq!(
+            expand_tilde("relative/path"),
+            PathBuf::from("relative/path")
+        );
     }
 
     #[test]
     fn test_parse_date_iso() {
         let dt = parse_date_or_interval("2025-01-15").unwrap();
-        assert_eq!(dt.date_naive(), NaiveDate::from_ymd_opt(2025, 1, 15).unwrap());
+        assert_eq!(
+            dt.date_naive(),
+            NaiveDate::from_ymd_opt(2025, 1, 15).unwrap()
+        );
     }
 
     #[test]
@@ -177,7 +186,10 @@ mod tests {
         let dt = parse_date_or_interval("2025-06-15T14:30:00").unwrap();
         let naive = dt.naive_local();
         assert_eq!(naive.date(), NaiveDate::from_ymd_opt(2025, 6, 15).unwrap());
-        assert_eq!(naive.time(), chrono::NaiveTime::from_hms_opt(14, 30, 0).unwrap());
+        assert_eq!(
+            naive.time(),
+            chrono::NaiveTime::from_hms_opt(14, 30, 0).unwrap()
+        );
     }
 
     #[test]
@@ -199,9 +211,9 @@ mod tests {
 
     fn make_cli(overrides: impl FnOnce(&mut crate::cli::Cli)) -> crate::cli::Cli {
         use clap::Parser;
-        let mut cli = crate::cli::Cli::try_parse_from([
-            "icloudpd-rs", "--username", "u@example.com",
-        ]).unwrap();
+        let mut cli =
+            crate::cli::Cli::try_parse_from(["icloudpd-rs", "--username", "u@example.com"])
+                .unwrap();
         overrides(&mut cli);
         cli
     }

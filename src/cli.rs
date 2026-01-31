@@ -1,5 +1,5 @@
-use clap::Parser;
 use crate::types::*;
+use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(name = "icloudpd-rs", about = "Download iCloud photos and videos")]

@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use base64::Engine;
 use serde_json::{json, Value};
 
-
 use super::album::PhotoAlbum;
 use super::queries::encode_params;
 use super::session::PhotosSession;
@@ -50,8 +49,8 @@ impl PhotoLibrary {
         .await
         .map_err(|e| ICloudError::Connection(e.to_string()))?;
 
-        let query: super::cloudkit::QueryResponse = serde_json::from_value(response)
-            .map_err(|e| ICloudError::Connection(e.to_string()))?;
+        let query: super::cloudkit::QueryResponse =
+            serde_json::from_value(response).map_err(|e| ICloudError::Connection(e.to_string()))?;
         let indexing_state = query
             .records
             .first()
@@ -96,9 +95,7 @@ impl PhotoLibrary {
             let folders = self.fetch_folders().await?;
             for folder in &folders {
                 let record_name = &folder.record_name;
-                if record_name == ROOT_FOLDER
-                    || record_name == PROJECT_ROOT_FOLDER
-                {
+                if record_name == ROOT_FOLDER || record_name == PROJECT_ROOT_FOLDER {
                     continue;
                 }
                 if folder.fields["isDeleted"]["value"]

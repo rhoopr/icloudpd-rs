@@ -9,18 +9,9 @@ use crate::retry::{self, RetryAction, RetryConfig};
 #[async_trait::async_trait]
 #[allow(dead_code)]
 pub trait PhotosSession: Send + Sync {
-    async fn post(
-        &self,
-        url: &str,
-        body: &str,
-        headers: &[(&str, &str)],
-    ) -> anyhow::Result<Value>;
+    async fn post(&self, url: &str, body: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value>;
 
-    async fn get(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-    ) -> anyhow::Result<reqwest::Response>;
+    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response>;
 
     /// Clone this session into a new boxed trait object.
     fn clone_box(&self) -> Box<dyn PhotosSession>;
@@ -30,12 +21,7 @@ pub trait PhotosSession: Send + Sync {
 // `PhotosSession` without an adapter, since Client is Arc-backed and cheap to clone.
 #[async_trait::async_trait]
 impl PhotosSession for reqwest::Client {
-    async fn post(
-        &self,
-        url: &str,
-        body: &str,
-        headers: &[(&str, &str)],
-    ) -> anyhow::Result<Value> {
+    async fn post(&self, url: &str, body: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value> {
         let mut builder = self.post(url).body(body.to_owned());
         for &(k, v) in headers {
             builder = builder.header(k, v);
@@ -45,11 +31,7 @@ impl PhotosSession for reqwest::Client {
         Ok(json)
     }
 
-    async fn get(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-    ) -> anyhow::Result<reqwest::Response> {
+    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response> {
         let mut builder = reqwest::Client::get(self, url);
         for &(k, v) in headers {
             builder = builder.header(k, v);
@@ -86,11 +68,9 @@ pub async fn retry_post(
     headers: &[(&str, &str)],
 ) -> anyhow::Result<Value> {
     let config = RetryConfig::default();
-    retry::retry_with_backoff(
-        &config,
-        classify_api_error,
-        || session.post(url, body, headers),
-    )
+    retry::retry_with_backoff(&config, classify_api_error, || {
+        session.post(url, body, headers)
+    })
     .await
 }
 

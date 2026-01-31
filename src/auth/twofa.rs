@@ -28,10 +28,14 @@ pub async fn request_2fa_code(
         let mut code = String::new();
         io::stdin().read_line(&mut code)?;
         Ok::<String, io::Error>(code.trim().to_string())
-    }).await??;
+    })
+    .await??;
 
     if code.len() != TWO_FA_CODE_LENGTH || !code.chars().all(|c| c.is_ascii_digit()) {
-        tracing::error!("Invalid 2FA code: must be exactly {} digits", TWO_FA_CODE_LENGTH);
+        tracing::error!(
+            "Invalid 2FA code: must be exactly {} digits",
+            TWO_FA_CODE_LENGTH
+        );
         return Ok(false);
     }
 
@@ -44,7 +48,12 @@ pub async fn request_2fa_code(
     let mut accept_override = HashMap::new();
     accept_override.insert("Accept".to_string(), "application/json".to_string());
 
-    let headers = get_auth_headers(domain, client_id, &session.session_data, Some(accept_override))?;
+    let headers = get_auth_headers(
+        domain,
+        client_id,
+        &session.session_data,
+        Some(accept_override),
+    )?;
 
     let url = format!("{}/verify/trusteddevice/securitycode", endpoints.auth);
     let response = session
@@ -54,7 +63,7 @@ pub async fn request_2fa_code(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-            // Apple error code -21669 = incorrect verification code
+        // Apple error code -21669 = incorrect verification code
         if text.contains("-21669") {
             tracing::error!("Code verification failed: wrong code");
             return Ok(false);
@@ -82,7 +91,9 @@ pub async fn trust_session(
     let headers = get_auth_headers(domain, client_id, &session.session_data, None)?;
     let url = format!("{}/2sv/trust", endpoints.auth);
 
-    session.get(&url, Some(headers)).await
+    session
+        .get(&url, Some(headers))
+        .await
         .context("Failed to trust session")?;
     tracing::debug!("Session trusted successfully");
     Ok(true)
@@ -99,14 +110,8 @@ pub async fn validate_token(
     tracing::debug!("Checking session token validity");
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "Origin",
-        session.home_endpoint().parse()?,
-    );
-    headers.insert(
-        "Referer",
-        format!("{}/", session.home_endpoint()).parse()?,
-    );
+    headers.insert("Origin", session.home_endpoint().parse()?);
+    headers.insert("Referer", format!("{}/", session.home_endpoint()).parse()?);
 
     let url = format!("{}/validate", endpoints.setup);
     let response = session
@@ -121,7 +126,9 @@ pub async fn validate_token(
     }
 
     tracing::debug!("Session token is still valid");
-    let data: AccountLoginResponse = response.json().await
+    let data: AccountLoginResponse = response
+        .json()
+        .await
         .context("Failed to parse validate response as JSON")?;
     Ok(data)
 }
@@ -142,9 +149,7 @@ pub async fn authenticate_with_token(
     });
 
     let url = format!("{}/accountLogin", endpoints.setup);
-    let response = session
-        .post(&url, Some(data.to_string()), None)
-        .await?;
+    let response = session.post(&url, Some(data.to_string()), None).await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -154,7 +159,9 @@ pub async fn authenticate_with_token(
         );
     }
 
-    let body: AccountLoginResponse = response.json().await
+    let body: AccountLoginResponse = response
+        .json()
+        .await
         .context("Failed to parse accountLogin response as JSON")?;
 
     // Apple redirects China mainland accounts to .com.cn — users must

@@ -71,7 +71,10 @@ pub async fn authenticate(
                 data = Some(d);
             }
             Err(e) => {
-                tracing::debug!("Invalid authentication token, will log in from scratch: {}", e);
+                tracing::debug!(
+                    "Invalid authentication token, will log in from scratch: {}",
+                    e
+                );
             }
         }
     }
@@ -102,7 +105,8 @@ pub async fn authenticate(
     if requires_2fa {
         tracing::info!("Two-factor authentication is required");
 
-        let verified = twofa::request_2fa_code(&mut session, &endpoints, &client_id, domain).await?;
+        let verified =
+            twofa::request_2fa_code(&mut session, &endpoints, &client_id, domain).await?;
         if !verified {
             return Err(AuthError::TwoFactorFailed("2FA verification failed".into()).into());
         }
@@ -141,7 +145,12 @@ mod tests {
     use super::*;
     use crate::auth::responses::{AccountLoginResponse, DsInfo};
 
-    fn make_response(hsa_version: i64, challenge: bool, trusted: bool, qualifying: bool) -> AccountLoginResponse {
+    fn make_response(
+        hsa_version: i64,
+        challenge: bool,
+        trusted: bool,
+        qualifying: bool,
+    ) -> AccountLoginResponse {
         AccountLoginResponse {
             ds_info: Some(DsInfo {
                 hsa_version,
