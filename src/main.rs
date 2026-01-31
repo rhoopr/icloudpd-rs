@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = config::Config::from_cli(cli)?;
+    tracing::info!(concurrency = config.threads_num, "Starting icloudpd-rs");
 
     // Authenticate
     let password_provider = {
@@ -87,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let http_client = auth_result.session.http_client();
     let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(http_client.clone());
 
+    tracing::info!("Initializing photos service...");
     let photos_service =
         icloud::photos::PhotosService::new(
             ckdatabasews.to_string(),
@@ -154,9 +156,10 @@ async fn main() -> anyhow::Result<()> {
         skip_photos: config.skip_photos,
         skip_created_before: config.skip_created_before.map(|d| d.with_timezone(&chrono::Utc)),
         skip_created_after: config.skip_created_after.map(|d| d.with_timezone(&chrono::Utc)),
-        until_found: config.until_found,
         set_exif_datetime: config.set_exif_datetime,
         dry_run: config.dry_run,
+        concurrent_downloads: config.threads_num as usize,
+        recent: config.recent,
     };
 
     // Main download loop (with optional watch mode)

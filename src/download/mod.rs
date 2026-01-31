@@ -10,6 +10,10 @@ use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
 use reqwest::Client;
 
+use std::path::PathBuf;
+
+use futures_util::stream::{self, StreamExt};
+
 use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum};
 
 /// Application configuration for the download engine.
@@ -26,25 +30,36 @@ pub struct DownloadConfig {
     pub(crate) skip_photos: bool,
     pub(crate) skip_created_before: Option<DateTime<Utc>>,
     pub(crate) skip_created_after: Option<DateTime<Utc>>,
-    pub(crate) until_found: Option<u32>,
     pub(crate) set_exif_datetime: bool,
     pub(crate) dry_run: bool,
+    pub(crate) concurrent_downloads: usize,
+    pub(crate) recent: Option<u32>,
+}
+
+/// A unit of work produced by the filter phase and consumed by the download phase.
+struct DownloadTask {
+    url: String,
+    download_path: PathBuf,
+    checksum: String,
+    created_local: DateTime<Local>,
 }
 
 /// Main download loop: fetch all photos from each album, apply filters,
 /// check local existence, download missing files, and optionally stamp
 /// EXIF datetime.
+///
+/// Uses a two-phase approach:
+/// 1. Sequential filter pass — builds a list of download tasks
+/// 2. Parallel download — consumes tasks with bounded concurrency
 pub async fn download_photos(
     client: &Client,
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
 ) -> Result<()> {
+    // ── Phase 1: Sequential filter pass ──────────────────────────────
+    let mut tasks: Vec<DownloadTask> = Vec::new();
     for album in albums {
-        let mut consecutive_found: u32 = 0;
-
-        // PhotoAlbum::photos() handles pagination internally and returns
-        // all assets in the album.
-        let assets = album.photos().await?;
+        let assets = album.photos(config.recent).await?;
 
         for asset in &assets {
             // --- type filter ---
@@ -57,12 +72,12 @@ pub async fn download_photos(
 
             // --- date filters (UTC comparison) ---
             let created_utc = asset.created();
-            if let Some(ref before) = config.skip_created_before {
+            if let Some(before) = &config.skip_created_before {
                 if created_utc < *before {
                     continue;
                 }
             }
-            if let Some(ref after) = config.skip_created_after {
+            if let Some(after) = &config.skip_created_after {
                 if created_utc > *after {
                     continue;
                 }
@@ -85,77 +100,101 @@ pub async fn download_photos(
                 &filename,
             );
 
-            // --- existence / until-found check ---
             if download_path.exists() {
-                consecutive_found += 1;
                 tracing::debug!("{} already exists", download_path.display());
-
-                if let Some(until_found) = config.until_found {
-                    if consecutive_found >= until_found {
-                        tracing::info!(
-                            "Found {} consecutive previously downloaded photos. Exiting",
-                            until_found
-                        );
-                        return Ok(());
-                    }
-                }
                 continue;
             }
 
-            consecutive_found = 0;
-
-            // --- download ---
+            // --- collect task ---
             let versions = asset.versions();
             if let Some(version) = versions.get(&config.size) {
-                // Ensure parent directory exists (skip in dry-run).
-                if !config.dry_run {
-                    if let Some(parent) = download_path.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
+                tasks.push(DownloadTask {
+                    url: version.url.clone(),
+                    download_path,
+                    checksum: version.checksum.clone(),
+                    created_local,
+                });
+            }
+        }
+    }
+
+    if tasks.is_empty() {
+        tracing::info!("No new photos to download");
+        return Ok(());
+    }
+
+    tracing::info!(
+        "Found {} photos to download (concurrency: {})",
+        tasks.len(),
+        config.concurrent_downloads
+    );
+
+    if config.dry_run {
+        for task in &tasks {
+            tracing::info!("[DRY RUN] Would download {}", task.download_path.display());
+        }
+        print_summary(&tasks, config);
+        return Ok(());
+    }
+
+    // ── Phase 2: Parallel download ───────────────────────────────────
+    let client = client.clone();
+    let set_exif = config.set_exif_datetime;
+
+    let results: Vec<Result<()>> = stream::iter(tasks)
+        .map(|task| {
+            let client = client.clone();
+            async move {
+                if let Some(parent) = task.download_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
                 }
 
                 let success = file::download_file(
-                    client,
-                    &version.url,
-                    &download_path,
-                    &version.checksum,
-                    config.dry_run,
+                    &client,
+                    &task.url,
+                    &task.download_path,
+                    &task.checksum,
+                    false,
                 )
                 .await?;
 
                 if success {
                     // Set file modification time to photo creation date.
-                    if !config.dry_run {
-                        let mtime_path = download_path.clone();
-                        let ts = created_local.timestamp();
-                        if let Err(e) = tokio::task::spawn_blocking(move || {
-                            set_file_mtime(&mtime_path, ts)
-                        }).await? {
-                            tracing::warn!(
-                                "Could not set mtime on {}: {}",
-                                download_path.display(),
-                                e
-                            );
-                        }
+                    let mtime_path = task.download_path.clone();
+                    let ts = task.created_local.timestamp();
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        set_file_mtime(&mtime_path, ts)
+                    })
+                    .await?
+                    {
+                        tracing::warn!(
+                            "Could not set mtime on {}: {}",
+                            task.download_path.display(),
+                            e
+                        );
                     }
 
-                    tracing::info!("Downloaded {}", download_path.display());
+                    tracing::info!("Downloaded {}", task.download_path.display());
 
                     // Stamp EXIF DateTimeOriginal on JPEGs if missing.
-                    if config.set_exif_datetime && !config.dry_run {
-                        let ext = download_path
+                    if set_exif {
+                        let ext = task
+                            .download_path
                             .extension()
                             .and_then(|e| e.to_str())
                             .unwrap_or("");
                         if matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg") {
-                            let exif_path = download_path.clone();
-                            let date_str = created_local
+                            let exif_path = task.download_path.clone();
+                            let date_str = task
+                                .created_local
                                 .format("%Y:%m:%d %H:%M:%S")
                                 .to_string();
                             let exif_result = tokio::task::spawn_blocking(move || {
                                 match exif::get_photo_exif(&exif_path) {
                                     Ok(None) => {
-                                        if let Err(e) = exif::set_photo_exif(&exif_path, &date_str) {
+                                        if let Err(e) =
+                                            exif::set_photo_exif(&exif_path, &date_str)
+                                        {
                                             tracing::warn!(
                                                 "Failed to set EXIF on {}: {}",
                                                 exif_path.display(),
@@ -172,18 +211,46 @@ pub async fn download_photos(
                                         );
                                     }
                                 }
-                            }).await;
+                            })
+                            .await;
                             if let Err(e) = exif_result {
                                 tracing::warn!("EXIF task panicked: {}", e);
                             }
                         }
                     }
                 }
+
+                Ok(())
             }
+        })
+        .buffer_unordered(config.concurrent_downloads)
+        .collect()
+        .await;
+
+    let failed = results.iter().filter(|r| r.is_err()).count();
+    for result in &results {
+        if let Err(e) = result {
+            tracing::error!("Download failed: {}", e);
         }
     }
 
+    let succeeded = results.len() - failed;
+    tracing::info!("── Summary ──");
+    tracing::info!("  {} downloaded, {} failed, {} total", succeeded, failed, results.len());
+
+    if failed > 0 {
+        anyhow::bail!("{} of {} downloads failed", failed, results.len());
+    }
+
     Ok(())
+}
+
+/// Print a dry-run summary of what would be downloaded.
+fn print_summary(tasks: &[DownloadTask], config: &DownloadConfig) {
+    tracing::info!("── Dry Run Summary ──");
+    tracing::info!("  {} files would be downloaded", tasks.len());
+    tracing::info!("  destination: {}", config.directory.display());
+    tracing::info!("  concurrency: {}", config.concurrent_downloads);
 }
 
 /// Set the modification and access times of a file to the given Unix
@@ -203,4 +270,50 @@ fn set_file_mtime(path: &Path, timestamp: i64) -> std::io::Result<()> {
     let file = std::fs::File::options().write(true).open(path)?;
     file.set_times(times)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_file(name: &str) -> PathBuf {
+        let dir = PathBuf::from("/tmp/claude/download_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        fs::write(&p, b"test").unwrap();
+        p
+    }
+
+    #[test]
+    fn test_set_file_mtime_positive_timestamp() {
+        let p = tmp_file("pos.txt");
+        set_file_mtime(&p, 1_700_000_000).unwrap();
+        let meta = fs::metadata(&p).unwrap();
+        let mtime = meta.modified().unwrap();
+        assert_eq!(mtime, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+    }
+
+    #[test]
+    fn test_set_file_mtime_zero_timestamp() {
+        let p = tmp_file("zero.txt");
+        set_file_mtime(&p, 0).unwrap();
+        let meta = fs::metadata(&p).unwrap();
+        let mtime = meta.modified().unwrap();
+        assert_eq!(mtime, UNIX_EPOCH);
+    }
+
+    #[test]
+    fn test_set_file_mtime_negative_timestamp() {
+        let p = tmp_file("neg.txt");
+        // Should not panic — clamps or uses pre-epoch time
+        set_file_mtime(&p, -86400).unwrap();
+    }
+
+    #[test]
+    fn test_set_file_mtime_nonexistent_file() {
+        let p = PathBuf::from("/tmp/claude/download_tests/nonexistent_file.txt");
+        let _ = fs::remove_file(&p); // ensure absent
+        assert!(set_file_mtime(&p, 0).is_err());
+    }
 }
