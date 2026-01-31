@@ -175,6 +175,9 @@ async fn main() -> anyhow::Result<()> {
             base_delay_secs: config.retry_delay_secs,
             max_delay_secs: 60,
         },
+        skip_live_photos: config.skip_live_photos,
+        live_photo_size: config.live_photo_size.to_asset_version_size(),
+        live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
     };
 
     loop {

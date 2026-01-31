@@ -22,6 +22,7 @@ use futures_util::stream::{self, StreamExt};
 
 use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum};
 use crate::retry::RetryConfig;
+use crate::types::LivePhotoMovFilenamePolicy;
 
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
@@ -39,6 +40,9 @@ pub struct DownloadConfig {
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
     pub(crate) retry: RetryConfig,
+    pub(crate) skip_live_photos: bool,
+    pub(crate) live_photo_size: AssetVersionSize,
+    pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.
@@ -68,9 +72,7 @@ async fn build_download_tasks(
         let assets = album_result?;
 
         for asset in &assets {
-            if let Some(task) = filter_asset_to_task(asset, config) {
-                tasks.push(task);
-            }
+            tasks.extend(filter_asset_to_tasks(asset, config));
         }
     }
 
@@ -78,27 +80,28 @@ async fn build_download_tasks(
 }
 
 /// Apply content filters (type, date range) and local existence check,
-/// producing a download task only for assets that need fetching.
-fn filter_asset_to_task(
+/// producing download tasks for assets that need fetching.
+/// Returns up to two tasks: the primary photo/video and an optional live photo MOV.
+fn filter_asset_to_tasks(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
-) -> Option<DownloadTask> {
+) -> Vec<DownloadTask> {
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
-        return None;
+        return Vec::new();
     }
     if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
-        return None;
+        return Vec::new();
     }
 
     let created_utc = asset.created();
     if let Some(before) = &config.skip_created_before {
         if created_utc < *before {
-            return None;
+            return Vec::new();
         }
     }
     if let Some(after) = &config.skip_created_after {
         if created_utc > *after {
-            return None;
+            return Vec::new();
         }
     }
 
@@ -106,7 +109,7 @@ fn filter_asset_to_task(
         Some(f) => f,
         None => {
             tracing::warn!("Asset {} has no filename, skipping", asset.id());
-            return None;
+            return Vec::new();
         }
     };
 
@@ -118,20 +121,46 @@ fn filter_asset_to_task(
         filename,
     );
 
-    if download_path.exists() {
-        tracing::debug!("{} already exists", download_path.display());
-        return None;
+    let mut tasks = Vec::new();
+
+    if !download_path.exists() {
+        if let Some(version) = asset.versions().get(&config.size) {
+            tasks.push(DownloadTask {
+                url: version.url.clone(),
+                download_path: download_path.clone(),
+                checksum: version.checksum.clone(),
+                created_local,
+            });
+        }
     }
 
-    asset
-        .versions()
-        .get(&config.size)
-        .map(|version| DownloadTask {
-            url: version.url.clone(),
-            download_path,
-            checksum: version.checksum.clone(),
-            created_local,
-        })
+    // Live photo MOV companion — only for images
+    if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
+        if let Some(live_version) = asset.versions().get(&config.live_photo_size) {
+            let mov_filename = match config.live_photo_mov_filename_policy {
+                LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(filename),
+                LivePhotoMovFilenamePolicy::Original => {
+                    paths::live_photo_mov_path_original(filename)
+                }
+            };
+            let mov_path = paths::local_download_path(
+                &config.directory,
+                &config.folder_structure,
+                &created_local,
+                &mov_filename,
+            );
+            if !mov_path.exists() {
+                tasks.push(DownloadTask {
+                    url: live_version.url.clone(),
+                    download_path: mov_path,
+                    checksum: live_version.checksum.clone(),
+                    created_local,
+                });
+            }
+        }
+    }
+
+    tasks
 }
 
 /// Streaming download pipeline — merges per-album streams and pipes assets
@@ -159,11 +188,11 @@ async fn stream_and_download(
         let mut count = 0usize;
         while let Some(result) = combined.next().await {
             let asset = result?;
-            if filter_asset_to_task(&asset, config).is_some() {
-                let filename = asset.filename().unwrap_or("<unknown>");
-                tracing::info!("[DRY RUN] Would download {}", filename);
-                count += 1;
+            let tasks = filter_asset_to_tasks(&asset, config);
+            for task in &tasks {
+                tracing::info!("[DRY RUN] Would download {}", task.download_path.display());
             }
+            count += tasks.len();
         }
         return Ok((count, Vec::new()));
     }
@@ -178,15 +207,17 @@ async fn stream_and_download(
     let mut failed: Vec<DownloadTask> = Vec::new();
 
     // Use buffer_unordered on a stream of download futures.
-    let task_stream = combined.filter_map(|result| async {
-        match result {
-            Ok(asset) => filter_asset_to_task(&asset, config),
-            Err(e) => {
-                tracing::error!("Error fetching asset: {}", e);
-                None
+    let task_stream = combined
+        .filter_map(|result| async {
+            match result {
+                Ok(asset) => Some(filter_asset_to_tasks(&asset, config)),
+                Err(e) => {
+                    tracing::error!("Error fetching asset: {}", e);
+                    None
+                }
             }
-        }
-    });
+        })
+        .flat_map(stream::iter);
 
     let download_stream = task_stream
         .map(|task| {
@@ -469,6 +500,9 @@ mod tests {
             concurrent_downloads: 1,
             recent: None,
             retry: RetryConfig::default(),
+            skip_live_photos: false,
+            live_photo_size: AssetVersionSize::LiveOriginal,
+            live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
         }
     }
 
@@ -492,11 +526,10 @@ mod tests {
     fn test_filter_asset_produces_task() {
         let asset = photo_asset_with_version();
         let config = test_config();
-        let task = filter_asset_to_task(&asset, &config);
-        assert!(task.is_some());
-        let task = task.unwrap();
-        assert_eq!(task.url, "https://example.com/orig");
-        assert_eq!(task.checksum, "abc123");
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].url, "https://example.com/orig");
+        assert_eq!(tasks[0].checksum, "abc123");
     }
 
     #[test]
@@ -516,7 +549,7 @@ mod tests {
         );
         let mut config = test_config();
         config.skip_videos = true;
-        assert!(filter_asset_to_task(&asset, &config).is_none());
+        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
     }
 
     #[test]
@@ -524,7 +557,7 @@ mod tests {
         let asset = photo_asset_with_version();
         let mut config = test_config();
         config.skip_photos = true;
-        assert!(filter_asset_to_task(&asset, &config).is_none());
+        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
     }
 
     #[test]
@@ -542,7 +575,7 @@ mod tests {
             json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
         );
         let config = test_config();
-        assert!(filter_asset_to_task(&asset, &config).is_none());
+        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
     }
 
     #[test]
@@ -561,30 +594,170 @@ mod tests {
             json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
         );
         let config = test_config(); // requests Original, but only Thumb available
-        assert!(filter_asset_to_task(&asset, &config).is_none());
+        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
     }
 
     #[test]
     fn test_filter_skips_existing_file() {
         let dir = PathBuf::from("/tmp/claude/download_filter_tests");
         fs::create_dir_all(&dir).unwrap();
-        // Create the file that would be the download target
         let asset = photo_asset_with_version();
         let mut config = test_config();
         config.directory = dir.clone();
 
         // First call should produce a task (file doesn't exist yet)
-        let task = filter_asset_to_task(&asset, &config);
-        assert!(task.is_some());
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
 
         // Create the file, second call should skip
-        let task = task.unwrap();
-        fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
-        fs::write(&task.download_path, b"existing").unwrap();
-        assert!(filter_asset_to_task(&asset, &config).is_none());
+        fs::create_dir_all(tasks[0].download_path.parent().unwrap()).unwrap();
+        fs::write(&tasks[0].download_path, b"existing").unwrap();
+        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
 
         // Cleanup
-        let _ = fs::remove_file(&task.download_path);
+        let _ = fs::remove_file(&tasks[0].download_path);
+    }
+
+    fn photo_asset_with_live_photo() -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": "LIVE_1", "fields": {
+                "filenameEnc": {"value": "IMG_0001.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://example.com/heic_orig",
+                    "fileChecksum": "heic_ck"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000,
+                    "downloadURL": "https://example.com/live_mov",
+                    "fileChecksum": "mov_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        )
+    }
+
+    #[test]
+    fn test_filter_produces_live_photo_mov_task() {
+        let asset = photo_asset_with_live_photo();
+        let config = test_config();
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(tasks[1].url, "https://example.com/live_mov");
+        assert!(tasks[1]
+            .download_path
+            .to_str()
+            .unwrap()
+            .contains("IMG_0001_HEVC.MOV"));
+    }
+
+    #[test]
+    fn test_filter_skips_live_photo_when_configured() {
+        let asset = photo_asset_with_live_photo();
+        let mut config = test_config();
+        config.skip_live_photos = true;
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+    }
+
+    #[test]
+    fn test_filter_live_photo_original_policy() {
+        let asset = photo_asset_with_live_photo();
+        let mut config = test_config();
+        config.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Original;
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks[1]
+            .download_path
+            .to_str()
+            .unwrap()
+            .contains("IMG_0001.MOV"));
+    }
+
+    #[test]
+    fn test_filter_skips_existing_live_photo_mov() {
+        let dir = PathBuf::from("/tmp/claude/download_filter_tests_live");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let asset = photo_asset_with_live_photo();
+        let mut config = test_config();
+        config.directory = dir.clone();
+
+        // First call: both photo and MOV
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+
+        // Create only the MOV file on disk
+        fs::create_dir_all(tasks[1].download_path.parent().unwrap()).unwrap();
+        fs::write(&tasks[1].download_path, b"mov_data").unwrap();
+
+        // Second call: only the photo task (MOV already exists)
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_filter_live_photo_medium_size() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "LIVE_MED", "fields": {
+                "filenameEnc": {"value": "IMG_0002.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://example.com/heic_orig",
+                    "fileChecksum": "heic_ck"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resVidMedRes": {"value": {
+                    "size": 1500,
+                    "downloadURL": "https://example.com/live_med",
+                    "fileChecksum": "med_ck"
+                }},
+                "resVidMedFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveMedium;
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].url, "https://example.com/live_med");
+    }
+
+    #[test]
+    fn test_filter_no_live_photo_for_videos() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "VID_1", "fields": {
+                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000,
+                    "downloadURL": "https://example.com/live_mov",
+                    "fileChecksum": "mov_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        // Videos should get 1 task (the video itself), not a live photo MOV
+        assert_eq!(tasks.len(), 1);
     }
 
     #[test]

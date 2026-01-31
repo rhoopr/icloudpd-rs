@@ -77,6 +77,38 @@ pub fn add_dedup_suffix(path: &str, size: u64) -> String {
     }
 }
 
+/// Generate a live photo MOV filename using the "suffix" policy.
+///
+/// For HEIC files: `photo.HEIC` → `photo_HEVC.MOV`
+/// For other files: `photo.JPG` → `photo.MOV`
+pub fn live_photo_mov_path_suffix(filename: &str) -> String {
+    match filename.rfind('.') {
+        Some(dot) => {
+            let (stem, ext) = filename.split_at(dot);
+            let ext_lower = ext[1..].to_ascii_lowercase();
+            if ext_lower == "heic" {
+                format!("{}_HEVC.MOV", stem)
+            } else {
+                format!("{}.MOV", stem)
+            }
+        }
+        None => format!("{}.MOV", filename),
+    }
+}
+
+/// Generate a live photo MOV filename using the "original" policy.
+///
+/// Simply replaces the extension with `.MOV`: `photo.HEIC` → `photo.MOV`
+pub fn live_photo_mov_path_original(filename: &str) -> String {
+    match filename.rfind('.') {
+        Some(dot) => {
+            let (stem, _) = filename.split_at(dot);
+            format!("{}.MOV", stem)
+        }
+        None => format!("{}.MOV", filename),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +125,37 @@ mod tests {
         assert_eq!(remove_unicode_chars("hello"), "hello");
         assert_eq!(remove_unicode_chars("héllo wörld"), "hllo wrld");
         assert_eq!(remove_unicode_chars("日本語.jpg"), ".jpg");
+    }
+
+    #[test]
+    fn test_live_photo_mov_path_suffix_heic() {
+        assert_eq!(
+            live_photo_mov_path_suffix("IMG_1234.HEIC"),
+            "IMG_1234_HEVC.MOV"
+        );
+        assert_eq!(live_photo_mov_path_suffix("photo.heic"), "photo_HEVC.MOV");
+    }
+
+    #[test]
+    fn test_live_photo_mov_path_suffix_non_heic() {
+        assert_eq!(live_photo_mov_path_suffix("IMG_1234.JPG"), "IMG_1234.MOV");
+        assert_eq!(live_photo_mov_path_suffix("photo.jpg"), "photo.MOV");
+        assert_eq!(live_photo_mov_path_suffix("photo.png"), "photo.MOV");
+    }
+
+    #[test]
+    fn test_live_photo_mov_path_suffix_no_extension() {
+        assert_eq!(live_photo_mov_path_suffix("photo"), "photo.MOV");
+    }
+
+    #[test]
+    fn test_live_photo_mov_path_original() {
+        assert_eq!(
+            live_photo_mov_path_original("IMG_1234.HEIC"),
+            "IMG_1234.MOV"
+        );
+        assert_eq!(live_photo_mov_path_original("photo.JPG"), "photo.MOV");
+        assert_eq!(live_photo_mov_path_original("photo"), "photo.MOV");
     }
 
     #[test]
