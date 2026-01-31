@@ -50,10 +50,12 @@ fn temp_download_path(download_path: &Path, checksum: &str) -> anyhow::Result<Pa
 
 /// Download a file from URL using .part temp files.
 ///
-/// Each attempt deletes any existing .part file and downloads from scratch
-/// to ensure reliable checksum verification. On completion the .part file
-/// is renamed to the final destination path. Retries with exponential
-/// backoff on transient failures.
+/// Resumes partial downloads via HTTP Range requests when a .part file
+/// already exists, hashing the existing bytes first so the final checksum
+/// covers the entire file. Falls back to a full download if the server
+/// ignores the Range header. On completion the .part file is renamed to
+/// the final destination path. Retries with exponential backoff on
+/// transient failures.
 pub async fn download_file(
     client: &Client,
     url: &str,
@@ -80,8 +82,6 @@ pub async fn download_file(
             }
         },
         || async {
-            // Delete any partial file so we always start fresh with checksum verification.
-            let _ = fs::remove_file(&part_path).await;
             attempt_download(client, url, download_path, &part_path, checksum).await
         },
     )
@@ -94,7 +94,26 @@ pub async fn download_file(
     })
 }
 
-/// Single download attempt with checksum verification.
+/// Rebuild SHA256 hash state by re-reading an existing .part file.
+/// Returns the hasher and byte count, or None if the file doesn't exist or is empty.
+async fn resume_hash_state(part_path: &Path) -> Option<(Sha256, u64)> {
+    let meta = fs::metadata(part_path).await.ok()?;
+    let existing_len = meta.len();
+    if existing_len == 0 {
+        return None;
+    }
+
+    let data = fs::read(part_path).await.ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    Some((hasher, existing_len))
+}
+
+/// Single download attempt with checksum verification and resume support.
+///
+/// If a .part file already exists, re-hashes its contents and sends a Range
+/// request to resume from where it left off. Falls back to a fresh download
+/// if the server doesn't support Range or returns an unexpected status.
 async fn attempt_download(
     client: &Client,
     url: &str,
@@ -103,32 +122,53 @@ async fn attempt_download(
     checksum: &str,
 ) -> Result<(), DownloadError> {
     let path_str = download_path.display().to_string();
-    let response = client.get(url).send().await.map_err(|e| DownloadError::Http {
+
+    // Check for existing .part file we can resume from.
+    let resume_state = resume_hash_state(part_path).await;
+    let resume_offset = resume_state.as_ref().map(|(_, len)| *len).unwrap_or(0);
+
+    let mut request = client.get(url);
+    if resume_offset > 0 {
+        tracing::info!(
+            "Resuming {} from byte {} (.part file exists)",
+            path_str,
+            resume_offset
+        );
+        request = request.header("Range", format!("bytes={}-", resume_offset));
+    }
+
+    let response = request.send().await.map_err(|e| DownloadError::Http {
         source: e,
         path: path_str.clone(),
     })?;
 
-    if !response.status().is_success() {
+    let status = response.status().as_u16();
+
+    // 206 = resumed successfully, 200 = server ignored Range (start over)
+    let (mut hasher, mut bytes_written, truncate) = if status == 206 && resume_offset > 0 {
+        let (hasher, len) = resume_state.expect("resume_state must be Some when status=206 and resume_offset>0");
+        (hasher, len, false)
+    } else if response.status().is_success() {
+        // Server sent full content — start fresh.
+        (Sha256::new(), 0u64, true)
+    } else {
         return Err(DownloadError::HttpStatus {
-            status: response.status().as_u16(),
+            status,
             path: path_str,
         });
-    }
+    };
 
-    let status = response.status().as_u16();
     let content_length = response.content_length();
 
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
+        .truncate(truncate)
+        .append(!truncate)
         .open(&part_path)
         .await
         .map_err(|e| DownloadError::Other(anyhow::anyhow!("Failed to open .part file: {}", e)))?;
 
-    // Incremental SHA256 — avoids buffering entire files in memory for large MOVs.
-    let mut hasher = Sha256::new();
-    let mut bytes_written: u64 = 0;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
@@ -162,6 +202,8 @@ async fn attempt_download(
         };
 
         if !matches {
+            // Checksum failed — delete .part so next attempt starts fresh
+            // (the partial data is corrupt or the resume was wrong).
             let _ = fs::remove_file(&part_path).await;
             return Err(DownloadError::ChecksumMismatch(
                 download_path.display().to_string(),

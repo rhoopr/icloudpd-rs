@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["full"] }
 # HTTP
 reqwest = { version = "0.12", features = ["cookies", "json", "stream"] }
 futures-util = "0.3"
+tokio-stream = "0.1"
 cookie_store = "0.21"
 cookie = "0.18"
 
