@@ -97,7 +97,10 @@ impl PhotosService {
             let libs = self.fetch_libraries("private").await?;
             self.private_libraries = Some(libs);
         }
-        Ok(self.private_libraries.as_ref().expect("just initialized above"))
+        Ok(self
+            .private_libraries
+            .as_ref()
+            .expect("just initialized above"))
     }
 
     /// Fetch shared libraries (lazily, first call triggers the HTTP request).
@@ -108,10 +111,16 @@ impl PhotosService {
             let libs = self.fetch_libraries("shared").await?;
             self.shared_libraries = Some(libs);
         }
-        Ok(self.shared_libraries.as_ref().expect("just initialized above"))
+        Ok(self
+            .shared_libraries
+            .as_ref()
+            .expect("just initialized above"))
     }
 
-    async fn fetch_libraries(&self, library_type: &str) -> anyhow::Result<HashMap<String, PhotoLibrary>> {
+    async fn fetch_libraries(
+        &self,
+        library_type: &str,
+    ) -> anyhow::Result<HashMap<String, PhotoLibrary>> {
         let mut libraries = HashMap::new();
         let service_endpoint = self.get_service_endpoint(library_type);
         let url = format!("{service_endpoint}/zones/list");

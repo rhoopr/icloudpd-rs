@@ -177,10 +177,7 @@ impl PhotoAsset {
     }
 
     /// Construct from typed `Record` structs (used by album pagination).
-    pub fn from_records(
-        master: super::cloudkit::Record,
-        asset: super::cloudkit::Record,
-    ) -> Self {
+    pub fn from_records(master: super::cloudkit::Record, asset: super::cloudkit::Record) -> Self {
         let filename = decode_filename(&master.fields);
         let item_type_val = resolve_item_type(&master.fields, &filename);
         let asset_date_ms = asset.fields["assetDate"]["value"].as_f64();
@@ -188,7 +185,12 @@ impl PhotoAsset {
         let original_size = master.fields["resOriginalRes"]["value"]["size"]
             .as_u64()
             .unwrap_or(0);
-        let versions = extract_versions(item_type_val, &master.fields, &asset.fields, &master.record_name);
+        let versions = extract_versions(
+            item_type_val,
+            &master.fields,
+            &asset.fields,
+            &master.record_name,
+        );
         Self {
             record_name: master.record_name,
             filename,
@@ -258,10 +260,7 @@ mod tests {
 
     #[test]
     fn test_id_present() {
-        let asset = make_asset(
-            json!({"recordName": "ABC123"}),
-            json!({}),
-        );
+        let asset = make_asset(json!({"recordName": "ABC123"}), json!({}));
         assert_eq!(asset.id(), "ABC123");
     }
 
@@ -427,7 +426,10 @@ mod tests {
         assert_eq!(asset.filename(), Some("vacation.jpg"));
         assert_eq!(asset.item_type(), Some(AssetItemType::Image));
         assert_eq!(asset.size(), 5000);
-        assert_eq!(asset.asset_date().format("%Y-%m-%d").to_string(), "2025-01-15");
+        assert_eq!(
+            asset.asset_date().format("%Y-%m-%d").to_string(),
+            "2025-01-15"
+        );
         let versions = asset.versions();
         assert!(versions.contains_key(&AssetVersionSize::Original));
     }
@@ -483,7 +485,10 @@ mod tests {
         assert!(versions.contains_key(&AssetVersionSize::Medium));
         // PHOTO_VERSION_LOOKUP maps Medium to resJPEGMed, but for videos
         // VIDEO_VERSION_LOOKUP maps Medium to resVidMed — verify the right one was used
-        assert_eq!(versions[&AssetVersionSize::Medium].url, "https://example.com/vid_med");
+        assert_eq!(
+            versions[&AssetVersionSize::Medium].url,
+            "https://example.com/vid_med"
+        );
     }
 
     #[test]

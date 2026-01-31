@@ -29,8 +29,7 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(filter)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )
         .init();
 
@@ -74,13 +73,28 @@ async fn main() -> anyhow::Result<()> {
 
     // Must match Python's PyiCloudService.params for API compatibility
     let mut params = std::collections::HashMap::new();
-    params.insert("clientBuildNumber".to_string(), serde_json::Value::String("2522Project44".to_string()));
-    params.insert("clientMasteringNumber".to_string(), serde_json::Value::String("2522B2".to_string()));
-    params.insert("clientId".to_string(), serde_json::Value::String(
-        auth_result.session.client_id().cloned().unwrap_or_default()
-    ));
-    if let Some(dsid) = &auth_result.data.ds_info.as_ref().and_then(|ds| ds.dsid.as_ref()) {
-        params.insert("dsid".to_string(), serde_json::Value::String(dsid.to_string()));
+    params.insert(
+        "clientBuildNumber".to_string(),
+        serde_json::Value::String("2522Project44".to_string()),
+    );
+    params.insert(
+        "clientMasteringNumber".to_string(),
+        serde_json::Value::String("2522B2".to_string()),
+    );
+    params.insert(
+        "clientId".to_string(),
+        serde_json::Value::String(auth_result.session.client_id().cloned().unwrap_or_default()),
+    );
+    if let Some(dsid) = &auth_result
+        .data
+        .ds_info
+        .as_ref()
+        .and_then(|ds| ds.dsid.as_ref())
+    {
+        params.insert(
+            "dsid".to_string(),
+            serde_json::Value::String(dsid.to_string()),
+        );
     }
 
     let http_client = auth_result.session.http_client();
@@ -88,11 +102,8 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Initializing photos service...");
     let photos_service =
-        icloud::photos::PhotosService::new(
-            ckdatabasews_url.to_string(),
-            session_box,
-            params,
-        ).await?;
+        icloud::photos::PhotosService::new(ckdatabasews_url.to_string(), session_box, params)
+            .await?;
 
     if config.list_libraries {
         let mut photos_service = photos_service;
@@ -149,8 +160,12 @@ async fn main() -> anyhow::Result<()> {
         size: config.size.into(),
         skip_videos: config.skip_videos,
         skip_photos: config.skip_photos,
-        skip_created_before: config.skip_created_before.map(|d| d.with_timezone(&chrono::Utc)),
-        skip_created_after: config.skip_created_after.map(|d| d.with_timezone(&chrono::Utc)),
+        skip_created_before: config
+            .skip_created_before
+            .map(|d| d.with_timezone(&chrono::Utc)),
+        skip_created_after: config
+            .skip_created_after
+            .map(|d| d.with_timezone(&chrono::Utc)),
         set_exif_datetime: config.set_exif_datetime,
         dry_run: config.dry_run,
         concurrent_downloads: config.threads_num as usize,
@@ -164,7 +179,6 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         download::download_photos(&http_client, &albums, &download_config).await?;
-
 
         if let Some(interval) = config.watch_with_interval {
             tracing::info!("Waiting {} seconds...", interval);

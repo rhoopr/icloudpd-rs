@@ -40,9 +40,7 @@ impl DownloadError {
     /// truncated transfer or expired CDN URL, not actual data corruption.
     pub fn is_retryable(&self) -> bool {
         match self {
-            DownloadError::HttpStatus { status, .. } => {
-                *status == 429 || *status >= 500
-            }
+            DownloadError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
             DownloadError::ChecksumMismatch(_) => true,
             DownloadError::Http { .. } => true,
             DownloadError::RetriesExhausted { .. } => false,
@@ -58,37 +56,55 @@ mod tests {
 
     #[test]
     fn test_http_404_not_retryable() {
-        let e = DownloadError::HttpStatus { status: 404, path: "x".into() };
+        let e = DownloadError::HttpStatus {
+            status: 404,
+            path: "x".into(),
+        };
         assert!(!e.is_retryable());
     }
 
     #[test]
     fn test_http_401_not_retryable() {
-        let e = DownloadError::HttpStatus { status: 401, path: "x".into() };
+        let e = DownloadError::HttpStatus {
+            status: 401,
+            path: "x".into(),
+        };
         assert!(!e.is_retryable());
     }
 
     #[test]
     fn test_http_403_not_retryable() {
-        let e = DownloadError::HttpStatus { status: 403, path: "x".into() };
+        let e = DownloadError::HttpStatus {
+            status: 403,
+            path: "x".into(),
+        };
         assert!(!e.is_retryable());
     }
 
     #[test]
     fn test_http_429_retryable() {
-        let e = DownloadError::HttpStatus { status: 429, path: "x".into() };
+        let e = DownloadError::HttpStatus {
+            status: 429,
+            path: "x".into(),
+        };
         assert!(e.is_retryable());
     }
 
     #[test]
     fn test_http_500_retryable() {
-        let e = DownloadError::HttpStatus { status: 500, path: "x".into() };
+        let e = DownloadError::HttpStatus {
+            status: 500,
+            path: "x".into(),
+        };
         assert!(e.is_retryable());
     }
 
     #[test]
     fn test_http_503_retryable() {
-        let e = DownloadError::HttpStatus { status: 503, path: "x".into() };
+        let e = DownloadError::HttpStatus {
+            status: 503,
+            path: "x".into(),
+        };
         assert!(e.is_retryable());
     }
 

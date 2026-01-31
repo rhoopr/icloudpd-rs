@@ -33,7 +33,9 @@ impl RetryConfig {
     ///
     /// Formula: `min(base_delay * 2^retry, max_delay) + random_jitter(0..base_delay)`
     pub fn delay_for_retry(&self, retry: u32) -> std::time::Duration {
-        let exp_delay = self.base_delay_secs.saturating_mul(1u64.checked_shl(retry).unwrap_or(u64::MAX));
+        let exp_delay = self
+            .base_delay_secs
+            .saturating_mul(1u64.checked_shl(retry).unwrap_or(u64::MAX));
         let capped = exp_delay.min(self.max_delay_secs);
         let jitter = if self.base_delay_secs > 0 {
             rand::thread_rng().gen_range(0..self.base_delay_secs)
@@ -156,12 +158,8 @@ mod tests {
             base_delay_secs: 0,
             max_delay_secs: 0,
         };
-        let result: Result<i32, String> = retry_with_backoff(
-            &config,
-            |_| RetryAction::Retry,
-            || async { Ok(42) },
-        )
-        .await;
+        let result: Result<i32, String> =
+            retry_with_backoff(&config, |_| RetryAction::Retry, || async { Ok(42) }).await;
         assert_eq!(result.unwrap(), 42);
     }
 

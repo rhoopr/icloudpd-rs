@@ -42,9 +42,7 @@ fn temp_download_path(download_path: &Path, checksum: &str) -> anyhow::Result<Pa
         .decode(checksum)
         .context("Failed to decode base64 checksum")?;
     let encoded = base32_encode(&decoded);
-    let download_dir = download_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let download_dir = download_path.parent().unwrap_or_else(|| Path::new("."));
     Ok(download_dir.join(format!("{}.part", encoded)))
 }
 
@@ -69,8 +67,7 @@ pub async fn download_file(
         return Ok(());
     }
 
-    let part_path = temp_download_path(download_path, checksum)
-        .map_err(DownloadError::Other)?;
+    let part_path = temp_download_path(download_path, checksum).map_err(DownloadError::Other)?;
 
     let result = retry::retry_with_backoff(
         retry_config,
@@ -81,9 +78,7 @@ pub async fn download_file(
                 RetryAction::Abort
             }
         },
-        || async {
-            attempt_download(client, url, download_path, &part_path, checksum).await
-        },
+        || async { attempt_download(client, url, download_path, &part_path, checksum).await },
     )
     .await;
 
@@ -146,7 +141,8 @@ async fn attempt_download(
 
     // 206 = resumed successfully, 200 = server ignored Range (start over)
     let (mut hasher, mut bytes_written, truncate) = if status == 206 && resume_offset > 0 {
-        let (hasher, len) = resume_state.expect("resume_state must be Some when status=206 and resume_offset>0");
+        let (hasher, len) =
+            resume_state.expect("resume_state must be Some when status=206 and resume_offset>0");
         (hasher, len, false)
     } else if response.status().is_success() {
         // Server sent full content — start fresh.
@@ -171,16 +167,17 @@ async fn attempt_download(
 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            tracing::warn!(
+        let chunk =
+            chunk.map_err(|e| {
+                tracing::warn!(
                 "Body decode error for {} (status={}, content_length={:?}, bytes_so_far={}): {}",
                 path_str, status, content_length, bytes_written, e
             );
-            DownloadError::Http {
-                source: e,
-                path: path_str.clone(),
-            }
-        })?;
+                DownloadError::Http {
+                    source: e,
+                    path: path_str.clone(),
+                }
+            })?;
         hasher.update(&chunk);
         file.write_all(&chunk).await?;
         bytes_written += chunk.len() as u64;

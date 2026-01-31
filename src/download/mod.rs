@@ -123,12 +123,15 @@ fn filter_asset_to_task(
         return None;
     }
 
-    asset.versions().get(&config.size).map(|version| DownloadTask {
-        url: version.url.clone(),
-        download_path,
-        checksum: version.checksum.clone(),
-        created_local,
-    })
+    asset
+        .versions()
+        .get(&config.size)
+        .map(|version| DownloadTask {
+            url: version.url.clone(),
+            download_path,
+            checksum: version.checksum.clone(),
+            created_local,
+        })
 }
 
 /// Streaming download pipeline — merges per-album streams and pipes assets
@@ -190,8 +193,7 @@ async fn stream_and_download(
             let client = client.clone();
             let retry_config = retry_config.clone();
             async move {
-                let result =
-                    download_single_task(&client, &task, &retry_config, set_exif).await;
+                let result = download_single_task(&client, &task, &retry_config, set_exif).await;
                 (task, result)
             }
         })
@@ -203,11 +205,7 @@ async fn stream_and_download(
         match result {
             Ok(()) => downloaded += 1,
             Err(e) => {
-                tracing::error!(
-                    "Download failed: {}: {}",
-                    task.download_path.display(),
-                    e
-                );
+                tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
                 failed.push(task);
             }
         }
@@ -274,10 +272,7 @@ pub async fn download_photos(
     );
 
     let fresh_tasks = build_download_tasks(albums, config).await?;
-    tracing::info!(
-        "  Re-fetched {} tasks with fresh URLs",
-        fresh_tasks.len()
-    );
+    tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
     let remaining_failed = run_download_pass(
         client,
@@ -369,11 +364,7 @@ async fn download_single_task(
 
     let mtime_path = task.download_path.clone();
     let ts = task.created_local.timestamp();
-    if let Err(e) = tokio::task::spawn_blocking(move || {
-        set_file_mtime(&mtime_path, ts)
-    })
-    .await?
-    {
+    if let Err(e) = tokio::task::spawn_blocking(move || set_file_mtime(&mtime_path, ts)).await? {
         tracing::warn!(
             "Could not set mtime on {}: {}",
             task.download_path.display(),
@@ -391,34 +382,20 @@ async fn download_single_task(
             .unwrap_or("");
         if matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg") {
             let exif_path = task.download_path.clone();
-            let date_str = task
-                .created_local
-                .format("%Y:%m:%d %H:%M:%S")
-                .to_string();
-            let exif_result = tokio::task::spawn_blocking(move || {
-                match exif::get_photo_exif(&exif_path) {
+            let date_str = task.created_local.format("%Y:%m:%d %H:%M:%S").to_string();
+            let exif_result =
+                tokio::task::spawn_blocking(move || match exif::get_photo_exif(&exif_path) {
                     Ok(None) => {
-                        if let Err(e) =
-                            exif::set_photo_exif(&exif_path, &date_str)
-                        {
-                            tracing::warn!(
-                                "Failed to set EXIF on {}: {}",
-                                exif_path.display(),
-                                e
-                            );
+                        if let Err(e) = exif::set_photo_exif(&exif_path, &date_str) {
+                            tracing::warn!("Failed to set EXIF on {}: {}", exif_path.display(), e);
                         }
                     }
                     Ok(Some(_)) => {}
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to read EXIF from {}: {}",
-                            exif_path.display(),
-                            e
-                        );
+                        tracing::warn!("Failed to read EXIF from {}: {}", exif_path.display(), e);
                     }
-                }
-            })
-            .await;
+                })
+                .await;
             if let Err(e) = exif_result {
                 tracing::warn!("EXIF task panicked: {}", e);
             }
