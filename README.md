@@ -19,7 +19,7 @@ Full feature parity with the Python icloudpd, including:
 - **Complete Apple authentication** — SRP-6a, two-factor authentication, session persistence with trust tokens
 - **Full iCloud Photos API** — albums, smart folders, shared libraries, asset enumeration with pagination
 - **Flexible downloads** — multiple size variants (original, medium, thumb, adjusted, alternative), live photos, RAW files
-- **Content filtering** — by media type, date range, album, recency, and consecutive-found early exit
+- **Content filtering** — by media type, date range, album, recency
 - **File organization** — date-based folder structures, filename sanitization, deduplication policies
 - **EXIF metadata** — read and write DateTimeOriginal, file modification time sync
 - **XMP sidecar export** — GPS, keywords, ratings, title, description, orientation
@@ -71,6 +71,8 @@ icloudpd-rs --username my@email.address --directory /photos
 | `--auth-only` | Only authenticate, don't download |
 | `-l, --list-albums` | List available albums |
 | `--list-libraries` | List available libraries |
+| `--recent N` | Download only the N most recent photos |
+| `--threads-num N` | Number of concurrent downloads (default: 1) |
 | `--dry-run` | Preview without modifying files or iCloud |
 
 ## License
