@@ -56,10 +56,18 @@ pub async fn download_photos(
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
 ) -> Result<()> {
-    // ── Phase 1: Sequential filter pass ──────────────────────────────
+    // ── Phase 1: Concurrent album fetch + sequential filter ─────────
+    let album_results: Vec<Result<Vec<_>>> = stream::iter(albums)
+        .map(|album| async move {
+            album.photos(config.recent).await
+        })
+        .buffer_unordered(config.concurrent_downloads)
+        .collect()
+        .await;
+
     let mut tasks: Vec<DownloadTask> = Vec::new();
-    for album in albums {
-        let assets = album.photos(config.recent).await?;
+    for album_result in album_results {
+        let assets = album_result?;
 
         for asset in &assets {
             // --- type filter ---
@@ -97,7 +105,7 @@ pub async fn download_photos(
                 &config.directory,
                 &config.folder_structure,
                 &created_local,
-                &filename,
+                filename,
             );
 
             if download_path.exists() {

@@ -1,5 +1,6 @@
 mod album;
 mod asset;
+pub mod cloudkit;
 mod library;
 pub mod queries;
 pub mod session;
@@ -117,23 +118,14 @@ impl PhotosService {
             .post(&url, "{}", &[("Content-type", "text/plain")])
             .await?;
 
-        let zones = match response["zones"].as_array() {
-            Some(z) => z,
-            None => return Ok(libraries),
-        };
+        let zone_list: cloudkit::ZoneListResponse = serde_json::from_value(response)?;
 
-        for zone in zones {
-            if zone.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
+        for zone in &zone_list.zones {
+            if zone.deleted.unwrap_or(false) {
                 continue;
             }
-            let zone_name = zone["zoneID"]["zoneName"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    tracing::warn!("Missing expected field: zoneID.zoneName");
-                    ""
-                })
-                .to_string();
-            let zone_id = zone["zoneID"].clone();
+            let zone_name = zone.zone_id.zone_name.clone();
+            let zone_id = serde_json::to_value(&zone.zone_id)?;
             let ep = self.get_service_endpoint(library_type);
             let lib_session = self.session.clone_box();
 

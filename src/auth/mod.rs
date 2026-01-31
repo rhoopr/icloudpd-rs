@@ -1,5 +1,6 @@
 pub mod endpoints;
 pub mod error;
+pub mod responses;
 pub mod session;
 pub mod srp;
 pub mod twofa;
@@ -11,12 +12,13 @@ use uuid::Uuid;
 
 use self::endpoints::Endpoints;
 use self::error::AuthError;
+pub use self::responses::AccountLoginResponse;
 use self::session::Session;
 
 /// Result of a successful authentication, including the account data payload.
 pub struct AuthResult {
     pub session: Session,
-    pub data: serde_json::Value,
+    pub data: AccountLoginResponse,
 }
 
 impl std::fmt::Debug for AuthResult {
@@ -56,7 +58,7 @@ pub async fn authenticate(
     session.set_client_id(&client_id);
 
     // Step 1: Try to validate existing token
-    let mut data: Option<serde_json::Value> = None;
+    let mut data: Option<AccountLoginResponse> = None;
     if session.session_data.contains_key("session_token") {
         tracing::debug!("Checking session token validity");
         match twofa::validate_token(&mut session, &endpoints).await {
@@ -122,29 +124,77 @@ pub async fn authenticate(
 }
 
 /// Check if 2FA is required based on the account data response.
-fn check_requires_2fa(data: &serde_json::Value) -> bool {
-    let hsa_version = data
-        .pointer("/dsInfo/hsaVersion")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    let hsa_challenge_required = data
-        .get("hsaChallengeRequired")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let hsa_trusted_browser = data
-        .get("hsaTrustedBrowser")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let has_qualifying_device = data
-        .pointer("/dsInfo/hasICloudQualifyingDevice")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+fn check_requires_2fa(data: &AccountLoginResponse) -> bool {
+    let (hsa_version, has_qualifying_device) = match &data.ds_info {
+        Some(ds) => (ds.hsa_version, ds.has_i_cloud_qualifying_device),
+        None => (0, false),
+    };
 
     // requires_2fa: hsaVersion == 2, challenge required or not trusted, and has qualifying device
     hsa_version == 2
-        && (hsa_challenge_required || !hsa_trusted_browser)
+        && (data.hsa_challenge_required || !data.hsa_trusted_browser)
         && has_qualifying_device
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::responses::{AccountLoginResponse, DsInfo};
+
+    fn make_response(hsa_version: i64, challenge: bool, trusted: bool, qualifying: bool) -> AccountLoginResponse {
+        AccountLoginResponse {
+            ds_info: Some(DsInfo {
+                hsa_version,
+                dsid: None,
+                has_i_cloud_qualifying_device: qualifying,
+            }),
+            webservices: None,
+            hsa_challenge_required: challenge,
+            hsa_trusted_browser: trusted,
+            domain_to_use: None,
+        }
+    }
+
+    #[test]
+    fn test_requires_2fa_all_conditions_met() {
+        let resp = make_response(2, true, false, true);
+        assert!(check_requires_2fa(&resp));
+    }
+
+    #[test]
+    fn test_requires_2fa_trusted_no_challenge() {
+        let resp = make_response(2, false, true, true);
+        assert!(!check_requires_2fa(&resp));
+    }
+
+    #[test]
+    fn test_requires_2fa_wrong_hsa_version() {
+        let resp = make_response(1, true, false, true);
+        assert!(!check_requires_2fa(&resp));
+    }
+
+    #[test]
+    fn test_requires_2fa_no_qualifying_device() {
+        let resp = make_response(2, true, false, false);
+        assert!(!check_requires_2fa(&resp));
+    }
+
+    #[test]
+    fn test_requires_2fa_no_ds_info() {
+        let resp = AccountLoginResponse {
+            ds_info: None,
+            webservices: None,
+            hsa_challenge_required: true,
+            hsa_trusted_browser: false,
+            domain_to_use: None,
+        };
+        assert!(!check_requires_2fa(&resp));
+    }
+
+    #[test]
+    fn test_requires_2fa_untrusted_no_challenge() {
+        // Not trusted + no explicit challenge = still requires 2FA
+        let resp = make_response(2, false, false, true);
+        assert!(check_requires_2fa(&resp));
+    }
 }

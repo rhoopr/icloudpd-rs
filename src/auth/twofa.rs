@@ -8,6 +8,7 @@ use super::endpoints::Endpoints;
 use super::session::Session;
 use super::srp::get_auth_headers;
 use crate::auth::error::AuthError;
+use crate::auth::responses::AccountLoginResponse;
 
 const TWO_FA_CODE_LENGTH: usize = 6;
 
@@ -94,7 +95,7 @@ pub async fn trust_session(
 pub async fn validate_token(
     session: &mut Session,
     endpoints: &Endpoints,
-) -> Result<serde_json::Value> {
+) -> Result<AccountLoginResponse> {
     tracing::debug!("Checking session token validity");
 
     let mut headers = HeaderMap::new();
@@ -120,7 +121,7 @@ pub async fn validate_token(
     }
 
     tracing::debug!("Session token is still valid");
-    let data: serde_json::Value = response.json().await
+    let data: AccountLoginResponse = response.json().await
         .context("Failed to parse validate response as JSON")?;
     Ok(data)
 }
@@ -132,7 +133,7 @@ pub async fn validate_token(
 pub async fn authenticate_with_token(
     session: &mut Session,
     endpoints: &Endpoints,
-) -> Result<serde_json::Value> {
+) -> Result<AccountLoginResponse> {
     let data = serde_json::json!({
         "accountCountryCode": session.session_data.get("account_country").cloned().unwrap_or_default(),
         "dsWebAuthToken": session.session_data.get("session_token").cloned().unwrap_or_default(),
@@ -153,11 +154,11 @@ pub async fn authenticate_with_token(
         );
     }
 
-    let body: serde_json::Value = response.json().await
+    let body: AccountLoginResponse = response.json().await
         .context("Failed to parse accountLogin response as JSON")?;
 
     // Check if Apple insists on a different domain
-    if let Some(domain_to_use) = body.get("domainToUse").and_then(|v| v.as_str()) {
+    if let Some(ref domain_to_use) = body.domain_to_use {
         return Err(anyhow::anyhow!(
             "Apple insists on using {} for your request. Please use --domain parameter",
             domain_to_use
