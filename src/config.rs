@@ -20,7 +20,6 @@ pub struct Config {
     pub skip_photos: bool,
     pub skip_live_photos: bool,
     pub force_size: bool,
-    pub auto_delete: bool,
     pub folder_structure: String,
     pub set_exif_datetime: bool,
     pub dry_run: bool,
@@ -35,8 +34,6 @@ pub struct Config {
     pub file_match_policy: FileMatchPolicy,
     pub skip_created_before: Option<DateTime<Local>>,
     pub skip_created_after: Option<DateTime<Local>>,
-    pub delete_after_download: bool,
-    pub keep_icloud_recent_days: Option<u32>,
     pub only_print_filenames: bool,
 }
 
@@ -97,7 +94,6 @@ impl Config {
             skip_photos: cli.skip_photos,
             skip_live_photos: cli.skip_live_photos,
             force_size: cli.force_size,
-            auto_delete: cli.auto_delete,
             folder_structure: cli.folder_structure,
             set_exif_datetime: cli.set_exif_datetime,
             dry_run: cli.dry_run,
@@ -112,8 +108,6 @@ impl Config {
             file_match_policy: cli.file_match_policy,
             skip_created_before,
             skip_created_after,
-            delete_after_download: cli.delete_after_download,
-            keep_icloud_recent_days: cli.keep_icloud_recent_days,
             only_print_filenames: cli.only_print_filenames,
         })
     }
