@@ -90,9 +90,15 @@ impl PhotoAlbum {
     }
 
     /// Fetch all photos in this album, handling pagination.
-    pub async fn photos(&self) -> anyhow::Result<Vec<PhotoAsset>> {
+    /// If `limit` is `Some(n)`, fetches newest-first and stops after `n` photos.
+    pub async fn photos(&self, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
+        self.fetch_photos("ASCENDING", limit).await
+    }
+
+    async fn fetch_photos(&self, direction: &str, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
         let mut all_assets: Vec<PhotoAsset> = Vec::new();
         let mut offset: u64 = 0;
+        tracing::info!("Fetching photos from iCloud...");
 
         loop {
             let url = format!(
@@ -100,7 +106,7 @@ impl PhotoAlbum {
                 self.service_endpoint,
                 encode_params(&self.params)
             );
-            let body = self.list_query(offset);
+            let body = self.list_query(offset, direction);
             debug!("Album '{}' POST URL: {}", self.name, url);
             let response = self
                 .session
@@ -162,12 +168,21 @@ impl PhotoAlbum {
                 }
                 offset += 1;
             }
+
+            tracing::info!("  fetched {} photos so far...", all_assets.len());
+
+            if let Some(n) = limit {
+                if all_assets.len() >= n as usize {
+                    all_assets.truncate(n as usize);
+                    break;
+                }
+            }
         }
 
         Ok(all_assets)
     }
 
-    fn list_query(&self, offset: u64) -> Value {
+    fn list_query(&self, offset: u64, direction: &str) -> Value {
         let desired_keys = &*DESIRED_KEYS_VALUES;
 
         let mut filter_by = vec![
@@ -178,7 +193,7 @@ impl PhotoAlbum {
             }),
             json!({
                 "fieldName": "direction",
-                "fieldValue": {"type": "STRING", "value": "ASCENDING"},
+                "fieldValue": {"type": "STRING", "value": direction},
                 "comparator": "EQUALS",
             }),
         ];

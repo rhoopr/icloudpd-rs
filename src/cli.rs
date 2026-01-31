@@ -50,9 +50,9 @@ pub struct Cli {
     #[arg(long)]
     pub recent: Option<u32>,
 
-    /// Download until finding X consecutive existing photos
-    #[arg(long)]
-    pub until_found: Option<u32>,
+    /// Number of concurrent download threads (default: 1)
+    #[arg(long = "threads-num", default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    pub threads_num: u16,
 
     /// Don't download videos
     #[arg(long)]
