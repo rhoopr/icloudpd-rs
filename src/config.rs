@@ -198,4 +198,40 @@ mod tests {
         assert!(parse_date_or_interval("not-a-date").is_err());
         assert!(parse_date_or_interval("").is_err());
     }
+
+    fn make_cli(overrides: impl FnOnce(&mut crate::cli::Cli)) -> crate::cli::Cli {
+        use clap::Parser;
+        let mut cli = crate::cli::Cli::try_parse_from([
+            "icloudpd-rs", "--username", "u@example.com",
+        ]).unwrap();
+        overrides(&mut cli);
+        cli
+    }
+
+    #[test]
+    fn test_from_cli_threads_num_passthrough() {
+        let cli = make_cli(|c| c.threads_num = 4);
+        let cfg = Config::from_cli(cli).unwrap();
+        assert_eq!(cfg.threads_num, 4);
+    }
+
+    #[test]
+    fn test_from_cli_skip_flags() {
+        let cli = make_cli(|c| {
+            c.skip_videos = true;
+            c.skip_photos = true;
+            c.skip_live_photos = true;
+        });
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.skip_videos);
+        assert!(cfg.skip_photos);
+        assert!(cfg.skip_live_photos);
+    }
+
+    #[test]
+    fn test_from_cli_dry_run() {
+        let cli = make_cli(|c| c.dry_run = true);
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(cfg.dry_run);
+    }
 }

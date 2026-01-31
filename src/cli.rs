@@ -142,3 +142,64 @@ pub struct Cli {
     #[arg(long)]
     pub only_print_filenames: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap()
+    }
+
+    fn base_args() -> Vec<&'static str> {
+        vec!["icloudpd-rs", "--username", "test@example.com"]
+    }
+
+    #[test]
+    fn test_threads_num_defaults_to_1() {
+        let cli = parse(&base_args());
+        assert_eq!(cli.threads_num, 1);
+    }
+
+    #[test]
+    fn test_threads_num_accepts_valid_value() {
+        let mut args = base_args();
+        args.extend(["--threads-num", "8"]);
+        let cli = parse(&args);
+        assert_eq!(cli.threads_num, 8);
+    }
+
+    #[test]
+    fn test_threads_num_rejects_zero() {
+        let mut args = base_args();
+        args.extend(["--threads-num", "0"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_dry_run_default_false() {
+        let cli = parse(&base_args());
+        assert!(!cli.dry_run);
+    }
+
+    #[test]
+    fn test_size_default_original() {
+        let cli = parse(&base_args());
+        assert!(matches!(cli.size, VersionSize::Original));
+    }
+
+    #[test]
+    fn test_recent_none_by_default() {
+        let cli = parse(&base_args());
+        assert!(cli.recent.is_none());
+    }
+
+    #[test]
+    fn test_recent_accepts_value() {
+        let mut args = base_args();
+        args.extend(["--recent", "50"]);
+        let cli = parse(&args);
+        assert_eq!(cli.recent, Some(50));
+    }
+}

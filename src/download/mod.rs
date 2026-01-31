@@ -72,12 +72,12 @@ pub async fn download_photos(
 
             // --- date filters (UTC comparison) ---
             let created_utc = asset.created();
-            if let Some(ref before) = config.skip_created_before {
+            if let Some(before) = &config.skip_created_before {
                 if created_utc < *before {
                     continue;
                 }
             }
-            if let Some(ref after) = config.skip_created_after {
+            if let Some(after) = &config.skip_created_after {
                 if created_utc > *after {
                     continue;
                 }
@@ -139,18 +139,14 @@ pub async fn download_photos(
 
     // ── Phase 2: Parallel download ───────────────────────────────────
     let client = client.clone();
-    let dry_run = config.dry_run;
     let set_exif = config.set_exif_datetime;
 
     let results: Vec<Result<()>> = stream::iter(tasks)
         .map(|task| {
             let client = client.clone();
             async move {
-                // Ensure parent directory exists (skip in dry-run).
-                if !dry_run {
-                    if let Some(parent) = task.download_path.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
+                if let Some(parent) = task.download_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
                 }
 
                 let success = file::download_file(
@@ -158,32 +154,30 @@ pub async fn download_photos(
                     &task.url,
                     &task.download_path,
                     &task.checksum,
-                    dry_run,
+                    false,
                 )
                 .await?;
 
                 if success {
                     // Set file modification time to photo creation date.
-                    if !dry_run {
-                        let mtime_path = task.download_path.clone();
-                        let ts = task.created_local.timestamp();
-                        if let Err(e) = tokio::task::spawn_blocking(move || {
-                            set_file_mtime(&mtime_path, ts)
-                        })
-                        .await?
-                        {
-                            tracing::warn!(
-                                "Could not set mtime on {}: {}",
-                                task.download_path.display(),
-                                e
-                            );
-                        }
+                    let mtime_path = task.download_path.clone();
+                    let ts = task.created_local.timestamp();
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        set_file_mtime(&mtime_path, ts)
+                    })
+                    .await?
+                    {
+                        tracing::warn!(
+                            "Could not set mtime on {}: {}",
+                            task.download_path.display(),
+                            e
+                        );
                     }
 
                     tracing::info!("Downloaded {}", task.download_path.display());
 
                     // Stamp EXIF DateTimeOriginal on JPEGs if missing.
-                    if set_exif && !dry_run {
+                    if set_exif {
                         let ext = task
                             .download_path
                             .extension()
@@ -276,4 +270,50 @@ fn set_file_mtime(path: &Path, timestamp: i64) -> std::io::Result<()> {
     let file = std::fs::File::options().write(true).open(path)?;
     file.set_times(times)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_file(name: &str) -> PathBuf {
+        let dir = PathBuf::from("/tmp/claude/download_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        fs::write(&p, b"test").unwrap();
+        p
+    }
+
+    #[test]
+    fn test_set_file_mtime_positive_timestamp() {
+        let p = tmp_file("pos.txt");
+        set_file_mtime(&p, 1_700_000_000).unwrap();
+        let meta = fs::metadata(&p).unwrap();
+        let mtime = meta.modified().unwrap();
+        assert_eq!(mtime, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+    }
+
+    #[test]
+    fn test_set_file_mtime_zero_timestamp() {
+        let p = tmp_file("zero.txt");
+        set_file_mtime(&p, 0).unwrap();
+        let meta = fs::metadata(&p).unwrap();
+        let mtime = meta.modified().unwrap();
+        assert_eq!(mtime, UNIX_EPOCH);
+    }
+
+    #[test]
+    fn test_set_file_mtime_negative_timestamp() {
+        let p = tmp_file("neg.txt");
+        // Should not panic — clamps or uses pre-epoch time
+        set_file_mtime(&p, -86400).unwrap();
+    }
+
+    #[test]
+    fn test_set_file_mtime_nonexistent_file() {
+        let p = PathBuf::from("/tmp/claude/download_tests/nonexistent_file.txt");
+        let _ = fs::remove_file(&p); // ensure absent
+        assert!(set_file_mtime(&p, 0).is_err());
+    }
 }
