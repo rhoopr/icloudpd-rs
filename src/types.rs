@@ -62,3 +62,36 @@ pub enum LivePhotoMovFilenamePolicy {
     Suffix,
     Original,
 }
+
+impl LivePhotoSize {
+    pub fn to_asset_version_size(self) -> crate::icloud::photos::AssetVersionSize {
+        use crate::icloud::photos::AssetVersionSize;
+        match self {
+            LivePhotoSize::Original => AssetVersionSize::LiveOriginal,
+            LivePhotoSize::Medium => AssetVersionSize::LiveMedium,
+            LivePhotoSize::Thumb => AssetVersionSize::LiveThumb,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::icloud::photos::AssetVersionSize;
+
+    #[test]
+    fn test_live_photo_size_to_asset_version_size() {
+        assert_eq!(
+            LivePhotoSize::Original.to_asset_version_size(),
+            AssetVersionSize::LiveOriginal
+        );
+        assert_eq!(
+            LivePhotoSize::Medium.to_asset_version_size(),
+            AssetVersionSize::LiveMedium
+        );
+        assert_eq!(
+            LivePhotoSize::Thumb.to_asset_version_size(),
+            AssetVersionSize::LiveThumb
+        );
+    }
+}
