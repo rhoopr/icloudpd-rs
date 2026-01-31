@@ -245,31 +245,22 @@ pub async fn authenticate_srp(
         return Err(AuthError::ApiError { code: status.as_u16(), message: text }.into());
     }
 
-    let body: serde_json::Value = response.json().await
+    let body: super::responses::SrpInitResponse = response.json().await
         .context("Failed to parse SRP init response as JSON")?;
 
     // Step 2: Parse server response
-    let salt_b64 = body["salt"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing salt in SRP init response"))?;
-    let b_b64 = body["b"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing b in SRP init response"))?;
-    let c_value = &body["c"];
-    let iterations = u32::try_from(
-        body["iteration"].as_u64()
-            .ok_or_else(|| anyhow::anyhow!("Missing iteration in SRP init response"))?
-    ).context("SRP iteration count exceeds u32")?;
-    let protocol = body["protocol"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing protocol in SRP init response"))?;
+    let iterations = u32::try_from(body.iteration)
+        .context("SRP iteration count exceeds u32")?;
 
-    let salt = BASE64.decode(salt_b64).context("Failed to decode SRP salt")?;
-    let b_pub_bytes = BASE64.decode(b_b64).context("Failed to decode SRP public key")?;
+    let salt = BASE64.decode(&body.salt).context("Failed to decode SRP salt")?;
+    let b_pub_bytes = BASE64.decode(&body.b).context("Failed to decode SRP public key")?;
     let b_pub = BigUint::from_bytes_be(&b_pub_bytes);
 
     // Step 3: Derive password key using Apple's method
-    let password_key = derive_apple_password(password, protocol, &salt, iterations);
+    let password_key = derive_apple_password(password, &body.protocol, &salt, iterations);
 
     // Step 4: Compute SRP values using Apple's no-username-in-x variant
-    tracing::debug!("SRP protocol: {}, iterations: {}", protocol, iterations);
+    tracing::debug!("SRP protocol: {}, iterations: {}", body.protocol, iterations);
     tracing::debug!("SRP salt ({} bytes): {}", salt.len(), BASE64.encode(&salt));
     tracing::debug!("SRP password_key: {}", BASE64.encode(&password_key));
 
@@ -325,7 +316,7 @@ pub async fn authenticate_srp(
 
     let complete_body = serde_json::json!({
         "accountName": apple_id,
-        "c": c_value,
+        "c": body.c,
         "m1": m1_b64,
         "m2": m2_b64,
         "rememberMe": true,

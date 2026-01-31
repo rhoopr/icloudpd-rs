@@ -10,101 +10,144 @@ use super::types::{AssetItemType, AssetVersion, AssetVersionSize};
 
 #[derive(Debug, Clone)]
 pub struct PhotoAsset {
-    master_record: Value,
-    asset_record: Value,
+    record_name: String,
+    master_fields: Value,
+    asset_fields: Value,
+    filename: Option<String>,
+    item_type_val: Option<AssetItemType>,
+    asset_date_ms: Option<f64>,
+    added_date_ms: Option<f64>,
+    original_size: u64,
+}
+
+/// Decode filename from a `filenameEnc` field value.
+fn decode_filename(fields: &Value) -> Option<String> {
+    let enc = &fields["filenameEnc"];
+    if enc.is_null() {
+        return None;
+    }
+    let value = enc["value"].as_str()?;
+    let enc_type = enc["type"].as_str().unwrap_or("STRING");
+    match enc_type {
+        "STRING" => Some(value.to_string()),
+        "ENCRYPTED_BYTES" => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .ok()?;
+            String::from_utf8(decoded).ok()
+        }
+        other => {
+            warn!("Unsupported filenameEnc type: {}", other);
+            None
+        }
+    }
+}
+
+/// Determine item type from fields, with filename fallback.
+fn resolve_item_type(fields: &Value, filename: &Option<String>) -> Option<AssetItemType> {
+    if let Some(s) = fields["itemType"]["value"].as_str() {
+        if let Some(t) = item_type_from_str(s) {
+            return Some(t);
+        }
+    }
+    if let Some(ref name) = filename {
+        let lower = name.to_lowercase();
+        if lower.ends_with(".heic")
+            || lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+        {
+            return Some(AssetItemType::Image);
+        }
+    }
+    Some(AssetItemType::Movie)
 }
 
 impl PhotoAsset {
+    /// Construct from raw JSON values (used by tests).
+    #[cfg(test)]
     pub fn new(master_record: Value, asset_record: Value) -> Self {
-        Self {
-            master_record,
-            asset_record,
-        }
-    }
-
-    /// The unique record name from the master record.
-    pub fn id(&self) -> &str {
-        self.master_record["recordName"]
+        let record_name = master_record["recordName"]
             .as_str()
-            .unwrap_or_else(|| {
-                tracing::warn!("Missing expected field: recordName");
-                ""
-            })
-    }
-
-    /// Decode the filename from the `filenameEnc` field.
-    /// Returns `None` when the field is absent.
-    pub fn filename(&self) -> Option<String> {
-        let fields = &self.master_record["fields"];
-        let enc = &fields["filenameEnc"];
-        if enc.is_null() {
-            return None;
-        }
-        let value = enc["value"].as_str()?;
-        let enc_type = enc["type"].as_str().unwrap_or("STRING");
-        match enc_type {
-            "STRING" => Some(value.to_string()),
-            "ENCRYPTED_BYTES" => {
-                let decoded = base64::engine::general_purpose::STANDARD
-                    .decode(value)
-                    .ok()?;
-                String::from_utf8(decoded).ok()
-            }
-            other => {
-                warn!("Unsupported filenameEnc type: {}", other);
-                None
-            }
+            .unwrap_or("")
+            .to_string();
+        let master_fields = master_record.get("fields").cloned().unwrap_or(Value::Null);
+        let asset_fields = asset_record.get("fields").cloned().unwrap_or(Value::Null);
+        let filename = decode_filename(&master_fields);
+        let item_type_val = resolve_item_type(&master_fields, &filename);
+        let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
+        let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
+        let original_size = master_fields["resOriginalRes"]["value"]["size"]
+            .as_u64()
+            .unwrap_or(0);
+        Self {
+            record_name,
+            master_fields,
+            asset_fields,
+            filename,
+            item_type_val,
+            asset_date_ms,
+            added_date_ms,
+            original_size,
         }
     }
 
-    /// Size in bytes of the original resource.
+    /// Construct from typed `Record` structs (used by album pagination).
+    pub fn from_records(
+        master: super::cloudkit::Record,
+        asset: super::cloudkit::Record,
+    ) -> Self {
+        let filename = decode_filename(&master.fields);
+        let item_type_val = resolve_item_type(&master.fields, &filename);
+        let asset_date_ms = asset.fields["assetDate"]["value"].as_f64();
+        let added_date_ms = asset.fields["addedDate"]["value"].as_f64();
+        let original_size = master.fields["resOriginalRes"]["value"]["size"]
+            .as_u64()
+            .unwrap_or(0);
+        Self {
+            record_name: master.record_name,
+            master_fields: master.fields,
+            asset_fields: asset.fields,
+            filename,
+            item_type_val,
+            asset_date_ms,
+            added_date_ms,
+            original_size,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.record_name
+    }
+
+    pub fn filename(&self) -> Option<&str> {
+        self.filename.as_deref()
+    }
+
     #[allow(dead_code)]
     pub fn size(&self) -> u64 {
-        self.master_record["fields"]["resOriginalRes"]["value"]["size"]
-            .as_u64()
-            .unwrap_or(0)
+        self.original_size
     }
 
-    /// The asset date (when the photo/video was taken), in UTC.
     pub fn asset_date(&self) -> DateTime<Utc> {
-        self.asset_record["fields"]["assetDate"]["value"]
-            .as_f64()
+        self.asset_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
             .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
     }
 
-    /// Convenience alias – returns `asset_date` converted to local time.
     pub fn created(&self) -> DateTime<Utc> {
         self.asset_date()
     }
 
-    /// The date the asset was added to the library.
     #[allow(dead_code)]
     pub fn added_date(&self) -> DateTime<Utc> {
-        self.asset_record["fields"]["addedDate"]["value"]
-            .as_f64()
+        self.added_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
             .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
     }
 
-    /// Determine the item type from the `itemType` field.
     pub fn item_type(&self) -> Option<AssetItemType> {
-        let item_type_str = self.master_record["fields"]["itemType"]["value"].as_str()?;
-        if let Some(t) = item_type_from_str(item_type_str) {
-            return Some(t);
-        }
-        // Fallback: guess from filename extension
-        if let Some(name) = self.filename() {
-            let lower = name.to_lowercase();
-            if lower.ends_with(".heic")
-                || lower.ends_with(".png")
-                || lower.ends_with(".jpg")
-                || lower.ends_with(".jpeg")
-            {
-                return Some(AssetItemType::Image);
-            }
-        }
-        Some(AssetItemType::Movie)
+        self.item_type_val
     }
 
     /// Build the map of available versions for this asset.
@@ -121,10 +164,10 @@ impl PhotoAsset {
             let type_field = format!("{prefix}FileType");
 
             // Try asset record first, then master record.
-            let fields = if !self.asset_record["fields"][&res_field].is_null() {
-                &self.asset_record["fields"]
-            } else if !self.master_record["fields"][&res_field].is_null() {
-                &self.master_record["fields"]
+            let fields = if !self.asset_fields[&res_field].is_null() {
+                &self.asset_fields
+            } else if !self.master_fields[&res_field].is_null() {
+                &self.master_fields
             } else {
                 continue;
             };
@@ -202,7 +245,7 @@ mod tests {
             json!({"fields": {"filenameEnc": {"value": "photo.jpg", "type": "STRING"}}}),
             json!({}),
         );
-        assert_eq!(asset.filename(), Some("photo.jpg".to_string()));
+        assert_eq!(asset.filename(), Some("photo.jpg"));
     }
 
     #[test]
@@ -213,7 +256,7 @@ mod tests {
             json!({"fields": {"filenameEnc": {"value": encoded, "type": "ENCRYPTED_BYTES"}}}),
             json!({}),
         );
-        assert_eq!(asset.filename(), Some("test.png".to_string()));
+        assert_eq!(asset.filename(), Some("test.png"));
     }
 
     #[test]
@@ -288,6 +331,60 @@ mod tests {
     fn test_display() {
         let asset = make_asset(json!({"recordName": "XYZ"}), json!({}));
         assert_eq!(format!("{}", asset), "<PhotoAsset: id=XYZ>");
+    }
+
+    #[test]
+    fn test_from_records_extracts_fields() {
+        use super::super::cloudkit::Record;
+
+        let master = Record {
+            record_name: "MASTER_1".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({
+                "filenameEnc": {"value": "vacation.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {"size": 5000, "downloadURL": "https://example.com/dl", "fileChecksum": "ck1"}},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }),
+        };
+        let asset_rec = Record {
+            record_name: "ASSET_1".to_string(),
+            record_type: "CPLAsset".to_string(),
+            fields: json!({
+                "assetDate": {"value": 1736899200000.0},
+                "addedDate": {"value": 1736899200000.0}
+            }),
+        };
+
+        let asset = PhotoAsset::from_records(master, asset_rec);
+        assert_eq!(asset.id(), "MASTER_1");
+        assert_eq!(asset.filename(), Some("vacation.jpg"));
+        assert_eq!(asset.item_type(), Some(AssetItemType::Image));
+        assert_eq!(asset.size(), 5000);
+        assert_eq!(asset.asset_date().format("%Y-%m-%d").to_string(), "2025-01-15");
+        let versions = asset.versions();
+        assert!(versions.contains_key(&AssetVersionSize::Original));
+    }
+
+    #[test]
+    fn test_from_records_missing_optional_fields() {
+        use super::super::cloudkit::Record;
+
+        let master = Record {
+            record_name: "M2".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({}),
+        };
+        let asset_rec = Record {
+            record_name: "A2".to_string(),
+            record_type: "CPLAsset".to_string(),
+            fields: json!({}),
+        };
+
+        let asset = PhotoAsset::from_records(master, asset_rec);
+        assert_eq!(asset.id(), "M2");
+        assert_eq!(asset.filename(), None);
+        assert_eq!(asset.size(), 0);
     }
 }
 

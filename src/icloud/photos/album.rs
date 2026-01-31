@@ -83,8 +83,12 @@ impl PhotoAlbum {
             .post(&url, &body.to_string(), &[("Content-type", "text/plain")])
             .await?;
 
-        let count = response["batch"][0]["records"][0]["fields"]["itemCount"]["value"]
-            .as_u64()
+        let batch: super::cloudkit::BatchQueryResponse = serde_json::from_value(response)?;
+        let count = batch
+            .batch
+            .first()
+            .and_then(|q| q.records.first())
+            .and_then(|r| r.fields["itemCount"]["value"].as_u64())
             .unwrap_or(0);
         Ok(count)
     }
@@ -114,14 +118,8 @@ impl PhotoAlbum {
                 .await?;
             debug!("Album '{}' response: {}", self.name, serde_json::to_string_pretty(&response).unwrap_or_default());
 
-            let mut response = response;
-            let records = match response.get_mut("records").and_then(|v| v.as_array_mut()) {
-                Some(r) => std::mem::take(r),
-                None => {
-                    debug!("No 'records' field in response for album '{}'", self.name);
-                    break;
-                }
-            };
+            let query: super::cloudkit::QueryResponse = serde_json::from_value(response)?;
+            let records = query.records;
 
             debug!(
                 "Album '{}': got {} records at offset {}",
@@ -130,24 +128,20 @@ impl PhotoAlbum {
                 offset
             );
 
-            let mut asset_records: HashMap<String, Value> = HashMap::new();
-            let mut master_records: Vec<Value> = Vec::new();
+            let mut asset_records: HashMap<String, super::cloudkit::Record> = HashMap::new();
+            let mut master_records: Vec<super::cloudkit::Record> = Vec::new();
 
-            for mut rec in records {
-                let record_type = rec["recordType"].as_str().unwrap_or_else(|| {
-                    tracing::warn!("Missing expected field: recordType");
-                    ""
-                });
-                debug!("  record type: {}", record_type);
-                if record_type == "CPLAsset" {
+            for rec in records {
+                debug!("  record type: {}", rec.record_type);
+                if rec.record_type == "CPLAsset" {
                     if let Some(master_id) =
-                        rec["fields"]["masterRef"]["value"]["recordName"].as_str()
+                        rec.fields["masterRef"]["value"]["recordName"].as_str()
                     {
                         let master_id = master_id.to_string();
-                        asset_records.insert(master_id, std::mem::take(&mut rec));
+                        asset_records.insert(master_id, rec);
                     }
-                } else if record_type == "CPLMaster" {
-                    master_records.push(std::mem::take(&mut rec));
+                } else if rec.record_type == "CPLMaster" {
+                    master_records.push(rec);
                 }
             }
 
@@ -156,15 +150,8 @@ impl PhotoAlbum {
             }
 
             for master in master_records {
-                let record_name = master["recordName"].as_str().unwrap_or_else(|| {
-                    tracing::warn!("Missing expected field: master recordName");
-                    ""
-                });
-                if let Some(asset_rec) = asset_records.remove(record_name) {
-                    all_assets.push(PhotoAsset::new(master, asset_rec));
-                } else {
-                    offset += 1;
-                    continue;
+                if let Some(asset_rec) = asset_records.remove(&master.record_name) {
+                    all_assets.push(PhotoAsset::from_records(master, asset_rec));
                 }
                 offset += 1;
             }

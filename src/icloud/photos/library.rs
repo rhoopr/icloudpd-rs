@@ -45,8 +45,12 @@ impl PhotoLibrary {
             .await
             .map_err(|e| ICloudError::Connection(e.to_string()))?;
 
-        let indexing_state = response["records"][0]["fields"]["state"]["value"]
-            .as_str()
+        let query: super::cloudkit::QueryResponse = serde_json::from_value(response)
+            .map_err(|e| ICloudError::Connection(e.to_string()))?;
+        let indexing_state = query
+            .records
+            .first()
+            .and_then(|r| r.fields["state"]["value"].as_str())
             .unwrap_or("");
         if indexing_state != "FINISHED" {
             return Err(ICloudError::IndexingNotFinished);
@@ -86,18 +90,15 @@ impl PhotoLibrary {
         // User albums (skip for shared libraries)
         if self.library_type != "shared" {
             let folders = self.fetch_folders().await?;
-            for folder in folders {
-                let record_name = folder["recordName"].as_str().unwrap_or_else(|| {
-                    tracing::warn!("Missing expected field: folder recordName");
-                    ""
-                });
+            for folder in &folders {
+                let record_name = &folder.record_name;
                 if record_name == ROOT_FOLDER
                     || record_name == PROJECT_ROOT_FOLDER
                 {
                     continue;
                 }
                 // Skip deleted folders
-                if folder["fields"]["isDeleted"]["value"]
+                if folder.fields["isDeleted"]["value"]
                     .as_bool()
                     .unwrap_or(false)
                 {
@@ -108,7 +109,7 @@ impl PhotoLibrary {
                 let folder_obj_type =
                     format!("CPLContainerRelationNotDeletedByAssetDate:{folder_id}");
 
-                let folder_name = match folder["fields"]["albumNameEnc"]["value"].as_str() {
+                let folder_name = match folder.fields["albumNameEnc"]["value"].as_str() {
                     Some(enc) => {
                         let decoded = base64::engine::general_purpose::STANDARD
                             .decode(enc)
@@ -177,7 +178,7 @@ impl PhotoLibrary {
 
     // -- internal helpers --
 
-    async fn fetch_folders(&self) -> anyhow::Result<Vec<Value>> {
+    async fn fetch_folders(&self) -> anyhow::Result<Vec<super::cloudkit::Record>> {
         let url = format!(
             "{}/records/query?{}",
             self.service_endpoint,
@@ -192,11 +193,8 @@ impl PhotoLibrary {
             .post(&url, &body.to_string(), &[("Content-type", "text/plain")])
             .await?;
 
-        let records = response["records"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        Ok(records)
+        let query: super::cloudkit::QueryResponse = serde_json::from_value(response)?;
+        Ok(query.records)
     }
 
     /// Clone the session as a boxed trait object, preserving the original

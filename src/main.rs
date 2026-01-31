@@ -59,16 +59,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize photos service
-    let webservices = auth_result
+    let ckdatabasews_url = auth_result
         .data
-        .get("webservices")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| anyhow::anyhow!("No webservices in response"))?;
-
-    let ckdatabasews = webservices
-        .get("ckdatabasews")
-        .and_then(|v| v.get("url"))
-        .and_then(|v| v.as_str())
+        .webservices
+        .as_ref()
+        .and_then(|ws| ws.ckdatabasews.as_ref())
+        .map(|ep| ep.url.as_str())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
 
     // Build params from service data (must match Python's PyiCloudService.params)
@@ -78,11 +74,8 @@ async fn main() -> anyhow::Result<()> {
     params.insert("clientId".to_string(), serde_json::Value::String(
         auth_result.session.client_id().cloned().unwrap_or_default()
     ));
-    if let Some(token) = auth_result.data.get("dsInfo")
-        .and_then(|v| v.get("dsid"))
-        .and_then(|v| v.as_str())
-    {
-        params.insert("dsid".to_string(), serde_json::Value::String(token.to_string()));
+    if let Some(ref dsid) = auth_result.data.ds_info.as_ref().and_then(|ds| ds.dsid.as_ref()) {
+        params.insert("dsid".to_string(), serde_json::Value::String(dsid.to_string()));
     }
 
     let http_client = auth_result.session.http_client();
@@ -91,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Initializing photos service...");
     let photos_service =
         icloud::photos::PhotosService::new(
-            ckdatabasews.to_string(),
+            ckdatabasews_url.to_string(),
             session_box,
             params,
         ).await?;
