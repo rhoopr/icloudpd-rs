@@ -99,10 +99,6 @@ mod tests {
     fn test_add_dedup_suffix() {
         assert_eq!(add_dedup_suffix("photo.jpg", 12345), "photo-12345.jpg");
         assert_eq!(add_dedup_suffix("photo", 100), "photo-100");
-        assert_eq!(
-            add_dedup_suffix("my.photo.png", 999),
-            "my.photo-999.png"
-        );
+        assert_eq!(add_dedup_suffix("my.photo.png", 999), "my.photo-999.png");
     }
-
 }

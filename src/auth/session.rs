@@ -58,8 +58,12 @@ impl Session {
         let cookie_dir = cookie_dir.to_path_buf();
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
 
-        fs::create_dir_all(&cookie_dir).await
-            .with_context(|| format!("Failed to create cookie directory: {}", cookie_dir.display()))?;
+        fs::create_dir_all(&cookie_dir).await.with_context(|| {
+            format!(
+                "Failed to create cookie directory: {}",
+                cookie_dir.display()
+            )
+        })?;
 
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
 
@@ -69,7 +73,10 @@ impl Session {
                 Ok(contents) => {
                     for line in contents.lines() {
                         let trimmed = line.trim();
-                        if trimmed.starts_with('#') || trimmed.is_empty() || trimmed.starts_with("Set-Cookie3:") {
+                        if trimmed.starts_with('#')
+                            || trimmed.is_empty()
+                            || trimmed.starts_with("Set-Cookie3:")
+                        {
                             continue;
                         }
                         // Try to parse as "url\tcookie_header" pairs we save
@@ -82,17 +89,18 @@ impl Session {
                     tracing::debug!("Read cookies from {}", cookiejar_path.display());
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to read cookiejar {}: {}", cookiejar_path.display(), e);
+                    tracing::warn!(
+                        "Failed to read cookiejar {}: {}",
+                        cookiejar_path.display(),
+                        e
+                    );
                 }
             }
         }
 
         // Origin/Referer headers are required by Apple's CORS checks
         let mut default_headers = HeaderMap::new();
-        default_headers.insert(
-            ORIGIN,
-            HeaderValue::from_str(home_endpoint)?,
-        );
+        default_headers.insert(ORIGIN, HeaderValue::from_str(home_endpoint)?);
         default_headers.insert(
             REFERER,
             HeaderValue::from_str(&format!("{}/", home_endpoint))?,
@@ -108,25 +116,21 @@ impl Session {
         let session_path = cookie_dir.join(format!("{}.session", sanitized));
         let session_data = if session_path.exists() {
             match fs::read_to_string(&session_path).await {
-                Ok(contents) => {
-                    match serde_json::from_str::<HashMap<String, Value>>(&contents) {
-                        Ok(map) => {
-                            tracing::debug!("Loaded session data from {}", session_path.display());
-                            map.into_iter()
-                                .map(|(k, v)| {
-                                    match v {
-                                        Value::String(s) => (k, s),
-                                        other => (k, other.to_string()),
-                                    }
-                                })
-                                .collect()
-                        }
-                        Err(_) => {
-                            tracing::info!("Session file corrupt, starting fresh");
-                            HashMap::new()
-                        }
+                Ok(contents) => match serde_json::from_str::<HashMap<String, Value>>(&contents) {
+                    Ok(map) => {
+                        tracing::debug!("Loaded session data from {}", session_path.display());
+                        map.into_iter()
+                            .map(|(k, v)| match v {
+                                Value::String(s) => (k, s),
+                                other => (k, other.to_string()),
+                            })
+                            .collect()
                     }
-                }
+                    Err(_) => {
+                        tracing::info!("Session file corrupt, starting fresh");
+                        HashMap::new()
+                    }
+                },
                 Err(_) => {
                     tracing::info!("Session file does not exist");
                     HashMap::new()
@@ -157,7 +161,8 @@ impl Session {
 
     /// Path for session data JSON file.
     pub fn session_path(&self) -> PathBuf {
-        self.cookie_dir.join(format!("{}.session", self.sanitized_username))
+        self.cookie_dir
+            .join(format!("{}.session", self.sanitized_username))
     }
 
     /// Get the client_id from session data, or None.
@@ -183,9 +188,7 @@ impl Session {
             builder = builder.headers(h);
         }
         if let Some(b) = body {
-            builder = builder
-                .header("Content-Type", "application/json")
-                .body(b);
+            builder = builder.header("Content-Type", "application/json").body(b);
         }
 
         tracing::debug!("POST {}", url);
@@ -195,11 +198,7 @@ impl Session {
     }
 
     /// Send a GET request, extract headers, save session data and cookies.
-    pub async fn get(
-        &mut self,
-        url: &str,
-        extra_headers: Option<HeaderMap>,
-    ) -> Result<Response> {
+    pub async fn get(&mut self, url: &str, extra_headers: Option<HeaderMap>) -> Result<Response> {
         let mut builder = self.client.get(url);
         if let Some(h) = extra_headers {
             builder = builder.headers(h);
@@ -226,8 +225,9 @@ impl Session {
 
         let session_path = self.session_path();
         let json = serde_json::to_string_pretty(&self.session_data)?;
-        fs::write(&session_path, json).await
-            .with_context(|| format!("Failed to write session data to {}", session_path.display()))?;
+        fs::write(&session_path, json).await.with_context(|| {
+            format!("Failed to write session data to {}", session_path.display())
+        })?;
         #[cfg(unix)]
         {
             // Session files contain auth tokens — restrict to owner-only
@@ -242,8 +242,14 @@ impl Session {
         let cookiejar_path = self.cookiejar_path();
         let url_str = response.url().to_string();
         let mut cookie_lines: Vec<String> = if cookiejar_path.exists() {
-            fs::read_to_string(&cookiejar_path).await
-                .with_context(|| format!("Failed to read cookie jar from {}", cookiejar_path.display()))?
+            fs::read_to_string(&cookiejar_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to read cookie jar from {}",
+                        cookiejar_path.display()
+                    )
+                })?
                 .lines()
                 .map(|l| l.to_string())
                 .collect()
@@ -267,7 +273,8 @@ impl Session {
                 cookie_lines.push(format!("{}\t{}", url_str, val));
             }
         }
-        fs::write(&cookiejar_path, cookie_lines.join("\n")).await
+        fs::write(&cookiejar_path, cookie_lines.join("\n"))
+            .await
             .with_context(|| format!("Failed to write cookies to {}", cookiejar_path.display()))?;
         #[cfg(unix)]
         {

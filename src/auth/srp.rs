@@ -13,8 +13,7 @@ use super::session::Session;
 use crate::auth::error::AuthError;
 
 /// Apple's public OAuth widget key — embedded in icloud.com's JavaScript.
-const APPLE_WIDGET_KEY: &str =
-    "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d";
+const APPLE_WIDGET_KEY: &str = "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d";
 
 /// RFC 5054 2048-bit SRP group prime (same as srp::groups::G_2048).
 const N_HEX: &str = concat!(
@@ -34,12 +33,7 @@ const G_VAL: u32 = 2;
 /// Apple's SRP uses PBKDF2 over a SHA-256 hash of the password, not the
 /// raw password. The `s2k_fo` protocol variant hex-encodes the hash first,
 /// while `s2k` uses raw bytes — both are PBKDF2'd with the server-provided salt.
-fn derive_apple_password(
-    password: &str,
-    protocol: &str,
-    salt: &[u8],
-    iterations: u32,
-) -> Vec<u8> {
+fn derive_apple_password(password: &str, protocol: &str, salt: &[u8], iterations: u32) -> Vec<u8> {
     let hash = Sha256::digest(password.as_bytes());
 
     let password_digest: Vec<u8> = if protocol == "s2k_fo" {
@@ -154,16 +148,40 @@ pub fn get_auth_headers(
     };
 
     let mut headers = HeaderMap::new();
-    headers.insert("Accept", HeaderValue::from_static("application/json, text/javascript"));
+    headers.insert(
+        "Accept",
+        HeaderValue::from_static("application/json, text/javascript"),
+    );
     headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-    headers.insert("X-Apple-OAuth-Client-Id", HeaderValue::from_static(APPLE_WIDGET_KEY));
-    headers.insert("X-Apple-OAuth-Client-Type", HeaderValue::from_static("firstPartyAuth"));
-    headers.insert("X-Apple-OAuth-Redirect-URI", HeaderValue::from_str(redirect_uri)?);
-    headers.insert("X-Apple-OAuth-Require-Grant-Code", HeaderValue::from_static("true"));
-    headers.insert("X-Apple-OAuth-Response-Mode", HeaderValue::from_static("web_message"));
-    headers.insert("X-Apple-OAuth-Response-Type", HeaderValue::from_static("code"));
+    headers.insert(
+        "X-Apple-OAuth-Client-Id",
+        HeaderValue::from_static(APPLE_WIDGET_KEY),
+    );
+    headers.insert(
+        "X-Apple-OAuth-Client-Type",
+        HeaderValue::from_static("firstPartyAuth"),
+    );
+    headers.insert(
+        "X-Apple-OAuth-Redirect-URI",
+        HeaderValue::from_str(redirect_uri)?,
+    );
+    headers.insert(
+        "X-Apple-OAuth-Require-Grant-Code",
+        HeaderValue::from_static("true"),
+    );
+    headers.insert(
+        "X-Apple-OAuth-Response-Mode",
+        HeaderValue::from_static("web_message"),
+    );
+    headers.insert(
+        "X-Apple-OAuth-Response-Type",
+        HeaderValue::from_static("code"),
+    );
     headers.insert("X-Apple-OAuth-State", HeaderValue::from_str(client_id)?);
-    headers.insert("X-Apple-Widget-Key", HeaderValue::from_static(APPLE_WIDGET_KEY));
+    headers.insert(
+        "X-Apple-Widget-Key",
+        HeaderValue::from_static(APPLE_WIDGET_KEY),
+    );
 
     if let Some(scnt) = session_data.get("scnt") {
         if let Ok(v) = HeaderValue::from_str(scnt) {
@@ -227,7 +245,12 @@ pub async fn authenticate_srp(
         ovr
     };
 
-    let init_headers = get_auth_headers(domain, client_id, &session.session_data, Some(build_overrides()))?;
+    let init_headers = get_auth_headers(
+        domain,
+        client_id,
+        &session.session_data,
+        Some(build_overrides()),
+    )?;
 
     tracing::debug!("Initiating SRP authentication for {}", apple_id);
 
@@ -242,22 +265,35 @@ pub async fn authenticate_srp(
     }
     if !status.is_success() && status.as_u16() != 409 {
         let text = response.text().await.unwrap_or_default();
-        return Err(AuthError::ApiError { code: status.as_u16(), message: text }.into());
+        return Err(AuthError::ApiError {
+            code: status.as_u16(),
+            message: text,
+        }
+        .into());
     }
 
-    let body: super::responses::SrpInitResponse = response.json().await
+    let body: super::responses::SrpInitResponse = response
+        .json()
+        .await
         .context("Failed to parse SRP init response as JSON")?;
 
-    let iterations = u32::try_from(body.iteration)
-        .context("SRP iteration count exceeds u32")?;
+    let iterations = u32::try_from(body.iteration).context("SRP iteration count exceeds u32")?;
 
-    let salt = BASE64.decode(&body.salt).context("Failed to decode SRP salt")?;
-    let b_pub_bytes = BASE64.decode(&body.b).context("Failed to decode SRP public key")?;
+    let salt = BASE64
+        .decode(&body.salt)
+        .context("Failed to decode SRP salt")?;
+    let b_pub_bytes = BASE64
+        .decode(&body.b)
+        .context("Failed to decode SRP public key")?;
     let b_pub = BigUint::from_bytes_be(&b_pub_bytes);
 
     let password_key = derive_apple_password(password, &body.protocol, &salt, iterations);
 
-    tracing::debug!("SRP protocol: {}, iterations: {}", body.protocol, iterations);
+    tracing::debug!(
+        "SRP protocol: {}, iterations: {}",
+        body.protocol,
+        iterations
+    );
     tracing::debug!("SRP salt ({} bytes): {}", salt.len(), BASE64.encode(&salt));
     tracing::debug!("SRP password_key: {}", BASE64.encode(&password_key));
 
@@ -316,10 +352,22 @@ pub async fn authenticate_srp(
     });
 
     // Rebuild headers — init response may have rotated scnt/session_id
-    let complete_headers = get_auth_headers(domain, client_id, &session.session_data, Some(build_overrides()))?;
-    let complete_url = format!("{}/signin/complete?isRememberMeEnabled=true", endpoints.auth);
+    let complete_headers = get_auth_headers(
+        domain,
+        client_id,
+        &session.session_data,
+        Some(build_overrides()),
+    )?;
+    let complete_url = format!(
+        "{}/signin/complete?isRememberMeEnabled=true",
+        endpoints.auth
+    );
     let response = session
-        .post(&complete_url, Some(complete_body.to_string()), Some(complete_headers))
+        .post(
+            &complete_url,
+            Some(complete_body.to_string()),
+            Some(complete_headers),
+        )
         .await?;
 
     let status = response.status();
@@ -336,11 +384,19 @@ pub async fn authenticate_srp(
             .await?;
         if !repair_response.status().is_success() {
             let text = repair_response.text().await.unwrap_or_default();
-            return Err(AuthError::ApiError { code: 412, message: format!("Repair failed: {}", text) }.into());
+            return Err(AuthError::ApiError {
+                code: 412,
+                message: format!("Repair failed: {}", text),
+            }
+            .into());
         }
     } else if status.is_client_error() || status.is_server_error() {
         let text = response.text().await.unwrap_or_default();
-        return Err(AuthError::FailedLogin(format!("Invalid email/password combination: {}", text)).into());
+        return Err(AuthError::FailedLogin(format!(
+            "Invalid email/password combination: {}",
+            text
+        ))
+        .into());
     }
 
     Ok(())
@@ -437,6 +493,9 @@ mod tests {
         session_data.insert("session_id".to_string(), "test_session".to_string());
         let headers = get_auth_headers("com", "client123", &session_data, None).unwrap();
         assert_eq!(headers.get("scnt").unwrap(), "test_scnt");
-        assert_eq!(headers.get("X-Apple-ID-Session-Id").unwrap(), "test_session");
+        assert_eq!(
+            headers.get("X-Apple-ID-Session-Id").unwrap(),
+            "test_session"
+        );
     }
 }

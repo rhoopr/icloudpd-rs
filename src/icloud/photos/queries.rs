@@ -113,7 +113,10 @@ pub const DESIRED_KEYS: &[&str] = &[
 ];
 
 pub static DESIRED_KEYS_VALUES: LazyLock<Vec<Value>> = LazyLock::new(|| {
-    DESIRED_KEYS.iter().map(|k| Value::String((*k).to_string())).collect()
+    DESIRED_KEYS
+        .iter()
+        .map(|k| Value::String((*k).to_string()))
+        .collect()
 });
 
 pub fn item_type_from_str(s: &str) -> Option<AssetItemType> {
@@ -181,15 +184,27 @@ mod tests {
 
     #[test]
     fn test_item_type_from_str_images() {
-        assert_eq!(item_type_from_str("public.jpeg"), Some(AssetItemType::Image));
-        assert_eq!(item_type_from_str("public.heic"), Some(AssetItemType::Image));
+        assert_eq!(
+            item_type_from_str("public.jpeg"),
+            Some(AssetItemType::Image)
+        );
+        assert_eq!(
+            item_type_from_str("public.heic"),
+            Some(AssetItemType::Image)
+        );
         assert_eq!(item_type_from_str("public.png"), Some(AssetItemType::Image));
-        assert_eq!(item_type_from_str("com.canon.cr2-raw-image"), Some(AssetItemType::Image));
+        assert_eq!(
+            item_type_from_str("com.canon.cr2-raw-image"),
+            Some(AssetItemType::Image)
+        );
     }
 
     #[test]
     fn test_item_type_from_str_movie() {
-        assert_eq!(item_type_from_str("com.apple.quicktime-movie"), Some(AssetItemType::Movie));
+        assert_eq!(
+            item_type_from_str("com.apple.quicktime-movie"),
+            Some(AssetItemType::Movie)
+        );
     }
 
     #[test]

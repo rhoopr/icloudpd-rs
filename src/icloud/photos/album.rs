@@ -102,7 +102,9 @@ impl PhotoAlbum {
     /// into a `Vec`. Prefer `photo_stream()` when memory is a concern.
     pub async fn photos(&self, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
         use tokio_stream::StreamExt;
-        self.photo_stream(limit).collect::<Result<Vec<_>, _>>().await
+        self.photo_stream(limit)
+            .collect::<Result<Vec<_>, _>>()
+            .await
     }
 
     /// Stream photos page-by-page without buffering the full album in memory.
@@ -167,8 +169,7 @@ impl PhotoAlbum {
                     serde_json::to_string_pretty(&response).unwrap_or_default()
                 );
 
-                let query: super::cloudkit::QueryResponse = match serde_json::from_value(response)
-                {
+                let query: super::cloudkit::QueryResponse = match serde_json::from_value(response) {
                     Ok(q) => q,
                     Err(e) => {
                         let _ = tx.send(Err(e.into())).await;

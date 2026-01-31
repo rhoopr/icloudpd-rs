@@ -97,7 +97,10 @@ mod tests {
         assert!(resp.hsa_challenge_required);
         assert!(!resp.hsa_trusted_browser);
         let ws = resp.webservices.unwrap();
-        assert_eq!(ws.ckdatabasews.unwrap().url, "https://p123-ckdatabasews.icloud.com");
+        assert_eq!(
+            ws.ckdatabasews.unwrap().url,
+            "https://p123-ckdatabasews.icloud.com"
+        );
     }
 
     #[test]
