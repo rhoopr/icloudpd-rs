@@ -8,44 +8,76 @@ A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud
 [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/Status-Early%20Development-blue.svg)]()
 
-Early development. Core authentication (SRP, 2FA) and photo download are functional.
+> [!IMPORTANT]
+> Early development. Core authentication (SRP, 2FA) and photo download are functional, but several features are still in progress. Expect breaking changes.
 
-## Project Goals
+## Project Roadmap
 
-### Ported Features
+<details open>
+<summary><strong>Implemented</strong></summary>
 
-Full feature parity with the Python icloudpd, including:
+- SRP-6a authentication with 2FA and session persistence
+- iCloud Photos API — albums, smart folders, shared libraries, pagination
+- Streaming download pipeline with concurrent downloads and parallel API fetching
+- Photo, video, and live photo MOV downloads with size variants
+- Content filtering by media type, date range, album, recency
+- Date-based folder structures, filename sanitization, and deduplication policies
+- EXIF DateTimeOriginal read/write and file modification time sync
+- Retry with exponential backoff and error classification
+- Resumable downloads with SHA256 checksum verification
+- Two-phase cleanup pass with fresh CDN URLs for failures
+- Dry-run, auth-only, list albums/libraries, watch mode
+- Strongly typed API layer and structured error handling
+- Low memory streaming for large libraries (100k+ photos)
 
-- **Complete Apple authentication** — SRP-6a, two-factor authentication, session persistence with trust tokens
-- **Full iCloud Photos API** — albums, smart folders, shared libraries, asset enumeration with pagination
-- **Flexible downloads** — multiple size variants (original, medium, thumb, adjusted, alternative), live photos, RAW files
-- **Content filtering** — by media type, date range, album, recency
-- **File organization** — date-based folder structures, filename sanitization, deduplication policies
-- **EXIF metadata** — read and write DateTimeOriginal, file modification time sync
-- **XMP sidecar export** — GPS, keywords, ratings, title, description, orientation
-- **iCloud management** — auto-delete synced removals, delete-after-download, keep-recent-days
-- **Operational modes** — watch/daemon mode, dry-run, auth-only, list albums/libraries
+</details>
 
-### Performance and Optimizations
+<details open>
+<summary><strong>Now</strong></summary>
 
-Taking advantage of what Rust offers over Python:
+- RAW file alignment (`--align-raw` version swapping)
+- Robust session persistence (mid-sync re-auth, token expiry tracking, lock files)
+- Progress bar integration
+- Incremental sync with SQLite state tracking and CloudKit sync tokens
+- Failed asset tracking with persistent state across runs
+- Graceful shutdown with signal handling
 
-- **True parallel downloads** — concurrent file downloads without GIL constraints, saturating available bandwidth
-- **Concurrent API pipeline** — parallel album fetching, page prefetching, and overlapped processing
-- **Low memory footprint** — strongly typed compact structs instead of raw JSON blobs, streaming page-by-page processing for 100k+ photo libraries
-- **Incremental sync** — SQLite-backed state tracking with CloudKit sync tokens to skip unchanged assets across runs, with migration support for existing Python icloudpd libraries
-- **Efficient retry** — exponential backoff with jitter, error classification (transient vs permanent), configurable limits
+</details>
 
-### New Features
+<details>
+<summary><strong>Next</strong></summary>
 
-Going beyond the Python original:
+- XMP sidecar export (GPS, keywords, ratings, title/description)
+- Shared library download integration
+- SMS-based 2FA
+- Keyring password storage
+- Write all EXIF date tags (DateTime, DateTimeDigitized)
+- Robust watch/daemon mode (session refresh, album re-enumeration, systemd/launchd)
 
-- **Graceful shutdown** — signal handling (Ctrl+C/SIGTERM) that finishes the current download, flushes state, and cleans up temp files
-- **Robust session management** — trust token expiry tracking, proactive session refresh during long syncs, concurrent-instance safety with lock files
-- **Strongly typed API layer** — compile-time guarantees on API response shapes; malformed responses surface as errors, not silent corruption
-- **Typed error handling** — structured error enums throughout, so retry logic can distinguish network timeouts from auth failures from disk errors
-- **Failed asset tracking** — persistent record of what succeeded, failed, or was skipped, with summary reporting and retry-only-failures mode
-- **Native daemon mode** — proper signal handling, session refresh between cycles, album re-enumeration, and optional systemd/launchd integration
+</details>
+
+<details>
+<summary><strong>Later</strong></summary>
+
+- Auto-delete synced removals (`--auto-delete`)
+- Delete after download (`--delete-after-download`)
+- Keep recent days in iCloud (`--keep-icloud-recent-days`)
+- Email/SMTP notifications
+- Notification scripts
+- Multi-account support
+- OS locale date formatting
+- Fingerprint fallback filenames
+- Docker and AUR builds
+
+</details>
+
+<details>
+<summary><strong>Never</strong></summary>
+
+- npm/PyPI packaging
+- Web UI
+
+</details>
 
 ## Build
 
@@ -60,6 +92,9 @@ Binary: `target/release/icloudpd-rs`
 ```sh
 icloudpd-rs --username my@email.address --directory /photos
 ```
+
+> [!TIP]
+> Use `--dry-run` to preview what would be downloaded without writing any files. Use `--auth-only` to verify your credentials without starting a download.
 
 ## CLI Flags
 
