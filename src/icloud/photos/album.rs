@@ -90,9 +90,15 @@ impl PhotoAlbum {
     }
 
     /// Fetch all photos in this album, handling pagination.
-    pub async fn photos(&self) -> anyhow::Result<Vec<PhotoAsset>> {
+    /// If `limit` is `Some(n)`, stops after `n` photos.
+    pub async fn photos(&self, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
+        self.fetch_photos("ASCENDING", limit).await
+    }
+
+    async fn fetch_photos(&self, direction: &str, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
         let mut all_assets: Vec<PhotoAsset> = Vec::new();
         let mut offset: u64 = 0;
+        tracing::info!("Fetching photos from iCloud...");
 
         loop {
             let url = format!(
@@ -100,7 +106,7 @@ impl PhotoAlbum {
                 self.service_endpoint,
                 encode_params(&self.params)
             );
-            let body = self.list_query(offset);
+            let body = self.list_query(offset, direction);
             debug!("Album '{}' POST URL: {}", self.name, url);
             let response = self
                 .session
@@ -162,12 +168,21 @@ impl PhotoAlbum {
                 }
                 offset += 1;
             }
+
+            tracing::info!("  fetched {} photos so far...", all_assets.len());
+
+            if let Some(n) = limit {
+                if all_assets.len() >= n as usize {
+                    all_assets.truncate(n as usize);
+                    break;
+                }
+            }
         }
 
         Ok(all_assets)
     }
 
-    fn list_query(&self, offset: u64) -> Value {
+    fn list_query(&self, offset: u64, direction: &str) -> Value {
         let desired_keys = &*DESIRED_KEYS_VALUES;
 
         let mut filter_by = vec![
@@ -178,12 +193,12 @@ impl PhotoAlbum {
             }),
             json!({
                 "fieldName": "direction",
-                "fieldValue": {"type": "STRING", "value": "ASCENDING"},
+                "fieldValue": {"type": "STRING", "value": direction},
                 "comparator": "EQUALS",
             }),
         ];
 
-        if let Some(ref qf) = self.query_filter {
+        if let Some(qf) = &self.query_filter {
             if let Some(arr) = qf.as_array() {
                 filter_by.extend(arr.iter().cloned());
             }
@@ -205,6 +220,87 @@ impl PhotoAlbum {
             "desiredKeys": desired_keys,
             "zoneID": self.zone_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct StubSession;
+
+    #[async_trait::async_trait]
+    impl PhotosSession for StubSession {
+        async fn post(&self, _url: &str, _body: &str, _headers: &[(&str, &str)]) -> anyhow::Result<Value> {
+            unimplemented!("stub")
+        }
+        async fn get(&self, _url: &str, _headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response> {
+            unimplemented!("stub")
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(StubSession)
+        }
+    }
+
+    fn make_album(page_size: usize, query_filter: Option<Value>, zone_id: Value) -> PhotoAlbum {
+        PhotoAlbum::new(
+            HashMap::new(),
+            Box::new(StubSession),
+            "https://example.com".into(),
+            "TestAlbum".into(),
+            "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+            "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+            query_filter,
+            page_size,
+            zone_id,
+        )
+    }
+
+    fn default_zone() -> Value {
+        json!({"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner", "zoneType": "REGULAR_CUSTOM_ZONE"})
+    }
+
+    #[test]
+    fn test_list_query_ascending_offset_zero() {
+        let album = make_album(200, None, default_zone());
+        let q = album.list_query(0, "ASCENDING");
+        let filters = q["query"]["filterBy"].as_array().unwrap();
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0]["fieldValue"]["value"], json!(0));
+        assert_eq!(filters[1]["fieldValue"]["value"], "ASCENDING");
+    }
+
+    #[test]
+    fn test_list_query_with_offset() {
+        let album = make_album(200, None, default_zone());
+        let q = album.list_query(42, "ASCENDING");
+        assert_eq!(q["query"]["filterBy"][0]["fieldValue"]["value"], json!(42));
+    }
+
+    #[test]
+    fn test_list_query_results_limit_double_page_size() {
+        let album = make_album(100, None, default_zone());
+        let q = album.list_query(0, "ASCENDING");
+        assert_eq!(q["resultsLimit"], json!(200));
+    }
+
+    #[test]
+    fn test_list_query_with_extra_filter() {
+        let extra = json!([{"fieldName": "albumName", "comparator": "EQUALS", "fieldValue": {"type": "STRING", "value": "Favorites"}}]);
+        let album = make_album(200, Some(extra), default_zone());
+        let q = album.list_query(0, "ASCENDING");
+        let filters = q["query"]["filterBy"].as_array().unwrap();
+        assert_eq!(filters.len(), 3);
+        assert_eq!(filters[2]["fieldName"], "albumName");
+    }
+
+    #[test]
+    fn test_list_query_zone_id_passed_through() {
+        let zone = json!({"zoneName": "CustomZone"});
+        let album = make_album(200, None, zone.clone());
+        let q = album.list_query(0, "ASCENDING");
+        assert_eq!(q["zoneID"], zone);
     }
 }
 
