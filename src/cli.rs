@@ -70,10 +70,6 @@ pub struct Cli {
     #[arg(long)]
     pub force_size: bool,
 
-    /// Scan "Recently Deleted" and delete local files found there
-    #[arg(long)]
-    pub auto_delete: bool,
-
     /// Folder structure for organizing downloads
     #[arg(long, default_value = "%Y/%m/%d")]
     pub folder_structure: String,
@@ -129,14 +125,6 @@ pub struct Cli {
     /// Skip assets created after this ISO date or interval
     #[arg(long)]
     pub skip_created_after: Option<String>,
-
-    /// Delete from iCloud after downloading
-    #[arg(long)]
-    pub delete_after_download: bool,
-
-    /// Keep photos newer than N days in iCloud, delete the rest
-    #[arg(long)]
-    pub keep_icloud_recent_days: Option<u32>,
 
     /// Only print filenames without downloading
     #[arg(long)]
