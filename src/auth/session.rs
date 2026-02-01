@@ -212,6 +212,14 @@ impl Session {
             .join(format!("{}.session", self.sanitized_username))
     }
 
+    /// Release the exclusive file lock without dropping the Session.
+    /// This allows a new Session to acquire the lock (e.g. during re-authentication).
+    pub fn release_lock(&self) -> Result<()> {
+        self._lock_file
+            .unlock()
+            .context("Failed to release session lock file")
+    }
+
     /// Get the client_id from session data, or None.
     pub fn client_id(&self) -> Option<&String> {
         self.session_data.get("client_id")
@@ -323,6 +331,10 @@ impl Session {
                     continue;
                 }
                 let new_name = val.split('=').next().unwrap_or("");
+                // Skip malformed cookies with empty name
+                if new_name.is_empty() {
+                    continue;
+                }
                 // Deduplicate: remove stale entries for the same cookie name + URL
                 cookie_lines.retain(|line| {
                     if let Some((line_url, line_cookie)) = line.split_once('\t') {
@@ -367,11 +379,10 @@ impl Session {
         let ts_str = self.session_data.get("trust_token_timestamp")?;
         let ts: i64 = ts_str.parse().ok()?;
         let now = chrono::Utc::now().timestamp();
-        if now > ts {
-            Some(std::time::Duration::from_secs((now - ts) as u64))
-        } else {
-            Some(std::time::Duration::ZERO)
-        }
+        now.checked_sub(ts)
+            .and_then(|d| u64::try_from(d).ok())
+            .map(std::time::Duration::from_secs)
+            .or(Some(std::time::Duration::ZERO))
     }
 
     /// Returns true if the trust token is older than (30 - warn_days) days.
