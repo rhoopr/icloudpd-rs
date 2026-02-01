@@ -173,7 +173,7 @@ async fn attempt_download(
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|e| {
-                tracing::debug!(
+                tracing::warn!(
                 "Body decode error for {} (status={}, content_length={:?}, bytes_so_far={}): {}",
                 path_str, status, content_length, bytes_written, e
             );
