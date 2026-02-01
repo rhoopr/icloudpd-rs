@@ -1,0 +1,794 @@
+//! Download engine — streaming pipeline that starts downloading as soon as
+//! the first API page returns, rather than enumerating the entire library
+//! upfront. Uses a two-phase approach: (1) stream-and-download with bounded
+//! concurrency, then (2) cleanup pass with fresh CDN URLs for any failures.
+
+pub mod error;
+pub mod exif;
+pub mod file;
+pub mod paths;
+
+use std::fs::FileTimes;
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::Result;
+use chrono::{DateTime, Local, Utc};
+use reqwest::Client;
+
+use std::path::PathBuf;
+
+use futures_util::stream::{self, StreamExt};
+
+use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum};
+use crate::retry::RetryConfig;
+use crate::types::LivePhotoMovFilenamePolicy;
+
+/// Subset of application config consumed by the download engine.
+/// Decoupled from CLI parsing so the engine can be tested independently.
+#[derive(Debug)]
+pub struct DownloadConfig {
+    pub(crate) directory: std::path::PathBuf,
+    pub(crate) folder_structure: String,
+    pub(crate) size: AssetVersionSize,
+    pub(crate) skip_videos: bool,
+    pub(crate) skip_photos: bool,
+    pub(crate) skip_created_before: Option<DateTime<Utc>>,
+    pub(crate) skip_created_after: Option<DateTime<Utc>>,
+    pub(crate) set_exif_datetime: bool,
+    pub(crate) dry_run: bool,
+    pub(crate) concurrent_downloads: usize,
+    pub(crate) recent: Option<u32>,
+    pub(crate) retry: RetryConfig,
+    pub(crate) skip_live_photos: bool,
+    pub(crate) live_photo_size: AssetVersionSize,
+    pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
+}
+
+/// A unit of work produced by the filter phase and consumed by the download phase.
+struct DownloadTask {
+    url: String,
+    download_path: PathBuf,
+    checksum: String,
+    created_local: DateTime<Local>,
+}
+
+/// Eagerly enumerate all albums and build a complete task list.
+///
+/// Used only by the Phase 2 cleanup pass — re-contacts the API so each call
+/// yields fresh CDN URLs that haven't expired during a long download session.
+async fn build_download_tasks(
+    albums: &[PhotoAlbum],
+    config: &DownloadConfig,
+) -> Result<Vec<DownloadTask>> {
+    let album_results: Vec<Result<Vec<_>>> = stream::iter(albums)
+        .map(|album| async move { album.photos(config.recent).await })
+        .buffer_unordered(config.concurrent_downloads)
+        .collect()
+        .await;
+
+    let mut tasks: Vec<DownloadTask> = Vec::new();
+    for album_result in album_results {
+        let assets = album_result?;
+
+        for asset in &assets {
+            tasks.extend(filter_asset_to_tasks(asset, config));
+        }
+    }
+
+    Ok(tasks)
+}
+
+/// Apply content filters (type, date range) and local existence check,
+/// producing download tasks for assets that need fetching.
+/// Returns up to two tasks: the primary photo/video and an optional live photo MOV.
+fn filter_asset_to_tasks(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> Vec<DownloadTask> {
+    if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
+        return Vec::new();
+    }
+    if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
+        return Vec::new();
+    }
+
+    let created_utc = asset.created();
+    if let Some(before) = &config.skip_created_before {
+        if created_utc < *before {
+            return Vec::new();
+        }
+    }
+    if let Some(after) = &config.skip_created_after {
+        if created_utc > *after {
+            return Vec::new();
+        }
+    }
+
+    let filename = match asset.filename() {
+        Some(f) => f,
+        None => {
+            tracing::warn!("Asset {} has no filename, skipping", asset.id());
+            return Vec::new();
+        }
+    };
+
+    let created_local: DateTime<Local> = created_utc.with_timezone(&Local);
+    let download_path = paths::local_download_path(
+        &config.directory,
+        &config.folder_structure,
+        &created_local,
+        filename,
+    );
+
+    let mut tasks = Vec::new();
+
+    if !download_path.exists() {
+        if let Some(version) = asset.versions().get(&config.size) {
+            tasks.push(DownloadTask {
+                url: version.url.clone(),
+                download_path: download_path.clone(),
+                checksum: version.checksum.clone(),
+                created_local,
+            });
+        }
+    }
+
+    // Live photo MOV companion — only for images
+    if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
+        if let Some(live_version) = asset.versions().get(&config.live_photo_size) {
+            let mov_filename = match config.live_photo_mov_filename_policy {
+                LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(filename),
+                LivePhotoMovFilenamePolicy::Original => {
+                    paths::live_photo_mov_path_original(filename)
+                }
+            };
+            let mov_path = paths::local_download_path(
+                &config.directory,
+                &config.folder_structure,
+                &created_local,
+                &mov_filename,
+            );
+            if !mov_path.exists() {
+                tasks.push(DownloadTask {
+                    url: live_version.url.clone(),
+                    download_path: mov_path,
+                    checksum: live_version.checksum.clone(),
+                    created_local,
+                });
+            }
+        }
+    }
+
+    tasks
+}
+
+/// Streaming download pipeline — merges per-album streams and pipes assets
+/// directly into the download loop as they arrive from the API.
+///
+/// Eliminates the startup delay of full-library enumeration: the first
+/// download begins as soon as the first API page returns. Each album's
+/// background task prefetches the next page via a channel buffer, so API
+/// latency overlaps with download I/O.
+async fn stream_and_download(
+    client: &Client,
+    albums: &[PhotoAlbum],
+    config: &DownloadConfig,
+) -> Result<(usize, Vec<DownloadTask>)> {
+    // select_all interleaves across albums so no single large album
+    // starves others; each stream's background task provides prefetch.
+    let album_streams: Vec<_> = albums
+        .iter()
+        .map(|album| album.photo_stream(config.recent))
+        .collect();
+
+    let mut combined = stream::select_all(album_streams);
+
+    if config.dry_run {
+        let mut count = 0usize;
+        while let Some(result) = combined.next().await {
+            let asset = result?;
+            let tasks = filter_asset_to_tasks(&asset, config);
+            for task in &tasks {
+                tracing::info!("[DRY RUN] Would download {}", task.download_path.display());
+            }
+            count += tasks.len();
+        }
+        return Ok((count, Vec::new()));
+    }
+
+    let client = client.clone();
+    let retry_config = config.retry.clone();
+    let set_exif = config.set_exif_datetime;
+    let concurrency = config.concurrent_downloads;
+
+    // Stream assets → filter → download with bounded concurrency.
+    let mut downloaded = 0usize;
+    let mut failed: Vec<DownloadTask> = Vec::new();
+
+    // Use buffer_unordered on a stream of download futures.
+    let task_stream = combined
+        .filter_map(|result| async {
+            match result {
+                Ok(asset) => Some(filter_asset_to_tasks(&asset, config)),
+                Err(e) => {
+                    tracing::error!("Error fetching asset: {}", e);
+                    None
+                }
+            }
+        })
+        .flat_map(stream::iter);
+
+    let download_stream = task_stream
+        .map(|task| {
+            let client = client.clone();
+            let retry_config = retry_config.clone();
+            async move {
+                let result = download_single_task(&client, &task, &retry_config, set_exif).await;
+                (task, result)
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    tokio::pin!(download_stream);
+
+    while let Some((task, result)) = download_stream.next().await {
+        match result {
+            Ok(()) => downloaded += 1,
+            Err(e) => {
+                tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
+                failed.push(task);
+            }
+        }
+    }
+
+    Ok((downloaded, failed))
+}
+
+/// Entry point for the download engine.
+///
+/// Phase 1: Stream assets page-by-page and download immediately with bounded
+/// concurrency — no upfront enumeration delay.
+///
+/// Phase 2 (cleanup): Re-fetch from the API to get fresh CDN URLs (the
+/// originals may have expired during a long Phase 1) and retry failures at
+/// reduced concurrency to give large files full bandwidth.
+pub async fn download_photos(
+    client: &Client,
+    albums: &[PhotoAlbum],
+    config: &DownloadConfig,
+) -> Result<()> {
+    let started = Instant::now();
+
+    // ── Phase 1: Stream and download ───────────────────────────────
+    let (downloaded, failed_tasks) = stream_and_download(client, albums, config).await?;
+
+    if downloaded == 0 && failed_tasks.is_empty() {
+        if config.dry_run {
+            tracing::info!("── Dry Run Summary ──");
+            tracing::info!("  0 files would be downloaded");
+            tracing::info!("  destination: {}", config.directory.display());
+        } else {
+            tracing::info!("No new photos to download");
+        }
+        return Ok(());
+    }
+
+    if config.dry_run {
+        tracing::info!("── Dry Run Summary ──");
+        tracing::info!("  {} files would be downloaded", downloaded);
+        tracing::info!("  destination: {}", config.directory.display());
+        tracing::info!("  concurrency: {}", config.concurrent_downloads);
+        return Ok(());
+    }
+
+    let total = downloaded + failed_tasks.len();
+
+    if failed_tasks.is_empty() {
+        tracing::info!("── Summary ──");
+        tracing::info!("  {} downloaded, 0 failed, {} total", total, total);
+        tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
+        return Ok(());
+    }
+
+    // Phase 2: CDN URLs from Phase 1 may have expired during a long
+    // download session. Re-fetch the full task list for fresh URLs and
+    // retry at concurrency 1 to give large files full bandwidth.
+    let cleanup_concurrency = 1;
+    let failure_count = failed_tasks.len();
+    tracing::info!(
+        "── Cleanup pass: re-fetching URLs and retrying {} failed downloads (concurrency: {}) ──",
+        failure_count,
+        cleanup_concurrency,
+    );
+
+    let fresh_tasks = build_download_tasks(albums, config).await?;
+    tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
+
+    let remaining_failed = run_download_pass(
+        client,
+        fresh_tasks,
+        &config.retry,
+        config.set_exif_datetime,
+        cleanup_concurrency,
+    )
+    .await;
+
+    let failed = remaining_failed.len();
+    let succeeded = total - failed;
+    tracing::info!("── Summary ──");
+    tracing::info!(
+        "  {} downloaded, {} failed, {} total",
+        succeeded,
+        failed,
+        total
+    );
+    tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
+
+    if failed > 0 {
+        for task in &remaining_failed {
+            tracing::error!("Download failed: {}", task.download_path.display());
+        }
+        anyhow::bail!("{} of {} downloads failed", failed, total);
+    }
+
+    Ok(())
+}
+
+/// Execute a download pass over the given tasks, returning any that failed.
+async fn run_download_pass(
+    client: &Client,
+    tasks: Vec<DownloadTask>,
+    retry_config: &RetryConfig,
+    set_exif: bool,
+    concurrency: usize,
+) -> Vec<DownloadTask> {
+    let client = client.clone();
+    let retry_config = retry_config.clone();
+
+    let results: Vec<(DownloadTask, Result<()>)> = stream::iter(tasks)
+        .map(|task| {
+            let client = client.clone();
+            let retry_config = retry_config.clone();
+            async move {
+                let result = download_single_task(&client, &task, &retry_config, set_exif).await;
+                (task, result)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    results
+        .into_iter()
+        .filter_map(|(task, result)| {
+            if let Err(e) = &result {
+                tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
+                Some(task)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Download a single task, handling mtime and EXIF stamping on success.
+async fn download_single_task(
+    client: &Client,
+    task: &DownloadTask,
+    retry_config: &RetryConfig,
+    set_exif: bool,
+) -> Result<()> {
+    if let Some(parent) = task.download_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    file::download_file(
+        client,
+        &task.url,
+        &task.download_path,
+        &task.checksum,
+        false,
+        retry_config,
+    )
+    .await?;
+
+    let mtime_path = task.download_path.clone();
+    let ts = task.created_local.timestamp();
+    if let Err(e) = tokio::task::spawn_blocking(move || set_file_mtime(&mtime_path, ts)).await? {
+        tracing::warn!(
+            "Could not set mtime on {}: {}",
+            task.download_path.display(),
+            e
+        );
+    }
+
+    tracing::info!("Downloaded {}", task.download_path.display());
+
+    if set_exif {
+        let ext = task
+            .download_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg") {
+            let exif_path = task.download_path.clone();
+            let date_str = task.created_local.format("%Y:%m:%d %H:%M:%S").to_string();
+            let exif_result =
+                tokio::task::spawn_blocking(move || match exif::get_photo_exif(&exif_path) {
+                    Ok(None) => {
+                        if let Err(e) = exif::set_photo_exif(&exif_path, &date_str) {
+                            tracing::warn!("Failed to set EXIF on {}: {}", exif_path.display(), e);
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Err(e) => {
+                        tracing::warn!("Failed to read EXIF from {}: {}", exif_path.display(), e);
+                    }
+                })
+                .await;
+            if let Err(e) = exif_result {
+                tracing::warn!("EXIF task panicked: {}", e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Format a Duration as a human-readable string like "1h 23m 45s" or "42s".
+fn format_duration(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if hours > 0 {
+        format!("{}h {:02}m {:02}s", hours, mins, secs)
+    } else if mins > 0 {
+        format!("{}m {:02}s", mins, secs)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Set the modification and access times of a file to the given Unix
+/// timestamp. Uses `std::fs::File::set_times` (stable since Rust 1.75).
+///
+/// Handles negative timestamps (dates before 1970) gracefully by clamping
+/// to the Unix epoch.
+fn set_file_mtime(path: &Path, timestamp: i64) -> std::io::Result<()> {
+    let time = if timestamp >= 0 {
+        UNIX_EPOCH + Duration::from_secs(timestamp as u64)
+    } else {
+        UNIX_EPOCH
+            .checked_sub(Duration::from_secs(timestamp.unsigned_abs()))
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    };
+    let times = FileTimes::new().set_modified(time).set_accessed(time);
+    let file = std::fs::File::options().write(true).open(path)?;
+    file.set_times(times)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::icloud::photos::PhotoAsset;
+    use serde_json::json;
+    use std::fs;
+
+    fn tmp_file(name: &str) -> PathBuf {
+        let dir = PathBuf::from("/tmp/claude/download_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        fs::write(&p, b"test").unwrap();
+        p
+    }
+
+    fn test_config() -> DownloadConfig {
+        DownloadConfig {
+            directory: PathBuf::from("/tmp/claude/download_filter_tests"),
+            folder_structure: "{:%Y/%m/%d}".to_string(),
+            size: AssetVersionSize::Original,
+            skip_videos: false,
+            skip_photos: false,
+            skip_created_before: None,
+            skip_created_after: None,
+            set_exif_datetime: false,
+            dry_run: false,
+            concurrent_downloads: 1,
+            recent: None,
+            retry: RetryConfig::default(),
+            skip_live_photos: false,
+            live_photo_size: AssetVersionSize::LiveOriginal,
+            live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
+        }
+    }
+
+    fn photo_asset_with_version() -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": "TEST_1", "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        )
+    }
+
+    #[test]
+    fn test_filter_asset_produces_task() {
+        let asset = photo_asset_with_version();
+        let config = test_config();
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].url, "https://example.com/orig");
+        assert_eq!(tasks[0].checksum, "abc123");
+    }
+
+    #[test]
+    fn test_filter_skips_videos_when_configured() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "VID_1", "fields": {
+                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let mut config = test_config();
+        config.skip_videos = true;
+        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_filter_skips_photos_when_configured() {
+        let asset = photo_asset_with_version();
+        let mut config = test_config();
+        config.skip_photos = true;
+        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_filter_skips_asset_without_filename() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "NO_NAME", "fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_filter_skips_asset_without_requested_version() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "SMALL_ONLY", "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 100,
+                    "downloadURL": "https://example.com/thumb",
+                    "fileChecksum": "th_ck"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config(); // requests Original, but only Thumb available
+        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_filter_skips_existing_file() {
+        let dir = PathBuf::from("/tmp/claude/download_filter_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let asset = photo_asset_with_version();
+        let mut config = test_config();
+        config.directory = dir.clone();
+
+        // First call should produce a task (file doesn't exist yet)
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+
+        // Create the file, second call should skip
+        fs::create_dir_all(tasks[0].download_path.parent().unwrap()).unwrap();
+        fs::write(&tasks[0].download_path, b"existing").unwrap();
+        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+
+        // Cleanup
+        let _ = fs::remove_file(&tasks[0].download_path);
+    }
+
+    fn photo_asset_with_live_photo() -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": "LIVE_1", "fields": {
+                "filenameEnc": {"value": "IMG_0001.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://example.com/heic_orig",
+                    "fileChecksum": "heic_ck"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000,
+                    "downloadURL": "https://example.com/live_mov",
+                    "fileChecksum": "mov_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        )
+    }
+
+    #[test]
+    fn test_filter_produces_live_photo_mov_task() {
+        let asset = photo_asset_with_live_photo();
+        let config = test_config();
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(tasks[1].url, "https://example.com/live_mov");
+        assert!(tasks[1]
+            .download_path
+            .to_str()
+            .unwrap()
+            .contains("IMG_0001_HEVC.MOV"));
+    }
+
+    #[test]
+    fn test_filter_skips_live_photo_when_configured() {
+        let asset = photo_asset_with_live_photo();
+        let mut config = test_config();
+        config.skip_live_photos = true;
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+    }
+
+    #[test]
+    fn test_filter_live_photo_original_policy() {
+        let asset = photo_asset_with_live_photo();
+        let mut config = test_config();
+        config.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Original;
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks[1]
+            .download_path
+            .to_str()
+            .unwrap()
+            .contains("IMG_0001.MOV"));
+    }
+
+    #[test]
+    fn test_filter_skips_existing_live_photo_mov() {
+        let dir = PathBuf::from("/tmp/claude/download_filter_tests_live");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let asset = photo_asset_with_live_photo();
+        let mut config = test_config();
+        config.directory = dir.clone();
+
+        // First call: both photo and MOV
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+
+        // Create only the MOV file on disk
+        fs::create_dir_all(tasks[1].download_path.parent().unwrap()).unwrap();
+        fs::write(&tasks[1].download_path, b"mov_data").unwrap();
+
+        // Second call: only the photo task (MOV already exists)
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_filter_live_photo_medium_size() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "LIVE_MED", "fields": {
+                "filenameEnc": {"value": "IMG_0002.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://example.com/heic_orig",
+                    "fileChecksum": "heic_ck"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resVidMedRes": {"value": {
+                    "size": 1500,
+                    "downloadURL": "https://example.com/live_med",
+                    "fileChecksum": "med_ck"
+                }},
+                "resVidMedFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveMedium;
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].url, "https://example.com/live_med");
+    }
+
+    #[test]
+    fn test_filter_no_live_photo_for_videos() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "VID_1", "fields": {
+                "filenameEnc": {"value": "movie.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000,
+                    "downloadURL": "https://example.com/live_mov",
+                    "fileChecksum": "mov_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        // Videos should get 1 task (the video itself), not a live photo MOV
+        assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn test_set_file_mtime_positive_timestamp() {
+        let p = tmp_file("pos.txt");
+        set_file_mtime(&p, 1_700_000_000).unwrap();
+        let meta = fs::metadata(&p).unwrap();
+        let mtime = meta.modified().unwrap();
+        assert_eq!(mtime, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+    }
+
+    #[test]
+    fn test_set_file_mtime_zero_timestamp() {
+        let p = tmp_file("zero.txt");
+        set_file_mtime(&p, 0).unwrap();
+        let meta = fs::metadata(&p).unwrap();
+        let mtime = meta.modified().unwrap();
+        assert_eq!(mtime, UNIX_EPOCH);
+    }
+
+    #[test]
+    fn test_set_file_mtime_negative_timestamp() {
+        let p = tmp_file("neg.txt");
+        // Should not panic — clamps or uses pre-epoch time
+        set_file_mtime(&p, -86400).unwrap();
+    }
+
+    #[test]
+    fn test_set_file_mtime_nonexistent_file() {
+        let p = PathBuf::from("/tmp/claude/download_tests/nonexistent_file.txt");
+        let _ = fs::remove_file(&p); // ensure absent
+        assert!(set_file_mtime(&p, 0).is_err());
+    }
+}

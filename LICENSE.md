@@ -1,6 +1,9 @@
 The MIT License (MIT)
 
-Copyright (c) 2016 Nathan Broadbent
+Copyright (c) 2026 Rob Hooper
+
+Based on [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader),
+originally Copyright (c) 2016 Nathan Broadbent.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -1,0 +1,63 @@
+[package]
+name = "icloudpd-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "icloudpd-rs"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+reqwest = { version = "0.12", features = ["cookies", "json", "stream"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+cookie_store = "0.21"
+cookie = "0.18"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto (SRP auth)
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+hmac = "0.12"
+num-bigint = "0.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v1", "v4"] }
+
+# Dates
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Progress / UI
+indicatif = "0.17"
+rpassword = "7"
+
+# EXIF
+kamadak-exif = "0.5"
+little_exif = "0.4"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Random
+rand = "0.8"
+
+# Misc
+url = "2"
+regex = "1"
+dirs = "6"
+async-trait = "0.1"
+urlencoding = "2"
