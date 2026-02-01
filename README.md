@@ -29,15 +29,18 @@ A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud
 - Dry-run, auth-only, list albums/libraries, watch mode
 - Strongly typed API layer and structured error handling
 - Low memory streaming for large libraries (100k+ photos)
+- Log level control (`--log-level`), `--skip-photos`, `--domain cn`, `--cookie-directory`
+- Live photo size and MOV filename policy selection
+- EXIF DateTimeOriginal write (`--set-exif-datetime`)
 
 </details>
 
 <details open>
 <summary><strong>Now</strong></summary>
 
-- RAW file alignment (`--align-raw` version swapping)
+- RAW file alignment (`--align-raw` with `as-is`, `as-original`, `as-alternative` modes)
 - Robust session persistence (mid-sync re-auth, token expiry tracking, lock files)
-- Progress bar integration
+- Progress bar integration (`--no-progress-bar` to disable)
 - Incremental sync with SQLite state tracking and CloudKit sync tokens
 - Failed asset tracking with persistent state across runs
 - Graceful shutdown with signal handling
@@ -47,37 +50,38 @@ A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud
 <details>
 <summary><strong>Next</strong></summary>
 
+- Multiple size downloads (`--size` accepting multiple per run)
+- `--force-size` (don't fall back to original when requested size is missing)
+- `--file-match-policy` for existing-file matching strategies
+- `--only-print-filenames` (filename-only dry-run output)
+- Write all EXIF date tags (DateTime, DateTimeDigitized)
 - XMP sidecar export (GPS, keywords, ratings, title/description)
 - Shared library download integration
 - SMS-based 2FA
-- Keyring password storage
-- Write all EXIF date tags (DateTime, DateTimeDigitized)
+- Password providers with priority ordering (parameter, keyring, console)
 - Robust watch/daemon mode (session refresh, album re-enumeration, systemd/launchd)
+- Relative day intervals for date range filters (e.g., `30` for last 30 days)
 
 </details>
 
 <details>
 <summary><strong>Later</strong></summary>
 
-- Auto-delete synced removals (`--auto-delete`)
+- Auto-delete via "Recently Deleted" album scan (`--auto-delete`)
 - Delete after download (`--delete-after-download`)
 - Keep recent days in iCloud (`--keep-icloud-recent-days`)
 - Email/SMTP notifications
 - Notification scripts
-- Multi-account support
+- Multi-account support (multiple `-u`/`-p` blocks in single run)
 - OS locale date formatting
 - Fingerprint fallback filenames
-- Docker and AUR builds
+- Docker and AUR builds with `docker exec` MFA submission for headless re-auth
 
 </details>
 
-<details>
-<summary><strong>Never</strong></summary>
+## Documentation
 
-- npm/PyPI packaging
-- Web UI
-
-</details>
+See [docs/](docs/) for detailed CLI flag reference and feature guides.
 
 ## Build
 
@@ -98,19 +102,34 @@ icloudpd-rs --username my@email.address --directory /photos
 
 ## CLI Flags
 
-| Flag | Purpose |
-|------|---------|
-| `-u, --username` | Apple ID email |
-| `-p, --password` | iCloud password (or `ICLOUD_PASSWORD` env) |
-| `-d, --directory` | Local download directory |
-| `--auth-only` | Only authenticate, don't download |
-| `-l, --list-albums` | List available albums |
-| `--list-libraries` | List available libraries |
-| `--recent N` | Download only the N most recent photos |
-| `--threads-num N` | Number of concurrent downloads (default: 1) |
-| `--max-retries N` | Max retries per download (default: 2, 0 = no retries) |
-| `--retry-delay N` | Initial retry delay in seconds (default: 5) |
-| `--dry-run` | Preview without modifying files or iCloud |
+| Flag | Purpose | Default |
+|------|---------|---------|
+| `-u, --username` | Apple ID email | |
+| `-p, --password` | iCloud password (or `ICLOUD_PASSWORD` env) | prompt |
+| `-d, --directory` | Local download directory | |
+| `--auth-only` | Only authenticate, don't download | |
+| `-l, --list-albums` | List available albums | |
+| `--list-libraries` | List available libraries | |
+| `-a, --album` | Album(s) to download (repeatable) | all |
+| `--size` | Image size: original, medium, thumb, adjusted, alternative | `original` |
+| `--live-photo-size` | Live photo MOV size: original, medium, thumb | `original` |
+| `--live-photo-mov-filename-policy` | MOV naming: suffix, original | `suffix` |
+| `--recent N` | Download only the N most recent photos | |
+| `--threads-num N` | Number of concurrent downloads | `1` |
+| `--skip-videos` | Don't download videos | |
+| `--skip-photos` | Don't download photos | |
+| `--skip-live-photos` | Don't download live photos | |
+| `--skip-created-before` | Skip assets before ISO date or interval (e.g., `2025-01-02` or `20d`) | |
+| `--skip-created-after` | Skip assets after ISO date or interval | |
+| `--folder-structure` | Folder template for organizing downloads | `%Y/%m/%d` |
+| `--set-exif-datetime` | Write DateTimeOriginal EXIF tag if missing | |
+| `--domain` | iCloud domain: com, cn | `com` |
+| `--cookie-directory` | Session/cookie storage path | `~/.icloudpd-rs` |
+| `--log-level` | Log verbosity: debug, info, error | `debug` |
+| `--max-retries N` | Max retries per download (0 = no retries) | `2` |
+| `--retry-delay N` | Initial retry delay in seconds | `5` |
+| `--watch-with-interval N` | Run continuously, waiting N seconds between runs | |
+| `--dry-run` | Preview without modifying files or iCloud | |
 
 ## License
 
