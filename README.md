@@ -69,7 +69,7 @@ icloudpd-rs --username my@email.address --directory /photos
 | `--domain` | iCloud domain: com, cn | `com` |
 | `--cookie-directory` | Session/cookie storage path | `~/.icloudpd-rs` |
 | `--no-progress-bar` | Disable the progress bar | |
-| `--log-level` | Log verbosity: debug, info, error | `debug` |
+| `--log-level` | Log verbosity: debug, info, error | `error` |
 | `--max-retries N` | Max retries per download (0 = no retries) | `2` |
 | `--retry-delay N` | Initial retry delay in seconds | `5` |
 | `--watch-with-interval N` | Run continuously, waiting N seconds between runs | |
