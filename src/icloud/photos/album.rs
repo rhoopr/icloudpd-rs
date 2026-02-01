@@ -50,7 +50,6 @@ impl PhotoAlbum {
     }
 
     /// Return total item count for this album via `HyperionIndexCountLookup`.
-    #[allow(dead_code)] // public API for progress bar integration
     pub async fn len(&self) -> anyhow::Result<u64> {
         let url = format!(
             "{}/internal/records/query/batch?{}",
