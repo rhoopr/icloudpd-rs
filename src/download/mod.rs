@@ -244,6 +244,11 @@ async fn stream_and_download(
     // Lightweight count-only API query (HyperionIndexCountLookup) — separate
     // from the page-by-page photo fetch, used to size the progress bar.
     // When --recent is set, cap to that limit since the stream will stop early.
+    //
+    // Note: the total reflects *photo count*, but each photo may produce
+    // multiple download tasks (e.g. live photo MOV companions, RAW
+    // alternates). The bar may therefore overshoot pos > len slightly.
+    // This matches Python icloudpd's tqdm behavior and keeps the ETA useful.
     let mut total: u64 = 0;
     for album in albums {
         total += album.len().await.unwrap_or(0);
