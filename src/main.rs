@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(concurrency = config.threads_num, "Starting icloudpd-rs");
 
     let password_provider = {
-        let pw = config.password.clone();
+        let pw = config.password;
         move || -> Option<String> {
             pw.clone().or_else(|| {
                 // Note: This closure is called from an async context but

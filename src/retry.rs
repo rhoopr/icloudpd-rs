@@ -11,7 +11,7 @@ pub enum RetryAction {
 
 /// Exponential backoff configuration with jitter to prevent thundering herd
 /// when multiple concurrent downloads hit the same transient failure.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
     pub max_retries: u32,
     pub base_delay_secs: u64,

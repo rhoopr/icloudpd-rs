@@ -9,6 +9,18 @@ use super::asset::PhotoAsset;
 use super::queries::{encode_params, DESIRED_KEYS_VALUES};
 use super::session::PhotosSession;
 
+/// Configuration for creating a `PhotoAlbum`, bundling all non-session fields.
+pub struct PhotoAlbumConfig {
+    pub params: HashMap<String, Value>,
+    pub service_endpoint: String,
+    pub name: String,
+    pub list_type: String,
+    pub obj_type: String,
+    pub query_filter: Option<Value>,
+    pub page_size: usize,
+    pub zone_id: Value,
+}
+
 #[allow(dead_code)] // fields accessed via pub(crate) by sibling modules
 pub struct PhotoAlbum {
     pub(crate) name: String,
@@ -23,28 +35,17 @@ pub struct PhotoAlbum {
 }
 
 impl PhotoAlbum {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        params: HashMap<String, Value>,
-        session: Box<dyn PhotosSession>,
-        service_endpoint: String,
-        name: String,
-        list_type: String,
-        obj_type: String,
-        query_filter: Option<Value>,
-        page_size: usize,
-        zone_id: Value,
-    ) -> Self {
+    pub fn new(config: PhotoAlbumConfig, session: Box<dyn PhotosSession>) -> Self {
         Self {
-            name,
-            params,
+            name: config.name,
+            params: config.params,
             session,
-            service_endpoint,
-            list_type,
-            obj_type,
-            query_filter,
-            page_size,
-            zone_id,
+            service_endpoint: config.service_endpoint,
+            list_type: config.list_type,
+            obj_type: config.obj_type,
+            query_filter: config.query_filter,
+            page_size: config.page_size,
+            zone_id: config.zone_id,
         }
     }
 
@@ -341,15 +342,17 @@ mod tests {
 
     fn make_album(page_size: usize, query_filter: Option<Value>, zone_id: Value) -> PhotoAlbum {
         PhotoAlbum::new(
-            HashMap::new(),
+            PhotoAlbumConfig {
+                params: HashMap::new(),
+                service_endpoint: "https://example.com".into(),
+                name: "TestAlbum".into(),
+                list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+                obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+                query_filter,
+                page_size,
+                zone_id,
+            },
             Box::new(StubSession),
-            "https://example.com".into(),
-            "TestAlbum".into(),
-            "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
-            "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
-            query_filter,
-            page_size,
-            zone_id,
         )
     }
 
