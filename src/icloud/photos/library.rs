@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use base64::Engine;
 use serde_json::{json, Value};
 
-use super::album::PhotoAlbum;
+use super::album::{PhotoAlbum, PhotoAlbumConfig};
 use super::queries::encode_params;
 use super::session::PhotosSession;
 use super::smart_folders::smart_folders;
@@ -12,6 +12,13 @@ use crate::icloud::error::ICloudError;
 // Apple's sentinel folder IDs — these are containers, not real albums.
 const ROOT_FOLDER: &str = "----Root-Folder----";
 const PROJECT_ROOT_FOLDER: &str = "----Project-Root-Folder----";
+
+// CloudKit record/query types for photo enumeration.
+const QUERY_ALL_LIST: &str = "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted";
+const QUERY_ALL_OBJ: &str = "CPLAssetByAssetDateWithoutHiddenOrDeleted";
+const QUERY_DELETED_LIST: &str = "CPLAssetAndMasterDeletedByExpungedDate";
+const QUERY_DELETED_OBJ: &str = "CPLAssetDeletedByExpungedDate";
+const QUERY_FOLDER_LIST: &str = "CPLContainerRelationLiveByAssetDate";
 
 pub struct PhotoLibrary {
     service_endpoint: String,
@@ -77,15 +84,17 @@ impl PhotoLibrary {
             albums.insert(
                 name.to_string(),
                 PhotoAlbum::new(
-                    self.params.clone(),
+                    PhotoAlbumConfig {
+                        params: self.params.clone(),
+                        service_endpoint: self.service_endpoint.clone(),
+                        name: name.to_string(),
+                        list_type: def.list_type.to_string(),
+                        obj_type: def.obj_type.to_string(),
+                        query_filter: def.query_filter,
+                        page_size: 100,
+                        zone_id: self.zone_id.clone(),
+                    },
                     self.clone_session(),
-                    self.service_endpoint.clone(),
-                    name.to_string(),
-                    def.list_type.to_string(),
-                    def.obj_type.to_string(),
-                    def.query_filter,
-                    100,
-                    self.zone_id.clone(),
                 ),
             );
         }
@@ -128,15 +137,17 @@ impl PhotoLibrary {
                 albums.insert(
                     folder_name.clone(),
                     PhotoAlbum::new(
-                        self.params.clone(),
+                        PhotoAlbumConfig {
+                            params: self.params.clone(),
+                            service_endpoint: self.service_endpoint.clone(),
+                            name: folder_name,
+                            list_type: QUERY_FOLDER_LIST.to_string(),
+                            obj_type: folder_obj_type,
+                            query_filter,
+                            page_size: 100,
+                            zone_id: self.zone_id.clone(),
+                        },
                         self.clone_session(),
-                        self.service_endpoint.clone(),
-                        folder_name,
-                        "CPLContainerRelationLiveByAssetDate".to_string(),
-                        folder_obj_type,
-                        query_filter,
-                        100,
-                        self.zone_id.clone(),
                     ),
                 );
             }
@@ -148,15 +159,17 @@ impl PhotoLibrary {
     /// Convenience: return a `PhotoAlbum` representing the whole collection.
     pub fn all(&self) -> PhotoAlbum {
         PhotoAlbum::new(
-            self.params.clone(),
+            PhotoAlbumConfig {
+                params: self.params.clone(),
+                service_endpoint: self.service_endpoint.clone(),
+                name: String::new(),
+                list_type: QUERY_ALL_LIST.to_string(),
+                obj_type: QUERY_ALL_OBJ.to_string(),
+                query_filter: None,
+                page_size: 100,
+                zone_id: self.zone_id.clone(),
+            },
             self.clone_session(),
-            self.service_endpoint.clone(),
-            String::new(),
-            "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".to_string(),
-            "CPLAssetByAssetDateWithoutHiddenOrDeleted".to_string(),
-            None,
-            100,
-            self.zone_id.clone(),
         )
     }
 
@@ -164,15 +177,17 @@ impl PhotoLibrary {
     #[allow(dead_code)] // for --auto-delete feature
     pub fn recently_deleted(&self) -> PhotoAlbum {
         PhotoAlbum::new(
-            self.params.clone(),
+            PhotoAlbumConfig {
+                params: self.params.clone(),
+                service_endpoint: self.service_endpoint.clone(),
+                name: String::new(),
+                list_type: QUERY_DELETED_LIST.to_string(),
+                obj_type: QUERY_DELETED_OBJ.to_string(),
+                query_filter: None,
+                page_size: 100,
+                zone_id: self.zone_id.clone(),
+            },
             self.clone_session(),
-            self.service_endpoint.clone(),
-            String::new(),
-            "CPLAssetAndMasterDeletedByExpungedDate".to_string(),
-            "CPLAssetDeletedByExpungedDate".to_string(),
-            None,
-            100,
-            self.zone_id.clone(),
         )
     }
 
