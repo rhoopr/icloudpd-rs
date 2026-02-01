@@ -9,3 +9,4 @@
 - Failed downloads get a cleanup pass that re-fetches URLs from iCloud before retrying, fixing expired CDN URL failures on large files
 - Partial `.part` files are resumed via HTTP Range requests; existing bytes are hashed on resume so the final SHA256 checksum still covers the entire file
 - API calls (album fetch, zone list) retry automatically on 5xx/429 errors
+- Live photo MOV files are downloaded alongside photos with configurable size (`--live-photo-size`) and filename policy (`--live-photo-mov-filename-policy`)
