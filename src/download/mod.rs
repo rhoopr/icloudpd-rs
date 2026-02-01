@@ -502,7 +502,7 @@ async fn download_single_task(
         );
     }
 
-    tracing::info!("Downloaded {}", task.download_path.display());
+    tracing::debug!("Downloaded {}", task.download_path.display());
 
     if set_exif {
         let ext = task
