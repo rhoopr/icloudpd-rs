@@ -243,9 +243,13 @@ async fn stream_and_download(
 ) -> Result<(usize, Vec<DownloadTask>)> {
     // Lightweight count-only API query (HyperionIndexCountLookup) — separate
     // from the page-by-page photo fetch, used to size the progress bar.
+    // When --recent is set, cap to that limit since the stream will stop early.
     let mut total: u64 = 0;
     for album in albums {
         total += album.len().await.unwrap_or(0);
+    }
+    if let Some(recent) = config.recent {
+        total = total.min(recent as u64);
     }
     let pb = create_progress_bar(config.no_progress_bar, total);
 
