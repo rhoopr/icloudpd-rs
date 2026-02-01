@@ -196,7 +196,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        download::download_photos(&shared_session, &albums, &download_config).await?;
+        let client = shared_session.read().await.http_client();
+        download::download_photos(&client, &albums, &download_config).await?;
 
         if let Some(interval) = config.watch_with_interval {
             tracing::info!("Waiting {} seconds...", interval);

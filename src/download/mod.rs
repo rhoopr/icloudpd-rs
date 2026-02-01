@@ -16,8 +16,6 @@ use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
 use reqwest::Client;
 
-use crate::auth::SharedSession;
-
 use std::path::PathBuf;
 
 use futures_util::stream::{self, StreamExt};
@@ -256,15 +254,14 @@ async fn stream_and_download(
 /// originals may have expired during a long Phase 1) and retry failures at
 /// reduced concurrency to give large files full bandwidth.
 pub async fn download_photos(
-    session: &SharedSession,
+    client: &Client,
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
 ) -> Result<()> {
     let started = Instant::now();
-    let client = session.read().await.http_client();
 
     // ── Phase 1: Stream and download ───────────────────────────────
-    let (downloaded, failed_tasks) = stream_and_download(&client, albums, config).await?;
+    let (downloaded, failed_tasks) = stream_and_download(client, albums, config).await?;
 
     if downloaded == 0 && failed_tasks.is_empty() {
         if config.dry_run {
@@ -309,7 +306,7 @@ pub async fn download_photos(
     tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
     let remaining_failed = run_download_pass(
-        &client,
+        client,
         fresh_tasks,
         &config.retry,
         config.set_exif_datetime,

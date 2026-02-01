@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
+use fs4::fs_std::FileExt;
 use reqwest::header::{HeaderMap, HeaderValue, ORIGIN, REFERER, USER_AGENT};
 use reqwest::{Client, Response};
 use serde_json::Value;
@@ -52,20 +52,33 @@ fn is_cookie_expired(cookie_str: &str, now: &chrono::DateTime<chrono::Utc>) -> b
     false
 }
 
+/// A single persisted cookie entry (URL + Set-Cookie header value).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CookieEntry {
+    url: String,
+    cookie: String,
+}
+
 /// HTTP session wrapper that persists cookies and session data to disk,
 /// allowing authentication to survive across process restarts.
 pub struct Session {
     client: Client,
-    pub(crate) _cookie_jar: Arc<reqwest::cookie::Jar>,
+    /// Held for the lifetime of the Session so the `Arc` reference kept by
+    /// `reqwest::Client` stays alive. Not accessed directly after construction.
+    #[allow(dead_code)]
+    cookie_jar: Arc<reqwest::cookie::Jar>,
     pub session_data: HashMap<String, String>,
     cookie_dir: PathBuf,
     sanitized_username: String,
     home_endpoint: String,
-    _timeout: Duration,
+    /// Stored so the configured timeout survives with the session, even though
+    /// it is baked into the `Client` at construction and not read again.
+    #[allow(dead_code)]
+    timeout: Duration,
     /// Exclusive file lock preventing concurrent instances for the same account.
     /// The advisory lock is held for the lifetime of the Session via the open
     /// file descriptor; released automatically when the File is dropped.
-    _lock_file: std::fs::File,
+    lock_file: std::fs::File,
 }
 
 impl Session {
@@ -90,14 +103,22 @@ impl Session {
         // Acquire an exclusive file lock to prevent concurrent instances for
         // the same account from corrupting session/cookie state.
         let lock_path = cookie_dir.join(format!("{}.lock", sanitized));
-        let lock_file = std::fs::File::create(&lock_path)
-            .with_context(|| format!("Failed to create lock file: {}", lock_path.display()))?;
-        lock_file.try_lock_exclusive().map_err(|_| {
-            anyhow::anyhow!(
-                "Another icloudpd-rs instance is running for this account (lock: {})",
-                lock_path.display()
-            )
-        })?;
+        let lock_file = tokio::task::spawn_blocking({
+            let lock_path = lock_path.clone();
+            move || {
+                let file = std::fs::File::create(&lock_path).with_context(|| {
+                    format!("Failed to create lock file: {}", lock_path.display())
+                })?;
+                file.try_lock_exclusive().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Another icloudpd-rs instance is running for this account (lock: {})",
+                        lock_path.display()
+                    )
+                })?;
+                Ok::<std::fs::File, anyhow::Error>(file)
+            }
+        })
+        .await??;
 
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
 
@@ -106,22 +127,35 @@ impl Session {
             match fs::read_to_string(&cookiejar_path).await {
                 Ok(contents) => {
                     let now = chrono::Utc::now();
-                    for line in contents.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with('#')
-                            || trimmed.is_empty()
-                            || trimmed.starts_with("Set-Cookie3:")
-                        {
-                            continue;
-                        }
-                        if let Some((url_str, cookie_str)) = trimmed.split_once('\t') {
-                            // Prune expired cookies on load
-                            if is_cookie_expired(cookie_str, &now) {
-                                tracing::debug!("Pruning expired cookie from {}", url_str);
+                    // Try JSON format first, fall back to legacy tab-separated format
+                    if let Ok(entries) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
+                        for entry in entries {
+                            if is_cookie_expired(&entry.cookie, &now) {
+                                tracing::debug!("Pruning expired cookie from {}", entry.url);
                                 continue;
                             }
-                            if let Ok(url) = url_str.parse::<url::Url>() {
-                                cookie_jar.add_cookie_str(cookie_str, &url);
+                            if let Ok(url) = entry.url.parse::<url::Url>() {
+                                cookie_jar.add_cookie_str(&entry.cookie, &url);
+                            }
+                        }
+                    } else {
+                        // Legacy tab-separated format
+                        for line in contents.lines() {
+                            let trimmed = line.trim();
+                            if trimmed.starts_with('#')
+                                || trimmed.is_empty()
+                                || trimmed.starts_with("Set-Cookie3:")
+                            {
+                                continue;
+                            }
+                            if let Some((url_str, cookie_str)) = trimmed.split_once('\t') {
+                                if is_cookie_expired(cookie_str, &now) {
+                                    tracing::debug!("Pruning expired cookie from {}", url_str);
+                                    continue;
+                                }
+                                if let Ok(url) = url_str.parse::<url::Url>() {
+                                    cookie_jar.add_cookie_str(cookie_str, &url);
+                                }
                             }
                         }
                     }
@@ -184,21 +218,14 @@ impl Session {
 
         Ok(Self {
             client,
-            _cookie_jar: cookie_jar,
+            cookie_jar,
             session_data,
             cookie_dir,
             sanitized_username: sanitized,
             home_endpoint: home_endpoint.to_string(),
-            _timeout: timeout,
-            _lock_file: lock_file,
+            timeout,
+            lock_file,
         })
-    }
-
-    /// Path for the lock file.
-    #[cfg(test)]
-    pub fn lock_path(&self) -> PathBuf {
-        self.cookie_dir
-            .join(format!("{}.lock", self.sanitized_username))
     }
 
     /// Path for cookie jar persistence.
@@ -215,7 +242,7 @@ impl Session {
     /// Release the exclusive file lock without dropping the Session.
     /// This allows a new Session to acquire the lock (e.g. during re-authentication).
     pub fn release_lock(&self) -> Result<()> {
-        self._lock_file
+        self.lock_file
             .unlock()
             .context("Failed to release session lock file")
     }
@@ -300,21 +327,17 @@ impl Session {
         tracing::debug!("Saved session data to file");
 
         // reqwest::cookie::Jar doesn't expose iteration, so we persist
-        // Set-Cookie headers ourselves in a simple "url\tcookie" format.
+        // Set-Cookie headers ourselves as a JSON array of {url, cookie}.
         let cookiejar_path = self.cookiejar_path();
         let url_str = response.url().to_string();
-        let mut cookie_lines: Vec<String> = if cookiejar_path.exists() {
-            fs::read_to_string(&cookiejar_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to read cookie jar from {}",
-                        cookiejar_path.display()
-                    )
-                })?
-                .lines()
-                .map(|l| l.to_string())
-                .collect()
+        let mut entries: Vec<CookieEntry> = if cookiejar_path.exists() {
+            let contents = fs::read_to_string(&cookiejar_path).await.with_context(|| {
+                format!(
+                    "Failed to read cookie jar from {}",
+                    cookiejar_path.display()
+                )
+            })?;
+            serde_json::from_str(&contents).unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -322,7 +345,6 @@ impl Session {
         let now = chrono::Utc::now();
         for cookie_header in headers.get_all("set-cookie") {
             if let Ok(val) = cookie_header.to_str() {
-                // Skip cookies that are already expired
                 if is_cookie_expired(val, &now) {
                     tracing::debug!(
                         "Skipping expired Set-Cookie: {}",
@@ -331,24 +353,24 @@ impl Session {
                     continue;
                 }
                 let new_name = val.split('=').next().unwrap_or("");
-                // Skip malformed cookies with empty name
                 if new_name.is_empty() {
                     continue;
                 }
                 // Deduplicate: remove stale entries for the same cookie name + URL
-                cookie_lines.retain(|line| {
-                    if let Some((line_url, line_cookie)) = line.split_once('\t') {
-                        if line_url == url_str {
-                            let existing_name = line_cookie.split('=').next().unwrap_or("");
-                            return existing_name != new_name;
-                        }
+                entries.retain(|e| {
+                    if e.url == url_str {
+                        let existing_name = e.cookie.split('=').next().unwrap_or("");
+                        return existing_name != new_name;
                     }
                     true
                 });
-                cookie_lines.push(format!("{}\t{}", url_str, val));
+                entries.push(CookieEntry {
+                    url: url_str.clone(),
+                    cookie: val.to_string(),
+                });
             }
         }
-        fs::write(&cookiejar_path, cookie_lines.join("\n"))
+        fs::write(&cookiejar_path, serde_json::to_string_pretty(&entries)?)
             .await
             .with_context(|| format!("Failed to write cookies to {}", cookiejar_path.display()))?;
         #[cfg(unix)]
@@ -382,7 +404,6 @@ impl Session {
         now.checked_sub(ts)
             .and_then(|d| u64::try_from(d).ok())
             .map(std::time::Duration::from_secs)
-            .or(Some(std::time::Duration::ZERO))
     }
 
     /// Returns true if the trust token is older than (30 - warn_days) days.
@@ -519,11 +540,11 @@ mod tests {
         let cookie_path = dir.join(&sanitized);
 
         // Write a cookie file with one expired and one valid cookie
-        let expired = format!(
+        let expired =
             "https://example.com\texpired_cookie=val; Expires=Thu, 01 Jan 2020 00:00:00 GMT"
-        );
-        let valid =
-            format!("https://example.com\tvalid_cookie=val; Expires=Thu, 01 Jan 2099 00:00:00 GMT");
+                .to_string();
+        let valid = "https://example.com\tvalid_cookie=val; Expires=Thu, 01 Jan 2099 00:00:00 GMT"
+            .to_string();
         std::fs::write(&cookie_path, format!("{}\n{}", expired, valid)).unwrap();
 
         let session = Session::new(&dir, "user@test.com", "https://example.com", None)
