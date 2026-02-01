@@ -55,6 +55,9 @@ thiserror = "2"
 # Random
 rand = "0.8"
 
+# File locking
+fs2 = "0.4"
+
 # Misc
 url = "2"
 regex = "1"
