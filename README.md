@@ -2,10 +2,15 @@
 
 A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (`icloudpd`).
 
+- **Single binary download.** No Python, no pip, no dependency conflicts.
+- **Native parallel downloads.** Large libraries don't take forever.
+- **Built for long-running daemons.** Won't leak memory or crash after a week.
+- **SQLite state tracking.** Knows what's downloaded, what failed, and where to resume.
+
 ## Status
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)
-[![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e)](LICENSE.md)
+[![Rust](https://shields.io/badge/-Rust-v1.92.0-2D2B28?logo=rust&logoColor=DEA584)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/Status-Early%20Development-blue.svg)]()
 
 > [!IMPORTANT]
@@ -15,13 +20,15 @@ A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud
 
 See [CHANGELOG.md](CHANGELOG.md) for what's already implemented.
 
-**Now** — Incremental sync (skip already-downloaded assets across runs), graceful shutdown, and mid-sync session recovery.
+**Now** — Incremental sync (skip already-downloaded assets across runs) and mid-sync session recovery.
 
 **Next** — XMP sidecar export, shared library downloads, OS keyring integration, robust daemon mode with systemd/launchd support, and additional download controls.
 
 **Later** — iCloud lifecycle management (auto-delete, delete-after-download), notifications, headless MFA for Docker, and multi-account support.
 
-## Documentation
+
+
+# Documentation
 
 See the [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) for detailed CLI flag reference and feature guides.
 
@@ -49,32 +56,17 @@ icloudpd-rs --username my@email.address --directory /photos
 | `-u, --username` | Apple ID email | |
 | `-p, --password` | iCloud password (or `ICLOUD_PASSWORD` env) | prompt |
 | `-d, --directory` | Local download directory | |
-| `--auth-only` | Only authenticate, don't download | |
-| `-l, --list-albums` | List available albums | |
-| `--list-libraries` | List available libraries | |
 | `-a, --album` | Album(s) to download (repeatable) | all |
-| `--size` | Image size: original, medium, thumb, adjusted, alternative | `original` |
-| `--align-raw` | RAW alignment: as-is, original, alternative | `as-is` |
-| `--live-photo-size` | Live photo MOV size: original, medium, thumb | `original` |
-| `--live-photo-mov-filename-policy` | MOV naming: suffix, original | `suffix` |
 | `--recent N` | Download only the N most recent photos | |
 | `--threads-num N` | Number of concurrent downloads | `1` |
-| `--skip-videos` | Don't download videos | |
-| `--skip-photos` | Don't download photos | |
-| `--skip-live-photos` | Don't download live photos | |
-| `--skip-created-before` | Skip assets before ISO date or interval (e.g., `2025-01-02` or `20d`) | |
-| `--skip-created-after` | Skip assets after ISO date or interval | |
 | `--folder-structure` | Folder template for organizing downloads | `%Y/%m/%d` |
-| `--set-exif-datetime` | Write EXIF date tags if missing (DateTime, DateTimeOriginal, DateTimeDigitized) | |
-| `--domain` | iCloud domain: com, cn | `com` |
-| `--cookie-directory` | Session/cookie storage path | `~/.icloudpd-rs` |
-| `--no-progress-bar` | Disable the progress bar | |
-| `--log-level` | Log verbosity: debug, info, error | `error` |
-| `--max-retries N` | Max retries per download (0 = no retries) | `2` |
-| `--retry-delay N` | Initial retry delay in seconds | `5` |
 | `--watch-with-interval N` | Run continuously, waiting N seconds between runs | |
 | `--dry-run` | Preview without modifying files or iCloud | |
 
-## License
+See the [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) for the full flag reference.
+
+
+
+# License
 
 MIT - see [LICENSE.md](LICENSE.md)

@@ -53,6 +53,7 @@
 ### Operational
 - Dry-run, auth-only, list albums/libraries modes
 - Watch mode with session validation between cycles
+- Graceful shutdown — first Ctrl+C / SIGTERM / SIGHUP finishes in-flight downloads then exits; second signal force-exits immediately. Partial `.part` files are kept for smart resume on next run. Watch mode sleep is interruptible.
 - Album and shared library enumeration
 - Log level control, domain selection (com/cn), custom cookie directory
 
