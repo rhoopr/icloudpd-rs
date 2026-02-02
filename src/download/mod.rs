@@ -22,6 +22,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use futures_util::stream::{self, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::types::AssetVersion;
 use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum};
@@ -66,8 +67,10 @@ struct DownloadTask {
 async fn build_download_tasks(
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
+    shutdown_token: CancellationToken,
 ) -> Result<Vec<DownloadTask>> {
     let album_results: Vec<Result<Vec<_>>> = stream::iter(albums)
+        .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|album| async move { album.photos(config.recent).await })
         .buffer_unordered(config.concurrent_downloads)
         .collect()
@@ -240,6 +243,7 @@ async fn stream_and_download(
     client: &Client,
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
+    shutdown_token: CancellationToken,
 ) -> Result<(usize, Vec<DownloadTask>)> {
     // Lightweight count-only API query (HyperionIndexCountLookup) — separate
     // from the page-by-page photo fetch, used to size the progress bar.
@@ -270,6 +274,10 @@ async fn stream_and_download(
     if config.dry_run {
         let mut count = 0usize;
         while let Some(result) = combined.next().await {
+            if shutdown_token.is_cancelled() {
+                tracing::info!("Shutdown requested, stopping dry run");
+                break;
+            }
             let asset = result?;
             let tasks = filter_asset_to_tasks(&asset, config);
             for task in &tasks {
@@ -316,6 +324,10 @@ async fn stream_and_download(
     tokio::pin!(download_stream);
 
     while let Some((task, result)) = download_stream.next().await {
+        if shutdown_token.is_cancelled() {
+            pb.suspend(|| tracing::info!("Shutdown requested, stopping new downloads"));
+            break;
+        }
         let filename = task
             .download_path
             .file_name()
@@ -351,10 +363,12 @@ pub async fn download_photos(
     client: &Client,
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
     let started = Instant::now();
 
-    let (downloaded, failed_tasks) = stream_and_download(client, albums, config).await?;
+    let (downloaded, failed_tasks) =
+        stream_and_download(client, albums, config, shutdown_token.clone()).await?;
 
     if downloaded == 0 && failed_tasks.is_empty() {
         if config.dry_run {
@@ -369,7 +383,14 @@ pub async fn download_photos(
 
     if config.dry_run {
         tracing::info!("── Dry Run Summary ──");
-        tracing::info!("  {} files would be downloaded", downloaded);
+        if shutdown_token.is_cancelled() {
+            tracing::info!(
+                "  Interrupted — scanned {} files before shutdown",
+                downloaded
+            );
+        } else {
+            tracing::info!("  {} files would be downloaded", downloaded);
+        }
         tracing::info!("  destination: {}", config.directory.display());
         tracing::info!("  concurrency: {}", config.concurrent_downloads);
         return Ok(());
@@ -395,7 +416,7 @@ pub async fn download_photos(
         cleanup_concurrency,
     );
 
-    let fresh_tasks = build_download_tasks(albums, config).await?;
+    let fresh_tasks = build_download_tasks(albums, config, shutdown_token.clone()).await?;
     tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
     let phase2_task_count = fresh_tasks.len();
@@ -406,6 +427,7 @@ pub async fn download_photos(
         config.set_exif_datetime,
         cleanup_concurrency,
         config.no_progress_bar,
+        shutdown_token,
     )
     .await;
 
@@ -440,11 +462,13 @@ async fn run_download_pass(
     set_exif: bool,
     concurrency: usize,
     no_progress_bar: bool,
+    shutdown_token: CancellationToken,
 ) -> Vec<DownloadTask> {
     let pb = create_progress_bar(no_progress_bar, tasks.len() as u64);
     let client = client.clone();
 
     let results: Vec<(DownloadTask, Result<()>)> = stream::iter(tasks)
+        .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
             async move {
@@ -1058,5 +1082,56 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].url, "https://example.com/orig");
         assert_eq!(tasks[0].checksum, "orig_ck");
+    }
+
+    #[tokio::test]
+    async fn test_run_download_pass_skips_all_tasks_when_cancelled() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let tasks = vec![
+            DownloadTask {
+                url: "https://example.com/a".into(),
+                download_path: PathBuf::from("/tmp/claude/shutdown_test/a.jpg"),
+                checksum: "aaa".into(),
+                created_local: chrono::Local::now(),
+            },
+            DownloadTask {
+                url: "https://example.com/b".into(),
+                download_path: PathBuf::from("/tmp/claude/shutdown_test/b.jpg"),
+                checksum: "bbb".into(),
+                created_local: chrono::Local::now(),
+            },
+        ];
+
+        let client = Client::new();
+        let retry = RetryConfig::default();
+
+        // Pre-cancelled token: take_while stops immediately, no downloads attempted.
+        let failed = run_download_pass(&client, tasks, &retry, false, 1, true, token).await;
+        assert!(failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_run_download_pass_processes_tasks_when_not_cancelled() {
+        let token = CancellationToken::new();
+
+        let tasks = vec![DownloadTask {
+            url: "https://0.0.0.0:1/nonexistent".into(),
+            download_path: PathBuf::from("/tmp/claude/shutdown_test/c.jpg"),
+            checksum: "ccc".into(),
+            created_local: chrono::Local::now(),
+        }];
+
+        let client = Client::new();
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+
+        // Non-cancelled token: task is attempted (and fails since URL is bogus).
+        let failed = run_download_pass(&client, tasks, &retry, false, 1, true, token).await;
+        assert_eq!(failed.len(), 1);
     }
 }
