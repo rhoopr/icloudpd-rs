@@ -7,27 +7,27 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
 /// Install signal handlers and return a [`CancellationToken`] that is
 /// cancelled on the first SIGINT / SIGTERM / SIGHUP.  A second signal
 /// force-exits the process.
-pub(crate) fn install_signal_handler() -> CancellationToken {
+pub(crate) fn install_signal_handler() -> anyhow::Result<CancellationToken> {
     let token = CancellationToken::new();
     let count = Arc::new(AtomicU32::new(0));
 
+    #[cfg(unix)]
+    let (mut sigterm, mut sighup) = {
+        use tokio::signal::unix::{signal, SignalKind};
+        (
+            signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?,
+            signal(SignalKind::hangup()).context("failed to register SIGHUP handler")?,
+        )
+    };
+
     let handler_token = token.clone();
     tokio::spawn(async move {
-        // Create signal listeners once, reuse across iterations.
-        #[cfg(unix)]
-        let (mut sigterm, mut sighup) = {
-            use tokio::signal::unix::{signal, SignalKind};
-            (
-                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler"),
-                signal(SignalKind::hangup()).expect("failed to register SIGHUP handler"),
-            )
-        };
-
         loop {
             #[cfg(unix)]
             {
@@ -40,9 +40,10 @@ pub(crate) fn install_signal_handler() -> CancellationToken {
 
             #[cfg(not(unix))]
             {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("failed to listen for Ctrl+C");
+                if tokio::signal::ctrl_c().await.is_err() {
+                    tracing::error!("Failed to listen for Ctrl+C");
+                    return;
+                }
             }
 
             let prev = count.fetch_add(1, Ordering::SeqCst);
@@ -57,7 +58,7 @@ pub(crate) fn install_signal_handler() -> CancellationToken {
         }
     });
 
-    token
+    Ok(token)
 }
 
 #[cfg(test)]
@@ -82,7 +83,7 @@ mod tests {
     /// (signal delivery can't be safely tested in a shared test binary).
     #[tokio::test]
     async fn install_returns_live_token() {
-        let token = install_signal_handler();
+        let token = install_signal_handler().unwrap();
         assert!(!token.is_cancelled());
     }
 }

@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
         no_progress_bar: config.no_progress_bar,
     };
 
-    let shutdown_token = shutdown::install_signal_handler();
+    let shutdown_token = shutdown::install_signal_handler()?;
 
     loop {
         if shutdown_token.is_cancelled() {

@@ -67,7 +67,7 @@ struct DownloadTask {
 async fn build_download_tasks(
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
-    shutdown_token: &CancellationToken,
+    shutdown_token: CancellationToken,
 ) -> Result<Vec<DownloadTask>> {
     let album_results: Vec<Result<Vec<_>>> = stream::iter(albums)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
@@ -416,7 +416,7 @@ pub async fn download_photos(
         cleanup_concurrency,
     );
 
-    let fresh_tasks = build_download_tasks(albums, config, &shutdown_token).await?;
+    let fresh_tasks = build_download_tasks(albums, config, shutdown_token.clone()).await?;
     tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
     let phase2_task_count = fresh_tasks.len();
