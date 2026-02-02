@@ -1,5 +1,10 @@
 # icloudpd-rs
 
+[![License: MIT](https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e)](LICENSE.md)
+[![Rust](https://shields.io/badge/Rust-v1.92.0-2D2B28?logo=rust&logoColor=DEA584)](https://www.rust-lang.org/)
+[![Status](https://img.shields.io/badge/Status-Early%20Development-blue.svg)]()
+
+
 A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (`icloudpd`).
 
 - **Single binary download.** No Python, no pip, no dependency conflicts.
@@ -8,10 +13,6 @@ A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud
 - **SQLite state tracking.** Knows what's downloaded, what failed, and where to resume.
 
 ## Status
-
-[![License: MIT](https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e)](LICENSE.md)
-[![Rust](https://shields.io/badge/-Rust-v1.92.0-2D2B28?logo=rust&logoColor=DEA584)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/Status-Early%20Development-blue.svg)]()
 
 > [!IMPORTANT]
 > Early development. Core authentication (SRP, 2FA) and photo download are functional, but several features are still in progress. Expect breaking changes.
