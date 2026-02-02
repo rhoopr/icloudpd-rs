@@ -383,7 +383,14 @@ pub async fn download_photos(
 
     if config.dry_run {
         tracing::info!("── Dry Run Summary ──");
-        tracing::info!("  {} files would be downloaded", downloaded);
+        if shutdown_token.is_cancelled() {
+            tracing::info!(
+                "  Interrupted — scanned {} files before shutdown",
+                downloaded
+            );
+        } else {
+            tracing::info!("  {} files would be downloaded", downloaded);
+        }
         tracing::info!("  destination: {}", config.directory.display());
         tracing::info!("  concurrency: {}", config.concurrent_downloads);
         return Ok(());
