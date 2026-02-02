@@ -15,6 +15,7 @@
 - Resumable partial downloads via HTTP Range requests with SHA256 verification
 - Retry with exponential backoff and transient/permanent error classification (`--max-retries`, `--retry-delay`)
 - Progress bar tracking download progress, auto-hidden in non-TTY environments (`--no-progress-bar`)
+- Live photo MOV collision detection — when a regular video occupies the same filename, the companion MOV is saved with an asset ID suffix (e.g. `IMG_0001-ASSET_ID.MOV`)
 - Two-phase cleanup pass — retries failures with fresh CDN URLs
 - Low memory streaming for large libraries (100k+ photos)
 
