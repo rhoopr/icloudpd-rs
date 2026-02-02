@@ -21,8 +21,14 @@
 
 ### Downloads
 - Streaming download pipeline with configurable concurrent downloads (`--threads-num`)
+
+> [!IMPORTANT]
+> **Change from Python:** `--threads-num` controls actual concurrent downloads — Python deprecated this flag and always downloads sequentially
 - Resumable partial downloads via HTTP Range requests with SHA256 verification
 - Retry with exponential backoff, jitter, and transient/permanent error classification (`--max-retries`, `--retry-delay`)
+
+> [!TIP]
+> **Change from Python:** `--max-retries` and `--retry-delay` are new flags — Python hardcodes `MAX_RETRIES = 0` with no user control
 - Progress bar tracking download progress, auto-hidden in non-TTY environments (`--no-progress-bar`)
 - Live photo MOV collision detection — when a regular video occupies the same filename, the companion MOV is saved with an asset ID suffix (e.g. `IMG_0001-ASSET_ID.MOV`)
 - Two-phase cleanup pass — retries failures with fresh CDN URLs
