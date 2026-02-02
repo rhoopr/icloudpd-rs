@@ -198,10 +198,42 @@ fn filter_asset_to_tasks(
                 &created_local,
                 &mov_filename,
             );
-            if !mov_path.exists() {
+            // If the path already exists, it may be a different file (e.g. a
+            // regular video) that collides with the live photo companion name.
+            // Detect this by comparing the on-disk file size with the expected
+            // live photo size; on mismatch, deduplicate using the asset ID.
+            let final_mov_path = if mov_path.exists() {
+                let on_disk_size = std::fs::metadata(&mov_path).map(|m| m.len()).unwrap_or(0);
+                if on_disk_size == live_version.size {
+                    // Same size — likely already downloaded, skip.
+                    None
+                } else {
+                    // Collision with a different file — deduplicate.
+                    let dedup_filename = paths::insert_suffix(&mov_filename, asset.id());
+                    let dedup_path = paths::local_download_path(
+                        &config.directory,
+                        &config.folder_structure,
+                        &created_local,
+                        &dedup_filename,
+                    );
+                    if dedup_path.exists() {
+                        None // deduped version already downloaded
+                    } else {
+                        tracing::debug!(
+                            "Live photo MOV collision: {} already exists with different size, using {}",
+                            mov_path.display(),
+                            dedup_path.display(),
+                        );
+                        Some(dedup_path)
+                    }
+                }
+            } else {
+                Some(mov_path)
+            };
+            if let Some(path) = final_mov_path {
                 tasks.push(DownloadTask {
                     url: live_version.url.clone(),
-                    download_path: mov_path,
+                    download_path: path,
                     checksum: live_version.checksum.clone(),
                     created_local,
                 });
@@ -822,14 +854,48 @@ mod tests {
         let tasks = filter_asset_to_tasks(&asset, &config);
         assert_eq!(tasks.len(), 2);
 
-        // Create only the MOV file on disk
+        // Create the MOV file on disk with matching size (3000 bytes)
         fs::create_dir_all(tasks[1].download_path.parent().unwrap()).unwrap();
-        fs::write(&tasks[1].download_path, b"mov_data").unwrap();
+        fs::write(&tasks[1].download_path, vec![0u8; 3000]).unwrap();
 
-        // Second call: only the photo task (MOV already exists)
+        // Second call: only the photo task (MOV already exists with matching size)
         let tasks = filter_asset_to_tasks(&asset, &config);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_filter_deduplicates_live_photo_mov_collision() {
+        let dir = PathBuf::from("/tmp/claude/download_filter_tests_live_dedup");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let asset = photo_asset_with_live_photo();
+        let mut config = test_config();
+        config.directory = dir.clone();
+
+        // First call to get the expected MOV path
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        let mov_path = &tasks[1].download_path;
+
+        // Create a file at the MOV path with a DIFFERENT size (simulating a
+        // regular video that collides with the live photo companion name).
+        fs::create_dir_all(mov_path.parent().unwrap()).unwrap();
+        fs::write(mov_path, vec![0u8; 9999]).unwrap();
+
+        // Second call: should produce a deduped MOV path with asset ID suffix
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].url, "https://example.com/live_mov");
+        let dedup_path = tasks[1].download_path.to_str().unwrap();
+        assert!(
+            dedup_path.contains("LIVE_1"),
+            "Expected asset ID 'LIVE_1' in deduped path, got: {}",
+            dedup_path,
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
