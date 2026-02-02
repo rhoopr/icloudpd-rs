@@ -7,9 +7,9 @@
 
 A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (`icloudpd`).
 
-- **Single binary download.** No Python, no pip, no dependency conflicts.
-- **Native parallel downloads.** Large libraries don't take forever.
-- **Built for long-running daemons.** Won't leak memory or crash after a week.
+- **Single binary download.** No runtime dependencies to manage.
+- **Native parallel downloads.** Handles large libraries efficiently.
+- **Built for long-running daemons.** Stable over days and weeks.
 - **SQLite state tracking.** Knows what's downloaded, what failed, and where to resume.
 
 ## Status
