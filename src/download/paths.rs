@@ -68,12 +68,19 @@ pub fn remove_unicode_chars(filename: &str) -> String {
 /// If the filename has no extension, the suffix is simply appended.
 #[allow(dead_code)] // for --file-match-policy (parsed but not yet wired)
 pub fn add_dedup_suffix(path: &str, size: u64) -> String {
+    insert_suffix(path, &size.to_string())
+}
+
+/// Add a string suffix before the file extension.
+///
+/// For example, `"photo.jpg"` with suffix `"abc"` becomes `"photo-abc.jpg"`.
+pub fn insert_suffix(path: &str, suffix: &str) -> String {
     match path.rfind('.') {
         Some(dot_pos) => {
             let (stem, ext) = path.split_at(dot_pos);
-            format!("{}-{}{}", stem, size, ext)
+            format!("{}-{}{}", stem, suffix, ext)
         }
-        None => format!("{}-{}", path, size),
+        None => format!("{}-{}", path, suffix),
     }
 }
 
@@ -163,5 +170,15 @@ mod tests {
         assert_eq!(add_dedup_suffix("photo.jpg", 12345), "photo-12345.jpg");
         assert_eq!(add_dedup_suffix("photo", 100), "photo-100");
         assert_eq!(add_dedup_suffix("my.photo.png", 999), "my.photo-999.png");
+    }
+
+    #[test]
+    fn test_insert_suffix() {
+        assert_eq!(
+            insert_suffix("IMG_0001.MOV", "ASSET_ID"),
+            "IMG_0001-ASSET_ID.MOV"
+        );
+        assert_eq!(insert_suffix("photo", "123"), "photo-123");
+        assert_eq!(insert_suffix("a.b.mov", "id"), "a.b-id.mov");
     }
 }
