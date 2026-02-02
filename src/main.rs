@@ -13,6 +13,7 @@ mod config;
 mod download;
 mod icloud;
 pub mod retry;
+mod shutdown;
 mod types;
 
 use clap::Parser;
@@ -180,7 +181,14 @@ async fn main() -> anyhow::Result<()> {
         no_progress_bar: config.no_progress_bar,
     };
 
+    let shutdown_token = shutdown::install_signal_handler();
+
     loop {
+        if shutdown_token.is_cancelled() {
+            tracing::info!("Shutdown requested, exiting...");
+            break;
+        }
+
         // Check trust token expiry before each download cycle
         {
             let session = shared_session.read().await;
@@ -196,11 +204,18 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let client = shared_session.read().await.http_client();
-        download::download_photos(&client, &albums, &download_config).await?;
+        download::download_photos(&client, &albums, &download_config, shutdown_token.clone())
+            .await?;
 
         if let Some(interval) = config.watch_with_interval {
             tracing::info!("Waiting {} seconds...", interval);
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                _ = shutdown_token.cancelled() => {
+                    tracing::info!("Shutdown during wait, exiting...");
+                    break;
+                }
+            }
 
             // Validate session before next cycle; re-authenticate if expired
             {
