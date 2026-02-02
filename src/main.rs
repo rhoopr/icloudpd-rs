@@ -208,6 +208,10 @@ async fn main() -> anyhow::Result<()> {
             .await?;
 
         if let Some(interval) = config.watch_with_interval {
+            if shutdown_token.is_cancelled() {
+                tracing::info!("Shutdown requested, exiting...");
+                break;
+            }
             tracing::info!("Waiting {} seconds...", interval);
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
