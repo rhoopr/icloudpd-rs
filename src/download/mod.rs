@@ -67,8 +67,10 @@ struct DownloadTask {
 async fn build_download_tasks(
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
+    shutdown_token: &CancellationToken,
 ) -> Result<Vec<DownloadTask>> {
     let album_results: Vec<Result<Vec<_>>> = stream::iter(albums)
+        .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|album| async move { album.photos(config.recent).await })
         .buffer_unordered(config.concurrent_downloads)
         .collect()
@@ -272,6 +274,10 @@ async fn stream_and_download(
     if config.dry_run {
         let mut count = 0usize;
         while let Some(result) = combined.next().await {
+            if shutdown_token.is_cancelled() {
+                tracing::info!("Shutdown requested, stopping dry run");
+                break;
+            }
             let asset = result?;
             let tasks = filter_asset_to_tasks(&asset, config);
             for task in &tasks {
@@ -403,7 +409,7 @@ pub async fn download_photos(
         cleanup_concurrency,
     );
 
-    let fresh_tasks = build_download_tasks(albums, config).await?;
+    let fresh_tasks = build_download_tasks(albums, config, &shutdown_token).await?;
     tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
     let phase2_task_count = fresh_tasks.len();
