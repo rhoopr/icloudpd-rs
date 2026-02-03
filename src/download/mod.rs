@@ -1535,26 +1535,28 @@ mod tests {
             claimed_paths.keys().collect::<Vec<_>>()
         );
 
-        // Check if paths differ only in case (case-insensitive collision)
-        let video_filename = video_path.file_name().unwrap().to_str().unwrap();
+        // Check the MOV filename based on platform
         let mov_filename = mov_path.file_name().unwrap().to_str().unwrap();
-        eprintln!(
-            "Video filename: {}, MOV filename: {}",
-            video_filename, mov_filename
-        );
 
-        // On case-insensitive filesystems, IMG_0996.mov and IMG_0996.MOV are the same.
-        // The MOV should be deduped (have asset ID suffix) to avoid overwriting the video.
-        let video_lower = video_filename.to_ascii_lowercase();
-        let mov_lower = mov_filename.to_ascii_lowercase();
-        if video_lower == mov_lower {
-            // They collide on case-insensitive FS - MOV must be deduped
+        // On case-insensitive filesystems (macOS, Windows), IMG_0996.mov and IMG_0996.MOV
+        // collide, so the MOV should be deduped with asset ID suffix.
+        // On case-sensitive filesystems (Linux), they're different files, no dedup needed.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
             assert!(
                 mov_filename.contains("-IMG_0996"),
                 "Case-insensitive collision: MOV should be deduped with asset ID suffix. \
-                Video: {}, MOV: {}",
-                video_filename,
+                Got: {}",
                 mov_filename
+            );
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            // On Linux (case-sensitive), both files can coexist without dedup
+            assert_eq!(
+                mov_filename, "IMG_0996.MOV",
+                "On case-sensitive FS, MOV should keep original name"
             );
         }
 
