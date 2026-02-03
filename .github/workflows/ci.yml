@@ -108,22 +108,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TOTAL_LINE=$(tail -1 coverage.txt | awk '{print $10}')
-          COMMENT="### Coverage Report
+          # Extract total line coverage
+          TOTAL=$(tail -1 coverage.txt | awk '{print $10}')
 
-          **Total line coverage: ${TOTAL_LINE}**
+          # Build markdown table from coverage data
+          {
+            echo "## Coverage Report"
+            echo ""
+            echo "**Total: ${TOTAL} line coverage**"
+            echo ""
+            echo "| File | Lines | Missed | Coverage |"
+            echo "|------|------:|-------:|---------:|"
+            # Skip header lines, process data lines, skip TOTAL
+            tail -n +3 coverage.txt | head -n -2 | while read -r line; do
+              FILE=$(echo "$line" | awk '{print $1}')
+              LINES=$(echo "$line" | awk '{print $8}')
+              MISSED=$(echo "$line" | awk '{print $9}')
+              COVER=$(echo "$line" | awk '{print $10}')
+              if [ -n "$FILE" ] && [ "$FILE" != "TOTAL" ]; then
+                echo "| \`$FILE\` | $LINES | $MISSED | $COVER |"
+              fi
+            done
+          } > comment.md
 
-          <details>
-          <summary>Full report</summary>
-
-          \`\`\`
-          $(cat coverage.txt)
-          \`\`\`
-
-          </details>"
-
-          # Delete previous coverage comment if exists
-          gh pr comment ${{ github.event.pull_request.number }} --body "${COMMENT}" || true
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
 
   # Compiles release builds on all platforms to catch platform-specific compile errors
   # Release mode can surface different issues than debug mode (e.g., optimization bugs)
