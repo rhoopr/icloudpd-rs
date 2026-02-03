@@ -105,6 +105,7 @@ jobs:
           cat coverage.txt
       - name: Post coverage comment
         if: github.event_name == 'pull_request'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -133,7 +134,7 @@ jobs:
             fi
           } > comment.md
 
-          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md || echo "Failed to post comment"
 
   # Compiles release builds on all platforms to catch platform-specific compile errors
   # Release mode can surface different issues than debug mode (e.g., optimization bugs)
