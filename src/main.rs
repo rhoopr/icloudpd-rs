@@ -266,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
             }
             download::DownloadOutcome::SessionExpired { auth_error_count } => {
                 reauth_attempts += 1;
-                if reauth_attempts > MAX_REAUTH_ATTEMPTS {
+                if reauth_attempts >= MAX_REAUTH_ATTEMPTS {
                     anyhow::bail!(
                         "Session expired {} times, giving up after {} re-auth attempts",
                         auth_error_count,
