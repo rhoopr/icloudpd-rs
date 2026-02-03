@@ -411,7 +411,10 @@ mod tests {
     use super::*;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = PathBuf::from("/tmp/claude/session_tests").join(name);
+        let dir = std::env::temp_dir()
+            .join("claude")
+            .join("session_tests")
+            .join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
