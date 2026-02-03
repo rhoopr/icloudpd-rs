@@ -14,6 +14,3 @@ pub mod types;
 
 pub use db::{SqliteStateDb, StateDb};
 pub use types::{AssetRecord, MediaType, SyncRunStats};
-
-#[cfg(test)]
-pub use db::StubStateDb;
