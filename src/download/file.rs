@@ -227,4 +227,39 @@ mod tests {
         assert_eq!(base32_encode(b"fo"), "MZXQ");
         assert_eq!(base32_encode(b"foo"), "MZXW6");
     }
+
+    #[test]
+    fn test_temp_download_path_valid_checksum() {
+        // Base64 "AAAA" decodes to [0, 0, 0], base32 encodes to "AAAAA"
+        let path = PathBuf::from("/photos/test.jpg");
+        let result = temp_download_path(&path, "AAAA").unwrap();
+        assert_eq!(result.parent().unwrap(), Path::new("/photos"));
+        assert!(result.to_string_lossy().ends_with(".part"));
+    }
+
+    #[test]
+    fn test_temp_download_path_derives_from_checksum() {
+        let path = PathBuf::from("/photos/test.jpg");
+        let result1 = temp_download_path(&path, "AAAA").unwrap();
+        let result2 = temp_download_path(&path, "AAAB").unwrap();
+        // Different checksums should produce different .part filenames
+        assert_ne!(result1, result2);
+    }
+
+    #[test]
+    fn test_temp_download_path_same_checksum_same_result() {
+        let path1 = PathBuf::from("/photos/a.jpg");
+        let path2 = PathBuf::from("/photos/b.jpg");
+        let result1 = temp_download_path(&path1, "AAAA").unwrap();
+        let result2 = temp_download_path(&path2, "AAAA").unwrap();
+        // Same checksum, same directory -> same .part file (for resume)
+        assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn test_temp_download_path_invalid_base64() {
+        let path = PathBuf::from("/photos/test.jpg");
+        let result = temp_download_path(&path, "not-valid-base64!!!");
+        assert!(result.is_err());
+    }
 }

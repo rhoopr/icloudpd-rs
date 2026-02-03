@@ -94,4 +94,10 @@ mod tests {
             AssetVersionSize::LiveThumb
         );
     }
+
+    #[test]
+    fn test_domain_as_str() {
+        assert_eq!(Domain::Com.as_str(), "com");
+        assert_eq!(Domain::Cn.as_str(), "cn");
+    }
 }
