@@ -58,6 +58,9 @@ rand = "0.9"
 # File locking
 fs4 = "0.12"
 
+# Pin time to avoid edition 2024 requirement (MSRV 1.75)
+time = ">=0.3.0, <0.3.37"
+
 # Misc
 url = "2"
 regex = "1"
