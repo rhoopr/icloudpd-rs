@@ -86,27 +86,44 @@ jobs:
       - run: cargo fetch --locked
 
   # Measures what percentage of code is exercised by tests
-  # Helps identify untested code paths and track coverage over time
+  # Posts coverage summary as PR comment
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # Required by cargo-llvm-cov for instrumentation
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
-      # Uploads to Codecov for tracking and PR comments showing coverage changes
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
+      - name: Generate coverage
+        run: |
+          cargo llvm-cov --all-features --summary-only > coverage.txt
+          cat coverage.txt
+      - name: Post coverage comment
+        if: github.event_name == 'pull_request'
         env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TOTAL_LINE=$(tail -1 coverage.txt | awk '{print $10}')
+          COMMENT="### Coverage Report
+
+          **Total line coverage: ${TOTAL_LINE}**
+
+          <details>
+          <summary>Full report</summary>
+
+          \`\`\`
+          $(cat coverage.txt)
+          \`\`\`
+
+          </details>"
+
+          # Delete previous coverage comment if exists
+          gh pr comment ${{ github.event.pull_request.number }} --body "${COMMENT}" || true
 
   # Compiles release builds on all platforms to catch platform-specific compile errors
   # Release mode can surface different issues than debug mode (e.g., optimization bugs)
