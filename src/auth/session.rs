@@ -256,9 +256,7 @@ impl Session {
     /// Release the exclusive file lock without dropping the Session.
     /// This allows a new Session to acquire the lock (e.g. during re-authentication).
     pub fn release_lock(&self) -> Result<()> {
-        self.lock_file
-            .unlock()
-            .context("Failed to release session lock file")
+        FileExt::unlock(&self.lock_file).context("Failed to release session lock file")
     }
 
     pub fn client_id(&self) -> Option<&String> {
