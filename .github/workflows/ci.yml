@@ -101,34 +101,36 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage
         run: |
-          cargo llvm-cov --all-features --summary-only > coverage.txt
+          cargo llvm-cov --all-features > coverage.txt
           cat coverage.txt
       - name: Post coverage comment
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Extract total line coverage
-          TOTAL=$(tail -1 coverage.txt | awk '{print $10}')
+          # Extract stats from coverage output
+          TOTAL=$(grep "^TOTAL" coverage.txt | awk '{print $10}')
+          TESTS=$(grep -E "^test result:" coverage.txt | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
 
-          # Build markdown table from coverage data
+          # Find files with 0% and 100% coverage
+          ZERO_COV=$(grep "0.00%" coverage.txt | grep -v "^TOTAL" | awk '{print $1}' | head -5 | tr '\n' ', ' | sed 's/,$//')
+          FULL_COV=$(grep "100.00%" coverage.txt | awk '{print $1}' | tr '\n' ', ' | sed 's/,$//')
+
           {
             echo "## Coverage Report"
             echo ""
-            echo "**Total: ${TOTAL} line coverage**"
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| **Line Coverage** | ${TOTAL} |"
+            echo "| **Tests Passed** | ${TESTS} |"
             echo ""
-            echo "| File | Lines | Missed | Coverage |"
-            echo "|------|------:|-------:|---------:|"
-            # Skip header lines, process data lines, skip TOTAL
-            tail -n +3 coverage.txt | head -n -2 | while read -r line; do
-              FILE=$(echo "$line" | awk '{print $1}')
-              LINES=$(echo "$line" | awk '{print $8}')
-              MISSED=$(echo "$line" | awk '{print $9}')
-              COVER=$(echo "$line" | awk '{print $10}')
-              if [ -n "$FILE" ] && [ "$FILE" != "TOTAL" ]; then
-                echo "| \`$FILE\` | $LINES | $MISSED | $COVER |"
-              fi
-            done
+            if [ -n "$FULL_COV" ]; then
+              echo "**100% coverage:** \`${FULL_COV}\`"
+              echo ""
+            fi
+            if [ -n "$ZERO_COV" ]; then
+              echo "**Needs tests:** \`${ZERO_COV}\`"
+            fi
           } > comment.md
 
           gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
