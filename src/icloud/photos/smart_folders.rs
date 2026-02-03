@@ -5,13 +5,13 @@
 use serde_json::{json, Value};
 
 #[derive(Debug)]
-pub struct FolderDef {
-    pub obj_type: &'static str,
-    pub list_type: &'static str,
-    pub query_filter: Option<Value>,
+pub(crate) struct FolderDef {
+    pub(crate) obj_type: &'static str,
+    pub(crate) list_type: &'static str,
+    pub(crate) query_filter: Option<Value>,
 }
 
-pub fn smart_folder_filter(field: &str, value: &str) -> Value {
+pub(crate) fn smart_folder_filter(field: &str, value: &str) -> Value {
     json!([{
         "fieldName": field,
         "comparator": "EQUALS",
@@ -19,7 +19,7 @@ pub fn smart_folder_filter(field: &str, value: &str) -> Value {
     }])
 }
 
-pub fn smart_folders() -> Vec<(&'static str, FolderDef)> {
+pub(crate) fn smart_folders() -> Vec<(&'static str, FolderDef)> {
     vec![
         (
             "Time-lapse",

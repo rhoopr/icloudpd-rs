@@ -148,17 +148,15 @@ async fn attempt_download(
     let status = response.status().as_u16();
 
     // 206 = resumed successfully, 200 = server ignored Range (start over)
-    let (mut hasher, mut bytes_written, truncate) = if status == 206 && resume_offset > 0 {
-        let (hasher, len) =
-            resume_state.expect("resume_state must be Some when status=206 and resume_offset>0");
-        (hasher, len, false)
-    } else if response.status().is_success() {
-        (Sha256::new(), 0u64, true)
-    } else {
-        return Err(DownloadError::HttpStatus {
-            status,
-            path: path_str,
-        });
+    let (mut hasher, mut bytes_written, truncate) = match (status, resume_offset, resume_state) {
+        (206, offset, Some((h, len))) if offset > 0 => (h, len, false),
+        (_, _, _) if response.status().is_success() => (Sha256::new(), 0u64, true),
+        _ => {
+            return Err(DownloadError::HttpStatus {
+                status,
+                path: path_str,
+            });
+        }
     };
 
     let content_length = response.content_length();
