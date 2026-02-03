@@ -340,32 +340,34 @@ impl StateDb for SqliteStateDb {
             .map_err(|e| StateError::Query(e.to_string()))?;
 
         let total_assets: u64 = conn
-            .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
-            .map_err(StateError::query)?;
+            .query_row("SELECT COUNT(*) FROM assets", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(StateError::query)? as u64;
 
         let downloaded: u64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM assets WHERE status = 'downloaded'",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
-            .map_err(StateError::query)?;
+            .map_err(StateError::query)? as u64;
 
         let pending: u64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM assets WHERE status = 'pending'",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
-            .map_err(StateError::query)?;
+            .map_err(StateError::query)? as u64;
 
         let failed: u64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM assets WHERE status = 'failed'",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0),
             )
-            .map_err(StateError::query)?;
+            .map_err(StateError::query)? as u64;
 
         let last_sync: Option<(Option<i64>, Option<i64>)> = conn
             .query_row(

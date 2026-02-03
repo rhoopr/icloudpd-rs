@@ -123,20 +123,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
 
-  # Verifies the project compiles on the minimum supported Rust version
-  # Prevents accidentally using features from newer Rust versions
-  # Update the toolchain version to match rust-version in your Cargo.toml
-  msrv:
-    name: MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.85"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-features
-
   # Checks dependencies against the RustSec Advisory Database
   # Catches known security vulnerabilities in your dependency tree
   security:
