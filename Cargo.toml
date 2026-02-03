@@ -46,7 +46,7 @@ rpassword = "7"
 
 # EXIF
 kamadak-exif = "0.5"
-little_exif = ">=0.6.0, <0.6.23"  # 0.6.23+ uses resolver 3 (edition 2024)
+little_exif = "0.6"
 
 # Error handling
 anyhow = "1"
@@ -57,9 +57,6 @@ rand = "0.9"
 
 # File locking
 fs4 = "0.12"
-
-# Pin time to avoid edition 2024 requirement (MSRV 1.75)
-time = ">=0.3.0, <0.3.37"
 
 # Misc
 url = "2"
