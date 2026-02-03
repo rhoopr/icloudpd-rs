@@ -140,7 +140,7 @@ impl SqliteStateDb {
     }
 
     /// Get the path to the database file.
-    #[allow(dead_code)] // Phase 4: used by reset-state command
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -71,7 +71,6 @@ impl MediaType {
 
 /// A record of an asset's state in the database.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used by db.rs for SQL serialization/deserialization
 pub struct AssetRecord {
     /// iCloud asset ID (recordName).
     pub id: String,
@@ -204,12 +203,13 @@ mod tests {
 
     #[test]
     fn test_asset_record_new_pending() {
+        let now = Utc::now();
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
             "original".to_string(),
             "checksum123".to_string(),
             "photo.jpg".to_string(),
-            Utc::now(),
+            now,
             None,
             12345,
             MediaType::Photo,
@@ -218,5 +218,7 @@ mod tests {
         assert_eq!(record.download_attempts, 0);
         assert!(record.downloaded_at.is_none());
         assert!(record.local_path.is_none());
+        // Verify last_seen_at is set to a recent time (within 1 second of now)
+        assert!((record.last_seen_at - now).num_seconds().abs() <= 1);
     }
 }

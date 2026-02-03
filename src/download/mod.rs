@@ -892,16 +892,16 @@ pub async fn download_photos(
     tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
     let phase2_task_count = fresh_tasks.len();
-    let pass_result = run_download_pass(
-        download_client,
-        fresh_tasks,
-        &config.retry,
-        config.set_exif_datetime,
-        cleanup_concurrency,
-        config.no_progress_bar,
+    let pass_config = PassConfig {
+        client: download_client,
+        retry_config: &config.retry,
+        set_exif: config.set_exif_datetime,
+        concurrency: cleanup_concurrency,
+        no_progress_bar: config.no_progress_bar,
         shutdown_token,
-    )
-    .await;
+        state_db: config.state_db.clone(),
+    };
+    let pass_result = run_download_pass(pass_config, fresh_tasks).await;
 
     let remaining_failed = pass_result.failed;
     let phase2_auth_errors = pass_result.auth_errors;
@@ -946,25 +946,69 @@ struct PassResult {
     auth_errors: usize,
 }
 
-/// Execute a download pass over the given tasks, returning any that failed.
-async fn run_download_pass(
-    client: &Client,
-    tasks: Vec<DownloadTask>,
-    retry_config: &RetryConfig,
+/// Configuration for a download pass.
+struct PassConfig<'a> {
+    client: &'a Client,
+    retry_config: &'a RetryConfig,
     set_exif: bool,
     concurrency: usize,
     no_progress_bar: bool,
     shutdown_token: CancellationToken,
-) -> PassResult {
-    let pb = create_progress_bar(no_progress_bar, tasks.len() as u64);
-    let client = client.clone();
+    state_db: Option<Arc<dyn StateDb>>,
+}
+
+/// Execute a download pass over the given tasks, returning any that failed.
+async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> PassResult {
+    let pb = create_progress_bar(config.no_progress_bar, tasks.len() as u64);
+    let client = config.client.clone();
+    let retry_config = config.retry_config;
+    let set_exif = config.set_exif;
+    let state_db = config.state_db.clone();
+    let shutdown_token = config.shutdown_token.clone();
+    let concurrency = config.concurrency;
 
     let results: Vec<(DownloadTask, Result<()>)> = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
+            let db = state_db.clone();
             async move {
                 let result = download_single_task(&client, &task, retry_config, set_exif).await;
+
+                // Record outcome in state DB
+                if let Some(db) = &db {
+                    match &result {
+                        Ok(()) => {
+                            if let Err(e) = db
+                                .mark_downloaded(
+                                    &task.asset_id,
+                                    &task.version_size,
+                                    &task.download_path,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to mark {} as downloaded in state DB: {}",
+                                    task.asset_id,
+                                    e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if let Err(db_err) = db
+                                .mark_failed(&task.asset_id, &task.version_size, &e.to_string())
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to mark {} as failed in state DB: {}",
+                                    task.asset_id,
+                                    db_err
+                                );
+                            }
+                        }
+                    }
+                }
+
                 (task, result)
             }
         })
@@ -1823,7 +1867,16 @@ mod tests {
         let retry = RetryConfig::default();
 
         // Pre-cancelled token: take_while stops immediately, no downloads attempted.
-        let result = run_download_pass(&client, tasks, &retry, false, 1, true, token).await;
+        let pass_config = PassConfig {
+            client: &client,
+            retry_config: &retry,
+            set_exif: false,
+            concurrency: 1,
+            no_progress_bar: true,
+            shutdown_token: token,
+            state_db: None,
+        };
+        let result = run_download_pass(pass_config, tasks).await;
         assert!(result.failed.is_empty());
     }
 
@@ -1850,7 +1903,16 @@ mod tests {
         };
 
         // Non-cancelled token: task is attempted (and fails since URL is bogus).
-        let result = run_download_pass(&client, tasks, &retry, false, 1, true, token).await;
+        let pass_config = PassConfig {
+            client: &client,
+            retry_config: &retry,
+            set_exif: false,
+            concurrency: 1,
+            no_progress_bar: true,
+            shutdown_token: token,
+            state_db: None,
+        };
+        let result = run_download_pass(pass_config, tasks).await;
         assert_eq!(result.failed.len(), 1);
     }
 }

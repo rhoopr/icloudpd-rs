@@ -141,11 +141,14 @@ async fn run_status(args: cli::StatusArgs) -> anyhow::Result<()> {
         println!("Failed assets:");
         let failed = db.get_failed().await?;
         for asset in failed {
+            let last_seen = asset.last_seen_at.format("%Y-%m-%d %H:%M:%S");
             println!(
-                "  {} ({}) - {}",
+                "  {} ({}) - {} (attempts: {}, last seen: {})",
                 asset.filename,
                 asset.id,
-                asset.last_error.as_deref().unwrap_or("unknown error")
+                asset.last_error.as_deref().unwrap_or("unknown error"),
+                asset.download_attempts,
+                last_seen
             );
         }
     }
@@ -211,9 +214,21 @@ async fn run_verify(args: cli::VerifyArgs) -> anyhow::Result<()> {
     let mut verified = 0;
 
     for asset in &downloaded {
+        // Sanity check: all assets from get_all_downloaded should have Downloaded status
+        debug_assert_eq!(asset.status, state::AssetStatus::Downloaded);
+
         if let Some(local_path) = &asset.local_path {
             if !local_path.exists() {
-                println!("MISSING: {} ({})", local_path.display(), asset.id);
+                let downloaded_at = asset
+                    .downloaded_at
+                    .map(|dt| dt.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!(
+                    "MISSING: {} ({}) - downloaded {}",
+                    local_path.display(),
+                    asset.id,
+                    downloaded_at
+                );
                 missing += 1;
                 continue;
             }
