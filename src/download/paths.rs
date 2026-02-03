@@ -43,7 +43,15 @@ pub fn local_download_path(
         .replace("%M", &minute)
         .replace("%S", &second);
 
-    directory.join(&date_path).join(&clean)
+    // Split on "/" and join as path components to handle cross-platform paths.
+    // This converts "{:%Y/%m/%d}" format like "2025/01/15" into proper PathBuf.
+    let mut path = directory.to_path_buf();
+    for component in date_path.split('/') {
+        if !component.is_empty() {
+            path = path.join(component);
+        }
+    }
+    path.join(&clean)
 }
 
 /// Clean a filename by removing characters that are invalid on common

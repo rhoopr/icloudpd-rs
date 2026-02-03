@@ -8,3 +8,5 @@ extend-exclude = ["reference/"]
 [default.extend-words]
 # HSA = Apple's authentication system term (Hardware Security Authentication)
 hsa = "hsa"
+# Used in s2k_fo protocol (Apple SRP) and base32 test data
+fo = "fo"
