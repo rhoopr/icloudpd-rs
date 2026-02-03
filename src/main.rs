@@ -189,9 +189,14 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
 
-        let client = shared_session.read().await.http_client();
-        download::download_photos(&client, &albums, &download_config, shutdown_token.clone())
-            .await?;
+        let download_client = shared_session.read().await.download_client();
+        download::download_photos(
+            &download_client,
+            &albums,
+            &download_config,
+            shutdown_token.clone(),
+        )
+        .await?;
 
         if let Some(interval) = config.watch_with_interval {
             if shutdown_token.is_cancelled() {

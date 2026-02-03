@@ -133,8 +133,8 @@ pub struct Cli {
     #[arg(long)]
     pub only_print_filenames: bool,
 
-    /// Max retries per download (default: 2, 0 = no retries)
-    #[arg(long, default_value_t = 2)]
+    /// Max retries per download (default: 3, 0 = no retries)
+    #[arg(long, default_value_t = 3)]
     pub max_retries: u32,
 
     /// Initial retry delay in seconds (default: 5)
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn test_max_retries_default() {
         let cli = parse(&base_args());
-        assert_eq!(cli.max_retries, 2);
+        assert_eq!(cli.max_retries, 3);
     }
 
     #[test]
