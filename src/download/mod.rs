@@ -234,8 +234,9 @@ fn filter_asset_to_tasks(
                             &created_local,
                             &dedup_filename,
                         );
-                        if dedup_path.exists() {
-                            None // deduped version already downloaded
+                        let dedup_normalized = normalize_path_for_collision(&dedup_path);
+                        if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
+                            None // deduped version already downloaded or claimed
                         } else {
                             tracing::debug!(
                                 "File collision: {} already exists with different size (on-disk: {}, expected: {}), using {}",

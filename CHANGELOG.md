@@ -53,7 +53,7 @@ Benchmarked against Python icloudpd 1.32.2 on macOS with WiFi (84 runs, ~500GB t
 - Live photo MOV collision detection — when a regular video occupies the same filename, the companion MOV is saved with an asset ID suffix (e.g. `IMG_0001-ASSET_ID.MOV`)
 - File collision deduplication (`--file-match-policy`) — when multiple iCloud assets share the same filename but have different content, the default `name-size-dedup-with-suffix` policy saves both files by appending the file size (e.g. `photo.jpg` and `photo-12345.jpg`)
 - Two-phase cleanup pass — retries failures with fresh CDN URLs
-- Low memory streaming for large libraries (100k+ photos)
+- Concurrent downloads with collision detection (tasks are buffered in memory for deduplication)
 - Deterministic `.part` filenames derived from checksum (base32-encoded, filesystem-safe)
 
 > [!IMPORTANT]
