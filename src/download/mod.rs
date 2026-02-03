@@ -335,7 +335,17 @@ async fn stream_and_download(
     let task_stream = combined
         .filter_map(|result| async move {
             match result {
-                Ok(asset) => Some(filter_asset_to_tasks(&asset, config)),
+                Ok(asset) => {
+                    let tasks = filter_asset_to_tasks(&asset, config);
+                    if tasks.is_empty() {
+                        // Asset already downloaded or filtered out — advance
+                        // the progress bar so the position reflects skipped items.
+                        pb_ref.inc(1);
+                        None
+                    } else {
+                        Some(tasks)
+                    }
+                }
                 Err(e) => {
                     // indicatif needs `suspend` to coordinate stderr/stdout writes
                     // with the progress bar redraw, preventing garbled output.
