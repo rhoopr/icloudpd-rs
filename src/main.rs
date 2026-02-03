@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
     let filter = match cli.log_level {
         types::LogLevel::Debug => "debug",
         types::LogLevel::Info => "info",
+        types::LogLevel::Warn => "warn",
         types::LogLevel::Error => "error",
     };
     tracing_subscriber::fmt()

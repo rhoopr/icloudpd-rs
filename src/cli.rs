@@ -94,7 +94,7 @@ pub struct Cli {
     pub watch_with_interval: Option<u64>,
 
     /// Log level
-    #[arg(long, value_enum, default_value = "error")]
+    #[arg(long, value_enum, default_value = "info")]
     pub log_level: LogLevel,
 
     /// Disable progress bar
