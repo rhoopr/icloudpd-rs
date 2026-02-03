@@ -119,12 +119,15 @@ impl Session {
                 let file = std::fs::File::create(&lock_path).with_context(|| {
                     format!("Failed to create lock file: {}", lock_path.display())
                 })?;
-                file.try_lock_exclusive().map_err(|_| {
-                    anyhow::anyhow!(
+                let acquired = file
+                    .try_lock_exclusive()
+                    .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))?;
+                if !acquired {
+                    anyhow::bail!(
                         "Another icloudpd-rs instance is running for this account (lock: {})",
                         lock_path.display()
-                    )
-                })?;
+                    );
+                }
                 Ok::<std::fs::File, anyhow::Error>(file)
             }
         })
