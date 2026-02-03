@@ -31,6 +31,23 @@ use crate::types::{FileMatchPolicy, LivePhotoMovFilenamePolicy, RawTreatmentPoli
 
 use error::DownloadError;
 
+/// Normalize a path for collision detection on case-insensitive filesystems.
+///
+/// On macOS and Windows, filesystems are typically case-insensitive, meaning
+/// `IMG_0996.mov` and `IMG_0996.MOV` are the same file. This function converts
+/// paths to lowercase for use as HashMap keys to detect such collisions.
+///
+/// On Linux (case-sensitive filesystem), paths are returned unchanged.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn normalize_path_for_collision(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().to_ascii_lowercase())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn normalize_path_for_collision(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 /// Outcome of a download pass.
 #[derive(Debug)]
 pub enum DownloadOutcome {
@@ -67,6 +84,7 @@ pub struct DownloadConfig {
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.
+#[derive(Debug)]
 struct DownloadTask {
     url: String,
     download_path: PathBuf,
@@ -92,11 +110,12 @@ async fn build_download_tasks(
         .await;
 
     let mut tasks: Vec<DownloadTask> = Vec::new();
+    let mut claimed_paths: HashMap<PathBuf, u64> = HashMap::new();
     for album_result in album_results {
         let assets = album_result?;
 
         for asset in &assets {
-            tasks.extend(filter_asset_to_tasks(asset, config));
+            tasks.extend(filter_asset_to_tasks(asset, config, &mut claimed_paths));
         }
     }
 
@@ -145,9 +164,14 @@ fn apply_raw_policy(
 /// Apply content filters (type, date range) and local existence check,
 /// producing download tasks for assets that need fetching.
 /// Returns up to two tasks: the primary photo/video and an optional live photo MOV.
+///
+/// The `claimed_paths` map tracks paths that have been claimed by earlier tasks
+/// in the same download session, preventing race conditions where two assets
+/// with the same filename both see "file doesn't exist" during concurrent downloads.
 fn filter_asset_to_tasks(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
+    claimed_paths: &mut HashMap<PathBuf, u64>,
 ) -> Vec<DownloadTask> {
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
         return Vec::new();
@@ -189,6 +213,8 @@ fn filter_asset_to_tasks(
 
     if let Some(version) = versions.get(&config.size) {
         // Determine the final download path, applying size-based deduplication if needed.
+        // Check both on-disk files AND in-flight downloads (claimed_paths) to handle
+        // concurrent downloads of assets with the same filename.
         let final_path = if download_path.exists() {
             match config.file_match_policy {
                 FileMatchPolicy::NameSizeDedupWithSuffix => {
@@ -228,11 +254,49 @@ fn filter_asset_to_tasks(
                     None
                 }
             }
+        } else if let Some(&claimed_size) =
+            claimed_paths.get(&normalize_path_for_collision(&download_path))
+        {
+            // Path is claimed by an in-flight download — check for size collision.
+            // Use normalized paths for collision detection to handle case-insensitive
+            // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
+            match config.file_match_policy {
+                FileMatchPolicy::NameSizeDedupWithSuffix => {
+                    if claimed_size == version.size {
+                        // Same size — likely duplicate asset, skip.
+                        None
+                    } else {
+                        // Different size — deduplicate by appending file size to filename.
+                        let dedup_filename = paths::add_dedup_suffix(filename, version.size);
+                        let dedup_path = paths::local_download_path(
+                            &config.directory,
+                            &config.folder_structure,
+                            &created_local,
+                            &dedup_filename,
+                        );
+                        let dedup_normalized = normalize_path_for_collision(&dedup_path);
+                        if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
+                            None // deduped version already downloaded or claimed
+                        } else {
+                            tracing::debug!(
+                                "In-flight collision: {} claimed with different size (claimed: {}, expected: {}), using {}",
+                                download_path.display(),
+                                claimed_size,
+                                version.size,
+                                dedup_path.display(),
+                            );
+                            Some(dedup_path)
+                        }
+                    }
+                }
+                FileMatchPolicy::NameId7 => None,
+            }
         } else {
             Some(download_path.clone())
         };
 
         if let Some(path) = final_path {
+            claimed_paths.insert(normalize_path_for_collision(&path), version.size);
             tasks.push(DownloadTask {
                 url: version.url.clone(),
                 download_path: path,
@@ -258,10 +322,14 @@ fn filter_asset_to_tasks(
                 &created_local,
                 &mov_filename,
             );
-            // If the path already exists, it may be a different file (e.g. a
-            // regular video) that collides with the live photo companion name.
-            // Detect this by comparing the on-disk file size with the expected
-            // live photo size; on mismatch, deduplicate using the asset ID.
+            // If the path already exists (on disk or claimed), it may be a different
+            // file (e.g. a regular video) that collides with the live photo companion
+            // name. Detect this by comparing sizes; on mismatch, deduplicate using
+            // the asset ID.
+            //
+            // Use normalized paths for collision detection to handle case-insensitive
+            // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
+            let mov_normalized = normalize_path_for_collision(&mov_path);
             let final_mov_path = if mov_path.exists() {
                 let on_disk_size = std::fs::metadata(&mov_path).map(|m| m.len()).unwrap_or(0);
                 if on_disk_size == live_version.size {
@@ -276,11 +344,37 @@ fn filter_asset_to_tasks(
                         &created_local,
                         &dedup_filename,
                     );
-                    if dedup_path.exists() {
-                        None // deduped version already downloaded
+                    let dedup_normalized = normalize_path_for_collision(&dedup_path);
+                    if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
+                        None // deduped version already downloaded or claimed
                     } else {
                         tracing::debug!(
                             "Live photo MOV collision: {} already exists with different size, using {}",
+                            mov_path.display(),
+                            dedup_path.display(),
+                        );
+                        Some(dedup_path)
+                    }
+                }
+            } else if let Some(&claimed_size) = claimed_paths.get(&mov_normalized) {
+                // Path is claimed by an in-flight download
+                if claimed_size == live_version.size {
+                    None // Same size, likely duplicate
+                } else {
+                    // Collision with in-flight download — deduplicate.
+                    let dedup_filename = paths::insert_suffix(&mov_filename, asset.id());
+                    let dedup_path = paths::local_download_path(
+                        &config.directory,
+                        &config.folder_structure,
+                        &created_local,
+                        &dedup_filename,
+                    );
+                    let dedup_normalized = normalize_path_for_collision(&dedup_path);
+                    if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
+                        None
+                    } else {
+                        tracing::debug!(
+                            "Live photo MOV in-flight collision: {} claimed, using {}",
                             mov_path.display(),
                             dedup_path.display(),
                         );
@@ -291,6 +385,7 @@ fn filter_asset_to_tasks(
                 Some(mov_path)
             };
             if let Some(path) = final_mov_path {
+                claimed_paths.insert(normalize_path_for_collision(&path), live_version.size);
                 tasks.push(DownloadTask {
                     url: live_version.url.clone(),
                     download_path: path,
@@ -325,10 +420,12 @@ fn create_progress_bar(no_progress_bar: bool, total: u64) -> ProgressBar {
     pb
 }
 
-/// Threshold of consecutive auth errors before aborting the download pass.
+/// Threshold of auth errors before aborting the download pass for re-authentication.
+/// Counted cumulatively across both phases (streaming + cleanup).
 const AUTH_ERROR_THRESHOLD: usize = 3;
 
 /// Result of the streaming download phase.
+#[derive(Debug)]
 struct StreamingResult {
     downloaded: usize,
     failed: Vec<DownloadTask>,
@@ -378,6 +475,10 @@ async fn stream_and_download(
 
     let mut combined = stream::select_all(album_streams);
 
+    // Track paths claimed by in-flight downloads to detect collisions between
+    // assets with the same filename processed in the same session.
+    let mut claimed_paths: HashMap<PathBuf, u64> = HashMap::new();
+
     if config.dry_run {
         let mut count = 0usize;
         while let Some(result) = combined.next().await {
@@ -386,7 +487,7 @@ async fn stream_and_download(
                 break;
             }
             let asset = result?;
-            let tasks = filter_asset_to_tasks(&asset, config);
+            let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths);
             for task in &tasks {
                 tracing::info!("[DRY RUN] Would download {}", task.download_path.display());
             }
@@ -408,30 +509,31 @@ async fn stream_and_download(
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
 
-    let pb_ref = &pb;
-    let task_stream = combined
-        .filter_map(|result| async move {
-            match result {
-                Ok(asset) => {
-                    let tasks = filter_asset_to_tasks(&asset, config);
-                    if tasks.is_empty() {
-                        // Asset already downloaded or filtered out — advance
-                        // the progress bar so the position reflects skipped items.
-                        pb_ref.inc(1);
-                        None
-                    } else {
-                        Some(tasks)
-                    }
-                }
-                Err(e) => {
-                    // indicatif needs `suspend` to coordinate stderr/stdout writes
-                    // with the progress bar redraw, preventing garbled output.
-                    pb_ref.suspend(|| tracing::error!("Error fetching asset: {}", e));
-                    None
+    // Collect all download tasks first, processing assets sequentially to ensure
+    // proper collision detection via claimed_paths. This trades some streaming
+    // benefit for correctness when multiple assets share the same filename.
+    let mut all_tasks: Vec<DownloadTask> = Vec::new();
+    while let Some(result) = combined.next().await {
+        if shutdown_token.is_cancelled() {
+            break;
+        }
+        match result {
+            Ok(asset) => {
+                let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths);
+                if tasks.is_empty() {
+                    pb.inc(1);
+                } else {
+                    all_tasks.extend(tasks);
                 }
             }
-        })
-        .flat_map(stream::iter);
+            Err(e) => {
+                pb.suspend(|| tracing::error!("Error fetching asset: {}", e));
+            }
+        }
+    }
+
+    // Now download all tasks concurrently
+    let task_stream = stream::iter(all_tasks);
 
     let download_stream = task_stream
         .map(|task| {
@@ -479,12 +581,9 @@ async fn stream_and_download(
                                     "Auth error threshold reached, aborting for re-authentication"
                                 );
                             });
-                            pb.finish_and_clear();
-                            return Ok(StreamingResult {
-                                downloaded,
-                                failed,
-                                auth_errors,
-                            });
+                            // Use break instead of return to allow buffered tasks to
+                            // complete cleanly, matching graceful shutdown behavior.
+                            break;
                         }
                         failed.push(task);
                         pb.inc(1);
@@ -501,6 +600,7 @@ async fn stream_and_download(
     }
 
     pb.finish_and_clear();
+
     Ok(StreamingResult {
         downloaded,
         failed,
@@ -639,6 +739,7 @@ pub async fn download_photos(
 }
 
 /// Result of a download pass.
+#[derive(Debug)]
 struct PassResult {
     failed: Vec<DownloadTask>,
     auth_errors: usize,
@@ -847,6 +948,13 @@ mod tests {
         }
     }
 
+    /// Helper that calls filter_asset_to_tasks with a fresh claimed_paths map.
+    /// Use this for simple tests that don't need to track paths across calls.
+    fn filter_asset_fresh(asset: &PhotoAsset, config: &DownloadConfig) -> Vec<DownloadTask> {
+        let mut claimed_paths = HashMap::new();
+        filter_asset_to_tasks(asset, config, &mut claimed_paths)
+    }
+
     fn photo_asset_with_version() -> PhotoAsset {
         PhotoAsset::new(
             json!({"recordName": "TEST_1", "fields": {
@@ -867,7 +975,7 @@ mod tests {
     fn test_filter_asset_produces_task() {
         let asset = photo_asset_with_version();
         let config = test_config();
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].url, "https://example.com/orig");
         assert_eq!(tasks[0].checksum, "abc123");
@@ -891,7 +999,7 @@ mod tests {
         );
         let mut config = test_config();
         config.skip_videos = true;
-        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+        assert!(filter_asset_fresh(&asset, &config).is_empty());
     }
 
     #[test]
@@ -910,7 +1018,7 @@ mod tests {
             json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
         );
         let config = test_config();
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].size, 500_000_000);
     }
@@ -920,7 +1028,7 @@ mod tests {
         let asset = photo_asset_with_version();
         let mut config = test_config();
         config.skip_photos = true;
-        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+        assert!(filter_asset_fresh(&asset, &config).is_empty());
     }
 
     #[test]
@@ -938,7 +1046,7 @@ mod tests {
             json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
         );
         let config = test_config();
-        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+        assert!(filter_asset_fresh(&asset, &config).is_empty());
     }
 
     #[test]
@@ -957,7 +1065,7 @@ mod tests {
             json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
         );
         let config = test_config(); // requests Original, but only Thumb available
-        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+        assert!(filter_asset_fresh(&asset, &config).is_empty());
     }
 
     #[test]
@@ -969,13 +1077,13 @@ mod tests {
         config.directory = dir.clone();
 
         // First call should produce a task (file doesn't exist yet)
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
 
         // Create the file with matching size (1000 bytes), second call should skip
         fs::create_dir_all(tasks[0].download_path.parent().unwrap()).unwrap();
         fs::write(&tasks[0].download_path, vec![0u8; 1000]).unwrap();
-        assert!(filter_asset_to_tasks(&asset, &config).is_empty());
+        assert!(filter_asset_fresh(&asset, &config).is_empty());
 
         // Cleanup
         let _ = fs::remove_file(&tasks[0].download_path);
@@ -992,7 +1100,7 @@ mod tests {
         config.directory = dir.clone();
 
         // First call: file doesn't exist yet
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         let original_path = tasks[0].download_path.clone();
 
@@ -1001,7 +1109,7 @@ mod tests {
         fs::write(&original_path, vec![0u8; 500]).unwrap(); // 500 bytes, not 1000
 
         // Second call: should produce a task with deduped path (size suffix)
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         let dedup_path = tasks[0].download_path.to_str().unwrap();
         assert!(
@@ -1040,7 +1148,7 @@ mod tests {
     fn test_filter_produces_live_photo_mov_task() {
         let asset = photo_asset_with_live_photo();
         let config = test_config();
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].url, "https://example.com/heic_orig");
         assert_eq!(tasks[0].size, 2000);
@@ -1058,7 +1166,7 @@ mod tests {
         let asset = photo_asset_with_live_photo();
         let mut config = test_config();
         config.skip_live_photos = true;
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].url, "https://example.com/heic_orig");
     }
@@ -1068,7 +1176,7 @@ mod tests {
         let asset = photo_asset_with_live_photo();
         let mut config = test_config();
         config.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Original;
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
         assert!(tasks[1]
             .download_path
@@ -1088,7 +1196,7 @@ mod tests {
         config.directory = dir.clone();
 
         // First call: both photo and MOV
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
 
         // Create the MOV file on disk with matching size (3000 bytes)
@@ -1096,7 +1204,7 @@ mod tests {
         fs::write(&tasks[1].download_path, vec![0u8; 3000]).unwrap();
 
         // Second call: only the photo task (MOV already exists with matching size)
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].url, "https://example.com/heic_orig");
 
@@ -1114,7 +1222,7 @@ mod tests {
         config.directory = dir.clone();
 
         // First call to get the expected MOV path
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
         let mov_path = &tasks[1].download_path;
 
@@ -1124,7 +1232,7 @@ mod tests {
         fs::write(mov_path, vec![0u8; 9999]).unwrap();
 
         // Second call: should produce a deduped MOV path with asset ID suffix
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[1].url, "https://example.com/live_mov");
         let dedup_path = tasks[1].download_path.to_str().unwrap();
@@ -1160,7 +1268,7 @@ mod tests {
         );
         let mut config = test_config();
         config.live_photo_size = AssetVersionSize::LiveMedium;
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[1].url, "https://example.com/live_med");
     }
@@ -1187,7 +1295,7 @@ mod tests {
             json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
         );
         let config = test_config();
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         // Videos should get 1 task (the video itself), not a live photo MOV
         assert_eq!(tasks.len(), 1);
     }
@@ -1327,7 +1435,7 @@ mod tests {
         let mut config = test_config();
         config.align_raw = RawTreatmentPolicy::AsOriginal;
         // With AsOriginal and RAW alternative, the swap makes Original point to alt URL
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].url, "https://example.com/alt");
         assert_eq!(tasks[0].checksum, "alt_ck");
@@ -1363,6 +1471,97 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_detects_case_insensitive_collision() {
+        // On case-insensitive filesystems (macOS, Windows), IMG_0996.mov and IMG_0996.MOV
+        // are the same file. Test that claimed_paths detects this collision.
+        let dir = test_tmp_dir("download_filter_tests_case");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // First asset: regular video IMG_0996.mov
+        let video_asset = PhotoAsset::new(
+            json!({"recordName": "VID_0996", "fields": {
+                "filenameEnc": {"value": "IMG_0996.mov", "type": "STRING"},
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 258592890,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1713657600000.0}}}), // 2025/04/21
+        );
+
+        // Second asset: live photo IMG_0996.JPG whose MOV companion would be IMG_0996.MOV
+        let photo_asset = PhotoAsset::new(
+            json!({"recordName": "IMG_0996", "fields": {
+                "filenameEnc": {"value": "IMG_0996.JPG", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/jpg",
+                    "fileChecksum": "jpg_ck"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 124037918,
+                    "downloadURL": "https://example.com/live_mov",
+                    "fileChecksum": "mov_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1713657600000.0}}}), // Same date
+        );
+
+        let mut config = test_config();
+        config.directory = dir.clone();
+
+        // Process both assets through claimed_paths
+        let mut claimed_paths = HashMap::new();
+        let video_tasks = filter_asset_to_tasks(&video_asset, &config, &mut claimed_paths);
+        assert_eq!(video_tasks.len(), 1);
+        let video_path = &video_tasks[0].download_path;
+        eprintln!("Video path: {:?}", video_path);
+
+        let photo_tasks = filter_asset_to_tasks(&photo_asset, &config, &mut claimed_paths);
+        assert_eq!(photo_tasks.len(), 2, "Expected 2 tasks (photo + MOV)");
+
+        let mov_task = &photo_tasks[1];
+        let mov_path = &mov_task.download_path;
+        eprintln!("Live MOV path: {:?}", mov_path);
+        eprintln!(
+            "Claimed paths: {:?}",
+            claimed_paths.keys().collect::<Vec<_>>()
+        );
+
+        // Check if paths differ only in case (case-insensitive collision)
+        let video_filename = video_path.file_name().unwrap().to_str().unwrap();
+        let mov_filename = mov_path.file_name().unwrap().to_str().unwrap();
+        eprintln!(
+            "Video filename: {}, MOV filename: {}",
+            video_filename, mov_filename
+        );
+
+        // On case-insensitive filesystems, IMG_0996.mov and IMG_0996.MOV are the same.
+        // The MOV should be deduped (have asset ID suffix) to avoid overwriting the video.
+        let video_lower = video_filename.to_ascii_lowercase();
+        let mov_lower = mov_filename.to_ascii_lowercase();
+        if video_lower == mov_lower {
+            // They collide on case-insensitive FS - MOV must be deduped
+            assert!(
+                mov_filename.contains("-IMG_0996"),
+                "Case-insensitive collision: MOV should be deduped with asset ID suffix. \
+                Video: {}, MOV: {}",
+                video_filename,
+                mov_filename
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_create_progress_bar_with_total() {
         // When not disabled, the bar should have the correct length.
         // In CI/test environments stdout may not be a TTY, so the bar
@@ -1381,7 +1580,7 @@ mod tests {
     fn test_filter_asset_as_is_downloads_original() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let config = test_config(); // align_raw defaults to AsIs
-        let tasks = filter_asset_to_tasks(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].url, "https://example.com/orig");
         assert_eq!(tasks[0].checksum, "orig_ck");
