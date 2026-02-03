@@ -27,7 +27,20 @@ use tokio_util::sync::CancellationToken;
 use crate::icloud::photos::types::AssetVersion;
 use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum};
 use crate::retry::RetryConfig;
-use crate::types::{LivePhotoMovFilenamePolicy, RawTreatmentPolicy};
+use crate::types::{FileMatchPolicy, LivePhotoMovFilenamePolicy, RawTreatmentPolicy};
+
+use error::DownloadError;
+
+/// Outcome of a download pass.
+#[derive(Debug)]
+pub enum DownloadOutcome {
+    /// All downloads completed successfully.
+    Success,
+    /// Session expired mid-sync; caller should re-authenticate and retry.
+    SessionExpired { auth_error_count: usize },
+    /// Some downloads failed (not session-related).
+    PartialFailure { failed_count: usize },
+}
 
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
@@ -50,6 +63,7 @@ pub struct DownloadConfig {
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub(crate) align_raw: RawTreatmentPolicy,
     pub(crate) no_progress_bar: bool,
+    pub(crate) file_match_policy: FileMatchPolicy,
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.
@@ -173,11 +187,55 @@ fn filter_asset_to_tasks(
     let versions = apply_raw_policy(asset.versions(), config.align_raw);
     let mut tasks = Vec::new();
 
-    if !download_path.exists() {
-        if let Some(version) = versions.get(&config.size) {
+    if let Some(version) = versions.get(&config.size) {
+        // Determine the final download path, applying size-based deduplication if needed.
+        let final_path = if download_path.exists() {
+            match config.file_match_policy {
+                FileMatchPolicy::NameSizeDedupWithSuffix => {
+                    // If file exists with different size, download with size suffix
+                    let on_disk_size = std::fs::metadata(&download_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    if on_disk_size == version.size {
+                        // Same size — likely already downloaded, skip.
+                        None
+                    } else {
+                        // Different size — deduplicate by appending file size to filename.
+                        let dedup_filename = paths::add_dedup_suffix(filename, version.size);
+                        let dedup_path = paths::local_download_path(
+                            &config.directory,
+                            &config.folder_structure,
+                            &created_local,
+                            &dedup_filename,
+                        );
+                        if dedup_path.exists() {
+                            None // deduped version already downloaded
+                        } else {
+                            tracing::debug!(
+                                "File collision: {} already exists with different size (on-disk: {}, expected: {}), using {}",
+                                download_path.display(),
+                                on_disk_size,
+                                version.size,
+                                dedup_path.display(),
+                            );
+                            Some(dedup_path)
+                        }
+                    }
+                }
+                FileMatchPolicy::NameId7 => {
+                    // name-id7 policy adds asset ID to ALL filenames, not just collisions.
+                    // If the file exists, it's already downloaded, skip.
+                    None
+                }
+            }
+        } else {
+            Some(download_path.clone())
+        };
+
+        if let Some(path) = final_path {
             tasks.push(DownloadTask {
                 url: version.url.clone(),
-                download_path: download_path.clone(),
+                download_path: path,
                 checksum: version.checksum.clone(),
                 created_local,
                 size: version.size,
@@ -267,6 +325,16 @@ fn create_progress_bar(no_progress_bar: bool, total: u64) -> ProgressBar {
     pb
 }
 
+/// Threshold of consecutive auth errors before aborting the download pass.
+const AUTH_ERROR_THRESHOLD: usize = 3;
+
+/// Result of the streaming download phase.
+struct StreamingResult {
+    downloaded: usize,
+    failed: Vec<DownloadTask>,
+    auth_errors: usize,
+}
+
 /// Streaming download pipeline — merges per-album streams and pipes assets
 /// directly into the download loop as they arrive from the API.
 ///
@@ -274,12 +342,16 @@ fn create_progress_bar(no_progress_bar: bool, total: u64) -> ProgressBar {
 /// download begins as soon as the first API page returns. Each album's
 /// background task prefetches the next page via a channel buffer, so API
 /// latency overlaps with download I/O.
+///
+/// Returns `StreamingResult` containing download counts, failed tasks, and
+/// auth error count. When auth errors exceed the threshold, the function
+/// returns early to allow re-authentication.
 async fn stream_and_download(
     download_client: &Client,
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
     shutdown_token: CancellationToken,
-) -> Result<(usize, Vec<DownloadTask>)> {
+) -> Result<StreamingResult> {
     // Lightweight count-only API query (HyperionIndexCountLookup) — separate
     // from the page-by-page photo fetch, used to size the progress bar.
     // When --recent is set, cap to that limit since the stream will stop early.
@@ -320,7 +392,11 @@ async fn stream_and_download(
             }
             count += tasks.len();
         }
-        return Ok((count, Vec::new()));
+        return Ok(StreamingResult {
+            downloaded: count,
+            failed: Vec::new(),
+            auth_errors: 0,
+        });
     }
 
     let download_client = download_client.clone();
@@ -330,6 +406,7 @@ async fn stream_and_download(
 
     let mut downloaded = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
+    let mut auth_errors = 0usize;
 
     let pb_ref = &pb;
     let task_stream = combined
@@ -383,6 +460,37 @@ async fn stream_and_download(
         match result {
             Ok(()) => downloaded += 1,
             Err(e) => {
+                // Check if this is a session expiry error
+                if let Some(download_err) = e.downcast_ref::<DownloadError>() {
+                    if download_err.is_session_expired() {
+                        auth_errors += 1;
+                        pb.suspend(|| {
+                            tracing::warn!(
+                                "Auth error ({}/{}): {} - {}",
+                                auth_errors,
+                                AUTH_ERROR_THRESHOLD,
+                                task.download_path.display(),
+                                e
+                            );
+                        });
+                        if auth_errors >= AUTH_ERROR_THRESHOLD {
+                            pb.suspend(|| {
+                                tracing::warn!(
+                                    "Auth error threshold reached, aborting for re-authentication"
+                                );
+                            });
+                            pb.finish_and_clear();
+                            return Ok(StreamingResult {
+                                downloaded,
+                                failed,
+                                auth_errors,
+                            });
+                        }
+                        failed.push(task);
+                        pb.inc(1);
+                        continue;
+                    }
+                }
                 pb.suspend(|| {
                     tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
                 });
@@ -393,7 +501,11 @@ async fn stream_and_download(
     }
 
     pb.finish_and_clear();
-    Ok((downloaded, failed))
+    Ok(StreamingResult {
+        downloaded,
+        failed,
+        auth_errors,
+    })
 }
 
 /// Entry point for the download engine.
@@ -404,16 +516,30 @@ async fn stream_and_download(
 /// Phase 2 (cleanup): Re-fetch from the API to get fresh CDN URLs (the
 /// originals may have expired during a long Phase 1) and retry failures at
 /// reduced concurrency to give large files full bandwidth.
+///
+/// Returns `DownloadOutcome` indicating whether all downloads succeeded,
+/// the session expired (requiring re-auth), or some downloads failed.
 pub async fn download_photos(
     download_client: &Client,
     albums: &[PhotoAlbum],
     config: &DownloadConfig,
     shutdown_token: CancellationToken,
-) -> Result<()> {
+) -> Result<DownloadOutcome> {
     let started = Instant::now();
 
-    let (downloaded, failed_tasks) =
+    let streaming_result =
         stream_and_download(download_client, albums, config, shutdown_token.clone()).await?;
+
+    let downloaded = streaming_result.downloaded;
+    let failed_tasks = streaming_result.failed;
+    let auth_errors = streaming_result.auth_errors;
+
+    // If auth errors exceeded threshold, return early for re-authentication
+    if auth_errors >= AUTH_ERROR_THRESHOLD {
+        return Ok(DownloadOutcome::SessionExpired {
+            auth_error_count: auth_errors,
+        });
+    }
 
     if downloaded == 0 && failed_tasks.is_empty() {
         if config.dry_run {
@@ -423,7 +549,7 @@ pub async fn download_photos(
         } else {
             tracing::info!("No new photos to download");
         }
-        return Ok(());
+        return Ok(DownloadOutcome::Success);
     }
 
     if config.dry_run {
@@ -438,7 +564,7 @@ pub async fn download_photos(
         }
         tracing::info!("  destination: {}", config.directory.display());
         tracing::info!("  concurrency: {}", config.concurrent_downloads);
-        return Ok(());
+        return Ok(DownloadOutcome::Success);
     }
 
     let total = downloaded + failed_tasks.len();
@@ -447,7 +573,7 @@ pub async fn download_photos(
         tracing::info!("── Summary ──");
         tracing::info!("  {} downloaded, 0 failed, {} total", total, total);
         tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
-        return Ok(());
+        return Ok(DownloadOutcome::Success);
     }
 
     // Phase 2: CDN URLs from Phase 1 may have expired during a long
@@ -465,7 +591,7 @@ pub async fn download_photos(
     tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
     let phase2_task_count = fresh_tasks.len();
-    let remaining_failed = run_download_pass(
+    let pass_result = run_download_pass(
         download_client,
         fresh_tasks,
         &config.retry,
@@ -475,6 +601,17 @@ pub async fn download_photos(
         shutdown_token,
     )
     .await;
+
+    let remaining_failed = pass_result.failed;
+    let phase2_auth_errors = pass_result.auth_errors;
+    let total_auth_errors = auth_errors + phase2_auth_errors;
+
+    // If auth errors exceeded threshold during phase 2, return for re-auth
+    if total_auth_errors >= AUTH_ERROR_THRESHOLD {
+        return Ok(DownloadOutcome::SessionExpired {
+            auth_error_count: total_auth_errors,
+        });
+    }
 
     let failed = remaining_failed.len();
     let phase2_succeeded = phase2_task_count - failed;
@@ -493,10 +630,18 @@ pub async fn download_photos(
         for task in &remaining_failed {
             tracing::error!("Download failed: {}", task.download_path.display());
         }
-        anyhow::bail!("{} of {} downloads failed", failed, final_total);
+        return Ok(DownloadOutcome::PartialFailure {
+            failed_count: failed,
+        });
     }
 
-    Ok(())
+    Ok(DownloadOutcome::Success)
+}
+
+/// Result of a download pass.
+struct PassResult {
+    failed: Vec<DownloadTask>,
+    auth_errors: usize,
 }
 
 /// Execute a download pass over the given tasks, returning any that failed.
@@ -508,7 +653,7 @@ async fn run_download_pass(
     concurrency: usize,
     no_progress_bar: bool,
     shutdown_token: CancellationToken,
-) -> Vec<DownloadTask> {
+) -> PassResult {
     let pb = create_progress_bar(no_progress_bar, tasks.len() as u64);
     let client = client.clone();
 
@@ -525,24 +670,34 @@ async fn run_download_pass(
         .collect()
         .await;
 
-    let failed: Vec<DownloadTask> = results
-        .into_iter()
-        .filter_map(|(task, result)| {
-            if let Err(e) = &result {
+    let mut failed: Vec<DownloadTask> = Vec::new();
+    let mut auth_errors = 0usize;
+
+    for (task, result) in results {
+        if let Err(e) = &result {
+            // Check if this is a session expiry error
+            if let Some(download_err) = e.downcast_ref::<DownloadError>() {
+                if download_err.is_session_expired() {
+                    auth_errors += 1;
+                    pb.suspend(|| {
+                        tracing::warn!("Auth error: {} - {}", task.download_path.display(), e);
+                    });
+                }
+            } else {
                 pb.suspend(|| {
                     tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
                 });
-                pb.inc(1);
-                Some(task)
-            } else {
-                pb.inc(1);
-                None
             }
-        })
-        .collect();
+            failed.push(task);
+        }
+        pb.inc(1);
+    }
 
     pb.finish_and_clear();
-    failed
+    PassResult {
+        failed,
+        auth_errors,
+    }
 }
 
 /// Download a single task, handling mtime and EXIF stamping on success.
@@ -688,6 +843,7 @@ mod tests {
             live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
             align_raw: RawTreatmentPolicy::AsIs,
             no_progress_bar: true,
+            file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
         }
     }
 
@@ -816,13 +972,46 @@ mod tests {
         let tasks = filter_asset_to_tasks(&asset, &config);
         assert_eq!(tasks.len(), 1);
 
-        // Create the file, second call should skip
+        // Create the file with matching size (1000 bytes), second call should skip
         fs::create_dir_all(tasks[0].download_path.parent().unwrap()).unwrap();
-        fs::write(&tasks[0].download_path, b"existing").unwrap();
+        fs::write(&tasks[0].download_path, vec![0u8; 1000]).unwrap();
         assert!(filter_asset_to_tasks(&asset, &config).is_empty());
 
         // Cleanup
         let _ = fs::remove_file(&tasks[0].download_path);
+    }
+
+    #[test]
+    fn test_filter_deduplicates_file_with_different_size() {
+        let dir = test_tmp_dir("download_filter_tests_dedup");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let asset = photo_asset_with_version(); // version.size = 1000
+        let mut config = test_config();
+        config.directory = dir.clone();
+
+        // First call: file doesn't exist yet
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let original_path = tasks[0].download_path.clone();
+
+        // Create a file with DIFFERENT size (simulating a collision with different content)
+        fs::create_dir_all(original_path.parent().unwrap()).unwrap();
+        fs::write(&original_path, vec![0u8; 500]).unwrap(); // 500 bytes, not 1000
+
+        // Second call: should produce a task with deduped path (size suffix)
+        let tasks = filter_asset_to_tasks(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let dedup_path = tasks[0].download_path.to_str().unwrap();
+        assert!(
+            dedup_path.contains("-1000."),
+            "Expected size suffix '-1000.' in deduped path, got: {}",
+            dedup_path,
+        );
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn photo_asset_with_live_photo() -> PhotoAsset {
@@ -1227,8 +1416,8 @@ mod tests {
         let retry = RetryConfig::default();
 
         // Pre-cancelled token: take_while stops immediately, no downloads attempted.
-        let failed = run_download_pass(&client, tasks, &retry, false, 1, true, token).await;
-        assert!(failed.is_empty());
+        let result = run_download_pass(&client, tasks, &retry, false, 1, true, token).await;
+        assert!(result.failed.is_empty());
     }
 
     #[tokio::test]
@@ -1252,7 +1441,7 @@ mod tests {
         };
 
         // Non-cancelled token: task is attempted (and fails since URL is bogus).
-        let failed = run_download_pass(&client, tasks, &retry, false, 1, true, token).await;
-        assert_eq!(failed.len(), 1);
+        let result = run_download_pass(&client, tasks, &retry, false, 1, true, token).await;
+        assert_eq!(result.failed.len(), 1);
     }
 }
