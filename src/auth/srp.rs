@@ -37,7 +37,11 @@ fn derive_apple_password(password: &str, protocol: &str, salt: &[u8], iterations
     let hash = Sha256::digest(password.as_bytes());
 
     let password_digest: Vec<u8> = if protocol == "s2k_fo" {
-        let hex_str: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+        use std::fmt::Write;
+        let hex_str = hash.iter().fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         hex_str.into_bytes()
     } else {
         hash.to_vec()

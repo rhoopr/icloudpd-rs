@@ -282,7 +282,11 @@ async fn verify_checksum(path: &Path, expected: &str) -> anyhow::Result<bool> {
         let mut hasher = Sha256::new();
         std::io::copy(&mut file, &mut hasher)?;
         let hash = hasher.finalize();
-        let computed: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+        use std::fmt::Write;
+        let computed = hash.iter().fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        });
 
         // Apple sometimes uses a 33-byte format with a leading byte
         let expected_normalized = if expected.len() == 66 && expected.starts_with("01") {

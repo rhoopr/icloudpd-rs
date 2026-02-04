@@ -314,13 +314,16 @@ fn apply_raw_policy(
         return std::borrow::Cow::Borrowed(versions);
     }
 
-    // Find indices for Original and Alternative
-    let orig_idx = versions
-        .iter()
-        .position(|(k, _)| *k == AssetVersionSize::Original);
-    let alt_idx = versions
-        .iter()
-        .position(|(k, _)| *k == AssetVersionSize::Alternative);
+    // Find indices for Original and Alternative in a single pass
+    let (orig_idx, alt_idx) =
+        versions
+            .iter()
+            .enumerate()
+            .fold((None, None), |(orig, alt), (idx, (k, _))| match k {
+                AssetVersionSize::Original => (Some(idx), alt),
+                AssetVersionSize::Alternative => (orig, Some(idx)),
+                _ => (orig, alt),
+            });
 
     let alt_idx = match alt_idx {
         Some(idx) => idx,
