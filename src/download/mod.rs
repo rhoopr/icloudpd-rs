@@ -874,54 +874,19 @@ async fn stream_and_download(
     let download_stream = task_stream
         .map(|task| {
             let client = download_client.clone();
-            let db = state_db.clone();
             async move {
                 let result = download_single_task(&client, &task, &retry_config, set_exif).await;
-
-                // Record outcome in state DB
-                if let Some(db) = &db {
-                    match &result {
-                        Ok(()) => {
-                            if let Err(e) = db
-                                .mark_downloaded(
-                                    &task.asset_id,
-                                    task.version_size.as_str(),
-                                    &task.download_path,
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to mark {} as downloaded in state DB: {}",
-                                    task.asset_id,
-                                    e
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if let Err(db_err) = db
-                                .mark_failed(
-                                    &task.asset_id,
-                                    task.version_size.as_str(),
-                                    &e.to_string(),
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to mark {} as failed in state DB: {}",
-                                    task.asset_id,
-                                    db_err
-                                );
-                            }
-                        }
-                    }
-                }
-
                 (task, result)
             }
         })
         .buffer_unordered(concurrency);
 
     tokio::pin!(download_stream);
+
+    // Batch DB writes for better throughput — flush every N completions
+    const DB_BATCH_SIZE: usize = 50;
+    let mut downloaded_batch: Vec<(String, String, PathBuf)> = Vec::with_capacity(DB_BATCH_SIZE);
+    let mut failed_batch: Vec<(String, String, String)> = Vec::with_capacity(DB_BATCH_SIZE);
 
     while let Some((task, result)) = download_stream.next().await {
         if shutdown_token.is_cancelled() {
@@ -936,7 +901,16 @@ async fn stream_and_download(
             .to_string();
         pb.set_message(filename);
         match result {
-            Ok(()) => downloaded += 1,
+            Ok(()) => {
+                downloaded += 1;
+                if state_db.is_some() {
+                    downloaded_batch.push((
+                        task.asset_id.clone(),
+                        task.version_size.as_str().to_string(),
+                        task.download_path.clone(),
+                    ));
+                }
+            }
             Err(e) => {
                 // Check if this is a session expiry error
                 if let Some(download_err) = e.downcast_ref::<DownloadError>() {
@@ -961,6 +935,13 @@ async fn stream_and_download(
                             // complete cleanly, matching graceful shutdown behavior.
                             break;
                         }
+                        if state_db.is_some() {
+                            failed_batch.push((
+                                task.asset_id.clone(),
+                                task.version_size.as_str().to_string(),
+                                e.to_string(),
+                            ));
+                        }
                         failed.push(task);
                         pb.inc(1);
                         continue;
@@ -969,10 +950,63 @@ async fn stream_and_download(
                 pb.suspend(|| {
                     tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
                 });
+                if state_db.is_some() {
+                    failed_batch.push((
+                        task.asset_id.clone(),
+                        task.version_size.as_str().to_string(),
+                        e.to_string(),
+                    ));
+                }
                 failed.push(task);
             }
         }
         pb.inc(1);
+
+        // Flush batches periodically
+        if let Some(db) = &state_db {
+            if downloaded_batch.len() >= DB_BATCH_SIZE {
+                if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
+                    tracing::warn!(
+                        "Failed to batch mark {} downloads: {}",
+                        downloaded_batch.len(),
+                        e
+                    );
+                }
+                downloaded_batch.clear();
+            }
+            if failed_batch.len() >= DB_BATCH_SIZE {
+                if let Err(e) = db.mark_failed_batch(&failed_batch).await {
+                    tracing::warn!(
+                        "Failed to batch mark {} failures: {}",
+                        failed_batch.len(),
+                        e
+                    );
+                }
+                failed_batch.clear();
+            }
+        }
+    }
+
+    // Flush remaining batches
+    if let Some(db) = &state_db {
+        if !downloaded_batch.is_empty() {
+            if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
+                tracing::warn!(
+                    "Failed to batch mark {} downloads: {}",
+                    downloaded_batch.len(),
+                    e
+                );
+            }
+        }
+        if !failed_batch.is_empty() {
+            if let Err(e) = db.mark_failed_batch(&failed_batch).await {
+                tracing::warn!(
+                    "Failed to batch mark {} failures: {}",
+                    failed_batch.len(),
+                    e
+                );
+            }
+        }
     }
 
     pb.finish_and_clear();
@@ -1075,8 +1109,8 @@ pub async fn download_photos(
 
     // Phase 2: CDN URLs from Phase 1 may have expired during a long
     // download session. Re-fetch the full task list for fresh URLs and
-    // retry at concurrency 1 to give large files full bandwidth.
-    let cleanup_concurrency = 1;
+    // retry with moderate parallelism (balance throughput vs. bandwidth per file).
+    let cleanup_concurrency = 5;
     let failure_count = failed_tasks.len();
     tracing::info!(
         "── Cleanup pass: re-fetching URLs and retrying {} failed downloads (concurrency: {}) ──",
@@ -1167,48 +1201,8 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
         .map(|task| {
             let client = client.clone();
-            let db = state_db.clone();
             async move {
                 let result = download_single_task(&client, &task, retry_config, set_exif).await;
-
-                // Record outcome in state DB
-                if let Some(db) = &db {
-                    match &result {
-                        Ok(()) => {
-                            if let Err(e) = db
-                                .mark_downloaded(
-                                    &task.asset_id,
-                                    task.version_size.as_str(),
-                                    &task.download_path,
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to mark {} as downloaded in state DB: {}",
-                                    task.asset_id,
-                                    e
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if let Err(db_err) = db
-                                .mark_failed(
-                                    &task.asset_id,
-                                    task.version_size.as_str(),
-                                    &e.to_string(),
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to mark {} as failed in state DB: {}",
-                                    task.asset_id,
-                                    db_err
-                                );
-                            }
-                        }
-                    }
-                }
-
                 (task, result)
             }
         })
@@ -1219,24 +1213,68 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
 
+    // Collect DB updates for batch write
+    let mut downloaded_batch: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut failed_batch: Vec<(String, String, String)> = Vec::new();
+
     for (task, result) in results {
-        if let Err(e) = &result {
-            // Check if this is a session expiry error
-            if let Some(download_err) = e.downcast_ref::<DownloadError>() {
-                if download_err.is_session_expired() {
-                    auth_errors += 1;
+        match &result {
+            Ok(()) => {
+                if state_db.is_some() {
+                    downloaded_batch.push((
+                        task.asset_id.clone(),
+                        task.version_size.as_str().to_string(),
+                        task.download_path.clone(),
+                    ));
+                }
+            }
+            Err(e) => {
+                // Check if this is a session expiry error
+                if let Some(download_err) = e.downcast_ref::<DownloadError>() {
+                    if download_err.is_session_expired() {
+                        auth_errors += 1;
+                        pb.suspend(|| {
+                            tracing::warn!("Auth error: {} - {}", task.download_path.display(), e);
+                        });
+                    }
+                } else {
                     pb.suspend(|| {
-                        tracing::warn!("Auth error: {} - {}", task.download_path.display(), e);
+                        tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
                     });
                 }
-            } else {
-                pb.suspend(|| {
-                    tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
-                });
+                if state_db.is_some() {
+                    failed_batch.push((
+                        task.asset_id.clone(),
+                        task.version_size.as_str().to_string(),
+                        e.to_string(),
+                    ));
+                }
+                failed.push(task);
             }
-            failed.push(task);
         }
         pb.inc(1);
+    }
+
+    // Batch write DB updates
+    if let Some(db) = &state_db {
+        if !downloaded_batch.is_empty() {
+            if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
+                tracing::warn!(
+                    "Failed to batch mark {} downloads: {}",
+                    downloaded_batch.len(),
+                    e
+                );
+            }
+        }
+        if !failed_batch.is_empty() {
+            if let Err(e) = db.mark_failed_batch(&failed_batch).await {
+                tracing::warn!(
+                    "Failed to batch mark {} failures: {}",
+                    failed_batch.len(),
+                    e
+                );
+            }
+        }
     }
 
     pb.finish_and_clear();

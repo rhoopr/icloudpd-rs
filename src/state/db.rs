@@ -54,6 +54,10 @@ pub trait StateDb: Send + Sync {
     ) -> Result<(), StateError>;
 
     /// Mark an asset as failed with an error message.
+    ///
+    /// Note: The download engine uses `mark_failed_batch` for efficiency.
+    /// This method is retained for API completeness with `mark_downloaded`.
+    #[allow(dead_code)]
     async fn mark_failed(
         &self,
         id: &str,
@@ -101,9 +105,7 @@ pub trait StateDb: Send + Sync {
 
     /// Batch mark assets as successfully downloaded.
     ///
-    /// Note: Available for future optimization when batching download results.
-    /// Currently download results are recorded individually as each task completes.
-    #[allow(dead_code)]
+    /// Used by the download engine to reduce per-download DB overhead.
     async fn mark_downloaded_batch(
         &self,
         items: &[(String, String, PathBuf)],
@@ -111,9 +113,7 @@ pub trait StateDb: Send + Sync {
 
     /// Batch mark assets as failed with error messages.
     ///
-    /// Note: Available for future optimization when batching download results.
-    /// Currently download results are recorded individually as each task completes.
-    #[allow(dead_code)]
+    /// Used by the download engine to reduce per-download DB overhead.
     async fn mark_failed_batch(&self, items: &[(String, String, String)])
         -> Result<(), StateError>;
 }
