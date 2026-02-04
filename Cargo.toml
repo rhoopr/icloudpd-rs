@@ -68,3 +68,7 @@ urlencoding = "2"
 
 # SQLite state tracking
 rusqlite = { version = "0.38", features = ["bundled"] }
+
+# Memory optimization
+smallvec = "1.15"
+rustc-hash = "2.1"

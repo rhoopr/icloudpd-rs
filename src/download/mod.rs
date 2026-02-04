@@ -8,7 +8,6 @@ pub mod exif;
 pub mod file;
 pub mod paths;
 
-use std::collections::{HashMap, HashSet};
 use std::fs::FileTimes;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,6 +17,7 @@ use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -26,40 +26,44 @@ use futures_util::stream::{self, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::types::AssetVersion;
-use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum};
+use crate::icloud::photos::{AssetItemType, AssetVersionSize, PhotoAlbum, VersionsMap};
 use crate::retry::RetryConfig;
-use crate::state::{AssetRecord, MediaType, StateDb, SyncRunStats};
+use crate::state::{AssetRecord, MediaType, StateDb, SyncRunStats, VersionSizeKey};
 use crate::types::{FileMatchPolicy, LivePhotoMovFilenamePolicy, RawTreatmentPolicy};
 
 use error::DownloadError;
 
 /// Determine the media type for an asset based on version size and item type.
 pub fn determine_media_type(
-    version_size: &str,
+    version_size: VersionSizeKey,
     asset: &crate::icloud::photos::PhotoAsset,
 ) -> MediaType {
-    if version_size.contains("live") {
-        if asset.item_type() == Some(AssetItemType::Image) {
-            MediaType::LivePhotoVideo
-        } else {
-            MediaType::Video
+    match version_size {
+        VersionSizeKey::LiveOriginal | VersionSizeKey::LiveMedium | VersionSizeKey::LiveThumb => {
+            if asset.item_type() == Some(AssetItemType::Image) {
+                MediaType::LivePhotoVideo
+            } else {
+                MediaType::Video
+            }
         }
-    } else if asset.item_type() == Some(AssetItemType::Movie) {
-        MediaType::Video
-    } else if asset.item_type() == Some(AssetItemType::Image) {
-        // Could be live photo image or regular photo
-        // Check if asset has live photo versions
-        let versions = asset.versions();
-        if versions.contains_key(&AssetVersionSize::LiveOriginal)
-            || versions.contains_key(&AssetVersionSize::LiveMedium)
-            || versions.contains_key(&AssetVersionSize::LiveThumb)
-        {
-            MediaType::LivePhotoImage
-        } else {
-            MediaType::Photo
+        _ => {
+            if asset.item_type() == Some(AssetItemType::Movie) {
+                MediaType::Video
+            } else if asset.item_type() == Some(AssetItemType::Image) {
+                // Could be live photo image or regular photo
+                // Check if asset has live photo versions
+                if asset.contains_version(&AssetVersionSize::LiveOriginal)
+                    || asset.contains_version(&AssetVersionSize::LiveMedium)
+                    || asset.contains_version(&AssetVersionSize::LiveThumb)
+                {
+                    MediaType::LivePhotoImage
+                } else {
+                    MediaType::Photo
+                }
+            } else {
+                MediaType::Photo
+            }
         }
-    } else {
-        MediaType::Photo
     }
 }
 
@@ -180,17 +184,27 @@ impl std::fmt::Debug for DownloadConfig {
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.
+///
+/// Fields ordered for optimal memory layout:
+/// - Heap types first (String, PathBuf)
+/// - 8-byte primitives (u64)
+/// - DateTime (12-16 bytes)
+/// - 1-byte enum last
 #[derive(Debug, Clone)]
 struct DownloadTask {
+    // Heap types first
     url: String,
     download_path: PathBuf,
     checksum: String,
-    created_local: DateTime<Local>,
-    size: u64,
     /// iCloud asset ID for state tracking.
     asset_id: String,
-    /// Version size key (e.g., "original", "live_original") for state tracking.
-    version_size: String,
+    // 8-byte primitives
+    size: u64,
+    // DateTime
+    created_local: DateTime<Local>,
+    // 1-byte enum
+    /// Version size key for state tracking.
+    version_size: VersionSizeKey,
 }
 
 /// Pre-loaded download state for O(1) skip decisions.
@@ -198,20 +212,32 @@ struct DownloadTask {
 /// Loaded once at sync start from the state database, this enables fast
 /// in-memory lookups instead of per-asset DB queries. For 100K+ asset
 /// libraries, this significantly reduces DB roundtrips.
+///
+/// Uses FxHash for faster hashing of string keys compared to SipHash.
 #[derive(Debug, Default)]
 struct DownloadContext {
     /// Set of (asset_id, version_size) pairs that are already downloaded.
-    downloaded_ids: HashSet<(String, String)>,
+    downloaded_ids: FxHashSet<(String, String)>,
     /// Map of (asset_id, version_size) -> checksum for downloaded assets.
     /// Used to detect checksum changes (iCloud asset updated) without DB queries.
-    downloaded_checksums: HashMap<(String, String), String>,
+    downloaded_checksums: FxHashMap<(String, String), String>,
 }
 
 impl DownloadContext {
     /// Load the download context from the state database.
     async fn load(db: &dyn StateDb) -> Self {
-        let downloaded_ids = db.get_downloaded_ids().await.unwrap_or_default();
-        let downloaded_checksums = db.get_downloaded_checksums().await.unwrap_or_default();
+        let downloaded_ids: FxHashSet<_> = db
+            .get_downloaded_ids()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let downloaded_checksums: FxHashMap<_, _> = db
+            .get_downloaded_checksums()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         Self {
             downloaded_ids,
             downloaded_checksums,
@@ -225,10 +251,10 @@ impl DownloadContext {
     fn should_download_fast(
         &self,
         asset_id: &str,
-        version_size: &str,
+        version_size: VersionSizeKey,
         checksum: &str,
     ) -> Option<bool> {
-        let key = (asset_id.to_string(), version_size.to_string());
+        let key = (asset_id.to_string(), version_size.as_str().to_string());
 
         if !self.downloaded_ids.contains(&key) {
             // Not in downloaded set — needs download
@@ -266,7 +292,7 @@ async fn build_download_tasks(
         .await;
 
     let mut tasks: Vec<DownloadTask> = Vec::new();
-    let mut claimed_paths: HashMap<NormalizedPath, u64> = HashMap::new();
+    let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
     for album_result in album_results {
         let assets = album_result?;
 
@@ -281,23 +307,31 @@ async fn build_download_tasks(
 /// Apply the RAW alignment policy by swapping Original and Alternative versions
 /// when appropriate, matching Python's `apply_raw_policy()`.
 fn apply_raw_policy(
-    versions: &HashMap<AssetVersionSize, AssetVersion>,
+    versions: &VersionsMap,
     policy: RawTreatmentPolicy,
-) -> std::borrow::Cow<'_, HashMap<AssetVersionSize, AssetVersion>> {
+) -> std::borrow::Cow<'_, VersionsMap> {
     if policy == RawTreatmentPolicy::Unchanged {
         return std::borrow::Cow::Borrowed(versions);
     }
 
-    let alt = match versions.get(&AssetVersionSize::Alternative) {
-        Some(v) => v,
+    // Find indices for Original and Alternative
+    let orig_idx = versions
+        .iter()
+        .position(|(k, _)| *k == AssetVersionSize::Original);
+    let alt_idx = versions
+        .iter()
+        .position(|(k, _)| *k == AssetVersionSize::Alternative);
+
+    let alt_idx = match alt_idx {
+        Some(idx) => idx,
         None => return std::borrow::Cow::Borrowed(versions),
     };
 
     let should_swap = match policy {
-        RawTreatmentPolicy::PreferOriginal => alt.asset_type.contains("raw"),
-        RawTreatmentPolicy::PreferAlternative => versions
-            .get(&AssetVersionSize::Original)
-            .is_some_and(|v| v.asset_type.contains("raw")),
+        RawTreatmentPolicy::PreferOriginal => versions[alt_idx].1.asset_type.contains("raw"),
+        RawTreatmentPolicy::PreferAlternative => orig_idx
+            .map(|idx| versions[idx].1.asset_type.contains("raw"))
+            .unwrap_or(false),
         RawTreatmentPolicy::Unchanged => false,
     };
 
@@ -305,14 +339,11 @@ fn apply_raw_policy(
         return std::borrow::Cow::Borrowed(versions);
     }
 
+    // Swap by cloning and modifying the keys
     let mut swapped = versions.clone();
-    let orig = swapped.remove(&AssetVersionSize::Original);
-    let alt = swapped.remove(&AssetVersionSize::Alternative);
-    if let Some(o) = orig {
-        swapped.insert(AssetVersionSize::Alternative, o);
-    }
-    if let Some(a) = alt {
-        swapped.insert(AssetVersionSize::Original, a);
+    if let Some(orig_idx) = orig_idx {
+        swapped[orig_idx].0 = AssetVersionSize::Alternative;
+        swapped[alt_idx].0 = AssetVersionSize::Original;
     }
     std::borrow::Cow::Owned(swapped)
 }
@@ -327,7 +358,7 @@ fn apply_raw_policy(
 fn filter_asset_to_tasks(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
-    claimed_paths: &mut HashMap<NormalizedPath, u64>,
+    claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
 ) -> Vec<DownloadTask> {
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
         return Vec::new();
@@ -367,7 +398,12 @@ fn filter_asset_to_tasks(
     let versions = apply_raw_policy(asset.versions(), config.align_raw);
     let mut tasks = Vec::new();
 
-    if let Some(version) = versions.get(&config.size) {
+    // Helper closure to find a version by key in the SmallVec
+    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
+        versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    };
+
+    if let Some(version) = get_version(&config.size) {
         // Determine the final download path, applying size-based deduplication if needed.
         // Check both on-disk files AND in-flight downloads (claimed_paths) to handle
         // concurrent downloads of assets with the same filename.
@@ -455,20 +491,20 @@ fn filter_asset_to_tasks(
         if let Some(path) = final_path {
             claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
             tasks.push(DownloadTask {
-                url: version.url.clone(),
+                url: version.url.to_string(),
                 download_path: path,
-                checksum: version.checksum.clone(),
-                created_local,
-                size: version.size,
+                checksum: version.checksum.to_string(),
                 asset_id: asset.id().to_string(),
-                version_size: format!("{:?}", config.size).to_lowercase(),
+                size: version.size,
+                created_local,
+                version_size: VersionSizeKey::from(config.size),
             });
         }
     }
 
     // Live photo MOV companion — only for images
     if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
-        if let Some(live_version) = versions.get(&config.live_photo_size) {
+        if let Some(live_version) = get_version(&config.live_photo_size) {
             let mov_filename = match config.live_photo_mov_filename_policy {
                 LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(filename),
                 LivePhotoMovFilenamePolicy::Original => {
@@ -546,13 +582,13 @@ fn filter_asset_to_tasks(
             if let Some(path) = final_mov_path {
                 claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
                 tasks.push(DownloadTask {
-                    url: live_version.url.clone(),
+                    url: live_version.url.to_string(),
                     download_path: path,
-                    checksum: live_version.checksum.clone(),
-                    created_local,
-                    size: live_version.size,
+                    checksum: live_version.checksum.to_string(),
                     asset_id: asset.id().to_string(),
-                    version_size: format!("{:?}", config.live_photo_size).to_lowercase(),
+                    size: live_version.size,
+                    created_local,
+                    version_size: VersionSizeKey::from(config.live_photo_size),
                 });
             }
         }
@@ -637,7 +673,7 @@ async fn stream_and_download(
 
     // Track paths claimed by in-flight downloads to detect collisions between
     // assets with the same filename processed in the same session.
-    let mut claimed_paths: HashMap<NormalizedPath, u64> = HashMap::new();
+    let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
 
     if config.dry_run {
         let mut count = 0usize;
@@ -722,10 +758,10 @@ async fn stream_and_download(
                     for task in tasks {
                         if state_db.is_some() {
                             // Create asset record for state tracking
-                            let media_type = determine_media_type(&task.version_size, &asset);
+                            let media_type = determine_media_type(task.version_size, &asset);
                             let record = AssetRecord::new_pending(
                                 task.asset_id.clone(),
-                                task.version_size.clone(),
+                                task.version_size,
                                 task.checksum.clone(),
                                 task.download_path
                                     .file_name()
@@ -742,7 +778,7 @@ async fn stream_and_download(
                             // Fast path: check pre-loaded state first
                             match download_ctx.should_download_fast(
                                 &task.asset_id,
-                                &task.version_size,
+                                task.version_size,
                                 &task.checksum,
                             ) {
                                 Some(true) => {
@@ -828,7 +864,7 @@ async fn stream_and_download(
                             if let Err(e) = db
                                 .mark_downloaded(
                                     &task.asset_id,
-                                    &task.version_size,
+                                    task.version_size.as_str(),
                                     &task.download_path,
                                 )
                                 .await
@@ -842,7 +878,11 @@ async fn stream_and_download(
                         }
                         Err(e) => {
                             if let Err(db_err) = db
-                                .mark_failed(&task.asset_id, &task.version_size, &e.to_string())
+                                .mark_failed(
+                                    &task.asset_id,
+                                    task.version_size.as_str(),
+                                    &e.to_string(),
+                                )
                                 .await
                             {
                                 tracing::warn!(
@@ -1117,7 +1157,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                             if let Err(e) = db
                                 .mark_downloaded(
                                     &task.asset_id,
-                                    &task.version_size,
+                                    task.version_size.as_str(),
                                     &task.download_path,
                                 )
                                 .await
@@ -1131,7 +1171,11 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                         }
                         Err(e) => {
                             if let Err(db_err) = db
-                                .mark_failed(&task.asset_id, &task.version_size, &e.to_string())
+                                .mark_failed(
+                                    &task.asset_id,
+                                    task.version_size.as_str(),
+                                    &e.to_string(),
+                                )
                                 .await
                             {
                                 tracing::warn!(
@@ -1332,7 +1376,7 @@ mod tests {
     /// Helper that calls filter_asset_to_tasks with a fresh claimed_paths map.
     /// Use this for simple tests that don't need to track paths across calls.
     fn filter_asset_fresh(asset: &PhotoAsset, config: &DownloadConfig) -> Vec<DownloadTask> {
-        let mut claimed_paths = HashMap::new();
+        let mut claimed_paths = FxHashMap::default();
         filter_asset_to_tasks(asset, config, &mut claimed_paths)
     }
 
@@ -1735,16 +1779,28 @@ mod tests {
         )
     }
 
+    /// Helper to get a version from a SmallVec by key
+    fn get_ver(versions: &VersionsMap, key: AssetVersionSize) -> Option<&AssetVersion> {
+        versions.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+
+    /// Helper to check if a version exists in a SmallVec
+    fn has_ver(versions: &VersionsMap, key: AssetVersionSize) -> bool {
+        versions.iter().any(|(k, _)| *k == key)
+    }
+
     #[test]
     fn test_raw_policy_as_is_no_swap() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::Unchanged);
         assert_eq!(
-            versions[&AssetVersionSize::Original].url,
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
             "https://example.com/orig"
         );
         assert_eq!(
-            versions[&AssetVersionSize::Alternative].url,
+            &*get_ver(&versions, AssetVersionSize::Alternative)
+                .unwrap()
+                .url,
             "https://example.com/alt"
         );
     }
@@ -1755,11 +1811,13 @@ mod tests {
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         // Alternative was RAW → swap: Original now has alt URL
         assert_eq!(
-            versions[&AssetVersionSize::Original].url,
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
             "https://example.com/alt"
         );
         assert_eq!(
-            versions[&AssetVersionSize::Alternative].url,
+            &*get_ver(&versions, AssetVersionSize::Alternative)
+                .unwrap()
+                .url,
             "https://example.com/orig"
         );
     }
@@ -1770,11 +1828,13 @@ mod tests {
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferAlternative);
         // Original was RAW → swap: Alternative now has orig URL
         assert_eq!(
-            versions[&AssetVersionSize::Original].url,
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
             "https://example.com/alt"
         );
         assert_eq!(
-            versions[&AssetVersionSize::Alternative].url,
+            &*get_ver(&versions, AssetVersionSize::Alternative)
+                .unwrap()
+                .url,
             "https://example.com/orig"
         );
     }
@@ -1784,7 +1844,7 @@ mod tests {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         assert_eq!(
-            versions[&AssetVersionSize::Original].url,
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
             "https://example.com/orig"
         );
     }
@@ -1794,7 +1854,7 @@ mod tests {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferAlternative);
         assert_eq!(
-            versions[&AssetVersionSize::Original].url,
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
             "https://example.com/orig"
         );
     }
@@ -1804,10 +1864,10 @@ mod tests {
         let asset = photo_asset_with_version(); // only has Original
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         assert_eq!(
-            versions[&AssetVersionSize::Original].url,
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
             "https://example.com/orig"
         );
-        assert!(!versions.contains_key(&AssetVersionSize::Alternative));
+        assert!(!has_ver(&versions, AssetVersionSize::Alternative));
     }
 
     #[test]
@@ -1899,7 +1959,7 @@ mod tests {
         config.directory = dir.clone();
 
         // Process both assets through claimed_paths
-        let mut claimed_paths = HashMap::new();
+        let mut claimed_paths = FxHashMap::default();
         let video_tasks = filter_asset_to_tasks(&video_asset, &config, &mut claimed_paths);
         assert_eq!(video_tasks.len(), 1);
         let video_path = &video_tasks[0].download_path;
@@ -1985,7 +2045,7 @@ mod tests {
                 created_local: chrono::Local::now(),
                 size: 1000,
                 asset_id: "ASSET_A".into(),
-                version_size: "original".into(),
+                version_size: VersionSizeKey::Original,
             },
             DownloadTask {
                 url: "https://example.com/b".into(),
@@ -1994,7 +2054,7 @@ mod tests {
                 created_local: chrono::Local::now(),
                 size: 2000,
                 asset_id: "ASSET_B".into(),
-                version_size: "original".into(),
+                version_size: VersionSizeKey::Original,
             },
         ];
 
@@ -2027,7 +2087,7 @@ mod tests {
             created_local: chrono::Local::now(),
             size: 500,
             asset_id: "ASSET_C".into(),
-            version_size: "original".into(),
+            version_size: VersionSizeKey::Original,
         }];
 
         let client = Client::new();
@@ -2049,5 +2109,15 @@ mod tests {
         };
         let result = run_download_pass(pass_config, tasks).await;
         assert_eq!(result.failed.len(), 1);
+    }
+
+    #[test]
+    fn test_download_task_size() {
+        use std::mem::size_of;
+        assert!(
+            size_of::<DownloadTask>() <= 128,
+            "DownloadTask size {} exceeds 128 bytes",
+            size_of::<DownloadTask>()
+        );
     }
 }

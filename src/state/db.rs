@@ -10,7 +10,9 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::error::StateError;
 use super::schema;
-use super::types::{AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary};
+use super::types::{
+    AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary, VersionSizeKey,
+};
 
 /// Trait for state database operations.
 ///
@@ -270,7 +272,7 @@ impl StateDb for SqliteStateDb {
 
     async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
         let id = record.id.clone();
-        let version_size = record.version_size.clone();
+        let version_size = record.version_size.as_str().to_string();
         let checksum = record.checksum.clone();
         let filename = record.filename.clone();
         let created_at = record.created_at.timestamp();
@@ -611,7 +613,7 @@ impl StateDb for SqliteStateDb {
             for record in records {
                 stmt.execute(rusqlite::params![
                     record.id,
-                    record.version_size,
+                    record.version_size.as_str(),
                     record.checksum,
                     record.filename,
                     record.created_at.timestamp(),
@@ -735,7 +737,7 @@ impl StateDb for SqliteStateDb {
 /// Convert a database row to an AssetRecord.
 fn row_to_asset_record(row: &rusqlite::Row<'_>) -> AssetRecord {
     let id: String = row.get(0).unwrap_or_default();
-    let version_size: String = row.get(1).unwrap_or_default();
+    let version_size_str: String = row.get(1).unwrap_or_default();
     let checksum: String = row.get(2).unwrap_or_default();
     let filename: String = row.get(3).unwrap_or_default();
     let created_at_ts: i64 = row.get(4).unwrap_or(0);
@@ -751,25 +753,26 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> AssetRecord {
 
     AssetRecord {
         id,
-        version_size,
         checksum,
         filename,
+        local_path: local_path_str.map(PathBuf::from),
+        last_error,
+        size_bytes: size_bytes as u64,
         created_at: Utc
             .timestamp_opt(created_at_ts, 0)
             .single()
             .unwrap_or(DateTime::UNIX_EPOCH),
         added_at: added_at_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
-        size_bytes: size_bytes as u64,
-        media_type: MediaType::from_str(&media_type_str).unwrap_or(MediaType::Photo),
-        status: AssetStatus::from_str(&status_str).unwrap_or(AssetStatus::Pending),
         downloaded_at: downloaded_at_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
-        local_path: local_path_str.map(PathBuf::from),
         last_seen_at: Utc
             .timestamp_opt(last_seen_at_ts, 0)
             .single()
             .unwrap_or(DateTime::UNIX_EPOCH),
         download_attempts: download_attempts as u32,
-        last_error,
+        version_size: VersionSizeKey::from_str(&version_size_str)
+            .unwrap_or(VersionSizeKey::Original),
+        media_type: MediaType::from_str(&media_type_str).unwrap_or(MediaType::Photo),
+        status: AssetStatus::from_str(&status_str).unwrap_or(AssetStatus::Pending),
     }
 }
 
@@ -813,7 +816,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -847,7 +850,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -875,7 +878,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -912,7 +915,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "old_checksum".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -940,7 +943,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -967,7 +970,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -994,7 +997,7 @@ mod tests {
         for i in 0..3 {
             let record = AssetRecord::new_pending(
                 format!("PENDING_{}", i),
-                "original".to_string(),
+                VersionSizeKey::Original,
                 format!("checksum_{}", i),
                 format!("photo_{}.jpg", i),
                 Utc::now(),
@@ -1009,7 +1012,7 @@ mod tests {
         for i in 0..2 {
             let record = AssetRecord::new_pending(
                 format!("DOWNLOADED_{}", i),
-                "original".to_string(),
+                VersionSizeKey::Original,
                 format!("dl_checksum_{}", i),
                 format!("dl_photo_{}.jpg", i),
                 Utc::now(),
@@ -1027,7 +1030,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "FAILED_1".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "fail_checksum".to_string(),
             "fail_photo.jpg".to_string(),
             Utc::now(),
@@ -1078,7 +1081,7 @@ mod tests {
 
         let record = AssetRecord::new_pending(
             "ABC123".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "checksum123".to_string(),
             "photo.jpg".to_string(),
             Utc::now(),
@@ -1111,7 +1114,7 @@ mod tests {
         for i in 0..3 {
             let record = AssetRecord::new_pending(
                 format!("DL_{}", i),
-                "original".to_string(),
+                VersionSizeKey::Original,
                 format!("checksum_{}", i),
                 format!("photo_{}.jpg", i),
                 Utc::now(),
@@ -1142,7 +1145,7 @@ mod tests {
         for i in 0..3 {
             let record = AssetRecord::new_pending(
                 format!("DL_{}", i),
-                "original".to_string(),
+                VersionSizeKey::Original,
                 format!("checksum_{}", i),
                 format!("photo_{}.jpg", i),
                 Utc::now(),
@@ -1161,7 +1164,7 @@ mod tests {
         // Add a pending asset (should not be in downloaded IDs)
         let pending = AssetRecord::new_pending(
             "PENDING_1".to_string(),
-            "original".to_string(),
+            VersionSizeKey::Original,
             "pending_ck".to_string(),
             "pending.jpg".to_string(),
             Utc::now(),
@@ -1187,7 +1190,7 @@ mod tests {
         for i in 0..2 {
             let record = AssetRecord::new_pending(
                 format!("DL_{}", i),
-                "original".to_string(),
+                VersionSizeKey::Original,
                 format!("checksum_{}", i),
                 format!("photo_{}.jpg", i),
                 Utc::now(),
@@ -1223,7 +1226,7 @@ mod tests {
             .map(|i| {
                 AssetRecord::new_pending(
                     format!("BATCH_{}", i),
-                    "original".to_string(),
+                    VersionSizeKey::Original,
                     format!("checksum_{}", i),
                     format!("photo_{}.jpg", i),
                     Utc::now(),
@@ -1259,7 +1262,7 @@ mod tests {
             .map(|i| {
                 AssetRecord::new_pending(
                     format!("BATCH_{}", i),
-                    "original".to_string(),
+                    VersionSizeKey::Original,
                     format!("checksum_{}", i),
                     format!("photo_{}.jpg", i),
                     Utc::now(),
@@ -1302,7 +1305,7 @@ mod tests {
             .map(|i| {
                 AssetRecord::new_pending(
                     format!("FAIL_{}", i),
-                    "original".to_string(),
+                    VersionSizeKey::Original,
                     format!("checksum_{}", i),
                     format!("photo_{}.jpg", i),
                     Utc::now(),
