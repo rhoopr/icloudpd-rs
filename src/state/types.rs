@@ -137,7 +137,7 @@ impl MediaType {
 /// A record of an asset's state in the database.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - 8-byte aligned heap types first (String, Option<PathBuf>, Option<String>)
+/// - 8-byte aligned heap types first (String, `Option<PathBuf>`, `Option<String>`)
 /// - 8-byte primitives (u64)
 /// - DateTime fields (12-16 bytes each)
 /// - 4-byte primitives (u32)

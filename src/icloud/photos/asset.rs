@@ -17,7 +17,7 @@ pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
 /// A photo or video asset from iCloud.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - Heap types first (String, Option<String>)
+/// - Heap types first (String, `Option<String>`)
 /// - VersionsMap (SmallVec inline storage)
 /// - f64 primitives
 /// - Small enums last

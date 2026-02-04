@@ -8,10 +8,10 @@ use std::path::PathBuf;
 /// Application configuration.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - Heap types first (String, PathBuf, Vec, Option<String>)
+/// - Heap types first (String, PathBuf, Vec, `Option<String>`)
 /// - DateTime fields (12-16 bytes each)
-/// - 8-byte primitives (u64, Option<u64>)
-/// - 4-byte primitives (u32, Option<u32>)
+/// - 8-byte primitives (u64, `Option<u64>`)
+/// - 4-byte primitives (u32, `Option<u32>`)
 /// - 2-byte primitives (u16)
 /// - 1-byte enums
 /// - All booleans grouped at the end

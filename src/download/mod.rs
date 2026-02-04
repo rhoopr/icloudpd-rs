@@ -2173,9 +2173,10 @@ mod tests {
     #[test]
     fn test_download_task_size() {
         use std::mem::size_of;
+        // 144 bytes accommodates platform differences (Windows has larger PathBuf)
         assert!(
-            size_of::<DownloadTask>() <= 128,
-            "DownloadTask size {} exceeds 128 bytes",
+            size_of::<DownloadTask>() <= 144,
+            "DownloadTask size {} exceeds 144 bytes",
             size_of::<DownloadTask>()
         );
     }
