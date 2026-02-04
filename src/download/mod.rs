@@ -8,7 +8,7 @@ pub mod exif;
 pub mod file;
 pub mod paths;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::FileTimes;
 use std::path::Path;
 use std::sync::Arc;
@@ -63,22 +63,56 @@ pub fn determine_media_type(
     }
 }
 
-/// Normalize a path for collision detection on case-insensitive filesystems.
+/// A path wrapper that caches the normalized form for case-insensitive collision detection.
 ///
-/// On macOS and Windows, filesystems are typically case-insensitive, meaning
-/// `IMG_0996.mov` and `IMG_0996.MOV` are the same file. This function converts
-/// paths to lowercase for use as HashMap keys to detect such collisions.
-///
-/// On Linux (case-sensitive filesystem), paths are returned unchanged.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn normalize_path_for_collision(path: &Path) -> PathBuf {
-    PathBuf::from(path.to_string_lossy().to_ascii_lowercase())
+/// On case-insensitive filesystems (macOS, Windows), we need to detect collisions between
+/// paths like `IMG_0996.mov` and `IMG_0996.MOV`. This struct stores both the original path
+/// and the normalized (lowercased) form, avoiding repeated `to_ascii_lowercase()` allocations
+/// when the same path is checked multiple times during collision detection.
+#[derive(Debug, Clone)]
+struct NormalizedPath {
+    /// The original, un-normalized path. Used on case-sensitive filesystems (Linux).
+    #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+    original: PathBuf,
+    /// The normalized (lowercased) path for case-insensitive collision detection.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    normalized: PathBuf,
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn normalize_path_for_collision(path: &Path) -> PathBuf {
-    path.to_path_buf()
+impl NormalizedPath {
+    fn new(path: PathBuf) -> Self {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let normalized = PathBuf::from(path.to_string_lossy().to_ascii_lowercase());
+
+        Self {
+            original: path,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            normalized,
+        }
+    }
 }
+
+impl std::hash::Hash for NormalizedPath {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        self.normalized.hash(state);
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        self.original.hash(state);
+    }
+}
+
+impl PartialEq for NormalizedPath {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        return self.normalized == other.normalized;
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        return self.original == other.original;
+    }
+}
+
+impl Eq for NormalizedPath {}
 
 /// Outcome of a download pass.
 #[derive(Debug)]
@@ -159,6 +193,62 @@ struct DownloadTask {
     version_size: String,
 }
 
+/// Pre-loaded download state for O(1) skip decisions.
+///
+/// Loaded once at sync start from the state database, this enables fast
+/// in-memory lookups instead of per-asset DB queries. For 100K+ asset
+/// libraries, this significantly reduces DB roundtrips.
+#[derive(Debug, Default)]
+struct DownloadContext {
+    /// Set of (asset_id, version_size) pairs that are already downloaded.
+    downloaded_ids: HashSet<(String, String)>,
+    /// Map of (asset_id, version_size) -> checksum for downloaded assets.
+    /// Used to detect checksum changes (iCloud asset updated) without DB queries.
+    downloaded_checksums: HashMap<(String, String), String>,
+}
+
+impl DownloadContext {
+    /// Load the download context from the state database.
+    async fn load(db: &dyn StateDb) -> Self {
+        let downloaded_ids = db.get_downloaded_ids().await.unwrap_or_default();
+        let downloaded_checksums = db.get_downloaded_checksums().await.unwrap_or_default();
+        Self {
+            downloaded_ids,
+            downloaded_checksums,
+        }
+    }
+
+    /// Check if an asset should be downloaded based on pre-loaded state.
+    ///
+    /// Returns `Some(true)` if definitely needs download, `Some(false)` if
+    /// definitely doesn't, or `None` if we need to check the filesystem.
+    fn should_download_fast(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+        checksum: &str,
+    ) -> Option<bool> {
+        let key = (asset_id.to_string(), version_size.to_string());
+
+        if !self.downloaded_ids.contains(&key) {
+            // Not in downloaded set — needs download
+            return Some(true);
+        }
+
+        // Check if checksum changed
+        if let Some(stored_checksum) = self.downloaded_checksums.get(&key) {
+            if stored_checksum != checksum {
+                // Checksum changed — needs re-download
+                return Some(true);
+            }
+        }
+
+        // Downloaded with matching checksum — but file might be missing,
+        // need filesystem check (return None)
+        None
+    }
+}
+
 /// Eagerly enumerate all albums and build a complete task list.
 ///
 /// Used only by the Phase 2 cleanup pass — re-contacts the API so each call
@@ -176,7 +266,7 @@ async fn build_download_tasks(
         .await;
 
     let mut tasks: Vec<DownloadTask> = Vec::new();
-    let mut claimed_paths: HashMap<PathBuf, u64> = HashMap::new();
+    let mut claimed_paths: HashMap<NormalizedPath, u64> = HashMap::new();
     for album_result in album_results {
         let assets = album_result?;
 
@@ -237,7 +327,7 @@ fn apply_raw_policy(
 fn filter_asset_to_tasks(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
-    claimed_paths: &mut HashMap<PathBuf, u64>,
+    claimed_paths: &mut HashMap<NormalizedPath, u64>,
 ) -> Vec<DownloadTask> {
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
         return Vec::new();
@@ -300,7 +390,7 @@ fn filter_asset_to_tasks(
                             &created_local,
                             &dedup_filename,
                         );
-                        let dedup_normalized = normalize_path_for_collision(&dedup_path);
+                        let dedup_normalized = NormalizedPath::new(dedup_path.clone());
                         if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
                             None // deduped version already downloaded or claimed
                         } else {
@@ -322,7 +412,7 @@ fn filter_asset_to_tasks(
                 }
             }
         } else if let Some(&claimed_size) =
-            claimed_paths.get(&normalize_path_for_collision(&download_path))
+            claimed_paths.get(&NormalizedPath::new(download_path.clone()))
         {
             // Path is claimed by an in-flight download — check for size collision.
             // Use normalized paths for collision detection to handle case-insensitive
@@ -341,7 +431,7 @@ fn filter_asset_to_tasks(
                             &created_local,
                             &dedup_filename,
                         );
-                        let dedup_normalized = normalize_path_for_collision(&dedup_path);
+                        let dedup_normalized = NormalizedPath::new(dedup_path.clone());
                         if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
                             None // deduped version already downloaded or claimed
                         } else {
@@ -363,7 +453,7 @@ fn filter_asset_to_tasks(
         };
 
         if let Some(path) = final_path {
-            claimed_paths.insert(normalize_path_for_collision(&path), version.size);
+            claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
             tasks.push(DownloadTask {
                 url: version.url.clone(),
                 download_path: path,
@@ -398,7 +488,7 @@ fn filter_asset_to_tasks(
             //
             // Use normalized paths for collision detection to handle case-insensitive
             // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
-            let mov_normalized = normalize_path_for_collision(&mov_path);
+            let mov_normalized = NormalizedPath::new(mov_path.clone());
             let final_mov_path = if mov_path.exists() {
                 let on_disk_size = std::fs::metadata(&mov_path).map(|m| m.len()).unwrap_or(0);
                 if on_disk_size == live_version.size {
@@ -413,7 +503,7 @@ fn filter_asset_to_tasks(
                         &created_local,
                         &dedup_filename,
                     );
-                    let dedup_normalized = normalize_path_for_collision(&dedup_path);
+                    let dedup_normalized = NormalizedPath::new(dedup_path.clone());
                     if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
                         None // deduped version already downloaded or claimed
                     } else {
@@ -438,7 +528,7 @@ fn filter_asset_to_tasks(
                         &created_local,
                         &dedup_filename,
                     );
-                    let dedup_normalized = normalize_path_for_collision(&dedup_path);
+                    let dedup_normalized = NormalizedPath::new(dedup_path.clone());
                     if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
                         None
                     } else {
@@ -454,7 +544,7 @@ fn filter_asset_to_tasks(
                 Some(mov_path)
             };
             if let Some(path) = final_mov_path {
-                claimed_paths.insert(normalize_path_for_collision(&path), live_version.size);
+                claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
                 tasks.push(DownloadTask {
                     url: live_version.url.clone(),
                     download_path: path,
@@ -547,7 +637,7 @@ async fn stream_and_download(
 
     // Track paths claimed by in-flight downloads to detect collisions between
     // assets with the same filename processed in the same session.
-    let mut claimed_paths: HashMap<PathBuf, u64> = HashMap::new();
+    let mut claimed_paths: HashMap<NormalizedPath, u64> = HashMap::new();
 
     if config.dry_run {
         let mut count = 0usize;
@@ -576,6 +666,18 @@ async fn stream_and_download(
     let concurrency = config.concurrent_downloads;
     let state_db = config.state_db.clone();
 
+    // Pre-load download context for O(1) skip decisions
+    let download_ctx = if let Some(db) = &state_db {
+        tracing::debug!("Pre-loading download state from database");
+        DownloadContext::load(db.as_ref()).await
+    } else {
+        DownloadContext::default()
+    };
+    tracing::debug!(
+        downloaded_ids = download_ctx.downloaded_ids.len(),
+        "Download context loaded"
+    );
+
     // Start sync run tracking
     let sync_run_id = if let Some(db) = &state_db {
         match db.start_sync_run().await {
@@ -597,6 +699,9 @@ async fn stream_and_download(
     let mut auth_errors = 0usize;
     let mut assets_seen = 0u64;
 
+    // Collect records for batch upsert
+    let mut pending_records: Vec<AssetRecord> = Vec::new();
+
     // Collect all download tasks first, processing assets sequentially to ensure
     // proper collision detection via claimed_paths. This trades some streaming
     // benefit for correctness when multiple assets share the same filename.
@@ -615,7 +720,7 @@ async fn stream_and_download(
                     // Record assets in state DB and filter by should_download
                     let mut filtered_tasks = Vec::new();
                     for task in tasks {
-                        if let Some(db) = &state_db {
+                        if state_db.is_some() {
                             // Create asset record for state tracking
                             let media_type = determine_media_type(&task.version_size, &asset);
                             let record = AssetRecord::new_pending(
@@ -632,35 +737,52 @@ async fn stream_and_download(
                                 task.size,
                                 media_type,
                             );
-                            if let Err(e) = db.upsert_seen(&record).await {
-                                tracing::warn!("Failed to record asset in state DB: {}", e);
-                            }
+                            pending_records.push(record);
 
-                            // Check if we should download (DB-based skip)
-                            match db
-                                .should_download(
-                                    &task.asset_id,
-                                    &task.version_size,
-                                    &task.checksum,
-                                    &task.download_path,
-                                )
-                                .await
-                            {
-                                Ok(true) => filtered_tasks.push(task),
-                                Ok(false) => {
-                                    tracing::debug!(
-                                        asset_id = %task.asset_id,
-                                        path = %task.download_path.display(),
-                                        "Skipping (already downloaded per state DB)"
-                                    );
-                                    pb.inc(1);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "State DB check failed, downloading anyway: {}",
-                                        e
-                                    );
+                            // Fast path: check pre-loaded state first
+                            match download_ctx.should_download_fast(
+                                &task.asset_id,
+                                &task.version_size,
+                                &task.checksum,
+                            ) {
+                                Some(true) => {
+                                    // Definitely needs download
                                     filtered_tasks.push(task);
+                                }
+                                Some(false) => {
+                                    // Should not happen — fast check doesn't return false
+                                    filtered_tasks.push(task);
+                                }
+                                None => {
+                                    // Downloaded with matching checksum — check file exists
+                                    let path_exists =
+                                        tokio::fs::try_exists(&task.download_path).await;
+                                    match path_exists {
+                                        Ok(true) => {
+                                            tracing::debug!(
+                                                asset_id = %task.asset_id,
+                                                path = %task.download_path.display(),
+                                                "Skipping (already downloaded)"
+                                            );
+                                            pb.inc(1);
+                                        }
+                                        Ok(false) => {
+                                            // File missing — re-download
+                                            tracing::debug!(
+                                                asset_id = %task.asset_id,
+                                                path = %task.download_path.display(),
+                                                "File missing, will re-download"
+                                            );
+                                            filtered_tasks.push(task);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "File existence check failed, downloading anyway: {}",
+                                                e
+                                            );
+                                            filtered_tasks.push(task);
+                                        }
+                                    }
                                 }
                             }
                         } else {
@@ -672,6 +794,19 @@ async fn stream_and_download(
             }
             Err(e) => {
                 pb.suspend(|| tracing::error!("Error fetching asset: {}", e));
+            }
+        }
+    }
+
+    // Batch upsert all pending records
+    if let Some(db) = &state_db {
+        if !pending_records.is_empty() {
+            if let Err(e) = db.upsert_seen_batch(&pending_records).await {
+                tracing::warn!(
+                    "Failed to batch upsert {} records: {}",
+                    pending_records.len(),
+                    e
+                );
             }
         }
     }
