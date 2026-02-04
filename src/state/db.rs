@@ -199,11 +199,6 @@ impl StateDb for SqliteStateDb {
         checksum: &str,
         local_path: &Path,
     ) -> Result<bool, StateError> {
-        let id = id.to_string();
-        let version_size = version_size.to_string();
-        let checksum = checksum.to_string();
-        let local_path = local_path.to_path_buf();
-
         // Query DB in a separate scope to ensure MutexGuard is dropped before any await
         let result: Option<(String, String, Option<String>)> = {
             let conn = self
@@ -213,7 +208,7 @@ impl StateDb for SqliteStateDb {
 
             conn.query_row(
                 "SELECT status, checksum, local_path FROM assets WHERE id = ?1 AND version_size = ?2",
-                [&id, &version_size],
+                [id, version_size],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -242,7 +237,7 @@ impl StateDb for SqliteStateDb {
                         // Check if file still exists (async to avoid blocking)
                         let path_to_check: PathBuf = stored_path_opt
                             .map(PathBuf::from)
-                            .unwrap_or_else(|| local_path.clone());
+                            .unwrap_or_else(|| local_path.to_path_buf());
                         match tokio::fs::try_exists(&path_to_check).await {
                             Ok(true) => Ok(false),
                             Ok(false) => {
@@ -271,14 +266,6 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
-        let id = record.id.clone();
-        let version_size = record.version_size.as_str().to_string();
-        let checksum = record.checksum.clone();
-        let filename = record.filename.clone();
-        let created_at = record.created_at.timestamp();
-        let added_at = record.added_at.map(|dt| dt.timestamp());
-        let size_bytes = record.size_bytes as i64;
-        let media_type = record.media_type.as_str().to_string();
         let last_seen_at = Utc::now().timestamp();
 
         let conn = self
@@ -302,14 +289,14 @@ impl StateDb for SqliteStateDb {
                 last_seen_at = excluded.last_seen_at
             "#,
             rusqlite::params![
-                id,
-                version_size,
-                checksum,
-                filename,
-                created_at,
-                added_at,
-                size_bytes,
-                media_type,
+                &record.id,
+                record.version_size.as_str(),
+                &record.checksum,
+                &record.filename,
+                record.created_at.timestamp(),
+                record.added_at.map(|dt| dt.timestamp()),
+                record.size_bytes as i64,
+                record.media_type.as_str(),
                 last_seen_at,
             ],
         )
@@ -324,9 +311,6 @@ impl StateDb for SqliteStateDb {
         version_size: &str,
         local_path: &Path,
     ) -> Result<(), StateError> {
-        let id = id.to_string();
-        let version_size = version_size.to_string();
-        let local_path = local_path.to_string_lossy().to_string();
         let downloaded_at = Utc::now().timestamp();
 
         let conn = self
@@ -336,7 +320,7 @@ impl StateDb for SqliteStateDb {
 
         conn.execute(
             "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, last_error = NULL WHERE id = ?3 AND version_size = ?4",
-            rusqlite::params![downloaded_at, local_path, id, version_size],
+            rusqlite::params![downloaded_at, local_path.to_string_lossy(), id, version_size],
         )
         .map_err(StateError::query)?;
 
@@ -349,10 +333,6 @@ impl StateDb for SqliteStateDb {
         version_size: &str,
         error: &str,
     ) -> Result<(), StateError> {
-        let id = id.to_string();
-        let version_size = version_size.to_string();
-        let error = error.to_string();
-
         let conn = self
             .conn
             .lock()
@@ -668,7 +648,7 @@ impl StateDb for SqliteStateDb {
             for (id, version_size, local_path) in items {
                 stmt.execute(rusqlite::params![
                     downloaded_at,
-                    local_path.to_string_lossy().to_string(),
+                    local_path.to_string_lossy(),
                     id,
                     version_size,
                 ])

@@ -67,56 +67,48 @@ pub fn determine_media_type(
     }
 }
 
-/// A path wrapper that caches the normalized form for case-insensitive collision detection.
+/// A normalized path string for case-insensitive collision detection.
 ///
 /// On case-insensitive filesystems (macOS, Windows), we need to detect collisions between
-/// paths like `IMG_0996.mov` and `IMG_0996.MOV`. This struct stores both the original path
-/// and the normalized (lowercased) form, avoiding repeated `to_ascii_lowercase()` allocations
-/// when the same path is checked multiple times during collision detection.
-#[derive(Debug, Clone)]
-struct NormalizedPath {
-    /// The original, un-normalized path. Used on case-sensitive filesystems (Linux).
-    #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
-    original: PathBuf,
-    /// The normalized (lowercased) path for case-insensitive collision detection.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    normalized: PathBuf,
-}
+/// paths like `IMG_0996.mov` and `IMG_0996.MOV`. This stores the normalized (lowercased)
+/// form as a `Box<str>` and implements `Borrow<str>` to enable zero-copy lookups.
+///
+/// Use `NormalizedPath::normalize()` for temporary lookup keys to avoid PathBuf cloning.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NormalizedPath(Box<str>);
 
 impl NormalizedPath {
+    /// Create a new normalized path from an owned PathBuf.
+    /// For lookup operations, prefer `normalize()` to avoid PathBuf cloning.
     fn new(path: PathBuf) -> Self {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        let normalized = PathBuf::from(path.to_string_lossy().to_ascii_lowercase());
+        Self(Self::normalize(&path).into_owned().into_boxed_str())
+    }
 
-        Self {
-            original: path,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            normalized,
+    /// Normalize a path reference for map lookups.
+    ///
+    /// On case-insensitive systems (macOS, Windows), returns a lowercase copy.
+    /// On case-sensitive systems (Linux), returns a borrowed view when possible.
+    ///
+    /// Use with `claimed_paths.contains_key(NormalizedPath::normalize(&path).as_ref())`
+    /// to avoid allocating a PathBuf just for the lookup.
+    fn normalize(path: &Path) -> std::borrow::Cow<'_, str> {
+        let s = path.to_string_lossy();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            std::borrow::Cow::Owned(s.to_ascii_lowercase())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            s
         }
     }
 }
 
-impl std::hash::Hash for NormalizedPath {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        self.normalized.hash(state);
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        self.original.hash(state);
+impl std::borrow::Borrow<str> for NormalizedPath {
+    fn borrow(&self) -> &str {
+        &self.0
     }
 }
-
-impl PartialEq for NormalizedPath {
-    fn eq(&self, other: &Self) -> bool {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        return self.normalized == other.normalized;
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        return self.original == other.original;
-    }
-}
-
-impl Eq for NormalizedPath {}
 
 /// Outcome of a download pass.
 #[derive(Debug)]
@@ -213,31 +205,42 @@ struct DownloadTask {
 /// in-memory lookups instead of per-asset DB queries. For 100K+ asset
 /// libraries, this significantly reduces DB roundtrips.
 ///
-/// Uses FxHash for faster hashing of string keys compared to SipHash.
+/// Uses a two-level map structure (asset_id -> version_sizes) to enable
+/// zero-allocation lookups via `&str` keys, avoiding the need to allocate
+/// `(String, String)` tuples for each lookup.
 #[derive(Debug, Default)]
 struct DownloadContext {
-    /// Set of (asset_id, version_size) pairs that are already downloaded.
-    downloaded_ids: FxHashSet<(String, String)>,
-    /// Map of (asset_id, version_size) -> checksum for downloaded assets.
+    /// Nested map: asset_id -> set of version_sizes that are already downloaded.
+    /// Two-level structure enables O(1) borrowed lookups without allocation.
+    downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>>,
+    /// Nested map: asset_id -> (version_size -> checksum) for downloaded assets.
     /// Used to detect checksum changes (iCloud asset updated) without DB queries.
-    downloaded_checksums: FxHashMap<(String, String), String>,
+    downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
 }
 
 impl DownloadContext {
     /// Load the download context from the state database.
     async fn load(db: &dyn StateDb) -> Self {
-        let downloaded_ids: FxHashSet<_> = db
-            .get_downloaded_ids()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let downloaded_checksums: FxHashMap<_, _> = db
-            .get_downloaded_checksums()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        // Build nested map structure for zero-allocation lookups
+        let mut downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>> = FxHashMap::default();
+        for (asset_id, version_size) in db.get_downloaded_ids().await.unwrap_or_default() {
+            downloaded_ids
+                .entry(asset_id.into_boxed_str())
+                .or_default()
+                .insert(version_size.into_boxed_str());
+        }
+
+        let mut downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
+            FxHashMap::default();
+        for ((asset_id, version_size), checksum) in
+            db.get_downloaded_checksums().await.unwrap_or_default()
+        {
+            downloaded_checksums
+                .entry(asset_id.into_boxed_str())
+                .or_default()
+                .insert(version_size.into_boxed_str(), checksum.into_boxed_str());
+        }
+
         Self {
             downloaded_ids,
             downloaded_checksums,
@@ -248,24 +251,34 @@ impl DownloadContext {
     ///
     /// Returns `Some(true)` if definitely needs download, `Some(false)` if
     /// definitely doesn't, or `None` if we need to check the filesystem.
+    ///
+    /// Uses borrowed `&str` keys for zero-allocation lookups.
     fn should_download_fast(
         &self,
         asset_id: &str,
         version_size: VersionSizeKey,
         checksum: &str,
     ) -> Option<bool> {
-        let key = (asset_id.to_string(), version_size.as_str().to_string());
+        let version_size_str = version_size.as_str();
 
-        if !self.downloaded_ids.contains(&key) {
+        // Two-level lookup with borrowed keys — no allocation
+        let is_downloaded = self
+            .downloaded_ids
+            .get(asset_id)
+            .is_some_and(|versions| versions.contains(version_size_str));
+
+        if !is_downloaded {
             // Not in downloaded set — needs download
             return Some(true);
         }
 
-        // Check if checksum changed
-        if let Some(stored_checksum) = self.downloaded_checksums.get(&key) {
-            if stored_checksum != checksum {
-                // Checksum changed — needs re-download
-                return Some(true);
+        // Check if checksum changed (also zero-allocation lookup)
+        if let Some(versions) = self.downloaded_checksums.get(asset_id) {
+            if let Some(stored_checksum) = versions.get(version_size_str) {
+                if stored_checksum.as_ref() != checksum {
+                    // Checksum changed — needs re-download
+                    return Some(true);
+                }
             }
         }
 
@@ -429,8 +442,9 @@ fn filter_asset_to_tasks(
                             &created_local,
                             &dedup_filename,
                         );
-                        let dedup_normalized = NormalizedPath::new(dedup_path.clone());
-                        if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
+                        // Use normalize() for lookup to avoid PathBuf clone
+                        let dedup_key = NormalizedPath::normalize(&dedup_path);
+                        if dedup_path.exists() || claimed_paths.contains_key(dedup_key.as_ref()) {
                             None // deduped version already downloaded or claimed
                         } else {
                             tracing::debug!(
@@ -451,7 +465,8 @@ fn filter_asset_to_tasks(
                 }
             }
         } else if let Some(&claimed_size) =
-            claimed_paths.get(&NormalizedPath::new(download_path.clone()))
+            // Use normalize() for lookup to avoid PathBuf clone
+            claimed_paths.get(NormalizedPath::normalize(&download_path).as_ref())
         {
             // Path is claimed by an in-flight download — check for size collision.
             // Use normalized paths for collision detection to handle case-insensitive
@@ -470,8 +485,9 @@ fn filter_asset_to_tasks(
                             &created_local,
                             &dedup_filename,
                         );
-                        let dedup_normalized = NormalizedPath::new(dedup_path.clone());
-                        if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
+                        // Use normalize() for lookup to avoid PathBuf clone
+                        let dedup_key = NormalizedPath::normalize(&dedup_path);
+                        if dedup_path.exists() || claimed_paths.contains_key(dedup_key.as_ref()) {
                             None // deduped version already downloaded or claimed
                         } else {
                             tracing::debug!(
@@ -492,6 +508,7 @@ fn filter_asset_to_tasks(
         };
 
         if let Some(path) = final_path {
+            // Clone for the normalized key, move original into DownloadTask
             claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
             tasks.push(DownloadTask {
                 url: version.url.to_string(),
@@ -527,7 +544,7 @@ fn filter_asset_to_tasks(
             //
             // Use normalized paths for collision detection to handle case-insensitive
             // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
-            let mov_normalized = NormalizedPath::new(mov_path.clone());
+            let mov_key = NormalizedPath::normalize(&mov_path);
             let final_mov_path = if mov_path.exists() {
                 let on_disk_size = std::fs::metadata(&mov_path).map(|m| m.len()).unwrap_or(0);
                 if on_disk_size == live_version.size {
@@ -542,8 +559,8 @@ fn filter_asset_to_tasks(
                         &created_local,
                         &dedup_filename,
                     );
-                    let dedup_normalized = NormalizedPath::new(dedup_path.clone());
-                    if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
+                    let dedup_key = NormalizedPath::normalize(&dedup_path);
+                    if dedup_path.exists() || claimed_paths.contains_key(dedup_key.as_ref()) {
                         None // deduped version already downloaded or claimed
                     } else {
                         tracing::debug!(
@@ -554,7 +571,7 @@ fn filter_asset_to_tasks(
                         Some(dedup_path)
                     }
                 }
-            } else if let Some(&claimed_size) = claimed_paths.get(&mov_normalized) {
+            } else if let Some(&claimed_size) = claimed_paths.get(mov_key.as_ref()) {
                 // Path is claimed by an in-flight download
                 if claimed_size == live_version.size {
                     None // Same size, likely duplicate
@@ -567,8 +584,8 @@ fn filter_asset_to_tasks(
                         &created_local,
                         &dedup_filename,
                     );
-                    let dedup_normalized = NormalizedPath::new(dedup_path.clone());
-                    if dedup_path.exists() || claimed_paths.contains_key(&dedup_normalized) {
+                    let dedup_key = NormalizedPath::normalize(&dedup_path);
+                    if dedup_path.exists() || claimed_paths.contains_key(dedup_key.as_ref()) {
                         None
                     } else {
                         tracing::debug!(
@@ -583,6 +600,7 @@ fn filter_asset_to_tasks(
                 Some(mov_path)
             };
             if let Some(path) = final_mov_path {
+                // Clone for the normalized key, move original into DownloadTask
                 claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
                 tasks.push(DownloadTask {
                     url: live_version.url.to_string(),
