@@ -15,7 +15,6 @@ pub struct PhotoAsset {
     item_type_val: Option<AssetItemType>,
     asset_date_ms: Option<f64>,
     added_date_ms: Option<f64>,
-    original_size: u64,
     versions: HashMap<AssetVersionSize, AssetVersion>,
 }
 
@@ -161,9 +160,6 @@ impl PhotoAsset {
         let item_type_val = resolve_item_type(&master_fields, &filename);
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
-        let original_size = master_fields["resOriginalRes"]["value"]["size"]
-            .as_u64()
-            .unwrap_or(0);
         let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
         Self {
             record_name,
@@ -171,7 +167,6 @@ impl PhotoAsset {
             item_type_val,
             asset_date_ms,
             added_date_ms,
-            original_size,
             versions,
         }
     }
@@ -182,9 +177,6 @@ impl PhotoAsset {
         let item_type_val = resolve_item_type(&master.fields, &filename);
         let asset_date_ms = asset.fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset.fields["addedDate"]["value"].as_f64();
-        let original_size = master.fields["resOriginalRes"]["value"]["size"]
-            .as_u64()
-            .unwrap_or(0);
         let versions = extract_versions(
             item_type_val,
             &master.fields,
@@ -197,7 +189,6 @@ impl PhotoAsset {
             item_type_val,
             asset_date_ms,
             added_date_ms,
-            original_size,
             versions,
         }
     }
@@ -210,11 +201,6 @@ impl PhotoAsset {
         self.filename.as_deref()
     }
 
-    #[allow(dead_code)] // public API for size-based dedup
-    pub fn size(&self) -> u64 {
-        self.original_size
-    }
-
     pub fn asset_date(&self) -> DateTime<Utc> {
         self.asset_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
@@ -225,7 +211,6 @@ impl PhotoAsset {
         self.asset_date()
     }
 
-    #[allow(dead_code)] // public API for incremental sync
     pub fn added_date(&self) -> DateTime<Utc> {
         self.added_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
@@ -425,7 +410,6 @@ mod tests {
         assert_eq!(asset.id(), "MASTER_1");
         assert_eq!(asset.filename(), Some("vacation.jpg"));
         assert_eq!(asset.item_type(), Some(AssetItemType::Image));
-        assert_eq!(asset.size(), 5000);
         assert_eq!(
             asset.asset_date().format("%Y-%m-%d").to_string(),
             "2025-01-15"
@@ -535,6 +519,5 @@ mod tests {
         let asset = PhotoAsset::from_records(master, asset_rec);
         assert_eq!(asset.id(), "M2");
         assert_eq!(asset.filename(), None);
-        assert_eq!(asset.size(), 0);
     }
 }

@@ -17,7 +17,7 @@ pub enum AssetStatus {
 
 impl AssetStatus {
     /// Convert to the string stored in the database.
-    #[allow(dead_code)] // Used internally by db.rs for SQL serialization
+    #[allow(dead_code)] // Symmetric with from_str; used in tests
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",

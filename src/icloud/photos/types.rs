@@ -2,7 +2,6 @@ use crate::types::VersionSize;
 
 #[derive(Debug, Clone)]
 pub struct AssetVersion {
-    #[allow(dead_code)] // used by asset.size() for size-based dedup (not yet wired)
     pub size: u64,
     pub url: String,
     pub asset_type: String,

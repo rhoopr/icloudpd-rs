@@ -29,7 +29,7 @@ pub struct Config {
     pub dry_run: bool,
     pub domain: Domain,
     pub watch_with_interval: Option<u64>,
-    #[allow(dead_code)] // CLI flag parsed but not yet wired
+    #[allow(dead_code)] // Copied from CLI but read from cli.log_level directly in main.rs
     pub log_level: LogLevel,
     pub no_progress_bar: bool,
     pub cookie_directory: PathBuf,
