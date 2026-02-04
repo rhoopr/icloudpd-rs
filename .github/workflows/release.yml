@@ -171,7 +171,7 @@ jobs:
         uses: mislav/bump-homebrew-formula-action@v3
         with:
           formula-name: icloudpd-rs
-          homebrew-tap: rhoopr/icloudpd-rs-tap
+          homebrew-tap: rhoopr/homebrew-icloudpd-rs
           download-url: https://github.com/rhoopr/icloudpd-rs/releases/download/${{ github.ref_name }}/icloudpd-rs-macos-aarch64.tar.gz
         env:
           COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
