@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.1] - 2026-02-04
+
+### Fixed
+
+- **Streaming regression** — Downloads now start immediately as assets arrive from the API, rather than waiting for all photos to be enumerated first. This fixes a regression introduced in v0.1.0 where large libraries experienced significant delay before the first download began.
+
+### Changed
+
+- Replaced blocking collection loop with channel-based producer-consumer pattern for true streaming behavior
+- Switched from batch `upsert_seen_batch` to per-asset `upsert_seen` calls (trades some DB efficiency for streaming)
+
+---
+
 ## [0.1.0] - 2025-02-03
 
 Initial release. A ground-up Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) with full photo/video download capabilities and SQLite state tracking.
