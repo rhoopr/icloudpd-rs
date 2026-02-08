@@ -2111,30 +2111,15 @@ mod tests {
             claimed_paths.keys().collect::<Vec<_>>()
         );
 
-        // Check the MOV filename based on platform
+        // Both the video (.mov) and the live-photo MOV get their extension
+        // mapped to uppercase .MOV via ITEM_TYPE_EXTENSIONS, so they collide
+        // on ALL platforms (not just case-insensitive ones).
         let mov_filename = mov_path.file_name().unwrap().to_str().unwrap();
-
-        // On case-insensitive filesystems (macOS, Windows), IMG_0996.mov and IMG_0996.MOV
-        // collide, so the MOV should be deduped with asset ID suffix.
-        // On case-sensitive filesystems (Linux), they're different files, no dedup needed.
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            assert!(
-                mov_filename.contains("-IMG_0996"),
-                "Case-insensitive collision: MOV should be deduped with asset ID suffix. \
-                Got: {}",
-                mov_filename
-            );
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            // On Linux (case-sensitive), both files can coexist without dedup
-            assert_eq!(
-                mov_filename, "IMG_0996.MOV",
-                "On case-sensitive FS, MOV should keep original name"
-            );
-        }
+        assert!(
+            mov_filename.contains("-IMG_0996"),
+            "MOV should be deduped with asset ID suffix due to path collision. Got: {}",
+            mov_filename
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
