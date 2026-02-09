@@ -188,7 +188,7 @@ impl std::fmt::Debug for DownloadConfig {
 /// A unit of work produced by the filter phase and consumed by the download phase.
 ///
 /// Fields ordered for optimal memory layout:
-/// - Heap types first (Box<str>, PathBuf)
+/// - Heap types first (`Box<str>`, PathBuf)
 /// - 8-byte primitives (u64)
 /// - DateTime (12-16 bytes)
 /// - 1-byte enum last
