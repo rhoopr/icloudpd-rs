@@ -70,6 +70,10 @@ impl PhotosSession for crate::auth::SharedSession {
 const RETRYABLE_SERVER_ERRORS: &[&str] =
     &["RETRY_LATER", "TRY_AGAIN_LATER", "CAS_OP_LOCK", "THROTTLED"];
 
+/// CloudKit server error codes that indicate the iCloud service is not
+/// activated or accessible (e.g. ADP enabled, incomplete iCloud setup).
+const SERVICE_NOT_ACTIVATED_ERRORS: &[&str] = &["ZONE_NOT_FOUND", "AUTHENTICATION_FAILED"];
+
 /// Error type for CloudKit server errors embedded in the JSON response body.
 /// These are distinct from HTTP-level errors and represent API-level failures.
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +82,21 @@ pub struct CloudKitServerError {
     pub code: String,
     pub reason: String,
     pub retryable: bool,
+    /// True when the error indicates the iCloud service is not activated
+    /// (ADP enabled, incomplete setup, or private db access disabled).
+    pub service_not_activated: bool,
+}
+
+/// Check whether an error code or reason indicates the iCloud service is not
+/// activated (ADP enabled, incomplete setup, or private db access disabled).
+fn is_service_not_activated(code: &str, reason: &str) -> bool {
+    SERVICE_NOT_ACTIVATED_ERRORS
+        .iter()
+        .any(|&s| s.eq_ignore_ascii_case(code))
+        || code.eq_ignore_ascii_case("ACCESS_DENIED")
+        || reason
+            .to_ascii_lowercase()
+            .contains("private db access disabled")
 }
 
 /// Check a CloudKit JSON response for `serverErrorCode` or per-record errors.
@@ -93,15 +112,18 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
         let retryable = RETRYABLE_SERVER_ERRORS
             .iter()
             .any(|&s| s.eq_ignore_ascii_case(code));
+        let service_not_activated = is_service_not_activated(code, &reason);
         tracing::warn!(
             error_code = code,
             retryable,
+            service_not_activated,
             "CloudKit server error: {reason}"
         );
         return Err(CloudKitServerError {
             code: code.to_string(),
             reason,
             retryable,
+            service_not_activated,
         }
         .into());
     }
@@ -114,15 +136,18 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                 let retryable = RETRYABLE_SERVER_ERRORS
                     .iter()
                     .any(|&s| s.eq_ignore_ascii_case(code));
+                let service_not_activated = is_service_not_activated(code, &reason);
                 tracing::warn!(
                     error_code = code,
                     retryable,
+                    service_not_activated,
                     "CloudKit per-record error: {reason}"
                 );
                 return Err(CloudKitServerError {
                     code: code.to_string(),
                     reason,
                     retryable,
+                    service_not_activated,
                 }
                 .into());
             }
@@ -229,6 +254,7 @@ mod tests {
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
         assert_eq!(ck_err.code, "TRY_AGAIN_LATER");
         assert!(ck_err.retryable);
+        assert!(!ck_err.service_not_activated);
         assert_eq!(classify_api_error(&err), RetryAction::Retry);
     }
 
@@ -241,6 +267,7 @@ mod tests {
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
         assert!(!ck_err.retryable);
+        assert!(ck_err.service_not_activated);
         assert_eq!(classify_api_error(&err), RetryAction::Abort);
     }
 
@@ -256,6 +283,7 @@ mod tests {
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
         assert_eq!(ck_err.code, "RETRY_LATER");
         assert!(ck_err.retryable);
+        assert!(!ck_err.service_not_activated);
     }
 
     #[test]
@@ -267,6 +295,7 @@ mod tests {
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
         assert!(ck_err.retryable);
+        assert!(!ck_err.service_not_activated);
     }
 
     #[test]
@@ -278,6 +307,56 @@ mod tests {
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
         assert!(ck_err.retryable);
+        assert!(!ck_err.service_not_activated);
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_zone_not_found_is_service_not_activated() {
+        let response = serde_json::json!({
+            "serverErrorCode": "ZONE_NOT_FOUND",
+            "reason": "CKError: Zone not found"
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert!(!ck_err.retryable);
+        assert!(ck_err.service_not_activated);
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_authentication_failed_is_service_not_activated() {
+        let response = serde_json::json!({
+            "serverErrorCode": "AUTHENTICATION_FAILED",
+            "reason": "Authentication failed"
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert!(!ck_err.retryable);
+        assert!(ck_err.service_not_activated);
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_access_denied_is_service_not_activated() {
+        let response = serde_json::json!({
+            "serverErrorCode": "ACCESS_DENIED",
+            "reason": "private db access disabled for this account"
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert!(!ck_err.retryable);
+        assert!(ck_err.service_not_activated);
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_private_db_disabled_by_reason() {
+        // Even with an unknown error code, "private db access disabled" in the
+        // reason should trigger service_not_activated detection.
+        let response = serde_json::json!({
+            "serverErrorCode": "UNKNOWN_CODE",
+            "reason": "private db access disabled for this account"
+        });
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert!(ck_err.service_not_activated);
     }
 
     #[test]
