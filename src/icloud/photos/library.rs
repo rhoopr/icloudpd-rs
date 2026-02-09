@@ -63,7 +63,17 @@ impl PhotoLibrary {
             &[("Content-type", "text/plain")],
         )
         .await
-        .map_err(|e| ICloudError::Connection(e.to_string()))?;
+        .map_err(|e| {
+            if let Some(ck) = e.downcast_ref::<super::session::CloudKitServerError>() {
+                if ck.service_not_activated {
+                    return ICloudError::ServiceNotActivated {
+                        code: ck.code.clone(),
+                        reason: ck.reason.clone(),
+                    };
+                }
+            }
+            ICloudError::Connection(e.to_string())
+        })?;
 
         let query: super::cloudkit::QueryResponse =
             serde_json::from_value(response).map_err(|e| ICloudError::Connection(e.to_string()))?;
