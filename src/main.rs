@@ -39,11 +39,15 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
         let password = self.password.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pw) = password.as_deref() {
             if !pw.is_empty() {
-                let s = String::from_utf8_lossy(buf);
-                if s.contains(pw) {
-                    let redacted = s.replace(pw, "********");
-                    self.inner.write_all(redacted.as_bytes())?;
-                    return Ok(buf.len());
+                // A buffer shorter than the password can't contain it,
+                // avoiding the lossy UTF-8 conversion for short log fragments.
+                if buf.len() >= pw.len() {
+                    let s = String::from_utf8_lossy(buf);
+                    if s.contains(pw) {
+                        let redacted = s.replace(pw, "********");
+                        self.inner.write_all(redacted.as_bytes())?;
+                        return Ok(buf.len());
+                    }
                 }
             }
         }
