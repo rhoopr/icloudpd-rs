@@ -353,8 +353,6 @@ async fn verify_checksum(path: &Path, expected: &str) -> anyhow::Result<bool> {
     .await?
 }
 
-/// Run the import-existing command.
-///
 /// Build the query parameters HashMap for the iCloud Photos CloudKit API.
 ///
 /// Must match Python's `PyiCloudService.params` for API compatibility.
