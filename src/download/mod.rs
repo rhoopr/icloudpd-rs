@@ -18,6 +18,7 @@ use chrono::{DateTime, Local, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -125,7 +126,6 @@ pub enum DownloadOutcome {
 
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
-#[derive(Clone)]
 pub struct DownloadConfig {
     pub(crate) directory: std::path::PathBuf,
     pub(crate) folder_structure: String,
@@ -188,18 +188,18 @@ impl std::fmt::Debug for DownloadConfig {
 /// A unit of work produced by the filter phase and consumed by the download phase.
 ///
 /// Fields ordered for optimal memory layout:
-/// - Heap types first (String, PathBuf)
+/// - Heap types first (Box<str>, PathBuf)
 /// - 8-byte primitives (u64)
 /// - DateTime (12-16 bytes)
 /// - 1-byte enum last
 #[derive(Debug, Clone)]
 struct DownloadTask {
     // Heap types first
-    url: String,
+    url: Box<str>,
     download_path: PathBuf,
-    checksum: String,
+    checksum: Box<str>,
     /// iCloud asset ID for state tracking.
-    asset_id: String,
+    asset_id: Box<str>,
     // 8-byte primitives
     size: u64,
     // DateTime
@@ -392,23 +392,23 @@ fn filter_asset_to_tasks(
     config: &DownloadConfig,
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut std::collections::HashMap<PathBuf, Vec<String>>,
-) -> Vec<DownloadTask> {
+) -> SmallVec<[DownloadTask; 2]> {
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
-        return Vec::new();
+        return SmallVec::new();
     }
     if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
-        return Vec::new();
+        return SmallVec::new();
     }
 
     let created_utc = asset.created();
     if let Some(before) = &config.skip_created_before {
         if created_utc < *before {
-            return Vec::new();
+            return SmallVec::new();
         }
     }
     if let Some(after) = &config.skip_created_after {
         if created_utc > *after {
-            return Vec::new();
+            return SmallVec::new();
         }
     }
 
@@ -442,7 +442,7 @@ fn filter_asset_to_tasks(
 
     let created_local: DateTime<Local> = created_utc.with_timezone(&Local);
     let versions = apply_raw_policy(asset.versions(), config.align_raw);
-    let mut tasks = Vec::new();
+    let mut tasks = SmallVec::new();
     // Track the effective primary filename (including any dedup suffix) so the
     // live photo MOV companion is derived from the same name, keeping them paired.
     let mut effective_primary_filename: Option<String> = None;
@@ -594,10 +594,10 @@ fn filter_asset_to_tasks(
             // Clone for the normalized key, move original into DownloadTask
             claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
             tasks.push(DownloadTask {
-                url: version.url.to_string(),
+                url: version.url.to_string().into_boxed_str(),
                 download_path: path,
-                checksum: version.checksum.to_string(),
-                asset_id: asset.id().to_string(),
+                checksum: version.checksum.to_string().into_boxed_str(),
+                asset_id: asset.id().to_string().into_boxed_str(),
                 size: version.size,
                 created_local,
                 version_size: VersionSizeKey::from(config.size),
@@ -696,10 +696,10 @@ fn filter_asset_to_tasks(
                 // Clone for the normalized key, move original into DownloadTask
                 claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
                 tasks.push(DownloadTask {
-                    url: live_version.url.to_string(),
+                    url: live_version.url.to_string().into_boxed_str(),
                     download_path: path,
-                    checksum: live_version.checksum.to_string(),
-                    asset_id: asset.id().to_string(),
+                    checksum: live_version.checksum.to_string().into_boxed_str(),
+                    asset_id: asset.id().to_string().into_boxed_str(),
                     size: live_version.size,
                     created_local,
                     version_size: VersionSizeKey::from(config.live_photo_size),
@@ -757,7 +757,7 @@ struct StreamingResult {
 async fn stream_and_download(
     download_client: &Client,
     albums: &[PhotoAlbum],
-    config: &DownloadConfig,
+    config: &Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<StreamingResult> {
     // Lightweight count-only API query (HyperionIndexCountLookup) — separate
@@ -862,7 +862,7 @@ async fn stream_and_download(
     let assets_seen_producer = Arc::clone(&assets_seen);
 
     // Spawn producer task that processes assets and sends download tasks
-    let producer_config = config.clone();
+    let producer_config = Arc::clone(config);
     let producer_state_db = state_db.clone();
     let producer_shutdown = shutdown_token.clone();
     let producer_pb = pb.clone();
@@ -887,9 +887,9 @@ async fn stream_and_download(
                             if let Some(db) = &producer_state_db {
                                 let media_type = determine_media_type(task.version_size, &asset);
                                 let record = AssetRecord::new_pending(
-                                    task.asset_id.clone(),
+                                    task.asset_id.to_string(),
                                     task.version_size,
-                                    task.checksum.clone(),
+                                    task.checksum.to_string(),
                                     task.download_path
                                         .file_name()
                                         .and_then(|f| f.to_str())
@@ -1034,7 +1034,7 @@ async fn stream_and_download(
                 }
                 if state_db.is_some() {
                     downloaded_batch.push((
-                        task.asset_id.clone(),
+                        task.asset_id.to_string(),
                         task.version_size.as_str().to_string(),
                         task.download_path.clone(),
                     ));
@@ -1066,7 +1066,7 @@ async fn stream_and_download(
                         }
                         if state_db.is_some() {
                             failed_batch.push((
-                                task.asset_id.clone(),
+                                task.asset_id.to_string(),
                                 task.version_size.as_str().to_string(),
                                 e.to_string(),
                             ));
@@ -1081,7 +1081,7 @@ async fn stream_and_download(
                 });
                 if state_db.is_some() {
                     failed_batch.push((
-                        task.asset_id.clone(),
+                        task.asset_id.to_string(),
                         task.version_size.as_str().to_string(),
                         e.to_string(),
                     ));
@@ -1193,13 +1193,13 @@ async fn stream_and_download(
 pub async fn download_photos(
     download_client: &Client,
     albums: &[PhotoAlbum],
-    config: &DownloadConfig,
+    config: Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<DownloadOutcome> {
     let started = Instant::now();
 
     let streaming_result =
-        stream_and_download(download_client, albums, config, shutdown_token.clone()).await?;
+        stream_and_download(download_client, albums, &config, shutdown_token.clone()).await?;
 
     let downloaded = streaming_result.downloaded;
     let mut exif_failures = streaming_result.exif_failures;
@@ -1268,7 +1268,7 @@ pub async fn download_photos(
         cleanup_concurrency,
     );
 
-    let fresh_tasks = build_download_tasks(albums, config, shutdown_token.clone()).await?;
+    let fresh_tasks = build_download_tasks(albums, &config, shutdown_token.clone()).await?;
     tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
 
     let phase2_task_count = fresh_tasks.len();
@@ -1394,7 +1394,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                 }
                 if state_db.is_some() {
                     downloaded_batch.push((
-                        task.asset_id.clone(),
+                        task.asset_id.to_string(),
                         task.version_size.as_str().to_string(),
                         task.download_path.clone(),
                     ));
@@ -1416,7 +1416,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                 }
                 if state_db.is_some() {
                     failed_batch.push((
-                        task.asset_id.clone(),
+                        task.asset_id.to_string(),
                         task.version_size.as_str().to_string(),
                         e.to_string(),
                     ));
@@ -1642,7 +1642,10 @@ mod tests {
 
     /// Helper that calls filter_asset_to_tasks with a fresh claimed_paths map.
     /// Use this for simple tests that don't need to track paths across calls.
-    fn filter_asset_fresh(asset: &PhotoAsset, config: &DownloadConfig) -> Vec<DownloadTask> {
+    fn filter_asset_fresh(
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> SmallVec<[DownloadTask; 2]> {
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = std::collections::HashMap::new();
         filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache)
@@ -1670,8 +1673,8 @@ mod tests {
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].url, "https://example.com/orig");
-        assert_eq!(tasks[0].checksum, "abc123");
+        assert_eq!(&*tasks[0].url, "https://example.com/orig");
+        assert_eq!(&*tasks[0].checksum, "abc123");
         assert_eq!(tasks[0].size, 1000);
     }
 
@@ -1854,9 +1857,9 @@ mod tests {
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
         assert_eq!(tasks[0].size, 2000);
-        assert_eq!(tasks[1].url, "https://example.com/live_mov");
+        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
         assert_eq!(tasks[1].size, 3000);
         assert!(tasks[1]
             .download_path
@@ -1872,7 +1875,7 @@ mod tests {
         config.skip_live_photos = true;
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
     }
 
     #[test]
@@ -1910,7 +1913,7 @@ mod tests {
         // Second call: only the photo task (MOV already exists with matching size)
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1938,7 +1941,7 @@ mod tests {
         // Second call: should produce a deduped MOV path with asset ID suffix
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[1].url, "https://example.com/live_mov");
+        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
         let dedup_path = tasks[1].download_path.to_str().unwrap();
         assert!(
             dedup_path.contains("LIVE_1"),
@@ -2064,7 +2067,7 @@ mod tests {
         config.live_photo_size = AssetVersionSize::LiveMedium;
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[1].url, "https://example.com/live_med");
+        assert_eq!(&*tasks[1].url, "https://example.com/live_med");
     }
 
     #[test]
@@ -2247,8 +2250,8 @@ mod tests {
         // With AsOriginal and RAW alternative, the swap makes Original point to alt URL
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].url, "https://example.com/alt");
-        assert_eq!(tasks[0].checksum, "alt_ck");
+        assert_eq!(&*tasks[0].url, "https://example.com/alt");
+        assert_eq!(&*tasks[0].checksum, "alt_ck");
     }
 
     #[test]
@@ -2382,8 +2385,8 @@ mod tests {
         let config = test_config(); // align_raw defaults to AsIs
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].url, "https://example.com/orig");
-        assert_eq!(tasks[0].checksum, "orig_ck");
+        assert_eq!(&*tasks[0].url, "https://example.com/orig");
+        assert_eq!(&*tasks[0].checksum, "orig_ck");
     }
 
     // These tests overflow the stack in debug builds due to large async futures
