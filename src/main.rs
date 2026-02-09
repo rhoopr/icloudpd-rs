@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn pid_file_guard_creates_and_removes() {
-        let path = PathBuf::from("/tmp/claude/test_pid_guard.pid");
+        let path = std::env::temp_dir().join("icloudpd_test_pid_guard.pid");
         let _ = std::fs::remove_file(&path);
 
         {
@@ -959,7 +959,7 @@ mod tests {
 
     #[test]
     fn pid_file_guard_handles_missing_parent() {
-        let path = PathBuf::from("/tmp/claude/nonexistent_dir_abc123/test.pid");
+        let path = std::env::temp_dir().join("nonexistent_dir_abc123/test.pid");
         assert!(PidFileGuard::new(path).is_err());
     }
 }
