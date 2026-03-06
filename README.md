@@ -156,6 +156,10 @@ cargo fmt -- --check && cargo clippy && cargo test
 
 MIT — see [LICENSE.md](LICENSE.md)
 
+## Blog
+
+- [I Got Suspended from GitHub for 10 Days](https://robhooper.xyz/github-suspension) — what happens when GitHub's automated systems flag your account, and why local backups matter
+
 ## Acknowledgments
 
 This project is a Rust reimplementation inspired by [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader). Thanks to the original maintainers for their work reverse-engineering Apple's private APIs.
