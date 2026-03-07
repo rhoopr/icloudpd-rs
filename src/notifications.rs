@@ -15,6 +15,8 @@ pub enum Event {
     SyncComplete,
     /// Sync cycle had failures
     SyncFailed,
+    /// Session expired and re-authentication failed
+    SessionExpired,
 }
 
 impl Event {
@@ -23,6 +25,7 @@ impl Event {
             Self::TwoFaRequired => "2fa_required",
             Self::SyncComplete => "sync_complete",
             Self::SyncFailed => "sync_failed",
+            Self::SessionExpired => "session_expired",
         }
     }
 }
@@ -43,9 +46,9 @@ impl Notifier {
     }
 
     /// Fire the notification script with the given event.
-    /// Non-blocking: spawns the script and logs any errors.
-    pub async fn notify(&self, event: Event, message: &str, username: &str) {
-        let Some(script) = &self.script else {
+    /// Fire-and-forget: spawns the script in a background task so it never blocks sync.
+    pub fn notify(&self, event: Event, message: &str, username: &str) {
+        let Some(script) = self.script.clone() else {
             return;
         };
 
@@ -58,27 +61,32 @@ impl Notifier {
         }
 
         let event_str = event.as_str();
+        let message = message.to_owned();
+        let username = username.to_owned();
+
         tracing::debug!(event = event_str, "Firing notification script");
 
-        match run_script(script, event_str, message, username).await {
-            Ok(status) if status.success() => {
-                tracing::debug!(event = event_str, "Notification script completed");
+        tokio::spawn(async move {
+            match run_script(&script, event_str, &message, &username).await {
+                Ok(status) if status.success() => {
+                    tracing::debug!(event = event_str, "Notification script completed");
+                }
+                Ok(status) => {
+                    tracing::warn!(
+                        event = event_str,
+                        code = status.code(),
+                        "Notification script exited with non-zero status"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event = event_str,
+                        error = %e,
+                        "Notification script failed"
+                    );
+                }
             }
-            Ok(status) => {
-                tracing::warn!(
-                    event = event_str,
-                    code = status.code(),
-                    "Notification script exited with non-zero status"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    event = event_str,
-                    error = %e,
-                    "Notification script failed"
-                );
-            }
-        }
+        });
     }
 }
 
@@ -119,6 +127,7 @@ mod tests {
         assert_eq!(Event::TwoFaRequired.as_str(), "2fa_required");
         assert_eq!(Event::SyncComplete.as_str(), "sync_complete");
         assert_eq!(Event::SyncFailed.as_str(), "sync_failed");
+        assert_eq!(Event::SessionExpired.as_str(), "session_expired");
     }
 
     #[test]
@@ -127,13 +136,11 @@ mod tests {
         assert!(notifier.script.is_none());
     }
 
-    #[tokio::test]
-    async fn notify_with_nonexistent_script() {
+    #[test]
+    fn notify_with_nonexistent_script() {
         let notifier = Notifier::new(Some(PathBuf::from("/tmp/claude/nonexistent_notify.sh")));
-        // Should not panic, just log a warning
-        notifier
-            .notify(Event::SyncComplete, "test message", "user@example.com")
-            .await;
+        // Should not panic, just log a warning (script existence checked synchronously)
+        notifier.notify(Event::SyncComplete, "test message", "user@example.com");
     }
 
     #[cfg(unix)]
@@ -159,9 +166,10 @@ mod tests {
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let notifier = Notifier::new(Some(script_path.clone()));
-        notifier
-            .notify(Event::TwoFaRequired, "Need 2FA code", "test@example.com")
-            .await;
+        notifier.notify(Event::TwoFaRequired, "Need 2FA code", "test@example.com");
+
+        // Wait for the spawned background task to complete
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let output = std::fs::read_to_string(&output_path).unwrap();
         assert_eq!(output.trim(), "2fa_required|Need 2FA code|test@example.com");

@@ -1047,6 +1047,7 @@ mod tests {
             ("[filters]\nbogus = true", "filters"),
             ("[photos]\nbogus = true", "photos"),
             ("[watch]\nbogus = 1", "watch"),
+            ("[notifications]\nbogus = true", "notifications"),
             ("bogus = true", "top-level"),
         ] {
             assert!(
@@ -1066,6 +1067,7 @@ mod tests {
             [filters]
             [photos]
             [watch]
+            [notifications]
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         assert!(config.auth.unwrap().username.is_none());
@@ -1073,6 +1075,7 @@ mod tests {
         assert!(config.filters.unwrap().library.is_none());
         assert!(config.photos.unwrap().size.is_none());
         assert!(config.watch.unwrap().interval.is_none());
+        assert!(config.notifications.unwrap().script.is_none());
     }
 
     // ── TOML individual field parsing ──────────────────────────────
@@ -1289,6 +1292,8 @@ mod tests {
         assert!(!cfg.list_libraries);
         assert!(!cfg.dry_run);
         assert!(!cfg.only_print_filenames);
+        // Notifications
+        assert!(cfg.notification_script.is_none());
     }
 
     #[test]

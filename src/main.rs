@@ -363,7 +363,7 @@ async fn run_submit_code(
 
     let password_provider = make_password_provider(password);
 
-    auth::authenticate(
+    let result = auth::authenticate(
         &cookie_directory,
         &username,
         &password_provider,
@@ -374,7 +374,11 @@ async fn run_submit_code(
     )
     .await?;
 
-    println!("2FA code accepted. Session is now authenticated.");
+    if result.requires_2fa {
+        println!("2FA code accepted. Session is now authenticated.");
+    } else {
+        println!("Session is already authenticated.");
+    }
     Ok(())
 }
 
@@ -701,7 +705,7 @@ async fn main() -> anyhow::Result<()> {
 
     let password_provider = make_password_provider(config.password);
 
-    let auth_result = auth::authenticate(
+    let auth_result = match auth::authenticate(
         &config.cookie_directory,
         &config.username,
         &password_provider,
@@ -710,7 +714,23 @@ async fn main() -> anyhow::Result<()> {
         None,
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(e)
+            if e.downcast_ref::<auth::error::AuthError>()
+                .is_some_and(|ae| ae.is_two_factor_required()) =>
+        {
+            let msg = format!(
+                "2FA required for {}. Run: icloudpd-rs submit-code <CODE> --username {}",
+                config.username, config.username
+            );
+            tracing::warn!("{}", msg);
+            notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
+            anyhow::bail!("{}", msg);
+        }
+        Err(e) => return Err(e),
+    };
 
     if config.auth_only {
         tracing::info!("Authentication completed successfully");
@@ -875,13 +895,11 @@ async fn main() -> anyhow::Result<()> {
         match outcome {
             download::DownloadOutcome::Success => {
                 reauth_attempts = 0;
-                notifier
-                    .notify(
-                        notifications::Event::SyncComplete,
-                        "Sync completed successfully",
-                        &config.username,
-                    )
-                    .await;
+                notifier.notify(
+                    notifications::Event::SyncComplete,
+                    "Sync completed successfully",
+                    &config.username,
+                );
             }
             download::DownloadOutcome::SessionExpired { auth_error_count } => {
                 reauth_attempts += 1;
@@ -920,25 +938,32 @@ async fn main() -> anyhow::Result<()> {
                             config.username, config.username
                         );
                         tracing::warn!("{}", msg);
-                        notifier
-                            .notify(notifications::Event::TwoFaRequired, &msg, &config.username)
-                            .await;
+                        notifier.notify(
+                            notifications::Event::TwoFaRequired,
+                            &msg,
+                            &config.username,
+                        );
                         if !is_watch_mode {
                             anyhow::bail!("{}", msg);
                         }
                         // In watch mode, skip this cycle and retry next interval
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        notifier.notify(
+                            notifications::Event::SessionExpired,
+                            &format!("Re-authentication failed: {e}"),
+                            &config.username,
+                        );
+                        return Err(e);
+                    }
                 }
             }
             download::DownloadOutcome::PartialFailure { failed_count } => {
-                notifier
-                    .notify(
-                        notifications::Event::SyncFailed,
-                        &format!("{} downloads failed", failed_count),
-                        &config.username,
-                    )
-                    .await;
+                notifier.notify(
+                    notifications::Event::SyncFailed,
+                    &format!("{} downloads failed", failed_count),
+                    &config.username,
+                );
                 if is_watch_mode {
                     tracing::warn!(
                         failed_count,

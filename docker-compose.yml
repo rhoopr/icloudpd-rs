@@ -4,6 +4,7 @@ services:
     container_name: icloudpd-rs
     restart: unless-stopped
     environment:
+      - ICLOUD_USERNAME=${ICLOUD_USERNAME}
       - ICLOUD_PASSWORD=${ICLOUD_PASSWORD}
       - TZ=${TZ:-UTC}
     volumes:

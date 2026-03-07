@@ -26,6 +26,8 @@ pub use self::session::SharedSession;
 pub struct AuthResult {
     pub session: Session,
     pub data: AccountLoginResponse,
+    /// Whether 2FA was required (and performed) during this authentication.
+    pub requires_2fa: bool,
 }
 
 impl std::fmt::Debug for AuthResult {
@@ -136,11 +138,16 @@ pub async fn authenticate(
         return Ok(AuthResult {
             session,
             data: account_data,
+            requires_2fa: true,
         });
     }
 
     tracing::info!("Authentication completed successfully");
-    Ok(AuthResult { session, data })
+    Ok(AuthResult {
+        session,
+        data,
+        requires_2fa: false,
+    })
 }
 
 /// Check if the current session token is still valid by calling Apple's
