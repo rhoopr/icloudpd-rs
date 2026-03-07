@@ -145,54 +145,6 @@ pub async fn validate_token(
     Ok(data)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::auth::session::Session;
-    use std::path::PathBuf;
-
-    async fn test_session(name: &str) -> Session {
-        let dir = PathBuf::from("/tmp/claude/twofa_tests").join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Session::new(&dir, "test@example.com", "https://example.com", None)
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn submit_2fa_code_rejects_too_short() {
-        let mut session = test_session("short").await;
-        let endpoints = Endpoints::for_domain("com").unwrap();
-        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "123").await;
-        assert_eq!(result.unwrap(), false);
-    }
-
-    #[tokio::test]
-    async fn submit_2fa_code_rejects_too_long() {
-        let mut session = test_session("long").await;
-        let endpoints = Endpoints::for_domain("com").unwrap();
-        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "1234567").await;
-        assert_eq!(result.unwrap(), false);
-    }
-
-    #[tokio::test]
-    async fn submit_2fa_code_rejects_non_digits() {
-        let mut session = test_session("nondigit").await;
-        let endpoints = Endpoints::for_domain("com").unwrap();
-        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "12345a").await;
-        assert_eq!(result.unwrap(), false);
-    }
-
-    #[tokio::test]
-    async fn submit_2fa_code_rejects_empty() {
-        let mut session = test_session("empty").await;
-        let endpoints = Endpoints::for_domain("com").unwrap();
-        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "").await;
-        assert_eq!(result.unwrap(), false);
-    }
-}
-
 /// Authenticate using a session token (dsWebAuthToken).
 ///
 /// POST `{setup_endpoint}/accountLogin` with the token and trust token.
@@ -234,4 +186,52 @@ pub async fn authenticate_with_token(
     }
 
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::session::Session;
+    use std::path::PathBuf;
+
+    async fn test_session(name: &str) -> Session {
+        let dir = PathBuf::from("/tmp/claude/twofa_tests").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Session::new(&dir, "test@example.com", "https://example.com", None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn submit_2fa_code_rejects_too_short() {
+        let mut session = test_session("short").await;
+        let endpoints = Endpoints::for_domain("com").unwrap();
+        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "123").await;
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn submit_2fa_code_rejects_too_long() {
+        let mut session = test_session("long").await;
+        let endpoints = Endpoints::for_domain("com").unwrap();
+        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "1234567").await;
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn submit_2fa_code_rejects_non_digits() {
+        let mut session = test_session("nondigit").await;
+        let endpoints = Endpoints::for_domain("com").unwrap();
+        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "12345a").await;
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn submit_2fa_code_rejects_empty() {
+        let mut session = test_session("empty").await;
+        let endpoints = Endpoints::for_domain("com").unwrap();
+        let result = submit_2fa_code(&mut session, &endpoints, "client", "com", "").await;
+        assert!(!result.unwrap());
+    }
 }
