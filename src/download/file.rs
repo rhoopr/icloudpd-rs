@@ -53,7 +53,7 @@ pub async fn download_file(
     let part_path =
         temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
 
-    let result = retry::retry_with_backoff(
+    Box::pin(retry::retry_with_backoff(
         retry_config,
         |e: &DownloadError| {
             if e.is_retryable() {
@@ -62,11 +62,18 @@ pub async fn download_file(
                 RetryAction::Abort
             }
         },
-        || async { attempt_download(client, url, download_path, &part_path, checksum).await },
-    )
-    .await;
-
-    result
+        || async {
+            Box::pin(attempt_download(
+                client,
+                url,
+                download_path,
+                &part_path,
+                checksum,
+            ))
+            .await
+        },
+    ))
+    .await
 }
 
 /// Rebuild hash state by re-reading an existing .part file.
@@ -83,7 +90,7 @@ async fn resume_hash_state(part_path: &Path) -> Option<(Sha256, Sha1, u64)> {
     let mut reader = tokio::io::BufReader::new(file);
     let mut sha256 = Sha256::new();
     let mut sha1 = Sha1::new();
-    let mut buf = [0u8; 262_144]; // 256 KiB for faster resume hashing
+    let mut buf = vec![0u8; 262_144]; // 256 KiB for faster resume hashing
     loop {
         let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
             .await

@@ -1034,9 +1034,14 @@ async fn stream_and_download(
             let client = download_client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
             async move {
-                let result =
-                    download_single_task(&client, &task, &retry_config, set_exif, &temp_suffix)
-                        .await;
+                let result = Box::pin(download_single_task(
+                    &client,
+                    &task,
+                    &retry_config,
+                    set_exif,
+                    &temp_suffix,
+                ))
+                .await;
                 (task, result)
             }
         })
@@ -1403,9 +1408,14 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
             let client = client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
             async move {
-                let result =
-                    download_single_task(&client, &task, retry_config, set_exif, &temp_suffix)
-                        .await;
+                let result = Box::pin(download_single_task(
+                    &client,
+                    &task,
+                    retry_config,
+                    set_exif,
+                    &temp_suffix,
+                ))
+                .await;
                 (task, result)
             }
         })
@@ -1513,7 +1523,7 @@ async fn download_single_task(
         "downloading",
     );
 
-    file::download_file(
+    Box::pin(file::download_file(
         client,
         &task.url,
         &task.download_path,
@@ -1521,7 +1531,7 @@ async fn download_single_task(
         false,
         retry_config,
         temp_suffix,
-    )
+    ))
     .await?;
 
     let mtime_path = task.download_path.clone();
