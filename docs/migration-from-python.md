@@ -103,7 +103,7 @@ Most flags are the same or very close. Here's the full mapping:
 
 ## Docker migration
 
-If you're using a Python icloudpd Docker wrapper (like boredazfcuk's), the key differences:
+If you're using a Python icloudpd Docker wrapper (like boredazfcuk's), here are the key differences:
 
 | Python Docker | icloudpd-rs Docker |
 |---------------|-------------------|
@@ -147,7 +147,7 @@ docker exec icloudpd-rs icloudpd-rs import-existing --directory /photos
 
 ## Known differences in output
 
-- **EXIF file size** — When `--set-exif-datetime` is used, files written by icloudpd-rs may differ by 29-58 bytes compared to the Python version. This is due to a different EXIF library (`little_exif` vs `piexif`) and does not affect image quality or metadata correctness. The photos are visually identical.
+- **EXIF file size** — When `--set-exif-datetime` is used, files written by icloudpd-rs may differ by 29-58 bytes compared to the Python version. This is due to a different EXIF library (`little_exif` vs `piexif`) and doesn't affect image quality or metadata correctness. The photos are visually identical.
 
 ## What you don't need to worry about
 

@@ -124,7 +124,7 @@ Run `icloudpd-rs --help` for the full flag list, or check the **[Wiki](https://g
 |---------|---------|
 | Parallel downloads | Configurable concurrency, downloads start as the first API page returns |
 | State tracking | SQLite DB tracks downloaded/failed/pending — no re-scanning |
-| Resumable transfers | `.part` files resumed via HTTP Range with SHA256 verification |
+| Resumable transfers | Partial downloads resume via HTTP Range with SHA256 verification |
 | TOML config | Optional `config.toml` with `[auth]`, `[download]`, `[filters]`, `[photos]`, `[watch]`, `[notifications]` sections. CLI flags override config values. [Guide](https://github.com/rhoopr/icloudpd-rs/wiki/Configuration) |
 | Docker | Multi-arch (amd64/arm64) on `ghcr.io/rhoopr/icloudpd-rs`. [Guide](https://github.com/rhoopr/icloudpd-rs/wiki/Docker) |
 | Headless MFA | `submit-code` subcommand for Docker/cron 2FA without interactive prompts |
