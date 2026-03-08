@@ -46,7 +46,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.18"
 rpassword = "7"
 
-# EXIF
+# EXIF — two libraries because no single crate handles both read and write.
+# kamadak-exif: read-only, used for reading DateTimeOriginal from existing files.
+# little_exif:  write-capable, used for stamping EXIF dates on downloaded photos.
 kamadak-exif = "0.6"
 little_exif = "0.6"
 
