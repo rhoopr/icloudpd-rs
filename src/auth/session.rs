@@ -124,7 +124,9 @@ impl Session {
                     .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))?;
                 if !acquired {
                     anyhow::bail!(
-                        "Another icloudpd-rs instance is running for this account (lock: {})",
+                        "Another icloudpd-rs instance is running for this account (lock: {}). \
+                         If running in Docker, check for orphaned containers with \
+                         `docker ps` and stop them with `docker stop <name>`.",
                         lock_path.display()
                     );
                 }
