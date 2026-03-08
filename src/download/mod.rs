@@ -375,16 +375,15 @@ fn apply_raw_policy(
                 _ => (orig, alt),
             });
 
-    let alt_idx = match alt_idx {
-        Some(idx) => idx,
-        None => return std::borrow::Cow::Borrowed(versions),
+    let Some(alt_idx) = alt_idx else {
+        return std::borrow::Cow::Borrowed(versions);
     };
 
     let should_swap = match policy {
         RawTreatmentPolicy::PreferOriginal => versions[alt_idx].1.asset_type.contains("raw"),
-        RawTreatmentPolicy::PreferAlternative => orig_idx
-            .map(|idx| versions[idx].1.asset_type.contains("raw"))
-            .unwrap_or(false),
+        RawTreatmentPolicy::PreferAlternative => {
+            orig_idx.is_some_and(|idx| versions[idx].1.asset_type.contains("raw"))
+        }
         RawTreatmentPolicy::Unchanged => false,
     };
 
