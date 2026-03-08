@@ -65,11 +65,9 @@ struct CookieEntry {
 pub struct Session {
     client: Client,
     download_client: Client,
-    /// Cookie jar shared with `reqwest::Client`. This field is intentionally
-    /// never read — it exists solely to prevent the `Arc<Jar>` from being
-    /// dropped while the client is in use. The client holds a weak reference
-    /// internally, so we must keep the Arc alive here.
-    #[allow(dead_code)] // Intentional: prevents Arc from dropping
+    /// Cookie jar shared with `reqwest::Client`. Queried by
+    /// `persist_jar_cookies` to save session cookies to disk, and kept alive
+    /// so the client's internal weak reference remains valid.
     cookie_jar: Arc<reqwest::cookie::Jar>,
     pub session_data: HashMap<String, String>,
     cookie_dir: PathBuf,
