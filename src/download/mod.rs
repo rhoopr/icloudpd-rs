@@ -151,6 +151,9 @@ pub struct DownloadConfig {
     pub(crate) temp_suffix: String,
     /// State database for tracking download progress.
     pub(crate) state_db: Option<Arc<dyn StateDb>>,
+    /// When true (retry-failed mode), only download assets already known to the
+    /// state DB. Skip new assets discovered from iCloud that were never synced.
+    pub(crate) retry_only: bool,
 }
 
 impl std::fmt::Debug for DownloadConfig {
@@ -181,6 +184,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("keep_unicode_in_filenames", &self.keep_unicode_in_filenames)
             .field("temp_suffix", &self.temp_suffix)
             .field("state_db", &self.state_db.is_some())
+            .field("retry_only", &self.retry_only)
             .finish()
     }
 }
@@ -226,11 +230,14 @@ struct DownloadContext {
     /// Nested map: asset_id -> (version_size -> checksum) for downloaded assets.
     /// Used to detect checksum changes (iCloud asset updated) without DB queries.
     downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
+    /// All asset IDs known to the state DB (any status). Used in retry-only mode
+    /// to skip new assets that were never synced.
+    known_ids: FxHashSet<Box<str>>,
 }
 
 impl DownloadContext {
     /// Load the download context from the state database.
-    async fn load(db: &dyn StateDb) -> Self {
+    async fn load(db: &dyn StateDb, retry_only: bool) -> Self {
         // Build nested map structure for zero-allocation lookups
         let mut downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>> = FxHashMap::default();
         for (asset_id, version_size) in db.get_downloaded_ids().await.unwrap_or_default() {
@@ -251,9 +258,23 @@ impl DownloadContext {
                 .insert(version_size.into_boxed_str(), checksum.into_boxed_str());
         }
 
+        // In retry-only mode, load all known asset IDs so we can skip new
+        // assets that were never synced before.
+        let known_ids = if retry_only {
+            db.get_all_known_ids()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(String::into_boxed_str)
+                .collect()
+        } else {
+            FxHashSet::default()
+        };
+
         Self {
             downloaded_ids,
             downloaded_checksums,
+            known_ids,
         }
     }
 
@@ -828,7 +849,7 @@ async fn stream_and_download(
     // Pre-load download context for O(1) skip decisions
     let download_ctx = if let Some(db) = &state_db {
         tracing::debug!("Pre-loading download state from database");
-        DownloadContext::load(db.as_ref()).await
+        DownloadContext::load(db.as_ref(), config.retry_only).await
     } else {
         DownloadContext::default()
     };
@@ -889,6 +910,14 @@ async fn stream_and_download(
                         producer_pb.inc(1);
                     } else {
                         for task in tasks {
+                            // In retry-only mode, skip assets not already in the state DB
+                            if config.retry_only
+                                && !download_ctx.known_ids.contains(task.asset_id.as_ref())
+                            {
+                                producer_pb.inc(1);
+                                continue;
+                            }
+
                             // Record asset in state DB
                             if let Some(db) = &producer_state_db {
                                 let media_type = determine_media_type(task.version_size, &asset);
@@ -1643,6 +1672,7 @@ mod tests {
             keep_unicode_in_filenames: false,
             temp_suffix: ".icloudpd-tmp".to_string(),
             state_db: None,
+            retry_only: false,
         }
     }
 

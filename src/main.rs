@@ -808,9 +808,11 @@ async fn main() -> anyhow::Result<()> {
                         Ok(count) if count > 0 => {
                             tracing::info!(count, "Reset failed assets to pending");
                         }
-                        Ok(_) => {
+                        Ok(0) => {
                             tracing::info!("No failed assets to retry");
+                            return Ok(());
                         }
+                        Ok(_) => unreachable!(),
                         Err(e) => {
                             tracing::warn!("Failed to reset failed assets: {}", e);
                         }
@@ -861,6 +863,7 @@ async fn main() -> anyhow::Result<()> {
         keep_unicode_in_filenames: config.keep_unicode_in_filenames,
         temp_suffix: config.temp_suffix.clone(),
         state_db,
+        retry_only: is_retry_failed,
     });
 
     let shutdown_token = shutdown::install_signal_handler(&sd_notifier)?;
