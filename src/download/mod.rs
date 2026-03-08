@@ -615,10 +615,10 @@ fn filter_asset_to_tasks(
             // Clone for the normalized key, move original into DownloadTask
             claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
             tasks.push(DownloadTask {
-                url: version.url.to_string().into_boxed_str(),
+                url: version.url.clone(),
                 download_path: path,
-                checksum: version.checksum.to_string().into_boxed_str(),
-                asset_id: asset.id().to_string().into_boxed_str(),
+                checksum: version.checksum.clone(),
+                asset_id: asset.id().into(),
                 size: version.size,
                 created_local,
                 version_size: VersionSizeKey::from(config.size),
@@ -717,10 +717,10 @@ fn filter_asset_to_tasks(
                 // Clone for the normalized key, move original into DownloadTask
                 claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
                 tasks.push(DownloadTask {
-                    url: live_version.url.to_string().into_boxed_str(),
+                    url: live_version.url.clone(),
                     download_path: path,
-                    checksum: live_version.checksum.to_string().into_boxed_str(),
-                    asset_id: asset.id().to_string().into_boxed_str(),
+                    checksum: live_version.checksum.clone(),
+                    asset_id: asset.id().into(),
                     size: live_version.size,
                     created_local,
                     version_size: VersionSizeKey::from(config.live_photo_size),
