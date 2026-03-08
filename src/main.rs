@@ -102,6 +102,14 @@ fn make_password_provider(password: Option<String>) -> impl Fn() -> Option<Strin
 /// First validates the existing session; if invalid, performs full re-authentication.
 /// If 2FA is required in headless mode, returns `AuthError::TwoFactorRequired`
 /// so the caller can fire a notification and skip the current cycle.
+///
+/// # Lock strategy
+///
+/// A write lock is held across the `validate_session` call because validation
+/// mutates the session (refreshes tokens). The lock is dropped before the
+/// heavier `authenticate` call to avoid blocking download tasks. A 30-second
+/// timeout guards against a hung validation request holding the lock
+/// indefinitely.
 async fn attempt_reauth<F>(
     shared_session: &auth::SharedSession,
     cookie_directory: &Path,
@@ -114,8 +122,15 @@ where
 {
     let mut session = shared_session.write().await;
 
-    // Try validation first
-    if auth::validate_session(&mut session, domain).await? {
+    // Try validation first — timeout prevents a hung HTTP request from
+    // holding the write lock indefinitely and starving download tasks.
+    let valid = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        auth::validate_session(&mut session, domain),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Session validation timed out after 30s"))??;
+    if valid {
         tracing::debug!("Session still valid after re-validation");
         return Ok(());
     }
