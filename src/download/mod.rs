@@ -124,6 +124,35 @@ pub enum DownloadOutcome {
     PartialFailure { failed_count: usize },
 }
 
+/// Compute a deterministic hash of the config fields that affect path resolution.
+///
+/// When this hash changes between runs, we can't trust the state DB's download
+/// records (the resolved paths may differ), so we fall back to the full pipeline
+/// with filesystem existence checks.
+fn hash_download_config(config: &DownloadConfig) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let mut hasher = Sha256::new();
+    hasher.update(config.directory.as_os_str().as_encoded_bytes());
+    hasher.update(b"\0");
+    hasher.update(config.folder_structure.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:?}", config.size).as_bytes());
+    hasher.update(format!("{:?}", config.live_photo_size).as_bytes());
+    hasher.update(format!("{:?}", config.file_match_policy).as_bytes());
+    hasher.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
+    hasher.update(format!("{:?}", config.align_raw).as_bytes());
+    hasher.update([config.keep_unicode_in_filenames as u8]);
+    let hash = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    // First 8 bytes is plenty for collision avoidance in this context
+    for &b in &hash[..8] {
+        let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+    }
+    hex
+}
+
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
 pub struct DownloadConfig {
@@ -280,8 +309,12 @@ impl DownloadContext {
 
     /// Check if an asset should be downloaded based on pre-loaded state.
     ///
-    /// Returns `Some(true)` if definitely needs download, or `None` if
-    /// downloaded with matching checksum (need filesystem check to confirm).
+    /// Returns:
+    /// - `Some(true)` — definitely needs download (not in DB or checksum changed)
+    /// - `Some(false)` — hard skip, DB confirms downloaded with matching checksum
+    ///   (only when `trust_state` is true)
+    /// - `None` — downloaded with matching checksum but needs filesystem check
+    ///   to confirm file is still on disk (when `trust_state` is false)
     ///
     /// Uses borrowed `&str` keys for zero-allocation lookups.
     fn should_download_fast(
@@ -289,6 +322,7 @@ impl DownloadContext {
         asset_id: &str,
         version_size: VersionSizeKey,
         checksum: &str,
+        trust_state: bool,
     ) -> Option<bool> {
         let version_size_str = version_size.as_str();
 
@@ -313,9 +347,14 @@ impl DownloadContext {
             }
         }
 
-        // Downloaded with matching checksum — but file might be missing,
-        // need filesystem check (return None)
-        None
+        // Downloaded with matching checksum
+        if trust_state {
+            // Trust the DB — hard skip without filesystem check
+            Some(false)
+        } else {
+            // Need filesystem check to confirm file is still on disk
+            None
+        }
     }
 }
 
@@ -398,6 +437,67 @@ fn apply_raw_policy(
         swapped[alt_idx].0 = AssetVersionSize::Original;
     }
     std::borrow::Cow::Owned(swapped)
+}
+
+/// Lightweight pre-check: extract (version_size, checksum) pairs for an asset
+/// after applying content/date filters but WITHOUT path resolution or disk I/O.
+///
+/// Returns the candidate versions that would be downloaded. Used by the early
+/// skip gate to check the state DB before the expensive `filter_asset_to_tasks`.
+fn extract_skip_candidates<'a>(
+    asset: &'a crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> SmallVec<[(VersionSizeKey, &'a str); 2]> {
+    // Content type filters — same as filter_asset_to_tasks
+    if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
+        return SmallVec::new();
+    }
+    if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
+        return SmallVec::new();
+    }
+
+    // Date filters
+    let created_utc = asset.created();
+    if let Some(before) = &config.skip_created_before {
+        if created_utc < *before {
+            return SmallVec::new();
+        }
+    }
+    if let Some(after) = &config.skip_created_after {
+        if created_utc > *after {
+            return SmallVec::new();
+        }
+    }
+
+    let versions = asset.versions();
+    let mut result = SmallVec::new();
+
+    // Primary version (with fallback to Original, same logic as filter_asset_to_tasks)
+    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
+        versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    };
+    let primary = match get_version(&config.size) {
+        Some(v) => Some((v, config.size)),
+        None if config.size != AssetVersionSize::Original && !config.force_size => {
+            get_version(&AssetVersionSize::Original).map(|v| (v, AssetVersionSize::Original))
+        }
+        _ => None,
+    };
+    if let Some((v, effective_size)) = primary {
+        result.push((VersionSizeKey::from(effective_size), v.checksum.as_ref()));
+    }
+
+    // Live photo companion
+    if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
+        if let Some(v) = get_version(&config.live_photo_size) {
+            result.push((
+                VersionSizeKey::from(config.live_photo_size),
+                v.checksum.as_ref(),
+            ));
+        }
+    }
+
+    result
 }
 
 /// Apply content filters (type, date range) and local existence check,
@@ -852,6 +952,29 @@ async fn stream_and_download(
         "Download context loaded"
     );
 
+    // Determine if we can trust the state DB for early skips.
+    // When the download config hash matches the stored hash, path resolution
+    // hasn't changed and we can skip filesystem existence checks entirely.
+    let trust_state = if let Some(db) = &state_db {
+        let config_hash = hash_download_config(config);
+        let stored_hash = db.get_metadata("config_hash").await.unwrap_or(None);
+        let trust = stored_hash.as_deref() == Some(&config_hash);
+        if !trust {
+            if stored_hash.is_some() {
+                tracing::info!("Download config changed since last sync, verifying all files");
+            }
+            let _ = db.set_metadata("config_hash", &config_hash).await;
+        }
+        trust && !download_ctx.downloaded_ids.is_empty()
+    } else {
+        false
+    };
+    if trust_state {
+        tracing::debug!(
+            "Trust-state mode active: skipping filesystem checks for DB-confirmed assets"
+        );
+    }
+
     // Start sync run tracking
     let sync_run_id = if let Some(db) = &state_db {
         match db.start_sync_run().await {
@@ -898,6 +1021,28 @@ async fn stream_and_download(
             match result {
                 Ok(asset) => {
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    // Early skip gate: when trust_state is active, check DB
+                    // without path resolution for assets confirmed as downloaded.
+                    if trust_state {
+                        let candidates = extract_skip_candidates(&asset, config);
+                        if !candidates.is_empty()
+                            && candidates.iter().all(|&(vs, cs)| {
+                                matches!(
+                                    download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                                    Some(false)
+                                )
+                            })
+                        {
+                            // All versions confirmed in DB — skip path resolution
+                            if let Some(db) = &producer_state_db {
+                                let _ = db.touch_last_seen(asset.id()).await;
+                            }
+                            producer_pb.inc(1);
+                            continue;
+                        }
+                    }
+
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
                     if tasks.is_empty() {
@@ -942,6 +1087,7 @@ async fn stream_and_download(
                                     &task.asset_id,
                                     task.version_size,
                                     &task.checksum,
+                                    false, // trust_state=false: full pipeline needs filesystem check
                                 ) {
                                     Some(true) => {
                                         if task_tx.send(task).await.is_err() {
@@ -2521,6 +2667,76 @@ mod tests {
             size_of::<DownloadTask>() <= 144,
             "DownloadTask size {} exceeds 144 bytes",
             size_of::<DownloadTask>()
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_deterministic() {
+        let config = test_config();
+        let hash1 = hash_download_config(&config);
+        let hash2 = hash_download_config(&config);
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 16); // 8 bytes hex-encoded
+    }
+
+    #[test]
+    fn test_hash_download_config_changes_on_directory() {
+        let mut config1 = test_config();
+        config1.directory = PathBuf::from("/photos/a");
+        let mut config2 = test_config();
+        config2.directory = PathBuf::from("/photos/b");
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_changes_on_folder_structure() {
+        let mut config1 = test_config();
+        config1.folder_structure = "{:%Y/%m/%d}".to_string();
+        let mut config2 = test_config();
+        config2.folder_structure = "{:%Y/%m}".to_string();
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_should_download_fast_trust_state_returns_false() {
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("asset1".into())
+            .or_default()
+            .insert("original".into());
+        ctx.downloaded_checksums
+            .entry("asset1".into())
+            .or_default()
+            .insert("original".into(), "checksum_a".into());
+
+        // trust_state=true: returns Some(false) for matching asset
+        assert_eq!(
+            ctx.should_download_fast("asset1", VersionSizeKey::Original, "checksum_a", true),
+            Some(false)
+        );
+
+        // trust_state=false: returns None (needs filesystem check)
+        assert_eq!(
+            ctx.should_download_fast("asset1", VersionSizeKey::Original, "checksum_a", false),
+            None
+        );
+
+        // Changed checksum: returns Some(true) regardless of trust_state
+        assert_eq!(
+            ctx.should_download_fast("asset1", VersionSizeKey::Original, "checksum_b", true),
+            Some(true)
+        );
+
+        // Unknown asset: returns Some(true)
+        assert_eq!(
+            ctx.should_download_fast("unknown", VersionSizeKey::Original, "x", true),
+            Some(true)
         );
     }
 }
