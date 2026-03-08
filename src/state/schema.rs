@@ -8,7 +8,7 @@ use super::error::StateError;
 pub const SCHEMA_VERSION: i32 = 1;
 
 /// Schema DDL for version 1.
-const SCHEMA_V1: &str = r#"
+const SCHEMA_V1: &str = r"
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT NOT NULL,
     version_size TEXT NOT NULL,
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     assets_failed INTEGER DEFAULT 0,
     interrupted INTEGER DEFAULT 0
 );
-"#;
+";
 
 /// Get the current schema version from the database.
 pub(crate) fn get_schema_version(conn: &Connection) -> Result<i32, StateError> {

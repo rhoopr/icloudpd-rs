@@ -280,7 +280,7 @@ impl StateDb for SqliteStateDb {
         // Use INSERT OR REPLACE to handle both insert and update
         // But preserve existing status, downloaded_at, local_path, download_attempts, last_error
         conn.execute(
-            r#"
+            r"
             INSERT INTO assets (id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, last_seen_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)
             ON CONFLICT(id, version_size) DO UPDATE SET
@@ -291,7 +291,7 @@ impl StateDb for SqliteStateDb {
                 size_bytes = excluded.size_bytes,
                 media_type = excluded.media_type,
                 last_seen_at = excluded.last_seen_at
-            "#,
+            ",
             rusqlite::params![
                 &record.id,
                 record.version_size.as_str(),
