@@ -868,7 +868,11 @@ fn sync_nonexistent_library_fails() {
         .timeout(std::time::Duration::from_secs(TIMEOUT_META))
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error").or(predicate::str::contains("ERROR")));
+        .stderr(
+            predicate::str::contains("error")
+                .or(predicate::str::contains("Error"))
+                .or(predicate::str::contains("ERROR")),
+        );
 }
 
 // ── Bad credentials (LAST — hits auth from scratch, burns rate limit) ───
@@ -896,7 +900,11 @@ fn zz_bad_credentials_fails() {
         .timeout(std::time::Duration::from_secs(60))
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error").or(predicate::str::contains("ERROR")));
+        .stderr(
+            predicate::str::contains("error")
+                .or(predicate::str::contains("Error"))
+                .or(predicate::str::contains("ERROR")),
+        );
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
