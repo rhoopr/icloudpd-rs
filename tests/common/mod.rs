@@ -15,7 +15,7 @@ fn init_env() {
 /// and `ICLOUD_PASSWORD` are available to the child process.
 pub fn cmd() -> assert_cmd::Command {
     init_env();
-    assert_cmd::Command::cargo_bin("icloudpd-rs").expect("binary icloudpd-rs not found")
+    assert_cmd::cargo_bin_cmd!("icloudpd-rs")
 }
 
 /// Skip the current test when credentials are not configured.
