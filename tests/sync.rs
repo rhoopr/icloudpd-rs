@@ -157,24 +157,8 @@ fn sync_idempotent_second_run_noop() {
     let (username, password, cookie_dir) = common::require_preauth();
     let download_dir = tempdir().expect("tempdir");
 
-    let args: Vec<&str> = vec![
-        "sync",
-        "--album",
-        ALBUM,
-        "--username",
-        &username,
-        "--password",
-        &password,
-        "--cookie-directory",
-        cookie_dir.to_str().unwrap(),
-        "--directory",
-        download_dir.path().to_str().unwrap(),
-        "--no-progress-bar",
-    ];
-
     // First sync
-    common::cmd()
-        .args(&args)
+    album_cmd(&username, &password, &cookie_dir, download_dir.path())
         .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
         .assert()
         .success();
@@ -188,8 +172,7 @@ fn sync_idempotent_second_run_noop() {
         .collect();
 
     // Second sync — should be a no-op
-    common::cmd()
-        .args(&args)
+    album_cmd(&username, &password, &cookie_dir, download_dir.path())
         .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
         .assert()
         .success();
@@ -885,7 +868,7 @@ fn sync_nonexistent_library_fails() {
         .timeout(std::time::Duration::from_secs(TIMEOUT_META))
         .assert()
         .failure()
-        .stderr(predicate::str::is_empty().not());
+        .stderr(predicate::str::contains("error").or(predicate::str::contains("ERROR")));
 }
 
 // ── Bad credentials (LAST — hits auth from scratch, burns rate limit) ───
@@ -913,7 +896,7 @@ fn zz_bad_credentials_fails() {
         .timeout(std::time::Duration::from_secs(60))
         .assert()
         .failure()
-        .stderr(predicate::str::is_empty().not());
+        .stderr(predicate::str::contains("error").or(predicate::str::contains("ERROR")));
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

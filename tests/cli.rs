@@ -781,5 +781,5 @@ fn submit_code_fails_without_username() {
         .timeout(std::time::Duration::from_secs(30))
         .assert()
         .failure()
-        .stderr(predicate::str::is_empty().not());
+        .stderr(predicate::str::contains("error").or(predicate::str::contains("required")));
 }
