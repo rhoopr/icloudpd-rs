@@ -43,6 +43,23 @@ fn install_rate_limit_hook() {
     }));
 }
 
+/// Sleep between auth tests to reduce Apple API rate-limit risk.
+///
+/// Default: 2 seconds. Override with `TEST_THROTTLE_SECS` env var (0 to disable).
+fn throttle() {
+    static FIRST: AtomicBool = AtomicBool::new(true);
+    if FIRST.swap(false, Ordering::SeqCst) {
+        return; // no delay before the very first test
+    }
+    let secs: u64 = std::env::var("TEST_THROTTLE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    if secs > 0 {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
+}
+
 /// Build an `assert_cmd::Command` for the icloudpd-rs binary.
 ///
 /// Loads `.env` from the repo root (if present) so that `ICLOUD_USERNAME`
@@ -105,6 +122,7 @@ pub fn require_preauth() -> (String, String, PathBuf) {
         eprintln!("\n*** ABORTING: Apple 503 rate limit detected in earlier test ***");
         std::process::exit(1);
     }
+    throttle();
     let (username, password) = creds_or_skip().expect(
         "AUTH TESTS REQUIRE ICLOUD_USERNAME and ICLOUD_PASSWORD — set them in .env or environment",
     );
