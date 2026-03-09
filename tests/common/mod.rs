@@ -1,12 +1,20 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Load `.env` exactly once across all test functions.
+fn init_env() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = dotenvy::from_filename(".env");
+    });
+}
 
 /// Build an `assert_cmd::Command` for the icloudpd-rs binary.
 ///
 /// Loads `.env` from the repo root (if present) so that `ICLOUD_USERNAME`
 /// and `ICLOUD_PASSWORD` are available to the child process.
-#[allow(deprecated)]
 pub fn cmd() -> assert_cmd::Command {
-    dotenvy::dotenv().ok();
+    init_env();
     assert_cmd::Command::cargo_bin("icloudpd-rs").expect("binary icloudpd-rs not found")
 }
 
@@ -16,7 +24,7 @@ pub fn cmd() -> assert_cmd::Command {
 /// `ICLOUD_PASSWORD` are set, otherwise prints a message and returns `None`.
 #[allow(dead_code)]
 pub fn creds_or_skip() -> Option<(String, String)> {
-    dotenvy::dotenv().ok();
+    init_env();
     let username = std::env::var("ICLOUD_USERNAME").ok()?;
     let password = std::env::var("ICLOUD_PASSWORD").ok()?;
     if username.is_empty() || password.is_empty() {
@@ -31,7 +39,7 @@ pub fn creds_or_skip() -> Option<(String, String)> {
 /// `{repo_root}/.test-cookies/`.
 #[allow(dead_code)]
 pub fn cookie_dir() -> PathBuf {
-    dotenvy::dotenv().ok();
+    init_env();
     if let Ok(dir) = std::env::var("ICLOUD_TEST_COOKIE_DIR") {
         return PathBuf::from(dir);
     }
@@ -52,7 +60,7 @@ pub fn cookie_dir() -> PathBuf {
 /// - Credentials are not configured
 /// - The shared cookie directory does not contain session files
 ///
-/// Pre-auth setup:
+/// Pre-auth setup (fish shell — use `$(…)` instead of `(…)` in bash/zsh):
 ///
 /// ```sh
 /// env (cat .env | grep -v '^#') cargo run -- sync --auth-only --cookie-directory .test-cookies
@@ -74,4 +82,22 @@ pub fn require_preauth() -> (String, String, PathBuf) {
         session_file.display()
     );
     (username, password, dir)
+}
+
+/// Recursively collect all regular files under `dir`, sorted for deterministic ordering.
+#[allow(dead_code)]
+pub fn walkdir(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(walkdir(&path));
+            } else if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
 }

@@ -7,6 +7,16 @@ mod common;
 
 use predicates::prelude::*;
 
+const ALL_SUBCOMMANDS: &[&str] = &[
+    "sync",
+    "status",
+    "reset-state",
+    "verify",
+    "retry-failed",
+    "submit-code",
+    "import-existing",
+];
+
 // ── Help output ─────────────────────────────────────────────────────────
 
 #[test]
@@ -24,15 +34,7 @@ fn help_flag_succeeds() {
 fn help_lists_all_subcommands() {
     let assert = common::cmd().arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
-    for sub in [
-        "sync",
-        "status",
-        "retry-failed",
-        "reset-state",
-        "import-existing",
-        "verify",
-        "submit-code",
-    ] {
+    for sub in ALL_SUBCOMMANDS {
         assert!(
             stdout.contains(sub),
             "help output missing subcommand `{sub}`"
@@ -502,15 +504,7 @@ fn bare_invocation_with_username_and_directory_parses() {
 
 #[test]
 fn config_global_flag_works_with_all_subcommands() {
-    for sub in [
-        "sync",
-        "status",
-        "reset-state",
-        "verify",
-        "retry-failed",
-        "submit-code",
-        "import-existing",
-    ] {
+    for sub in ALL_SUBCOMMANDS {
         common::cmd()
             .args([sub, "--config", "/custom/config.toml", "--help"])
             .assert()
@@ -520,15 +514,7 @@ fn config_global_flag_works_with_all_subcommands() {
 
 #[test]
 fn log_level_global_flag_works_with_all_subcommands() {
-    for sub in [
-        "sync",
-        "status",
-        "reset-state",
-        "verify",
-        "retry-failed",
-        "submit-code",
-        "import-existing",
-    ] {
+    for sub in ALL_SUBCOMMANDS {
         common::cmd()
             .args([sub, "--log-level", "warn", "--help"])
             .assert()
@@ -671,13 +657,7 @@ fn import_existing_short_d_flag() {
 
 #[test]
 fn unknown_flag_on_all_subcommands_fails() {
-    for sub in [
-        "verify",
-        "reset-state",
-        "import-existing",
-        "submit-code",
-        "retry-failed",
-    ] {
+    for sub in ALL_SUBCOMMANDS {
         common::cmd()
             .args([sub, "--bogus-flag"])
             .assert()
@@ -690,15 +670,7 @@ fn unknown_flag_on_all_subcommands_fails() {
 
 #[test]
 fn auth_flags_accepted_on_all_subcommands() {
-    for sub in [
-        "sync",
-        "status",
-        "reset-state",
-        "verify",
-        "retry-failed",
-        "import-existing",
-        "submit-code",
-    ] {
+    for sub in ALL_SUBCOMMANDS {
         for (flag, value) in [
             ("--username", "x@x.com"),
             ("--password", "secret"),

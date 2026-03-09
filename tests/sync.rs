@@ -102,7 +102,7 @@ fn sync_album_downloads_all_asset_types() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     assert!(
         files.len() >= 5,
         "expected at least 5 files from test album, got {}",
@@ -116,30 +116,20 @@ fn sync_album_downloads_all_asset_types() {
     }
 
     // Verify expected file types are present
-    let extensions: Vec<String> = files
-        .iter()
-        .filter_map(|p| {
+    let has_ext = |target: &str| {
+        files.iter().any(|p: &std::path::PathBuf| {
             p.extension()
                 .and_then(|e| e.to_str())
-                .map(|s| s.to_lowercase())
+                .is_some_and(|e| e.eq_ignore_ascii_case(target))
         })
-        .collect();
+    };
     assert!(
-        extensions.contains(&"jpg".to_string()) || extensions.contains(&"jpeg".to_string()),
-        "expected a JPEG file, found extensions: {extensions:?}"
+        has_ext("jpg") || has_ext("jpeg"),
+        "expected a JPEG file in: {files:?}"
     );
-    assert!(
-        extensions.contains(&"mov".to_string()),
-        "expected a MOV file, found extensions: {extensions:?}"
-    );
-    assert!(
-        extensions.contains(&"heic".to_string()),
-        "expected a HEIC file, found extensions: {extensions:?}"
-    );
-    assert!(
-        extensions.contains(&"dng".to_string()),
-        "expected a DNG file, found extensions: {extensions:?}"
-    );
+    assert!(has_ext("mov"), "expected a MOV file in: {files:?}");
+    assert!(has_ext("heic"), "expected a HEIC file in: {files:?}");
+    assert!(has_ext("dng"), "expected a DNG file in: {files:?}");
 }
 
 /// Dry-run should list assets but not write any files to disk.
@@ -154,7 +144,7 @@ fn sync_dry_run_downloads_nothing() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     assert!(
         files.is_empty(),
         "dry-run should download nothing, found: {files:?}"
@@ -189,7 +179,7 @@ fn sync_idempotent_second_run_noop() {
         .assert()
         .success();
 
-    let files_first = walkdir(download_dir.path());
+    let files_first = common::walkdir(download_dir.path());
     assert!(!files_first.is_empty(), "first sync should download files");
 
     let mtimes_before: Vec<_> = files_first
@@ -204,7 +194,7 @@ fn sync_idempotent_second_run_noop() {
         .assert()
         .success();
 
-    let files_second = walkdir(download_dir.path());
+    let files_second = common::walkdir(download_dir.path());
     assert_eq!(
         files_first.len(),
         files_second.len(),
@@ -235,7 +225,7 @@ fn sync_skip_videos_excludes_video_files() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     // --skip-videos excludes standalone videos, not Live Photo MOV companions
     let standalone_videos: Vec<_> = files
         .iter()
@@ -265,7 +255,7 @@ fn sync_skip_photos_excludes_image_files() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     let image_files: Vec<_> = files.iter().filter(|p| is_image_ext(p)).collect();
     assert!(
         image_files.is_empty(),
@@ -292,7 +282,7 @@ fn sync_skip_live_photos_excludes_companions() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
 
     // Standalone video (IMG_0962.MOV) should still be present
     let standalone_video = files.iter().any(|p| file_name_contains(p, "0962"));
@@ -327,7 +317,7 @@ fn sync_skip_all_media_downloads_nothing() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     assert!(
         files.is_empty(),
         "skipping all media types should download nothing, found: {files:?}"
@@ -348,7 +338,7 @@ fn sync_date_filters_exclude_by_creation_date() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
-        let files = walkdir(dir.path());
+        let files = common::walkdir(dir.path());
         assert!(
             files.is_empty(),
             "--skip-created-before 2099 should filter everything, found: {files:?}"
@@ -363,7 +353,7 @@ fn sync_date_filters_exclude_by_creation_date() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
-        let files = walkdir(dir.path());
+        let files = common::walkdir(dir.path());
         assert!(
             files.is_empty(),
             "--skip-created-after 2000 should filter everything, found: {files:?}"
@@ -396,7 +386,7 @@ fn sync_size_medium_produces_smaller_files() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     assert!(!files.is_empty(), "should download files at medium size");
 
     // Medium photos should be well under 2MB (originals are typically 3-15MB)
@@ -423,7 +413,7 @@ fn sync_force_size_succeeds_when_available() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     assert!(
         !files.is_empty(),
         "--force-size with available size should download files"
@@ -442,7 +432,7 @@ fn sync_name_id7_appends_asset_id() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     assert!(!files.is_empty(), "name-id7 should download files");
 
     // Every file should have a separator + 7-char alphanumeric suffix in its stem.
@@ -491,7 +481,7 @@ fn sync_custom_folder_structure() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     assert!(!files.is_empty(), "should download files");
 
     for f in &files {
@@ -525,7 +515,7 @@ fn sync_keep_unicode_preserves_special_chars() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     let has_unicode = files.iter().any(|p| {
         p.file_name()
             .and_then(|n| n.to_str())
@@ -552,7 +542,7 @@ fn sync_set_exif_datetime_embeds_date() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     let jpeg_files: Vec<_> = files
         .iter()
         .filter(|p| {
@@ -597,7 +587,7 @@ fn sync_align_raw_controls_raw_naming() {
             .assert()
             .success();
 
-        let files = walkdir(dir.path());
+        let files = common::walkdir(dir.path());
 
         // DNG should be present in each variant
         let has_dng = files.iter().any(|p| {
@@ -700,7 +690,7 @@ fn sync_temp_suffix_leaves_no_remnants() {
         .assert()
         .success();
 
-    let temp_files: Vec<_> = walkdir(download_dir.path())
+    let temp_files: Vec<_> = common::walkdir(download_dir.path())
         .into_iter()
         .filter(|p| p.to_str().unwrap_or("").ends_with(".downloading"))
         .collect();
@@ -817,7 +807,7 @@ fn sync_bare_invocation_works_like_sync() {
         .assert()
         .success();
 
-    let files = walkdir(download_dir.path());
+    let files = common::walkdir(download_dir.path());
     assert!(!files.is_empty(), "bare invocation should download files");
 }
 
@@ -928,23 +918,6 @@ fn zz_bad_credentials_fails() {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-/// Recursively collect all regular files under `dir`, sorted for deterministic ordering.
-fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(walkdir(&path));
-            } else if path.is_file() {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    files
-}
-
 fn is_video_ext(p: &std::path::Path) -> bool {
     let ext = p
         .extension()
@@ -993,7 +966,7 @@ fn strip_ansi(s: &str) -> String {
 
 /// Find Live Photo MOV filenames (files containing "1127" with .mov extension).
 fn live_photo_movs(dir: &std::path::Path) -> Vec<String> {
-    walkdir(dir)
+    common::walkdir(dir)
         .iter()
         .filter(|p| {
             file_name_contains(p, "1127")

@@ -9,7 +9,10 @@ cargo clippy -- -D warnings
 cargo test --bin icloudpd-rs --test cli --test state
 
 # 2. One-time auth setup (interactive, prompts for 2FA)
+# fish:
 env (cat .env | grep -v '^#') cargo run -- sync --auth-only --cookie-directory .test-cookies
+# bash/zsh:
+env $(grep -v '^#' .env | xargs) cargo run -- sync --auth-only --cookie-directory .test-cookies
 
 # 3. Run all tests
 ./tests/run-all-tests.sh
@@ -31,7 +34,10 @@ cargo test --test sync list_albums_prints_album_names -- --test-threads=1
 
 2. Authenticate (creates `.test-cookies/` with session files):
    ```sh
-   env (cat .env | grep -v '^#') cargo run -- sync --auth-only --cookie-directory .test-cookies
+   # fish:
+env (cat .env | grep -v '^#') cargo run -- sync --auth-only --cookie-directory .test-cookies
+# bash/zsh:
+env $(grep -v '^#' .env | xargs) cargo run -- sync --auth-only --cookie-directory .test-cookies
    ```
    This prompts for a 2FA code. You only need to redo this when the session expires.
 
