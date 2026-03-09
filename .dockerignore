@@ -1,10 +1,28 @@
+# Rust
 target/
+
+# Git & GitHub
 .git/
 .github/
+.gitignore
+
+# Claude
+.claude/
+.scratch/
+
+# Docs (keep README)
 docs/
 reference/
 *.md
 !README.md
-.gitignore
+
+# Docker
 .dockerignore
 docker-compose.yml
+
+# Credentials
+.env
+.test-cookies/
+
+# macOS Junk
+.DS_Store
