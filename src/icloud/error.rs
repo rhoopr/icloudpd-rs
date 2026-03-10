@@ -17,11 +17,29 @@ pub enum ICloudError {
     )]
     ServiceNotActivated { code: String, reason: String },
     #[error(transparent)]
-    Http(#[from] reqwest::Error),
+    Http(Box<reqwest::Error>),
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(Box<std::io::Error>),
     #[error(transparent)]
-    Json(#[from] serde_json::Error),
+    Json(Box<serde_json::Error>),
+}
+
+impl From<reqwest::Error> for ICloudError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Http(Box::new(e))
+    }
+}
+
+impl From<std::io::Error> for ICloudError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(Box::new(e))
+    }
+}
+
+impl From<serde_json::Error> for ICloudError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Json(Box::new(e))
+    }
 }
 
 #[cfg(test)]

@@ -92,7 +92,7 @@ async fn attempt_download(
     }
 
     let response = request.send().await.map_err(|e| DownloadError::Http {
-        source: e,
+        source: Box::new(e),
         path: path_str.clone(),
         status: 0,
         content_length: None,
@@ -141,7 +141,7 @@ async fn attempt_download(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| DownloadError::Http {
-            source: e,
+            source: Box::new(e),
             path: path_str.clone(),
             status,
             content_length,
