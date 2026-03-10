@@ -141,8 +141,9 @@ fn extract_versions(
             Some(u) => u.into(),
             None => {
                 warn!(
-                    "Asset {}: missing {prefix}Res.downloadURL, skipping version",
-                    record_name
+                    asset = %record_name,
+                    field = format_args!("{prefix}Res.downloadURL"),
+                    "Missing downloadURL, skipping version"
                 );
                 continue;
             }
@@ -152,8 +153,9 @@ fn extract_versions(
             Some(c) => c.into(),
             None => {
                 warn!(
-                    "Asset {}: missing {prefix}Res.fileChecksum, skipping version",
-                    record_name
+                    asset = %record_name,
+                    field = format_args!("{prefix}Res.fileChecksum"),
+                    "Missing fileChecksum, skipping version"
                 );
                 continue;
             }

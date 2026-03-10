@@ -25,7 +25,7 @@ pub(crate) fn get_photo_exif(path: &Path) -> Result<Option<String>> {
             }
         }
         Err(e) => {
-            tracing::debug!("No EXIF data in {}: {}", path.display(), e);
+            tracing::debug!(path = %path.display(), error = %e, "No EXIF data");
             Ok(None)
         }
     }
@@ -56,9 +56,9 @@ pub(crate) fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
         .with_context(|| format!("Writing EXIF metadata to {}", path.display()))?;
 
     tracing::debug!(
-        "Set EXIF DateTime/DateTimeOriginal/DateTimeDigitized={} on {}",
-        datetime_str,
-        path.display()
+        datetime = %datetime_str,
+        path = %path.display(),
+        "Set EXIF DateTime/DateTimeOriginal/DateTimeDigitized"
     );
     Ok(())
 }

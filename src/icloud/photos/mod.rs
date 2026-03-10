@@ -184,11 +184,11 @@ impl PhotosService {
             .await
             {
                 Ok(lib) => {
-                    debug!("Loaded library zone: {}", zone_name);
+                    debug!(zone = %zone_name, "Loaded library zone");
                     libraries.insert(zone_name, lib);
                 }
                 Err(e) => {
-                    error!("Failed to load library zone {}: {}", zone_name, e);
+                    error!(zone = %zone_name, error = %e, "Failed to load library zone");
                 }
             }
         }

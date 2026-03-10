@@ -674,11 +674,11 @@ fn filter_asset_to_tasks(
                             None // deduped version already downloaded or claimed
                         } else {
                             tracing::debug!(
-                                "File collision: {} already exists with different size (on-disk: {}, expected: {}), using {}",
-                                download_path.display(),
+                                path = %download_path.display(),
                                 on_disk_size,
-                                version.size,
-                                dedup_path.display(),
+                                expected_size = version.size,
+                                dedup_path = %dedup_path.display(),
+                                "File collision: already exists with different size"
                             );
                             Some(dedup_path)
                         }
@@ -717,11 +717,11 @@ fn filter_asset_to_tasks(
                             None // deduped version already downloaded or claimed
                         } else {
                             tracing::debug!(
-                                "In-flight collision: {} claimed with different size (claimed: {}, expected: {}), using {}",
-                                download_path.display(),
+                                path = %download_path.display(),
                                 claimed_size,
-                                version.size,
-                                dedup_path.display(),
+                                expected_size = version.size,
+                                dedup_path = %dedup_path.display(),
+                                "In-flight collision: claimed with different size"
                             );
                             Some(dedup_path)
                         }
@@ -807,9 +807,9 @@ fn filter_asset_to_tasks(
                         None // deduped version already downloaded or claimed
                     } else {
                         tracing::debug!(
-                            "Live photo MOV collision: {} already exists with different size, using {}",
-                            mov_path.display(),
-                            dedup_path.display(),
+                            path = %mov_path.display(),
+                            dedup_path = %dedup_path.display(),
+                            "Live photo MOV collision: already exists with different size"
                         );
                         Some(dedup_path)
                     }
@@ -832,9 +832,9 @@ fn filter_asset_to_tasks(
                         None
                     } else {
                         tracing::debug!(
-                            "Live photo MOV in-flight collision: {} claimed, using {}",
-                            mov_path.display(),
-                            dedup_path.display(),
+                            path = %mov_path.display(),
+                            dedup_path = %dedup_path.display(),
+                            "Live photo MOV in-flight collision"
                         );
                         Some(dedup_path)
                     }
@@ -928,8 +928,8 @@ pub async fn download_photos_with_sync(
                 Err(e) => {
                     if e.downcast_ref::<SyncTokenError>().is_some() {
                         tracing::warn!(
-                            "Incremental sync failed ({}), falling back to full enumeration",
-                            e
+                            error = %e,
+                            "Incremental sync failed, falling back to full enumeration"
                         );
                         download_photos_full_with_token(
                             download_client,
@@ -1095,7 +1095,7 @@ async fn download_photos_incremental(
 
     if downloadable_assets.is_empty() {
         tracing::info!("No new photos to download from incremental sync");
-        tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
+        tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
         return Ok(SyncResult {
             outcome: DownloadOutcome::Success,
             sync_token,
@@ -1103,8 +1103,8 @@ async fn download_photos_incremental(
     }
 
     tracing::info!(
-        "{} assets to download from incremental sync",
-        downloadable_assets.len()
+        count = downloadable_assets.len(),
+        "Assets to download from incremental sync"
     );
 
     // Convert assets to download tasks
@@ -1123,7 +1123,7 @@ async fn download_photos_incremental(
 
     if tasks.is_empty() {
         tracing::info!("All incremental assets already downloaded or filtered");
-        tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
+        tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
         return Ok(SyncResult {
             outcome: DownloadOutcome::Success,
             sync_token,
@@ -1131,7 +1131,10 @@ async fn download_photos_incremental(
     }
 
     let task_count = tasks.len();
-    tracing::info!("Downloading {} files from incremental sync", task_count);
+    tracing::info!(
+        count = task_count,
+        "Downloading files from incremental sync"
+    );
 
     // Run the download pass on the collected tasks
     let pass_config = PassConfig {
@@ -1152,21 +1155,21 @@ async fn download_photos_incremental(
     tracing::info!("── Incremental Sync Summary ──");
     if pass_result.exif_failures > 0 {
         tracing::info!(
-            "  {} downloaded ({} EXIF failures), {} failed, {} total",
-            succeeded,
-            pass_result.exif_failures,
+            downloaded = succeeded,
+            exif_failures = pass_result.exif_failures,
             failed,
-            task_count
+            total = task_count,
+            "  sync results"
         );
     } else {
         tracing::info!(
-            "  {} downloaded, {} failed, {} total",
-            succeeded,
+            downloaded = succeeded,
             failed,
-            task_count
+            total = task_count,
+            "  sync results"
         );
     }
-    tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
+    tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
 
     if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
         return Ok(SyncResult {
@@ -1179,7 +1182,7 @@ async fn download_photos_incremental(
 
     let outcome = if failed > 0 {
         for task in &pass_result.failed {
-            tracing::error!("Download failed: {}", task.download_path.display());
+            tracing::error!(path = %task.download_path.display(), "Download failed");
         }
         DownloadOutcome::PartialFailure {
             failed_count: failed,
@@ -1226,7 +1229,7 @@ where
             let asset = result?;
             let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
             for task in &tasks {
-                tracing::info!("[DRY RUN] Would download {}", task.download_path.display());
+                tracing::info!(path = %task.download_path.display(), "[DRY RUN] Would download");
             }
             count += tasks.len();
         }
@@ -1285,7 +1288,7 @@ where
                 Some(id)
             }
             Err(e) => {
-                tracing::warn!("Failed to start sync run tracking: {}", e);
+                tracing::warn!(error = %e, "Failed to start sync run tracking");
                 None
             }
         }
@@ -1369,9 +1372,9 @@ where
                                 );
                                 if let Err(e) = db.upsert_seen(&record).await {
                                     tracing::warn!(
-                                        "Failed to record asset {}: {}",
-                                        task.asset_id,
-                                        e
+                                        asset_id = %task.asset_id,
+                                        error = %e,
+                                        "Failed to record asset"
                                     );
                                 }
 
@@ -1429,8 +1432,8 @@ where
                                             }
                                             Err(e) => {
                                                 tracing::warn!(
-                                                    "File existence check failed, downloading anyway: {}",
-                                                    e
+                                                    error = %e,
+                                                    "File existence check failed, downloading anyway"
                                                 );
                                                 if task_tx.send(task).await.is_err() {
                                                     return;
@@ -1446,7 +1449,7 @@ where
                     }
                 }
                 Err(e) => {
-                    producer_pb.suspend(|| tracing::error!("Error fetching asset: {}", e));
+                    producer_pb.suspend(|| tracing::error!(error = %e, "Error fetching asset"));
                 }
             }
         }
@@ -1512,11 +1515,11 @@ where
                         auth_errors += 1;
                         pb.suspend(|| {
                             tracing::warn!(
-                                "Auth error ({}/{}): {} - {}",
                                 auth_errors,
-                                AUTH_ERROR_THRESHOLD,
-                                task.download_path.display(),
-                                e
+                                threshold = AUTH_ERROR_THRESHOLD,
+                                path = %task.download_path.display(),
+                                error = %e,
+                                "Auth error"
                             );
                         });
                         if auth_errors >= AUTH_ERROR_THRESHOLD {
@@ -1540,7 +1543,7 @@ where
                     }
                 }
                 pb.suspend(|| {
-                    tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
+                    tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
                 });
                 if state_db.is_some() {
                     failed_batch.push((
@@ -1558,9 +1561,9 @@ where
             if downloaded_batch.len() >= DB_BATCH_SIZE {
                 if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
                     tracing::warn!(
-                        "Failed to batch mark {} downloads: {}",
-                        downloaded_batch.len(),
-                        e
+                        count = downloaded_batch.len(),
+                        error = %e,
+                        "Failed to batch mark downloads"
                     );
                 }
                 downloaded_batch.clear();
@@ -1568,9 +1571,9 @@ where
             if failed_batch.len() >= DB_BATCH_SIZE {
                 if let Err(e) = db.mark_failed_batch(&failed_batch).await {
                     tracing::warn!(
-                        "Failed to batch mark {} failures: {}",
-                        failed_batch.len(),
-                        e
+                        count = failed_batch.len(),
+                        error = %e,
+                        "Failed to batch mark failures"
                     );
                 }
                 failed_batch.clear();
@@ -1580,7 +1583,7 @@ where
 
     if let Err(e) = producer.await {
         if e.is_panic() {
-            tracing::error!("Asset producer task panicked: {:?}", e);
+            tracing::error!(error = ?e, "Asset producer task panicked");
         }
     }
 
@@ -1590,18 +1593,18 @@ where
         if !downloaded_batch.is_empty() {
             if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
                 tracing::warn!(
-                    "Failed to batch mark {} downloads: {}",
-                    downloaded_batch.len(),
-                    e
+                    count = downloaded_batch.len(),
+                    error = %e,
+                    "Failed to batch mark downloads"
                 );
             }
         }
         if !failed_batch.is_empty() {
             if let Err(e) = db.mark_failed_batch(&failed_batch).await {
                 tracing::warn!(
-                    "Failed to batch mark {} failures: {}",
-                    failed_batch.len(),
-                    e
+                    count = failed_batch.len(),
+                    error = %e,
+                    "Failed to batch mark failures"
                 );
             }
         }
@@ -1617,7 +1620,7 @@ where
             interrupted: shutdown_token.is_cancelled() || auth_errors >= AUTH_ERROR_THRESHOLD,
         };
         if let Err(e) = db.complete_sync_run(run_id, &stats).await {
-            tracing::warn!("Failed to complete sync run tracking: {}", e);
+            tracing::warn!(error = %e, "Failed to complete sync run tracking");
         } else {
             tracing::debug!(
                 run_id,
@@ -1663,7 +1666,7 @@ async fn build_download_outcome(
         if config.dry_run {
             tracing::info!("── Dry Run Summary ──");
             tracing::info!("  0 files would be downloaded");
-            tracing::info!("  destination: {}", config.directory.display());
+            tracing::info!(destination = %config.directory.display(), "  destination");
         } else {
             tracing::info!("No new photos to download");
         }
@@ -1673,15 +1676,12 @@ async fn build_download_outcome(
     if config.dry_run {
         tracing::info!("── Dry Run Summary ──");
         if shutdown_token.is_cancelled() {
-            tracing::info!(
-                "  Interrupted — scanned {} files before shutdown",
-                downloaded
-            );
+            tracing::info!(scanned = downloaded, "  Interrupted before shutdown");
         } else {
-            tracing::info!("  {} files would be downloaded", downloaded);
+            tracing::info!(count = downloaded, "  files would be downloaded");
         }
-        tracing::info!("  destination: {}", config.directory.display());
-        tracing::info!("  concurrency: {}", config.concurrent_downloads);
+        tracing::info!(destination = %config.directory.display(), "  destination");
+        tracing::info!(concurrency = config.concurrent_downloads, "  concurrency");
         return Ok(DownloadOutcome::Success);
     }
 
@@ -1691,15 +1691,16 @@ async fn build_download_outcome(
         tracing::info!("── Summary ──");
         if exif_failures > 0 {
             tracing::info!(
-                "  {} downloaded ({} EXIF failures), 0 failed, {} total",
-                total,
+                downloaded = total,
                 exif_failures,
-                total
+                failed = 0,
+                total,
+                "  sync results"
             );
         } else {
-            tracing::info!("  {} downloaded, 0 failed, {} total", total, total);
+            tracing::info!(downloaded = total, failed = 0, total, "  sync results");
         }
-        tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
+        tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
         return Ok(DownloadOutcome::Success);
     }
 
@@ -1707,13 +1708,16 @@ async fn build_download_outcome(
     let cleanup_concurrency = 5;
     let failure_count = failed_tasks.len();
     tracing::info!(
-        "── Cleanup pass: re-fetching URLs and retrying {} failed downloads (concurrency: {}) ──",
         failure_count,
-        cleanup_concurrency,
+        concurrency = cleanup_concurrency,
+        "── Cleanup pass: re-fetching URLs and retrying failed downloads ──"
     );
 
     let fresh_tasks = build_download_tasks(albums, config, shutdown_token.clone()).await?;
-    tracing::info!("  Re-fetched {} tasks with fresh URLs", fresh_tasks.len());
+    tracing::info!(
+        count = fresh_tasks.len(),
+        "  Re-fetched tasks with fresh URLs"
+    );
 
     let phase2_task_count = fresh_tasks.len();
     let pass_config = PassConfig {
@@ -1746,25 +1750,25 @@ async fn build_download_outcome(
     tracing::info!("── Summary ──");
     if exif_failures > 0 {
         tracing::info!(
-            "  {} downloaded ({} EXIF failures), {} failed, {} total",
-            succeeded,
+            downloaded = succeeded,
             exif_failures,
             failed,
-            final_total
+            total = final_total,
+            "  sync results"
         );
     } else {
         tracing::info!(
-            "  {} downloaded, {} failed, {} total",
-            succeeded,
+            downloaded = succeeded,
             failed,
-            final_total
+            total = final_total,
+            "  sync results"
         );
     }
-    tracing::info!("  elapsed: {}", format_duration(started.elapsed()));
+    tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
 
     if failed > 0 {
         for task in &remaining_failed {
-            tracing::error!("Download failed: {}", task.download_path.display());
+            tracing::error!(path = %task.download_path.display(), "Download failed");
         }
         return Ok(DownloadOutcome::PartialFailure {
             failed_count: failed,
@@ -1855,12 +1859,12 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                     if download_err.is_session_expired() {
                         auth_errors += 1;
                         pb.suspend(|| {
-                            tracing::warn!("Auth error: {} - {}", task.download_path.display(), e);
+                            tracing::warn!(path = %task.download_path.display(), error = %e, "Auth error");
                         });
                     }
                 } else {
                     pb.suspend(|| {
-                        tracing::error!("Download failed: {}: {}", task.download_path.display(), e);
+                        tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
                     });
                 }
                 if state_db.is_some() {
@@ -1881,18 +1885,18 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
         if !downloaded_batch.is_empty() {
             if let Err(e) = db.mark_downloaded_batch(&downloaded_batch).await {
                 tracing::warn!(
-                    "Failed to batch mark {} downloads: {}",
-                    downloaded_batch.len(),
-                    e
+                    count = downloaded_batch.len(),
+                    error = %e,
+                    "Failed to batch mark downloads"
                 );
             }
         }
         if !failed_batch.is_empty() {
             if let Err(e) = db.mark_failed_batch(&failed_batch).await {
                 tracing::warn!(
-                    "Failed to batch mark {} failures: {}",
-                    failed_batch.len(),
-                    e
+                    count = failed_batch.len(),
+                    error = %e,
+                    "Failed to batch mark failures"
                 );
             }
         }
@@ -1942,13 +1946,13 @@ async fn download_single_task(
     let ts = task.created_local.timestamp();
     if let Err(e) = tokio::task::spawn_blocking(move || set_file_mtime(&mtime_path, ts)).await? {
         tracing::warn!(
-            "Could not set mtime on {}: {}",
-            task.download_path.display(),
-            e
+            path = %task.download_path.display(),
+            error = %e,
+            "Could not set mtime"
         );
     }
 
-    tracing::debug!("Downloaded {}", task.download_path.display());
+    tracing::debug!(path = %task.download_path.display(), "Downloaded");
 
     let mut exif_ok = true;
     if set_exif {
@@ -1964,7 +1968,7 @@ async fn download_single_task(
                 tokio::task::spawn_blocking(move || match exif::get_photo_exif(&exif_path) {
                     Ok(None) => {
                         if let Err(e) = exif::set_photo_exif(&exif_path, &date_str) {
-                            tracing::warn!("Failed to set EXIF on {}: {}", exif_path.display(), e);
+                            tracing::warn!(path = %exif_path.display(), error = %e, "Failed to set EXIF");
                             false
                         } else {
                             true
@@ -1972,7 +1976,7 @@ async fn download_single_task(
                     }
                     Ok(Some(_)) => true,
                     Err(e) => {
-                        tracing::warn!("Failed to read EXIF from {}: {}", exif_path.display(), e);
+                        tracing::warn!(path = %exif_path.display(), error = %e, "Failed to read EXIF");
                         false
                     }
                 })
@@ -1980,7 +1984,7 @@ async fn download_single_task(
             match exif_result {
                 Ok(ok) => exif_ok = ok,
                 Err(e) => {
-                    tracing::warn!("EXIF task panicked: {}", e);
+                    tracing::warn!(error = %e, "EXIF task panicked");
                     exif_ok = false;
                 }
             }
@@ -1992,9 +1996,9 @@ async fn download_single_task(
                 tokio::task::spawn_blocking(move || set_file_mtime(&mtime_path2, ts2)).await?
             {
                 tracing::warn!(
-                    "Could not restore mtime on {}: {}",
-                    task.download_path.display(),
-                    e
+                    path = %task.download_path.display(),
+                    error = %e,
+                    "Could not restore mtime"
                 );
             }
         }

@@ -472,8 +472,11 @@ impl PhotoAlbum {
                     "ASCENDING",
                 );
                 debug!(
-                    "Album '{}' fetcher [{}..{}] POST offset={}",
-                    name, start_offset, end_offset, offset
+                    album = %name,
+                    range_start = start_offset,
+                    range_end = end_offset,
+                    offset,
+                    "Fetcher POST"
                 );
                 let response = match super::session::retry_post(
                     session.as_ref(),
@@ -490,9 +493,9 @@ impl PhotoAlbum {
                     }
                 };
                 debug!(
-                    "Album '{}' response: {}",
-                    name,
-                    serde_json::to_string_pretty(&response).unwrap_or_default()
+                    album = %name,
+                    response = %serde_json::to_string_pretty(&response).unwrap_or_default(),
+                    "Fetcher response"
                 );
 
                 let query: super::cloudkit::QueryResponse = match serde_json::from_value(response) {
@@ -513,17 +516,17 @@ impl PhotoAlbum {
                 let records = query.records;
 
                 debug!(
-                    "Album '{}': got {} records at offset {}",
-                    name,
-                    records.len(),
-                    offset
+                    album = %name,
+                    count = records.len(),
+                    offset,
+                    "Got records"
                 );
 
                 let mut asset_records: HashMap<String, super::cloudkit::Record> = HashMap::new();
                 let mut master_records: Vec<super::cloudkit::Record> = Vec::new();
 
                 for rec in records {
-                    debug!("  record type: {}", rec.record_type);
+                    debug!(record_type = %rec.record_type, "  record");
                     if rec.record_type == "CPLAsset" {
                         if let Some(master_id) =
                             rec.fields["masterRef"]["value"]["recordName"].as_str()
@@ -617,13 +620,13 @@ impl PhotoAlbum {
             "recordType": list_type,
         });
         debug!(
-            "list_query filterBy ({} items): {}",
-            filter_by.len(),
-            serde_json::to_string(&query_part).unwrap_or_default()
+            count = filter_by.len(),
+            query = %serde_json::to_string(&query_part).unwrap_or_default(),
+            "list_query filterBy"
         );
         debug!(
-            "list_query zoneID: {}",
-            serde_json::to_string(zone_id).unwrap_or_default()
+            zone_id = %serde_json::to_string(zone_id).unwrap_or_default(),
+            "list_query zoneID"
         );
 
         json!({

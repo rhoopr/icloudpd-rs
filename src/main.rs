@@ -436,7 +436,7 @@ async fn run_import_existing(
 
     // Create or open the state database
     let db = Arc::new(state::SqliteStateDb::open(&db_path).await?);
-    tracing::info!("State database at {}", db_path.display());
+    tracing::info!(path = %db_path.display(), "State database opened");
 
     // Resolve auth from CLI + TOML
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
@@ -488,7 +488,7 @@ async fn run_import_existing(
         let asset: icloud::photos::PhotoAsset = match result {
             Ok(a) => a,
             Err(e) => {
-                tracing::warn!("Error fetching asset: {}", e);
+                tracing::warn!(error = %e, "Error fetching asset");
                 continue;
             }
         };
@@ -542,7 +542,7 @@ async fn run_import_existing(
                         );
 
                         if let Err(e) = db.upsert_seen(&record).await {
-                            tracing::warn!("Failed to record asset {}: {}", asset.id(), e);
+                            tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to record asset");
                             continue;
                         }
 
@@ -551,7 +551,7 @@ async fn run_import_existing(
                         {
                             Ok(hash) => hash,
                             Err(e) => {
-                                tracing::warn!("Failed to hash {}: {}", expected_path.display(), e);
+                                tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
                                 continue;
                             }
                         };
@@ -565,7 +565,7 @@ async fn run_import_existing(
                             )
                             .await
                         {
-                            tracing::warn!("Failed to mark {} as downloaded: {}", asset.id(), e);
+                            tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to mark as downloaded");
                             continue;
                         }
 
@@ -736,7 +736,7 @@ async fn main() -> anyhow::Result<()> {
                 "2FA required for {}. Run: icloudpd-rs submit-code <CODE> --username {}",
                 config.username, config.username
             );
-            tracing::warn!("{}", msg);
+            tracing::warn!(message = %msg, "2FA required");
             notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
             anyhow::bail!("{msg}");
         }
@@ -810,7 +810,7 @@ async fn main() -> anyhow::Result<()> {
         ));
         match state::SqliteStateDb::open(&db_path).await {
             Ok(db) => {
-                tracing::debug!("State database opened at {}", db_path.display());
+                tracing::debug!(path = %db_path.display(), "State database opened");
                 let db = Arc::new(db);
 
                 // For retry-failed, reset failed assets to pending
@@ -833,9 +833,9 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 tracing::warn!(
-                    "Failed to open state database at {}: {}. Continuing without state tracking.",
-                    db_path.display(),
-                    e
+                    path = %db_path.display(),
+                    error = %e,
+                    "Failed to open state database, continuing without state tracking"
                 );
                 None
             }
@@ -1047,10 +1047,10 @@ async fn main() -> anyhow::Result<()> {
                     );
                     }
                     tracing::warn!(
-                        "Session expired ({} auth errors), attempting re-auth ({}/{})",
                         auth_error_count,
                         reauth_attempts,
-                        MAX_REAUTH_ATTEMPTS
+                        max_attempts = MAX_REAUTH_ATTEMPTS,
+                        "Session expired, attempting re-auth"
                     );
                     match attempt_reauth(
                         &shared_session,
@@ -1073,7 +1073,7 @@ async fn main() -> anyhow::Result<()> {
                             "2FA required for {}. Run: icloudpd-rs submit-code <CODE> --username {}",
                             config.username, config.username
                         );
-                            tracing::warn!("{}", msg);
+                            tracing::warn!(message = %msg, "2FA required");
                             notifier.notify(
                                 notifications::Event::TwoFaRequired,
                                 &msg,
@@ -1118,7 +1118,7 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
-            tracing::info!("Waiting {} seconds...", interval);
+            tracing::info!(interval_secs = interval, "Waiting before next cycle");
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
                 _ = shutdown_token.cancelled() => {
