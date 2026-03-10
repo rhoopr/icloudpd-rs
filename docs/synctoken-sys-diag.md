@@ -9,7 +9,7 @@ Full lifecycle of authentication, photo enumeration, incremental sync, file down
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │                           CLI / Config                               │
-│  src/cli.rs → src/config.rs → TOML merge → DownloadConfig           │
+│  src/cli.rs → src/config.rs → TOML merge → DownloadConfig            │
 └──────────────────────┬───────────────────────────────────────────────┘
                        │
                        ▼
@@ -17,14 +17,14 @@ Full lifecycle of authentication, photo enumeration, incremental sync, file down
 │                        Main Sync Loop                                │
 │                        src/main.rs                                   │
 │                                                                      │
-│  ┌─────────┐   ┌──────────────┐   ┌──────────────┐   ┌───────────┐ │
-│  │  Auth    │──▶│ PhotosService│──▶│  Download    │──▶│  State DB │ │
-│  │  Layer   │   │  (API)       │   │  Pipeline    │   │  (SQLite) │ │
-│  └─────────┘   └──────────────┘   └──────────────┘   └───────────┘ │
+│  ┌─────────┐   ┌──────────────┐   ┌──────────────┐   ┌───────────┐   │
+│  │  Auth   │──▶│ PhotosService│──▶│  Download    │──▶│  State DB │   │
+│  │  Layer  │   │  (API)       │   │  Pipeline    │   │  (SQLite) │   │
+│  └─────────┘   └──────────────┘   └──────────────┘   └───────────┘   │
 │       │              │                    │                  │       │
 │       ▼              ▼                    ▼                  ▼       │
-│  Cookie jar    iCloud CloudKit      Local files       assets table  │
-│  Lock file     endpoints            .part → final     metadata KV   │
+│  Cookie jar    iCloud CloudKit      Local files       assets table   │
+│  Lock file     endpoints            .part → final     metadata KV    │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -41,8 +41,8 @@ src/auth/mod.rs :: authenticate()
 │  └─ Acquire exclusive lock file ({user}.lock)
 │
 ├─ validate_session()  ─── session_token exists? ──┐
-│                                                   │
-│  ┌────── YES: token valid ◀───────────────────────┘
+│                                                  │
+│  ┌────── YES: token valid ◀──────────────────────┘
 │  │
 │  └────── NO: token absent/expired
 │          │
@@ -117,10 +117,10 @@ GET  {cdn_url}                File download (supports Range headers)
 ```
 src/main.rs (lines 921-946)
 
-                    ┌─────────────────┐
-                    │ --no-incremental │──── YES ──▶ SyncMode::Full
+                    ┌───────────────────┐
+                    │ --no-incremental  │──── YES ──▶ SyncMode::Full
                     │ --reset-sync-token│
-                    └────────┬────────┘
+                    └────────┬──────────┘
                              │ NO
                              ▼
               ┌──────────────────────────┐
@@ -179,7 +179,7 @@ This is the **cheapest possible no-op check** — a single API call that returns
 ```
 src/download/mod.rs :: download_photos_with_sync()
 │
-├─── SyncMode::Full ─────────────────────────────────────────────────┐
+├─── SyncMode::Full ──────────────────────────────────────────────────┐
 │                                                                     │
 │  download_photos_full_with_token()                                  │
 │  │                                                                  │
@@ -191,7 +191,7 @@ src/download/mod.rs :: download_photos_with_sync()
 │  │                                                                  │
 │  └─ stream_and_download_from_stream()  ──────────────────▶ [Phase 1]│
 │                                                                     │
-├─── SyncMode::Incremental ──────────────────────────────────────────┐
+├─── SyncMode::Incremental ───────────────────────────────────────────┐
 │                                                                     │
 │  download_photos_incremental()                                      │
 │  │                                                                  │
@@ -225,7 +225,7 @@ stream_and_download_from_stream()
   └──────────────────────┬───────────────────────────────┘
                          │
                          ▼
-  ┌─────────────────── Producer Task ────────────────────┐
+  ┌─────────────────── Producer Task ─────────────────────┐
   │                                                       │
   │  for each PhotoAsset in stream:                       │
   │    ├─ Content filter (type, date range, media)        │
@@ -241,7 +241,7 @@ stream_and_download_from_stream()
   └──────────────────────┬────────────────────────────────┘
                          │ mpsc channel
                          ▼
-  ┌──────────── Download Concurrency Pool ───────────────┐
+  ┌──────────── Download Concurrency Pool ────────────────┐
   │  buffer_unordered(concurrent_downloads)               │
   │                                                       │
   │  Per DownloadTask:                                    │
@@ -260,7 +260,7 @@ stream_and_download_from_stream()
   │  Batch DB updates (50-item batches):                  │
   │    ├─ mark_downloaded_batch() on success              │
   │    └─ mark_failed_batch() on exhausted retries        │
-  └──────────────────────────────────────────────────────┘
+  └───────────────────────────────────────────────────────┘
 ```
 
 ### Phase 2: Retry Failed Downloads
@@ -283,8 +283,8 @@ src/state/db.rs     (SqliteStateDb)
 
 Database: ~/.icloudpd-rs/{user}.db  (WAL mode, NORMAL sync)
 
-┌─────────────────────────── assets ──────────────────────────────────┐
-│ PRIMARY KEY (id, version_size)                                      │
+┌─────────────────────────── assets ───────────────────────────────────┐
+│ PRIMARY KEY (id, version_size)                                       │
 │                                                                      │
 │ id               TEXT     CloudKit record name                       │
 │ version_size     TEXT     Original / Medium / Thumb / Alternative    │
@@ -295,33 +295,33 @@ Database: ~/.icloudpd-rs/{user}.db  (WAL mode, NORMAL sync)
 │ size_bytes       INTEGER  File size in bytes                         │
 │ media_type       TEXT     image / video                              │
 │ status           TEXT     pending / downloaded / failed              │
-│ downloaded_at    TEXT     When successfully downloaded                │
+│ downloaded_at    TEXT     When successfully downloaded               │
 │ local_path       TEXT     Path where file was saved                  │
 │ last_seen_at     TEXT     Last time seen in API response             │
 │ download_attempts INTEGER Number of download attempts                │
 │ last_error       TEXT     Last error message (if failed)             │
 │ local_checksum   TEXT     SHA256 of the downloaded file              │
-└─────────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────── sync_runs ───────────────────────────────────┐
-│ id               INTEGER  Auto-increment                            │
+┌─────────────────────── sync_runs ────────────────────────────────────┐
+│ id               INTEGER  Auto-increment                             │
 │ started_at       TEXT     Cycle start time                           │
 │ completed_at     TEXT     Cycle end time                             │
-│ total_seen       INTEGER  Assets seen in API                        │
-│ downloaded       INTEGER  Successfully downloaded                   │
+│ total_seen       INTEGER  Assets seen in API                         │
+│ downloaded       INTEGER  Successfully downloaded                    │
 │ skipped          INTEGER  Already present / filtered                 │
-│ failed           INTEGER  Download failures                         │
-└─────────────────────────────────────────────────────────────────────┘
+│ failed           INTEGER  Download failures                          │
+└──────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────── metadata ────────────────────────────────────┐
+┌─────────────────────── metadata ─────────────────────────────────────┐
 │ key              TEXT     PRIMARY KEY                                │
 │ value            TEXT                                                │
 │                                                                      │
 │ Reserved keys:                                                       │
-│   db_sync_token           Database-level token (changes/database)   │
-│   sync_token:{zone}       Zone-level token (changes/zone)           │
-│   config_hash             DownloadConfig fingerprint (trust-state)  │
-└─────────────────────────────────────────────────────────────────────┘
+│   db_sync_token           Database-level token (changes/database)    │
+│   sync_token:{zone}       Zone-level token (changes/zone)            │
+│   config_hash             DownloadConfig fingerprint (trust-state)   │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### DB Access Patterns
@@ -348,7 +348,7 @@ Token management:
 ## 7. SyncToken Lifecycle
 
 ```
-┌─────────────────── First Run (Full Sync) ──────────────────────────┐
+┌─────────────────── First Run (Full Sync) ───────────────────────────┐
 │                                                                     │
 │  1. No stored token → SyncMode::Full                                │
 │  2. photo_stream_with_token() enumerates all assets                 │
@@ -360,7 +360,7 @@ Token management:
 └─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌─────────────────── Subsequent Runs (Incremental) ──────────────────┐
+┌─────────────────── Subsequent Runs (Incremental) ───────────────────┐
 │                                                                     │
 │  1. Load sync_token:{zone} from metadata → SyncMode::Incremental    │
 │                                                                     │
@@ -382,11 +382,11 @@ Token management:
 └─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌─────────────────── Error / Fallback ───────────────────────────────┐
+┌─────────────────── Error / Fallback ────────────────────────────────┐
 │                                                                     │
 │  SyncTokenError::InvalidToken                                       │
 │  ├─ Detected via changes/zone returning BAD_REQUEST                 │
-│  ├─ check_changes_zone_error() → SyncTokenError                    │
+│  ├─ check_changes_zone_error() → SyncTokenError                     │
 │  ├─ Propagated as anyhow::Error, downcast in download pipeline      │
 │  └─ Fallback: clear stored token, retry with SyncMode::Full         │
 │                                                                     │
@@ -394,7 +394,7 @@ Token management:
 │  └─ Zone was deleted (shared library removed) → skip zone           │
 │                                                                     │
 │  --reset-sync-token CLI flag                                        │
-│  └─ Clears db_sync_token + sync_token:{zone} → forces Full sync    │
+│  └─ Clears db_sync_token + sync_token:{zone} → forces Full sync     │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -416,27 +416,27 @@ Token management:
 
 ```
 ┌──────────── Download Errors ────────────────────────────────────────┐
-│                                                                      │
-│  DownloadError (src/download/error.rs)                               │
+│                                                                     │
+│  DownloadError (src/download/error.rs)                              │
 │  ├─ is_retryable():  429, 5xx → true; 4xx → false; disk → false     │
 │  ├─ is_session_expired():  401, 403 → true                          │
 │  └─ Retry: exponential backoff (base 2s, max 60s)                   │
-│                                                                      │
-│  Session Expiry:                                                     │
-│  ├─ DownloadOutcome::SessionExpired bubbles up to main loop          │
+│                                                                     │
+│  Session Expiry:                                                    │
+│  ├─ DownloadOutcome::SessionExpired bubbles up to main loop         │
 │  ├─ attempt_reauth() called (max 3 attempts, 30s timeout)           │
 │  └─ Watch mode: re-auth + continue; single-shot: bail               │
-│                                                                      │
-│  SyncTokenError:                                                     │
-│  ├─ InvalidToken: changes/zone returned BAD_REQUEST                  │
+│                                                                     │
+│  SyncTokenError:                                                    │
+│  ├─ InvalidToken: changes/zone returned BAD_REQUEST                 │
 │  │   └─ Automatic fallback to SyncMode::Full                        │
 │  └─ ZoneNotFound: ZONE_NOT_FOUND in response                        │
-│      └─ Zone deleted (shared library removed)                        │
-│                                                                      │
-│  CloudKitServerError (src/icloud/photos/error.rs)                    │
-│  └─ Retried with exponential backoff via retry_post()                │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
+│      └─ Zone deleted (shared library removed)                       │
+│                                                                     │
+│  CloudKitServerError (src/icloud/photos/error.rs)                   │
+│  └─ Retried with exponential backoff via retry_post()               │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
