@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Incremental sync via CloudKit syncToken** - After the first full sync, subsequent runs use Apple's `changes/database` and `changes/zone` APIs to fetch only new/changed/deleted photos instead of re-enumerating the entire library. A no-change cycle completes in 1-2 API calls (~75 fewer than a full scan). Tokens are persisted per-zone in the state DB's metadata table and chained across paginated responses for crash-safe resume. Falls back to full enumeration automatically if a token expires or the server rejects it ([#131])
+- **`--no-incremental` flag** - Forces a full library enumeration even when a stored sync token exists. Available on `sync` and `retry-failed` ([#131])
+- **`--reset-sync-token` flag** - Clears stored sync tokens before syncing. Useful for recovery if incremental sync gets into a bad state ([#131])
 - **Early state DB skip** - During re-syncs, assets already confirmed in the state DB skip path resolution and filesystem checks entirely. Uses a config hash to detect when download settings change (invalidating trust). Eliminates ~16k path resolutions per cycle for a 16k-photo library with only a handful of new photos. Adds metadata table (schema v2 migration) ([#129])
 
 ### Fixed
@@ -25,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Boxed large error enum variants (`reqwest::Error`, `io::Error`) in `DownloadError`, `AuthError`, `ICloudError` to reduce stack size ~75% with compile-time size guards ([#131])
+- Converted ~70 tracing calls across 13 files from string interpolation to structured fields ([#131])
+- Fused incremental sync event filtering into a single pass, removing intermediate `Vec` and two redundant iterations ([#131])
+- Replaced bare `as` numeric casts with `try_from().unwrap_or()` in SQLite layer to prevent silent overflow ([#131])
+- Updated quinn-proto to 0.11.14 (RUSTSEC-2026-0037 fix) ([#131])
 - Inline format args across 10 files (~40 instances) ([#129])
 - Narrowed `pub` to `pub(crate)` for 14 functions and 6 structs ([#129])
 - Capped mpsc channel buffer at 500, removed intermediate `.collect()` before `select_all` ([#129])
@@ -33,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Derived `PartialEq` on `CookieEntry`, flattened nested `if let`, simplified match arms ([#129])
 - Replaced redundant `.to_string().into_boxed_str()` with `.clone()` / `.into()` ([#129])
 
+[#131]: https://github.com/rhoopr/icloudpd-rs/pull/131
 [#129]: https://github.com/rhoopr/icloudpd-rs/pull/129
 
 ---

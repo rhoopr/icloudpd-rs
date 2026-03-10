@@ -10,6 +10,7 @@ A fast, reliable iCloud Photos downloader and **icloudpd alternative**. Single b
 Inspired by the excellent [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (icloudpd), which did the hard work of reverse-engineering Apple's private APIs. icloudpd-rs is a ground-up rewrite that adds parallel downloads, persistent state, and resumable transfers - things that are hard to retrofit into an existing codebase:
 
 - **Parallel downloads** - Network speed is the bottleneck, **5x+ faster** than icloudpd in gigabit benchmarks.
+- **Incremental sync** - After the first run, only changed/new photos are fetched. A no-change check completes in 1-2 API calls instead of ~75.
 - **Fast library scanning** - 20k-photo library indexed in ~30s, **15x faster** than sequential API calls.
 - **SQLite state tracking** - Subsequent syncs skip what's already downloaded, instantly.
 - **Resumable transfers** - Partial downloads pick up where they left off, with SHA256 verification.
@@ -123,6 +124,7 @@ Run `icloudpd-rs --help` for the full flag list, or check the **[Wiki](https://g
 | Feature | Details |
 |---------|---------|
 | Parallel downloads | Configurable concurrency, downloads start as the first API page returns |
+| Incremental sync | CloudKit syncToken delta sync - only fetches changes since the last run. [Details](https://github.com/rhoopr/icloudpd-rs/wiki/State-Tracking#incremental-sync) |
 | State tracking | SQLite DB tracks downloaded/failed/pending - no re-scanning |
 | Resumable transfers | Partial downloads resume via HTTP Range with SHA256 verification |
 | TOML config | Optional `config.toml` with `[auth]`, `[download]`, `[filters]`, `[photos]`, `[watch]`, `[notifications]` sections. CLI flags override config values. [Guide](https://github.com/rhoopr/icloudpd-rs/wiki/Configuration) |
