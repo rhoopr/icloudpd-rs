@@ -200,24 +200,15 @@ pub async fn retry_post(
 }
 
 /// Errors from `changes/zone` when syncToken is invalid.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SyncTokenError {
     /// Token is invalid/corrupted — fall back to full enumeration
+    #[error("Invalid sync token: {reason}")]
     InvalidToken { reason: String },
     /// Zone no longer exists — stop syncing this zone
+    #[error("Zone not found: {zone_name}")]
     ZoneNotFound { zone_name: String },
 }
-
-impl std::fmt::Display for SyncTokenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidToken { reason } => write!(f, "Invalid sync token: {reason}"),
-            Self::ZoneNotFound { zone_name } => write!(f, "Zone not found: {zone_name}"),
-        }
-    }
-}
-
-impl std::error::Error for SyncTokenError {}
 
 /// Check if a `ChangesZoneResult` contains a zone-level error.
 /// Returns `Ok(())` if no error, `Err(SyncTokenError)` if there is one.
