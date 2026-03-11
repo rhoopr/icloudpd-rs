@@ -50,7 +50,7 @@ pub struct SyncArgs {
     #[arg(short = 'a', long = "album")]
     pub albums: Vec<String>,
 
-    /// Library to download (default: PrimarySync)
+    /// Library to download (default: PrimarySync, use "all" for all libraries)
     #[arg(long)]
     pub library: Option<String>,
 
@@ -147,6 +147,14 @@ pub struct SyncArgs {
     /// Change if the default conflicts with your filesystem (e.g. Nextcloud rejects .part).
     #[arg(long)]
     pub temp_suffix: Option<String>,
+
+    /// Force full library enumeration even if a sync token exists
+    #[arg(long)]
+    pub no_incremental: bool,
+
+    /// Clear stored sync tokens before syncing (recovery tool)
+    #[arg(long)]
+    pub reset_sync_token: bool,
 
     /// Send systemd sd_notify messages (READY, STOPPING, STATUS).
     /// Only effective on Linux with a systemd service unit.
@@ -1141,6 +1149,46 @@ mod tests {
         } else {
             panic!("Expected SubmitCode command");
         }
+    }
+
+    // ── no-incremental / reset-sync-token flags ───────────────────
+
+    #[test]
+    fn test_no_incremental_default_false() {
+        let cli = parse(&base_args());
+        assert!(!cli.sync.no_incremental);
+    }
+
+    #[test]
+    fn test_no_incremental_flag() {
+        let mut args = base_args();
+        args.push("--no-incremental");
+        let cli = parse(&args);
+        assert!(cli.sync.no_incremental);
+    }
+
+    #[test]
+    fn test_reset_sync_token_default_false() {
+        let cli = parse(&base_args());
+        assert!(!cli.sync.reset_sync_token);
+    }
+
+    #[test]
+    fn test_reset_sync_token_flag() {
+        let mut args = base_args();
+        args.push("--reset-sync-token");
+        let cli = parse(&args);
+        assert!(cli.sync.reset_sync_token);
+    }
+
+    #[test]
+    fn test_no_incremental_and_reset_sync_token_together() {
+        let mut args = base_args();
+        args.push("--no-incremental");
+        args.push("--reset-sync-token");
+        let cli = parse(&args);
+        assert!(cli.sync.no_incremental);
+        assert!(cli.sync.reset_sync_token);
     }
 
     // ── notification-script flag ──────────────────────────────────

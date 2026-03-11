@@ -73,7 +73,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
         conn.execute_batch(SCHEMA_V2)?;
         conn.execute_batch(SCHEMA_V3)?;
         set_schema_version(conn, SCHEMA_VERSION)?;
-        tracing::debug!("Initialized database schema at version {}", SCHEMA_VERSION);
+        tracing::debug!(version = SCHEMA_VERSION, "Initialized database schema");
     } else if current_version < SCHEMA_VERSION {
         // Run incremental migrations
         for version in (current_version + 1)..=SCHEMA_VERSION {
@@ -111,7 +111,7 @@ fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError>
         }
     }
     set_schema_version(conn, version)?;
-    tracing::info!("Migrated database to schema version {version}");
+    tracing::info!(version, "Migrated database schema");
     Ok(())
 }
 

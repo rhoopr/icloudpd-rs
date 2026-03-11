@@ -82,8 +82,8 @@ pub async fn authenticate(
             }
             Err(e) => {
                 tracing::debug!(
-                    "Invalid authentication token, will log in from scratch: {}",
-                    e
+                    error = %e,
+                    "Invalid authentication token, will log in from scratch"
                 );
             }
         }
@@ -93,7 +93,7 @@ pub async fn authenticate(
         let password = password_provider()
             .ok_or_else(|| AuthError::FailedLogin("Password provider returned no data".into()))?;
 
-        tracing::debug!("Authenticating as {}", apple_id);
+        tracing::debug!(apple_id = %apple_id, "Authenticating");
 
         srp::authenticate_srp(
             &mut session,

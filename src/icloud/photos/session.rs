@@ -199,6 +199,60 @@ pub async fn retry_post(
     .await
 }
 
+/// Errors from `changes/zone` when syncToken is invalid.
+#[derive(Debug, thiserror::Error)]
+pub enum SyncTokenError {
+    /// Token is invalid/corrupted — fall back to full enumeration
+    #[error("Invalid sync token: {reason}")]
+    InvalidToken { reason: String },
+    /// Zone no longer exists — stop syncing this zone
+    #[error("Zone not found: {zone_name}")]
+    ZoneNotFound { zone_name: String },
+    /// Unexpected zone-level error (e.g. RETRY_LATER, THROTTLED) —
+    /// treat as transient; do NOT advance the sync token.
+    #[error("Unexpected zone error in {zone_name}: {error_code}")]
+    UnexpectedZoneError {
+        zone_name: String,
+        error_code: String,
+    },
+}
+
+impl SyncTokenError {
+    /// Whether this error should trigger a fallback from incremental to full sync.
+    /// Only token/zone-level issues warrant full re-enumeration; transient errors
+    /// (THROTTLED, RETRY_LATER) should propagate without triggering an expensive fallback.
+    pub fn should_fallback_to_full(&self) -> bool {
+        matches!(
+            self,
+            SyncTokenError::InvalidToken { .. } | SyncTokenError::ZoneNotFound { .. }
+        )
+    }
+}
+
+/// Check if a `ChangesZoneResult` contains a zone-level error.
+/// Returns `Ok(())` if no error, `Err(SyncTokenError)` if there is one.
+pub fn check_changes_zone_error(
+    server_error_code: Option<&str>,
+    reason: Option<&str>,
+    zone_name: &str,
+) -> Result<(), SyncTokenError> {
+    match server_error_code {
+        Some("BAD_REQUEST") => Err(SyncTokenError::InvalidToken {
+            reason: reason
+                .unwrap_or("Unknown sync continuation type")
+                .to_string(),
+        }),
+        Some("ZONE_NOT_FOUND") => Err(SyncTokenError::ZoneNotFound {
+            zone_name: zone_name.to_string(),
+        }),
+        Some(code) => Err(SyncTokenError::UnexpectedZoneError {
+            zone_name: zone_name.to_string(),
+            error_code: code.to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +493,104 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("TEST"));
         assert!(msg.contains("test reason"));
+    }
+
+    #[test]
+    fn test_check_changes_zone_error_no_error() {
+        let result = check_changes_zone_error(None, None, "PrimarySync");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_changes_zone_error_unknown_code_is_unexpected() {
+        let result = check_changes_zone_error(Some("SOME_OTHER_CODE"), None, "PrimarySync");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SyncTokenError::UnexpectedZoneError {
+                zone_name,
+                error_code,
+            } => {
+                assert_eq!(zone_name, "PrimarySync");
+                assert_eq!(error_code, "SOME_OTHER_CODE");
+            }
+            other => panic!("Expected UnexpectedZoneError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_changes_zone_error_bad_request() {
+        let result = check_changes_zone_error(
+            Some("BAD_REQUEST"),
+            Some("Unknown sync continuation type"),
+            "PrimarySync",
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SyncTokenError::InvalidToken { reason } => {
+                assert_eq!(reason, "Unknown sync continuation type");
+            }
+            other => panic!("Expected InvalidToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_changes_zone_error_bad_request_no_reason() {
+        let result = check_changes_zone_error(Some("BAD_REQUEST"), None, "PrimarySync");
+        match result.unwrap_err() {
+            SyncTokenError::InvalidToken { reason } => {
+                assert_eq!(reason, "Unknown sync continuation type");
+            }
+            other => panic!("Expected InvalidToken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_changes_zone_error_zone_not_found() {
+        let result = check_changes_zone_error(Some("ZONE_NOT_FOUND"), None, "SharedSync-123");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SyncTokenError::ZoneNotFound { zone_name } => {
+                assert_eq!(zone_name, "SharedSync-123");
+            }
+            other => panic!("Expected ZoneNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sync_token_error_display_invalid_token() {
+        let err = SyncTokenError::InvalidToken {
+            reason: "bad token".into(),
+        };
+        assert_eq!(err.to_string(), "Invalid sync token: bad token");
+    }
+
+    #[test]
+    fn test_sync_token_error_display_zone_not_found() {
+        let err = SyncTokenError::ZoneNotFound {
+            zone_name: "SharedSync-ABC".into(),
+        };
+        assert_eq!(err.to_string(), "Zone not found: SharedSync-ABC");
+    }
+
+    #[test]
+    fn test_sync_token_error_downcast_from_anyhow() {
+        let err: anyhow::Error = SyncTokenError::InvalidToken {
+            reason: "expired".into(),
+        }
+        .into();
+        let downcasted = err.downcast_ref::<SyncTokenError>();
+        assert!(downcasted.is_some());
+        assert_eq!(
+            downcasted.unwrap().to_string(),
+            "Invalid sync token: expired"
+        );
+    }
+
+    #[test]
+    fn test_sync_token_error_display_empty_reason() {
+        let err = SyncTokenError::InvalidToken {
+            reason: String::new(),
+        };
+        assert_eq!(err.to_string(), "Invalid sync token: ");
     }
 }

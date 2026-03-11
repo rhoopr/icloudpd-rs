@@ -259,7 +259,7 @@ pub async fn authenticate_srp(
     let init_headers =
         get_auth_headers(domain, client_id, &session.session_data, Some(&overrides))?;
 
-    tracing::debug!("Initiating SRP authentication for {}", apple_id);
+    tracing::debug!(apple_id = %apple_id, "Initiating SRP authentication");
 
     let init_url = format!("{}/signin/init", endpoints.auth);
     let response = session
@@ -297,9 +297,9 @@ pub async fn authenticate_srp(
     let password_key = derive_apple_password(password, &body.protocol, &salt, iterations);
 
     tracing::debug!(
-        "SRP protocol: {}, iterations: {}",
-        body.protocol,
-        iterations
+        protocol = %body.protocol,
+        iterations,
+        "SRP parameters"
     );
     let x = compute_x(&salt, &password_key);
     let k = compute_k(&n, &g);

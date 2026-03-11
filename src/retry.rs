@@ -80,11 +80,11 @@ where
                 }
                 let delay = config.delay_for_retry(attempt);
                 tracing::warn!(
-                    "Retryable error (attempt {}/{}), retrying in {}s: {}",
-                    attempt + 1,
+                    attempt = attempt + 1,
                     total_attempts,
-                    delay.as_secs(),
-                    e
+                    retry_delay_secs = delay.as_secs(),
+                    error = %e,
+                    "Retryable error, retrying"
                 );
                 tokio::time::sleep(delay).await;
             }

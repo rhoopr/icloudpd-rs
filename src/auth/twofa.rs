@@ -29,8 +29,8 @@ pub async fn submit_2fa_code(
 ) -> Result<bool> {
     if !is_valid_2fa_code(code) {
         tracing::error!(
-            "Invalid 2FA code: must be exactly {} digits",
-            TWO_FA_CODE_LENGTH
+            expected_length = TWO_FA_CODE_LENGTH,
+            "Invalid 2FA code: must be exactly the specified number of digits"
         );
         return Ok(false);
     }
