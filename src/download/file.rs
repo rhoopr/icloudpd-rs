@@ -42,7 +42,7 @@ pub async fn download_file(
     temp_suffix: &str,
 ) -> Result<(), DownloadError> {
     if dry_run {
-        tracing::info!("[DRY RUN] Would download {}", download_path.display());
+        tracing::info!(path = %download_path.display(), "[DRY RUN] Would download");
         return Ok(());
     }
 
@@ -84,15 +84,15 @@ async fn attempt_download(
     let mut request = client.get(url);
     if resume_offset > 0 {
         tracing::info!(
-            "Resuming {} from byte {} (partial file exists)",
-            path_str,
-            resume_offset
+            path = %path_str,
+            resume_offset,
+            "Resuming download (partial file exists)"
         );
         request = request.header("Range", format!("bytes={resume_offset}-"));
     }
 
     let response = request.send().await.map_err(|e| DownloadError::Http {
-        source: e,
+        source: Box::new(e),
         path: path_str.clone(),
         status: 0,
         content_length: None,
@@ -110,9 +110,9 @@ async fn attempt_download(
         _ if response.status().is_success() => {
             if resume_offset > 0 {
                 tracing::info!(
-                    "Server returned {} instead of 206 for Range request, restarting download of {}",
                     status,
-                    path_str,
+                    path = %path_str,
+                    "Server ignored Range request, restarting download"
                 );
             }
             (0u64, true, 0u64)
@@ -141,7 +141,7 @@ async fn attempt_download(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| DownloadError::Http {
-            source: e,
+            source: Box::new(e),
             path: path_str.clone(),
             status,
             content_length,

@@ -145,7 +145,7 @@ impl Session {
                     if let Ok(entries) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
                         for entry in entries {
                             if is_cookie_expired(&entry.cookie, &now) {
-                                tracing::debug!("Pruning expired cookie from {}", entry.url);
+                                tracing::debug!(url = %entry.url, "Pruning expired cookie");
                                 continue;
                             }
                             if let Ok(url) = entry.url.parse::<url::Url>() {
@@ -163,7 +163,7 @@ impl Session {
                             }
                             if let Some((url_str, cookie_str)) = trimmed.split_once('\t') {
                                 if is_cookie_expired(cookie_str, &now) {
-                                    tracing::debug!("Pruning expired cookie from {}", url_str);
+                                    tracing::debug!(url = %url_str, "Pruning expired cookie");
                                     continue;
                                 }
                                 if let Ok(url) = url_str.parse::<url::Url>() {
@@ -179,16 +179,16 @@ impl Session {
                             &cookiejar_path,
                             std::fs::Permissions::from_mode(0o600),
                         ) {
-                            tracing::warn!("Could not set cookie file permissions: {}", e);
+                            tracing::warn!(error = %e, "Could not set cookie file permissions");
                         }
                     }
-                    tracing::debug!("Read cookies from {}", cookiejar_path.display());
+                    tracing::debug!(path = %cookiejar_path.display(), "Read cookies");
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to read cookiejar {}: {}",
-                        cookiejar_path.display(),
-                        e
+                        path = %cookiejar_path.display(),
+                        error = %e,
+                        "Failed to read cookiejar"
                     );
                 }
             }
@@ -227,7 +227,7 @@ impl Session {
             match fs::read_to_string(&session_path).await {
                 Ok(contents) => match serde_json::from_str::<HashMap<String, Value>>(&contents) {
                     Ok(map) => {
-                        tracing::debug!("Loaded session data from {}", session_path.display());
+                        tracing::debug!(path = %session_path.display(), "Loaded session data");
                         map.into_iter()
                             .map(|(k, v)| match v {
                                 Value::String(s) => (k, s),
@@ -250,7 +250,7 @@ impl Session {
             HashMap::new()
         };
 
-        tracing::debug!("Using session file {}", session_path.display());
+        tracing::debug!(path = %session_path.display(), "Using session file");
 
         Ok(Self {
             client,
@@ -302,7 +302,7 @@ impl Session {
             builder = builder.header("Content-Type", "application/json").body(b);
         }
 
-        tracing::debug!("POST {}", url);
+        tracing::debug!(url = %url, "POST");
         let response = builder.send().await?;
         self.extract_and_save(&response).await?;
         Ok(response)
@@ -314,7 +314,7 @@ impl Session {
             builder = builder.headers(h);
         }
 
-        tracing::debug!("GET {}", url);
+        tracing::debug!(url = %url, "GET");
         let response = builder.send().await?;
         self.extract_and_save(&response).await?;
         Ok(response)

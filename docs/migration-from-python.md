@@ -37,7 +37,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `-d, --directory` | |
 | `-a, --album` | Multiple `--album` flags supported, same as Python |
 | `-l, --list-albums` | |
-| `--library` | Default: `PrimarySync` |
+| `--library` | Default: `PrimarySync`. Use `all` to sync every library at once |
 | `--list-libraries` | |
 | `--recent` | |
 | `--skip-videos` | |
@@ -92,6 +92,8 @@ Most flags are the same or very close. Here's the full mapping:
 | `--max-retries` | Retry limit per download (Python hardcoded `MAX_RETRIES = 0`) |
 | `--retry-delay` | Base delay for exponential backoff |
 | `--temp-suffix` | Suffix for partial downloads (default: `.icloudpd-tmp`) |
+| `--no-incremental` | Force full library scan instead of syncToken delta sync. Use when you suspect the incremental state is stale, or to verify that incremental results match a full enumeration. |
+| `--reset-sync-token` | Clear stored sync tokens before syncing. Unlike `--no-incremental`, this also stores the fresh token from the full scan, so the next run resumes incremental from that point. Use after recovering from a bad state or after a long gap between syncs. |
 | `--notify-systemd` | systemd sd_notify integration |
 | `--pid-file` | PID file for service managers |
 | `submit-code <code>` | Submit 2FA code non-interactively (for Docker/headless) |
@@ -153,5 +155,6 @@ docker exec icloudpd-rs icloudpd-rs import-existing --directory /photos
 
 - **`--until-found`** - The SQLite state database replaces this entirely. icloudpd-rs knows exactly which assets have been downloaded, so it doesn't need to scan backwards looking for familiar files.
 - **Re-downloading** - `import-existing` populates the database from your existing files. After that, only new or failed assets are fetched.
+- **Full re-scans** - After the first sync, icloudpd-rs uses Apple's CloudKit syncToken to fetch only what's changed. A no-change cycle takes 1-2 API calls. Python icloudpd re-enumerates the entire library every run.
 - **Cookie migration** - You can't reuse Python cookies, but a fresh auth takes 30 seconds. The new session persists the same way.
 - **Folder structure compatibility** - Both Python-style `{:%Y/%m/%d}` and plain `%Y/%m/%d` format strings are accepted. Your existing folder layout works as-is.

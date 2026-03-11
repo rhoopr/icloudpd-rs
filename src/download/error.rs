@@ -18,11 +18,11 @@ pub enum DownloadError {
     },
 
     #[error("Disk error: {0}")]
-    Disk(#[from] std::io::Error),
+    Disk(Box<std::io::Error>),
 
     #[error("HTTP error downloading {path} (status={status}, content_length={content_length:?}, bytes_so_far={bytes_written}): {source}")]
     Http {
-        source: reqwest::Error,
+        source: Box<reqwest::Error>,
         path: String,
         status: u16,
         content_length: Option<u64>,
@@ -32,6 +32,15 @@ pub enum DownloadError {
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
+
+impl From<std::io::Error> for DownloadError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Disk(Box::new(e))
+    }
+}
+
+// Verify boxing keeps enum small — guards against regressions from adding unboxed large variants.
+const _: () = assert!(std::mem::size_of::<DownloadError>() <= 80);
 
 impl DownloadError {
     /// Whether this error is transient and worth retrying.
@@ -119,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_disk_not_retryable() {
-        let e = DownloadError::Disk(std::io::Error::other("disk full"));
+        let e = DownloadError::Disk(Box::new(std::io::Error::other("disk full")));
         assert!(!e.is_retryable());
     }
 
@@ -140,7 +149,7 @@ mod tests {
             .block_on(reqwest::Client::new().get("http://127.0.0.1:1").send())
             .unwrap_err();
         let e = DownloadError::Http {
-            source: err,
+            source: Box::new(err),
             path: "x".into(),
             status: 0,
             content_length: None,
@@ -198,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_disk_not_session_expired() {
-        let e = DownloadError::Disk(std::io::Error::other("disk full"));
+        let e = DownloadError::Disk(Box::new(std::io::Error::other("disk full")));
         assert!(!e.is_session_expired());
     }
 }

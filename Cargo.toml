@@ -1,6 +1,6 @@
 [package]
 name = "icloudpd-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [[bin]]
@@ -85,6 +85,7 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 dotenvy = "0.15"
+rusqlite = { version = "0.38", features = ["bundled"] }
 
 [[test]]
 name = "cli"

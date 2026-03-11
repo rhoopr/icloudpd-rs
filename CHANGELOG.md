@@ -9,12 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.4.0] - 2026-03-11
+
 ### Added
 
+- **Incremental sync via CloudKit syncToken** - After the first full sync, subsequent runs use Apple's `changes/database` and `changes/zone` APIs to fetch only new/changed/deleted photos instead of re-enumerating the entire library. A no-change cycle completes in 1-2 API calls (~75 fewer than a full scan). Tokens are persisted per-zone in the state DB's metadata table and chained across paginated responses for crash-safe resume. Falls back to full enumeration automatically if a token expires or the server rejects it ([#131])
+- **`--library all`** - Downloads from all available libraries (personal + shared) in a single run instead of requiring separate `--library` invocations per zone. Each library syncs with its own per-zone sync token. `--list-albums --library all` shows albums grouped by library ([#98])
+- **`--no-incremental` flag** - Forces a full library enumeration even when a stored sync token exists. Available on `sync` and `retry-failed` ([#131])
+- **`--reset-sync-token` flag** - Clears stored sync tokens before syncing. Useful for recovery if incremental sync gets into a bad state ([#131])
 - **Early state DB skip** - During re-syncs, assets already confirmed in the state DB skip path resolution and filesystem checks entirely. Uses a config hash to detect when download settings change (invalidating trust). Eliminates ~16k path resolutions per cycle for a 16k-photo library with only a handful of new photos. Adds metadata table (schema v2 migration) ([#129])
 
 ### Fixed
 
+- **Sync token not withheld on partial failure** - Incremental sync now only advances the sync token when all downloads succeed. Partial failures and session expiry leave the token unchanged so change events replay on the next cycle instead of being silently lost ([#132])
+- **Zone-level errors silently ignored** - Unknown zone error codes from `changes/zone` (THROTTLED, RETRY_LATER, etc.) were silently swallowed. They now propagate as `UnexpectedZoneError`. Only `InvalidToken` and `ZoneNotFound` trigger fallback to full enumeration; transient errors skip the expensive full re-scan ([#132])
+- **`--recent` ignored in incremental sync** - The `--recent` flag was only applied during full enumeration. Incremental sync now caps downloaded assets to the `--recent` limit ([#132])
+- **No state DB fast-skip in incremental path** - Incremental sync re-checked the filesystem for already-downloaded assets. It now uses the same `DownloadContext` pre-filter as the streaming path, skipping known assets instantly ([#132])
+- **DeltaRecordBuffer pairing used wrong ChangeReason** - When CPLMaster and CPLAsset records arrived with different deletion states, only the second-arriving record's reason was used. A soft-deleted master paired with a normal asset would emit `Created` instead of `SoftDeleted`. Both records' reasons are now reconciled, taking the most severe (HardDeleted > SoftDeleted > Hidden > Created) ([#132])
+- **Watch mode skipped cycle on paginated changes/database** - When `changes/database` returned `zones: []` with `moreComing: true`, the watch cycle was incorrectly skipped. Pagination is now respected before deciding nothing changed ([#132])
+- **SharedSync zone queried for unsupported album types** - Smart folder and user album queries were sent to SharedSync zones, which don't support them. These queries are now skipped for shared libraries ([#98])
 - **`retry-failed` downloading entire library** - `retry-failed` now only retries assets already known to the state DB, skipping new iCloud assets that appear between runs ([#129])
 - **SHA-1 checksum support** - Apple's 20-byte (raw SHA-1) and 21-byte (0x01 prefix + SHA-1) checksum formats are now handled in both downloads and verify ([#129])
 - **Session cookie persistence** - All cookies from the jar (including those set by redirect responses) are now persisted, so sessions survive process restarts ([#129])
@@ -25,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Boxed large error enum variants (`reqwest::Error`, `io::Error`) in `DownloadError`, `AuthError`, `ICloudError` to reduce stack size ~75% with compile-time size guards ([#131])
+- Converted ~70 tracing calls across 13 files from string interpolation to structured fields ([#131])
+- Fused incremental sync event filtering into a single pass, removing intermediate `Vec` and two redundant iterations ([#131])
+- Replaced bare `as` numeric casts with `try_from().unwrap_or()` in SQLite layer to prevent silent overflow ([#131])
+- Increased auth throttle to 8s to avoid Apple SRP rate limiting during rapid re-auth
+- Updated quinn-proto to 0.11.14 (RUSTSEC-2026-0037 fix) ([#131])
 - Inline format args across 10 files (~40 instances) ([#129])
 - Narrowed `pub` to `pub(crate)` for 14 functions and 6 structs ([#129])
 - Capped mpsc channel buffer at 500, removed intermediate `.collect()` before `select_all` ([#129])
@@ -33,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Derived `PartialEq` on `CookieEntry`, flattened nested `if let`, simplified match arms ([#129])
 - Replaced redundant `.to_string().into_boxed_str()` with `.clone()` / `.into()` ([#129])
 
+[#98]: https://github.com/rhoopr/icloudpd-rs/issues/98
+[#132]: https://github.com/rhoopr/icloudpd-rs/pull/132
+[#131]: https://github.com/rhoopr/icloudpd-rs/pull/131
 [#129]: https://github.com/rhoopr/icloudpd-rs/pull/129
 
 ---
@@ -213,7 +237,7 @@ These are intentional improvements over the Python implementation:
 
 The following Python icloudpd features are not yet available. Links go to tracking issues:
 
-#### Coming in v0.4
+#### Coming in v0.5
 
 - [#28](https://github.com/rhoopr/icloudpd-rs/issues/28) - **Auto-delete** (detect iCloud deletions, optionally remove local copies)
 - [#29](https://github.com/rhoopr/icloudpd-rs/issues/29) - **Delete after download** (`--delete-after-download`)
@@ -250,7 +274,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.1.0...v0.2.0
