@@ -483,8 +483,9 @@ fn sync_force_size_succeeds_when_available() {
         for f in &non_raw_files {
             let size = std::fs::metadata(f).unwrap().len();
             assert!(
-                size > 0,
-                "--force-size should produce non-empty files: {}",
+                size < 2_097_152,
+                "--force-size medium file should be under 2MB, got {} bytes: {}",
+                size,
                 f.display()
             );
         }

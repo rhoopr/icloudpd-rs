@@ -552,8 +552,7 @@ fn retry_failed_with_no_db_succeeds() {
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("No failed assets to retry")
-                || stderr.contains("No state database found"),
+            stderr.contains("No failed assets to retry"),
             "retry-failed with no DB should report nothing to retry, stderr:\n{stderr}"
         );
     });
