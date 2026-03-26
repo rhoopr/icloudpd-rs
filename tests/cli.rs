@@ -661,14 +661,15 @@ fn log_level_before_subcommand() {
         .success();
 }
 
-// ── Hidden flags ────────────────────────────────────────────────────────
+// ── --only-print-filenames ──────────────────────────────────────────────
 
 #[test]
-fn only_print_filenames_hidden_flag_accepted() {
+fn only_print_filenames_visible_in_help() {
     common::cmd()
-        .args(["sync", "--only-print-filenames", "--help"])
+        .args(["sync", "--help"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("--only-print-filenames"));
 }
 
 // ── import-existing short -d flag ───────────────────────────────────────

@@ -911,6 +911,7 @@ async fn main() -> anyhow::Result<()> {
             live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
             align_raw: config.align_raw,
             no_progress_bar: config.no_progress_bar,
+            only_print_filenames: config.only_print_filenames,
             file_match_policy: config.file_match_policy,
             force_size: config.force_size,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,

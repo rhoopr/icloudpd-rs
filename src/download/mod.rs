@@ -200,6 +200,7 @@ pub struct DownloadConfig {
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub(crate) align_raw: RawTreatmentPolicy,
     pub(crate) no_progress_bar: bool,
+    pub(crate) only_print_filenames: bool,
     pub(crate) file_match_policy: FileMatchPolicy,
     pub(crate) force_size: bool,
     pub(crate) keep_unicode_in_filenames: bool,
@@ -237,6 +238,7 @@ impl std::fmt::Debug for DownloadConfig {
             )
             .field("align_raw", &self.align_raw)
             .field("no_progress_bar", &self.no_progress_bar)
+            .field("only_print_filenames", &self.only_print_filenames)
             .field("file_match_policy", &self.file_match_policy)
             .field("force_size", &self.force_size)
             .field("keep_unicode_in_filenames", &self.keep_unicode_in_filenames)
@@ -866,8 +868,12 @@ fn filter_asset_to_tasks(
 /// Returns `ProgressBar::hidden()` when the user passed `--no-progress-bar` or
 /// stdout is not a TTY (e.g. piped output, cron jobs) — this prevents output
 /// corruption and honours the user's preference.
-fn create_progress_bar(no_progress_bar: bool, total: u64) -> ProgressBar {
-    if no_progress_bar || !std::io::stdout().is_terminal() {
+fn create_progress_bar(
+    no_progress_bar: bool,
+    only_print_filenames: bool,
+    total: u64,
+) -> ProgressBar {
+    if no_progress_bar || only_print_filenames || !std::io::stdout().is_terminal() {
         return ProgressBar::hidden();
     }
     let pb = ProgressBar::new(total);
@@ -1175,6 +1181,16 @@ async fn download_photos_incremental(
         });
     }
 
+    if config.only_print_filenames {
+        for task in &tasks {
+            println!("{}", task.download_path.display());
+        }
+        return Ok(SyncResult {
+            outcome: DownloadOutcome::Success,
+            sync_token,
+        });
+    }
+
     let task_count = tasks.len();
     tracing::info!(
         count = task_count,
@@ -1259,7 +1275,29 @@ where
         + Send
         + 'static,
 {
-    let pb = create_progress_bar(config.no_progress_bar, total);
+    let pb = create_progress_bar(config.no_progress_bar, config.only_print_filenames, total);
+
+    if config.only_print_filenames {
+        tokio::pin!(combined);
+        let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
+        let mut dir_cache = std::collections::HashMap::new();
+        while let Some(result) = combined.next().await {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            let asset = result?;
+            let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
+            for task in &tasks {
+                println!("{}", task.download_path.display());
+            }
+        }
+        return Ok(StreamingResult {
+            downloaded: 0,
+            exif_failures: 0,
+            failed: Vec::new(),
+            auth_errors: 0,
+        });
+    }
 
     if config.dry_run {
         tokio::pin!(combined);
@@ -1840,7 +1878,7 @@ struct PassConfig<'a> {
 
 /// Execute a download pass over the given tasks, returning any that failed.
 async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> PassResult {
-    let pb = create_progress_bar(config.no_progress_bar, tasks.len() as u64);
+    let pb = create_progress_bar(config.no_progress_bar, false, tasks.len() as u64);
     let client = config.client.clone();
     let retry_config = config.retry_config;
     let set_exif = config.set_exif;
@@ -2129,6 +2167,7 @@ mod tests {
             live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
             align_raw: RawTreatmentPolicy::Unchanged,
             no_progress_bar: true,
+            only_print_filenames: false,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
@@ -2778,7 +2817,7 @@ mod tests {
 
     #[test]
     fn test_create_progress_bar_hidden_when_disabled() {
-        let pb = create_progress_bar(true, 100);
+        let pb = create_progress_bar(true, false, 100);
         assert!(pb.is_hidden());
     }
 
@@ -2868,7 +2907,7 @@ mod tests {
         // When not disabled, the bar should have the correct length.
         // In CI/test environments stdout may not be a TTY, so the bar
         // may be hidden — we test both branches.
-        let pb = create_progress_bar(false, 42);
+        let pb = create_progress_bar(false, false, 42);
         if std::io::stdout().is_terminal() {
             assert!(!pb.is_hidden());
             assert_eq!(pb.length(), Some(42));

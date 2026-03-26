@@ -131,8 +131,7 @@ pub struct SyncArgs {
     pub skip_created_after: Option<String>,
 
     /// Only print filenames without downloading
-    /// NOTE: Parsed but not yet wired up - hidden until implemented
-    #[arg(long, hide = true)]
+    #[arg(long)]
     pub only_print_filenames: bool,
 
     /// Max retries per download (default: 3, 0 = no retries)
