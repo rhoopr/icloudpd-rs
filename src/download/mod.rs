@@ -2822,6 +2822,12 @@ mod tests {
     }
 
     #[test]
+    fn test_create_progress_bar_hidden_when_only_print_filenames() {
+        let pb = create_progress_bar(false, true, 100);
+        assert!(pb.is_hidden());
+    }
+
+    #[test]
     fn test_filter_detects_case_insensitive_collision() {
         // On case-insensitive filesystems (macOS, Windows), IMG_0996.mov and IMG_0996.MOV
         // are the same file. Test that claimed_paths detects this collision.

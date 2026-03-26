@@ -526,6 +526,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cookiejar_directory_at_path_skipped() {
+        let dir = test_dir("cookie_dir_skip");
+        let sanitized = sanitize_username("user@test.com");
+        let cookiejar_path = dir.join(&sanitized);
+
+        // Create a directory where the cookiejar file would be
+        std::fs::create_dir_all(&cookiejar_path).unwrap();
+        assert!(cookiejar_path.is_dir());
+
+        // Session should initialize without error (directory silently skipped)
+        let session = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .unwrap();
+        assert!(session.cookiejar_path().is_dir());
+    }
+
+    #[tokio::test]
     async fn test_expired_cookies_pruned_on_load() {
         let dir = test_dir("cookie_prune");
         let sanitized = sanitize_username("user@test.com");
