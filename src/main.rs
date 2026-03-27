@@ -480,7 +480,9 @@ async fn run_import_existing(
     let stream = all_album.photo_stream(args.recent, None, 1);
     tokio::pin!(stream);
 
-    println!("Scanning iCloud assets and matching with local files...");
+    if !args.no_progress_bar {
+        println!("Scanning iCloud assets and matching with local files...");
+    }
 
     let mut matched = 0u64;
     let mut unmatched = 0u64;
@@ -587,11 +589,13 @@ async fn run_import_existing(
         }
     }
 
-    println!();
-    println!("Import complete:");
-    println!("  Total assets scanned: {total}");
-    println!("  Files matched:        {matched}");
-    println!("  Unmatched versions:   {unmatched}");
+    if !args.no_progress_bar {
+        println!();
+        println!("Import complete:");
+        println!("  Total assets scanned: {total}");
+        println!("  Files matched:        {matched}");
+        println!("  Unmatched versions:   {unmatched}");
+    }
 
     Ok(())
 }

@@ -865,9 +865,9 @@ fn filter_asset_to_tasks(
 
 /// Create a progress bar with a consistent template.
 ///
-/// Returns `ProgressBar::hidden()` when the user passed `--no-progress-bar` or
-/// stdout is not a TTY (e.g. piped output, cron jobs) — this prevents output
-/// corruption and honours the user's preference.
+/// Returns `ProgressBar::hidden()` when the user passed `--no-progress-bar`,
+/// `--only-print-filenames`, or stdout is not a TTY (e.g. piped output, cron
+/// jobs) — this prevents output corruption and honours the user's preference.
 fn create_progress_bar(
     no_progress_bar: bool,
     only_print_filenames: bool,
@@ -1278,6 +1278,14 @@ where
     let pb = create_progress_bar(config.no_progress_bar, config.only_print_filenames, total);
 
     if config.only_print_filenames {
+        // Load state DB context so we skip already-downloaded assets,
+        // matching the incremental path's behavior.
+        let download_ctx = if let Some(db) = &config.state_db {
+            DownloadContext::load(db.as_ref(), false).await
+        } else {
+            DownloadContext::default()
+        };
+
         tokio::pin!(combined);
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = std::collections::HashMap::new();
@@ -1285,10 +1293,29 @@ where
             if shutdown_token.is_cancelled() {
                 break;
             }
-            let asset = result?;
-            let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
-            for task in &tasks {
-                println!("{}", task.download_path.display());
+            match result {
+                Ok(asset) => {
+                    let candidates = extract_skip_candidates(&asset, config);
+                    if !candidates.is_empty()
+                        && candidates.iter().all(|&(vs, cs)| {
+                            matches!(
+                                download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                                Some(false)
+                            )
+                        })
+                    {
+                        continue;
+                    }
+
+                    let tasks =
+                        filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
+                    for task in &tasks {
+                        println!("{}", task.download_path.display());
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Error fetching asset");
+                }
             }
         }
         return Ok(StreamingResult {
