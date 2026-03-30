@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.2] - 2026-03-30
+
+### Fixed
+
+- **"Photo library not finished indexing" blocking all operations** - The `CheckIndexingState` gate has been downgraded from a fatal error to a warning. The iCloud API serves photos normally regardless of this field, but stale or freshly-created sessions often return a non-`FINISHED` state, permanently blocking downloads, album listings, and all other photo operations. Users now see a log warning and proceed as normal ([#144])
+
+[#144]: https://github.com/rhoopr/icloudpd-rs/issues/144
+
+---
+
 ## [0.4.1] - 2026-03-28
 
 ### Added
@@ -290,7 +300,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/rhoopr/icloudpd-rs/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/rhoopr/icloudpd-rs/compare/v0.2.1...v0.3.0
