@@ -15,7 +15,7 @@
 
 ---
 
-kei syncs your photos from cloud services to local storage. Single binary, small footprint, runs unattended. Named after kei trucks - compact, gets the job done.
+kei syncs your photos from cloud services to local storage. Single binary, small footprint, runs unattended.
 
 Right now kei supports iCloud Photos. Google Takeout, Immich, and other sources are on the roadmap.
 
