@@ -1,77 +1,78 @@
-# kei
+<p align="center">
+  <img src="assets/logo.png" alt="kei logo" width="200">
+</p>
 
-*photo sync engine*
+<h1 align="center">kei</h1>
+<p align="center">photo sync engine</p>
 
-> Previously known as icloudpd-rs.
+<p align="center">
+  <a href="https://github.com/rhoopr/icloudpd-rs/releases"><img src="https://img.shields.io/github/v/release/rhoopr/icloudpd-rs?color=blue&label=version" alt="Version"></a>
+  <a href="https://github.com/rhoopr/icloudpd-rs/actions"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/icloudpd-rs/ci.yml?label=build" alt="Build"></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e" alt="License: MIT"></a>
+  <a href="https://github.com/rhoopr/icloudpd-rs/releases"><img src="https://img.shields.io/github/downloads/rhoopr/icloudpd-rs/total?color=green" alt="Downloads"></a>
+  <a href="https://github.com/rhoopr/homebrew-kei"><img src="https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew" alt="Homebrew"></a>
+  <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
+</p>
 
-[![Version](https://img.shields.io/github/v/release/rhoopr/icloudpd-rs?color=blue&label=version)](https://github.com/rhoopr/icloudpd-rs/releases)
-[![Build](https://img.shields.io/github/actions/workflow/status/rhoopr/icloudpd-rs/ci.yml?label=build)](https://github.com/rhoopr/icloudpd-rs/actions)
-[![License: MIT](https://img.shields.io/github/license/rhoopr/icloudpd-rs?color=8b959e)](LICENSE.md)
-[![Downloads](https://img.shields.io/github/downloads/rhoopr/icloudpd-rs/total?color=green)](https://github.com/rhoopr/icloudpd-rs/releases)
-[![Homebrew](https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew)](https://github.com/rhoopr/homebrew-kei)
-[![Docker](https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker)](https://ghcr.io/rhoopr/kei)
+---
 
-Modern photo sync engine. Enumerates large libraries in seconds, tracks state across runs, downloads in parallel, and runs unattended in Docker: all in a single binary.
+kei syncs your photos from cloud services to local storage. Single binary, small footprint, runs unattended. Named after kei trucks - compact, gets the job done.
 
-A Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (icloudpd). 5x+ faster downloads, 15x faster library scanning, incremental sync that only fetches what changed, and resumable transfers with SHA256 verification.
+Right now kei supports iCloud Photos. Google Takeout, Immich, and other sources are on the roadmap.
+
+It scans large libraries in seconds using incremental sync, downloads in parallel with resumable transfers, and tracks everything in a local SQLite database so it never re-downloads what it already has.
 
 > [!TIP]
 > Coming from Python icloudpd? The [Migration Guide](docs/migration-from-python.md) maps every flag and shows how to pick up where you left off without re-downloading.
 
----
-
 ## Install
 
-### Homebrew (macOS & Linux)
+**Homebrew**
 
 ```sh
 brew install rhoopr/kei/kei
 ```
 
-### Docker
+**Docker**
 
 ```sh
 docker pull ghcr.io/rhoopr/kei:latest
 ```
 
-See the [Docker wiki page](https://github.com/rhoopr/icloudpd-rs/wiki/Docker) for the full setup guide, including compose files and headless 2FA via `submit-code`.
+See the [Docker guide](https://github.com/rhoopr/icloudpd-rs/wiki/Docker) for compose files and headless 2FA.
 
-### Pre-built binaries
+**Pre-built binaries**
 
-[GitHub Releases](https://github.com/rhoopr/icloudpd-rs/releases) - macOS (Apple Silicon, Intel), Linux (ARM64, x86_64), Windows (x86_64).
+Grab one from [GitHub Releases](https://github.com/rhoopr/icloudpd-rs/releases). macOS (Apple Silicon + Intel), Linux (ARM64 + x86_64), Windows (x86_64).
 
-### From source
+**From source**
 
 ```sh
 git clone https://github.com/rhoopr/icloudpd-rs.git && cd icloudpd-rs
 cargo build --release
 ```
 
----
-
 ## Quick start
 
-The `setup` wizard walks you through config interactively:
+The setup wizard generates a config file interactively:
 
 ```sh
 kei setup
 ```
 
-This generates a TOML config file at `~/.config/kei/config.toml`. Then run:
+This writes `~/.config/kei/config.toml`. Then just run:
 
 ```sh
 kei
 ```
 
-Or skip the wizard and pass flags directly:
+Or skip the wizard:
 
 ```sh
 kei -u you@example.com -d ~/Photos/iCloud
 ```
 
 You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to approve 2FA on a trusted device. Downloads start right after.
-
----
 
 ## Usage
 
@@ -82,62 +83,61 @@ kei -u you@example.com -d ~/Photos --album "Favorites" --recent 100 --skip-video
 # All libraries (personal + shared) in one run
 kei -u you@example.com -d ~/Photos --library all
 
-# Keep syncing every hour with notifications
-kei -u you@example.com -d ~/Photos --watch-with-interval 3600 --notification-script ./notify.sh
+# Keep syncing every hour
+kei -u you@example.com -d ~/Photos --watch-with-interval 3600
 
-# Preview what would be downloaded
+# Preview what would download
 kei -u you@example.com -d ~/Photos --only-print-filenames
 
-# Dry run (no writes to disk or iCloud)
+# Dry run (no writes to disk)
 kei -u you@example.com -d ~/Photos --dry-run
 ```
 
-Run `kei --help` for all flags. The [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) has detailed guides.
+Run `kei --help` for all flags.
 
----
+## How it works
 
-## Features
+kei downloads on a streaming pipeline. It starts fetching files as soon as the first API page comes back, rather than waiting to enumerate the whole library. After the first full sync, it uses Apple's CloudKit syncToken to pull only what changed - a no-change check takes 1-2 API calls.
 
-| Feature | |
-|---|---|
-| Parallel downloads | Configurable concurrency; downloads start as the first API page returns |
-| Incremental sync | CloudKit syncToken delta sync - subsequent runs only fetch changes |
-| State tracking | SQLite DB tracks downloaded/failed/pending across runs |
-| Resumable transfers | `.part` files resume via HTTP Range with SHA256 verification |
-| TOML config | CLI overrides config. `setup` wizard for easy generation. [Guide](https://github.com/rhoopr/icloudpd-rs/wiki/Configuration) |
-| Watch mode | Continuous sync on an interval, systemd notify, PID file, graceful shutdown |
-| Multi-library | `--library all` syncs personal + shared libraries in one run |
-| File organization | Date-based folders, live photo MOV pairing, EXIF datetime writing |
-| Docker & headless | Multi-arch images (amd64/arm64), `submit-code` for non-interactive 2FA |
-| Notifications | Hook scripts on `2fa_required`, `sync_complete`, `sync_failed`, `session_expired` |
-| Content filtering | Skip videos/photos/live photos, date ranges, `--recent N` |
-| Retry & recovery | Exponential backoff, `retry-failed` subcommand, transient/permanent error classification |
-| Diagnostics | `status`, `verify --checksums`, `reset-state`, `import-existing` subcommands |
+Downloads run with configurable concurrency (default 10). Partial downloads are saved as `.kei-tmp` files and resumed via HTTP Range headers. Every file is verified against its SHA256 checksum.
+
+State lives in a SQLite database alongside your session cookies in `~/.config/kei/`. The DB tracks what's been downloaded, what failed, and where files landed on disk. This is what makes `retry-failed`, `verify`, and `import-existing` possible.
 
 ## Subcommands
 
-| Command | What it does |
+| Command | |
 |---|---|
-| `sync` | Download photos (default when no subcommand given) |
-| `setup` | Interactive config wizard |
-| `status` | Show sync status and DB summary |
-| `verify` | Check downloaded files exist, optionally verify checksums |
-| `retry-failed` | Reset failed downloads to pending and re-sync |
-| `reset-state` | Delete the state DB and start fresh |
-| `import-existing` | Import local files into the state DB (avoids re-downloading) |
-| `submit-code` | Submit 2FA code non-interactively (Docker / headless) |
+| `sync` | Download photos. Default when no subcommand is given. |
+| `setup` | Interactive config wizard. |
+| `status` | Show sync stats and database summary. |
+| `verify` | Check that downloaded files exist. `--checksums` to verify SHA256. |
+| `retry-failed` | Reset failed downloads to pending and re-sync. |
+| `reset-state` | Delete the state database and start fresh. |
+| `import-existing` | Import local files into the state DB so they aren't re-downloaded. |
+| `submit-code` | Submit a 2FA code non-interactively. For Docker and headless setups. |
 
----
+## Features
 
-## Documentation
+- Parallel downloads with streaming pipeline - files start downloading before enumeration finishes
+- Incremental sync via CloudKit syncTokens - only fetches what changed
+- Resumable transfers with `.kei-tmp` partial files and SHA256 verification
+- SQLite state tracking across runs (downloaded, failed, pending)
+- Watch mode with configurable interval, systemd notify, PID file, graceful shutdown
+- Multi-library sync (`--library all` for personal + shared)
+- Date-based folder structure, live photo MOV pairing, EXIF datetime stamping
+- Multi-arch Docker images (amd64/arm64) with headless 2FA via `submit-code`
+- Notification scripts on events: `2fa_required`, `sync_complete`, `sync_failed`, `session_expired`
+- Content filtering: skip videos/photos/live photos, date ranges, `--recent N`
+- Exponential backoff retries with transient vs. permanent error classification
+- TOML config file with `setup` wizard, CLI flags override config values
+
+## Docs
 
 - [Wiki](https://github.com/rhoopr/icloudpd-rs/wiki) - configuration, Docker, troubleshooting
 - [Migration Guide](docs/migration-from-python.md) - switching from Python icloudpd
-- [Changelog](CHANGELOG.md) - release history
-- [Roadmap](docs/roadmap.md) - planned features through v1.0.0
-- [How iCloud's Incremental Sync Works](https://robhooper.xyz/blog-synctoken) - technical deep dive on CloudKit syncTokens
-
----
+- [Changelog](CHANGELOG.md)
+- [Roadmap](docs/roadmap.md)
+- [How iCloud's Incremental Sync Works](https://robhooper.xyz/blog-synctoken) - deep dive on CloudKit syncTokens
 
 ## Contributing
 
@@ -153,4 +153,4 @@ MIT - see [LICENSE.md](LICENSE.md)
 
 ## Acknowledgments
 
-Built on the reverse-engineering work of the [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) maintainers.
+Built on the reverse-engineering work of the [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) project. Previously known as icloudpd-rs.
