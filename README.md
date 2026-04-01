@@ -155,4 +155,4 @@ MIT - see [LICENSE.md](LICENSE.md)
 
 ## Acknowledgments
 
-Built on the reverse-engineering work of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader). Formerly called `icloudpd-rs`.
+kei started as `icloudpd-rs`, a Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader). Thanks to the original maintainers for their reverse-engineering work.
