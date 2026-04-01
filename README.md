@@ -2,8 +2,7 @@
   <img src="assets/logo.png" alt="kei logo" width="200">
 </p>
 
-<h1 align="center">kei</h1>
-<p align="center">photo sync engine</p>
+<h1 align="center">kei: photo sync engine</h1>
 
 <p align="center">
   <a href="https://github.com/rhoopr/icloudpd-rs/releases"><img src="https://img.shields.io/github/v/release/rhoopr/icloudpd-rs?color=blue&label=version" alt="Version"></a>
@@ -153,4 +152,4 @@ MIT - see [LICENSE.md](LICENSE.md)
 
 ## Acknowledgments
 
-Built on the reverse-engineering work of the [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) project. Previously known as icloudpd-rs.
+Built on the reverse-engineering work of the [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) project. This project was formerly called icloudpd-rs.
