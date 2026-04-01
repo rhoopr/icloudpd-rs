@@ -155,4 +155,4 @@ MIT - see [LICENSE.md](LICENSE.md)
 
 ## Acknowledgments
 
-Built on the reverse-engineering work of the [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) project. This project was formerly called icloudpd-rs.
+Built on the reverse-engineering work of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader). Formerly called `icloudpd-rs`.
