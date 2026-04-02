@@ -234,9 +234,9 @@ fn resolve_flag(cli_flag: bool, toml_val: Option<bool>) -> bool {
 /// Returns (username, password, domain, `cookie_directory`).
 pub(crate) fn resolve_auth(
     auth: &crate::cli::AuthArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> (String, Option<String>, Domain, PathBuf) {
-    let toml_auth = toml.as_ref().and_then(|t| t.auth.as_ref());
+    let toml_auth = toml.and_then(|t| t.auth.as_ref());
 
     let username = resolve(
         auth.username.clone(),
@@ -269,7 +269,7 @@ impl Config {
         log_level: Option<LogLevel>,
         toml: Option<TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let (username, password, domain, cookie_directory) = resolve_auth(&auth, &toml);
+        let (username, password, domain, cookie_directory) = resolve_auth(&auth, toml.as_ref());
 
         anyhow::ensure!(!username.is_empty(), "username is required");
 
@@ -2030,7 +2030,7 @@ mod tests {
             domain: None,
             cookie_directory: None,
         };
-        let (username, password, domain, cookie_dir) = resolve_auth(&auth, &Some(toml));
+        let (username, password, domain, cookie_dir) = resolve_auth(&auth, Some(&toml));
         assert_eq!(username, "toml@example.com");
         assert_eq!(password.as_deref(), Some("toml-pw"));
         assert!(matches!(domain, Domain::Cn));
@@ -2053,7 +2053,7 @@ mod tests {
             domain: Some(Domain::Com),
             cookie_directory: Some("/cli/cookies".to_string()),
         };
-        let (username, password, domain, cookie_dir) = resolve_auth(&auth, &Some(toml));
+        let (username, password, domain, cookie_dir) = resolve_auth(&auth, Some(&toml));
         assert_eq!(username, "cli@example.com");
         assert_eq!(password.as_deref(), Some("cli-pw"));
         assert!(matches!(domain, Domain::Com));
@@ -2068,7 +2068,7 @@ mod tests {
             domain: None,
             cookie_directory: None,
         };
-        let (username, password, domain, cookie_dir) = resolve_auth(&auth, &None);
+        let (username, password, domain, cookie_dir) = resolve_auth(&auth, None);
         assert!(username.is_empty());
         assert!(password.is_none());
         assert!(matches!(domain, Domain::Com));

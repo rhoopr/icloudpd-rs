@@ -213,7 +213,7 @@ async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
 }
 
 /// Get the database path for a given auth config, merging with TOML defaults.
-fn get_db_path(auth: &cli::AuthArgs, toml: &Option<TomlConfig>) -> PathBuf {
+fn get_db_path(auth: &cli::AuthArgs, toml: Option<&TomlConfig>) -> PathBuf {
     let (username, _, _, cookie_dir) = config::resolve_auth(auth, toml);
     cookie_dir.join(format!(
         "{}.db",
@@ -222,7 +222,7 @@ fn get_db_path(auth: &cli::AuthArgs, toml: &Option<TomlConfig>) -> PathBuf {
 }
 
 /// Run the status command.
-async fn run_status(args: cli::StatusArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+async fn run_status(args: cli::StatusArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let db_path = get_db_path(&args.auth, toml);
 
     if !db_path.exists() {
@@ -279,7 +279,7 @@ async fn run_status(args: cli::StatusArgs, toml: &Option<TomlConfig>) -> anyhow:
 /// Run the reset-state command.
 async fn run_reset_state(
     args: cli::ResetStateArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
     let db_path = get_db_path(&args.auth, toml);
 
@@ -317,7 +317,7 @@ async fn run_reset_state(
 }
 
 /// Run the verify command.
-async fn run_verify(args: cli::VerifyArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+async fn run_verify(args: cli::VerifyArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let db_path = get_db_path(&args.auth, toml);
 
     if !db_path.exists() {
@@ -409,7 +409,7 @@ async fn verify_local_checksum(path: &Path, expected_hex: &str) -> anyhow::Resul
 }
 
 /// Run the get-code command: trigger push notification for 2FA.
-async fn run_get_code(args: cli::GetCodeArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+async fn run_get_code(args: cli::GetCodeArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
     if username.is_empty() {
@@ -435,7 +435,7 @@ fn keyring_entry(username: &str) -> anyhow::Result<keyring::Entry> {
     keyring::Entry::new("kei", username).map_err(|e| anyhow::anyhow!("OS keyring unavailable: {e}"))
 }
 
-fn run_store_password(auth: cli::AuthArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+fn run_store_password(auth: cli::AuthArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let (username, _, _, _) = config::resolve_auth(&auth, toml);
     anyhow::ensure!(
         !username.is_empty(),
@@ -453,7 +453,7 @@ fn run_store_password(auth: cli::AuthArgs, toml: &Option<TomlConfig>) -> anyhow:
     Ok(())
 }
 
-fn run_delete_password(auth: cli::AuthArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+fn run_delete_password(auth: cli::AuthArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let (username, _, _, _) = config::resolve_auth(&auth, toml);
     anyhow::ensure!(
         !username.is_empty(),
@@ -470,7 +470,7 @@ fn run_delete_password(auth: cli::AuthArgs, toml: &Option<TomlConfig>) -> anyhow
 
 async fn run_submit_code(
     args: cli::SubmitCodeArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
@@ -534,7 +534,7 @@ fn build_photos_params(
 /// 3. If the file exists and size matches, marking it as downloaded in the DB
 async fn run_import_existing(
     args: cli::ImportArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
     use chrono::Local;
     use futures_util::StreamExt;
@@ -843,17 +843,19 @@ async fn run() -> anyhow::Result<()> {
     let command = cli.effective_command();
     let is_retry_failed = matches!(command, Command::RetryFailed(_));
     let (auth, sync) = match command {
-        Command::Status(args) => return run_status(args, &toml_config).await,
-        Command::ResetState(args) => return run_reset_state(args, &toml_config).await,
-        Command::Verify(args) => return run_verify(args, &toml_config).await,
-        Command::ImportExisting(args) => return run_import_existing(args, &toml_config).await,
-        Command::GetCode(args) => return run_get_code(args, &toml_config).await,
-        Command::SubmitCode(args) => return run_submit_code(args, &toml_config).await,
+        Command::Status(args) => return run_status(args, toml_config.as_ref()).await,
+        Command::ResetState(args) => return run_reset_state(args, toml_config.as_ref()).await,
+        Command::Verify(args) => return run_verify(args, toml_config.as_ref()).await,
+        Command::ImportExisting(args) => {
+            return run_import_existing(args, toml_config.as_ref()).await;
+        }
+        Command::GetCode(args) => return run_get_code(args, toml_config.as_ref()).await,
+        Command::SubmitCode(args) => return run_submit_code(args, toml_config.as_ref()).await,
         Command::StorePassword { auth } => {
-            return run_store_password(auth, &toml_config);
+            return run_store_password(auth, toml_config.as_ref());
         }
         Command::DeletePassword { auth } => {
-            return run_delete_password(auth, &toml_config);
+            return run_delete_password(auth, toml_config.as_ref());
         }
         Command::Setup { output } => {
             let path = output
