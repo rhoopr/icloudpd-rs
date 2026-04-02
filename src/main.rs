@@ -842,12 +842,8 @@ async fn run() -> anyhow::Result<()> {
             tracing::warn!(message = %msg, "2FA required");
             notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
 
-            if config.watch_with_interval.is_none() {
-                return Err(e);
-            }
-
-            // Watch mode: wait for submit-code to update the session file,
-            // then retry auth. No Apple API calls while waiting.
+            // Wait for submit-code to update the session file, then retry
+            // auth. No Apple API calls while waiting.
             wait_for_2fa_submit(&config.cookie_directory, &config.username).await;
 
             auth::authenticate(
