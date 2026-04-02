@@ -143,23 +143,85 @@ pub(crate) fn item_type_from_str(s: &str) -> Option<AssetItemType> {
     }
 }
 
-/// Maps logical version sizes to `CloudKit` field prefixes.
-/// The field prefix + "Res" gives the resource field (e.g., "resOriginalRes").
-pub(crate) const PHOTO_VERSION_LOOKUP: &[(AssetVersionSize, &str)] = &[
-    (AssetVersionSize::Original, "resOriginal"),
-    (AssetVersionSize::Alternative, "resOriginalAlt"),
-    (AssetVersionSize::Medium, "resJPEGMed"),
-    (AssetVersionSize::Thumb, "resJPEGThumb"),
-    (AssetVersionSize::Adjusted, "resJPEGFull"),
-    (AssetVersionSize::LiveOriginal, "resOriginalVidCompl"),
-    (AssetVersionSize::LiveMedium, "resVidMed"),
-    (AssetVersionSize::LiveThumb, "resVidSmall"),
+/// Maps logical version sizes to `CloudKit` field names.
+/// Pre-built to avoid `format!()` allocations in the hot asset-parsing loop.
+pub(crate) struct VersionFieldNames {
+    pub key: AssetVersionSize,
+    pub prefix: &'static str,
+    pub res_field: &'static str,
+    pub type_field: &'static str,
+}
+
+pub(crate) const PHOTO_VERSION_LOOKUP: &[VersionFieldNames] = &[
+    VersionFieldNames {
+        key: AssetVersionSize::Original,
+        prefix: "resOriginal",
+        res_field: "resOriginalRes",
+        type_field: "resOriginalFileType",
+    },
+    VersionFieldNames {
+        key: AssetVersionSize::Alternative,
+        prefix: "resOriginalAlt",
+        res_field: "resOriginalAltRes",
+        type_field: "resOriginalAltFileType",
+    },
+    VersionFieldNames {
+        key: AssetVersionSize::Medium,
+        prefix: "resJPEGMed",
+        res_field: "resJPEGMedRes",
+        type_field: "resJPEGMedFileType",
+    },
+    VersionFieldNames {
+        key: AssetVersionSize::Thumb,
+        prefix: "resJPEGThumb",
+        res_field: "resJPEGThumbRes",
+        type_field: "resJPEGThumbFileType",
+    },
+    VersionFieldNames {
+        key: AssetVersionSize::Adjusted,
+        prefix: "resJPEGFull",
+        res_field: "resJPEGFullRes",
+        type_field: "resJPEGFullFileType",
+    },
+    VersionFieldNames {
+        key: AssetVersionSize::LiveOriginal,
+        prefix: "resOriginalVidCompl",
+        res_field: "resOriginalVidComplRes",
+        type_field: "resOriginalVidComplFileType",
+    },
+    VersionFieldNames {
+        key: AssetVersionSize::LiveMedium,
+        prefix: "resVidMed",
+        res_field: "resVidMedRes",
+        type_field: "resVidMedFileType",
+    },
+    VersionFieldNames {
+        key: AssetVersionSize::LiveThumb,
+        prefix: "resVidSmall",
+        res_field: "resVidSmallRes",
+        type_field: "resVidSmallFileType",
+    },
 ];
 
-pub(crate) const VIDEO_VERSION_LOOKUP: &[(AssetVersionSize, &str)] = &[
-    (AssetVersionSize::Original, "resOriginal"),
-    (AssetVersionSize::Medium, "resVidMed"),
-    (AssetVersionSize::Thumb, "resVidSmall"),
+pub(crate) const VIDEO_VERSION_LOOKUP: &[VersionFieldNames] = &[
+    VersionFieldNames {
+        key: AssetVersionSize::Original,
+        prefix: "resOriginal",
+        res_field: "resOriginalRes",
+        type_field: "resOriginalFileType",
+    },
+    VersionFieldNames {
+        key: AssetVersionSize::Medium,
+        prefix: "resVidMed",
+        res_field: "resVidMedRes",
+        type_field: "resVidMedFileType",
+    },
+    VersionFieldNames {
+        key: AssetVersionSize::Thumb,
+        prefix: "resVidSmall",
+        res_field: "resVidSmallRes",
+        type_field: "resVidSmallFileType",
+    },
 ];
 
 pub(crate) fn encode_params(params: &HashMap<String, Value>) -> String {
@@ -346,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_photo_version_lookup_contains_all_sizes() {
-        let sizes: Vec<AssetVersionSize> = PHOTO_VERSION_LOOKUP.iter().map(|(s, _)| *s).collect();
+        let sizes: Vec<AssetVersionSize> = PHOTO_VERSION_LOOKUP.iter().map(|e| e.key).collect();
         assert!(sizes.contains(&AssetVersionSize::Original));
         assert!(sizes.contains(&AssetVersionSize::Alternative));
         assert!(sizes.contains(&AssetVersionSize::Medium));
@@ -359,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_video_version_lookup_has_original() {
-        let sizes: Vec<AssetVersionSize> = VIDEO_VERSION_LOOKUP.iter().map(|(s, _)| *s).collect();
+        let sizes: Vec<AssetVersionSize> = VIDEO_VERSION_LOOKUP.iter().map(|e| e.key).collect();
         assert!(sizes.contains(&AssetVersionSize::Original));
         assert!(sizes.contains(&AssetVersionSize::Medium));
         assert!(sizes.contains(&AssetVersionSize::Thumb));

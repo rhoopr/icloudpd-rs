@@ -497,7 +497,7 @@ impl StateDb for SqliteStateDb {
         let assets_seen = i64::try_from(stats.assets_seen).unwrap_or(i64::MAX);
         let assets_downloaded = i64::try_from(stats.assets_downloaded).unwrap_or(i64::MAX);
         let assets_failed = i64::try_from(stats.assets_failed).unwrap_or(i64::MAX);
-        let interrupted = if stats.interrupted { 1 } else { 0 };
+        let interrupted = i32::from(stats.interrupted);
 
         let conn = self
             .conn

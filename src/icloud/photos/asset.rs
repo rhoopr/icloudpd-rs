@@ -120,21 +120,18 @@ fn extract_versions(
     };
 
     let mut versions = VersionsMap::new();
-    for (key, prefix) in lookup {
-        let res_field = format!("{prefix}Res");
-        let type_field = format!("{prefix}FileType");
-
+    for entry in lookup {
         // Asset record has adjusted versions; master has originals.
         // Prefer asset record so adjusted/edited versions take priority.
-        let fields = if !asset_fields[&res_field].is_null() {
+        let fields = if !asset_fields[entry.res_field].is_null() {
             asset_fields
-        } else if !master_fields[&res_field].is_null() {
+        } else if !master_fields[entry.res_field].is_null() {
             master_fields
         } else {
             continue;
         };
 
-        let res_entry = &fields[&res_field]["value"];
+        let res_entry = &fields[entry.res_field]["value"];
         if res_entry.is_null() {
             continue;
         }
@@ -146,7 +143,7 @@ fn extract_versions(
             None => {
                 warn!(
                     asset = %record_name,
-                    field = format_args!("{prefix}Res.downloadURL"),
+                    field = format_args!("{}.downloadURL", entry.prefix),
                     "Missing downloadURL, skipping version"
                 );
                 continue;
@@ -158,23 +155,23 @@ fn extract_versions(
             None => {
                 warn!(
                     asset = %record_name,
-                    field = format_args!("{prefix}Res.fileChecksum"),
+                    field = format_args!("{}.fileChecksum", entry.prefix),
                     "Missing fileChecksum, skipping version"
                 );
                 continue;
             }
         };
 
-        let asset_type: Box<str> = fields[&type_field]["value"]
+        let asset_type: Box<str> = fields[entry.type_field]["value"]
             .as_str()
             .unwrap_or_else(|| {
-                tracing::warn!("Missing expected field: {type_field}");
+                tracing::warn!("Missing expected field: {}", entry.type_field);
                 ""
             })
             .into();
 
         versions.push((
-            *key,
+            entry.key,
             AssetVersion {
                 size,
                 url,

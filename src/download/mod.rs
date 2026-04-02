@@ -170,7 +170,7 @@ fn hash_download_config(config: &DownloadConfig) -> String {
     hasher.update(format!("{:?}", config.file_match_policy).as_bytes());
     hasher.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
     hasher.update(format!("{:?}", config.align_raw).as_bytes());
-    hasher.update([config.keep_unicode_in_filenames as u8]);
+    hasher.update([u8::from(config.keep_unicode_in_filenames)]);
     let hash = hasher.finalize();
     let mut hex = String::with_capacity(16);
     // First 8 bytes is plenty for collision avoidance in this context
@@ -543,7 +543,7 @@ fn filter_asset_to_tasks(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
-    dir_cache: &mut std::collections::HashMap<PathBuf, Vec<String>>,
+    dir_cache: &mut paths::AmpmDirCache,
 ) -> SmallVec<[DownloadTask; 2]> {
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
         return SmallVec::new();
@@ -975,7 +975,7 @@ async fn download_photos_full_with_token(
     }
     let mut total: u64 = album_counts.iter().sum();
     if let Some(recent) = config.recent {
-        total = total.min(recent as u64);
+        total = total.min(u64::from(recent));
     }
 
     // Create photo_stream_with_token for each album and collect token receivers

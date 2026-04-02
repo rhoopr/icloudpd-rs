@@ -387,9 +387,13 @@ pub(crate) fn normalize_ampm(s: &str) -> String {
 /// repeated `read_dir` syscalls in hot loops.
 ///
 /// Returns the matching variant's full path, or `None` if no match is found.
+/// Cache entry: `(original_filename, normalized_filename)`.
+/// Pre-computing normalized forms avoids O(n) `normalize_ampm()` calls per lookup.
+pub(crate) type AmpmDirCache = std::collections::HashMap<PathBuf, Vec<(String, String)>>;
+
 pub(crate) fn find_ampm_variant_cached(
     path: &Path,
-    dir_cache: &mut std::collections::HashMap<PathBuf, Vec<String>>,
+    dir_cache: &mut AmpmDirCache,
 ) -> Option<PathBuf> {
     let filename = path.file_name()?.to_str()?;
     let normalized = normalize_ampm(filename);
@@ -400,24 +404,28 @@ pub(crate) fn find_ampm_variant_cached(
     }
 
     let parent = path.parent()?;
-    let filenames = dir_cache.entry(parent.to_path_buf()).or_insert_with(|| {
+    let entries = dir_cache.entry(parent.to_path_buf()).or_insert_with(|| {
         std::fs::read_dir(parent)
             .ok()
-            .map(|entries| {
-                entries
+            .map(|dir_entries| {
+                dir_entries
                     .flatten()
-                    .filter_map(|e| e.file_name().to_str().map(String::from))
+                    .filter_map(|e| {
+                        let name = e.file_name().to_str()?.to_string();
+                        let norm = normalize_ampm(&name);
+                        Some((name, norm))
+                    })
                     .collect()
             })
             .unwrap_or_default()
     });
 
-    for sibling in filenames {
+    for (sibling, sibling_normalized) in entries {
         if sibling == filename {
             continue;
         }
-        if normalize_ampm(sibling) == normalized {
-            return Some(parent.join(sibling));
+        if *sibling_normalized == normalized {
+            return Some(parent.join(sibling.as_str()));
         }
     }
 

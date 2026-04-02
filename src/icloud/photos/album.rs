@@ -351,8 +351,8 @@ impl PhotoAlbum {
 
         // Compute effective total, capped by --recent if set.
         let effective_total = total_count
-            .map(|tc| limit.map_or(tc, |lim| tc.min(lim as u64)))
-            .or(limit.map(|lim| lim as u64));
+            .map(|tc| limit.map_or(tc, |lim| tc.min(u64::from(lim))))
+            .or(limit.map(u64::from));
 
         // Use 2x concurrency for enumeration fetchers — Apple's CloudKit
         // doesn't throttle at these levels and it halves enumeration time.
@@ -394,7 +394,7 @@ impl PhotoAlbum {
                 // last fetcher also respect the global --recent cap.
                 let fetcher_limit = match limit {
                     Some(lim) => {
-                        let remaining = (lim as u64).saturating_sub(start);
+                        let remaining = u64::from(lim).saturating_sub(start);
                         Some(remaining.min(end - start) as u32)
                     }
                     None => None,
@@ -546,7 +546,7 @@ impl PhotoAlbum {
                 let mut limit_reached = false;
                 for master in master_records {
                     if let Some(n) = limit {
-                        if total_sent >= n as u64 {
+                        if total_sent >= u64::from(n) {
                             limit_reached = true;
                             break;
                         }
