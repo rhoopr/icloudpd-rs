@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.2] - 2026-04-02
+
+### Fixed
+
+- **Docker restart loop during 2FA** — v0.5.1's push notification bridge call fired before checking whether a code could be collected, causing repeated Apple API hits in a non-TTY restart loop until `securityCodeLocked`. kei now bails before the bridge call in headless mode and stays running while waiting for `submit-code` instead of exiting. ([#152])
+
+[#152]: https://github.com/rhoopr/kei/pull/152
+
+---
+
+## [0.5.1] - 2026-04-02
+
+### Added
+
+- **Push notification to trusted devices during 2FA** — Apple requires a POST to `/auth/bridge/step/0` to initiate push notifications for 2FA codes. Without this, some accounts only receive a "website login" email instead of a code on their trusted devices. ([#151])
+
+[#151]: https://github.com/rhoopr/kei/pull/151
+
+---
+
 ## [0.5.0] - 2026-04-01
 
 ### Changed
