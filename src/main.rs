@@ -22,6 +22,7 @@ mod systemd;
 mod types;
 
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -652,7 +653,26 @@ impl Drop for PidFileGuard {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // 2FA required is not a failure — kei checked auth, told the user
+            // what to do, and is done. Exit 0 so `restart: on-failure` won't
+            // restart into a loop that hammers Apple's auth endpoints.
+            if e.downcast_ref::<auth::error::AuthError>()
+                .is_some_and(|ae| ae.is_two_factor_required())
+            {
+                ExitCode::SUCCESS
+            } else {
+                eprintln!("Error: {e:#}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
     // Migrate legacy icloudpd-rs paths before loading config, so the
@@ -795,7 +815,7 @@ async fn main() -> anyhow::Result<()> {
             );
             tracing::warn!(message = %msg, "2FA required");
             notifier.notify(notifications::Event::TwoFaRequired, &msg, &config.username);
-            anyhow::bail!("{msg}");
+            return Err(e);
         }
         Err(e) => return Err(e),
     };
@@ -1211,7 +1231,7 @@ async fn main() -> anyhow::Result<()> {
                             &config.username,
                         );
                         if !is_watch_mode {
-                            anyhow::bail!("{msg}");
+                            return Err(e);
                         }
                     }
                     Err(e) => {
