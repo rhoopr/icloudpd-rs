@@ -13,11 +13,11 @@ fmt:
 clippy:
     cargo clippy --all-targets --all-features
 
-# Run tests (excludes credential-dependent tests)
+# Run all offline tests (unit + integration, no credentials needed)
 test:
-    cargo test --all-features --test cli --test state --test auth
+    cargo test --all-features --bin kei --test cli --test state --test auth
 
-# Run all tests including auth-dependent (requires .env credentials)
+# Run all tests including credential-dependent (requires .env)
 test-all:
     cargo test --all-features
 
