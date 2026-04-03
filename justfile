@@ -2,8 +2,11 @@
 default:
     @just --list
 
-# Run all checks (fmt, clippy, test)
-check: fmt clippy test
+# Quick lint (runs as pre-commit hook)
+check: fmt clippy
+
+# Full pre-PR validation — mirrors CI
+pre-flight: fmt clippy test coverage-check build doc
 
 # Check formatting
 fmt:
@@ -60,6 +63,10 @@ coverage-lcov:
 # Build release binary
 build:
     cargo build --release
+
+# Check docs build without warnings
+doc:
+    RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
 
 # Run the app with arguments
 run *ARGS:
