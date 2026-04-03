@@ -2176,6 +2176,7 @@ mod tests {
     use super::*;
     use crate::icloud::photos::asset::ChangeEvent;
     use crate::icloud::photos::PhotoAsset;
+    use chrono::TimeZone;
     use serde_json::json;
     use std::fs;
 
@@ -4063,5 +4064,206 @@ mod tests {
         assert_eq!(hidden_count, 1);
         assert_eq!(downloadable_assets.len(), 1);
         assert_eq!(downloadable_assets[0].id(), "TEST_1");
+    }
+
+    // ── download_single_task integration tests ──
+
+    /// Minimal HTTP server for download_single_task tests.
+    /// Returns 200 with the given body for any request.
+    async fn start_body_server(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        (format!("http://{addr}/file"), handle)
+    }
+
+    fn make_download_task(url: &str, download_path: PathBuf, ext: &str) -> DownloadTask {
+        let path = if !ext.is_empty() {
+            download_path.with_extension(ext)
+        } else {
+            download_path
+        };
+        DownloadTask {
+            asset_id: "TEST_ASSET".into(),
+            url: url.into(),
+            checksum: "AAAA".into(), // valid base64
+            download_path: path,
+            size: 0,
+            version_size: VersionSizeKey::Original,
+            created_local: chrono::Local::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_single_task_basic() {
+        let body = b"photo content here";
+        let (url, _handle) = start_body_server(body.to_vec()).await;
+        let dir = test_tmp_dir("single_task_basic");
+        let dest = dir.join("photo.png");
+
+        let task = make_download_task(&url, dest.clone(), "");
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+
+        let (exif_ok, checksum) =
+            download_single_task(&Client::new(), &task, &retry, false, ".kei-test-tmp")
+                .await
+                .unwrap();
+
+        assert!(exif_ok);
+        assert!(!checksum.is_empty());
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn test_download_single_task_creates_parent_dirs() {
+        let body = b"data";
+        let (url, _handle) = start_body_server(body.to_vec()).await;
+        let dir = test_tmp_dir("single_task_mkdir");
+        let dest = dir.join("deep/nested/dir/photo.png");
+
+        let task = make_download_task(&url, dest.clone(), "");
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+
+        download_single_task(&Client::new(), &task, &retry, false, ".kei-test-tmp")
+            .await
+            .unwrap();
+
+        assert!(dest.exists());
+    }
+
+    #[tokio::test]
+    async fn test_download_single_task_sets_mtime() {
+        let body = b"timestamped";
+        let (url, _handle) = start_body_server(body.to_vec()).await;
+        let dir = test_tmp_dir("single_task_mtime");
+        let dest = dir.join("photo.png");
+
+        let mut task = make_download_task(&url, dest.clone(), "");
+        // Set created date to 2024-01-01 00:00:00
+        task.created_local = chrono::Local.from_utc_datetime(
+            &chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        );
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+
+        download_single_task(&Client::new(), &task, &retry, false, ".kei-test-tmp")
+            .await
+            .unwrap();
+
+        let mtime = std::fs::metadata(&dest).unwrap().modified().unwrap();
+        let expected = UNIX_EPOCH + Duration::from_secs(task.created_local.timestamp() as u64);
+        assert_eq!(mtime, expected);
+    }
+
+    #[tokio::test]
+    async fn test_download_single_task_skips_exif_for_non_jpeg() {
+        let body = b"png data";
+        let (url, _handle) = start_body_server(body.to_vec()).await;
+        let dir = test_tmp_dir("single_task_no_exif");
+        let dest = dir.join("photo.png");
+
+        let task = make_download_task(&url, dest.clone(), "");
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+
+        // set_exif=true but file is .png → should skip EXIF entirely
+        let (exif_ok, checksum1) =
+            download_single_task(&Client::new(), &task, &retry, true, ".kei-test-tmp")
+                .await
+                .unwrap();
+
+        assert!(exif_ok);
+        // Checksum should be the streaming hash (no EXIF recompute)
+        let checksum2 = file::compute_sha256(&dest).await.unwrap();
+        assert_eq!(
+            checksum1, checksum2,
+            "No EXIF written → streaming hash == file hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_single_task_exif_on_jpeg() {
+        // Minimal JPEG so EXIF can be written
+        let jpeg = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xE0, // APP0
+            0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0xFF, 0xD9, // EOI
+        ];
+        let (url, _handle) = start_body_server(jpeg.clone()).await;
+        let dir = test_tmp_dir("single_task_exif_jpeg");
+        let dest = dir.join("photo.jpg");
+
+        let mut task = make_download_task(&url, dest.clone(), "jpg");
+        task.created_local = chrono::Local.from_utc_datetime(
+            &chrono::NaiveDate::from_ymd_opt(2023, 6, 15)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+        );
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+
+        let (exif_ok, local_checksum) =
+            download_single_task(&Client::new(), &task, &retry, true, ".kei-test-tmp")
+                .await
+                .unwrap();
+
+        assert!(exif_ok);
+        // File should be larger than original (EXIF tags added)
+        let file_bytes = std::fs::read(&dest).unwrap();
+        assert!(
+            file_bytes.len() > jpeg.len(),
+            "EXIF should have been written"
+        );
+
+        // local_checksum should be recomputed (different from streaming hash since file changed)
+        let recomputed = file::compute_sha256(&dest).await.unwrap();
+        assert_eq!(
+            local_checksum, recomputed,
+            "Checksum should be recomputed after EXIF write"
+        );
+
+        // Verify EXIF data was actually written
+        let exif_date = exif::get_photo_exif(&dest).unwrap();
+        assert!(exif_date.is_some(), "EXIF DateTimeOriginal should be set");
     }
 }

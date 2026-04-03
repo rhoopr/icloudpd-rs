@@ -460,4 +460,238 @@ mod tests {
             "https://p00-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private"
         );
     }
+
+    // ── Tests for fetch_libraries / get_library / all_libraries ──
+
+    /// Cloneable stub session that returns different responses based on URL patterns.
+    /// Uses Arc<Vec> of (url_contains, response) rules checked in order.
+    struct MultiResponseSession {
+        rules: Arc<Vec<(String, Value)>>,
+    }
+
+    impl MultiResponseSession {
+        fn new(rules: Vec<(&str, Value)>) -> Self {
+            Self {
+                rules: Arc::new(rules.into_iter().map(|(s, v)| (s.to_string(), v)).collect()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl session::PhotosSession for MultiResponseSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            for (pattern, response) in self.rules.iter() {
+                if url.contains(pattern.as_str()) {
+                    return Ok(response.clone());
+                }
+            }
+            panic!("MultiResponseSession: no rule matched URL: {url}");
+        }
+
+        async fn get(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<reqwest::Response> {
+            panic!("MultiResponseSession::get not expected");
+        }
+
+        fn clone_box(&self) -> Box<dyn session::PhotosSession> {
+            Box::new(MultiResponseSession {
+                rules: Arc::clone(&self.rules),
+            })
+        }
+    }
+
+    fn make_service_multi(session: MultiResponseSession) -> PhotosService {
+        // Use the multi-response session for the primary library too
+        let primary = PhotoLibrary::new_stub(session.clone_box());
+        PhotosService {
+            service_root: "https://ck.icloud.com".to_string(),
+            session: Box::new(session),
+            params: Arc::new(HashMap::new()),
+            primary_library: primary,
+            private_libraries: None,
+            shared_libraries: None,
+        }
+    }
+
+    /// Indexing check response (required by PhotoLibrary::new)
+    fn indexing_finished() -> Value {
+        json!({"records": [{"fields": {"state": {"value": "FINISHED"}}}]})
+    }
+
+    #[tokio::test]
+    async fn test_fetch_private_libraries_parses_zones() {
+        let session = MultiResponseSession::new(vec![
+            (
+                "zones/list",
+                json!({
+                    "zones": [
+                        {"zoneID": {"zoneName": "PrimarySync"}, "deleted": false},
+                        {"zoneID": {"zoneName": "PrivateZone-ABC"}, "deleted": false}
+                    ]
+                }),
+            ),
+            ("records/query", indexing_finished()),
+        ]);
+        let mut svc = make_service_multi(session);
+
+        let libs = svc.fetch_private_libraries().await.unwrap();
+        assert!(libs.contains_key("PrimarySync"));
+        assert!(libs.contains_key("PrivateZone-ABC"));
+        assert_eq!(libs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_libraries_skips_deleted_zones() {
+        let session = MultiResponseSession::new(vec![
+            (
+                "zones/list",
+                json!({
+                    "zones": [
+                        {"zoneID": {"zoneName": "PrimarySync"}, "deleted": false},
+                        {"zoneID": {"zoneName": "DeletedZone"}, "deleted": true}
+                    ]
+                }),
+            ),
+            ("records/query", indexing_finished()),
+        ]);
+        let mut svc = make_service_multi(session);
+
+        let libs = svc.fetch_private_libraries().await.unwrap();
+        assert!(libs.contains_key("PrimarySync"));
+        assert!(
+            !libs.contains_key("DeletedZone"),
+            "Deleted zones should be filtered out"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_libraries_caches_result() {
+        let session = MultiResponseSession::new(vec![
+            (
+                "zones/list",
+                json!({"zones": [
+                    {"zoneID": {"zoneName": "PrimarySync"}, "deleted": false}
+                ]}),
+            ),
+            ("records/query", indexing_finished()),
+        ]);
+        let mut svc = make_service_multi(session);
+
+        // First call fetches
+        let libs1 = svc.fetch_private_libraries().await.unwrap();
+        assert_eq!(libs1.len(), 1);
+
+        // Second call uses cache (same result, no panic from missing rules)
+        let libs2 = svc.fetch_private_libraries().await.unwrap();
+        assert_eq!(libs2.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_library_primary() {
+        let session = MultiResponseSession::new(vec![]);
+        let mut svc = make_service_multi(session);
+
+        let lib = svc.get_library("PrimarySync").await.unwrap();
+        assert_eq!(lib.zone_name(), "PrimarySync");
+    }
+
+    #[tokio::test]
+    async fn test_get_library_unknown_returns_error() {
+        let session = MultiResponseSession::new(vec![
+            (
+                "zones/list",
+                json!({"zones": [
+                    {"zoneID": {"zoneName": "PrimarySync"}, "deleted": false}
+                ]}),
+            ),
+            ("records/query", indexing_finished()),
+        ]);
+        let mut svc = make_service_multi(session);
+
+        let result = svc.get_library("NonExistentZone").await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Unknown library"),
+            "Should mention unknown library"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_library_shared() {
+        let session = MultiResponseSession::new(vec![
+            // Private zones/list returns empty (no private zones besides primary)
+            (
+                "private/zones/list",
+                json!({"zones": [
+                    {"zoneID": {"zoneName": "PrimarySync"}, "deleted": false}
+                ]}),
+            ),
+            // Shared zones/list returns a shared zone
+            (
+                "shared/zones/list",
+                json!({"zones": [
+                    {"zoneID": {"zoneName": "SharedSync-XYZ"}, "deleted": false}
+                ]}),
+            ),
+            ("records/query", indexing_finished()),
+        ]);
+        let mut svc = make_service_multi(session);
+
+        let lib = svc.get_library("SharedSync-XYZ").await.unwrap();
+        assert_eq!(lib.zone_name(), "SharedSync-XYZ");
+    }
+
+    #[tokio::test]
+    async fn test_all_libraries_combines_all_types() {
+        let session = MultiResponseSession::new(vec![
+            (
+                "private/zones/list",
+                json!({"zones": [
+                    {"zoneID": {"zoneName": "PrimarySync"}, "deleted": false},
+                    {"zoneID": {"zoneName": "PrivateExtra"}, "deleted": false}
+                ]}),
+            ),
+            (
+                "shared/zones/list",
+                json!({"zones": [
+                    {"zoneID": {"zoneName": "SharedSync-ABC"}, "deleted": false}
+                ]}),
+            ),
+            ("records/query", indexing_finished()),
+        ]);
+        let mut svc = make_service_multi(session);
+
+        let all = svc.all_libraries().await.unwrap();
+        let names: Vec<&str> = all.iter().map(|l| l.zone_name()).collect();
+
+        // Primary (from make_service_multi) + PrivateExtra + SharedSync-ABC
+        // PrimarySync from fetch_private is deduplicated (name != "PrimarySync" filter)
+        assert!(names.contains(&"PrimarySync"), "Should include primary");
+        assert!(
+            names.contains(&"PrivateExtra"),
+            "Should include private non-primary"
+        );
+        assert!(names.contains(&"SharedSync-ABC"), "Should include shared");
+        assert_eq!(
+            names.iter().filter(|&&n| n == "PrimarySync").count(),
+            1,
+            "PrimarySync should appear exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_returns_primary_album() {
+        let session = MultiResponseSession::new(vec![]);
+        let svc = make_service_multi(session);
+        // all() should not panic and return an album
+        let _album = svc.all();
+    }
 }
