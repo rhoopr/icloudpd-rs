@@ -54,6 +54,16 @@ git clone https://github.com/rhoopr/kei.git kei && cd kei
 cargo build --release
 ```
 
+On Linux, the OS keyring integration requires D-Bus headers at build time:
+
+```sh
+# Debian/Ubuntu
+sudo apt install libdbus-1-dev
+
+# Fedora/RHEL
+sudo dnf install dbus-devel
+```
+
 ## Quick start
 
 The setup wizard generates a config file interactively:

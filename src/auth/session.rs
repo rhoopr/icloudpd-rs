@@ -19,23 +19,23 @@ use tokio::fs;
 #[serde(default)]
 pub struct SessionData {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub account_country: Option<String>,
+    pub(crate) account_country: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_token: Option<String>,
+    pub(crate) session_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub trust_token: Option<String>,
+    pub(crate) trust_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub trust_eligible: Option<String>,
+    pub(crate) trust_eligible: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub apple_rscd: Option<String>,
+    pub(crate) apple_rscd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub apple_ercd: Option<String>,
+    pub(crate) apple_ercd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub scnt: Option<String>,
+    pub(crate) scnt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
+    pub(crate) client_id: Option<String>,
 }
 
 /// Maps an HTTP header name to the corresponding `SessionData` field,

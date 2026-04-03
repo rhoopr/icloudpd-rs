@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] - 2026-04-03
+
+### Added
+
+- **OS keyring password storage** — `store-password` and `delete-password` subcommands for macOS Keychain, Linux Secret Service, and Windows Credential Manager.
+- **Environment variable support** — All CLI parameters can now be set via `KEI_*` / `ICLOUD_*` env vars.
+- **`--print-config` flag** — Display resolved configuration and exit.
+- **Streaming SHA-256** — Checksums are computed during download, eliminating a second full-file read.
+- **Input validation** — Config values are validated at startup with clear error messages.
+- **Typed session data** — `SessionData` struct replaces `HashMap<String, String>` for compile-time field safety.
+
+### Fixed
+
+- **Tightened `SessionData` visibility** — Fields narrowed from `pub` to `pub(crate)`.
+- **Dead code in download resume logic** — Removed empty branch with misleading comment.
+- **Linux build dependency documented** — README now notes `libdbus-1-dev` / `dbus-devel` requirement for keyring support.
+
+---
+
 ## [0.5.3] - 2026-04-03
 
 ### Added

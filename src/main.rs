@@ -122,7 +122,7 @@ fn make_password_provider(
             return Some(pw);
         }
 
-        // Fall back to interactive prompt
+        // Fall back to interactive prompt (requires multi-threaded tokio runtime)
         tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
     }
 }

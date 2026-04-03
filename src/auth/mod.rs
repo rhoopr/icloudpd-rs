@@ -267,6 +267,9 @@ pub(crate) fn parse_auth_error(status: u16, body: &str, apple_rscd: Option<&str>
             .or_else(|| json.get("errorCode"))
             .and_then(|v| v.as_str());
         match error_code {
+            // AUTHENTICATION_FAILED from CloudKit means the iCloud zone hasn't
+            // been set up, not a credential failure (matches icloudpd behavior).
+            // Credential failures are caught earlier via X-Apple-I-Rscd == "401".
             Some("ZONE_NOT_FOUND" | "AUTHENTICATION_FAILED") => return AuthError::SetupRequired,
             Some("ACCESS_DENIED") => return AuthError::RateLimited,
             _ => {}

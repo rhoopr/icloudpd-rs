@@ -184,9 +184,7 @@ async fn attempt_download(
         }
     })?;
 
-    if !resolution.truncate && resume_offset > 0 {
-        // Server returned 200 instead of 206 — log the fallback
-    } else if resolution.truncate && resume_offset > 0 {
+    if resolution.truncate && resume_offset > 0 {
         tracing::info!(
             status,
             path = %path_str,
