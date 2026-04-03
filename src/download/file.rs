@@ -514,4 +514,511 @@ mod tests {
         // total_bytes = 1000-500 = 500 ≠ 1000 → false mismatch
         assert!(verify_content_length(1000, 500, Some(1000), "photo.jpg").is_err());
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // TestHttpServer — integration tests for the full download pipeline
+    // ══════════════════════════════════════════════════════════════════
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Configurable response behavior for the test HTTP server.
+    #[derive(Clone)]
+    enum Behavior {
+        /// 200 with full body and correct Content-Length.
+        FullBody(Vec<u8>),
+        /// 206 for Range requests, 200 for non-Range.
+        Resumable(Vec<u8>),
+        /// Always 200 even when Range is sent (server ignores Range).
+        RangeIgnored(Vec<u8>),
+        /// Stream `cutoff` bytes then drop the connection.
+        Truncated { body: Vec<u8>, cutoff: usize },
+        /// Return a specific HTTP status with empty body.
+        StatusError(u16),
+        /// Lie about Content-Length.
+        ContentLengthLie { body: Vec<u8>, claimed: u64 },
+        /// First N requests return `first`, then switch to `then`.
+        Sequence {
+            first: Box<Behavior>,
+            then: Box<Behavior>,
+            switch_after: u32,
+            counter: Arc<AtomicU32>,
+        },
+    }
+
+    struct TestHttpServer {
+        addr: std::net::SocketAddr,
+        _handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestHttpServer {
+        async fn start(behavior: Behavior) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let behavior = behavior.clone();
+                    tokio::spawn(async move {
+                        Self::handle_connection(&mut stream, &behavior).await;
+                    });
+                }
+            });
+
+            Self {
+                addr,
+                _handle: handle,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/file", self.addr)
+        }
+
+        async fn handle_connection(stream: &mut tokio::net::TcpStream, behavior: &Behavior) {
+            // Read request headers
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            let request = String::from_utf8_lossy(&buf[..n]);
+
+            // Parse Range header
+            let range_offset = request
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("range: bytes="))
+                .and_then(|l| {
+                    let val = l.split('=').nth(1)?;
+                    val.trim_end_matches('-').parse::<u64>().ok()
+                });
+
+            // Resolve sequenced behaviors
+            let effective = match behavior {
+                Behavior::Sequence {
+                    first,
+                    then,
+                    switch_after,
+                    counter,
+                } => {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n < *switch_after {
+                        first.as_ref()
+                    } else {
+                        then.as_ref()
+                    }
+                }
+                other => other,
+            };
+
+            match effective {
+                Behavior::FullBody(body) => {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                }
+                Behavior::Resumable(body) => {
+                    if let Some(offset) = range_offset {
+                        let offset = offset as usize;
+                        if offset < body.len() {
+                            let partial = &body[offset..];
+                            let header = format!(
+                                "HTTP/1.1 206 Partial Content\r\n\
+                                 Content-Length: {}\r\n\
+                                 Content-Range: bytes {}-{}/{}\r\n\
+                                 Connection: close\r\n\r\n",
+                                partial.len(),
+                                offset,
+                                body.len() - 1,
+                                body.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes()).await;
+                            let _ = stream.write_all(partial).await;
+                        }
+                    } else {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(body).await;
+                    }
+                }
+                Behavior::RangeIgnored(body) => {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                }
+                Behavior::Truncated { body, cutoff } => {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body[..*cutoff]).await;
+                    let _ = stream.flush().await;
+                    // Drop stream to simulate broken connection
+                }
+                Behavior::StatusError(code) => {
+                    let header = format!(
+                        "HTTP/1.1 {code} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                }
+                Behavior::ContentLengthLie { body, claimed } => {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {claimed}\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                }
+                Behavior::Sequence { .. } => unreachable!("resolved above"),
+            }
+        }
+    }
+
+    fn no_retry() -> RetryConfig {
+        RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        }
+    }
+
+    fn fast_retry(retries: u32) -> RetryConfig {
+        RetryConfig {
+            max_retries: retries,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        }
+    }
+
+    const TEST_CHECKSUM: &str = "AAAA";
+    const TEST_SUFFIX: &str = ".kei-test-tmp";
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("claude")
+            .join("download_http_tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // ── Integration tests ──
+
+    #[tokio::test]
+    async fn test_download_fresh_200() {
+        let body = b"hello world";
+        let server = TestHttpServer::start(Behavior::FullBody(body.to_vec())).await;
+        let dir = test_dir("fresh_200");
+        let dest = dir.join("photo.jpg");
+
+        let hash = download_file(
+            &Client::new(),
+            &server.url(),
+            &dest,
+            TEST_CHECKSUM,
+            false,
+            &no_retry(),
+            TEST_SUFFIX,
+        )
+        .await
+        .unwrap();
+
+        assert!(dest.exists(), "Final file should exist");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        // .part file should not remain
+        let part = temp_download_path(&dest, TEST_CHECKSUM, TEST_SUFFIX).unwrap();
+        assert!(!part.exists(), ".part file should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn test_download_resume_206() {
+        let full_body = b"hello world";
+        let server = TestHttpServer::start(Behavior::Resumable(full_body.to_vec())).await;
+        let dir = test_dir("resume_206");
+        let dest = dir.join("photo.jpg");
+
+        // Pre-create .part file with first 5 bytes
+        let part = temp_download_path(&dest, TEST_CHECKSUM, TEST_SUFFIX).unwrap();
+        std::fs::write(&part, &full_body[..5]).unwrap();
+
+        let hash = download_file(
+            &Client::new(),
+            &server.url(),
+            &dest,
+            TEST_CHECKSUM,
+            false,
+            &no_retry(),
+            TEST_SUFFIX,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), full_body);
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_range_ignored_200_fallback() {
+        let full_body = b"complete file content here";
+        let server = TestHttpServer::start(Behavior::RangeIgnored(full_body.to_vec())).await;
+        let dir = test_dir("range_ignored");
+        let dest = dir.join("photo.jpg");
+
+        // Pre-create stale .part file
+        let part = temp_download_path(&dest, TEST_CHECKSUM, TEST_SUFFIX).unwrap();
+        std::fs::write(&part, b"stale").unwrap();
+
+        let _hash = download_file(
+            &Client::new(),
+            &server.url(),
+            &dest,
+            TEST_CHECKSUM,
+            false,
+            &no_retry(),
+            TEST_SUFFIX,
+        )
+        .await
+        .unwrap();
+
+        // Should have the full body, not stale + new
+        assert_eq!(std::fs::read(&dest).unwrap(), full_body);
+    }
+
+    #[tokio::test]
+    async fn test_download_truncated_stream() {
+        let body = vec![0xAB; 1000];
+        let server = TestHttpServer::start(Behavior::Truncated { body, cutoff: 500 }).await;
+        let dir = test_dir("truncated");
+        let dest = dir.join("photo.jpg");
+
+        let result = download_file(
+            &Client::new(),
+            &server.url(),
+            &dest,
+            TEST_CHECKSUM,
+            false,
+            &no_retry(),
+            TEST_SUFFIX,
+        )
+        .await;
+
+        assert!(result.is_err(), "Truncated stream should error");
+        assert!(!dest.exists(), "Final file should not exist on failure");
+    }
+
+    #[tokio::test]
+    async fn test_download_status_401() {
+        let server = TestHttpServer::start(Behavior::StatusError(401)).await;
+        let dir = test_dir("status_401");
+        let dest = dir.join("photo.jpg");
+
+        let err = download_file(
+            &Client::new(),
+            &server.url(),
+            &dest,
+            TEST_CHECKSUM,
+            false,
+            &no_retry(),
+            TEST_SUFFIX,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.is_session_expired());
+        assert!(!err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn test_download_status_429_retryable() {
+        let server = TestHttpServer::start(Behavior::StatusError(429)).await;
+        let dir = test_dir("status_429");
+        let dest = dir.join("photo.jpg");
+
+        let err = download_file(
+            &Client::new(),
+            &server.url(),
+            &dest,
+            TEST_CHECKSUM,
+            false,
+            &no_retry(),
+            TEST_SUFFIX,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.is_retryable());
+        assert!(!err.is_session_expired());
+    }
+
+    #[tokio::test]
+    async fn test_download_status_500_retryable() {
+        let server = TestHttpServer::start(Behavior::StatusError(500)).await;
+        let dir = test_dir("status_500");
+        let dest = dir.join("photo.jpg");
+
+        let err = download_file(
+            &Client::new(),
+            &server.url(),
+            &dest,
+            TEST_CHECKSUM,
+            false,
+            &no_retry(),
+            TEST_SUFFIX,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn test_download_content_length_mismatch() {
+        let server = TestHttpServer::start(Behavior::ContentLengthLie {
+            body: b"short".to_vec(),
+            claimed: 1000,
+        })
+        .await;
+        let dir = test_dir("cl_mismatch");
+        let dest = dir.join("photo.jpg");
+
+        let err = download_file(
+            &Client::new(),
+            &server.url(),
+            &dest,
+            TEST_CHECKSUM,
+            false,
+            &no_retry(),
+            TEST_SUFFIX,
+        )
+        .await
+        .unwrap_err();
+
+        // Could be ContentLengthMismatch or Http (stream error when server closes early)
+        // Either way it should be an error
+        match &err {
+            DownloadError::ContentLengthMismatch {
+                expected, received, ..
+            } => {
+                assert_eq!(*expected, 1000);
+                assert_eq!(*received, 5);
+            }
+            DownloadError::Http { .. } => {
+                // reqwest detected the stream ended early — also valid
+            }
+            other => panic!("Expected ContentLengthMismatch or Http, got: {:?}", other),
+        }
+
+        // .part file should have been cleaned up on mismatch
+        let part = temp_download_path(&dest, TEST_CHECKSUM, TEST_SUFFIX).unwrap();
+        if matches!(err, DownloadError::ContentLengthMismatch { .. }) {
+            assert!(!part.exists(), ".part should be deleted on mismatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_download_retry_recovers_from_500() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let server = TestHttpServer::start(Behavior::Sequence {
+            first: Box::new(Behavior::StatusError(500)),
+            then: Box::new(Behavior::FullBody(b"recovered".to_vec())),
+            switch_after: 1,
+            counter: counter.clone(),
+        })
+        .await;
+        let dir = test_dir("retry_recovery");
+        let dest = dir.join("photo.jpg");
+
+        let hash = download_file(
+            &Client::new(),
+            &server.url(),
+            &dest,
+            TEST_CHECKSUM,
+            false,
+            &fast_retry(2),
+            TEST_SUFFIX,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"recovered");
+        assert!(!hash.is_empty());
+        assert!(
+            counter.load(Ordering::SeqCst) >= 2,
+            "Should have made at least 2 requests (1 failure + 1 success)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_dry_run_skips_http() {
+        // No server needed — dry_run should return immediately
+        let dir = test_dir("dry_run");
+        let dest = dir.join("photo.jpg");
+
+        let hash = download_file(
+            &Client::new(),
+            "http://should-not-be-called.invalid/file",
+            &dest,
+            TEST_CHECKSUM,
+            true,
+            &no_retry(),
+            TEST_SUFFIX,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hash, "");
+        assert!(!dest.exists(), "Dry run should not create files");
+    }
+
+    #[tokio::test]
+    async fn test_download_sha256_correctness() {
+        // Use a deterministic payload and verify hash matches independent computation
+        let payload: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        let expected_hash = {
+            let mut h = Sha256::new();
+            h.update(&payload);
+            format!("{:x}", h.finalize())
+        };
+
+        let server = TestHttpServer::start(Behavior::FullBody(payload.clone())).await;
+        let dir = test_dir("sha256_check");
+        let dest = dir.join("photo.bin");
+
+        let hash = download_file(
+            &Client::new(),
+            &server.url(),
+            &dest,
+            TEST_CHECKSUM,
+            false,
+            &no_retry(),
+            TEST_SUFFIX,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hash, expected_hash);
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+    }
 }
