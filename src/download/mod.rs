@@ -648,16 +648,17 @@ fn filter_asset_to_tasks(
         // concurrent downloads of assets with the same filename.
         // Check for the file on disk, including AM/PM whitespace variants
         // (e.g., "1.40.01 PM.PNG" vs "1.40.01\u{202F}PM.PNG")
-        let existing_path = if dir_cache.exists(&download_path) {
-            Some(download_path.clone())
-        } else {
-            dir_cache.find_ampm_variant(&download_path)
-        };
-        let final_path = if let Some(existing) = existing_path {
+        let existing_with_size = dir_cache
+            .file_size(&download_path)
+            .map(|size| (download_path.clone(), size))
+            .or_else(|| {
+                let variant = dir_cache.find_ampm_variant(&download_path)?;
+                let size = dir_cache.file_size(&variant).unwrap_or(0);
+                Some((variant, size))
+            });
+        let final_path = if let Some((_, on_disk_size)) = existing_with_size {
             match config.file_match_policy {
                 FileMatchPolicy::NameSizeDedupWithSuffix => {
-                    // If file exists with different size, download with size suffix
-                    let on_disk_size = dir_cache.file_size(&existing).unwrap_or(0);
                     if on_disk_size == version.size {
                         // Same size — likely already downloaded, skip.
                         None
@@ -794,8 +795,7 @@ fn filter_asset_to_tasks(
             // Use normalized paths for collision detection to handle case-insensitive
             // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
             let mov_key = NormalizedPath::normalize(&mov_path);
-            let final_mov_path = if dir_cache.exists(&mov_path) {
-                let on_disk_size = dir_cache.file_size(&mov_path).unwrap_or(0);
+            let final_mov_path = if let Some(on_disk_size) = dir_cache.file_size(&mov_path) {
                 if on_disk_size == live_version.size {
                     // Same size — likely already downloaded, skip.
                     None
