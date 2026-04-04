@@ -57,6 +57,8 @@ fn set_schema_version(conn: &Connection, version: i32) -> Result<(), StateError>
 /// Initialize or migrate the database schema.
 ///
 /// This function is idempotent and safe to call on both new and existing databases.
+/// Each migration step is wrapped in a SAVEPOINT so that a failure rolls back
+/// only the current step, leaving the database at the last successfully applied version.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
     let current_version = get_schema_version(conn)?;
 
@@ -67,17 +69,20 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
         });
     }
 
-    if current_version == 0 {
-        // Fresh database — apply all schemas
-        conn.execute_batch(SCHEMA_V1)?;
-        conn.execute_batch(SCHEMA_V2)?;
-        conn.execute_batch(SCHEMA_V3)?;
-        set_schema_version(conn, SCHEMA_VERSION)?;
-        tracing::debug!(version = SCHEMA_VERSION, "Initialized database schema");
-    } else if current_version < SCHEMA_VERSION {
-        // Run incremental migrations
-        for version in (current_version + 1)..=SCHEMA_VERSION {
-            migrate_to_version(conn, version)?;
+    let start_version = if current_version == 0 {
+        1
+    } else {
+        current_version + 1
+    };
+
+    for version in start_version..=SCHEMA_VERSION {
+        conn.execute_batch("SAVEPOINT migration")?;
+        match migrate_to_version(conn, version) {
+            Ok(()) => conn.execute_batch("RELEASE migration")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK TO migration");
+                return Err(e);
+            }
         }
     }
 
@@ -98,6 +103,9 @@ const SCHEMA_V3: &str = "ALTER TABLE assets ADD COLUMN local_checksum TEXT;";
 /// Apply migration for a specific version.
 fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError> {
     match version {
+        1 => {
+            conn.execute_batch(SCHEMA_V1)?;
+        }
         2 => {
             conn.execute_batch(SCHEMA_V2)?;
         }
@@ -232,6 +240,32 @@ mod tests {
             has_column,
             "local_checksum column should exist after v3 migration"
         );
+    }
+
+    #[test]
+    fn test_failed_migration_rolls_back() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Set up a v2 database
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        set_schema_version(&conn, 2).unwrap();
+
+        // Manually add the local_checksum column so the v3 ALTER TABLE fails
+        conn.execute_batch("ALTER TABLE assets ADD COLUMN local_checksum TEXT")
+            .unwrap();
+
+        // Migration should fail on v3
+        let result = migrate(&conn);
+        assert!(result.is_err());
+
+        // Version should still be 2 — the failed step was rolled back
+        assert_eq!(get_schema_version(&conn).unwrap(), 2);
+
+        // Database should still be usable
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
