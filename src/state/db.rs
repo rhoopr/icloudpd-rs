@@ -1585,4 +1585,332 @@ mod tests {
             .iter()
             .all(|r| r.status == AssetStatus::Downloaded));
     }
+
+    // ── Gap tests: robustness and edge cases ──
+
+    #[tokio::test]
+    async fn should_download_unknown_version_size_treated_as_pending() {
+        // Arrange: insert a row with a version_size string that doesn't map to any VersionSizeKey variant
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, media_type, status, last_seen_at)
+                 VALUES ('AQvz7R8kP4', 'superHD', 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6abcd', 'IMG_4231.HEIC', ?1, 8294400, 'photo', 'pending', ?1)",
+                rusqlite::params![now],
+            ).unwrap();
+        }
+
+        // Act: query should_download with the same unknown version_size
+        let result = db
+            .should_download(
+                "AQvz7R8kP4",
+                "superHD",
+                "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6abcd",
+                Path::new("/photos/2026/04/IMG_4231.HEIC"),
+            )
+            .await
+            .unwrap();
+
+        // Assert: pending asset should need download
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn upsert_seen_then_summary_counts_accurate_across_transitions() {
+        // Arrange: create assets and move them through pending -> downloaded -> failed transitions
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let dir = test_dir("summary_transitions");
+
+        let now = Utc::now();
+        let ids = ["AEt9xLq2V0", "AEt9xLq2V1", "AEt9xLq2V2", "AEt9xLq2V3"];
+        for (i, id) in ids.iter().enumerate() {
+            let record = AssetRecord::new_pending(
+                id.to_string(),
+                VersionSizeKey::Original,
+                format!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8{:02x}", i),
+                format!("IMG_{}.JPG", 1000 + i),
+                now,
+                Some(now - chrono::Duration::days(1)),
+                u64::try_from(4_194_304 + i * 1024).unwrap_or(0),
+                MediaType::Photo,
+            );
+            db.upsert_seen(&record).await.unwrap();
+        }
+
+        // All 4 start as pending
+        let s1 = db.get_summary().await.unwrap();
+        assert_eq!(s1.total_assets, 4);
+        assert_eq!(s1.pending, 4);
+        assert_eq!(s1.downloaded, 0);
+        assert_eq!(s1.failed, 0);
+
+        // Act: download two, fail one, leave one pending
+        let path0 = dir.join("IMG_1000.JPG");
+        fs::write(&path0, b"JPEG data").unwrap();
+        db.mark_downloaded(ids[0], "original", &path0, "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592")
+            .await
+            .unwrap();
+
+        let path1 = dir.join("IMG_1001.JPG");
+        fs::write(&path1, b"JPEG data 2").unwrap();
+        db.mark_downloaded(ids[1], "original", &path1, "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d")
+            .await
+            .unwrap();
+
+        db.mark_failed(ids[2], "original", "HTTP 503 Service Unavailable")
+            .await
+            .unwrap();
+
+        // Assert: counts reflect exact transitions
+        let s2 = db.get_summary().await.unwrap();
+        assert_eq!(s2.total_assets, 4);
+        assert_eq!(s2.downloaded, 2);
+        assert_eq!(s2.failed, 1);
+        assert_eq!(s2.pending, 1);
+
+        // Act: reset failed back to pending
+        let reset_count = db.reset_failed().await.unwrap();
+        assert_eq!(reset_count, 1);
+
+        // Assert: failed count goes to 0, pending increases
+        let s3 = db.get_summary().await.unwrap();
+        assert_eq!(s3.total_assets, 4);
+        assert_eq!(s3.downloaded, 2);
+        assert_eq!(s3.failed, 0);
+        assert_eq!(s3.pending, 2);
+    }
+
+    #[tokio::test]
+    async fn mark_downloaded_batch_duplicate_entries_idempotent() {
+        // Arrange: insert one asset, then call mark_downloaded_batch with the same entry twice
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let dir = test_dir("batch_dup");
+
+        let record = AssetRecord::new_pending(
+            "ARm4pKz8W1".to_string(),
+            VersionSizeKey::Original,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_string(),
+            "DSC_0042.NEF".to_string(),
+            Utc::now(),
+            None,
+            25_165_824,
+            MediaType::Photo,
+        );
+        db.upsert_seen(&record).await.unwrap();
+
+        let path = dir.join("DSC_0042.NEF");
+        fs::write(&path, b"RAW sensor data placeholder").unwrap();
+
+        // Act: batch with the same (id, version_size) repeated
+        let items = vec![
+            (
+                "ARm4pKz8W1".to_string(),
+                "original".to_string(),
+                path.clone(),
+                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
+            ),
+            (
+                "ARm4pKz8W1".to_string(),
+                "original".to_string(),
+                path.clone(),
+                "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
+            ),
+        ];
+        db.mark_downloaded_batch(&items).await.unwrap();
+
+        // Assert: only one downloaded record exists, not two
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 1);
+        assert_eq!(summary.downloaded, 1);
+
+        let downloaded = db.get_all_downloaded().await.unwrap();
+        assert_eq!(downloaded.len(), 1);
+        assert_eq!(downloaded[0].id, "ARm4pKz8W1");
+    }
+
+    #[tokio::test]
+    async fn metadata_empty_string_key_and_value() {
+        // Arrange
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Act: set metadata with an empty key
+        db.set_metadata("", "some_value").await.unwrap();
+
+        // Assert: can retrieve by empty key
+        let val = db.get_metadata("").await.unwrap();
+        assert_eq!(val, Some("some_value".to_string()));
+
+        // Act: set metadata with a normal key but empty value
+        db.set_metadata("last_sync_token", "").await.unwrap();
+
+        // Assert: empty value is stored and retrievable
+        let val = db.get_metadata("last_sync_token").await.unwrap();
+        assert_eq!(val, Some(String::new()));
+
+        // Act: overwrite empty key with empty value
+        db.set_metadata("", "").await.unwrap();
+        let val = db.get_metadata("").await.unwrap();
+        assert_eq!(val, Some(String::new()));
+    }
+
+    #[tokio::test]
+    async fn row_to_asset_record_unknown_status_falls_back_to_pending() {
+        // Arrange: manually insert a row with a status string that doesn't match any AssetStatus variant
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, media_type, status, last_seen_at)
+                 VALUES ('ABx7kQ9nR2', 'original', 'b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c', 'IMG_7892.HEIC', ?1, 6_291_456, 'photo', 'corrupted_junk', ?1)",
+                rusqlite::params![now],
+            ).unwrap();
+        }
+
+        // Act: retrieve via get_failed (won't match 'corrupted_junk'), so use get_all_downloaded (also won't match).
+        // Instead, query via should_download which reads the row and parses status.
+        // The unknown status falls back to Pending via AssetStatus::from_str -> unwrap_or(Pending).
+        let needs_download = db
+            .should_download(
+                "ABx7kQ9nR2",
+                "original",
+                "b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c",
+                Path::new("/photos/2026/04/IMG_7892.HEIC"),
+            )
+            .await
+            .unwrap();
+
+        // Assert: unknown status treated as pending, which means should download
+        assert!(needs_download);
+
+        // Also verify via summary: the unknown status won't match 'downloaded', 'pending', or 'failed'
+        // COUNT(CASE WHEN ...) so it counts as part of total but not any specific bucket
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 1);
+        assert_eq!(summary.downloaded, 0);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn sync_run_zero_value_stats() {
+        // Arrange
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+
+        // Act: complete the sync run with all-zero stats
+        let stats = SyncRunStats {
+            assets_seen: 0,
+            assets_downloaded: 0,
+            assets_failed: 0,
+            interrupted: false,
+        };
+        db.complete_sync_run(run_id, &stats).await.unwrap();
+
+        // Assert: summary reflects the completed run with timestamps populated
+        let summary = db.get_summary().await.unwrap();
+        assert!(summary.last_sync_started.is_some());
+        assert!(summary.last_sync_completed.is_some());
+
+        // Verify the raw sync_runs row has zero values
+        let (seen, downloaded, failed, interrupted): (i64, i64, i64, i64) = {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT assets_seen, assets_downloaded, assets_failed, interrupted FROM sync_runs WHERE id = ?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap()
+        };
+        assert_eq!(seen, 0);
+        assert_eq!(downloaded, 0);
+        assert_eq!(failed, 0);
+        assert_eq!(interrupted, 0);
+    }
+
+    #[tokio::test]
+    async fn reset_failed_precise_count_with_mixed_statuses() {
+        // Arrange: create assets across all three statuses with multiple failed entries
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let dir = test_dir("reset_mixed");
+
+        // 2 downloaded
+        for i in 0..2 {
+            let id = format!("ADl{}mNp3Q{}", i, i);
+            let record = AssetRecord::new_pending(
+                id.clone(),
+                VersionSizeKey::Original,
+                format!("ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48b{}", i),
+                format!("IMG_{}.HEIC", 2000 + i),
+                Utc::now(),
+                None,
+                5_242_880,
+                MediaType::Photo,
+            );
+            db.upsert_seen(&record).await.unwrap();
+            let path = dir.join(format!("IMG_{}.HEIC", 2000 + i));
+            fs::write(&path, b"heic payload").unwrap();
+            db.mark_downloaded(&id, "original", &path, &format!("localhash{i}"))
+                .await
+                .unwrap();
+        }
+
+        // 3 pending (just upserted, never transitioned)
+        for i in 0..3 {
+            let record = AssetRecord::new_pending(
+                format!("APn{}rWx5Z{}", i, i),
+                VersionSizeKey::Original,
+                format!("3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009{}", i),
+                format!("IMG_{}.JPG", 3000 + i),
+                Utc::now(),
+                None,
+                3_145_728,
+                MediaType::Photo,
+            );
+            db.upsert_seen(&record).await.unwrap();
+        }
+
+        // 4 failed
+        for i in 0..4 {
+            let id = format!("AFl{}kRt7Y{}", i, i);
+            let record = AssetRecord::new_pending(
+                id.clone(),
+                VersionSizeKey::Original,
+                format!("d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab3{}", i),
+                format!("IMG_{}.MOV", 4000 + i),
+                Utc::now(),
+                None,
+                10_485_760,
+                MediaType::Video,
+            );
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_failed(&id, "original", &format!("HTTP 500 attempt {i}"))
+                .await
+                .unwrap();
+        }
+
+        // Pre-check
+        let before = db.get_summary().await.unwrap();
+        assert_eq!(before.total_assets, 9);
+        assert_eq!(before.downloaded, 2);
+        assert_eq!(before.pending, 3);
+        assert_eq!(before.failed, 4);
+
+        // Act
+        let reset_count = db.reset_failed().await.unwrap();
+
+        // Assert: exactly 4 were reset
+        assert_eq!(reset_count, 4);
+
+        let after = db.get_summary().await.unwrap();
+        assert_eq!(after.total_assets, 9);
+        assert_eq!(after.downloaded, 2);
+        assert_eq!(after.pending, 7); // 3 original pending + 4 reset from failed
+        assert_eq!(after.failed, 0);
+
+        // Verify the formerly-failed assets have cleared error and zero attempts
+        let failed_after = db.get_failed().await.unwrap();
+        assert!(failed_after.is_empty());
+    }
 }

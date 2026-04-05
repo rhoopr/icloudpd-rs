@@ -477,6 +477,7 @@ pub(crate) fn live_photo_mov_path_original(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn test_clean_filename() {
@@ -820,6 +821,142 @@ mod tests {
         assert_eq!(
             generate_fingerprint_filename("asset123", "some.unknown.type"),
             "asset123.unknown"
+        );
+    }
+
+    #[test]
+    fn test_clean_filename_null_bytes() {
+        // Null bytes could exploit C-based filesystem APIs
+        assert_eq!(clean_filename("photo\0.jpg"), "photo\0.jpg");
+        // Note: clean_filename only strips /:*?"<>|\ — null bytes pass through.
+        // This documents current behavior. If null byte sanitization is needed,
+        // it should be added to clean_filename.
+    }
+
+    #[test]
+    fn test_clean_filename_empty_string() {
+        assert_eq!(clean_filename(""), "");
+    }
+
+    #[test]
+    fn test_clean_filename_all_invalid_chars() {
+        assert_eq!(clean_filename("/:*?\"<>|\\"), "");
+    }
+
+    #[test]
+    fn test_sanitize_path_component_control_characters() {
+        // Control characters (tabs, newlines) should be kept by current impl
+        // since clean_filename only removes specific chars
+        let result = sanitize_path_component("album\ttab\nnewline");
+        assert_eq!(result, "album\ttab\nnewline");
+    }
+
+    #[test]
+    fn test_sanitize_path_component_long_input() {
+        // Very long album names (>255 chars) should not panic
+        let long_name = "a".repeat(1000);
+        let result = sanitize_path_component(&long_name);
+        assert_eq!(result.len(), 1000);
+    }
+
+    #[test]
+    fn test_sanitize_path_component_unicode_with_traversal() {
+        // Unicode album name with path traversal attempt
+        assert_eq!(sanitize_path_component("日本語/../secrets"), "日本語_secrets");
+    }
+
+    #[test]
+    fn test_local_download_path_none_folder_structure() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let result = local_download_path(dir, "none", &date, "IMG_0001.JPG");
+        assert_eq!(result, PathBuf::from("/photos/IMG_0001.JPG"));
+    }
+
+    #[test]
+    fn test_local_download_path_none_case_insensitive() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        assert_eq!(
+            local_download_path(dir, "NONE", &date, "photo.jpg"),
+            PathBuf::from("/photos/photo.jpg")
+        );
+        assert_eq!(
+            local_download_path(dir, "None", &date, "photo.jpg"),
+            PathBuf::from("/photos/photo.jpg")
+        );
+    }
+
+    #[test]
+    fn test_local_download_path_date_based_folder() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let result = local_download_path(dir, "{:%Y/%m/%d}", &date, "IMG_0001.JPG");
+        assert_eq!(result, PathBuf::from("/photos/2025/06/15/IMG_0001.JPG"));
+    }
+
+    #[test]
+    fn test_local_download_path_without_python_wrapper() {
+        // Format string without {: ... } wrapper
+        let dir = Path::new("/photos");
+        let date = chrono::Local.with_ymd_and_hms(2025, 1, 5, 9, 5, 3).unwrap();
+        let result = local_download_path(dir, "%Y-%m-%d", &date, "photo.jpg");
+        assert_eq!(result, PathBuf::from("/photos/2025-01-05/photo.jpg"));
+    }
+
+    #[test]
+    fn test_local_download_path_with_time_components() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local.with_ymd_and_hms(2025, 12, 31, 23, 59, 59).unwrap();
+        let result = local_download_path(dir, "{:%Y/%m/%d/%H-%M-%S}", &date, "photo.jpg");
+        assert_eq!(result, PathBuf::from("/photos/2025/12/31/23-59-59/photo.jpg"));
+    }
+
+    #[test]
+    fn test_expand_date_format_unknown_token_preserved() {
+        // Unknown % tokens should keep the % sign
+        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let result = expand_date_format("%Y-%Z-%d", &date);
+        // %Z is unknown, so "%" is kept, then "Z" is processed as literal
+        assert_eq!(result, "2025-%Z-15");
+    }
+
+    #[test]
+    fn test_expand_date_format_trailing_percent() {
+        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let result = expand_date_format("%Y/%m/%d%", &date);
+        assert_eq!(result, "2025/06/15%");
+    }
+
+    #[test]
+    fn test_generate_fingerprint_filename_empty_id() {
+        let result = generate_fingerprint_filename("", "public.jpeg");
+        assert_eq!(result, ".JPG");
+    }
+
+    #[test]
+    fn test_local_download_path_cleans_invalid_chars_in_filename() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local.with_ymd_and_hms(2025, 6, 15, 14, 30, 0).unwrap();
+        let result = local_download_path(dir, "none", &date, "photo:1.jpg");
+        assert_eq!(result, PathBuf::from("/photos/photo1.jpg"));
+    }
+
+    #[test]
+    fn test_normalize_ampm_no_break_space_u00a0() {
+        // U+00A0 (NO-BREAK SPACE) before AM should also be stripped
+        assert_eq!(
+            normalize_ampm("Screenshot at 10.30.00\u{00A0}AM.PNG"),
+            "Screenshot at 10.30.00AM.PNG"
+        );
+    }
+
+    #[test]
+    fn test_normalize_ampm_lowercase_pm() {
+        // AM/PM matching is case-insensitive in the check
+        assert_eq!(
+            normalize_ampm("Screenshot at 1.40.01 pm.PNG"),
+            "Screenshot at 1.40.01pm.PNG"
         );
     }
 }

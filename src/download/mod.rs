@@ -4098,4 +4098,348 @@ mod tests {
             "Expected producer panic error, got: {err}"
         );
     }
+
+    // ── Gap coverage: empty versions, path traversal, empty filename ───
+
+    #[test]
+    fn filter_asset_empty_versions_map_produces_no_tasks() {
+        // Asset with no version fields at all — filter should produce zero tasks.
+        let asset = PhotoAsset::new(
+            json!({"recordName": "NO_VERS_1", "fields": {
+                "filenameEnc": {"value": "IMG_4502.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks.is_empty(),
+            "Asset with no versions should produce 0 tasks, got {}",
+            tasks.len()
+        );
+    }
+
+    #[test]
+    fn filter_asset_path_traversal_filename_is_sanitized() {
+        // A filename containing path traversal should NOT escape the download
+        // directory. The folder_structure + local_download_path should confine it.
+        let asset = PhotoAsset::new(
+            json!({"recordName": "TRAV_1", "fields": {
+                "filenameEnc": {"value": "../../../etc/passwd", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 512,
+                    "downloadURL": "https://cdn.icloud.com/photos/orig/abc",
+                    "fileChecksum": "a1b2c3d4e5f6"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let path_str = tasks[0].download_path.to_string_lossy();
+        // The download path must stay inside the configured directory
+        assert!(
+            path_str.starts_with(config.directory.to_string_lossy().as_ref()),
+            "Path traversal filename should be confined to download dir, got: {path_str}"
+        );
+        assert!(
+            !path_str.contains("/etc/passwd"),
+            "Path traversal must not escape download directory, got: {path_str}"
+        );
+    }
+
+    #[test]
+    fn filter_asset_missing_filename_uses_fingerprint_fallback() {
+        // Asset whose filenameEnc field is absent (null) should trigger the
+        // fingerprint fallback path, generating a filename from the asset ID.
+        let asset = PhotoAsset::new(
+            json!({"recordName": "NOFN_ASSET1", "fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 2048,
+                    "downloadURL": "https://cdn.icloud.com/photos/orig/nofn",
+                    "fileChecksum": "deadbeef1234"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        assert!(
+            asset.filename().is_none(),
+            "Asset with no filenameEnc should have None filename"
+        );
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // Fingerprint path: asset ID chars sanitized, up to 12 chars
+        // "NOFN_ASSET1" → "NOFN_ASSET1" (all valid, 11 chars < 12 limit)
+        assert!(
+            filename.contains("NOFN_ASSET1"),
+            "Missing filename should use fingerprint from asset ID, got: {filename}"
+        );
+        assert!(
+            filename.ends_with(".JPG"),
+            "Fingerprint filename for public.jpeg should have .JPG extension, got: {filename}"
+        );
+    }
+
+    // ── Gap coverage: should_download_fast with empty checksum ──────────
+
+    #[test]
+    fn should_download_fast_empty_checksum_string() {
+        // When the stored checksum is empty and the incoming checksum is also
+        // empty, they match — should behave like a normal matching checksum.
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("asset_empty_ck".into())
+            .or_default()
+            .insert("original".into());
+        ctx.downloaded_checksums
+            .entry("asset_empty_ck".into())
+            .or_default()
+            .insert("original".into(), "".into());
+
+        // Empty matches empty → trust_state=true gives hard skip
+        assert_eq!(
+            ctx.should_download_fast("asset_empty_ck", VersionSizeKey::Original, "", true),
+            Some(false)
+        );
+        // Empty matches empty → trust_state=false gives None (needs fs check)
+        assert_eq!(
+            ctx.should_download_fast("asset_empty_ck", VersionSizeKey::Original, "", false),
+            None
+        );
+        // Non-empty vs empty stored → checksum changed, needs download
+        assert_eq!(
+            ctx.should_download_fast(
+                "asset_empty_ck",
+                VersionSizeKey::Original,
+                "abc123def456",
+                true,
+            ),
+            Some(true)
+        );
+    }
+
+    // ── Gap coverage: retry_only known_ids filtering ────────────────────
+
+    #[test]
+    fn download_context_retry_only_skips_unknown_assets() {
+        // In retry-only mode, the producer checks known_ids before sending
+        // tasks. Simulate that filtering logic here.
+        let mut ctx = DownloadContext::default();
+        ctx.known_ids.insert("PREV_SYNCED_001".into());
+        ctx.known_ids.insert("PREV_SYNCED_002".into());
+
+        let known_asset = photo_asset_with_version(); // recordName "TEST_1"
+        let config = test_config();
+        let tasks = filter_asset_fresh(&known_asset, &config);
+
+        // Simulate the retry_only check from the producer loop
+        let retry_filtered: Vec<_> = tasks
+            .into_iter()
+            .filter(|task| ctx.known_ids.contains(task.asset_id.as_ref()))
+            .collect();
+
+        // "TEST_1" is NOT in known_ids, so retry_only would skip it
+        assert!(
+            retry_filtered.is_empty(),
+            "Unknown asset should be filtered out in retry_only mode"
+        );
+
+        // Now add "TEST_1" to known_ids and verify it passes
+        ctx.known_ids.insert("TEST_1".into());
+        let tasks2 = filter_asset_fresh(&known_asset, &config);
+        let retry_filtered2: Vec<_> = tasks2
+            .into_iter()
+            .filter(|task| ctx.known_ids.contains(task.asset_id.as_ref()))
+            .collect();
+        assert_eq!(
+            retry_filtered2.len(),
+            1,
+            "Known asset should pass retry_only filter"
+        );
+    }
+
+    // ── Gap coverage: skip_created_before AND skip_created_after ────────
+
+    #[test]
+    fn filter_asset_narrowing_date_window_includes_asset_inside() {
+        // Asset date: 2025-01-15 (epoch ms 1736899200000)
+        let asset = photo_asset_with_version();
+        let mut config = test_config();
+        // Window: 2025-01-01 .. 2025-02-01 — asset at Jan 15 is inside
+        config.skip_created_before = Some(
+            DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        config.skip_created_after = Some(
+            DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "Asset inside the date window should produce a task"
+        );
+    }
+
+    #[test]
+    fn filter_asset_narrowing_date_window_excludes_asset_before() {
+        // Asset date: 2025-01-15
+        let asset = photo_asset_with_version();
+        let mut config = test_config();
+        // Window: 2025-01-20 .. 2025-02-01 — asset at Jan 15 is before the window
+        config.skip_created_before = Some(
+            DateTime::parse_from_rfc3339("2025-01-20T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        config.skip_created_after = Some(
+            DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "Asset before the date window should be skipped"
+        );
+    }
+
+    #[test]
+    fn filter_asset_narrowing_date_window_excludes_asset_after() {
+        // Asset date: 2025-01-15
+        let asset = photo_asset_with_version();
+        let mut config = test_config();
+        // Window: 2024-12-01 .. 2025-01-10 — asset at Jan 15 is after the window
+        config.skip_created_before = Some(
+            DateTime::parse_from_rfc3339("2024-12-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        config.skip_created_after = Some(
+            DateTime::parse_from_rfc3339("2025-01-10T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "Asset after the date window should be skipped"
+        );
+    }
+
+    // ── Gap coverage: incremental Modified events are downloadable ──────
+
+    #[test]
+    fn change_event_modified_asset_is_downloadable() {
+        // In the iCloud changes API, both new and modified records arrive as
+        // ChangeReason::Created (the enum doc says "new or modified").
+        // Verify that a "modified" asset with a ChangeReason::Created is
+        // picked up by the download filter.
+        let modified_asset = PhotoAsset::new(
+            json!({"recordName": "MODIFIED_ASSET_1", "fields": {
+                "filenameEnc": {"value": "IMG_9876.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 4500000,
+                    "downloadURL": "https://cdn.icloud.com/photos/orig/modified",
+                    "fileChecksum": "f0e1d2c3b4a5"
+                }},
+                "resOriginalFileType": {"value": "public.heic"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+
+        let event = ChangeEvent {
+            record_name: "MODIFIED_ASSET_1".to_string(),
+            record_type: Some("CPLAsset".to_string()),
+            reason: ChangeReason::Created,
+            asset: Some(modified_asset),
+        };
+
+        // Simulate the incremental filtering: Created reason + asset present
+        assert!(matches!(event.reason, ChangeReason::Created));
+        let asset = event.asset.unwrap();
+
+        // The extracted asset should produce a download task
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "Modified asset via Created reason should produce a download task"
+        );
+        assert_eq!(&*tasks[0].checksum, "f0e1d2c3b4a5");
+    }
+
+    // ── Gap coverage: NameId7 produces task when file at original path ──
+
+    #[test]
+    fn filter_asset_name_id7_downloads_when_original_path_exists() {
+        // With NameId7 policy, the download path includes an ID suffix.
+        // Even if a file exists at the *non-suffixed* (original) path,
+        // NameId7 should produce a task because its path is different.
+        let dir = test_tmp_dir("download_filter_tests_name_id7_orig");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let asset = photo_asset_with_version(); // recordName "TEST_1", "photo.jpg"
+        let mut config = test_config();
+        config.directory = dir.clone();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+
+        // Get the NameId7 path
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let id7_path = &tasks[0].download_path;
+
+        // Create a file at the non-suffixed original path (without ID suffix)
+        // This simulates a file that was downloaded with NameSizeDedupWithSuffix
+        let original_path = paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &tasks[0].created_local,
+            "photo.JPG",
+        );
+        fs::create_dir_all(original_path.parent().unwrap()).unwrap();
+        fs::write(&original_path, vec![0u8; 1000]).unwrap();
+
+        // The NameId7 path is different from the original path
+        assert_ne!(
+            id7_path, &original_path,
+            "NameId7 path should differ from non-suffixed path"
+        );
+
+        // NameId7 should still produce a task because the ID7 path doesn't exist
+        let tasks2 = filter_asset_fresh(&asset, &config);
+        assert_eq!(
+            tasks2.len(),
+            1,
+            "NameId7 should produce task when only the non-suffixed file exists"
+        );
+
+        // Now create the file at the NameId7 path — should skip
+        fs::create_dir_all(id7_path.parent().unwrap()).unwrap();
+        fs::write(id7_path, vec![0u8; 1000]).unwrap();
+        let tasks3 = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks3.is_empty(),
+            "NameId7 should skip when ID-suffixed file already exists"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

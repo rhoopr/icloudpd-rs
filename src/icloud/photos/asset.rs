@@ -1384,4 +1384,136 @@ mod tests {
             "standalone asset should have no PhotoAsset"
         );
     }
+
+    // --- Gap tests: API response handling robustness ---
+
+    #[test]
+    fn photo_asset_null_record_name_returns_empty_id() {
+        // recordName is JSON null rather than missing entirely
+        let asset = make_asset(json!({"recordName": null}), json!({}));
+        assert_eq!(asset.id(), "");
+    }
+
+    #[test]
+    fn decode_filename_invalid_base64_encrypted_bytes_returns_none() {
+        // "!!not-valid-base64!!" is not decodable
+        let asset = make_asset(
+            json!({"fields": {"filenameEnc": {"value": "!!not-valid-base64!!", "type": "ENCRYPTED_BYTES"}}}),
+            json!({}),
+        );
+        assert_eq!(asset.filename(), None);
+    }
+
+    #[test]
+    fn decode_filename_invalid_utf8_after_base64_decode_returns_none() {
+        use base64::Engine;
+        // 0xFF 0xFE is not valid UTF-8
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0x80, 0x81]);
+        let asset = make_asset(
+            json!({"fields": {"filenameEnc": {"value": encoded, "type": "ENCRYPTED_BYTES"}}}),
+            json!({}),
+        );
+        assert_eq!(asset.filename(), None);
+    }
+
+    #[test]
+    fn decode_filename_unsupported_type_returns_none() {
+        // "BINARY" is not a recognized filenameEnc type
+        let asset = make_asset(
+            json!({"fields": {"filenameEnc": {"value": "photo.jpg", "type": "BINARY"}}}),
+            json!({}),
+        );
+        assert_eq!(asset.filename(), None);
+    }
+
+    #[test]
+    fn resolve_item_type_no_item_type_no_filename_defaults_to_movie() {
+        // No itemType field and no filenameEnc -> extension heuristic cannot fire -> Movie
+        let asset = make_asset(json!({"fields": {}}), json!({}));
+        assert_eq!(asset.item_type(), Some(AssetItemType::Movie));
+    }
+
+    #[test]
+    fn asset_date_negative_timestamp_pre_epoch() {
+        // 1969-07-20T20:17:00Z (Apollo 11 landing) = -14182980000 ms
+        let asset = make_asset(
+            json!({}),
+            json!({"fields": {"assetDate": {"value": -14_182_980_000.0}}}),
+        );
+        let dt = asset.asset_date();
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "1969-07-20");
+    }
+
+    #[test]
+    fn asset_date_zero_timestamp_returns_epoch() {
+        let asset = make_asset(
+            json!({}),
+            json!({"fields": {"assetDate": {"value": 0.0}}}),
+        );
+        let dt = asset.asset_date();
+        assert_eq!(dt, DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn versions_completely_empty_fields_returns_empty_map() {
+        // Both master and asset have fields: {} — no version resources at all
+        let asset = make_asset(json!({"fields": {}}), json!({"fields": {}}));
+        assert!(asset.versions().is_empty());
+    }
+
+    #[test]
+    fn photo_asset_very_large_size_values() {
+        let large_size: u64 = u64::MAX;
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": large_size,
+                    "downloadURL": "https://example.com/huge",
+                    "fileChecksum": "ck_huge"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        let orig = asset.get_version(AssetVersionSize::Original).unwrap();
+        // serde_json may not round-trip u64::MAX exactly through f64,
+        // but the version should still be present and have a non-zero size
+        assert!(orig.size > 0);
+        assert_eq!(&*orig.url, "https://example.com/huge");
+    }
+
+    #[test]
+    fn from_records_null_master_fields_partial_data() {
+        use super::super::cloudkit::Record;
+
+        // Master record where fields has null values for everything except recordName
+        let master = Record {
+            record_name: "M_PARTIAL".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({
+                "filenameEnc": null,
+                "itemType": null,
+                "resOriginalRes": null
+            }),
+            deleted: None,
+        };
+        let asset_rec = Record {
+            record_name: "A_PARTIAL".to_string(),
+            record_type: "CPLAsset".to_string(),
+            fields: json!({
+                "assetDate": null,
+                "addedDate": null
+            }),
+            deleted: None,
+        };
+
+        let asset = PhotoAsset::from_records(master, asset_rec);
+        assert_eq!(asset.id(), "M_PARTIAL");
+        assert_eq!(asset.filename(), None);
+        assert!(asset.versions().is_empty());
+        // Missing assetDate falls back to epoch
+        assert_eq!(asset.asset_date(), DateTime::UNIX_EPOCH);
+        assert_eq!(asset.added_date(), DateTime::UNIX_EPOCH);
+    }
 }

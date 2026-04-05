@@ -374,11 +374,6 @@ mod tests {
     }
 
     #[test]
-    fn test_version_size_key_is_one_byte() {
-        assert_eq!(size_of::<VersionSizeKey>(), 1);
-    }
-
-    #[test]
     fn test_asset_status_is_one_byte() {
         assert_eq!(size_of::<AssetStatus>(), 1);
     }

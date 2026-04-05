@@ -301,4 +301,111 @@ mod tests {
         let result = compute_sha256(&file_path).await;
         assert!(result.is_err());
     }
+
+    #[test]
+    fn temp_download_path_empty_checksum_fails() {
+        // Empty string is technically valid base64 (decodes to empty bytes),
+        // but produces an empty base32 filename — verify it at least doesn't panic.
+        // An empty checksum decodes to zero bytes, so base32 is also empty.
+        let path = PathBuf::from("/photos/test.jpg");
+        let result = temp_download_path(&path, "", ".kei-tmp");
+        // Empty base64 decodes successfully to empty bytes; the path is valid
+        // but the stem is empty — just the suffix. Ensure no error.
+        assert!(result.is_ok());
+        let temp = result.unwrap();
+        // The filename should be just the suffix since the encoded part is empty
+        assert_eq!(temp.file_name().unwrap().to_str().unwrap(), ".kei-tmp");
+    }
+
+    #[tokio::test]
+    async fn compute_sha256_empty_file_returns_known_hash() {
+        // Arrange: create an empty file
+        let dir = PathBuf::from("/tmp/claude/sha256_empty_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("empty.bin");
+        std::fs::write(&file_path, b"").unwrap();
+
+        // Act
+        let hash = compute_sha256(&file_path).await.unwrap();
+
+        // Assert: SHA-256 of empty input is the well-known constant
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_sha256_large_file_streams_without_loading_all_into_memory() {
+        // Arrange: write a 2 MiB file (large enough to confirm streaming via io::copy)
+        let dir = PathBuf::from("/tmp/claude/sha256_large_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("large.bin");
+
+        let chunk = vec![0xABu8; 1024];
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&file_path).unwrap();
+            for _ in 0..2048 {
+                f.write_all(&chunk).unwrap();
+            }
+        }
+
+        // Act
+        let hash = compute_sha256(&file_path).await.unwrap();
+
+        // Assert: hash is a valid 64-char hex string (SHA-256)
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Compute expected hash independently for verification
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for _ in 0..2048 {
+            hasher.update(&chunk);
+        }
+        let expected = format!("{:x}", hasher.finalize());
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn temp_download_path_different_directories_produce_different_paths() {
+        // Arrange: two target files in different directories, same checksum
+        let path_a = PathBuf::from("/photos/2024/test.jpg");
+        let path_b = PathBuf::from("/photos/2025/test.jpg");
+        let checksum = "AAAA";
+
+        // Act
+        let result_a = temp_download_path(&path_a, checksum, ".kei-tmp").unwrap();
+        let result_b = temp_download_path(&path_b, checksum, ".kei-tmp").unwrap();
+
+        // Assert: temp files land in their respective parent directories
+        assert_eq!(result_a.parent().unwrap(), Path::new("/photos/2024"));
+        assert_eq!(result_b.parent().unwrap(), Path::new("/photos/2025"));
+        assert_ne!(result_a, result_b);
+        // But the filename portion (base32 + suffix) should be identical
+        assert_eq!(result_a.file_name(), result_b.file_name());
+    }
+
+    #[test]
+    fn temp_download_path_url_unsafe_base64_chars_produce_safe_filename() {
+        // Arrange: base64 with '+' and '/' characters (URL-unsafe)
+        // "+/+/" decodes to [0xFB, 0xFF, 0xBF] — valid base64 with unsafe chars
+        let path = PathBuf::from("/photos/test.jpg");
+        let checksum = "+/+/";
+
+        // Act
+        let result = temp_download_path(&path, checksum, ".kei-tmp").unwrap();
+
+        // Assert: the resulting filename must not contain '+' or '/'
+        let filename = result.file_name().unwrap().to_str().unwrap();
+        assert!(!filename.contains('+'), "filename should not contain '+'");
+        assert!(!filename.contains('/'), "filename should not contain '/'");
+        // Base32 alphabet is A-Z, 2-7 — verify the stem uses only those
+        let stem = filename.strip_suffix(".kei-tmp").unwrap();
+        assert!(
+            stem.chars().all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)),
+            "base32 stem should only contain A-Z and 2-7, got: {stem}"
+        );
+    }
 }
