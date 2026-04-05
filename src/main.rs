@@ -92,6 +92,44 @@ use systemd::SystemdNotifier;
 /// Maximum number of re-authentication attempts before giving up.
 const MAX_REAUTH_ATTEMPTS: u32 = 3;
 
+/// Exit code for partial sync (some downloads failed, but sync was not a total failure).
+const EXIT_PARTIAL: u8 = 2;
+/// Exit code for authentication failures.
+const EXIT_AUTH: u8 = 3;
+
+/// Returned when some (but not all) downloads failed during a sync.
+#[derive(Debug)]
+struct PartialSyncError(usize);
+impl std::fmt::Display for PartialSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} downloads failed", self.0)
+    }
+}
+impl std::error::Error for PartialSyncError {}
+
+/// Query available disk space on the filesystem containing `path`.
+///
+/// Returns `None` if the statvfs call fails (e.g. path doesn't exist yet).
+#[cfg(unix)]
+fn available_disk_space(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+    }
+}
+
+#[cfg(not(unix))]
+fn available_disk_space(_path: &Path) -> Option<u64> {
+    None
+}
+
 /// Build a password provider closure that returns the given password or
 /// falls back to prompting on stdin.
 fn make_password_provider(password: Option<String>) -> impl Fn() -> Option<String> {
@@ -729,6 +767,12 @@ async fn main() -> ExitCode {
                 .is_some_and(auth::error::AuthError::is_two_factor_required)
             {
                 ExitCode::SUCCESS
+            } else if e.downcast_ref::<PartialSyncError>().is_some() {
+                eprintln!("Error: {e:#}");
+                ExitCode::from(EXIT_PARTIAL)
+            } else if e.downcast_ref::<auth::error::AuthError>().is_some() {
+                eprintln!("Error: {e:#}");
+                ExitCode::from(EXIT_AUTH)
             } else {
                 eprintln!("Error: {e:#}");
                 ExitCode::FAILURE
@@ -1039,6 +1083,19 @@ async fn run() -> anyhow::Result<()> {
         )
     })?;
     let _ = tokio::fs::remove_file(&probe).await;
+
+    // Warn if available disk space is low
+    if let Some(avail) = available_disk_space(&config.directory) {
+        const MIN_FREE_BYTES: u64 = 1_073_741_824; // 1 GiB
+        if avail < MIN_FREE_BYTES {
+            let avail_mb = avail / (1024 * 1024);
+            tracing::warn!(
+                available_mb = avail_mb,
+                path = %config.directory.display(),
+                "Low disk space — downloads may fail with disk errors"
+            );
+        }
+    }
 
     // Initialize state database
     let state_db: Option<Arc<dyn state::StateDb>> = {
@@ -1388,7 +1445,7 @@ async fn run() -> anyhow::Result<()> {
                         "Some downloads failed this cycle, will retry next cycle"
                     );
                 } else {
-                    anyhow::bail!("{cycle_failed_count} downloads failed");
+                    return Err(PartialSyncError(cycle_failed_count).into());
                 }
             } else {
                 reauth_attempts = 0;

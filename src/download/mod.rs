@@ -1047,6 +1047,7 @@ struct StreamingResult {
     auth_errors: usize,
     state_write_failures: usize,
     enumeration_errors: usize,
+    assets_seen: u64,
 }
 
 /// Download photos with syncToken support.
@@ -1155,6 +1156,21 @@ async fn download_photos_full_with_token(
         shutdown_token.clone(),
     )
     .await?;
+
+    // Warn if enumeration saw significantly fewer assets than the API reported.
+    // This catches silent pagination truncation, dropped pages, or API hiccups
+    // that would otherwise go unnoticed.
+    if total > 0 && !config.only_print_filenames && !config.dry_run {
+        let seen = streaming_result.assets_seen;
+        let threshold = total * 95 / 100; // 5% tolerance
+        if seen < threshold {
+            tracing::warn!(
+                expected = total,
+                seen,
+                "Enumeration saw fewer assets than expected — consider running a full re-sync"
+            );
+        }
+    }
 
     // Collect the sync token from any album's token receiver.
     // In practice, all albums share the same zone so any token suffices.
@@ -1481,6 +1497,7 @@ where
             auth_errors: 0,
             state_write_failures: 0,
             enumeration_errors: 0,
+            assets_seen: 0,
         });
     }
 
@@ -1508,6 +1525,7 @@ where
             auth_errors: 0,
             state_write_failures: 0,
             enumeration_errors: 0,
+            assets_seen: 0,
         });
     }
 
@@ -1616,6 +1634,7 @@ where
         let config = &producer_config;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
+        let mut seen_ids: FxHashSet<Box<str>> = FxHashSet::default();
         tokio::pin!(combined);
         while let Some(result) = combined.next().await {
             if producer_shutdown.is_cancelled() {
@@ -1624,6 +1643,15 @@ where
             match result {
                 Ok(asset) => {
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    if !seen_ids.insert(asset.id().into()) {
+                        tracing::warn!(
+                            asset_id = %asset.id(),
+                            "Duplicate asset ID from API, skipping"
+                        );
+                        producer_pb.inc(1);
+                        continue;
+                    }
 
                     if trust_state {
                         let candidates = extract_skip_candidates(&asset, config);
@@ -1919,6 +1947,7 @@ where
         auth_errors,
         state_write_failures,
         enumeration_errors: enum_errors.load(std::sync::atomic::Ordering::Relaxed),
+        assets_seen: assets_seen_count,
     })
 }
 
