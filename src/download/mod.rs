@@ -1642,8 +1642,6 @@ where
             }
             match result {
                 Ok(asset) => {
-                    assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
                     if !seen_ids.insert(asset.id().into()) {
                         tracing::warn!(
                             asset_id = %asset.id(),
@@ -1652,6 +1650,8 @@ where
                         producer_pb.inc(1);
                         continue;
                     }
+
+                    assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                     if trust_state {
                         let candidates = extract_skip_candidates(&asset, config);

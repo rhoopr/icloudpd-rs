@@ -767,15 +767,15 @@ async fn main() -> ExitCode {
                 .is_some_and(auth::error::AuthError::is_two_factor_required)
             {
                 ExitCode::SUCCESS
-            } else if e.downcast_ref::<PartialSyncError>().is_some() {
-                eprintln!("Error: {e:#}");
-                ExitCode::from(EXIT_PARTIAL)
-            } else if e.downcast_ref::<auth::error::AuthError>().is_some() {
-                eprintln!("Error: {e:#}");
-                ExitCode::from(EXIT_AUTH)
             } else {
                 eprintln!("Error: {e:#}");
-                ExitCode::FAILURE
+                if e.downcast_ref::<PartialSyncError>().is_some() {
+                    ExitCode::from(EXIT_PARTIAL)
+                } else if e.downcast_ref::<auth::error::AuthError>().is_some() {
+                    ExitCode::from(EXIT_AUTH)
+                } else {
+                    ExitCode::FAILURE
+                }
             }
         }
     }
