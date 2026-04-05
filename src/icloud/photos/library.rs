@@ -203,7 +203,7 @@ impl PhotoLibrary {
     pub fn all(&self) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
-                params: self.params.clone(),
+                params: Arc::clone(&self.params),
                 service_endpoint: self.service_endpoint.clone(),
                 name: String::new(),
                 list_type: QUERY_ALL_LIST.to_string(),
@@ -220,7 +220,7 @@ impl PhotoLibrary {
     pub fn recently_deleted(&self) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
-                params: self.params.clone(),
+                params: Arc::clone(&self.params),
                 service_endpoint: self.service_endpoint.clone(),
                 name: String::new(),
                 list_type: QUERY_DELETED_LIST.to_string(),
