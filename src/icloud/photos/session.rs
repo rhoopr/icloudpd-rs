@@ -114,54 +114,46 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
     // Per-record errors: filter out errored records and keep valid ones.
     // Only return Err if ALL records are errored.
     if let Some(records) = response["records"].as_array() {
-        let total = records.len();
-        let mut last_error: Option<CloudKitServerError> = None;
-        let mut error_count = 0usize;
-
-        let valid_records: Vec<Value> = records
+        let (errored, valid): (Vec<&Value>, Vec<&Value>) = records
             .iter()
-            .filter(|record| {
-                if let Some(code) = record["serverErrorCode"].as_str() {
-                    let reason = record["reason"].as_str().unwrap_or("unknown").to_string();
-                    let retryable = RETRYABLE_SERVER_ERRORS
-                        .iter()
-                        .any(|&s| s.eq_ignore_ascii_case(code));
-                    let service_not_activated = is_service_not_activated(code, &reason);
-                    tracing::warn!(
-                        error_code = code,
-                        retryable,
-                        service_not_activated,
-                        "CloudKit per-record error: {reason}"
-                    );
-                    error_count += 1;
-                    last_error = Some(CloudKitServerError {
-                        code: code.to_string(),
-                        reason,
-                        retryable,
-                        service_not_activated,
-                    });
-                    false
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
+            .partition(|r| r["serverErrorCode"].as_str().is_some());
 
-        if error_count > 0 {
-            if valid_records.is_empty() {
-                // All records errored — propagate the last error for retry
-                return Err(last_error.expect("error_count > 0").into());
+        if !errored.is_empty() {
+            let mut last_ck_err = None;
+            for record in &errored {
+                let code = record["serverErrorCode"].as_str().unwrap_or("unknown");
+                let reason = record["reason"].as_str().unwrap_or("unknown").to_string();
+                let retryable = RETRYABLE_SERVER_ERRORS
+                    .iter()
+                    .any(|&s| s.eq_ignore_ascii_case(code));
+                let service_not_activated = is_service_not_activated(code, &reason);
+                tracing::warn!(
+                    error_code = code,
+                    retryable,
+                    service_not_activated,
+                    "CloudKit per-record error: {reason}"
+                );
+                last_ck_err = Some(CloudKitServerError {
+                    code: code.to_string(),
+                    reason,
+                    retryable,
+                    service_not_activated,
+                });
             }
+
+            if valid.is_empty() {
+                return Err(last_ck_err.expect("errored is non-empty").into());
+            }
+            let total = errored.len() + valid.len();
             tracing::warn!(
-                errored = error_count,
-                valid = valid_records.len(),
+                errored = errored.len(),
+                valid = valid.len(),
                 total,
                 "Filtered errored records from CloudKit response"
             );
-            // Replace the records array with only valid records
+            let valid_owned: Vec<Value> = valid.into_iter().cloned().collect();
             let mut response = response;
-            response["records"] = Value::Array(valid_records);
+            response["records"] = Value::Array(valid_owned);
             return Ok(response);
         }
     }

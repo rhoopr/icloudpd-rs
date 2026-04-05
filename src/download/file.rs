@@ -176,11 +176,11 @@ async fn attempt_download(
     }
     .await;
     drop(file);
-    if let Err(e) = &stream_result {
+    if let Err(e) = stream_result {
         if !e.is_retryable() {
             let _ = fs::remove_file(&part_path).await;
         }
-        return Err(stream_result.unwrap_err());
+        return Err(e);
     }
 
     // Verify the server sent the number of bytes it promised.
