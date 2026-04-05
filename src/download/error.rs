@@ -29,6 +29,9 @@ pub(crate) enum DownloadError {
         bytes_written: u64,
     },
 
+    #[error("Invalid content for {path}: {reason}")]
+    InvalidContent { path: String, reason: String },
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -47,7 +50,9 @@ impl DownloadError {
     pub fn is_retryable(&self) -> bool {
         match self {
             DownloadError::HttpStatus { status, .. } => *status == 429 || *status >= 500,
-            DownloadError::ContentLengthMismatch { .. } | DownloadError::Http { .. } => true,
+            DownloadError::ContentLengthMismatch { .. }
+            | DownloadError::InvalidContent { .. }
+            | DownloadError::Http { .. } => true,
             DownloadError::Disk(_) | DownloadError::Other(_) => false,
         }
     }
@@ -356,6 +361,27 @@ mod tests {
             !e.is_session_expired(),
             "Other variant should not be session expired"
         );
+    }
+
+    #[test]
+    fn test_invalid_content_retryable() {
+        let e = DownloadError::InvalidContent {
+            path: "photo.heic".into(),
+            reason: "file contains HTML".into(),
+        };
+        assert!(e.is_retryable());
+        assert!(!e.is_session_expired());
+    }
+
+    #[test]
+    fn display_invalid_content_includes_path_and_reason() {
+        let e = DownloadError::InvalidContent {
+            path: "photo.jpg".into(),
+            reason: "file header does not match expected format for .jpg".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("photo.jpg"));
+        assert!(msg.contains("does not match"));
     }
 
     #[test]

@@ -180,6 +180,14 @@ async fn attempt_download(
     // to catch truncated downloads. The fileChecksum is used for temp filename
     // derivation and change detection across syncs.
 
+    // Validate content looks like actual media, not an HTML error page.
+    // Apple's CDN occasionally returns HTTP 200 with HTML (rate limit, CAPTCHA,
+    // service unavailable) which would otherwise be saved as the final file.
+    if let Err(e) = validate_downloaded_content(part_path, download_path) {
+        let _ = fs::remove_file(&part_path).await;
+        return Err(e);
+    }
+
     if !skip_rename {
         fs::rename(&part_path, download_path).await?;
     }
@@ -201,6 +209,82 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
         Ok(format!("{:x}", hasher.finalize()))
     })
     .await?
+}
+
+/// Validate that downloaded content matches expected format for the file extension.
+///
+/// For known media types (JPEG, PNG, HEIC, MOV, etc.), checks magic bytes in the
+/// file header. For unknown extensions, rejects content that looks like HTML.
+/// Deleting the .part file and returning a retryable error prevents HTML error
+/// pages from being persisted as valid downloads.
+fn validate_downloaded_content(
+    part_path: &Path,
+    download_path: &Path,
+) -> Result<(), DownloadError> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(part_path).map_err(|e| DownloadError::Disk(Box::new(e)))?;
+    let mut buf = [0u8; 16];
+    let n = file
+        .read(&mut buf)
+        .map_err(|e| DownloadError::Disk(Box::new(e)))?;
+
+    if n == 0 {
+        return Ok(());
+    }
+
+    let header = &buf[..n];
+    let path_str = download_path.display().to_string();
+
+    let ext = download_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // For known media types, validate magic bytes.
+    // This catches HTML error pages AND any other corrupted content.
+    let magic_match = match ext.as_str() {
+        "jpg" | "jpeg" => Some(n >= 2 && header[..2] == [0xFF, 0xD8]),
+        "png" => Some(n >= 4 && header[..4] == [0x89, 0x50, 0x4E, 0x47]),
+        "heic" | "heif" | "mov" | "mp4" | "m4v" => Some(n >= 8 && header[4..8] == *b"ftyp"),
+        "gif" => Some(n >= 4 && header[..4] == *b"GIF8"),
+        "tiff" | "tif" => Some(
+            n >= 4
+                && (header[..4] == [0x49, 0x49, 0x2A, 0x00]
+                    || header[..4] == [0x4D, 0x4D, 0x00, 0x2A]),
+        ),
+        "webp" => Some(n >= 12 && header[..4] == *b"RIFF" && header[8..12] == *b"WEBP"),
+        _ => None,
+    };
+
+    match magic_match {
+        Some(false) => {
+            return Err(DownloadError::InvalidContent {
+                path: path_str,
+                reason: format!("file header does not match expected format for .{ext}"),
+            });
+        }
+        Some(true) => return Ok(()),
+        None => {}
+    }
+
+    // For unrecognized extensions, reject obvious HTML error pages.
+    let trimmed = header
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map_or(header, |pos| &header[pos..]);
+
+    if trimmed.starts_with(b"<!")
+        || trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case(b"<html")
+    {
+        return Err(DownloadError::InvalidContent {
+            path: path_str,
+            reason: "file contains HTML (likely a CDN error page)".into(),
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -417,5 +501,151 @@ mod tests {
                 .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)),
             "base32 stem should only contain A-Z and 2-7, got: {stem}"
         );
+    }
+
+    // --- Content validation tests ---
+
+    fn write_temp_file(name: &str, content: &[u8]) -> (PathBuf, PathBuf) {
+        let dir = PathBuf::from("/tmp/claude/validate_content_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part_path = dir.join(format!("{name}.part"));
+        let download_path = dir.join(name);
+        std::fs::write(&part_path, content).unwrap();
+        (part_path, download_path)
+    }
+
+    #[test]
+    fn validate_rejects_html_doctype_as_jpeg() {
+        let (part, dest) = write_temp_file("photo.jpg", b"<!DOCTYPE html><html>");
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn validate_rejects_html_tag_as_heic() {
+        let (part, dest) = write_temp_file("photo.heic", b"<html><head></head>");
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    #[test]
+    fn validate_accepts_valid_jpeg() {
+        let (part, dest) = write_temp_file("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_valid_png() {
+        let (part, dest) = write_temp_file(
+            "photo.png",
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        );
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_valid_heic() {
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x1C]); // box size
+        buf[4..8].copy_from_slice(b"ftyp");
+        buf[8..12].copy_from_slice(b"heic");
+        let (part, dest) = write_temp_file("photo.heic", &buf);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_valid_mov() {
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x14]);
+        buf[4..8].copy_from_slice(b"ftyp");
+        buf[8..12].copy_from_slice(b"qt  ");
+        let (part, dest) = write_temp_file("clip.mov", &buf);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_html_error_page_as_mov() {
+        let html = b"<!DOCTYPE html>\n<html><body>Service Temporarily Unavailable</body></html>";
+        let (part, dest) = write_temp_file("clip.mov", html);
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_html_for_unknown_extension() {
+        let (part, dest) = write_temp_file("file.xyz", b"<!DOCTYPE html><html>");
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_html_with_leading_whitespace() {
+        let (part, dest) = write_temp_file("file.dat", b"  \n<!DOCTYPE html>");
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    #[test]
+    fn validate_accepts_xml_for_unknown_extension() {
+        // AAE files are XML plists — should not be rejected
+        let (part, dest) = write_temp_file("photo.aae", b"<?xml version=\"1.0\"?>");
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_empty_file() {
+        let (part, dest) = write_temp_file("empty.jpg", b"");
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_wrong_magic_for_png() {
+        // Write JPEG magic but with .png extension
+        let (part, dest) = write_temp_file("photo.png", &[0xFF, 0xD8, 0xFF, 0xE0]);
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    #[test]
+    fn validate_accepts_gif() {
+        let (part, dest) = write_temp_file("anim.gif", b"GIF89a\x01\x00\x01\x00");
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_tiff_little_endian() {
+        let (part, dest) = write_temp_file("photo.tiff", &[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00]);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_tiff_big_endian() {
+        let (part, dest) = write_temp_file("photo.tif", &[0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x08]);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_webp() {
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(b"RIFF");
+        buf[4..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]); // file size (irrelevant)
+        buf[8..12].copy_from_slice(b"WEBP");
+        let (part, dest) = write_temp_file("photo.webp", &buf);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_arbitrary_binary_for_unknown_extension() {
+        // Random binary data with unknown extension should pass
+        let (part, dest) = write_temp_file("data.bin", &[0x00, 0x01, 0x02, 0xFF, 0xFE]);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_html_case_insensitive() {
+        let (part, dest) = write_temp_file("file.dat", b"<HTML><HEAD>");
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
 }
