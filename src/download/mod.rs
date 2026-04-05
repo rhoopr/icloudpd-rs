@@ -2063,20 +2063,77 @@ async fn download_single_task(
         "downloading",
     );
 
+    // Determine if EXIF modification is needed so we can keep the .part file
+    // around for modification before the atomic rename to the final path.
+    let needs_exif = set_exif && {
+        let ext = task
+            .download_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg")
+    };
+
     Box::pin(file::download_file(
         client,
         &task.url,
         &task.download_path,
         &task.checksum,
-        false,
         retry_config,
         temp_suffix,
+        needs_exif,
     ))
     .await?;
 
-    let mtime_path = task.download_path.clone();
+    // When EXIF is needed, modifications happen on the .part file before
+    // the atomic rename, preventing silent corruption on power loss / SIGKILL.
+    let part_path = if needs_exif {
+        Some(
+            file::temp_download_path(&task.download_path, &task.checksum, temp_suffix)
+                .context("failed to compute part path")?,
+        )
+    } else {
+        None
+    };
+
+    let mut exif_ok = true;
+    if let Some(part) = &part_path {
+        let exif_path = part.clone();
+        let date_str = task.created_local.format("%Y:%m:%d %H:%M:%S").to_string();
+        let exif_result =
+            tokio::task::spawn_blocking(move || match exif::get_photo_exif(&exif_path) {
+                Ok(None) => {
+                    if let Err(e) = exif::set_photo_exif(&exif_path, &date_str) {
+                        tracing::warn!(path = %exif_path.display(), error = %e, "Failed to set EXIF");
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Ok(Some(_)) => true,
+                Err(e) => {
+                    tracing::warn!(path = %exif_path.display(), error = %e, "Failed to read EXIF");
+                    false
+                }
+            })
+            .await;
+        match exif_result {
+            Ok(ok) => exif_ok = ok,
+            Err(e) => {
+                tracing::warn!(error = %e, "EXIF task panicked");
+                exif_ok = false;
+            }
+        }
+    }
+
+    // Set mtime on .part (before rename) or final path directly.
+    // rename() preserves mtime so this works in both cases.
+    let mtime_target = part_path
+        .as_deref()
+        .unwrap_or(&task.download_path)
+        .to_path_buf();
     let ts = task.created_local.timestamp();
-    if let Err(e) = tokio::task::spawn_blocking(move || set_file_mtime(&mtime_path, ts)).await? {
+    if let Err(e) = tokio::task::spawn_blocking(move || set_file_mtime(&mtime_target, ts)).await? {
         tracing::warn!(
             path = %task.download_path.display(),
             error = %e,
@@ -2084,57 +2141,20 @@ async fn download_single_task(
         );
     }
 
-    tracing::debug!(path = %task.download_path.display(), "Downloaded");
-
-    let mut exif_ok = true;
-    if set_exif {
-        let ext = task
-            .download_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        if matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg") {
-            let exif_path = task.download_path.clone();
-            let date_str = task.created_local.format("%Y:%m:%d %H:%M:%S").to_string();
-            let exif_result =
-                tokio::task::spawn_blocking(move || match exif::get_photo_exif(&exif_path) {
-                    Ok(None) => {
-                        if let Err(e) = exif::set_photo_exif(&exif_path, &date_str) {
-                            tracing::warn!(path = %exif_path.display(), error = %e, "Failed to set EXIF");
-                            false
-                        } else {
-                            true
-                        }
-                    }
-                    Ok(Some(_)) => true,
-                    Err(e) => {
-                        tracing::warn!(path = %exif_path.display(), error = %e, "Failed to read EXIF");
-                        false
-                    }
-                })
-                .await;
-            match exif_result {
-                Ok(ok) => exif_ok = ok,
-                Err(e) => {
-                    tracing::warn!(error = %e, "EXIF task panicked");
-                    exif_ok = false;
-                }
-            }
-
-            // Restore mtime after EXIF modification (EXIF write updates mtime to "now")
-            let mtime_path2 = task.download_path.clone();
-            let ts2 = task.created_local.timestamp();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || set_file_mtime(&mtime_path2, ts2)).await?
-            {
-                tracing::warn!(
-                    path = %task.download_path.display(),
-                    error = %e,
-                    "Could not restore mtime"
-                );
-            }
-        }
+    // Atomic rename: .part → final (only when EXIF path was used)
+    if let Some(part) = &part_path {
+        tokio::fs::rename(part, &task.download_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to rename {} to {}",
+                    part.display(),
+                    task.download_path.display()
+                )
+            })?;
     }
+
+    tracing::debug!(path = %task.download_path.display(), "Downloaded");
 
     // Compute SHA-256 of the final file for local verification
     let local_checksum = file::compute_sha256(&task.download_path).await?;

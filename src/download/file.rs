@@ -13,7 +13,7 @@ use crate::retry::{self, RetryAction, RetryConfig};
 /// Derive a deterministic .part filename from the checksum so that
 /// concurrent downloads of different files don't collide. Base32-encoded
 /// because base64 contains `/` which is invalid in filenames.
-fn temp_download_path(
+pub(super) fn temp_download_path(
     download_path: &Path,
     checksum: &str,
     temp_suffix: &str,
@@ -30,22 +30,19 @@ fn temp_download_path(
 ///
 /// Resumes partial downloads via HTTP Range requests when a .part file
 /// already exists. Falls back to a full download if the server ignores the
-/// Range header. On completion the .part file is renamed to the final
-/// destination path. Retries with exponential backoff on transient failures.
+/// Range header. When `skip_rename` is false, the .part file is renamed to
+/// the final destination on success. When true, the .part file is left in
+/// place so the caller can modify it before performing the rename.
+/// Retries with exponential backoff on transient failures.
 pub(super) async fn download_file(
     client: &Client,
     url: &str,
     download_path: &Path,
     checksum: &str,
-    dry_run: bool,
     retry_config: &RetryConfig,
     temp_suffix: &str,
+    skip_rename: bool,
 ) -> Result<(), DownloadError> {
-    if dry_run {
-        tracing::info!(path = %download_path.display(), "[DRY RUN] Would download");
-        return Ok(());
-    }
-
     let part_path =
         temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
 
@@ -58,7 +55,16 @@ pub(super) async fn download_file(
                 RetryAction::Abort
             }
         },
-        || async { Box::pin(attempt_download(client, url, download_path, &part_path)).await },
+        || async {
+            Box::pin(attempt_download(
+                client,
+                url,
+                download_path,
+                &part_path,
+                skip_rename,
+            ))
+            .await
+        },
     ))
     .await
 }
@@ -73,6 +79,7 @@ async fn attempt_download(
     url: &str,
     download_path: &Path,
     part_path: &Path,
+    skip_rename: bool,
 ) -> Result<(), DownloadError> {
     let path_str = download_path.display().to_string();
 
@@ -173,7 +180,9 @@ async fn attempt_download(
     // to catch truncated downloads. The fileChecksum is used for temp filename
     // derivation and change detection across syncs.
 
-    fs::rename(&part_path, download_path).await?;
+    if !skip_rename {
+        fs::rename(&part_path, download_path).await?;
+    }
 
     Ok(())
 }
@@ -404,7 +413,8 @@ mod tests {
         // Base32 alphabet is A-Z, 2-7 — verify the stem uses only those
         let stem = filename.strip_suffix(".kei-tmp").unwrap();
         assert!(
-            stem.chars().all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)),
+            stem.chars()
+                .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c)),
             "base32 stem should only contain A-Z and 2-7, got: {stem}"
         );
     }
