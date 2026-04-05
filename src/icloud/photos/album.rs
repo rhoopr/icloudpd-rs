@@ -52,7 +52,7 @@ pub struct PhotoAlbumConfig {
     pub obj_type: String,
     pub query_filter: Option<Value>,
     pub page_size: usize,
-    pub zone_id: Value,
+    pub zone_id: Arc<Value>,
 }
 
 pub struct PhotoAlbum {
@@ -64,7 +64,7 @@ pub struct PhotoAlbum {
     obj_type: String,
     query_filter: Option<Value>,
     page_size: usize,
-    zone_id: Value,
+    zone_id: Arc<Value>,
 }
 
 impl std::fmt::Debug for PhotoAlbum {
@@ -116,7 +116,7 @@ impl PhotoAlbum {
                     "recordType": "HyperionIndexCountLookup",
                 },
                 "zoneWide": true,
-                "zoneID": self.zone_id,
+                "zoneID": *self.zone_id,
             }]
         });
 
@@ -237,7 +237,7 @@ impl PhotoAlbum {
         let session = self.session.clone_box();
         let service_endpoint = self.service_endpoint.clone();
         let params = Arc::clone(&self.params);
-        let zone_id = self.zone_id.clone();
+        let zone_id = Arc::clone(&self.zone_id);
         let initial_token = sync_token.to_string();
         let album_name = self.name.clone();
 
@@ -466,7 +466,7 @@ impl PhotoAlbum {
         let list_type = self.list_type.clone();
         let query_filter = self.query_filter.clone();
         let page_size = self.page_size;
-        let zone_id = self.zone_id.clone();
+        let zone_id = Arc::clone(&self.zone_id);
 
         tokio::spawn(async move {
             let mut offset = start_offset;
@@ -707,7 +707,7 @@ mod tests {
                 obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
                 query_filter,
                 page_size,
-                zone_id,
+                zone_id: Arc::new(zone_id),
             },
             Box::new(StubSession),
         )
@@ -886,7 +886,7 @@ mod tests {
                 obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
                 query_filter: None,
                 page_size,
-                zone_id: default_zone(),
+                zone_id: Arc::new(default_zone()),
             },
             session,
         )

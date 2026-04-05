@@ -59,7 +59,7 @@ impl PhotosService {
 
         let params = Arc::new(params);
         let service_endpoint = Self::build_service_endpoint(&service_root, "private");
-        let zone_id = json!({"zoneName": "PrimarySync"});
+        let zone_id = Arc::new(json!({"zoneName": "PrimarySync"}));
 
         let lib_session = session.clone_box();
 
@@ -189,7 +189,7 @@ impl PhotosService {
                 continue;
             }
             let zone_name = zone.zone_id.zone_name.clone();
-            let zone_id = serde_json::to_value(&zone.zone_id)?;
+            let zone_id = Arc::new(serde_json::to_value(&zone.zone_id)?);
             let ep = self.get_service_endpoint(library_type);
             let lib_session = self.session.clone_box();
 

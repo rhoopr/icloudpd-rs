@@ -29,7 +29,7 @@ pub struct PhotoLibrary {
     service_endpoint: String,
     params: Arc<HashMap<String, Value>>,
     session: Box<dyn PhotosSession>,
-    zone_id: Value,
+    zone_id: Arc<Value>,
     library_type: String,
 }
 
@@ -39,7 +39,7 @@ impl Clone for PhotoLibrary {
             service_endpoint: self.service_endpoint.clone(),
             params: Arc::clone(&self.params),
             session: self.session.clone_box(),
-            zone_id: self.zone_id.clone(),
+            zone_id: Arc::clone(&self.zone_id),
             library_type: self.library_type.clone(),
         }
     }
@@ -60,7 +60,7 @@ impl PhotoLibrary {
         service_endpoint: String,
         params: Arc<HashMap<String, Value>>,
         session: Box<dyn PhotosSession>,
-        zone_id: Value,
+        zone_id: Arc<Value>,
         library_type: String,
     ) -> Result<Self, ICloudError> {
         let url = format!(
@@ -70,7 +70,7 @@ impl PhotoLibrary {
         );
         let body = json!({
             "query": {"recordType": "CheckIndexingState"},
-            "zoneID": &zone_id,
+            "zoneID": &*zone_id,
         });
 
         let response = super::session::retry_post(
@@ -137,7 +137,7 @@ impl PhotoLibrary {
                             obj_type: def.obj_type.to_string(),
                             query_filter: def.query_filter,
                             page_size: DEFAULT_PAGE_SIZE,
-                            zone_id: self.zone_id.clone(),
+                            zone_id: Arc::clone(&self.zone_id),
                         },
                         self.clone_session(),
                     ),
@@ -189,7 +189,7 @@ impl PhotoLibrary {
                             obj_type: folder_obj_type,
                             query_filter,
                             page_size: DEFAULT_PAGE_SIZE,
-                            zone_id: self.zone_id.clone(),
+                            zone_id: Arc::clone(&self.zone_id),
                         },
                         self.clone_session(),
                     ),
@@ -210,7 +210,7 @@ impl PhotoLibrary {
                 obj_type: QUERY_ALL_OBJ.to_string(),
                 query_filter: None,
                 page_size: DEFAULT_PAGE_SIZE,
-                zone_id: self.zone_id.clone(),
+                zone_id: Arc::clone(&self.zone_id),
             },
             self.clone_session(),
         )
@@ -227,7 +227,7 @@ impl PhotoLibrary {
                 obj_type: QUERY_DELETED_OBJ.to_string(),
                 query_filter: None,
                 page_size: DEFAULT_PAGE_SIZE,
-                zone_id: self.zone_id.clone(),
+                zone_id: Arc::clone(&self.zone_id),
             },
             self.clone_session(),
         )
@@ -241,7 +241,7 @@ impl PhotoLibrary {
         );
         let body = json!({
             "query": {"recordType": "CPLAlbumByPositionLive"},
-            "zoneID": &self.zone_id,
+            "zoneID": &*self.zone_id,
         });
         let response = super::session::retry_post(
             self.session.as_ref(),
@@ -278,7 +278,7 @@ impl PhotoLibrary {
             service_endpoint: "https://stub.example.com".to_string(),
             params: Arc::new(HashMap::new()),
             session,
-            zone_id: json!({"zoneName": "PrimarySync"}),
+            zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
             library_type: "private".to_string(),
         }
     }
@@ -323,7 +323,7 @@ mod tests {
             service_endpoint: "https://example.com".to_string(),
             params: Arc::new(HashMap::new()),
             session: Box::new(StubSession),
-            zone_id,
+            zone_id: Arc::new(zone_id),
             library_type: "personal".to_string(),
         }
     }
