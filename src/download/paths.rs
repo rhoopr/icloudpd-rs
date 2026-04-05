@@ -971,32 +971,18 @@ mod tests {
             .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
             .unwrap();
 
-        // Literal traversal: "../../etc" — ".." components must be neutralised
-        let result = local_download_path(dir, "../../etc", &date, "passwd");
-        let result_str = result.to_string_lossy();
-        assert!(
-            result_str.starts_with("/photos/"),
-            "path escaped directory: {result_str}"
+        // ".." components are neutralised — path stays inside directory
+        assert_eq!(
+            local_download_path(dir, "../../etc", &date, "passwd"),
+            PathBuf::from("/photos/_/_/etc/passwd")
         );
-        assert!(
-            !result_str.contains(".."),
-            "traversal not sanitized: {result_str}"
+        assert_eq!(
+            local_download_path(dir, "../../%Y", &date, "photo.jpg"),
+            PathBuf::from("/photos/_/_/2025/photo.jpg")
         );
-
-        // Traversal mixed with date tokens: "../../%Y"
-        let result = local_download_path(dir, "../../%Y", &date, "photo.jpg");
-        let result_str = result.to_string_lossy();
-        assert!(
-            result_str.starts_with("/photos/"),
-            "path escaped directory: {result_str}"
-        );
-
-        // Python-style wrapper with traversal
-        let result = local_download_path(dir, "{:../../%Y}", &date, "photo.jpg");
-        let result_str = result.to_string_lossy();
-        assert!(
-            result_str.starts_with("/photos/"),
-            "path escaped directory: {result_str}"
+        assert_eq!(
+            local_download_path(dir, "{:../../%Y}", &date, "photo.jpg"),
+            PathBuf::from("/photos/_/_/2025/photo.jpg")
         );
     }
 
