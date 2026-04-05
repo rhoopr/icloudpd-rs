@@ -234,7 +234,6 @@ fn validate_downloaded_content(
     }
 
     let header = &buf[..n];
-    let path_str = download_path.display().to_string();
 
     let ext = download_path
         .extension()
@@ -261,7 +260,7 @@ fn validate_downloaded_content(
     match magic_match {
         Some(false) => {
             return Err(DownloadError::InvalidContent {
-                path: path_str,
+                path: download_path.display().to_string(),
                 reason: format!("file header does not match expected format for .{ext}"),
             });
         }
@@ -279,7 +278,7 @@ fn validate_downloaded_content(
         || trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case(b"<html")
     {
         return Err(DownloadError::InvalidContent {
-            path: path_str,
+            path: download_path.display().to_string(),
             reason: "file contains HTML (likely a CDN error page)".into(),
         });
     }
