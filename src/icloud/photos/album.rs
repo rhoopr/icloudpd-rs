@@ -605,8 +605,7 @@ impl PhotoAlbum {
                         record_count,
                         advance,
                         offset,
-                        "Page returned {record_count} records but no CPLMaster entries; \
-                         advancing offset by {advance}",
+                        "Page returned records but no CPLMaster entries; advancing offset",
                     );
                 }
 
