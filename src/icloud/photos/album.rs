@@ -522,6 +522,11 @@ impl PhotoAlbum {
                 let query: super::cloudkit::QueryResponse = match serde_json::from_value(response) {
                     Ok(q) => q,
                     Err(e) => {
+                        tracing::warn!(
+                            album = %name,
+                            error = %e,
+                            "Failed to deserialize fetcher response (body logged above at DEBUG)",
+                        );
                         let _ = tx.send(Err(e.into())).await;
                         return;
                     }
@@ -692,7 +697,11 @@ mod tests {
         }
     }
 
-    fn make_album(page_size: usize, query_filter: Option<Arc<Value>>, zone_id: Value) -> PhotoAlbum {
+    fn make_album(
+        page_size: usize,
+        query_filter: Option<Arc<Value>>,
+        zone_id: Value,
+    ) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),

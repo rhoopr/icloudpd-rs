@@ -237,13 +237,13 @@ impl Session {
                             })
                             .collect()
                     }
-                    Err(_) => {
-                        tracing::info!("Session file corrupt, starting fresh");
+                    Err(e) => {
+                        tracing::info!(path = %session_path.display(), error = %e, "Session file corrupt, starting fresh");
                         HashMap::new()
                     }
                 },
-                Err(_) => {
-                    tracing::info!("Session file does not exist");
+                Err(e) => {
+                    tracing::info!(path = %session_path.display(), error = %e, "Could not read session file, starting fresh");
                     HashMap::new()
                 }
             }

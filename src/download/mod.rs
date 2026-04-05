@@ -2047,9 +2047,9 @@ async fn download_single_task(
     temp_suffix: &str,
 ) -> Result<(bool, String)> {
     if let Some(parent) = task.download_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!("failed to create directory {}", parent.display())
+        })?;
     }
 
     tracing::debug!(
