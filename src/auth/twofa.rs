@@ -72,11 +72,7 @@ fn check_apple_service_errors(body: &Value) -> Result<(), AuthError> {
                 .filter(|m| !m.is_empty())
                 .or_else(|| first.get("title").and_then(Value::as_str))
                 .unwrap_or("Apple reported an error");
-            let message = enrich_service_error_message(code, raw_message);
-            return Err(AuthError::ServiceError {
-                code: code.to_string(),
-                message,
-            });
+            return Err(AuthError::service_error(code, raw_message));
         }
     }
 
@@ -90,18 +86,27 @@ fn check_apple_service_errors(body: &Value) -> Result<(), AuthError> {
     Ok(())
 }
 
-/// Enrich service error messages with user-friendly context based on the error code.
-fn enrich_service_error_message(code: &str, raw_message: &str) -> String {
-    let upper = code.to_ascii_uppercase();
-    if upper == "ZONE_NOT_FOUND" || upper == "AUTHENTICATION_FAILED" {
-        format!(
-            "{raw_message}. Your iCloud account may not be fully set up — \
-             please sign in at https://icloud.com to complete setup."
-        )
-    } else if upper == "ACCESS_DENIED" {
-        format!("{raw_message}. Please wait a few minutes then try again.")
-    } else {
-        raw_message.to_string()
+/// Classify an HTTP error status from an auth endpoint into a typed `AuthError`.
+///
+/// - 421/450 → `ServiceError` ("Authentication required")
+/// - 5xx → `ServiceError` (server error with context)
+/// - anything else → calls `fallback` to produce the default error
+fn classify_auth_http_error(
+    status: u16,
+    text: &str,
+    context: &str,
+    fallback: impl FnOnce() -> AuthError,
+) -> AuthError {
+    match status {
+        421 | 450 => AuthError::ServiceError {
+            code: format!("http_{status}"),
+            message: "Authentication required for this account. Please re-authenticate.".into(),
+        },
+        s if s >= 500 => AuthError::ServiceError {
+            code: format!("http_{s}"),
+            message: format!("Apple server error during {context} (HTTP {s}): {text}"),
+        },
+        _ => fallback(),
     }
 }
 
@@ -302,23 +307,13 @@ pub async fn validate_token(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        return match status.as_u16() {
-            421 | 450 => Err(AuthError::ServiceError {
-                code: format!("http_{}", status.as_u16()),
-                message: "Authentication required for this account. Please re-authenticate."
-                    .to_string(),
-            }
-            .into()),
-            s if s >= 500 => Err(AuthError::ServiceError {
-                code: format!("http_{s}"),
-                message: format!("Apple server error during validation (HTTP {s}): {text}"),
-            }
-            .into()),
-            _ => {
+        return Err(
+            classify_auth_http_error(status.as_u16(), &text, "validation", || {
                 tracing::debug!("Invalid authentication token");
-                Err(AuthError::InvalidToken(text).into())
-            }
-        };
+                AuthError::InvalidToken(text.clone())
+            })
+            .into(),
+        );
     }
 
     let response = reject_on_rscd(response).await?;
@@ -353,22 +348,12 @@ pub async fn authenticate_with_token(
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        return match status.as_u16() {
-            421 | 450 => Err(AuthError::ServiceError {
-                code: format!("http_{}", status.as_u16()),
-                message: "Authentication required for this account. Please re-authenticate."
-                    .to_string(),
-            }
-            .into()),
-            s if s >= 500 => Err(AuthError::ServiceError {
-                code: format!("http_{s}"),
-                message: format!("Apple server error during login (HTTP {s}): {text}"),
-            }
-            .into()),
-            _ => {
-                Err(AuthError::FailedLogin(format!("Invalid authentication token: {text}")).into())
-            }
-        };
+        return Err(
+            classify_auth_http_error(status.as_u16(), &text, "login", || {
+                AuthError::FailedLogin(format!("Invalid authentication token: {text}"))
+            })
+            .into(),
+        );
     }
 
     let response = reject_on_rscd(response).await?;
@@ -576,31 +561,6 @@ mod tests {
             .unwrap();
         let resp = Response::from(response);
         assert!(check_apple_rscd(&resp).is_none());
-    }
-
-    #[test]
-    fn test_enrich_zone_not_found() {
-        let msg = enrich_service_error_message("ZONE_NOT_FOUND", "Zone not found");
-        assert!(msg.contains("icloud.com"));
-        assert!(msg.contains("set up"));
-    }
-
-    #[test]
-    fn test_enrich_authentication_failed() {
-        let msg = enrich_service_error_message("AUTHENTICATION_FAILED", "Auth failed");
-        assert!(msg.contains("set up"));
-    }
-
-    #[test]
-    fn test_enrich_access_denied() {
-        let msg = enrich_service_error_message("ACCESS_DENIED", "Denied");
-        assert!(msg.contains("wait a few minutes"));
-    }
-
-    #[test]
-    fn test_enrich_other_code_unchanged() {
-        let msg = enrich_service_error_message("UNKNOWN_ERROR", "Something broke");
-        assert_eq!(msg, "Something broke");
     }
 
     #[test]

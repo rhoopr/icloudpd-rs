@@ -65,11 +65,7 @@ impl AccountLoginResponse {
             } else {
                 err.message.clone()
             };
-            let message = enrich_error_message(&err.code, &raw_message);
-            return Err(AuthError::ServiceError {
-                code: err.code.clone(),
-                message,
-            });
+            return Err(AuthError::service_error(&err.code, &raw_message));
         }
         if self.has_error {
             return Err(AuthError::ServiceError {
@@ -78,21 +74,6 @@ impl AccountLoginResponse {
             });
         }
         Ok(())
-    }
-}
-
-/// Enrich service error messages with user-friendly context based on the error code.
-fn enrich_error_message(code: &str, raw_message: &str) -> String {
-    let upper = code.to_ascii_uppercase();
-    if upper == "ZONE_NOT_FOUND" || upper == "AUTHENTICATION_FAILED" {
-        format!(
-            "{raw_message}. Your iCloud account may not be fully set up — \
-             please sign in at https://icloud.com to complete setup."
-        )
-    } else if upper == "ACCESS_DENIED" {
-        format!("{raw_message}. Please wait a few minutes then try again.")
-    } else {
-        raw_message.to_string()
     }
 }
 

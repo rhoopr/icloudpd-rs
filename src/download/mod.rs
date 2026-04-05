@@ -514,29 +514,24 @@ fn extract_skip_candidates<'a>(
     let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
         versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     };
-    let primary = match get_version(&config.size) {
-        Some(v) => Some((v, config.size)),
-        None if config.size != AssetVersionSize::Original && !config.force_size => {
-            get_version(&AssetVersionSize::Original).map(|v| (v, AssetVersionSize::Original))
-        }
-        _ => None,
-    };
+    let primary = version_with_fallback(
+        &get_version,
+        config.size,
+        AssetVersionSize::Original,
+        config.force_size,
+    );
     if let Some((v, effective_size)) = primary {
         result.push((VersionSizeKey::from(effective_size), v.checksum.as_ref()));
     }
 
     // Live photo companion (with fallback to LiveOriginal, mirrors primary logic)
     if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
-        let live = match get_version(&config.live_photo_size) {
-            Some(v) => Some((v, config.live_photo_size)),
-            None if config.live_photo_size != AssetVersionSize::LiveOriginal
-                && !config.force_size =>
-            {
-                get_version(&AssetVersionSize::LiveOriginal)
-                    .map(|v| (v, AssetVersionSize::LiveOriginal))
-            }
-            _ => None,
-        };
+        let live = version_with_fallback(
+            &get_version,
+            config.live_photo_size,
+            AssetVersionSize::LiveOriginal,
+            config.force_size,
+        );
         if let Some((v, effective_live_size)) = live {
             result.push((
                 VersionSizeKey::from(effective_live_size),
@@ -546,6 +541,24 @@ fn extract_skip_candidates<'a>(
     }
 
     result
+}
+
+/// Look up a version by key, falling back to `fallback_key` when the requested
+/// size is unavailable (unless `force_size` is set). Shared by both
+/// `extract_skip_candidates` and `filter_asset_to_tasks`.
+fn version_with_fallback<'a>(
+    get_version: &dyn Fn(&AssetVersionSize) -> Option<&'a AssetVersion>,
+    requested: AssetVersionSize,
+    fallback: AssetVersionSize,
+    force_size: bool,
+) -> Option<(&'a AssetVersion, AssetVersionSize)> {
+    match get_version(&requested) {
+        Some(v) => Some((v, requested)),
+        None if requested != fallback && !force_size => {
+            get_version(&fallback).map(|v| (v, fallback))
+        }
+        _ => None,
+    }
 }
 
 /// Apply content filters (type, date range) and local existence check,
@@ -623,15 +636,14 @@ fn filter_asset_to_tasks(
     // unavailable (unless --force-size is set). Matches Python's behavior.
     // Track the effective size so we only add "-medium"/"-thumb" suffix when
     // the asset actually has that version (not on fallback to Original).
-    let (version, effective_size) = match get_version(&config.size) {
-        Some(v) => (Some(v), config.size),
-        None if config.size != AssetVersionSize::Original && !config.force_size => {
-            match get_version(&AssetVersionSize::Original) {
-                Some(v) => (Some(v), AssetVersionSize::Original),
-                None => (None, config.size),
-            }
-        }
-        _ => (None, config.size),
+    let (version, effective_size) = match version_with_fallback(
+        &get_version,
+        config.size,
+        AssetVersionSize::Original,
+        config.force_size,
+    ) {
+        Some((v, s)) => (Some(v), s),
+        None => (None, config.size),
     };
     if let Some(version) = version {
         // Map the file extension based on the version's UTI asset_type
@@ -777,21 +789,18 @@ fn filter_asset_to_tasks(
         }
     }
 
-    // Live photo MOV companion — only for images
+    // Live photo MOV companion — only for images.
     // Falls back from LiveAdjusted → LiveOriginal when adjusted isn't available
     // (mirrors the primary version fallback logic), unless --force-size is set.
     if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
-        let (live_version_opt, effective_live_size) = match get_version(&config.live_photo_size) {
-            Some(v) => (Some(v), config.live_photo_size),
-            None if config.live_photo_size != AssetVersionSize::LiveOriginal
-                && !config.force_size =>
-            {
-                match get_version(&AssetVersionSize::LiveOriginal) {
-                    Some(v) => (Some(v), AssetVersionSize::LiveOriginal),
-                    None => (None, config.live_photo_size),
-                }
-            }
-            _ => (None, config.live_photo_size),
+        let (live_version_opt, effective_live_size) = match version_with_fallback(
+            &get_version,
+            config.live_photo_size,
+            AssetVersionSize::LiveOriginal,
+            config.force_size,
+        ) {
+            Some((v, s)) => (Some(v), s),
+            None => (None, config.live_photo_size),
         };
         if let Some(live_version) = live_version_opt {
             // Derive the MOV filename from the effective primary filename (which
