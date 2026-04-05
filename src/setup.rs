@@ -187,6 +187,12 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     );
     std::fs::write(&env_path, &env_content)
         .with_context(|| format!("Failed to write {}", env_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on {}", env_path.display()))?;
+    }
 
     println!();
     println!("Config written to:  {}", config_path.display());
