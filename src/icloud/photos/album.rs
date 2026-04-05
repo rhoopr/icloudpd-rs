@@ -685,13 +685,6 @@ mod tests {
         ) -> anyhow::Result<Value> {
             unimplemented!("stub")
         }
-        async fn get(
-            &self,
-            _url: &str,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<reqwest::Response> {
-            unimplemented!("stub")
-        }
         fn clone_box(&self) -> Box<dyn PhotosSession> {
             Box::new(StubSession)
         }
@@ -854,13 +847,6 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| json!({"records": []}));
             Ok(next)
-        }
-        async fn get(
-            &self,
-            _url: &str,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<reqwest::Response> {
-            unimplemented!("stub")
         }
         fn clone_box(&self) -> Box<dyn PhotosSession> {
             // Clone-box snapshots remaining responses so the spawned fetcher

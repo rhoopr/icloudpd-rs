@@ -31,7 +31,7 @@ pub trait StateDb: Send + Sync {
     /// Note: In the optimized flow, the caller pre-loads downloaded IDs and
     /// checksums using `get_downloaded_ids()` and `get_downloaded_checksums()`
     /// for O(1) skip decisions, falling back to filesystem checks for edge cases.
-    #[allow(dead_code)]
+    #[cfg(test)]
     async fn should_download(
         &self,
         id: &str,
@@ -58,7 +58,7 @@ pub trait StateDb: Send + Sync {
     ///
     /// Note: The download engine uses `mark_failed_batch` for efficiency.
     /// This method is retained for API completeness with `mark_downloaded`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     async fn mark_failed(
         &self,
         id: &str,
@@ -207,6 +207,7 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl StateDb for SqliteStateDb {
+    #[cfg(test)]
     async fn should_download(
         &self,
         id: &str,
@@ -343,6 +344,7 @@ impl StateDb for SqliteStateDb {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn mark_failed(
         &self,
         id: &str,

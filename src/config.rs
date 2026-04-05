@@ -167,8 +167,6 @@ pub struct Config {
     pub size: VersionSize,
     pub live_photo_size: LivePhotoSize,
     pub domain: Domain,
-    #[allow(dead_code)] // Copied from CLI but read from cli.log_level directly in main.rs
-    pub log_level: LogLevel,
     pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub align_raw: RawTreatmentPolicy,
     pub file_match_policy: FileMatchPolicy,
@@ -261,7 +259,6 @@ impl Config {
     pub fn build(
         auth: crate::cli::AuthArgs,
         sync: crate::cli::SyncArgs,
-        log_level: Option<LogLevel>,
         toml: Option<TomlConfig>,
     ) -> anyhow::Result<Self> {
         let (username, password, domain, cookie_directory) = resolve_auth(&auth, &toml);
@@ -400,13 +397,6 @@ impl Config {
             .or_else(|| toml_notif.and_then(|n| n.script.clone()))
             .map(|s| expand_tilde(&s));
 
-        // Log level
-        let resolved_log_level = resolve(
-            log_level,
-            toml.as_ref().and_then(|t| t.log_level),
-            LogLevel::Info,
-        );
-
         Ok(Self {
             username,
             password,
@@ -428,7 +418,6 @@ impl Config {
             size,
             live_photo_size,
             domain,
-            log_level: resolved_log_level,
             live_photo_mov_filename_policy,
             align_raw,
             file_match_policy,
@@ -713,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_build_defaults_no_toml() {
-        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
         assert_eq!(cfg.username, "u@example.com");
         assert_eq!(cfg.threads_num, 10);
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
@@ -726,7 +715,6 @@ mod tests {
         assert_eq!(cfg.temp_suffix, ".kei-tmp");
         assert!(matches!(cfg.size, VersionSize::Original));
         assert!(matches!(cfg.domain, Domain::Com));
-        assert!(matches!(cfg.log_level, LogLevel::Info));
     }
 
     #[test]
@@ -740,7 +728,7 @@ mod tests {
             library = "SharedSync-ABC"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.threads_num, 4);
         assert_eq!(cfg.folder_structure, "%Y-%m");
         assert_eq!(
@@ -764,7 +752,7 @@ mod tests {
         sync.threads_num = Some(8);
         sync.library = Some("PrimarySync".to_string());
 
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.threads_num, 8);
         assert_eq!(
             cfg.library,
@@ -776,7 +764,7 @@ mod tests {
     fn test_library_all_value() {
         let mut sync = default_sync();
         sync.library = Some("all".to_string());
-        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
         assert_eq!(cfg.library, LibrarySelection::All);
     }
 
@@ -784,7 +772,7 @@ mod tests {
     fn test_library_all_case_insensitive() {
         let mut sync = default_sync();
         sync.library = Some("ALL".to_string());
-        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
         assert_eq!(cfg.library, LibrarySelection::All);
     }
 
@@ -795,13 +783,13 @@ mod tests {
             library = "all"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.library, LibrarySelection::All);
     }
 
     #[test]
     fn test_build_hardcoded_default_when_both_absent() {
-        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
         assert_eq!(cfg.threads_num, 10);
         assert!(matches!(cfg.align_raw, RawTreatmentPolicy::Unchanged));
     }
@@ -816,7 +804,7 @@ mod tests {
             skip_videos = true
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(cfg.set_exif_datetime);
         assert!(cfg.skip_videos);
     }
@@ -830,7 +818,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.skip_videos = true;
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(cfg.skip_videos);
     }
 
@@ -841,7 +829,7 @@ mod tests {
             threads_num = 0
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let result = Config::build(default_auth(), default_sync(), None, Some(toml));
+        let result = Config::build(default_auth(), default_sync(), Some(toml));
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("threads_num"),
@@ -858,7 +846,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut auth = default_auth();
         auth.username = None; // Simulate no CLI username
-        let cfg = Config::build(auth, default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(auth, default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.username, "toml@example.com");
     }
 
@@ -869,7 +857,7 @@ mod tests {
             username = "toml@example.com"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.username, "u@example.com");
     }
 
@@ -880,7 +868,7 @@ mod tests {
             albums = ["Favorites", "Vacation"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.albums, vec!["Favorites", "Vacation"]);
     }
 
@@ -893,34 +881,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.albums = vec!["Screenshots".to_string()];
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.albums, vec!["Screenshots"]);
-    }
-
-    #[test]
-    fn test_build_log_level_from_toml() {
-        let toml_str = r#"
-            log_level = "debug"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
-        assert!(matches!(cfg.log_level, LogLevel::Debug));
-    }
-
-    #[test]
-    fn test_build_cli_log_level_overrides_toml() {
-        let toml_str = r#"
-            log_level = "debug"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            default_auth(),
-            default_sync(),
-            Some(LogLevel::Warn),
-            Some(toml),
-        )
-        .unwrap();
-        assert!(matches!(cfg.log_level, LogLevel::Warn));
     }
 
     #[test]
@@ -931,7 +893,7 @@ mod tests {
             pid_file = "/run/test.pid"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(1800));
         assert_eq!(cfg.pid_file, Some(PathBuf::from("/run/test.pid")));
     }
@@ -944,7 +906,7 @@ mod tests {
             skip_created_after = "2025-01-01"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(cfg.skip_created_before.is_some());
         assert!(cfg.skip_created_after.is_some());
     }
@@ -1303,7 +1265,7 @@ mod tests {
 
     #[test]
     fn test_build_all_defaults_no_toml_exhaustive() {
-        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
         // Auth
         assert_eq!(cfg.username, "u@example.com");
         assert!(cfg.password.is_none());
@@ -1349,7 +1311,6 @@ mod tests {
         assert!(!cfg.notify_systemd);
         assert!(cfg.pid_file.is_none());
         // Misc
-        assert!(matches!(cfg.log_level, LogLevel::Info));
         assert!(!cfg.auth_only);
         assert!(!cfg.list_albums);
         assert!(!cfg.list_libraries);
@@ -1368,7 +1329,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut auth = default_auth();
         auth.password = Some("cli-pw".to_string());
-        let cfg = Config::build(auth, default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(auth, default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.password.as_deref(), Some("cli-pw"));
     }
 
@@ -1379,7 +1340,7 @@ mod tests {
             password = "toml-pw"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.password.as_deref(), Some("toml-pw"));
     }
 
@@ -1392,7 +1353,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut auth = default_auth();
         auth.domain = Some(Domain::Com);
-        let cfg = Config::build(auth, default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(auth, default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.domain, Domain::Com));
     }
 
@@ -1403,7 +1364,7 @@ mod tests {
             domain = "cn"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.domain, Domain::Cn));
     }
 
@@ -1416,7 +1377,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut auth = default_auth();
         auth.cookie_directory = Some("/cli/cookies".to_string());
-        let cfg = Config::build(auth, default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(auth, default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.cookie_directory, PathBuf::from("/cli/cookies"));
     }
 
@@ -1427,7 +1388,7 @@ mod tests {
             cookie_directory = "/toml/cookies"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.cookie_directory, PathBuf::from("/toml/cookies"));
     }
 
@@ -1438,7 +1399,7 @@ mod tests {
             cookie_directory = "~/my-cookies"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         if let Some(home) = dirs::home_dir() {
             assert_eq!(cfg.cookie_directory, home.join("my-cookies"));
         }
@@ -1451,7 +1412,7 @@ mod tests {
             directory = "~/photos"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         if let Some(home) = dirs::home_dir() {
             assert_eq!(cfg.directory, home.join("photos"));
         }
@@ -1466,7 +1427,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d".to_string());
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
     }
 
@@ -1479,7 +1440,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.temp_suffix = Some(".cli-tmp".to_string());
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.temp_suffix, ".cli-tmp");
     }
 
@@ -1490,7 +1451,7 @@ mod tests {
             temp_suffix = ".downloading"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.temp_suffix, ".downloading");
     }
 
@@ -1503,7 +1464,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.max_retries = Some(10);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.max_retries, 10);
     }
 
@@ -1516,7 +1477,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.retry_delay = Some(30);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.retry_delay_secs, 30);
     }
 
@@ -1527,7 +1488,7 @@ mod tests {
             delay = 15
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.retry_delay_secs, 15);
     }
 
@@ -1540,7 +1501,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.size = Some(VersionSize::Medium);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(matches!(cfg.size, VersionSize::Medium));
     }
 
@@ -1551,7 +1512,7 @@ mod tests {
             size = "thumb"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.size, VersionSize::Thumb));
     }
 
@@ -1564,7 +1525,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.live_photo_size = Some(LivePhotoSize::Medium);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Medium));
     }
 
@@ -1575,7 +1536,7 @@ mod tests {
             live_photo_size = "thumb"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Thumb));
     }
 
@@ -1588,7 +1549,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.live_photo_mov_filename_policy = Some(LivePhotoMovFilenamePolicy::Suffix);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(matches!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Suffix
@@ -1602,7 +1563,7 @@ mod tests {
             live_photo_mov_filename_policy = "original"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Original
@@ -1618,7 +1579,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.align_raw = Some(RawTreatmentPolicy::PreferAlternative);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(matches!(
             cfg.align_raw,
             RawTreatmentPolicy::PreferAlternative
@@ -1634,7 +1595,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.file_match_policy = Some(FileMatchPolicy::NameSizeDedupWithSuffix);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(matches!(
             cfg.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
@@ -1648,7 +1609,7 @@ mod tests {
             file_match_policy = "name-id7"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.file_match_policy, FileMatchPolicy::NameId7));
     }
 
@@ -1674,7 +1635,7 @@ mod tests {
             notify_systemd = true
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(cfg.set_exif_datetime);
         assert!(cfg.no_progress_bar);
         assert!(cfg.skip_videos);
@@ -1696,7 +1657,7 @@ mod tests {
         sync.force_size = true;
         sync.keep_unicode_in_filenames = true;
         sync.notify_systemd = true;
-        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
         assert!(cfg.set_exif_datetime);
         assert!(cfg.no_progress_bar);
         assert!(cfg.skip_videos);
@@ -1715,7 +1676,7 @@ mod tests {
             skip_photos = false
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(!cfg.skip_videos);
         assert!(!cfg.skip_photos);
     }
@@ -1731,7 +1692,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.watch_with_interval = Some(600);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(600));
     }
 
@@ -1744,7 +1705,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.pid_file = Some(PathBuf::from("/cli/pid"));
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.pid_file, Some(PathBuf::from("/cli/pid")));
     }
 
@@ -1757,7 +1718,7 @@ mod tests {
             script = "/config/notify.sh"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(
             cfg.notification_script,
             Some(PathBuf::from("/config/notify.sh"))
@@ -1773,7 +1734,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.notification_script = Some("/cli/notify.sh".to_string());
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(
             cfg.notification_script,
             Some(PathBuf::from("/cli/notify.sh"))
@@ -1782,7 +1743,7 @@ mod tests {
 
     #[test]
     fn test_build_notification_script_none_by_default() {
-        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
         assert!(cfg.notification_script.is_none());
     }
 
@@ -1810,7 +1771,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.recent = Some(100);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.recent, Some(100));
     }
 
@@ -1821,7 +1782,7 @@ mod tests {
             recent = 500
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.recent, Some(500));
     }
 
@@ -1836,7 +1797,7 @@ mod tests {
         let mut sync = default_sync();
         sync.skip_created_before = Some("2023-06-01".to_string());
         sync.skip_created_after = Some("2024-06-01".to_string());
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         let before = cfg.skip_created_before.unwrap();
         assert_eq!(
             before.date_naive(),
@@ -1856,7 +1817,7 @@ mod tests {
             skip_created_before = "30d"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         let before = cfg.skip_created_before.unwrap();
         let expected = chrono::Local::now() - chrono::Duration::days(30);
         assert!((before - expected).num_seconds().abs() < 2);
@@ -1869,7 +1830,7 @@ mod tests {
             skip_created_before = "not-a-date"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let result = Config::build(default_auth(), default_sync(), None, Some(toml));
+        let result = Config::build(default_auth(), default_sync(), Some(toml));
         assert!(result.is_err());
     }
 
@@ -1917,7 +1878,7 @@ mod tests {
             pid_file = "/full/pid"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         // default_auth username overrides toml
         assert_eq!(cfg.username, "u@example.com");
         assert_eq!(cfg.password.as_deref(), Some("fullpw"));
@@ -1952,7 +1913,6 @@ mod tests {
         assert!(cfg.force_size);
         assert_eq!(cfg.watch_with_interval, Some(900));
         assert_eq!(cfg.pid_file, Some(PathBuf::from("/full/pid")));
-        assert!(matches!(cfg.log_level, LogLevel::Warn));
     }
 
     // ── resolve_auth tests ─────────────────────────────────────────
@@ -2027,13 +1987,13 @@ mod tests {
             albums = []
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(cfg.albums.is_empty());
     }
 
     #[test]
     fn test_build_albums_no_toml_no_cli() {
-        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
         assert!(cfg.albums.is_empty());
     }
 
@@ -2046,7 +2006,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.directory = Some("/cli/photos".to_string());
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/cli/photos"));
     }
 
@@ -2059,7 +2019,7 @@ mod tests {
         sync.list_albums = true;
         sync.list_libraries = true;
         sync.dry_run = true;
-        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
         assert!(cfg.auth_only);
         assert!(cfg.list_albums);
         assert!(cfg.list_libraries);

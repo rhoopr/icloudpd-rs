@@ -7,11 +7,8 @@ use crate::retry::{self, RetryAction, RetryConfig};
 /// Abstracted as a trait so album/library code can be tested with stubs
 /// without hitting the real iCloud API.
 #[async_trait::async_trait]
-#[allow(dead_code)] // get() not called yet; part of public session API for future use
 pub trait PhotosSession: Send + Sync {
     async fn post(&self, url: &str, body: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value>;
-
-    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response>;
 
     /// Clone this session into a new boxed trait object.
     fn clone_box(&self) -> Box<dyn PhotosSession>;
@@ -31,15 +28,6 @@ impl PhotosSession for reqwest::Client {
         Ok(json)
     }
 
-    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response> {
-        let mut builder = reqwest::Client::get(self, url);
-        for &(k, v) in headers {
-            builder = builder.header(k, v);
-        }
-        let resp = builder.send().await?;
-        Ok(resp)
-    }
-
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
     }
@@ -53,11 +41,6 @@ impl PhotosSession for crate::auth::SharedSession {
     async fn post(&self, url: &str, body: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value> {
         let client = self.read().await.http_client();
         PhotosSession::post(&client, url, body, headers).await
-    }
-
-    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response> {
-        let client = self.read().await.http_client();
-        PhotosSession::get(&client, url, headers).await
     }
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {

@@ -820,7 +820,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Sync { auth, sync } => (auth, sync),
         Command::RetryFailed(args) => (args.auth, args.sync),
     };
-    let config = config::Config::build(auth, sync, cli.log_level, toml_config)?;
+    let config = config::Config::build(auth, sync, toml_config)?;
 
     // Install password redaction now that we know the password
     if let Some(pw) = &config.password {

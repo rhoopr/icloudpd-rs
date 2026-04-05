@@ -277,14 +277,6 @@ mod tests {
             Ok(self.response.clone())
         }
 
-        async fn get(
-            &self,
-            _url: &str,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<reqwest::Response> {
-            panic!("CapturingSession::get should not be called");
-        }
-
         fn clone_box(&self) -> Box<dyn session::PhotosSession> {
             panic!("CapturingSession::clone_box should not be called");
         }
@@ -319,14 +311,6 @@ mod tests {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             panic!("PanicSession::post should not be called");
-        }
-
-        async fn get(
-            &self,
-            _url: &str,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<reqwest::Response> {
-            panic!("PanicSession::get should not be called");
         }
 
         fn clone_box(&self) -> Box<dyn session::PhotosSession> {

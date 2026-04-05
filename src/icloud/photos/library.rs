@@ -21,8 +21,6 @@ const DEFAULT_PAGE_SIZE: usize = 100;
 // CloudKit record/query types for photo enumeration.
 const QUERY_ALL_LIST: &str = "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted";
 const QUERY_ALL_OBJ: &str = "CPLAssetByAssetDateWithoutHiddenOrDeleted";
-const QUERY_DELETED_LIST: &str = "CPLAssetAndMasterDeletedByExpungedDate";
-const QUERY_DELETED_OBJ: &str = "CPLAssetDeletedByExpungedDate";
 const QUERY_FOLDER_LIST: &str = "CPLContainerRelationLiveByAssetDate";
 
 pub struct PhotoLibrary {
@@ -216,23 +214,6 @@ impl PhotoLibrary {
         )
     }
 
-    #[allow(dead_code)] // for --auto-delete feature
-    pub fn recently_deleted(&self) -> PhotoAlbum {
-        PhotoAlbum::new(
-            PhotoAlbumConfig {
-                params: Arc::clone(&self.params),
-                service_endpoint: self.service_endpoint.clone(),
-                name: String::new(),
-                list_type: QUERY_DELETED_LIST.to_string(),
-                obj_type: QUERY_DELETED_OBJ.to_string(),
-                query_filter: None,
-                page_size: DEFAULT_PAGE_SIZE,
-                zone_id: Arc::clone(&self.zone_id),
-            },
-            self.clone_session(),
-        )
-    }
-
     async fn fetch_folders(&self) -> anyhow::Result<Vec<super::cloudkit::Record>> {
         let url = format!(
             "{}/records/query?{}",
@@ -302,14 +283,6 @@ mod tests {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             panic!("StubSession::post should not be called in zone_name tests");
-        }
-
-        async fn get(
-            &self,
-            _url: &str,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<reqwest::Response> {
-            panic!("StubSession::get should not be called in zone_name tests");
         }
 
         fn clone_box(&self) -> Box<dyn PhotosSession> {

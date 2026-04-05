@@ -82,7 +82,7 @@ pub enum AssetStatus {
 
 impl AssetStatus {
     /// Convert to the string stored in the database.
-    #[allow(dead_code)] // Symmetric with from_str; used in tests
+    #[cfg(test)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
