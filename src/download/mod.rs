@@ -912,17 +912,11 @@ struct PendingStateWrite {
 ///
 /// Each write is attempted up to 3 times with exponential backoff (100ms, 200ms).
 /// Returns the number of writes that still failed after all retries.
-async fn flush_pending_state_writes(
-    db: &dyn StateDb,
-    pending: &[PendingStateWrite],
-) -> usize {
+async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWrite]) -> usize {
     if pending.is_empty() {
         return 0;
     }
-    tracing::info!(
-        count = pending.len(),
-        "Retrying deferred state writes"
-    );
+    tracing::info!(count = pending.len(), "Retrying deferred state writes");
     let mut failures = 0;
     for write in pending {
         let mut succeeded = false;
@@ -971,10 +965,7 @@ async fn flush_pending_state_writes(
             "Some state writes could not be saved"
         );
     } else {
-        tracing::info!(
-            count = pending.len(),
-            "All deferred state writes recovered"
-        );
+        tracing::info!(count = pending.len(), "All deferred state writes recovered");
     }
     failures
 }
@@ -4608,19 +4599,13 @@ mod tests {
         async fn start_sync_run(&self) -> Result<i64, StateError> {
             unimplemented!()
         }
-        async fn complete_sync_run(
-            &self,
-            _: i64,
-            _: &SyncRunStats,
-        ) -> Result<(), StateError> {
+        async fn complete_sync_run(&self, _: i64, _: &SyncRunStats) -> Result<(), StateError> {
             unimplemented!()
         }
         async fn reset_failed(&self) -> Result<u64, StateError> {
             unimplemented!()
         }
-        async fn get_downloaded_ids(
-            &self,
-        ) -> Result<HashSet<(String, String)>, StateError> {
+        async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
             unimplemented!()
         }
         async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
@@ -4717,7 +4702,10 @@ mod tests {
             },
         ];
         let failures = flush_pending_state_writes(&db, &pending).await;
-        assert_eq!(failures, 1, "First write should fail, second should recover");
+        assert_eq!(
+            failures, 1,
+            "First write should fail, second should recover"
+        );
         assert_eq!(db.success_count(), 1);
     }
 }
