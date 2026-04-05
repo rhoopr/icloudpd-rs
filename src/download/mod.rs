@@ -4069,4 +4069,29 @@ mod tests {
         assert_eq!(downloadable_assets.len(), 1);
         assert_eq!(downloadable_assets[0].id(), "TEST_1");
     }
+
+    #[tokio::test]
+    async fn test_producer_panic_propagates_as_error() {
+        let config = Arc::new(test_config());
+        let client = reqwest::Client::new();
+        let shutdown_token = CancellationToken::new();
+
+        // Stream that panics on first poll — simulates a producer task panic
+        let panicking_stream = futures_util::stream::poll_fn(
+            |_cx| -> std::task::Poll<Option<anyhow::Result<PhotoAsset>>> {
+                panic!("simulated producer panic");
+            },
+        );
+
+        let result =
+            stream_and_download_from_stream(&client, panicking_stream, &config, 0, shutdown_token)
+                .await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("producer panicked"),
+            "Expected producer panic error, got: {err_msg}"
+        );
+    }
 }

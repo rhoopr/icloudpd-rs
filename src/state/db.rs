@@ -1545,4 +1545,42 @@ mod tests {
             "last_seen_at should be updated: {updated_ts} >= {original_ts}"
         );
     }
+
+    #[tokio::test]
+    async fn test_get_all_downloaded_scales_to_large_count() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let count = 10_000;
+
+        // Bulk-insert records directly for speed
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, media_type, status, downloaded_at, local_path, local_checksum, last_seen_at)
+                     VALUES (?1, 'original', ?2, ?3, ?4, ?5, 'photo', 'downloaded', ?4, ?6, ?2, ?4)",
+                )
+                .unwrap();
+            let now = Utc::now().timestamp();
+            for i in 0..count {
+                let id = format!("ASSET_{i:05}");
+                let checksum = format!("cksum_{i:05}");
+                let filename = format!("IMG_{i:05}.jpg");
+                let path = format!("/photos/2026/01/01/{filename}");
+                stmt.execute(rusqlite::params![id, checksum, filename, now, 4096, path])
+                    .unwrap();
+            }
+            conn.execute_batch("COMMIT").unwrap();
+        }
+
+        let downloaded = db.get_all_downloaded().await.unwrap();
+        assert_eq!(downloaded.len(), count);
+
+        // Spot-check first and last records
+        assert_eq!(downloaded[0].id, "ASSET_00000");
+        assert_eq!(downloaded[count - 1].id, format!("ASSET_{:05}", count - 1));
+        assert!(downloaded
+            .iter()
+            .all(|r| r.status == AssetStatus::Downloaded));
+    }
 }

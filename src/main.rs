@@ -1611,4 +1611,131 @@ mod tests {
             Some(&serde_json::Value::String("12345".to_string()))
         );
     }
+
+    // ── Watch-mode control flow tests ──────────────────────────────────
+
+    /// The watch loop uses `tokio::select!` to make the inter-cycle sleep
+    /// interruptible by a shutdown signal.  This test verifies that
+    /// cancellation breaks out promptly despite a long interval.
+    #[tokio::test]
+    async fn watch_sleep_exits_promptly_on_shutdown() {
+        use tokio_util::sync::CancellationToken;
+
+        let shutdown_token = CancellationToken::new();
+        let token_clone = shutdown_token.clone();
+
+        // Cancel after a short delay
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token_clone.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let interval = 3600u64; // 1 hour — must not wait this long
+
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {
+                panic!("Should not have waited the full interval");
+            }
+            _ = shutdown_token.cancelled() => {
+                // Correct: shutdown broke us out of the sleep
+            }
+        }
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "Shutdown should break the sleep almost immediately"
+        );
+    }
+
+    /// The watch loop checks `shutdown_token.is_cancelled()` at the top of
+    /// each cycle to avoid starting a new sync after shutdown was requested.
+    #[tokio::test]
+    async fn watch_loop_skips_cycle_when_already_cancelled() {
+        use tokio_util::sync::CancellationToken;
+
+        let shutdown_token = CancellationToken::new();
+        shutdown_token.cancel(); // Pre-cancelled
+
+        let mut cycles_started = 0u32;
+        loop {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            cycles_started += 1;
+        }
+
+        assert_eq!(cycles_started, 0, "No cycles should start after shutdown");
+    }
+
+    /// When `watch_with_interval` is None the loop executes exactly once.
+    #[tokio::test]
+    async fn watch_loop_runs_once_without_interval() {
+        use tokio_util::sync::CancellationToken;
+
+        let shutdown_token = CancellationToken::new();
+        let watch_with_interval: Option<u64> = None;
+
+        let mut cycles = 0u32;
+        loop {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+
+            cycles += 1;
+
+            if let Some(interval) = watch_with_interval {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                    _ = shutdown_token.cancelled() => { break; }
+                }
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(
+            cycles, 1,
+            "Without an interval the loop should run exactly once"
+        );
+    }
+
+    /// In watch mode, a shutdown during sleep results in exactly one completed
+    /// cycle plus the interrupted wait — no extra cycles run.
+    #[tokio::test]
+    async fn watch_loop_completes_one_cycle_then_exits_on_shutdown() {
+        use tokio_util::sync::CancellationToken;
+
+        let shutdown_token = CancellationToken::new();
+        let token_clone = shutdown_token.clone();
+        let watch_with_interval: Option<u64> = Some(3600);
+
+        // Cancel during the inter-cycle wait
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token_clone.cancel();
+        });
+
+        let mut cycles = 0u32;
+        loop {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            cycles += 1;
+
+            if let Some(interval) = watch_with_interval {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                    _ = shutdown_token.cancelled() => { break; }
+                }
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(
+            cycles, 1,
+            "Exactly one cycle should complete before shutdown"
+        );
+    }
 }

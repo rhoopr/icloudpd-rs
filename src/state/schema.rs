@@ -277,4 +277,36 @@ mod tests {
             .is_ok();
         assert!(has_column);
     }
+
+    #[test]
+    fn test_recovery_after_failed_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Set up a v2 database with the v3 column pre-existing (causes failure)
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        set_schema_version(&conn, 2).unwrap();
+        conn.execute_batch("ALTER TABLE assets ADD COLUMN local_checksum TEXT")
+            .unwrap();
+
+        // First migrate() fails
+        assert!(migrate(&conn).is_err());
+        assert_eq!(get_schema_version(&conn).unwrap(), 2);
+
+        // "Fix" the issue by dropping and recreating the table without the
+        // conflicting column, simulating a repaired database.
+        conn.execute_batch("DROP TABLE assets; DROP TABLE sync_runs;")
+            .unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+
+        // Retry should succeed now
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Database fully functional
+        let has_column: bool = conn
+            .prepare("SELECT local_checksum FROM assets LIMIT 0")
+            .is_ok();
+        assert!(has_column);
+    }
 }
