@@ -108,7 +108,7 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
 /// Which library (or libraries) to sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibrarySelection {
-    /// A single named library (e.g. "PrimarySync", "SharedSync-ABCD1234").
+    /// A single named library (e.g. "`PrimarySync`", "SharedSync-ABCD1234").
     Single(String),
     /// All available libraries (primary + private + shared).
     All,
@@ -126,13 +126,14 @@ impl std::fmt::Display for LibrarySelection {
 /// Application configuration.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - Heap types first (String, PathBuf, Vec, `Option<String>`)
-/// - DateTime fields (12-16 bytes each)
+/// - Heap types first (String, `PathBuf`, Vec, `Option<String>`)
+/// - `DateTime` fields (12-16 bytes each)
 /// - 8-byte primitives (u64, `Option<u64>`)
 /// - 4-byte primitives (u32, `Option<u32>`)
 /// - 2-byte primitives (u16)
 /// - 1-byte enums
 /// - All booleans grouped at the end
+#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     // Heap types first
     pub username: String,
@@ -223,12 +224,12 @@ fn resolve_flag(cli_flag: bool, toml_val: Option<bool>) -> bool {
 }
 
 /// Resolve auth fields from CLI auth args + optional TOML config.
-/// Returns (username, password, domain, cookie_directory).
+/// Returns (username, password, domain, `cookie_directory`).
 pub(crate) fn resolve_auth(
     auth: &crate::cli::AuthArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> (String, Option<String>, Domain, PathBuf) {
-    let toml_auth = toml.as_ref().and_then(|t| t.auth.as_ref());
+    let toml_auth = toml.and_then(|t| t.auth.as_ref());
 
     let username = resolve(
         auth.username.clone(),
@@ -256,12 +257,13 @@ pub(crate) fn resolve_auth(
 impl Config {
     /// Build a Config by merging CLI args with optional TOML config.
     /// Resolution order: CLI > TOML > hardcoded default.
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub fn build(
         auth: crate::cli::AuthArgs,
         sync: crate::cli::SyncArgs,
         toml: Option<TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let (username, password, domain, cookie_directory) = resolve_auth(&auth, &toml);
+        let (username, password, domain, cookie_directory) = resolve_auth(&auth, toml.as_ref());
 
         let toml_dl = toml.as_ref().and_then(|t| t.download.as_ref());
         let toml_retry = toml_dl.and_then(|d| d.retry.as_ref());
@@ -1933,7 +1935,7 @@ mod tests {
             domain: None,
             cookie_directory: None,
         };
-        let (username, password, domain, cookie_dir) = resolve_auth(&auth, &Some(toml));
+        let (username, password, domain, cookie_dir) = resolve_auth(&auth, Some(&toml));
         assert_eq!(username, "toml@example.com");
         assert_eq!(password.as_deref(), Some("toml-pw"));
         assert!(matches!(domain, Domain::Cn));
@@ -1956,7 +1958,7 @@ mod tests {
             domain: Some(Domain::Com),
             cookie_directory: Some("/cli/cookies".to_string()),
         };
-        let (username, password, domain, cookie_dir) = resolve_auth(&auth, &Some(toml));
+        let (username, password, domain, cookie_dir) = resolve_auth(&auth, Some(&toml));
         assert_eq!(username, "cli@example.com");
         assert_eq!(password.as_deref(), Some("cli-pw"));
         assert!(matches!(domain, Domain::Com));
@@ -1971,7 +1973,7 @@ mod tests {
             domain: None,
             cookie_directory: None,
         };
-        let (username, password, domain, cookie_dir) = resolve_auth(&auth, &None);
+        let (username, password, domain, cookie_dir) = resolve_auth(&auth, None);
         assert!(username.is_empty());
         assert!(password.is_none());
         assert!(matches!(domain, Domain::Com));

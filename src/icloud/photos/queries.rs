@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 
 use super::types::{AssetItemType, AssetVersionSize};
 
-/// CloudKit field names requested in every query — must include all fields
+/// `CloudKit` field names requested in every query — must include all fields
 /// needed for filename resolution, version URLs, checksums, and metadata.
 /// Matches the Python `DESIRED_KEYS` list for API compatibility.
 pub(crate) const DESIRED_KEYS: &[&str] = &[
@@ -143,7 +143,7 @@ pub(crate) fn item_type_from_str(s: &str) -> Option<AssetItemType> {
     }
 }
 
-/// Maps logical version sizes to pre-computed CloudKit field names.
+/// Maps logical version sizes to pre-computed `CloudKit` field names.
 /// Tuple: (size, resource field, file-type field).
 pub(crate) const PHOTO_VERSION_LOOKUP: &[(AssetVersionSize, &str, &str)] = &[
     (

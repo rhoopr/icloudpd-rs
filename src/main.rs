@@ -1,6 +1,6 @@
 //! kei: photo sync engine — Rust rewrite of icloud-photos-downloader.
 //!
-//! Downloads photos and videos from iCloud via Apple's private CloudKit APIs.
+//! Downloads photos and videos from iCloud via Apple's private `CloudKit` APIs.
 //! Authentication uses SRP-6a with Apple's custom variant, followed by optional
 //! 2FA. Photos are streamed with exponential-backoff retries on transient
 //! failures.
@@ -39,7 +39,10 @@ struct RedactingWriter<W> {
 
 impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let password = self.password.lock().unwrap_or_else(|e| e.into_inner());
+        let password = self
+            .password
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(pw) = password.as_deref() {
             if !pw.is_empty() {
                 // A buffer shorter than the password can't contain it,
@@ -184,7 +187,7 @@ async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
 }
 
 /// Get the database path for a given auth config, merging with TOML defaults.
-fn get_db_path(auth: &cli::AuthArgs, toml: &Option<TomlConfig>) -> PathBuf {
+fn get_db_path(auth: &cli::AuthArgs, toml: Option<&TomlConfig>) -> PathBuf {
     let (username, _, _, cookie_dir) = config::resolve_auth(auth, toml);
     cookie_dir.join(format!(
         "{}.db",
@@ -193,7 +196,7 @@ fn get_db_path(auth: &cli::AuthArgs, toml: &Option<TomlConfig>) -> PathBuf {
 }
 
 /// Run the status command.
-async fn run_status(args: cli::StatusArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+async fn run_status(args: cli::StatusArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let db_path = get_db_path(&args.auth, toml);
 
     if !db_path.exists() {
@@ -250,7 +253,7 @@ async fn run_status(args: cli::StatusArgs, toml: &Option<TomlConfig>) -> anyhow:
 /// Run the reset-state command.
 async fn run_reset_state(
     args: cli::ResetStateArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
     let db_path = get_db_path(&args.auth, toml);
 
@@ -260,11 +263,11 @@ async fn run_reset_state(
     }
 
     if !args.yes {
+        use std::io::Write;
         println!("This will delete the state database at:");
         println!("  {}", db_path.display());
         println!();
         print!("Are you sure? [y/N] ");
-        use std::io::Write;
         std::io::stdout().flush()?;
 
         let mut input = String::new();
@@ -288,7 +291,7 @@ async fn run_reset_state(
 }
 
 /// Run the verify command.
-async fn run_verify(args: cli::VerifyArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+async fn run_verify(args: cli::VerifyArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let db_path = get_db_path(&args.auth, toml);
 
     if !db_path.exists() {
@@ -313,10 +316,10 @@ async fn run_verify(args: cli::VerifyArgs, toml: &Option<TomlConfig>) -> anyhow:
 
         if let Some(local_path) = &asset.local_path {
             if !local_path.exists() {
-                let downloaded_at = asset
-                    .downloaded_at
-                    .map(|dt| dt.format("%Y-%m-%d").to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
+                let downloaded_at = asset.downloaded_at.map_or_else(
+                    || "unknown".to_string(),
+                    |dt| dt.format("%Y-%m-%d").to_string(),
+                );
                 println!(
                     "MISSING: {} ({}) - downloaded {}",
                     local_path.display(),
@@ -380,7 +383,7 @@ async fn verify_local_checksum(path: &Path, expected_hex: &str) -> anyhow::Resul
 }
 
 /// Run the get-code command: trigger push notification for 2FA.
-async fn run_get_code(args: cli::GetCodeArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+async fn run_get_code(args: cli::GetCodeArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
     if username.is_empty() {
@@ -405,7 +408,7 @@ async fn run_get_code(args: cli::GetCodeArgs, toml: &Option<TomlConfig>) -> anyh
 /// Run the submit-code command: authenticate with a pre-provided 2FA code.
 async fn run_submit_code(
     args: cli::SubmitCodeArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
@@ -434,7 +437,7 @@ async fn run_submit_code(
     Ok(())
 }
 
-/// Build the query parameters HashMap for the iCloud Photos CloudKit API.
+/// Build the query parameters `HashMap` for the iCloud Photos `CloudKit` API.
 ///
 /// Must match Python's `PyiCloudService.params` for API compatibility.
 fn build_photos_params(
@@ -467,9 +470,10 @@ fn build_photos_params(
 /// 1. Enumerating all iCloud assets via the photos API
 /// 2. Computing the expected local path for each asset
 /// 3. If the file exists and size matches, marking it as downloaded in the DB
+#[allow(clippy::too_many_lines)]
 async fn run_import_existing(
     args: cli::ImportArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
     use chrono::Local;
     use futures_util::StreamExt;
@@ -552,12 +556,11 @@ async fn run_import_existing(
         total += 1;
 
         // Get filename from the asset
-        let filename = match asset.filename() {
-            Some(f) => f.to_string(),
-            None => {
-                tracing::debug!(id = %asset.id(), "Skipping asset with no filename");
-                continue;
-            }
+        let filename = if let Some(f) = asset.filename() {
+            f.to_string()
+        } else {
+            tracing::debug!(id = %asset.id(), "Skipping asset with no filename");
+            continue;
         };
 
         // Get versions
@@ -571,7 +574,7 @@ async fn run_import_existing(
 
         // Check each version (we only check "original" for import since that's
         // what the normal sync would download)
-        if let Some(version) = asset.get_version(&AssetVersionSize::Original) {
+        if let Some(version) = asset.get_version(AssetVersionSize::Original) {
             let expected_path = download::paths::local_download_path(
                 &directory,
                 &args.folder_structure,
@@ -667,12 +670,11 @@ async fn resolve_albums(
         let mut album_map = library.albums().await?;
         let mut matched = Vec::new();
         for name in album_names {
-            match album_map.remove(name.as_str()) {
-                Some(album) => matched.push(album),
-                None => {
-                    let available: Vec<&String> = album_map.keys().collect();
-                    anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
-                }
+            if let Some(album) = album_map.remove(name.as_str()) {
+                matched.push(album);
+            } else {
+                let available: Vec<&String> = album_map.keys().collect();
+                anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
             }
         }
         Ok(matched)
@@ -701,6 +703,14 @@ impl Drop for PidFileGuard {
     }
 }
 
+/// Per-library state: zone name, sync token key, and resolved albums.
+struct LibraryState {
+    library: icloud::photos::PhotoLibrary,
+    zone_name: String,
+    sync_token_key: String,
+    albums: Vec<icloud::photos::PhotoAlbum>,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -710,7 +720,7 @@ async fn main() -> ExitCode {
             // what to do, and is done. Exit 0 so `restart: on-failure` won't
             // restart into a loop that hammers Apple's auth endpoints.
             if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(|ae| ae.is_two_factor_required())
+                .is_some_and(auth::error::AuthError::is_two_factor_required)
             {
                 ExitCode::SUCCESS
             } else {
@@ -721,6 +731,7 @@ async fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
@@ -773,16 +784,16 @@ async fn run() -> anyhow::Result<()> {
     let command = cli.effective_command();
     let is_retry_failed = matches!(command, Command::RetryFailed(_));
     let (auth, sync) = match command {
-        Command::Status(args) => return run_status(args, &toml_config).await,
-        Command::ResetState(args) => return run_reset_state(args, &toml_config).await,
-        Command::Verify(args) => return run_verify(args, &toml_config).await,
-        Command::ImportExisting(args) => return run_import_existing(args, &toml_config).await,
-        Command::GetCode(args) => return run_get_code(args, &toml_config).await,
-        Command::SubmitCode(args) => return run_submit_code(args, &toml_config).await,
+        Command::Status(args) => return run_status(args, toml_config.as_ref()).await,
+        Command::ResetState(args) => return run_reset_state(args, toml_config.as_ref()).await,
+        Command::Verify(args) => return run_verify(args, toml_config.as_ref()).await,
+        Command::ImportExisting(args) => {
+            return run_import_existing(args, toml_config.as_ref()).await;
+        }
+        Command::GetCode(args) => return run_get_code(args, toml_config.as_ref()).await,
+        Command::SubmitCode(args) => return run_submit_code(args, toml_config.as_ref()).await,
         Command::Setup { output } => {
-            let path = output
-                .map(|o| config::expand_tilde(&o))
-                .unwrap_or_else(|| config_path.clone());
+            let path = output.map_or_else(|| config_path.clone(), |o| config::expand_tilde(&o));
             match setup::run_setup(&path)? {
                 setup::SetupResult::SyncNow {
                     config_path: cfg_path,
@@ -857,7 +868,7 @@ async fn run() -> anyhow::Result<()> {
         Ok(result) => result,
         Err(e)
             if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(|ae| ae.is_two_factor_required()) =>
+                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
         {
             let msg = format!(
                 "2FA required for {u}. Run: kei get-code",
@@ -893,14 +904,13 @@ async fn run() -> anyhow::Result<()> {
                         Ok(result) => break 'wait_2fa result,
                         Err(e)
                             if e.downcast_ref::<auth::error::AuthError>()
-                                .is_some_and(|ae| ae.is_two_factor_required()) =>
+                                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
                         {
                             tracing::info!("Session not yet trusted, continuing to wait...");
                             continue 'wait_2fa;
                         }
                         Err(e) if e.to_string().contains("Another kei instance") => {
                             tracing::debug!("Lock held by another process, retrying...");
-                            continue;
                         }
                         Err(e) => return Err(e),
                     }
@@ -1089,18 +1099,10 @@ async fn run() -> anyhow::Result<()> {
         })
     };
 
-    let shutdown_token = shutdown::install_signal_handler(&sd_notifier)?;
+    let shutdown_token = shutdown::install_signal_handler(sd_notifier)?;
 
     let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;
-
-    // Build per-library state: zone name, sync token key, and resolved albums.
-    struct LibraryState {
-        library: icloud::photos::PhotoLibrary,
-        zone_name: String,
-        sync_token_key: String,
-        albums: Vec<icloud::photos::PhotoAlbum>,
-    }
 
     let mut library_states: Vec<LibraryState> = Vec::with_capacity(libraries.len());
     for library in &libraries {
@@ -1310,7 +1312,7 @@ async fn run() -> anyhow::Result<()> {
                     }
                     Err(e)
                         if e.downcast_ref::<auth::error::AuthError>()
-                            .is_some_and(|ae| ae.is_two_factor_required()) =>
+                            .is_some_and(auth::error::AuthError::is_two_factor_required) =>
                     {
                         // 2FA is user action, not a failed attempt — don't
                         // burn reauth_attempts so false wakeups from get-code
@@ -1374,8 +1376,8 @@ async fn run() -> anyhow::Result<()> {
             sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
             tracing::info!(interval_secs = interval, "Waiting before next cycle");
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
-                _ = shutdown_token.cancelled() => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                () = shutdown_token.cancelled() => {
                     tracing::info!("Shutdown during wait, exiting...");
                     break;
                 }

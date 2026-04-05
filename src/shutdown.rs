@@ -17,7 +17,7 @@ use crate::systemd::SystemdNotifier;
 /// cancelled on the first SIGINT / SIGTERM / SIGHUP.  A second signal
 /// force-exits the process.
 pub(crate) fn install_signal_handler(
-    notifier: &SystemdNotifier,
+    notifier: SystemdNotifier,
 ) -> anyhow::Result<CancellationToken> {
     let token = CancellationToken::new();
     let count = Arc::new(AtomicU32::new(0));
@@ -32,7 +32,7 @@ pub(crate) fn install_signal_handler(
     };
 
     let handler_token = token.clone();
-    let handler_notifier = *notifier;
+    let handler_notifier = notifier;
     tokio::spawn(async move {
         loop {
             #[cfg(unix)]
@@ -91,7 +91,7 @@ mod tests {
     #[tokio::test]
     async fn install_returns_live_token() {
         let notifier = SystemdNotifier::new(false);
-        let token = install_signal_handler(&notifier).unwrap();
+        let token = install_signal_handler(notifier).unwrap();
         assert!(!token.is_cancelled());
     }
 }

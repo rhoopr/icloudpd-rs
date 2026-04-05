@@ -58,9 +58,9 @@ pub fn determine_media_type(
             } else if asset.item_type() == Some(AssetItemType::Image) {
                 // Could be live photo image or regular photo
                 // Check if asset has live photo versions
-                if asset.contains_version(&AssetVersionSize::LiveOriginal)
-                    || asset.contains_version(&AssetVersionSize::LiveMedium)
-                    || asset.contains_version(&AssetVersionSize::LiveThumb)
+                if asset.contains_version(AssetVersionSize::LiveOriginal)
+                    || asset.contains_version(AssetVersionSize::LiveMedium)
+                    || asset.contains_version(AssetVersionSize::LiveThumb)
                 {
                     MediaType::LivePhotoImage
                 } else {
@@ -79,13 +79,14 @@ pub fn determine_media_type(
 /// paths like `IMG_0996.mov` and `IMG_0996.MOV`. This stores the normalized (lowercased)
 /// form as a `Box<str>` and implements `Borrow<str>` to enable zero-copy lookups.
 ///
-/// Use `NormalizedPath::normalize()` for temporary lookup keys to avoid PathBuf cloning.
+/// Use `NormalizedPath::normalize()` for temporary lookup keys to avoid `PathBuf` cloning.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NormalizedPath(Box<str>);
 
 impl NormalizedPath {
-    /// Create a new normalized path from an owned PathBuf.
-    /// For lookup operations, prefer `normalize()` to avoid PathBuf cloning.
+    /// Create a new normalized path from an owned `PathBuf`.
+    /// For lookup operations, prefer `normalize()` to avoid `PathBuf` cloning.
+    #[allow(clippy::needless_pass_by_value)]
     fn new(path: PathBuf) -> Self {
         Self(Self::normalize(&path).into_owned().into_boxed_str())
     }
@@ -96,7 +97,7 @@ impl NormalizedPath {
     /// On case-sensitive systems (Linux), returns a borrowed view when possible.
     ///
     /// Use with `claimed_paths.contains_key(NormalizedPath::normalize(&path).as_ref())`
-    /// to avoid allocating a PathBuf just for the lookup.
+    /// to avoid allocating a `PathBuf` just for the lookup.
     fn normalize(path: &Path) -> std::borrow::Cow<'_, str> {
         let s = path.to_string_lossy();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -182,6 +183,7 @@ fn hash_download_config(config: &DownloadConfig) -> String {
 
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct DownloadConfig {
     pub(crate) directory: std::path::PathBuf,
     pub(crate) folder_structure: String,
@@ -253,9 +255,9 @@ impl std::fmt::Debug for DownloadConfig {
 /// A unit of work produced by the filter phase and consumed by the download phase.
 ///
 /// Fields ordered for optimal memory layout:
-/// - Heap types first (`Box<str>`, PathBuf)
+/// - Heap types first (`Box<str>`, `PathBuf`)
 /// - 8-byte primitives (u64)
-/// - DateTime (12-16 bytes)
+/// - `DateTime` (12-16 bytes)
 /// - 1-byte enum last
 #[derive(Debug, Clone)]
 struct DownloadTask {
@@ -280,15 +282,15 @@ struct DownloadTask {
 /// in-memory lookups instead of per-asset DB queries. For 100K+ asset
 /// libraries, this significantly reduces DB roundtrips.
 ///
-/// Uses a two-level map structure (asset_id -> version_sizes) to enable
+/// Uses a two-level map structure (`asset_id` -> `version_sizes`) to enable
 /// zero-allocation lookups via `&str` keys, avoiding the need to allocate
 /// `(String, String)` tuples for each lookup.
 #[derive(Debug, Default)]
 struct DownloadContext {
-    /// Nested map: asset_id -> set of version_sizes that are already downloaded.
+    /// Nested map: `asset_id` -> set of `version_sizes` that are already downloaded.
     /// Two-level structure enables O(1) borrowed lookups without allocation.
     downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>>,
-    /// Nested map: asset_id -> (version_size -> checksum) for downloaded assets.
+    /// Nested map: `asset_id` -> (`version_size` -> checksum) for downloaded assets.
     /// Used to detect checksum changes (iCloud asset updated) without DB queries.
     downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
@@ -471,7 +473,7 @@ fn apply_raw_policy(
     std::borrow::Cow::Owned(swapped)
 }
 
-/// Lightweight pre-check: extract (version_size, checksum) pairs for an asset
+/// Lightweight pre-check: extract (`version_size`, checksum) pairs for an asset
 /// after applying content/date filters but WITHOUT path resolution or disk I/O.
 ///
 /// Returns the candidate versions that would be downloaded. Used by the early
@@ -539,6 +541,7 @@ fn extract_skip_candidates<'a>(
 /// The `claimed_paths` map tracks paths that have been claimed by earlier tasks
 /// in the same download session, preventing race conditions where two assets
 /// with the same filename both see "file doesn't exist" during concurrent downloads.
+#[allow(clippy::too_many_lines)]
 fn filter_asset_to_tasks(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
@@ -565,23 +568,21 @@ fn filter_asset_to_tasks(
     }
 
     let fallback_filename;
-    let raw_filename = match asset.filename() {
-        Some(f) => f,
-        None => {
-            // Generate fallback from asset ID fingerprint, matching Python behavior.
-            let asset_type = asset
-                .versions()
-                .first()
-                .map(|(_, v)| v.asset_type.as_ref())
-                .unwrap_or("");
-            fallback_filename = paths::generate_fingerprint_filename(asset.id(), asset_type);
-            tracing::info!(
-                asset_id = %asset.id(),
-                filename = %fallback_filename,
-                "Using fingerprint fallback filename"
-            );
-            &fallback_filename
-        }
+    let raw_filename = if let Some(f) = asset.filename() {
+        f
+    } else {
+        // Generate fallback from asset ID fingerprint, matching Python behavior.
+        let asset_type = asset
+            .versions()
+            .first()
+            .map_or("", |(_, v)| v.asset_type.as_ref());
+        fallback_filename = paths::generate_fingerprint_filename(asset.id(), asset_type);
+        tracing::info!(
+            asset_id = %asset.id(),
+            filename = %fallback_filename,
+            "Using fingerprint fallback filename"
+        );
+        &fallback_filename
     };
 
     // Strip non-ASCII characters unless --keep-unicode-in-filenames is set.
@@ -634,7 +635,7 @@ fn filter_asset_to_tasks(
         // Apply name-id7 policy: bake asset ID suffix into ALL filenames upfront
         let filename = match config.file_match_policy {
             FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized_filename, asset.id()),
-            _ => sized_filename,
+            FileMatchPolicy::NameSizeDedupWithSuffix => sized_filename,
         };
 
         let download_path = paths::local_download_path(
@@ -770,7 +771,7 @@ fn filter_asset_to_tasks(
             // Fall back to the base filename when no primary was produced (e.g. skipped).
             let live_base = match config.file_match_policy {
                 FileMatchPolicy::NameId7 => paths::apply_name_id7(&base_filename, asset.id()),
-                _ => effective_primary_filename
+                FileMatchPolicy::NameSizeDedupWithSuffix => effective_primary_filename
                     .as_deref()
                     .unwrap_or(&base_filename)
                     .to_string(),
@@ -940,9 +941,9 @@ pub async fn download_photos_with_sync(
             {
                 Ok(result) => Ok(result),
                 Err(e) => {
-                    if e.downcast_ref::<SyncTokenError>()
-                        .is_some_and(|se| se.should_fallback_to_full())
-                    {
+                    if e.downcast_ref::<SyncTokenError>().is_some_and(
+                        super::icloud::photos::session::SyncTokenError::should_fallback_to_full,
+                    ) {
                         tracing::warn!(
                             error = %e,
                             "Incremental sync failed, falling back to full enumeration"
@@ -1048,6 +1049,7 @@ async fn download_photos_full_with_token(
 ///
 /// Fetches `ChangeEvent`s since the given sync token, filters to
 /// downloadable assets, and feeds them through the download pipeline.
+#[allow(clippy::too_many_lines)]
 async fn download_photos_incremental(
     download_client: &Client,
     albums: &[PhotoAlbum],
@@ -1275,6 +1277,7 @@ async fn download_photos_incremental(
 /// This is the core producer/consumer download logic from `stream_and_download`,
 /// factored out so that `download_photos_full_with_token` can supply a
 /// token-aware combined stream while reusing the same download machinery.
+#[allow(clippy::too_many_lines)]
 async fn stream_and_download_from_stream<S>(
     download_client: &Client,
     combined: S,
@@ -1287,6 +1290,7 @@ where
         + Send
         + 'static,
 {
+    const DB_BATCH_SIZE: usize = 50;
     let pb = create_progress_bar(config.no_progress_bar, config.only_print_filenames, total);
 
     if config.only_print_filenames {
@@ -1594,7 +1598,6 @@ where
 
     tokio::pin!(download_stream);
 
-    const DB_BATCH_SIZE: usize = 50;
     let mut downloaded_batch: Vec<(String, String, PathBuf, String)> =
         Vec::with_capacity(DB_BATCH_SIZE);
     let mut failed_batch: Vec<(String, String, String)> = Vec::with_capacity(DB_BATCH_SIZE);
@@ -1768,6 +1771,7 @@ where
 /// Build a `DownloadOutcome` from a `StreamingResult`, running a cleanup
 /// pass if there were failures. Shared between `download_photos` and
 /// `download_photos_full_with_token`.
+#[allow(clippy::too_many_lines)]
 async fn build_download_outcome(
     download_client: &Client,
     albums: &[PhotoAlbum],
@@ -1924,6 +1928,7 @@ struct PassConfig<'a> {
 }
 
 /// Execute a download pass over the given tasks, returning any that failed.
+#[allow(clippy::too_many_lines)]
 async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> PassResult {
     let pb = create_progress_bar(config.no_progress_bar, false, tasks.len() as u64);
     let client = config.client.clone();
@@ -2047,9 +2052,9 @@ async fn download_single_task(
     temp_suffix: &str,
 ) -> Result<(bool, String)> {
     if let Some(parent) = task.download_path.parent() {
-        tokio::fs::create_dir_all(parent).await.with_context(|| {
-            format!("failed to create directory {}", parent.display())
-        })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
     tracing::debug!(
@@ -2157,6 +2162,7 @@ fn format_duration(d: Duration) -> String {
 ///
 /// Handles negative timestamps (dates before 1970) gracefully by clamping
 /// to the Unix epoch.
+#[allow(clippy::cast_sign_loss)]
 fn set_file_mtime(path: &Path, timestamp: i64) -> std::io::Result<()> {
     let time = if timestamp >= 0 {
         UNIX_EPOCH + Duration::from_secs(timestamp as u64)

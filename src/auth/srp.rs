@@ -16,7 +16,7 @@ use crate::auth::error::AuthError;
 pub(crate) const APPLE_WIDGET_KEY: &str =
     "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d";
 
-/// RFC 5054 2048-bit SRP group prime (same as srp::groups::G_2048).
+/// RFC 5054 2048-bit SRP group prime (same as `srp::groups::G_2048`).
 const N_HEX: &str = concat!(
     "AC6BDB41324A9A9BF166DE5E1389582FAF72B6651987EE07FC319294",
     "3DB56050A37329CBB4A099ED8193E0757767A13DD52312AB4B03310D",
@@ -51,7 +51,7 @@ fn derive_apple_password(password: &str, protocol: &str, salt: &[u8], iterations
         pbkdf2::pbkdf2_hmac::<Sha256>(hex_str.as_bytes(), salt, iterations, &mut key);
     } else {
         pbkdf2::pbkdf2_hmac::<Sha256>(&hash, salt, iterations, &mut key);
-    };
+    }
 
     key
 }
@@ -103,7 +103,7 @@ fn compute_u(a_pub: &BigUint, b_pub: &BigUint, n: &BigUint) -> BigUint {
 
 /// Compute M1 = H(H(N) XOR H(g) | H(username) | salt | A | B | K).
 /// Note: `no_username_in_x` only affects x computation, NOT M1.
-/// M1 always uses the real username (apple_id).
+/// M1 always uses the real username (`apple_id`).
 ///
 /// Returns a fixed 32-byte array, avoiding heap allocation.
 fn compute_m1(
@@ -228,6 +228,7 @@ pub(crate) fn get_auth_headers(
 /// Uses a custom SRP implementation that matches Apple's variant:
 /// - no username in the x computation (Python's `no_username_in_x()`)
 /// - PBKDF2-derived password key
+#[allow(clippy::many_single_char_names, clippy::too_many_lines)]
 pub async fn authenticate_srp(
     session: &mut Session,
     endpoints: &Endpoints,

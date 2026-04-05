@@ -32,6 +32,7 @@ impl RetryConfig {
     /// Compute the delay for a given retry attempt (0-indexed).
     ///
     /// Formula: `min(base_delay * 2^retry, max_delay) + random_jitter(0..base_delay)`
+    #[must_use]
     pub fn delay_for_retry(&self, retry: u32) -> std::time::Duration {
         let exp_delay = self
             .base_delay_secs
@@ -54,6 +55,7 @@ impl RetryConfig {
 ///
 /// Returns the first `Ok` result, or the last error if retries are exhausted
 /// or the classifier returns `Abort`.
+#[allow(clippy::missing_errors_doc)]
 pub async fn retry_with_backoff<F, Fut, T, E, C>(
     config: &RetryConfig,
     classifier: C,

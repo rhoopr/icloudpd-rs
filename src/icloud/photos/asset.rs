@@ -11,7 +11,7 @@ use super::types::{AssetItemType, AssetVersion, AssetVersionSize, ChangeReason};
 
 /// Type alias for the versions map.
 ///
-/// Uses SmallVec with capacity 4 to store versions inline (no heap allocation)
+/// Uses `SmallVec` with capacity 4 to store versions inline (no heap allocation)
 /// for the common case of <=4 versions per asset. Most assets have 1-3 versions
 /// (original + optional medium/thumb + optional live photo).
 pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
@@ -19,7 +19,7 @@ pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
 /// A change event from the `changes/zone` delta API.
 #[derive(Debug)]
 pub struct ChangeEvent {
-    /// The record name (CloudKit record ID)
+    /// The record name (`CloudKit` record ID)
     pub record_name: String,
     /// The record type, if known (None for hard-deletes)
     pub record_type: Option<String>,
@@ -34,7 +34,7 @@ pub struct ChangeEvent {
 ///
 /// Fields are ordered for optimal memory layout:
 /// - Heap types first (String, `Option<String>`)
-/// - VersionsMap (SmallVec inline storage)
+/// - `VersionsMap` (`SmallVec` inline storage)
 /// - f64 primitives
 /// - Small enums last
 #[derive(Debug, Clone)]
@@ -51,8 +51,8 @@ pub struct PhotoAsset {
     item_type_val: Option<AssetItemType>,
 }
 
-/// Decode filename from CloudKit's `filenameEnc` field.
-/// Apple uses either plain STRING or base64-encoded ENCRYPTED_BYTES depending
+/// Decode filename from `CloudKit`'s `filenameEnc` field.
+/// Apple uses either plain STRING or base64-encoded `ENCRYPTED_BYTES` depending
 /// on the user's iCloud configuration.
 fn decode_filename(fields: &Value) -> Option<String> {
     let enc = &fields["filenameEnc"];
@@ -76,16 +76,17 @@ fn decode_filename(fields: &Value) -> Option<String> {
     }
 }
 
-/// Determine asset type from the `itemType` CloudKit field, falling back to
+/// Determine asset type from the `itemType` `CloudKit` field, falling back to
 /// file extension heuristics. Defaults to Movie for unknown types because
 /// videos are more likely to have non-standard UTI strings.
-fn resolve_item_type(fields: &Value, filename: &Option<String>) -> Option<AssetItemType> {
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn resolve_item_type(fields: &Value, filename: Option<&str>) -> AssetItemType {
     if let Some(s) = fields["itemType"]["value"].as_str() {
         if let Some(t) = item_type_from_str(s) {
-            return Some(t);
+            return t;
         }
     }
-    if let Some(name) = &filename {
+    if let Some(name) = filename {
         let lower = name.to_lowercase();
         if lower.ends_with(".heic")
             || lower.ends_with(".png")
@@ -93,10 +94,10 @@ fn resolve_item_type(fields: &Value, filename: &Option<String>) -> Option<AssetI
             || lower.ends_with(".jpeg")
             || lower.ends_with(".webp")
         {
-            return Some(AssetItemType::Image);
+            return AssetItemType::Image;
         }
     }
-    Some(AssetItemType::Movie)
+    AssetItemType::Movie
 }
 
 /// Pre-parse version URLs at construction so `PhotoAsset` carries no raw
@@ -134,28 +135,26 @@ fn extract_versions(
 
         let size = res_entry["size"].as_u64().unwrap_or(0);
 
-        let url: Box<str> = match res_entry["downloadURL"].as_str() {
-            Some(u) => u.into(),
-            None => {
-                warn!(
-                    asset = %record_name,
-                    field = format_args!("{res_field}.downloadURL"),
-                    "Missing downloadURL, skipping version"
-                );
-                continue;
-            }
+        let url: Box<str> = if let Some(u) = res_entry["downloadURL"].as_str() {
+            u.into()
+        } else {
+            warn!(
+                asset = %record_name,
+                field = format_args!("{res_field}.downloadURL"),
+                "Missing downloadURL, skipping version"
+            );
+            continue;
         };
 
-        let checksum: Box<str> = match res_entry["fileChecksum"].as_str() {
-            Some(c) => c.into(),
-            None => {
-                warn!(
-                    asset = %record_name,
-                    field = format_args!("{res_field}.fileChecksum"),
-                    "Missing fileChecksum, skipping version"
-                );
-                continue;
-            }
+        let checksum: Box<str> = if let Some(c) = res_entry["fileChecksum"].as_str() {
+            c.into()
+        } else {
+            warn!(
+                asset = %record_name,
+                field = format_args!("{res_field}.fileChecksum"),
+                "Missing fileChecksum, skipping version"
+            );
+            continue;
         };
 
         let asset_type: Box<str> = fields[type_field]["value"]
@@ -190,7 +189,7 @@ impl PhotoAsset {
         let master_fields = master_record.get("fields").cloned().unwrap_or(Value::Null);
         let asset_fields = asset_record.get("fields").cloned().unwrap_or(Value::Null);
         let filename = decode_filename(&master_fields);
-        let item_type_val = resolve_item_type(&master_fields, &filename);
+        let item_type_val = Some(resolve_item_type(&master_fields, filename.as_deref()));
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
         let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
@@ -205,9 +204,10 @@ impl PhotoAsset {
     }
 
     /// Construct from typed `Record` structs (used by album pagination).
+    #[allow(clippy::needless_pass_by_value)]
     pub fn from_records(master: super::cloudkit::Record, asset: super::cloudkit::Record) -> Self {
         let filename = decode_filename(&master.fields);
-        let item_type_val = resolve_item_type(&master.fields, &filename);
+        let item_type_val = Some(resolve_item_type(&master.fields, filename.as_deref()));
         let asset_date_ms = asset.fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset.fields["addedDate"]["value"].as_f64();
         let versions = extract_versions(
@@ -234,6 +234,7 @@ impl PhotoAsset {
         self.filename.as_deref()
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn asset_date(&self) -> DateTime<Utc> {
         self.asset_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
@@ -247,6 +248,7 @@ impl PhotoAsset {
         self.asset_date()
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn added_date(&self) -> DateTime<Utc> {
         self.added_date_ms
             .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
@@ -267,13 +269,16 @@ impl PhotoAsset {
     }
 
     /// Get a specific version by size key.
-    pub fn get_version(&self, key: &AssetVersionSize) -> Option<&AssetVersion> {
-        self.versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    pub fn get_version(&self, key: AssetVersionSize) -> Option<&AssetVersion> {
+        self.versions
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v)
     }
 
     /// Check if a specific version exists.
-    pub fn contains_version(&self, key: &AssetVersionSize) -> bool {
-        self.versions.iter().any(|(k, _)| k == key)
+    pub fn contains_version(&self, key: AssetVersionSize) -> bool {
+        self.versions.iter().any(|(k, _)| *k == key)
     }
 }
 
@@ -283,11 +288,11 @@ impl std::fmt::Display for PhotoAsset {
     }
 }
 
-/// Classify a CloudKit record from `changes/zone` into a `ChangeReason`.
+/// Classify a `CloudKit` record from `changes/zone` into a `ChangeReason`.
 ///
 /// Detection logic (from empirical API testing):
-/// - `record.deleted == Some(true)` --> HardDeleted (purged, recordType unknown)
-/// - `fields.isDeleted.value == 1` --> SoftDeleted (trashed, recoverable)
+/// - `record.deleted == Some(true)` --> `HardDeleted` (purged, recordType unknown)
+/// - `fields.isDeleted.value == 1` --> `SoftDeleted` (trashed, recoverable)
 /// - `fields.isHidden.value == 1` --> Hidden
 /// - Otherwise --> Modified (caller checks state DB for Created/Restored/Unhidden)
 ///
@@ -322,26 +327,26 @@ pub(crate) fn classify_change_reason(record: &Record) -> ChangeReason {
     ChangeReason::Created
 }
 
-/// Extract the `masterRef` record name from a CPLAsset's fields.
+/// Extract the `masterRef` record name from a `CPLAsset`'s fields.
 fn extract_master_ref(fields: &Value) -> Option<String> {
     fields
         .get("masterRef")
         .and_then(|r| r.get("value"))
         .and_then(|v| v.get("recordName"))
         .and_then(|n| n.as_str())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
-/// Buffers CPLMaster and CPLAsset records from `changes/zone` responses
+/// Buffers `CPLMaster` and `CPLAsset` records from `changes/zone` responses
 /// and pairs them into `ChangeEvent`s when both halves are available.
 ///
 /// In `changes/zone`, records arrive in change-log order (not paired like `records/query`).
-/// A CPLAsset references its CPLMaster via the `masterRef` field.
+/// A `CPLAsset` references its `CPLMaster` via the `masterRef` field.
 #[derive(Debug, Default)]
 pub(crate) struct DeltaRecordBuffer {
-    /// Unpaired CPLMaster records, keyed by recordName
+    /// Unpaired `CPLMaster` records, keyed by recordName
     pending_masters: FxHashMap<String, Record>,
-    /// Unpaired CPLAsset records, keyed by masterRef recordName
+    /// Unpaired `CPLAsset` records, keyed by masterRef recordName
     pending_assets: FxHashMap<String, Record>,
 }
 
@@ -442,10 +447,10 @@ impl DeltaRecordBuffer {
 
     /// Pick the more severe reason from a pair of records.
     ///
-    /// When CPLMaster and CPLAsset arrive on different pages, we classify
+    /// When `CPLMaster` and `CPLAsset` arrive on different pages, we classify
     /// each independently. A soft-deleted master paired with a non-deleted
     /// asset should emit `SoftDeleted`, not `Created`. Severity order:
-    /// HardDeleted > SoftDeleted > Hidden > Created.
+    /// `HardDeleted` > `SoftDeleted` > Hidden > Created.
     fn reconcile_reasons(a: ChangeReason, b: ChangeReason) -> ChangeReason {
         fn severity(r: ChangeReason) -> u8 {
             match r {
@@ -602,8 +607,8 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        assert!(asset.contains_version(&AssetVersionSize::Original));
-        let orig = asset.get_version(&AssetVersionSize::Original).unwrap();
+        assert!(asset.contains_version(AssetVersionSize::Original));
+        let orig = asset.get_version(AssetVersionSize::Original).unwrap();
         assert_eq!(&*orig.url, "https://example.com/orig");
         assert_eq!(&*orig.checksum, "abc123");
     }
@@ -681,7 +686,7 @@ mod tests {
             asset.asset_date().format("%Y-%m-%d").to_string(),
             "2025-01-15"
         );
-        assert!(asset.contains_version(&AssetVersionSize::Original));
+        assert!(asset.contains_version(AssetVersionSize::Original));
     }
 
     #[test]
@@ -705,7 +710,7 @@ mod tests {
                 "resOriginalFileType": {"value": "public.jpeg"}
             }}),
         );
-        let orig = asset.get_version(&AssetVersionSize::Original).unwrap();
+        let orig = asset.get_version(AssetVersionSize::Original).unwrap();
         assert_eq!(&*orig.url, "https://asset.example.com/adjusted");
         assert_eq!(orig.size, 2000);
     }
@@ -730,11 +735,11 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        assert!(asset.contains_version(&AssetVersionSize::Original));
-        assert!(asset.contains_version(&AssetVersionSize::Medium));
+        assert!(asset.contains_version(AssetVersionSize::Original));
+        assert!(asset.contains_version(AssetVersionSize::Medium));
         // PHOTO_VERSION_LOOKUP maps Medium to resJPEGMed, but for videos
         // VIDEO_VERSION_LOOKUP maps Medium to resVidMed — verify the right one was used
-        let medium = asset.get_version(&AssetVersionSize::Medium).unwrap();
+        let medium = asset.get_version(AssetVersionSize::Medium).unwrap();
         assert_eq!(&*medium.url, "https://example.com/vid_med");
     }
 
@@ -760,11 +765,11 @@ mod tests {
         );
         assert_eq!(asset.versions().len(), 2);
         assert_eq!(
-            asset.get_version(&AssetVersionSize::Original).unwrap().size,
+            asset.get_version(AssetVersionSize::Original).unwrap().size,
             5000
         );
         assert_eq!(
-            asset.get_version(&AssetVersionSize::Thumb).unwrap().size,
+            asset.get_version(AssetVersionSize::Thumb).unwrap().size,
             100
         );
     }
@@ -805,10 +810,10 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        assert!(asset.contains_version(&AssetVersionSize::Original));
-        assert!(!asset.contains_version(&AssetVersionSize::Medium));
-        assert!(asset.get_version(&AssetVersionSize::Original).is_some());
-        assert!(asset.get_version(&AssetVersionSize::Medium).is_none());
+        assert!(asset.contains_version(AssetVersionSize::Original));
+        assert!(!asset.contains_version(AssetVersionSize::Medium));
+        assert!(asset.get_version(AssetVersionSize::Original).is_some());
+        assert!(asset.get_version(AssetVersionSize::Medium).is_none());
     }
 
     #[test]

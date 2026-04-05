@@ -62,6 +62,7 @@ struct CookieEntry {
 
 /// HTTP session wrapper that persists cookies and session data to disk,
 /// allowing authentication to survive across process restarts.
+#[allow(clippy::struct_field_names)]
 pub struct Session {
     client: Client,
     download_client: Client,
@@ -92,6 +93,7 @@ impl std::fmt::Debug for Session {
 
 impl Session {
     /// Create a new session, loading existing cookies and session data from disk.
+    #[allow(clippy::too_many_lines)]
     pub async fn new(
         cookie_dir: &Path,
         username: &str,
@@ -333,7 +335,7 @@ impl Session {
             if let Some(val) = headers.get(header_name) {
                 if let Ok(val_str) = val.to_str() {
                     let existing = self.session_data.get(session_key);
-                    if existing.map(|s| s.as_str()) != Some(val_str) {
+                    if existing.map(std::string::String::as_str) != Some(val_str) {
                         self.session_data
                             .insert(session_key.to_string(), val_str.to_string());
                         session_changed = true;

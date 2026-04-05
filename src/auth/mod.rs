@@ -233,7 +233,7 @@ pub async fn validate_session(session: &mut Session, domain: &str) -> Result<boo
 }
 
 /// Apple's HSA2 (two-step verification v2) requires all three conditions:
-/// the account uses HSAv2, the browser isn't trusted yet, and the account
+/// the account uses `HSAv2`, the browser isn't trusted yet, and the account
 /// has a device capable of receiving verification codes.
 fn check_requires_2fa(data: &AccountLoginResponse) -> bool {
     let (hsa_version, has_qualifying_device) = match &data.ds_info {

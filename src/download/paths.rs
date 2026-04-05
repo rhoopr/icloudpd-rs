@@ -157,7 +157,7 @@ pub(crate) fn sanitize_path_component(name: &str) -> String {
 /// Remove non-ASCII (unicode) characters from a filename, keeping only
 /// ASCII characters.
 pub(crate) fn remove_unicode_chars(filename: &str) -> String {
-    filename.chars().filter(|c| c.is_ascii()).collect()
+    filename.chars().filter(char::is_ascii).collect()
 }
 
 /// Add a size-based deduplication suffix to a filename.
@@ -168,24 +168,21 @@ pub(crate) fn remove_unicode_chars(filename: &str) -> String {
 /// Formats the size directly into the result string, avoiding an intermediate
 /// `size.to_string()` allocation.
 pub(crate) fn add_dedup_suffix(path: &str, size: u64) -> String {
-    match path.rfind('.') {
-        Some(dot_pos) => {
-            let (stem, ext) = path.split_at(dot_pos);
-            // Pre-allocate: stem + "-" + max 20 digits for u64 + ext
-            let mut result = String::with_capacity(stem.len() + 1 + 20 + ext.len());
-            result.push_str(stem);
-            result.push('-');
-            let _ = write!(result, "{size}");
-            result.push_str(ext);
-            result
-        }
-        None => {
-            let mut result = String::with_capacity(path.len() + 1 + 20);
-            result.push_str(path);
-            result.push('-');
-            let _ = write!(result, "{size}");
-            result
-        }
+    if let Some(dot_pos) = path.rfind('.') {
+        let (stem, ext) = path.split_at(dot_pos);
+        // Pre-allocate: stem + "-" + max 20 digits for u64 + ext
+        let mut result = String::with_capacity(stem.len() + 1 + 20 + ext.len());
+        result.push_str(stem);
+        result.push('-');
+        let _ = write!(result, "{size}");
+        result.push_str(ext);
+        result
+    } else {
+        let mut result = String::with_capacity(path.len() + 1 + 20);
+        result.push_str(path);
+        result.push('-');
+        let _ = write!(result, "{size}");
+        result
     }
 }
 
@@ -193,28 +190,25 @@ pub(crate) fn add_dedup_suffix(path: &str, size: u64) -> String {
 ///
 /// For example, `"photo.jpg"` with suffix `"abc"` becomes `"photo-abc.jpg"`.
 pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
-    match path.rfind('.') {
-        Some(dot_pos) => {
-            let (stem, ext) = path.split_at(dot_pos);
-            // Pre-allocate exact size needed
-            let mut result = String::with_capacity(stem.len() + 1 + suffix.len() + ext.len());
-            result.push_str(stem);
-            result.push('-');
-            result.push_str(suffix);
-            result.push_str(ext);
-            result
-        }
-        None => {
-            let mut result = String::with_capacity(path.len() + 1 + suffix.len());
-            result.push_str(path);
-            result.push('-');
-            result.push_str(suffix);
-            result
-        }
+    if let Some(dot_pos) = path.rfind('.') {
+        let (stem, ext) = path.split_at(dot_pos);
+        // Pre-allocate exact size needed
+        let mut result = String::with_capacity(stem.len() + 1 + suffix.len() + ext.len());
+        result.push_str(stem);
+        result.push('-');
+        result.push_str(suffix);
+        result.push_str(ext);
+        result
+    } else {
+        let mut result = String::with_capacity(path.len() + 1 + suffix.len());
+        result.push_str(path);
+        result.push('-');
+        result.push_str(suffix);
+        result
     }
 }
 
-/// Map UTI asset_type strings to standardized uppercase file extensions.
+/// Map UTI `asset_type` strings to standardized uppercase file extensions.
 ///
 /// Matches `icloudpd`'s `ITEM_TYPE_EXTENSIONS` mapping.
 const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
@@ -296,7 +290,7 @@ pub(crate) fn live_photo_mov_path_suffix(filename: &str) -> String {
     }
 }
 
-/// Pre-built HashMap for O(1) asset type lookups instead of linear scan.
+/// Pre-built `HashMap` for O(1) asset type lookups instead of linear scan.
 static ITEM_TYPE_MAP: LazyLock<FxHashMap<&'static str, &'static str>> =
     LazyLock::new(|| ITEM_TYPE_EXTENSIONS.iter().copied().collect());
 
@@ -395,6 +389,7 @@ impl DirCache {
     }
 
     /// Invalidate all cached entries. Use after writing files to disk.
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.dirs.clear();
     }

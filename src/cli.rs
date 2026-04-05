@@ -14,7 +14,7 @@ pub struct AuthArgs {
 
     /// iCloud password (if not provided, will prompt).
     /// WARNING: passing via --password is visible in process listings.
-    /// Prefer the ICLOUD_PASSWORD environment variable instead.
+    /// Prefer the `ICLOUD_PASSWORD` environment variable instead.
     #[arg(short = 'p', long, env = "ICLOUD_PASSWORD")]
     pub password: Option<String>,
 
@@ -28,6 +28,7 @@ pub struct AuthArgs {
 }
 
 /// Arguments for the sync command (also used as default when no subcommand).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
     /// Local directory for downloads
@@ -50,7 +51,7 @@ pub struct SyncArgs {
     #[arg(short = 'a', long = "album")]
     pub albums: Vec<String>,
 
-    /// Library to download (default: PrimarySync, use "all" for all libraries)
+    /// Library to download (default: `PrimarySync`, use "all" for all libraries)
     #[arg(long)]
     pub library: Option<String>,
 
@@ -90,7 +91,7 @@ pub struct SyncArgs {
     #[arg(long)]
     pub folder_structure: Option<String>,
 
-    /// Write DateTimeOriginal EXIF tag if missing
+    /// Write `DateTimeOriginal` EXIF tag if missing
     #[arg(long)]
     pub set_exif_datetime: bool,
 
@@ -155,7 +156,7 @@ pub struct SyncArgs {
     #[arg(long)]
     pub reset_sync_token: bool,
 
-    /// Send systemd sd_notify messages (READY, STOPPING, STATUS).
+    /// Send systemd `sd_notify` messages (READY, STOPPING, STATUS).
     /// Only effective on Linux with a systemd service unit.
     #[arg(long)]
     pub notify_systemd: bool,
@@ -165,7 +166,7 @@ pub struct SyncArgs {
     pub pid_file: Option<std::path::PathBuf>,
 
     /// Script to run on events (2FA required, sync complete, etc.).
-    /// Called with KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME env vars.
+    /// Called with `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars.
     #[arg(long)]
     pub notification_script: Option<String>,
 }

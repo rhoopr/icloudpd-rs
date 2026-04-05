@@ -105,16 +105,15 @@ async fn run_script(
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
 
-    match tokio::time::timeout(SCRIPT_TIMEOUT, child.wait()).await {
-        Ok(result) => Ok(result?),
-        Err(_) => {
-            tracing::warn!("Notification script timed out, killing");
-            child.kill().await.ok();
-            anyhow::bail!(
-                "notification script timed out after {}s",
-                SCRIPT_TIMEOUT.as_secs()
-            )
-        }
+    if let Ok(result) = tokio::time::timeout(SCRIPT_TIMEOUT, child.wait()).await {
+        Ok(result?)
+    } else {
+        tracing::warn!("Notification script timed out, killing");
+        child.kill().await.ok();
+        anyhow::bail!(
+            "notification script timed out after {}s",
+            SCRIPT_TIMEOUT.as_secs()
+        )
     }
 }
 

@@ -33,7 +33,7 @@ pub enum StateError {
 
 impl StateError {
     /// Create a Query error from a rusqlite error.
-    pub fn query(source: rusqlite::Error) -> Self {
+    pub fn query(source: &rusqlite::Error) -> Self {
         Self::Query(source.to_string())
     }
 }
@@ -58,7 +58,7 @@ mod tests {
     fn query_helper_creates_correct_variant() {
         let rusqlite_err = make_rusqlite_error();
         let msg = rusqlite_err.to_string();
-        let err = StateError::query(rusqlite_err);
+        let err = StateError::query(&rusqlite_err);
         match &err {
             StateError::Query(s) => assert_eq!(s, &msg),
             other => panic!("expected Query variant, got {:?}", other),

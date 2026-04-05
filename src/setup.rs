@@ -21,6 +21,7 @@ pub(crate) enum SetupResult {
 }
 
 /// Collected answers from the interactive setup wizard.
+#[allow(clippy::struct_excessive_bools)]
 struct SetupAnswers {
     // Account
     username: String,
@@ -278,7 +279,6 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .interact()?;
 
     answers.folder_structure = match folder {
-        0 => None, // %Y/%m/%d is the default
         1 => Some("%Y/%m".to_string()),
         2 => Some("%Y".to_string()),
         3 => Some(String::new()),
@@ -289,6 +289,7 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
                 .interact_text()?;
             Some(custom)
         }
+        // %Y/%m/%d is the default
         _ => None,
     };
 
@@ -629,6 +630,7 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
 // ── TOML generation ────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn generate_toml(answers: &SetupAnswers) -> String {
     let mut out = String::with_capacity(2048);
 
