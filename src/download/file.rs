@@ -32,7 +32,7 @@ fn temp_download_path(
 /// already exists. Falls back to a full download if the server ignores the
 /// Range header. On completion the .part file is renamed to the final
 /// destination path. Retries with exponential backoff on transient failures.
-pub async fn download_file(
+pub(super) async fn download_file(
     client: &Client,
     url: &str,
     download_path: &Path,

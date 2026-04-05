@@ -32,7 +32,7 @@ pbkdf2 = { version = "0.12", features = ["simple"] }
 hmac = "0.12"
 num-bigint = "0.4"
 base64 = "0.22"
-uuid = { version = "1", features = ["v1", "v4"] }
+uuid = { version = "1", features = ["v4"] }
 
 # Dates
 chrono = { version = "0.4", features = ["serde"] }

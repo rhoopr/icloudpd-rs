@@ -6,7 +6,7 @@ use thiserror::Error;
 /// rate limits, content-length mismatches from truncated transfers) from
 /// permanent ones (auth errors, disk failures) so the retry loop can abort early.
 #[derive(Debug, Error)]
-pub enum DownloadError {
+pub(crate) enum DownloadError {
     #[error("HTTP error {status} downloading {path}")]
     HttpStatus { status: u16, path: String },
 
