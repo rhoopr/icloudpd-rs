@@ -899,6 +899,86 @@ fn create_progress_bar(
 /// Counted cumulatively across both phases (streaming + cleanup).
 const AUTH_ERROR_THRESHOLD: usize = 3;
 
+/// A successful download whose state write to SQLite failed on first attempt.
+/// Accumulated during the download loop and retried in a final flush.
+struct PendingStateWrite {
+    asset_id: Box<str>,
+    version_size: VersionSizeKey,
+    download_path: PathBuf,
+    local_checksum: String,
+}
+
+/// Retry all pending state writes that failed during the download loop.
+///
+/// Each write is attempted up to 3 times with exponential backoff (100ms, 200ms).
+/// Returns the number of writes that still failed after all retries.
+async fn flush_pending_state_writes(
+    db: &dyn StateDb,
+    pending: &[PendingStateWrite],
+) -> usize {
+    if pending.is_empty() {
+        return 0;
+    }
+    tracing::info!(
+        count = pending.len(),
+        "Retrying deferred state writes"
+    );
+    let mut failures = 0;
+    for write in pending {
+        let mut succeeded = false;
+        for attempt in 1..=3u32 {
+            match db
+                .mark_downloaded(
+                    &write.asset_id,
+                    write.version_size.as_str(),
+                    &write.download_path,
+                    &write.local_checksum,
+                )
+                .await
+            {
+                Ok(()) => {
+                    succeeded = true;
+                    break;
+                }
+                Err(e) => {
+                    if attempt < 3 {
+                        tracing::debug!(
+                            asset_id = %write.asset_id,
+                            attempt,
+                            error = %e,
+                            "State write retry failed, will retry"
+                        );
+                        tokio::time::sleep(Duration::from_millis(u64::from(attempt) * 100)).await;
+                    } else {
+                        tracing::error!(
+                            asset_id = %write.asset_id,
+                            path = %write.download_path.display(),
+                            error = %e,
+                            "State write failed after 3 attempts — file on disk but untracked, will be re-downloaded next sync"
+                        );
+                    }
+                }
+            }
+        }
+        if !succeeded {
+            failures += 1;
+        }
+    }
+    if failures > 0 {
+        tracing::warn!(
+            failures,
+            total = pending.len(),
+            "Some state writes could not be saved"
+        );
+    } else {
+        tracing::info!(
+            count = pending.len(),
+            "All deferred state writes recovered"
+        );
+    }
+    failures
+}
+
 /// Result of the streaming download phase.
 #[derive(Debug)]
 struct StreamingResult {
@@ -906,6 +986,7 @@ struct StreamingResult {
     exif_failures: usize,
     failed: Vec<DownloadTask>,
     auth_errors: usize,
+    state_write_failures: usize,
 }
 
 /// Download photos with syncToken support.
@@ -1338,6 +1419,7 @@ where
             exif_failures: 0,
             failed: Vec::new(),
             auth_errors: 0,
+            state_write_failures: 0,
         });
     }
 
@@ -1363,6 +1445,7 @@ where
             exif_failures: 0,
             failed: Vec::new(),
             auth_errors: 0,
+            state_write_failures: 0,
         });
     }
 
@@ -1425,6 +1508,7 @@ where
     let mut exif_failures = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
+    let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
 
     let (task_tx, task_rx) = mpsc::channel::<DownloadTask>(concurrency * 2);
 
@@ -1625,11 +1709,19 @@ where
                         )
                         .await
                     {
-                        tracing::warn!(
-                            asset_id = %task.asset_id,
-                            error = %e,
-                            "Failed to mark download"
-                        );
+                        pb.suspend(|| {
+                            tracing::warn!(
+                                asset_id = %task.asset_id,
+                                error = %e,
+                                "State write failed, deferring for retry"
+                            );
+                        });
+                        pending_state_writes.push(PendingStateWrite {
+                            asset_id: task.asset_id.clone(),
+                            version_size: task.version_size,
+                            download_path: task.download_path.clone(),
+                            local_checksum,
+                        });
                     }
                 }
             }
@@ -1717,11 +1809,19 @@ where
         ));
     }
 
+    // Retry any state writes that failed during the streaming loop
+    let state_write_failures = if let Some(db) = &state_db {
+        flush_pending_state_writes(db.as_ref(), &pending_state_writes).await
+    } else {
+        0
+    };
+
     Ok(StreamingResult {
         downloaded,
         exif_failures,
         failed,
         auth_errors,
+        state_write_failures,
     })
 }
 
@@ -1741,6 +1841,7 @@ async fn build_download_outcome(
     let mut exif_failures = streaming_result.exif_failures;
     let failed_tasks = streaming_result.failed;
     let auth_errors = streaming_result.auth_errors;
+    let mut state_write_failures = streaming_result.state_write_failures;
 
     if auth_errors >= AUTH_ERROR_THRESHOLD {
         return Ok(DownloadOutcome::SessionExpired {
@@ -1775,10 +1876,11 @@ async fn build_download_outcome(
 
     if failed_tasks.is_empty() {
         tracing::info!("── Summary ──");
-        if exif_failures > 0 {
+        if exif_failures > 0 || state_write_failures > 0 {
             tracing::info!(
                 downloaded = total,
                 exif_failures,
+                state_write_failures,
                 failed = 0,
                 total,
                 "  sync results"
@@ -1787,6 +1889,11 @@ async fn build_download_outcome(
             tracing::info!(downloaded = total, failed = 0, total, "  sync results");
         }
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
+        if state_write_failures > 0 {
+            return Ok(DownloadOutcome::PartialFailure {
+                failed_count: state_write_failures,
+            });
+        }
         return Ok(DownloadOutcome::Success);
     }
 
@@ -1821,6 +1928,7 @@ async fn build_download_outcome(
     let remaining_failed = pass_result.failed;
     let phase2_auth_errors = pass_result.auth_errors;
     exif_failures += pass_result.exif_failures;
+    state_write_failures += pass_result.state_write_failures;
     let total_auth_errors = auth_errors + phase2_auth_errors;
 
     if total_auth_errors >= AUTH_ERROR_THRESHOLD {
@@ -1834,10 +1942,11 @@ async fn build_download_outcome(
     let succeeded = downloaded + phase2_succeeded;
     let final_total = succeeded + failed;
     tracing::info!("── Summary ──");
-    if exif_failures > 0 {
+    if exif_failures > 0 || state_write_failures > 0 {
         tracing::info!(
             downloaded = succeeded,
             exif_failures,
+            state_write_failures,
             failed,
             total = final_total,
             "  sync results"
@@ -1852,12 +1961,13 @@ async fn build_download_outcome(
     }
     tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
 
-    if failed > 0 {
+    let total_failures = failed + state_write_failures;
+    if total_failures > 0 {
         for task in &remaining_failed {
             tracing::error!(path = %task.download_path.display(), "Download failed");
         }
         return Ok(DownloadOutcome::PartialFailure {
-            failed_count: failed,
+            failed_count: total_failures,
         });
     }
 
@@ -1870,6 +1980,7 @@ struct PassResult {
     exif_failures: usize,
     failed: Vec<DownloadTask>,
     auth_errors: usize,
+    state_write_failures: usize,
 }
 
 /// Configuration for a download pass.
@@ -1920,6 +2031,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
     let mut failed: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
     let mut exif_failures = 0usize;
+    let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
 
     for (task, result) in results {
         match &result {
@@ -1937,11 +2049,19 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                         )
                         .await
                     {
-                        tracing::warn!(
-                            asset_id = %task.asset_id,
-                            error = %e,
-                            "Failed to mark download"
-                        );
+                        pb.suspend(|| {
+                            tracing::warn!(
+                                asset_id = %task.asset_id,
+                                error = %e,
+                                "State write failed, deferring for retry"
+                            );
+                        });
+                        pending_state_writes.push(PendingStateWrite {
+                            asset_id: task.asset_id.clone(),
+                            version_size: task.version_size,
+                            download_path: task.download_path.clone(),
+                            local_checksum: local_checksum.clone(),
+                        });
                     }
                 }
             }
@@ -1976,11 +2096,19 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
         pb.inc(1);
     }
 
+    // Retry any state writes that failed during the pass
+    let state_write_failures = if let Some(db) = &state_db {
+        flush_pending_state_writes(db.as_ref(), &pending_state_writes).await
+    } else {
+        0
+    };
+
     pb.finish_and_clear();
     PassResult {
         exif_failures,
         failed,
         auth_errors,
+        state_write_failures,
     }
 }
 
@@ -4405,5 +4533,191 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── State-write retry tests ──
+
+    use crate::state::error::StateError;
+    use crate::state::types::SyncSummary;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A StateDb stub where `mark_downloaded` fails a configurable number
+    /// of times before succeeding. All other methods panic (unused).
+    struct FailingStateDb {
+        remaining_failures: AtomicUsize,
+        successes: AtomicUsize,
+    }
+
+    impl FailingStateDb {
+        fn new(fail_count: usize) -> Self {
+            Self {
+                remaining_failures: AtomicUsize::new(fail_count),
+                successes: AtomicUsize::new(0),
+            }
+        }
+
+        fn success_count(&self) -> usize {
+            self.successes.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateDb for FailingStateDb {
+        #[cfg(test)]
+        async fn should_download(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &Path,
+        ) -> Result<bool, StateError> {
+            unimplemented!()
+        }
+        async fn upsert_seen(&self, _: &AssetRecord) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn mark_downloaded(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Path,
+            _: &str,
+        ) -> Result<(), StateError> {
+            let prev = self.remaining_failures.fetch_sub(1, Ordering::Relaxed);
+            if prev > 0 {
+                Err(StateError::Query("simulated failure".into()))
+            } else {
+                self.remaining_failures.store(0, Ordering::Relaxed);
+                self.successes.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+        async fn mark_failed(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+        async fn get_summary(&self) -> Result<SyncSummary, StateError> {
+            unimplemented!()
+        }
+        async fn get_all_downloaded(&self) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+        async fn start_sync_run(&self) -> Result<i64, StateError> {
+            unimplemented!()
+        }
+        async fn complete_sync_run(
+            &self,
+            _: i64,
+            _: &SyncRunStats,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn reset_failed(&self) -> Result<u64, StateError> {
+            unimplemented!()
+        }
+        async fn get_downloaded_ids(
+            &self,
+        ) -> Result<HashSet<(String, String)>, StateError> {
+            unimplemented!()
+        }
+        async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+            unimplemented!()
+        }
+        async fn get_downloaded_checksums(
+            &self,
+        ) -> Result<HashMap<(String, String), String>, StateError> {
+            unimplemented!()
+        }
+        async fn get_metadata(&self, _: &str) -> Result<Option<String>, StateError> {
+            unimplemented!()
+        }
+        async fn set_metadata(&self, _: &str, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn touch_last_seen(&self, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_pending_state_writes_empty_is_noop() {
+        let db = FailingStateDb::new(0);
+        let result = flush_pending_state_writes(&db, &[]).await;
+        assert_eq!(result, 0);
+        assert_eq!(db.success_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn flush_pending_state_writes_succeeds_on_first_try() {
+        let db = FailingStateDb::new(0);
+        let pending = vec![PendingStateWrite {
+            asset_id: "A1".into(),
+            version_size: VersionSizeKey::Original,
+            download_path: PathBuf::from("/tmp/claude/photo.jpg"),
+            local_checksum: "abc".into(),
+        }];
+        let failures = flush_pending_state_writes(&db, &pending).await;
+        assert_eq!(failures, 0);
+        assert_eq!(db.success_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn flush_pending_state_writes_recovers_after_transient_failure() {
+        // Fail the first attempt, succeed on retry
+        let db = FailingStateDb::new(1);
+        let pending = vec![PendingStateWrite {
+            asset_id: "A1".into(),
+            version_size: VersionSizeKey::Original,
+            download_path: PathBuf::from("/tmp/claude/photo.jpg"),
+            local_checksum: "abc".into(),
+        }];
+        let failures = flush_pending_state_writes(&db, &pending).await;
+        assert_eq!(failures, 0);
+        assert_eq!(db.success_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn flush_pending_state_writes_reports_persistent_failure() {
+        // Fail all 3 attempts (initial call already failed once, so 3 retries = 3 failures)
+        let db = FailingStateDb::new(3);
+        let pending = vec![PendingStateWrite {
+            asset_id: "A1".into(),
+            version_size: VersionSizeKey::Original,
+            download_path: PathBuf::from("/tmp/claude/photo.jpg"),
+            local_checksum: "abc".into(),
+        }];
+        let failures = flush_pending_state_writes(&db, &pending).await;
+        assert_eq!(failures, 1);
+        assert_eq!(db.success_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn flush_pending_state_writes_partial_recovery() {
+        // 2 failures: first write fails all 3 attempts, second write fails once then succeeds
+        // Total calls: write1 (3 fails) + write2 (1 fail + 1 success) = 4 fails needed
+        // But FailingStateDb counts globally, so we need 4 failures total.
+        // write1: attempts 1,2,3 all fail (3 failures consumed), write1 reported as failure
+        // write2: attempt 1 fails (4th failure consumed), attempt 2 succeeds
+        let db = FailingStateDb::new(4);
+        let pending = vec![
+            PendingStateWrite {
+                asset_id: "A1".into(),
+                version_size: VersionSizeKey::Original,
+                download_path: PathBuf::from("/tmp/claude/photo1.jpg"),
+                local_checksum: "abc".into(),
+            },
+            PendingStateWrite {
+                asset_id: "A2".into(),
+                version_size: VersionSizeKey::Original,
+                download_path: PathBuf::from("/tmp/claude/photo2.jpg"),
+                local_checksum: "def".into(),
+            },
+        ];
+        let failures = flush_pending_state_writes(&db, &pending).await;
+        assert_eq!(failures, 1, "First write should fail, second should recover");
+        assert_eq!(db.success_count(), 1);
     }
 }
