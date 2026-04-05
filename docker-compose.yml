@@ -3,6 +3,7 @@ services:
     image: ghcr.io/rhoopr/kei:latest
     container_name: kei
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       - ICLOUD_USERNAME=${ICLOUD_USERNAME}
       - ICLOUD_PASSWORD=${ICLOUD_PASSWORD}

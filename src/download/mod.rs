@@ -593,20 +593,24 @@ fn filter_asset_to_tasks(
     dir_cache: &mut paths::DirCache,
 ) -> SmallVec<[DownloadTask; 2]> {
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping video (skip_videos enabled)");
         return SmallVec::new();
     }
     if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping photo (skip_photos enabled)");
         return SmallVec::new();
     }
 
     let created_utc = asset.created();
     if let Some(before) = &config.skip_created_before {
         if created_utc < *before {
+            tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (before date range)");
             return SmallVec::new();
         }
     }
     if let Some(after) = &config.skip_created_after {
         if created_utc > *after {
+            tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (after date range)");
             return SmallVec::new();
         }
     }
@@ -1635,6 +1639,10 @@ where
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
         let mut seen_ids: FxHashSet<Box<str>> = FxHashSet::default();
+        let mut skipped_by_state = 0usize;
+        let mut skipped_on_disk = 0usize;
+        let mut skipped_ampm = 0usize;
+        let mut skipped_by_filter = 0usize;
         tokio::pin!(combined);
         while let Some(result) = combined.next().await {
             if producer_shutdown.is_cancelled() {
@@ -1666,6 +1674,7 @@ where
                             if let Some(db) = &producer_state_db {
                                 let _ = db.touch_last_seen(asset.id()).await;
                             }
+                            skipped_by_state += 1;
                             producer_pb.inc(1);
                             continue;
                         }
@@ -1674,6 +1683,7 @@ where
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
                     if tasks.is_empty() {
+                        skipped_by_filter += 1;
                         producer_pb.inc(1);
                     } else {
                         for task in tasks {
@@ -1719,6 +1729,7 @@ where
                                         }
                                     }
                                     Some(false) => {
+                                        skipped_by_state += 1;
                                         tracing::debug!(
                                             asset_id = %task.asset_id,
                                             "Skipping (state confirms no download needed)"
@@ -1727,6 +1738,7 @@ where
                                     None => {
                                         match tokio::fs::try_exists(&task.download_path).await {
                                             Ok(true) => {
+                                                skipped_on_disk += 1;
                                                 tracing::debug!(
                                                     asset_id = %task.asset_id,
                                                     path = %task.download_path.display(),
@@ -1738,6 +1750,7 @@ where
                                                     .find_ampm_variant(&task.download_path)
                                                     .is_some()
                                                 {
+                                                    skipped_ampm += 1;
                                                     tracing::debug!(
                                                         asset_id = %task.asset_id,
                                                         path = %task.download_path.display(),
@@ -1778,6 +1791,20 @@ where
                     producer_pb.suspend(|| tracing::error!(error = %e, "Error fetching asset"));
                 }
             }
+        }
+
+        let total_skipped = skipped_by_state + skipped_on_disk + skipped_ampm + skipped_by_filter;
+        if total_skipped > 0 {
+            producer_pb.suspend(|| {
+                tracing::info!(
+                    state = skipped_by_state,
+                    on_disk = skipped_on_disk,
+                    ampm_variant = skipped_ampm,
+                    filtered = skipped_by_filter,
+                    total = total_skipped,
+                    "Skipped assets"
+                );
+            });
         }
     });
 
