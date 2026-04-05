@@ -505,7 +505,10 @@ mod tests {
     // --- Content validation tests ---
 
     fn write_temp_file(name: &str, content: &[u8]) -> (PathBuf, PathBuf) {
-        let dir = PathBuf::from("/tmp/claude/validate_content_test");
+        let dir = std::env::temp_dir()
+            .join("claude")
+            .join("validate_content_test")
+            .join(format!("{}_{}", std::process::id(), name));
         std::fs::create_dir_all(&dir).unwrap();
         let part_path = dir.join(format!("{name}.part"));
         let download_path = dir.join(name);

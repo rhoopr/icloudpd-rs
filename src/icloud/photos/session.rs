@@ -577,43 +577,31 @@ mod tests {
         assert_eq!(err.to_string(), "Invalid sync token: ");
     }
 
-    /// Post to a local server that replies with the given status line,
-    /// then classify the resulting error.
-    async fn post_status_and_classify(status_line: &'static str) -> RetryAction {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
-            let resp = format!("{status_line}\r\nContent-Length: 0\r\n\r\n");
-            tokio::io::AsyncWriteExt::write_all(&mut socket, resp.as_bytes())
-                .await
-                .unwrap();
-        });
-        let client = reqwest::Client::new();
-        let url = format!("http://{addr}/test");
-        let err = PhotosSession::post(&client, &url, "{}", &[])
-            .await
-            .unwrap_err();
-        classify_api_error(&err)
+    /// Build a reqwest::Error with the given HTTP status code (no network needed).
+    fn reqwest_status_error(status: u16) -> anyhow::Error {
+        let http_resp = http::Response::builder()
+            .status(status)
+            .body(Vec::<u8>::new())
+            .unwrap();
+        let resp = reqwest::Response::from(http_resp);
+        resp.error_for_status().unwrap_err().into()
     }
 
-    #[tokio::test]
-    async fn test_post_503_is_retryable() {
-        let action = post_status_and_classify("HTTP/1.1 503 Service Unavailable").await;
-        assert_eq!(action, RetryAction::Retry);
+    #[test]
+    fn test_post_503_is_retryable() {
+        let err = reqwest_status_error(503);
+        assert_eq!(classify_api_error(&err), RetryAction::Retry);
     }
 
-    #[tokio::test]
-    async fn test_post_429_is_retryable() {
-        let action = post_status_and_classify("HTTP/1.1 429 Too Many Requests").await;
-        assert_eq!(action, RetryAction::Retry);
+    #[test]
+    fn test_post_429_is_retryable() {
+        let err = reqwest_status_error(429);
+        assert_eq!(classify_api_error(&err), RetryAction::Retry);
     }
 
-    #[tokio::test]
-    async fn test_post_421_aborts() {
-        let action = post_status_and_classify("HTTP/1.1 421 Misdirected Request").await;
-        assert_eq!(action, RetryAction::Abort);
+    #[test]
+    fn test_post_421_aborts() {
+        let err = reqwest_status_error(421);
+        assert_eq!(classify_api_error(&err), RetryAction::Abort);
     }
 }

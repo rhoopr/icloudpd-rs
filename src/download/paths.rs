@@ -35,10 +35,11 @@ pub(crate) fn local_download_path(
 
     // Split on "/" and join as path components to handle cross-platform paths.
     // This converts "{:%Y/%m/%d}" format like "2025/01/15" into proper PathBuf.
+    // Each component is sanitized to prevent path traversal (e.g. "../../etc").
     let mut path = directory.to_path_buf();
     for component in date_path.split('/') {
         if !component.is_empty() {
-            path = path.join(component);
+            path = path.join(sanitize_path_component(component));
         }
     }
     path.join(&clean)
@@ -961,6 +962,42 @@ mod tests {
             .unwrap();
         let result = local_download_path(dir, "none", &date, "photo:1.jpg");
         assert_eq!(result, PathBuf::from("/photos/photo_1.jpg"));
+    }
+
+    #[test]
+    fn test_local_download_path_traversal_in_folder_structure() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+
+        // Literal traversal: "../../etc" — ".." components must be neutralised
+        let result = local_download_path(dir, "../../etc", &date, "passwd");
+        let result_str = result.to_string_lossy();
+        assert!(
+            result_str.starts_with("/photos/"),
+            "path escaped directory: {result_str}"
+        );
+        assert!(
+            !result_str.contains(".."),
+            "traversal not sanitized: {result_str}"
+        );
+
+        // Traversal mixed with date tokens: "../../%Y"
+        let result = local_download_path(dir, "../../%Y", &date, "photo.jpg");
+        let result_str = result.to_string_lossy();
+        assert!(
+            result_str.starts_with("/photos/"),
+            "path escaped directory: {result_str}"
+        );
+
+        // Python-style wrapper with traversal
+        let result = local_download_path(dir, "{:../../%Y}", &date, "photo.jpg");
+        let result_str = result.to_string_lossy();
+        assert!(
+            result_str.starts_with("/photos/"),
+            "path escaped directory: {result_str}"
+        );
     }
 
     #[test]
