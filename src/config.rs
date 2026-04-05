@@ -352,10 +352,17 @@ impl Config {
             toml_photos.and_then(|p| p.size),
             VersionSize::Original,
         );
+        // When --size adjusted and live-photo-size is not explicitly set,
+        // default to adjusted live photo companions too.
+        let default_live_photo_size = if size == VersionSize::Adjusted {
+            LivePhotoSize::Adjusted
+        } else {
+            LivePhotoSize::Original
+        };
         let live_photo_size = resolve(
             sync.live_photo_size,
             toml_photos.and_then(|p| p.live_photo_size),
-            LivePhotoSize::Original,
+            default_live_photo_size,
         );
         let live_photo_mov_filename_policy = resolve(
             sync.live_photo_mov_filename_policy,
@@ -940,6 +947,7 @@ mod tests {
             ("original", LivePhotoSize::Original),
             ("medium", LivePhotoSize::Medium),
             ("thumb", LivePhotoSize::Thumb),
+            ("adjusted", LivePhotoSize::Adjusted),
         ] {
             let toml_str = format!("[photos]\nlive_photo_size = \"{input}\"");
             let config: TomlConfig = toml::from_str(&toml_str).unwrap();
@@ -1540,6 +1548,23 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Thumb));
+    }
+
+    #[test]
+    fn test_build_live_photo_size_defaults_to_adjusted_when_size_adjusted() {
+        let mut sync = default_sync();
+        sync.size = Some(VersionSize::Adjusted);
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
+        assert!(matches!(cfg.live_photo_size, LivePhotoSize::Adjusted));
+    }
+
+    #[test]
+    fn test_build_live_photo_size_explicit_overrides_adjusted_default() {
+        let mut sync = default_sync();
+        sync.size = Some(VersionSize::Adjusted);
+        sync.live_photo_size = Some(LivePhotoSize::Original);
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
+        assert!(matches!(cfg.live_photo_size, LivePhotoSize::Original));
     }
 
     #[test]

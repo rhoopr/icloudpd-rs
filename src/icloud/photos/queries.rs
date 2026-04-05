@@ -172,6 +172,11 @@ pub(crate) const PHOTO_VERSION_LOOKUP: &[(AssetVersionSize, &str, &str)] = &[
         "resJPEGFullFileType",
     ),
     (
+        AssetVersionSize::LiveAdjusted,
+        "resVidFullRes",
+        "resVidFullFileType",
+    ),
+    (
         AssetVersionSize::LiveOriginal,
         "resOriginalVidComplRes",
         "resOriginalVidComplFileType",
@@ -193,6 +198,11 @@ pub(crate) const VIDEO_VERSION_LOOKUP: &[(AssetVersionSize, &str, &str)] = &[
         AssetVersionSize::Original,
         "resOriginalRes",
         "resOriginalFileType",
+    ),
+    (
+        AssetVersionSize::Adjusted,
+        "resVidFullRes",
+        "resVidFullFileType",
     ),
     (
         AssetVersionSize::Medium,
@@ -396,15 +406,17 @@ mod tests {
         assert!(sizes.contains(&AssetVersionSize::Medium));
         assert!(sizes.contains(&AssetVersionSize::Thumb));
         assert!(sizes.contains(&AssetVersionSize::Adjusted));
+        assert!(sizes.contains(&AssetVersionSize::LiveAdjusted));
         assert!(sizes.contains(&AssetVersionSize::LiveOriginal));
         assert!(sizes.contains(&AssetVersionSize::LiveMedium));
         assert!(sizes.contains(&AssetVersionSize::LiveThumb));
     }
 
     #[test]
-    fn test_video_version_lookup_has_original() {
+    fn test_video_version_lookup_has_expected_sizes() {
         let sizes: Vec<AssetVersionSize> = VIDEO_VERSION_LOOKUP.iter().map(|(s, ..)| *s).collect();
         assert!(sizes.contains(&AssetVersionSize::Original));
+        assert!(sizes.contains(&AssetVersionSize::Adjusted));
         assert!(sizes.contains(&AssetVersionSize::Medium));
         assert!(sizes.contains(&AssetVersionSize::Thumb));
     }

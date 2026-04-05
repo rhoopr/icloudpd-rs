@@ -292,7 +292,7 @@ fn domain_rejects_invalid() {
 
 #[test]
 fn live_photo_size_accepts_valid() {
-    for variant in ["original", "medium", "thumb"] {
+    for variant in ["original", "medium", "thumb", "adjusted"] {
         common::cmd()
             .args(["sync", "--live-photo-size", variant, "--help"])
             .assert()

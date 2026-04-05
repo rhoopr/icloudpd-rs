@@ -45,7 +45,10 @@ pub fn determine_media_type(
     asset: &crate::icloud::photos::PhotoAsset,
 ) -> MediaType {
     match version_size {
-        VersionSizeKey::LiveOriginal | VersionSizeKey::LiveMedium | VersionSizeKey::LiveThumb => {
+        VersionSizeKey::LiveOriginal
+        | VersionSizeKey::LiveMedium
+        | VersionSizeKey::LiveThumb
+        | VersionSizeKey::LiveAdjusted => {
             if asset.item_type() == Some(AssetItemType::Image) {
                 MediaType::LivePhotoVideo
             } else {
@@ -61,6 +64,7 @@ pub fn determine_media_type(
                 if asset.contains_version(AssetVersionSize::LiveOriginal)
                     || asset.contains_version(AssetVersionSize::LiveMedium)
                     || asset.contains_version(AssetVersionSize::LiveThumb)
+                    || asset.contains_version(AssetVersionSize::LiveAdjusted)
                 {
                     MediaType::LivePhotoImage
                 } else {

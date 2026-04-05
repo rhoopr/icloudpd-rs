@@ -16,6 +16,7 @@ pub enum LivePhotoSize {
     Original,
     Medium,
     Thumb,
+    Adjusted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -80,6 +81,7 @@ impl LivePhotoSize {
             LivePhotoSize::Original => AssetVersionSize::LiveOriginal,
             LivePhotoSize::Medium => AssetVersionSize::LiveMedium,
             LivePhotoSize::Thumb => AssetVersionSize::LiveThumb,
+            LivePhotoSize::Adjusted => AssetVersionSize::LiveAdjusted,
         }
     }
 }
@@ -102,6 +104,10 @@ mod tests {
         assert_eq!(
             LivePhotoSize::Thumb.to_asset_version_size(),
             AssetVersionSize::LiveThumb
+        );
+        assert_eq!(
+            LivePhotoSize::Adjusted.to_asset_version_size(),
+            AssetVersionSize::LiveAdjusted
         );
     }
 
@@ -133,6 +139,7 @@ mod tests {
             (LivePhotoSize::Original, "\"original\""),
             (LivePhotoSize::Medium, "\"medium\""),
             (LivePhotoSize::Thumb, "\"thumb\""),
+            (LivePhotoSize::Adjusted, "\"adjusted\""),
         ] {
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, expected);

@@ -21,6 +21,7 @@ pub enum VersionSizeKey {
     LiveOriginal = 5,
     LiveMedium = 6,
     LiveThumb = 7,
+    LiveAdjusted = 8,
 }
 
 impl VersionSizeKey {
@@ -35,6 +36,7 @@ impl VersionSizeKey {
             Self::LiveOriginal => "live_original",
             Self::LiveMedium => "live_medium",
             Self::LiveThumb => "live_thumb",
+            Self::LiveAdjusted => "live_adjusted",
         }
     }
 
@@ -49,6 +51,7 @@ impl VersionSizeKey {
             "live_original" | "liveoriginal" => Some(Self::LiveOriginal),
             "live_medium" | "livemedium" => Some(Self::LiveMedium),
             "live_thumb" | "livethumb" => Some(Self::LiveThumb),
+            "live_adjusted" | "liveadjusted" => Some(Self::LiveAdjusted),
             _ => None,
         }
     }
@@ -65,6 +68,7 @@ impl From<AssetVersionSize> for VersionSizeKey {
             AssetVersionSize::LiveOriginal => Self::LiveOriginal,
             AssetVersionSize::LiveMedium => Self::LiveMedium,
             AssetVersionSize::LiveThumb => Self::LiveThumb,
+            AssetVersionSize::LiveAdjusted => Self::LiveAdjusted,
         }
     }
 }
@@ -265,6 +269,7 @@ mod tests {
             VersionSizeKey::LiveOriginal,
             VersionSizeKey::LiveMedium,
             VersionSizeKey::LiveThumb,
+            VersionSizeKey::LiveAdjusted,
         ] {
             assert_eq!(VersionSizeKey::from_str(key.as_str()), Some(key));
         }
@@ -284,6 +289,10 @@ mod tests {
         assert_eq!(
             VersionSizeKey::from_str("livethumb"),
             Some(VersionSizeKey::LiveThumb)
+        );
+        assert_eq!(
+            VersionSizeKey::from_str("liveadjusted"),
+            Some(VersionSizeKey::LiveAdjusted)
         );
     }
 
@@ -422,6 +431,7 @@ mod tests {
             (AssetVersionSize::LiveOriginal, VersionSizeKey::LiveOriginal),
             (AssetVersionSize::LiveMedium, VersionSizeKey::LiveMedium),
             (AssetVersionSize::LiveThumb, VersionSizeKey::LiveThumb),
+            (AssetVersionSize::LiveAdjusted, VersionSizeKey::LiveAdjusted),
         ];
         for (avs, expected) in conversions {
             assert_eq!(VersionSizeKey::from(avs), expected, "{:?}", avs);
