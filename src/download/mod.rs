@@ -445,6 +445,13 @@ async fn build_download_tasks(
         let assets = album_result?;
 
         for asset in &assets {
+            let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
+            let parent_dir = paths::local_download_dir(
+                &config.directory,
+                &config.folder_structure,
+                &created_local,
+            );
+            dir_cache.ensure_dir_async(&parent_dir).await;
             tasks.extend(filter_asset_to_tasks(
                 asset,
                 config,
@@ -1340,6 +1347,10 @@ async fn download_photos_incremental(
             continue;
         }
 
+        let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
+        let parent_dir =
+            paths::local_download_dir(&config.directory, &config.folder_structure, &created_local);
+        dir_cache.ensure_dir_async(&parent_dir).await;
         tasks.extend(filter_asset_to_tasks(
             asset,
             config,
@@ -1492,6 +1503,13 @@ where
                         continue;
                     }
 
+                    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
+                    let parent_dir = paths::local_download_dir(
+                        &config.directory,
+                        &config.folder_structure,
+                        &created_local,
+                    );
+                    dir_cache.ensure_dir_async(&parent_dir).await;
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
                     for task in &tasks {
@@ -1525,6 +1543,13 @@ where
                 break;
             }
             let asset = result?;
+            let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
+            let parent_dir = paths::local_download_dir(
+                &config.directory,
+                &config.folder_structure,
+                &created_local,
+            );
+            dir_cache.ensure_dir_async(&parent_dir).await;
             let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
             for task in &tasks {
                 tracing::info!(path = %task.download_path.display(), "[DRY RUN] Would download");
@@ -1701,6 +1726,17 @@ where
                         }
                     }
 
+                    // Pre-populate the DirCache on the blocking threadpool so
+                    // that the sync filter_asset_to_tasks call below never blocks
+                    // the tokio worker with read_dir/stat syscalls.
+                    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
+                    let parent_dir = paths::local_download_dir(
+                        &config.directory,
+                        &config.folder_structure,
+                        &created_local,
+                    );
+                    dir_cache.ensure_dir_async(&parent_dir).await;
+
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
                     if tasks.is_empty() {
@@ -1757,45 +1793,33 @@ where
                                         );
                                     }
                                     None => {
-                                        match tokio::fs::try_exists(&task.download_path).await {
-                                            Ok(true) => {
-                                                skipped_on_disk += 1;
-                                                tracing::debug!(
-                                                    asset_id = %task.asset_id,
-                                                    path = %task.download_path.display(),
-                                                    "Skipping (already downloaded)"
-                                                );
-                                            }
-                                            Ok(false) => {
-                                                if dir_cache
-                                                    .find_ampm_variant(&task.download_path)
-                                                    .is_some()
-                                                {
-                                                    skipped_ampm += 1;
-                                                    tracing::debug!(
-                                                        asset_id = %task.asset_id,
-                                                        path = %task.download_path.display(),
-                                                        "Skipping (AM/PM variant exists on disk)"
-                                                    );
-                                                } else {
-                                                    tracing::debug!(
-                                                        asset_id = %task.asset_id,
-                                                        path = %task.download_path.display(),
-                                                        "File missing, will re-download"
-                                                    );
-                                                    if task_tx.send(task).await.is_err() {
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    "File existence check failed, downloading anyway"
-                                                );
-                                                if task_tx.send(task).await.is_err() {
-                                                    return;
-                                                }
+                                        // Directory was pre-populated above, so these
+                                        // are cache-hits — no blocking I/O.
+                                        if dir_cache.exists(&task.download_path) {
+                                            skipped_on_disk += 1;
+                                            tracing::debug!(
+                                                asset_id = %task.asset_id,
+                                                path = %task.download_path.display(),
+                                                "Skipping (already downloaded)"
+                                            );
+                                        } else if dir_cache
+                                            .find_ampm_variant(&task.download_path)
+                                            .is_some()
+                                        {
+                                            skipped_ampm += 1;
+                                            tracing::debug!(
+                                                asset_id = %task.asset_id,
+                                                path = %task.download_path.display(),
+                                                "Skipping (AM/PM variant exists on disk)"
+                                            );
+                                        } else {
+                                            tracing::debug!(
+                                                asset_id = %task.asset_id,
+                                                path = %task.download_path.display(),
+                                                "File missing, will re-download"
+                                            );
+                                            if task_tx.send(task).await.is_err() {
+                                                return;
                                             }
                                         }
                                     }

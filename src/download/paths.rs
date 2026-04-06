@@ -6,20 +6,17 @@ use base64::Engine;
 use chrono::{DateTime, Datelike, Local, Timelike};
 use rustc_hash::FxHashMap;
 
-/// Build the local download path for a photo asset.
+/// Build the date-based parent directory for a photo asset (without filename).
 ///
 /// `folder_structure` is a date format string such as `"{:%Y/%m/%d}"`. The
 /// special value `"none"` (case-insensitive) disables date-based folders.
-pub(crate) fn local_download_path(
+pub(crate) fn local_download_dir(
     directory: &Path,
     folder_structure: &str,
     created_date: &DateTime<Local>,
-    filename: &str,
 ) -> PathBuf {
-    let clean = clean_filename(filename);
-
     if folder_structure.eq_ignore_ascii_case("none") {
-        return directory.join(&clean);
+        return directory.to_path_buf();
     }
 
     // Extract format from Python-style {:%Y/%m/%d} wrapper if present
@@ -42,7 +39,20 @@ pub(crate) fn local_download_path(
             path = path.join(sanitize_path_component(component));
         }
     }
-    path.join(&clean)
+    path
+}
+
+/// Build the local download path for a photo asset.
+///
+/// `folder_structure` is a date format string such as `"{:%Y/%m/%d}"`. The
+/// special value `"none"` (case-insensitive) disables date-based folders.
+pub(crate) fn local_download_path(
+    directory: &Path,
+    folder_structure: &str,
+    created_date: &DateTime<Local>,
+    filename: &str,
+) -> PathBuf {
+    local_download_dir(directory, folder_structure, created_date).join(clean_filename(filename))
 }
 
 /// Expand date format tokens (%Y, %m, %d, %H, %M, %S) in a single pass.
@@ -399,12 +409,36 @@ pub(crate) fn normalize_ampm(s: &str) -> String {
     result
 }
 
+/// Read all entries in `dir`, returning a filename→size map.
+///
+/// This is the blocking I/O primitive used by `DirCache`. Extracted so it can
+/// be called from both sync (`ensure_dir`) and async (`ensure_dir_async`) paths.
+fn read_dir_entries(dir: &Path) -> FxHashMap<String, u64> {
+    std::fs::read_dir(dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_str()?.to_string();
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    Some((name, size))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Cached directory listing that amortizes filesystem syscalls.
 ///
 /// For each parent directory, a single `read_dir` populates a filename→size map.
 /// All subsequent existence checks and size lookups for files in that directory
 /// are served from the cache — eliminating per-file `stat()` calls that would
 /// otherwise block the tokio runtime when called from an async task.
+///
+/// Async callers should pre-populate directories with `ensure_dir_async()` before
+/// entering tight sync loops (e.g. `filter_asset_to_tasks`), so that the sync
+/// lookup methods (`exists`, `file_size`, `find_ampm_variant`) never hit disk.
 pub(crate) struct DirCache {
     dirs: std::collections::HashMap<PathBuf, FxHashMap<String, u64>>,
 }
@@ -420,6 +454,25 @@ impl DirCache {
     #[cfg(test)]
     pub fn clear(&mut self) {
         self.dirs.clear();
+    }
+
+    /// Pre-populate the cache for `dir` on the blocking threadpool.
+    ///
+    /// Call this from async code before using the sync lookup methods, so that
+    /// the subsequent `ensure_dir` calls are guaranteed cache-hits with no
+    /// blocking I/O on the tokio worker thread.
+    pub async fn ensure_dir_async(&mut self, dir: &Path) {
+        if self.dirs.contains_key(dir) {
+            return;
+        }
+        let dir_buf = dir.to_path_buf();
+        let entries = tokio::task::spawn_blocking({
+            let d = dir_buf.clone();
+            move || read_dir_entries(&d)
+        })
+        .await
+        .unwrap_or_default();
+        self.dirs.insert(dir_buf, entries);
     }
 
     /// Check whether `path` exists on disk, using cached directory listings.
@@ -469,23 +522,14 @@ impl DirCache {
         None
     }
 
-    /// Populate the cache for `dir` if not already present.
+    /// Populate the cache for `dir` if not already present (blocking I/O).
+    ///
+    /// In async contexts, prefer `ensure_dir_async()` to avoid blocking the
+    /// tokio worker thread — especially on slow or network-attached storage.
     fn ensure_dir(&mut self, dir: &Path) -> &FxHashMap<String, u64> {
-        self.dirs.entry(dir.to_path_buf()).or_insert_with(|| {
-            std::fs::read_dir(dir)
-                .ok()
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .filter_map(|e| {
-                            let name = e.file_name().to_str()?.to_string();
-                            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                            Some((name, size))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
+        self.dirs
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| read_dir_entries(dir))
     }
 }
 
