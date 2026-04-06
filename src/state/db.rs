@@ -1771,4 +1771,37 @@ mod tests {
         let failed_after = db.get_failed().await.unwrap();
         assert!(failed_after.is_empty());
     }
+
+    #[tokio::test]
+    async fn open_corrupt_db_returns_error() {
+        let dir = test_dir("corrupt_db");
+        let path = dir.join("corrupt.db");
+
+        // Write garbage bytes (not a valid SQLite header)
+        fs::write(&path, b"this is not a sqlite database at all").unwrap();
+
+        let result = SqliteStateDb::open(&path).await;
+        assert!(result.is_err(), "opening a corrupt DB should fail");
+
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a database"),
+            "error should indicate corruption, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_truncated_db_returns_error() {
+        let dir = test_dir("truncated_db");
+        let path = dir.join("truncated.db");
+
+        // Write a partial SQLite header (valid magic, but truncated)
+        let mut header = b"SQLite format 3\0".to_vec();
+        header.extend_from_slice(&[0u8; 16]); // truncated page header
+        fs::write(&path, &header).unwrap();
+
+        let result = SqliteStateDb::open(&path).await;
+        assert!(result.is_err(), "opening a truncated DB should fail");
+    }
 }
