@@ -280,7 +280,7 @@ impl PhotoAlbum {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
-                        let _ = token_tx.send(None);
+                        let _ = token_tx.send(Some(current_token));
                         return;
                     }
                 };
@@ -289,7 +289,7 @@ impl PhotoAlbum {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx.send(Err(e.into())).await;
-                        let _ = token_tx.send(None);
+                        let _ = token_tx.send(Some(current_token));
                         return;
                     }
                 };
@@ -300,7 +300,7 @@ impl PhotoAlbum {
                             "changes/zone returned empty zones array"
                         )))
                         .await;
-                    let _ = token_tx.send(None);
+                    let _ = token_tx.send(Some(current_token));
                     return;
                 };
 
@@ -312,7 +312,7 @@ impl PhotoAlbum {
                     &zone_name,
                 ) {
                     let _ = tx.send(Err(sync_err.into())).await;
-                    let _ = token_tx.send(None);
+                    let _ = token_tx.send(Some(current_token));
                     return;
                 }
 
@@ -1316,7 +1316,11 @@ mod tests {
         );
 
         let token = token_rx.await.expect("oneshot should not be dropped");
-        assert_eq!(token, None, "token should be None on error");
+        assert_eq!(
+            token.as_deref(),
+            Some("bad-token"),
+            "on error, should preserve the last-good token for checkpoint"
+        );
     }
 
     #[tokio::test]
