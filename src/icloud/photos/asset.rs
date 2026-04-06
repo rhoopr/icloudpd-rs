@@ -467,10 +467,6 @@ impl DeltaRecordBuffer {
         }
     }
 
-    fn orphaned_count(&self) -> usize {
-        self.pending_masters.len() + self.pending_assets.len()
-    }
-
     fn emit_paired(
         master_record: Record,
         asset_record: Record,
@@ -490,8 +486,7 @@ impl DeltaRecordBuffer {
 
 impl Drop for DeltaRecordBuffer {
     fn drop(&mut self) {
-        let count = self.orphaned_count();
-        if count > 0 {
+        if !self.pending_masters.is_empty() || !self.pending_assets.is_empty() {
             tracing::warn!(
                 orphaned_masters = self.pending_masters.len(),
                 orphaned_assets = self.pending_assets.len(),
