@@ -110,6 +110,10 @@ pub trait StateDb: Send + Sync {
     /// Set a metadata key-value pair (insert or update).
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError>;
 
+    /// Delete all metadata entries whose key starts with `prefix`.
+    /// Returns the number of rows deleted.
+    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError>;
+
     /// Update `last_seen_at` for all versions of an asset without requiring
     /// full metadata. Used by the early skip path to avoid path resolution.
     async fn touch_last_seen(&self, asset_id: &str) -> Result<(), StateError>;
@@ -616,6 +620,22 @@ impl StateDb for SqliteStateDb {
         .map_err(|e| StateError::query(&e))?;
 
         Ok(())
+    }
+
+    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        let deleted = conn
+            .execute(
+                "DELETE FROM metadata WHERE key LIKE ?1",
+                [format!("{prefix}%")],
+            )
+            .map_err(|e| StateError::query(&e))?;
+
+        Ok(deleted as u64)
     }
 
     async fn touch_last_seen(&self, asset_id: &str) -> Result<(), StateError> {
@@ -1201,6 +1221,31 @@ mod tests {
             db.get_metadata("config_hash").await.unwrap(),
             Some("def456".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_metadata_by_prefix() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        db.set_metadata("sync_token:zone1", "tok1").await.unwrap();
+        db.set_metadata("sync_token:zone2", "tok2").await.unwrap();
+        db.set_metadata("config_hash", "abc").await.unwrap();
+
+        // Only deletes matching prefix
+        let deleted = db.delete_metadata_by_prefix("sync_token:").await.unwrap();
+        assert_eq!(deleted, 2);
+
+        assert_eq!(db.get_metadata("sync_token:zone1").await.unwrap(), None);
+        assert_eq!(db.get_metadata("sync_token:zone2").await.unwrap(), None);
+        // Unrelated key is untouched
+        assert_eq!(
+            db.get_metadata("config_hash").await.unwrap(),
+            Some("abc".to_string())
+        );
+
+        // No-op when nothing matches
+        let deleted = db.delete_metadata_by_prefix("nonexistent:").await.unwrap();
+        assert_eq!(deleted, 0);
     }
 
     #[tokio::test]
