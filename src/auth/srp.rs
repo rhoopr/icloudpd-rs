@@ -556,8 +556,6 @@ mod tests {
 
     // --- SRP orchestration tests ---
 
-    use crate::auth::endpoints::Endpoints;
-
     fn srp_init_body(b_b64: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "salt": BASE64.encode(b"salt1234"),
@@ -608,17 +606,15 @@ mod tests {
         }
     }
 
-    fn endpoints() -> Endpoints {
-        Endpoints::for_domain("com").unwrap()
+    async fn run_srp(responses: Vec<SrpResponse>) -> Result<()> {
+        let mut t = stub(responses);
+        let ep = Endpoints::for_domain("com").unwrap();
+        authenticate_srp(&mut t, &ep, "u@test.com", "p", "c", "com").await
     }
 
     #[tokio::test]
     async fn srp_init_401_returns_failed_login() {
-        let mut t = stub(vec![SrpResponse {
-            status: 401,
-            body: vec![],
-        }]);
-        let err = authenticate_srp(&mut t, &endpoints(), "u@test.com", "p", "c", "com")
+        let err = run_srp(vec![SrpResponse { status: 401, body: vec![] }])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Failed to initiate SRP"));
@@ -626,135 +622,102 @@ mod tests {
 
     #[tokio::test]
     async fn srp_init_500_returns_api_error() {
-        let mut t = stub(vec![SrpResponse {
+        let err = run_srp(vec![SrpResponse {
             status: 500,
             body: b"server error".to_vec(),
-        }]);
-        let err = authenticate_srp(&mut t, &endpoints(), "u@test.com", "p", "c", "com")
-            .await
-            .unwrap_err();
+        }])
+        .await
+        .unwrap_err();
         let auth_err = err.downcast_ref::<AuthError>().unwrap();
         assert!(matches!(auth_err, AuthError::ApiError { code: 500, .. }));
     }
 
     #[tokio::test]
     async fn srp_init_invalid_json_returns_parse_error() {
-        let mut t = stub(vec![SrpResponse {
+        let err = run_srp(vec![SrpResponse {
             status: 200,
             body: b"not json".to_vec(),
-        }]);
-        let err = authenticate_srp(&mut t, &endpoints(), "u@test.com", "p", "c", "com")
-            .await
-            .unwrap_err();
+        }])
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("Failed to parse SRP init response"));
     }
 
     #[tokio::test]
     async fn srp_b_mod_n_zero_returns_error() {
-        let mut t = stub(vec![SrpResponse {
+        let err = run_srp(vec![SrpResponse {
             status: 200,
             body: srp_init_body(&BASE64.encode([0u8])),
-        }]);
-        let err = authenticate_srp(&mut t, &endpoints(), "u@test.com", "p", "c", "com")
-            .await
-            .unwrap_err();
+        }])
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("B mod N is zero"));
     }
 
     #[tokio::test]
     async fn srp_happy_path() {
-        let mut t = stub(vec![
+        run_srp(vec![
             valid_init_response(),
-            SrpResponse {
-                status: 200,
-                body: vec![],
-            },
-        ]);
-        authenticate_srp(&mut t, &endpoints(), "u@test.com", "p", "c", "com")
-            .await
-            .unwrap();
+            SrpResponse { status: 200, body: vec![] },
+        ])
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn srp_complete_409_signals_2fa_required() {
-        let mut t = stub(vec![
+        run_srp(vec![
             valid_init_response(),
-            SrpResponse {
-                status: 409,
-                body: vec![],
-            },
-        ]);
-        authenticate_srp(&mut t, &endpoints(), "u@test.com", "p", "c", "com")
-            .await
-            .unwrap();
+            SrpResponse { status: 409, body: vec![] },
+        ])
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn srp_complete_412_repair_succeeds() {
-        let mut t = stub(vec![
+        run_srp(vec![
             valid_init_response(),
-            SrpResponse {
-                status: 412,
-                body: vec![],
-            },
-            SrpResponse {
-                status: 200,
-                body: vec![],
-            },
-        ]);
-        authenticate_srp(&mut t, &endpoints(), "u@test.com", "p", "c", "com")
-            .await
-            .unwrap();
+            SrpResponse { status: 412, body: vec![] },
+            SrpResponse { status: 200, body: vec![] },
+        ])
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn srp_complete_412_repair_fails() {
-        let mut t = stub(vec![
+        let err = run_srp(vec![
             valid_init_response(),
-            SrpResponse {
-                status: 412,
-                body: vec![],
-            },
-            SrpResponse {
-                status: 500,
-                body: b"repair broken".to_vec(),
-            },
-        ]);
-        let err = authenticate_srp(&mut t, &endpoints(), "u@test.com", "p", "c", "com")
-            .await
-            .unwrap_err();
+            SrpResponse { status: 412, body: vec![] },
+            SrpResponse { status: 500, body: b"repair broken".to_vec() },
+        ])
+        .await
+        .unwrap_err();
         let auth_err = err.downcast_ref::<AuthError>().unwrap();
         assert!(matches!(auth_err, AuthError::ApiError { code: 412, .. }));
     }
 
     #[tokio::test]
     async fn srp_complete_client_error_returns_failed_login() {
-        let mut t = stub(vec![
+        let err = run_srp(vec![
             valid_init_response(),
-            SrpResponse {
-                status: 403,
-                body: b"forbidden".to_vec(),
-            },
-        ]);
-        let err = authenticate_srp(&mut t, &endpoints(), "u@test.com", "p", "c", "com")
-            .await
-            .unwrap_err();
+            SrpResponse { status: 403, body: b"forbidden".to_vec() },
+        ])
+        .await
+        .unwrap_err();
         let auth_err = err.downcast_ref::<AuthError>().unwrap();
         assert!(matches!(auth_err, AuthError::FailedLogin(_)));
     }
 
     #[tokio::test]
     async fn srp_complete_server_error_returns_failed_login() {
-        let mut t = stub(vec![
+        let err = run_srp(vec![
             valid_init_response(),
-            SrpResponse {
-                status: 502,
-                body: b"bad gateway".to_vec(),
-            },
-        ]);
-        let err = authenticate_srp(&mut t, &endpoints(), "u@test.com", "p", "c", "com")
-            .await
-            .unwrap_err();
+            SrpResponse { status: 502, body: b"bad gateway".to_vec() },
+        ])
+        .await
+        .unwrap_err();
         let auth_err = err.downcast_ref::<AuthError>().unwrap();
         assert!(matches!(auth_err, AuthError::FailedLogin(_)));
     }
