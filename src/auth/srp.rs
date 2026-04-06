@@ -352,6 +352,10 @@ pub async fn authenticate_srp(
         .context("Failed to parse SRP init response as JSON")?;
 
     let iterations = u32::try_from(body.iteration).context("SRP iteration count exceeds u32")?;
+    anyhow::ensure!(
+        iterations <= 1_000_000,
+        "SRP iteration count {iterations} exceeds safety limit"
+    );
 
     let salt = BASE64
         .decode(&body.salt)
