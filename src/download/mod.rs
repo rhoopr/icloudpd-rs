@@ -4783,7 +4783,11 @@ mod tests {
         async fn get_summary(&self) -> Result<SyncSummary, StateError> {
             unimplemented!()
         }
-        async fn get_all_downloaded(&self) -> Result<Vec<AssetRecord>, StateError> {
+        async fn get_downloaded_page(
+            &self,
+            _offset: u64,
+            _limit: u32,
+        ) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()
         }
         async fn start_sync_run(&self) -> Result<i64, StateError> {

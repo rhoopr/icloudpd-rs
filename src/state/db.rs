@@ -69,8 +69,15 @@ pub trait StateDb: Send + Sync {
     /// Get a summary of the database state.
     async fn get_summary(&self) -> Result<SyncSummary, StateError>;
 
-    /// Get all downloaded assets.
-    async fn get_all_downloaded(&self) -> Result<Vec<AssetRecord>, StateError>;
+    /// Get a page of downloaded assets, ordered by rowid.
+    ///
+    /// Returns up to `limit` records starting from `offset`.
+    /// Returns an empty `Vec` when no more records remain.
+    async fn get_downloaded_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError>;
 
     /// Start a new sync run and return its ID.
     async fn start_sync_run(&self) -> Result<i64, StateError>;
@@ -447,7 +454,11 @@ impl StateDb for SqliteStateDb {
         })
     }
 
-    async fn get_all_downloaded(&self) -> Result<Vec<AssetRecord>, StateError> {
+    async fn get_downloaded_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
         let conn = self
             .conn
             .lock()
@@ -455,12 +466,15 @@ impl StateDb for SqliteStateDb {
 
         let mut stmt = conn
             .prepare(
-                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'downloaded'",
+                "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'downloaded' ORDER BY rowid LIMIT ?1 OFFSET ?2",
             )
             .map_err(|e| StateError::query(&e))?;
 
         let records = stmt
-            .query_map([], row_to_asset_record)
+            .query_map(
+                rusqlite::params![limit as i64, offset as i64],
+                row_to_asset_record,
+            )
             .map_err(|e| StateError::query(&e))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| StateError::query(&e))?;
@@ -989,7 +1003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_all_downloaded() {
+    async fn test_get_downloaded_page() {
         let dir = test_dir();
         let db = SqliteStateDb::open_in_memory().unwrap();
 
@@ -1007,8 +1021,17 @@ mod tests {
                 .unwrap();
         }
 
-        let downloaded = db.get_all_downloaded().await.unwrap();
-        assert_eq!(downloaded.len(), 3);
+        // Fetch all in one page
+        let page = db.get_downloaded_page(0, 100).await.unwrap();
+        assert_eq!(page.len(), 3);
+
+        // Paginate: page of 2, then remainder
+        let first = db.get_downloaded_page(0, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        let second = db.get_downloaded_page(2, 2).await.unwrap();
+        assert_eq!(second.len(), 1);
+        let third = db.get_downloaded_page(4, 2).await.unwrap();
+        assert!(third.is_empty());
     }
 
     // ── Batch operation tests ──
@@ -1298,9 +1321,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_all_downloaded_scales_to_large_count() {
+    async fn test_get_downloaded_page_scales_to_large_count() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        let count = 10_000;
+        let count: usize = 10_000;
 
         // Bulk-insert records directly for speed
         {
@@ -1324,15 +1347,29 @@ mod tests {
             conn.execute_batch("COMMIT").unwrap();
         }
 
-        let downloaded = db.get_all_downloaded().await.unwrap();
-        assert_eq!(downloaded.len(), count);
+        // Paginate through all records
+        let page_size: u32 = 1000;
+        let mut total = 0usize;
+        let mut offset = 0u64;
+        let mut first_id = String::new();
+        let mut last_id = String::new();
+        loop {
+            let page = db.get_downloaded_page(offset, page_size).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            if total == 0 {
+                first_id = page[0].id.clone();
+            }
+            last_id = page.last().unwrap().id.clone();
+            assert!(page.iter().all(|r| r.status == AssetStatus::Downloaded));
+            total += page.len();
+            offset += page.len() as u64;
+        }
 
-        // Spot-check first and last records
-        assert_eq!(downloaded[0].id, "ASSET_00000");
-        assert_eq!(downloaded[count - 1].id, format!("ASSET_{:05}", count - 1));
-        assert!(downloaded
-            .iter()
-            .all(|r| r.status == AssetStatus::Downloaded));
+        assert_eq!(total, count);
+        assert_eq!(first_id, "ASSET_00000");
+        assert_eq!(last_id, format!("ASSET_{:05}", count - 1));
     }
 
     // ── Gap tests: robustness and edge cases ──
@@ -1482,7 +1519,7 @@ mod tests {
             ).unwrap();
         }
 
-        // Act: retrieve via get_failed (won't match 'corrupted_junk'), so use get_all_downloaded (also won't match).
+        // Act: retrieve via get_failed (won't match 'corrupted_junk'), and get_downloaded_page also won't match.
         // Instead, query via should_download which reads the row and parses status.
         // The unknown status falls back to Pending via AssetStatus::from_str -> unwrap_or(Pending).
         let needs_download = db

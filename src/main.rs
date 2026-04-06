@@ -344,63 +344,70 @@ async fn run_verify(args: cli::VerifyArgs, toml: Option<&TomlConfig>) -> anyhow:
     }
 
     let db = state::SqliteStateDb::open(&db_path).await?;
-    let downloaded = db.get_all_downloaded().await?;
+    let summary = db.get_summary().await?;
 
-    println!("Verifying {} downloaded assets...", downloaded.len());
+    println!("Verifying {} downloaded assets...", summary.downloaded);
     println!();
 
-    let mut missing = 0;
-    let mut corrupted = 0;
-    let mut verified = 0;
+    let mut missing = 0u64;
+    let mut corrupted = 0u64;
+    let mut verified = 0u64;
 
-    for asset in &downloaded {
-        // Sanity check: all assets from get_all_downloaded should have Downloaded status
-        debug_assert_eq!(asset.status, state::AssetStatus::Downloaded);
+    const PAGE_SIZE: u32 = 1000;
+    let mut offset = 0u64;
+    loop {
+        let page = db.get_downloaded_page(offset, PAGE_SIZE).await?;
+        if page.is_empty() {
+            break;
+        }
+        offset += page.len() as u64;
 
-        if let Some(local_path) = &asset.local_path {
-            if !local_path.exists() {
-                let downloaded_at = asset.downloaded_at.map_or_else(
-                    || "unknown".to_string(),
-                    |dt| dt.format("%Y-%m-%d").to_string(),
-                );
-                println!(
-                    "MISSING: {} ({}) - downloaded {}",
-                    local_path.display(),
-                    asset.id,
-                    downloaded_at
-                );
-                missing += 1;
-                continue;
-            }
+        for asset in &page {
+            debug_assert_eq!(asset.status, state::AssetStatus::Downloaded);
 
-            if args.checksums {
-                if let Some(local_cksum) = &asset.local_checksum {
-                    // Verify against locally-computed SHA-256
-                    match verify_local_checksum(local_path, local_cksum).await {
-                        Ok(true) => verified += 1,
-                        Ok(false) => {
-                            println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
-                            corrupted += 1;
+            if let Some(local_path) = &asset.local_path {
+                if !local_path.exists() {
+                    let downloaded_at = asset.downloaded_at.map_or_else(
+                        || "unknown".to_string(),
+                        |dt| dt.format("%Y-%m-%d").to_string(),
+                    );
+                    println!(
+                        "MISSING: {} ({}) - downloaded {}",
+                        local_path.display(),
+                        asset.id,
+                        downloaded_at
+                    );
+                    missing += 1;
+                    continue;
+                }
+
+                if args.checksums {
+                    if let Some(local_cksum) = &asset.local_checksum {
+                        match verify_local_checksum(local_path, local_cksum).await {
+                            Ok(true) => verified += 1,
+                            Ok(false) => {
+                                println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
+                                corrupted += 1;
+                            }
+                            Err(e) => {
+                                println!("ERROR: {} - {}", local_path.display(), e);
+                                corrupted += 1;
+                            }
                         }
-                        Err(e) => {
-                            println!("ERROR: {} - {}", local_path.display(), e);
-                            corrupted += 1;
-                        }
+                    } else {
+                        tracing::debug!(
+                            id = %asset.id,
+                            "No local checksum stored, skipping verification"
+                        );
+                        verified += 1;
                     }
                 } else {
-                    // Pre-v3 asset without local checksum — skip verification
-                    tracing::debug!(
-                        id = %asset.id,
-                        "No local checksum stored, skipping verification"
-                    );
                     verified += 1;
                 }
             } else {
-                verified += 1;
+                println!("NO PATH: {} - no local path recorded", asset.id);
+                missing += 1;
             }
-        } else {
-            println!("NO PATH: {} - no local path recorded", asset.id);
-            missing += 1;
         }
     }
 
