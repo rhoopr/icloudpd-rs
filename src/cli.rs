@@ -63,7 +63,6 @@ pub struct AuthArgs {
 }
 
 /// Arguments for the sync command (also used as default when no subcommand).
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
     /// Local directory for downloads

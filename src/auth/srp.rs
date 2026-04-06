@@ -292,7 +292,6 @@ pub(crate) fn get_auth_headers(
 /// Uses a custom SRP implementation that matches Apple's variant:
 /// - no username in the x computation (Python's `no_username_in_x()`)
 /// - PBKDF2-derived password key
-#[allow(clippy::many_single_char_names, clippy::too_many_lines)]
 pub async fn authenticate_srp(
     transport: &mut impl SrpTransport,
     endpoints: &Endpoints,

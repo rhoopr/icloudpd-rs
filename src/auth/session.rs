@@ -52,8 +52,8 @@ pub fn sanitize_username(username: &str) -> String {
             (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
         });
         let prefix_len = MAX_SANITIZED_USERNAME_LEN - 17; // room for "_" + 16 hex digits
-        // Find the last char boundary at or before prefix_len to avoid
-        // panicking on multi-byte UTF-8 (e.g. CJK usernames).
+                                                          // Find the last char boundary at or before prefix_len to avoid
+                                                          // panicking on multi-byte UTF-8 (e.g. CJK usernames).
         let prefix_end = sanitized[..prefix_len]
             .char_indices()
             .last()
@@ -128,7 +128,6 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 
 /// HTTP session wrapper that persists cookies and session data to disk,
 /// allowing authentication to survive across process restarts.
-#[allow(clippy::struct_field_names)]
 pub struct Session {
     client: Client,
     download_client: Client,
@@ -159,7 +158,6 @@ impl std::fmt::Debug for Session {
 
 impl Session {
     /// Create a new session, loading existing cookies and session data from disk.
-    #[allow(clippy::too_many_lines)]
     pub async fn new(
         cookie_dir: &Path,
         username: &str,

@@ -611,7 +611,6 @@ fn build_photos_params(
 /// 1. Enumerating all iCloud assets via the photos API
 /// 2. Computing the expected local path for each asset
 /// 3. If the file exists and size matches, marking it as downloaded in the DB
-#[allow(clippy::too_many_lines)]
 async fn run_import_existing(
     args: cli::ImportArgs,
     toml: Option<&TomlConfig>,
@@ -896,7 +895,6 @@ fn main() -> ExitCode {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 

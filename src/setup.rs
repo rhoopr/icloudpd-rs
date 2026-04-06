@@ -21,7 +21,6 @@ pub(crate) enum SetupResult {
 }
 
 /// Collected answers from the interactive setup wizard.
-#[allow(clippy::struct_excessive_bools)]
 struct SetupAnswers {
     // Account
     username: String,
@@ -644,7 +643,6 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
 // ── TOML generation ────────────────────────────────────────────────
 
-#[allow(clippy::too_many_lines)]
 fn generate_toml(answers: &SetupAnswers) -> String {
     let mut out = String::with_capacity(2048);
 

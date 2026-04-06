@@ -51,7 +51,6 @@ pub(crate) struct BatchQueryResponse {
 
 /// A `CloudKit` record. Fields are kept as dynamic JSON because Apple's schema
 /// varies by record type and changes without notice.
-#[allow(clippy::struct_field_names)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Record {

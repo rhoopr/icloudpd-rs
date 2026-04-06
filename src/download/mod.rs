@@ -90,7 +90,6 @@ struct NormalizedPath(Box<str>);
 impl NormalizedPath {
     /// Create a new normalized path from an owned `PathBuf`.
     /// For lookup operations, prefer `normalize()` to avoid `PathBuf` cloning.
-    #[allow(clippy::needless_pass_by_value)]
     fn new(path: PathBuf) -> Self {
         Self(Self::normalize(&path).into_owned().into_boxed_str())
     }
@@ -204,7 +203,6 @@ fn hash_download_config(config: &DownloadConfig) -> String {
 
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
-#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct DownloadConfig {
     pub(crate) directory: std::path::PathBuf,
     pub(crate) folder_structure: String,
@@ -609,7 +607,6 @@ async fn pre_ensure_asset_dir(
 /// The `claimed_paths` map tracks paths that have been claimed by earlier tasks
 /// in the same download session, preventing race conditions where two assets
 /// with the same filename both see "file doesn't exist" during concurrent downloads.
-#[allow(clippy::too_many_lines)]
 fn filter_asset_to_tasks(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
@@ -1234,7 +1231,6 @@ async fn download_photos_full_with_token(
 ///
 /// Fetches `ChangeEvent`s since the given sync token, filters to
 /// downloadable assets, and feeds them through the download pipeline.
-#[allow(clippy::too_many_lines)]
 async fn download_photos_incremental(
     download_client: &Client,
     albums: &[PhotoAlbum],
@@ -1463,7 +1459,6 @@ async fn download_photos_incremental(
 /// This is the core producer/consumer download logic from `stream_and_download`,
 /// factored out so that `download_photos_full_with_token` can supply a
 /// token-aware combined stream while reusing the same download machinery.
-#[allow(clippy::too_many_lines)]
 async fn stream_and_download_from_stream<S>(
     download_client: &Client,
     combined: S,
@@ -2010,7 +2005,6 @@ where
 /// Build a `DownloadOutcome` from a `StreamingResult`, running a cleanup
 /// pass if there were failures. Shared between `download_photos` and
 /// `download_photos_full_with_token`.
-#[allow(clippy::too_many_lines)]
 async fn build_download_outcome(
     download_client: &Client,
     albums: &[PhotoAlbum],
@@ -2180,7 +2174,6 @@ struct PassConfig<'a> {
 }
 
 /// Execute a download pass over the given tasks, returning any that failed.
-#[allow(clippy::too_many_lines)]
 async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> PassResult {
     let pb = create_progress_bar(config.no_progress_bar, false, tasks.len() as u64);
     let client = config.client.clone();
@@ -2452,10 +2445,9 @@ fn format_duration(d: Duration) -> String {
 ///
 /// Handles negative timestamps (dates before 1970) gracefully by clamping
 /// to the Unix epoch.
-#[allow(clippy::cast_sign_loss)]
 fn set_file_mtime(path: &Path, timestamp: i64) -> std::io::Result<()> {
     let time = if timestamp >= 0 {
-        UNIX_EPOCH + Duration::from_secs(timestamp as u64)
+        UNIX_EPOCH + Duration::from_secs(timestamp.unsigned_abs())
     } else {
         tracing::warn!(
             path = %path.display(),

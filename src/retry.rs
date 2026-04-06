@@ -55,7 +55,10 @@ impl RetryConfig {
 ///
 /// Returns the first `Ok` result, or the last error if retries are exhausted
 /// or the classifier returns `Abort`.
-#[allow(clippy::missing_errors_doc)]
+/// # Errors
+///
+/// Returns the last error if all retry attempts are exhausted or the
+/// classifier returns `Abort` for a non-retryable error.
 pub async fn retry_with_backoff<F, Fut, T, E, C>(
     config: &RetryConfig,
     classifier: C,

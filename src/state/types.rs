@@ -192,7 +192,6 @@ pub struct AssetRecord {
 
 impl AssetRecord {
     /// Create a new pending asset record.
-    #[allow(clippy::too_many_arguments)] // Matches SQL table columns
     pub fn new_pending(
         id: String,
         version_size: VersionSizeKey,

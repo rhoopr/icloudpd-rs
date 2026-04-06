@@ -76,23 +76,31 @@ fn decode_filename(fields: &Value) -> Option<String> {
     }
 }
 
+/// Convert an `f64` millisecond timestamp to a `DateTime<Utc>`, returning
+/// `None` if the value is out of `i64` range.
+fn f64_to_millis_datetime(ms: f64) -> Option<DateTime<Utc>> {
+    if (i64::MIN as f64..=i64::MAX as f64).contains(&ms) {
+        Utc.timestamp_millis_opt(ms as i64).single()
+    } else {
+        None
+    }
+}
+
 /// Determine asset type from the `itemType` `CloudKit` field, falling back to
 /// file extension heuristics. Defaults to Movie for unknown types because
 /// videos are more likely to have non-standard UTI strings.
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn resolve_item_type(fields: &Value, filename: Option<&str>) -> AssetItemType {
     if let Some(s) = fields["itemType"]["value"].as_str() {
         if let Some(t) = item_type_from_str(s) {
             return t;
         }
     }
-    if let Some(name) = filename {
-        let lower = name.to_lowercase();
-        if lower.ends_with(".heic")
-            || lower.ends_with(".png")
-            || lower.ends_with(".jpg")
-            || lower.ends_with(".jpeg")
-            || lower.ends_with(".webp")
+    if let Some(ext) = filename.and_then(|n| std::path::Path::new(n).extension()) {
+        if ext.eq_ignore_ascii_case("heic")
+            || ext.eq_ignore_ascii_case("png")
+            || ext.eq_ignore_ascii_case("jpg")
+            || ext.eq_ignore_ascii_case("jpeg")
+            || ext.eq_ignore_ascii_case("webp")
         {
             return AssetItemType::Image;
         }
@@ -204,7 +212,6 @@ impl PhotoAsset {
     }
 
     /// Construct from typed `Record` structs (used by album pagination).
-    #[allow(clippy::needless_pass_by_value)]
     pub fn from_records(master: super::cloudkit::Record, asset: super::cloudkit::Record) -> Self {
         let filename = decode_filename(&master.fields);
         let item_type_val = Some(resolve_item_type(&master.fields, filename.as_deref()));
@@ -234,10 +241,9 @@ impl PhotoAsset {
         self.filename.as_deref()
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     pub fn asset_date(&self) -> DateTime<Utc> {
         self.asset_date_ms
-            .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
+            .and_then(f64_to_millis_datetime)
             .unwrap_or_else(|| {
                 warn!(asset_id = %self.record_name, "Missing or invalid assetDate, falling back to epoch");
                 DateTime::UNIX_EPOCH
@@ -248,10 +254,9 @@ impl PhotoAsset {
         self.asset_date()
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     pub fn added_date(&self) -> DateTime<Utc> {
         self.added_date_ms
-            .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
+            .and_then(f64_to_millis_datetime)
             .unwrap_or_else(|| {
                 warn!(asset_id = %self.record_name, "Missing or invalid addedDate, falling back to epoch");
                 DateTime::UNIX_EPOCH

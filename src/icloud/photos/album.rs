@@ -39,7 +39,6 @@ type ChangeStream = Pin<Box<dyn Stream<Item = anyhow::Result<ChangeEvent>> + Sen
 ///
 /// We never spawn more fetchers than total pages (no empty fetchers)
 /// and never more than the requested concurrency level.
-#[allow(clippy::cast_possible_truncation)]
 fn determine_fetcher_count(total_items: u64, page_size: usize, concurrency: usize) -> usize {
     let total_pages = total_items.div_ceil(page_size as u64);
     (total_pages as usize).min(concurrency).max(1)
@@ -360,7 +359,6 @@ impl PhotoAlbum {
     /// observed `syncToken` into the shared mutex.
     ///
     /// Returns the stream and all spawned fetcher `JoinHandle`s.
-    #[allow(clippy::cast_possible_truncation)]
     fn photo_stream_inner(
         &self,
         limit: Option<u32>,
@@ -454,7 +452,6 @@ impl PhotoAlbum {
     /// If `shared_sync_token` is provided, the fetcher writes the last non-None
     /// `syncToken` from each `QueryResponse` page into it. Because the token is
     /// a zone-level invariant, any fetcher's final value is correct.
-    #[allow(clippy::too_many_lines)]
     fn spawn_fetcher(
         &self,
         tx: mpsc::Sender<anyhow::Result<PhotoAsset>>,

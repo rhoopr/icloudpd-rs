@@ -55,8 +55,9 @@ impl SystemdNotifier {
     }
 
     #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::unused_self)]
-    fn send_impl_ready(self) {}
+    fn send_impl_ready(self) {
+        let _ = self;
+    }
 
     #[cfg(target_os = "linux")]
     fn send_impl_stopping(self) {
@@ -66,8 +67,9 @@ impl SystemdNotifier {
     }
 
     #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::unused_self)]
-    fn send_impl_stopping(self) {}
+    fn send_impl_stopping(self) {
+        let _ = self;
+    }
 
     #[cfg(target_os = "linux")]
     fn send_impl_status(self, msg: &str) {
@@ -77,8 +79,9 @@ impl SystemdNotifier {
     }
 
     #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::unused_self)]
-    fn send_impl_status(self, _msg: &str) {}
+    fn send_impl_status(self, _msg: &str) {
+        let _ = self;
+    }
 
     #[cfg(target_os = "linux")]
     fn send_impl_watchdog(self) {
@@ -88,8 +91,9 @@ impl SystemdNotifier {
     }
 
     #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::unused_self)]
-    fn send_impl_watchdog(self) {}
+    fn send_impl_watchdog(self) {
+        let _ = self;
+    }
 }
 
 #[cfg(test)]

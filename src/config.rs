@@ -153,7 +153,6 @@ impl std::fmt::Display for LibrarySelection {
 /// - 2-byte primitives (u16)
 /// - 1-byte enums
 /// - All booleans grouped at the end
-#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     // Heap types first
     pub username: String,
@@ -298,11 +297,9 @@ fn resolve_password_command(
         .or_else(|| toml_auth.and_then(|a| a.password_command.clone()))
 }
 
-
 impl Config {
     /// Build a Config by merging CLI args with optional TOML config.
     /// Resolution order: CLI > TOML > hardcoded default.
-    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub fn build(
         auth: crate::cli::AuthArgs,
         sync: crate::cli::SyncArgs,
