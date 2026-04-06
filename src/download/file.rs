@@ -1140,4 +1140,201 @@ mod tests {
             "client should receive the .part file size as resume offset"
         );
     }
+
+    // --- download_file retry integration tests ---
+
+    /// Stub client that returns a configurable error status for the first N
+    /// calls, then succeeds with the given body. Tracks total call count.
+    struct RetryingStubClient {
+        fail_count: u32,
+        fail_status: u16,
+        body: Vec<u8>,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl RetryingStubClient {
+        fn new(fail_count: u32, fail_status: u16, body: Vec<u8>) -> Self {
+            Self {
+                fail_count,
+                fail_status,
+                body,
+                calls: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        fn call_count(&self) -> u32 {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DownloadClient for RetryingStubClient {
+        async fn fetch(
+            &self,
+            _url: &str,
+            _resume_from: Option<u64>,
+        ) -> Result<DownloadResponse, BoxError> {
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.fail_count {
+                // Return the error status with an empty body
+                let chunks: Vec<Result<Bytes, BoxError>> = vec![];
+                Ok(DownloadResponse {
+                    status: self.fail_status,
+                    content_length: None,
+                    stream: Box::pin(futures_util::stream::iter(chunks)),
+                })
+            } else {
+                let chunks: Vec<Result<Bytes, BoxError>> =
+                    vec![Ok(Bytes::from(self.body.clone()))];
+                Ok(DownloadResponse {
+                    status: 200,
+                    content_length: Some(self.body.len() as u64),
+                    stream: Box::pin(futures_util::stream::iter(chunks)),
+                })
+            }
+        }
+    }
+
+    fn retry_config_no_delay(max_retries: u32) -> RetryConfig {
+        RetryConfig {
+            max_retries,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn download_file_retries_on_429_then_succeeds() {
+        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let client = RetryingStubClient::new(2, 429, jpeg_body.clone());
+        let dir = PathBuf::from("/tmp/claude/retry_test").join(format!(
+            "{}_429_retry",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let download_path = dir.join("photo.jpg");
+        let _ = std::fs::remove_file(&download_path);
+
+        download_file(
+            &client,
+            "http://stub/photo.jpg",
+            &download_path,
+            "AAAA", // valid base64
+            &retry_config_no_delay(3),
+            ".kei-tmp",
+            DownloadOpts {
+                skip_rename: false,
+                expected_size: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(client.call_count(), 3, "should have retried twice then succeeded");
+        assert!(download_path.exists(), "file should be downloaded");
+        assert_eq!(std::fs::read(&download_path).unwrap(), jpeg_body);
+    }
+
+    #[tokio::test]
+    async fn download_file_retries_on_503_then_succeeds() {
+        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let client = RetryingStubClient::new(1, 503, jpeg_body.clone());
+        let dir = PathBuf::from("/tmp/claude/retry_test").join(format!(
+            "{}_503_retry",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let download_path = dir.join("photo.jpg");
+        let _ = std::fs::remove_file(&download_path);
+
+        download_file(
+            &client,
+            "http://stub/photo.jpg",
+            &download_path,
+            "AAAA",
+            &retry_config_no_delay(3),
+            ".kei-tmp",
+            DownloadOpts {
+                skip_rename: false,
+                expected_size: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(client.call_count(), 2, "should have retried once then succeeded");
+        assert!(download_path.exists());
+    }
+
+    #[tokio::test]
+    async fn download_file_aborts_on_non_retryable_status() {
+        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let client = RetryingStubClient::new(1, 404, jpeg_body);
+        let dir = PathBuf::from("/tmp/claude/retry_test").join(format!(
+            "{}_404_abort",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let download_path = dir.join("photo.jpg");
+        let _ = std::fs::remove_file(&download_path);
+
+        let err = download_file(
+            &client,
+            "http://stub/photo.jpg",
+            &download_path,
+            "AAAA",
+            &retry_config_no_delay(3),
+            ".kei-tmp",
+            DownloadOpts {
+                skip_rename: false,
+                expected_size: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(client.call_count(), 1, "should abort immediately on 404");
+        assert!(
+            matches!(err, DownloadError::HttpStatus { status: 404, .. }),
+            "expected HttpStatus 404, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_exhausts_retries_on_persistent_429() {
+        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        // Fail more times than max_retries allows
+        let client = RetryingStubClient::new(10, 429, jpeg_body);
+        let dir = PathBuf::from("/tmp/claude/retry_test").join(format!(
+            "{}_429_exhaust",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let download_path = dir.join("photo.jpg");
+        let _ = std::fs::remove_file(&download_path);
+
+        let err = download_file(
+            &client,
+            "http://stub/photo.jpg",
+            &download_path,
+            "AAAA",
+            &retry_config_no_delay(2),
+            ".kei-tmp",
+            DownloadOpts {
+                skip_rename: false,
+                expected_size: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        // 1 initial + 2 retries = 3 total attempts
+        assert_eq!(client.call_count(), 3, "should exhaust all retry attempts");
+        assert!(
+            matches!(err, DownloadError::HttpStatus { status: 429, .. }),
+            "expected HttpStatus 429, got: {err:?}"
+        );
+    }
 }
