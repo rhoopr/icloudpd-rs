@@ -54,7 +54,7 @@ pub struct SyncArgs {
     pub directory: Option<String>,
 
     /// Only authenticate (create/update session tokens)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "watch_with_interval")]
     pub auth_only: bool,
 
     /// List available albums
@@ -954,6 +954,13 @@ mod tests {
     fn test_watch_with_interval_rejects_zero() {
         let mut args = base_args();
         args.extend(["--watch-with-interval", "0"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_auth_only_conflicts_with_watch() {
+        let mut args = base_args();
+        args.extend(["--auth-only", "--watch-with-interval", "300"]);
         assert!(Cli::try_parse_from(&args).is_err());
     }
 
