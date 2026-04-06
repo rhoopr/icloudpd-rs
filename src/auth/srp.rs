@@ -48,7 +48,7 @@ pub(crate) trait SrpTransport {
     async fn post(
         &mut self,
         url: &str,
-        body: Option<String>,
+        body: Option<&str>,
         headers: Option<HeaderMap>,
     ) -> Result<SrpResponse>;
     fn session_data(&self) -> &HashMap<String, String>;
@@ -59,7 +59,7 @@ impl SrpTransport for Session {
     async fn post(
         &mut self,
         url: &str,
-        body: Option<String>,
+        body: Option<&str>,
         headers: Option<HeaderMap>,
     ) -> Result<SrpResponse> {
         let response = Session::post(self, url, body, headers).await?;
@@ -332,8 +332,9 @@ pub async fn authenticate_srp(
     tracing::debug!(apple_id = %apple_id, "Initiating SRP authentication");
 
     let init_url = format!("{}/signin/init", endpoints.auth);
+    let init_body = init_body.to_string();
     let response = transport
-        .post(&init_url, Some(init_body.to_string()), Some(init_headers))
+        .post(&init_url, Some(&init_body), Some(init_headers))
         .await?;
 
     if response.status == 401 {
@@ -439,12 +440,9 @@ pub async fn authenticate_srp(
         "{}/signin/complete?isRememberMeEnabled=true",
         endpoints.auth
     );
+    let complete_body = complete_body.to_string();
     let response = transport
-        .post(
-            &complete_url,
-            Some(complete_body.to_string()),
-            Some(complete_headers),
-        )
+        .post(&complete_url, Some(&complete_body), Some(complete_headers))
         .await?;
 
     if response.status == 409 {
@@ -456,7 +454,7 @@ pub async fn authenticate_srp(
         let repair_headers = get_auth_headers(domain, client_id, transport.session_data(), None)?;
         let repair_url = format!("{}/repair/complete", endpoints.auth);
         let repair_response = transport
-            .post(&repair_url, Some("{}".to_string()), Some(repair_headers))
+            .post(&repair_url, Some("{}"), Some(repair_headers))
             .await?;
         if !repair_response.is_success() {
             return Err(AuthError::ApiError {
@@ -604,7 +602,7 @@ mod tests {
         async fn post(
             &mut self,
             _url: &str,
-            _body: Option<String>,
+            _body: Option<&str>,
             _headers: Option<HeaderMap>,
         ) -> Result<SrpResponse> {
             Ok(self

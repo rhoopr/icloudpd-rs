@@ -339,7 +339,7 @@ impl Session {
     pub async fn post(
         &mut self,
         url: &str,
-        body: Option<String>,
+        body: Option<&str>,
         extra_headers: Option<HeaderMap>,
     ) -> Result<Response> {
         let mut builder = self.client.post(url);
@@ -347,7 +347,9 @@ impl Session {
             builder = builder.headers(h);
         }
         if let Some(b) = body {
-            builder = builder.header("Content-Type", "application/json").body(b);
+            builder = builder
+                .header("Content-Type", "application/json")
+                .body(b.to_owned());
         }
 
         tracing::debug!(url = %url, "POST");

@@ -152,9 +152,8 @@ pub async fn trigger_push_notification(
     let url = format!("{}/bridge/step/0", endpoints.auth);
     tracing::debug!(url = %url, "Triggering push notification to trusted devices");
 
-    let response = session
-        .post(&url, Some(data.to_string()), Some(headers))
-        .await?;
+    let body = data.to_string();
+    let response = session.post(&url, Some(&body), Some(headers)).await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -211,9 +210,8 @@ pub async fn submit_2fa_code(
     )?;
 
     let url = format!("{}/verify/trusteddevice/securitycode", endpoints.auth);
-    let response = session
-        .post(&url, Some(data.to_string()), Some(headers))
-        .await?;
+    let body = data.to_string();
+    let response = session.post(&url, Some(&body), Some(headers)).await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -300,9 +298,7 @@ pub async fn validate_token(
     headers.insert("Referer", format!("{}/", session.home_endpoint()).parse()?);
 
     let url = format!("{}/validate", endpoints.setup);
-    let response = session
-        .post(&url, Some("null".to_string()), Some(headers))
-        .await?;
+    let response = session.post(&url, Some("null"), Some(headers)).await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -347,7 +343,8 @@ pub async fn authenticate_with_token(
     });
 
     let url = format!("{}/accountLogin", endpoints.setup);
-    let response = session.post(&url, Some(data.to_string()), None).await?;
+    let body = data.to_string();
+    let response = session.post(&url, Some(&body), None).await?;
 
     let status = response.status();
     if !status.is_success() {
