@@ -260,7 +260,7 @@ impl PhotoAlbum {
                 encode_params(&params)
             );
 
-            loop {
+            let stream_error: Option<anyhow::Error> = loop {
                 let body = build_changes_zone_request(&zone_id, Some(&current_token), 200);
                 debug!(
                     album = %album_name,
@@ -278,30 +278,16 @@ impl PhotoAlbum {
                 .await
                 {
                     Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        let _ = token_tx.send(current_token);
-                        return;
-                    }
+                    Err(e) => break Some(e),
                 };
 
                 let changes_resp: ChangesZoneResponse = match serde_json::from_value(response) {
                     Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx.send(Err(e.into())).await;
-                        let _ = token_tx.send(current_token);
-                        return;
-                    }
+                    Err(e) => break Some(e.into()),
                 };
 
                 let Some(zone_result) = changes_resp.zones.into_iter().next() else {
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!(
-                            "changes/zone returned empty zones array"
-                        )))
-                        .await;
-                    let _ = token_tx.send(current_token);
-                    return;
+                    break Some(anyhow::anyhow!("changes/zone returned empty zones array"));
                 };
 
                 // Check for zone-level errors
@@ -311,9 +297,7 @@ impl PhotoAlbum {
                     zone_result.reason.as_deref(),
                     &zone_name,
                 ) {
-                    let _ = tx.send(Err(sync_err.into())).await;
-                    let _ = token_tx.send(current_token);
-                    return;
+                    break Some(sync_err.into());
                 }
 
                 current_token = zone_result.sync_token;
@@ -330,24 +314,37 @@ impl PhotoAlbum {
                 let events = buffer.process_records(zone_result.records);
                 for event in events {
                     if tx.send(Ok(event)).await.is_err() {
-                        // Receiver dropped
+                        // Receiver dropped -- no one to flush to
                         let _ = token_tx.send(current_token);
                         return;
                     }
                 }
 
                 if !more_coming {
-                    break;
+                    break None;
+                }
+            };
+
+            // Always flush unpaired records, even on error
+            let flush_events = buffer.flush();
+            if !flush_events.is_empty() {
+                if stream_error.is_some() {
+                    tracing::warn!(
+                        album = %album_name,
+                        orphaned = flush_events.len(),
+                        "flushing unpaired records after stream error"
+                    );
+                }
+                for event in flush_events {
+                    if tx.send(Ok(event)).await.is_err() {
+                        let _ = token_tx.send(current_token);
+                        return;
+                    }
                 }
             }
 
-            // Flush remaining unpaired records
-            let flush_events = buffer.flush();
-            for event in flush_events {
-                if tx.send(Ok(event)).await.is_err() {
-                    let _ = token_tx.send(current_token);
-                    return;
-                }
+            if let Some(e) = stream_error {
+                let _ = tx.send(Err(e)).await;
             }
 
             let _ = token_tx.send(current_token);
