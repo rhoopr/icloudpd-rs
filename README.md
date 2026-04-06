@@ -139,7 +139,6 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 - [Wiki](https://github.com/rhoopr/kei/wiki) - configuration, Docker, troubleshooting
 - [Migration Guide](docs/migration-from-python.md) - switching from `icloudpd`
 - [Changelog](CHANGELOG.md)
-- [Roadmap](docs/roadmap.md)
 - [How iCloud's Incremental Sync Works](https://robhooper.xyz/blog-synctoken) - deep dive on CloudKit syncTokens
 
 ## Contributing

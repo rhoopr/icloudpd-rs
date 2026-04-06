@@ -442,8 +442,10 @@ impl Config {
         let watch_with_interval = sync
             .watch_with_interval
             .or_else(|| toml_watch.and_then(|w| w.interval));
-        if let Some(0) = watch_with_interval {
-            anyhow::bail!("watch interval must be >= 1, got 0");
+        if let Some(n) = watch_with_interval {
+            if n < 60 {
+                anyhow::bail!("watch interval must be >= 60 seconds, got {n}");
+            }
         }
         let notify_systemd = resolve_flag(
             sync.notify_systemd,
@@ -964,18 +966,22 @@ mod tests {
     }
 
     #[test]
-    fn test_build_watch_interval_zero_from_toml_rejected() {
-        let toml_str = r#"
-            [watch]
-            interval = 0
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let result = Config::build(default_auth(), default_sync(), Some(toml));
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("watch interval"),
-            "Error should mention watch interval"
-        );
+    fn test_build_watch_interval_below_minimum_from_toml_rejected() {
+        for interval in [0, 1, 59] {
+            let toml_str = format!(
+                r#"
+                [watch]
+                interval = {interval}
+            "#
+            );
+            let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
+            let result = Config::build(default_auth(), default_sync(), Some(toml));
+            assert!(result.is_err(), "interval {interval} should be rejected");
+            assert!(
+                result.unwrap_err().to_string().contains("watch interval"),
+                "Error should mention watch interval"
+            );
+        }
     }
 
     #[test]
