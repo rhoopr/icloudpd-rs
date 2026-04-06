@@ -153,12 +153,12 @@ pub struct SyncArgs {
     #[arg(long)]
     pub only_print_filenames: bool,
 
-    /// Max retries per download (default: 3, 0 = no retries)
-    #[arg(long)]
+    /// Max retries per download (default: 3, 0 = no retries, max: 100)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=100))]
     pub max_retries: Option<u32>,
 
-    /// Initial retry delay in seconds (default: 5, minimum: 1)
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    /// Initial retry delay in seconds (default: 5, range: 1–3600)
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub retry_delay: Option<u64>,
 
     /// Temp file suffix for partial downloads (default: .kei-tmp).
@@ -1309,6 +1309,36 @@ mod tests {
         args.extend(["--retry-delay", "1"]);
         let cli = parse(&args);
         assert_eq!(cli.sync.retry_delay, Some(1));
+    }
+
+    #[test]
+    fn test_retry_delay_rejects_above_3600() {
+        let mut args = base_args();
+        args.extend(["--retry-delay", "3601"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_retry_delay_accepts_3600() {
+        let mut args = base_args();
+        args.extend(["--retry-delay", "3600"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.retry_delay, Some(3600));
+    }
+
+    #[test]
+    fn test_max_retries_rejects_above_100() {
+        let mut args = base_args();
+        args.extend(["--max-retries", "101"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_max_retries_accepts_100() {
+        let mut args = base_args();
+        args.extend(["--max-retries", "100"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.max_retries, Some(100));
     }
 
     // ── no-incremental / reset-sync-token flags ───────────────────
