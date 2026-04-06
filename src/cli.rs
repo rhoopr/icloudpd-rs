@@ -1407,7 +1407,7 @@ mod tests {
     #[test]
     fn test_empty_username_rejected() {
         let args = ["kei", "--username", ""];
-        assert!(Cli::try_parse_from(&args).is_err());
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]

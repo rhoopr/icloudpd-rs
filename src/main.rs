@@ -145,13 +145,21 @@ fn available_disk_space(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
+    /// Widen a platform-dependent statvfs field to u64. `as u64` is the only
+    /// portable way since the underlying types (`c_ulong`, `fsblkcnt_t`) vary
+    /// across targets.
+    #[inline]
+    fn widen(v: impl Into<u64>) -> u64 {
+        v.into()
+    }
+
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
             return None;
         }
-        Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+        Some(widen(stat.f_bavail) * widen(stat.f_frsize))
     }
 }
 
@@ -160,7 +168,7 @@ fn available_disk_space(_path: &Path) -> Option<u64> {
     None
 }
 
-/// Build a password provider closure from a [`PasswordSource`].
+/// Build a password provider closure from a [`password::PasswordSource`].
 ///
 /// The source is evaluated lazily on each call — for `Command` and `File`
 /// sources, this re-executes/re-reads each time, supporting password rotation

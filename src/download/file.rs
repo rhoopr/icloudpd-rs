@@ -1027,7 +1027,7 @@ mod tests {
 
         // Pre-create a partial .part file (first 2 bytes of JPEG header)
         let first_half = [0xFF, 0xD8];
-        std::fs::write(&part_path, &first_half).unwrap();
+        std::fs::write(&part_path, first_half).unwrap();
 
         // Stub returns 206 with the remaining bytes
         let second_half = vec![0xFF, 0xE0, 0x00, 0x10];
