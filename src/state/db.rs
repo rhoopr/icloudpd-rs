@@ -1813,20 +1813,21 @@ mod tests {
         }
 
         // Spawn 10 tasks that each mark a different asset as downloaded
-        let mut handles: Vec<tokio::task::JoinHandle<Result<(), StateError>>> = Vec::new();
-        for i in 0..10 {
-            let db = Arc::clone(&db);
-            handles.push(tokio::spawn(async move {
-                db.mark_downloaded(
-                    &format!("CONCURRENT_{i}"),
-                    "original",
-                    Path::new(&format!("/tmp/photo_{i}.jpg")),
-                    &format!("hash_{i}"),
-                    None,
-                )
-                .await
-            }));
-        }
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let db = Arc::clone(&db);
+                tokio::spawn(async move {
+                    db.mark_downloaded(
+                        &format!("CONCURRENT_{i}"),
+                        "original",
+                        Path::new(&format!("/tmp/photo_{i}.jpg")),
+                        &format!("hash_{i}"),
+                        None,
+                    )
+                    .await
+                })
+            })
+            .collect();
 
         // All tasks should succeed without SQLite busy errors
         for handle in handles {
