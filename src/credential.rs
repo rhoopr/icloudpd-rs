@@ -67,14 +67,11 @@ impl CredentialStore {
                 tracing::debug!(error = %e, "Keyring unavailable, trying encrypted file");
             }
         }
-        match self.file_retrieve() {
-            Ok(Some(pw)) => {
-                tracing::debug!(backend = "encrypted-file", "Credential retrieved");
-                Ok(Some(pw))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
+        let result = self.file_retrieve()?;
+        if result.is_some() {
+            tracing::debug!(backend = "encrypted-file", "Credential retrieved");
         }
+        Ok(result)
     }
 
     /// Delete stored credentials from all backends.
@@ -107,24 +104,17 @@ impl CredentialStore {
 
     /// Return the name of the currently active backend.
     pub fn backend_name(&self) -> &'static str {
-        match self.keyring_entry() {
-            Ok(entry) => match entry.get_password() {
-                Ok(_) => "keyring",
-                Err(_) => {
-                    if self.credential_file_path().exists() {
-                        "encrypted-file"
-                    } else {
-                        "none"
-                    }
-                }
-            },
-            Err(_) => {
-                if self.credential_file_path().exists() {
-                    "encrypted-file"
-                } else {
-                    "none"
-                }
-            }
+        if self
+            .keyring_entry()
+            .and_then(|e| e.get_password().map_err(Into::into))
+            .is_ok()
+        {
+            return "keyring";
+        }
+        if self.credential_file_path().exists() {
+            "encrypted-file"
+        } else {
+            "none"
         }
     }
 

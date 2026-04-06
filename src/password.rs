@@ -139,7 +139,16 @@ fn strip_trailing_newline(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+
+    fn write_test_file(name: &str, contents: &str) -> PathBuf {
+        let dir = PathBuf::from("/tmp/claude/test_pw");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    // ── strip_trailing_newline ──────────────────────────────────────
 
     #[test]
     fn strip_trailing_newline_lf() {
@@ -161,52 +170,45 @@ mod tests {
         assert_eq!(strip_trailing_newline("password\n\n"), "password\n");
     }
 
+    // ── read_password_file ──────────────────────────────────────────
+
     #[test]
     fn read_password_file_normal() {
-        let dir = PathBuf::from("/tmp/claude/test_pw");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pw_normal.txt");
-        std::fs::write(&path, "my_secret\n").unwrap();
-        let secret = read_password_file(&path).unwrap();
-        assert_eq!(secret.expose_secret(), "my_secret");
+        let path = write_test_file("pw_normal.txt", "my_secret\n");
+        assert_eq!(
+            read_password_file(&path).unwrap().expose_secret(),
+            "my_secret"
+        );
     }
 
     #[test]
     fn read_password_file_no_newline() {
-        let dir = PathBuf::from("/tmp/claude/test_pw");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pw_no_nl.txt");
-        std::fs::write(&path, "my_secret").unwrap();
-        let secret = read_password_file(&path).unwrap();
-        assert_eq!(secret.expose_secret(), "my_secret");
+        let path = write_test_file("pw_no_nl.txt", "my_secret");
+        assert_eq!(
+            read_password_file(&path).unwrap().expose_secret(),
+            "my_secret"
+        );
     }
 
     #[test]
     fn read_password_file_crlf() {
-        let dir = PathBuf::from("/tmp/claude/test_pw");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pw_crlf.txt");
-        std::fs::write(&path, "my_secret\r\n").unwrap();
-        let secret = read_password_file(&path).unwrap();
-        assert_eq!(secret.expose_secret(), "my_secret");
+        let path = write_test_file("pw_crlf.txt", "my_secret\r\n");
+        assert_eq!(
+            read_password_file(&path).unwrap().expose_secret(),
+            "my_secret"
+        );
     }
 
     #[test]
     fn read_password_file_empty() {
-        let dir = PathBuf::from("/tmp/claude/test_pw");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pw_empty.txt");
-        std::fs::write(&path, "").unwrap();
+        let path = write_test_file("pw_empty.txt", "");
         let err = read_password_file(&path).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
     }
 
     #[test]
     fn read_password_file_only_newline() {
-        let dir = PathBuf::from("/tmp/claude/test_pw");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pw_only_nl.txt");
-        std::fs::write(&path, "\n").unwrap();
+        let path = write_test_file("pw_only_nl.txt", "\n");
         let err = read_password_file(&path).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
     }
@@ -218,10 +220,16 @@ mod tests {
         assert!(err.to_string().contains("Failed to read"), "{err}");
     }
 
+    // ── run_password_command ────────────────────────────────────────
+
     #[test]
     fn run_password_command_echo() {
-        let secret = run_password_command("echo hunter2").unwrap();
-        assert_eq!(secret.expose_secret(), "hunter2");
+        assert_eq!(
+            run_password_command("echo hunter2")
+                .unwrap()
+                .expose_secret(),
+            "hunter2"
+        );
     }
 
     #[test]
@@ -238,35 +246,38 @@ mod tests {
 
     #[test]
     fn run_password_command_strips_newline() {
-        // `echo` adds a trailing newline by default
-        let secret = run_password_command("echo secret_value").unwrap();
-        assert_eq!(secret.expose_secret(), "secret_value");
+        assert_eq!(
+            run_password_command("echo secret_value")
+                .unwrap()
+                .expose_secret(),
+            "secret_value"
+        );
     }
+
+    // ── PasswordSource::resolve ─────────────────────────────────────
 
     #[test]
     fn password_source_direct_resolve() {
-        let secret = SecretString::from("direct_pw".to_string());
-        let source = PasswordSource::Direct(Arc::new(secret));
-        let resolved = source.resolve().unwrap().unwrap();
-        assert_eq!(resolved.expose_secret(), "direct_pw");
+        let source = PasswordSource::Direct(Arc::new(SecretString::from("direct_pw")));
+        assert_eq!(
+            source.resolve().unwrap().unwrap().expose_secret(),
+            "direct_pw"
+        );
     }
 
     #[test]
     fn password_source_command_resolve() {
         let source = PasswordSource::Command("echo cmd_pw".to_string());
-        let resolved = source.resolve().unwrap().unwrap();
-        assert_eq!(resolved.expose_secret(), "cmd_pw");
+        assert_eq!(source.resolve().unwrap().unwrap().expose_secret(), "cmd_pw");
     }
 
     #[test]
     fn password_source_file_resolve() {
-        let dir = PathBuf::from("/tmp/claude/test_pw");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pw_source.txt");
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(f, "file_pw\n").unwrap();
+        let path = write_test_file("pw_source.txt", "file_pw\n");
         let source = PasswordSource::File(path);
-        let resolved = source.resolve().unwrap().unwrap();
-        assert_eq!(resolved.expose_secret(), "file_pw");
+        assert_eq!(
+            source.resolve().unwrap().unwrap().expose_secret(),
+            "file_pw"
+        );
     }
 }

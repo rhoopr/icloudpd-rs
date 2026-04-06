@@ -169,6 +169,24 @@ fn make_password_provider(source: password::PasswordSource) -> impl Fn() -> Opti
     move || source.resolve().ok().flatten()
 }
 
+/// Build a password provider from CLI auth args and resolved auth fields.
+///
+/// Shared by `run_get_code`, `run_submit_code`, and `run_import_existing`.
+fn make_provider_from_auth(
+    auth: &cli::AuthArgs,
+    password: Option<String>,
+    username: &str,
+    cookie_directory: &Path,
+) -> impl Fn() -> Option<SecretString> {
+    let source = password::build_password_source(
+        password.map(SecretString::from).as_ref(),
+        auth.password_command.as_deref(),
+        auth.password_file.as_deref().map(Path::new),
+        credential::CredentialStore::new(username, cookie_directory),
+    );
+    make_password_provider(source)
+}
+
 /// Attempt to re-authenticate the session.
 ///
 /// First validates the existing session; if invalid, performs full re-authentication.
@@ -497,13 +515,8 @@ async fn run_get_code(args: cli::GetCodeArgs, toml: Option<&TomlConfig>) -> anyh
         anyhow::bail!("--username is required for get-code");
     }
 
-    let source = password::build_password_source(
-        password.map(SecretString::from).as_ref(),
-        args.auth.password_command.as_deref(),
-        args.auth.password_file.as_deref().map(std::path::Path::new),
-        credential::CredentialStore::new(&username, &cookie_directory),
-    );
-    let password_provider = make_password_provider(source);
+    let password_provider =
+        make_provider_from_auth(&args.auth, password, &username, &cookie_directory);
 
     auth::send_2fa_push(
         &cookie_directory,
@@ -529,13 +542,8 @@ async fn run_submit_code(
         anyhow::bail!("--username is required for submit-code");
     }
 
-    let source = password::build_password_source(
-        password.map(SecretString::from).as_ref(),
-        args.auth.password_command.as_deref(),
-        args.auth.password_file.as_deref().map(std::path::Path::new),
-        credential::CredentialStore::new(&username, &cookie_directory),
-    );
-    let password_provider = make_password_provider(source);
+    let password_provider =
+        make_provider_from_auth(&args.auth, password, &username, &cookie_directory);
 
     let result = auth::authenticate(
         &cookie_directory,
@@ -613,13 +621,8 @@ async fn run_import_existing(
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
     // Authenticate
-    let source = password::build_password_source(
-        password.map(SecretString::from).as_ref(),
-        args.auth.password_command.as_deref(),
-        args.auth.password_file.as_deref().map(std::path::Path::new),
-        credential::CredentialStore::new(&username, &cookie_directory),
-    );
-    let password_provider = make_password_provider(source);
+    let password_provider =
+        make_provider_from_auth(&args.auth, password, &username, &cookie_directory);
 
     let auth_result = auth::authenticate(
         &cookie_directory,
@@ -1082,18 +1085,15 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // Save password to credential store if requested
-    if config.save_password {
-        if let Some(ref pw) = config.password {
-            let store =
-                credential::CredentialStore::new(&config.username, &config.cookie_directory);
-            if let Err(e) = store.store(pw.expose_secret()) {
-                tracing::warn!(error = %e, "Failed to save password to credential store");
-            } else {
-                tracing::info!(
-                    backend = store.backend_name(),
-                    "Password saved to credential store"
-                );
-            }
+    if let (true, Some(ref pw)) = (config.save_password, &config.password) {
+        let store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
+        if let Err(e) = store.store(pw.expose_secret()) {
+            tracing::warn!(error = %e, "Failed to save password to credential store");
+        } else {
+            tracing::info!(
+                backend = store.backend_name(),
+                "Password saved to credential store"
+            );
         }
     }
 
