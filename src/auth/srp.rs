@@ -347,9 +347,15 @@ pub async fn authenticate_srp(
         .into());
     }
 
-    let body: super::responses::SrpInitResponse = response
-        .json()
-        .context("Failed to parse SRP init response as JSON")?;
+    let body: super::responses::SrpInitResponse = response.json().with_context(|| {
+        let text = response.text();
+        let n = text.len().min(200);
+        format!(
+            "SRP init: expected JSON but got (HTTP {}): {:?}",
+            response.status,
+            &text[..n]
+        )
+    })?;
 
     let iterations = u32::try_from(body.iteration).context("SRP iteration count exceeds u32")?;
     anyhow::ensure!(
@@ -653,9 +659,7 @@ mod tests {
         }])
         .await
         .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Failed to parse SRP init response"));
+        assert!(err.to_string().contains("SRP init: expected JSON"));
     }
 
     #[tokio::test]

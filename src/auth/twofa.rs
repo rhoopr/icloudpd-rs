@@ -319,10 +319,11 @@ pub async fn validate_token(
     let response = reject_on_rscd(response).await?;
 
     tracing::debug!("Session token is still valid");
-    let data: AccountLoginResponse = response
-        .json()
-        .await
-        .context("Failed to parse validate response as JSON")?;
+    let text = response.text().await.unwrap_or_default();
+    let data: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
+        let n = text.len().min(200);
+        format!("Validate: expected JSON but got: {:?}", &text[..n])
+    })?;
     data.check_errors()?;
     Ok(data)
 }
@@ -358,10 +359,11 @@ pub async fn authenticate_with_token(
 
     let response = reject_on_rscd(response).await?;
 
-    let body: AccountLoginResponse = response
-        .json()
-        .await
-        .context("Failed to parse accountLogin response as JSON")?;
+    let text = response.text().await.unwrap_or_default();
+    let body: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
+        let n = text.len().min(200);
+        format!("Account login: expected JSON but got: {:?}", &text[..n])
+    })?;
 
     // Check for body-level error indicators before proceeding
     body.check_errors()?;
