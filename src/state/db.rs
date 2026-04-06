@@ -1792,6 +1792,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_mark_downloaded_all_succeed() {
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+
+        // Insert 10 pending assets
+        for i in 0..10 {
+            let record = AssetRecord::new_pending(
+                format!("CONCURRENT_{i}"),
+                VersionSizeKey::Original,
+                format!("ck_{i}"),
+                format!("photo_{i}.jpg"),
+                Utc::now(),
+                None,
+                1000,
+                MediaType::Photo,
+            );
+            db.upsert_seen(&record).await.unwrap();
+        }
+
+        // Spawn 10 tasks that each mark a different asset as downloaded
+        let mut handles: Vec<tokio::task::JoinHandle<Result<(), StateError>>> = Vec::new();
+        for i in 0..10 {
+            let db = Arc::clone(&db);
+            handles.push(tokio::spawn(async move {
+                db.mark_downloaded(
+                    &format!("CONCURRENT_{i}"),
+                    "original",
+                    Path::new(&format!("/tmp/photo_{i}.jpg")),
+                    &format!("hash_{i}"),
+                    None,
+                )
+                .await
+            }));
+        }
+
+        // All tasks should succeed without SQLite busy errors
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+
+        // Verify all 10 assets are downloaded
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 10);
+        assert_eq!(summary.pending, 0);
+    }
+
+    #[tokio::test]
     async fn open_truncated_db_returns_error() {
         let dir = test_dir("truncated_db");
         let path = dir.join("truncated.db");
