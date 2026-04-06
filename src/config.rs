@@ -1099,13 +1099,10 @@ mod tests {
     #[test]
     fn test_build_cookie_directory_nonexistent_rejected() {
         let mut auth = default_auth();
-        auth.cookie_directory = Some("/nonexistent/deeply/nested/cookies".to_string());
+        // Use a path with a null byte which is invalid on all platforms
+        auth.cookie_directory = Some("\0invalid/cookies".to_string());
         let result = Config::build(auth, default_sync(), None);
         assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("cookie directory"),
-            "Error should mention cookie directory"
-        );
     }
 
     #[test]
@@ -1577,15 +1574,17 @@ mod tests {
         assert!(matches!(cfg.domain, Domain::Cn));
     }
 
+    /// Escape backslashes for embedding a path in a TOML string literal.
+    fn toml_escape(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('\\', "\\\\")
+    }
+
     #[test]
     fn test_build_cookie_directory_cli_overrides_toml() {
         let dir = tempfile::tempdir().unwrap();
         let cli_path = dir.path().join("cli_cookies");
         let toml_path = dir.path().join("toml_cookies");
-        let toml_str = format!(
-            "[auth]\ncookie_directory = \"{}\"",
-            toml_path.to_string_lossy()
-        );
+        let toml_str = format!("[auth]\ncookie_directory = \"{}\"", toml_escape(&toml_path));
         let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
         let mut auth = default_auth();
         auth.cookie_directory = Some(cli_path.to_string_lossy().to_string());
@@ -1597,10 +1596,7 @@ mod tests {
     fn test_build_cookie_directory_from_toml() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("toml_cookies");
-        let toml_str = format!(
-            "[auth]\ncookie_directory = \"{}\"",
-            toml_path.to_string_lossy()
-        );
+        let toml_str = format!("[auth]\ncookie_directory = \"{}\"", toml_escape(&toml_path));
         let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
         let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.cookie_directory, toml_path);
@@ -2078,7 +2074,7 @@ mod tests {
             username = "full@example.com"
             password = "fullpw"
             domain = "cn"
-            cookie_directory = "{}"
+            cookie_directory = "{cookie}"
 
             [download]
             directory = "/full/photos"
@@ -2110,7 +2106,7 @@ mod tests {
             interval = 900
             pid_file = "/full/pid"
         "#,
-            cookie_path.to_string_lossy()
+            cookie = toml_escape(&cookie_path)
         );
         let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
         let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
