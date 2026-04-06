@@ -231,14 +231,14 @@ impl PhotoAlbum {
     ///
     /// Returns a stream of `ChangeEvent`s and a oneshot receiver for the final syncToken.
     /// The syncToken is sent through the oneshot after all pages have been consumed
-    /// (moreComing: false).
+    /// (moreComing: false), or on error with the last successfully consumed token.
     ///
     /// This method is inherently sequential -- each page's syncToken feeds the next request.
     /// No parallel fetchers.
     pub fn changes_stream(
         &self,
         sync_token: &str,
-    ) -> (ChangeStream, tokio::sync::oneshot::Receiver<Option<String>>) {
+    ) -> (ChangeStream, tokio::sync::oneshot::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<anyhow::Result<ChangeEvent>>(200);
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
 
@@ -280,7 +280,7 @@ impl PhotoAlbum {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
-                        let _ = token_tx.send(Some(current_token));
+                        let _ = token_tx.send(current_token);
                         return;
                     }
                 };
@@ -289,7 +289,7 @@ impl PhotoAlbum {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx.send(Err(e.into())).await;
-                        let _ = token_tx.send(Some(current_token));
+                        let _ = token_tx.send(current_token);
                         return;
                     }
                 };
@@ -300,7 +300,7 @@ impl PhotoAlbum {
                             "changes/zone returned empty zones array"
                         )))
                         .await;
-                    let _ = token_tx.send(Some(current_token));
+                    let _ = token_tx.send(current_token);
                     return;
                 };
 
@@ -312,7 +312,7 @@ impl PhotoAlbum {
                     &zone_name,
                 ) {
                     let _ = tx.send(Err(sync_err.into())).await;
-                    let _ = token_tx.send(Some(current_token));
+                    let _ = token_tx.send(current_token);
                     return;
                 }
 
@@ -331,7 +331,7 @@ impl PhotoAlbum {
                 for event in events {
                     if tx.send(Ok(event)).await.is_err() {
                         // Receiver dropped
-                        let _ = token_tx.send(Some(current_token));
+                        let _ = token_tx.send(current_token);
                         return;
                     }
                 }
@@ -345,12 +345,12 @@ impl PhotoAlbum {
             let flush_events = buffer.flush();
             for event in flush_events {
                 if tx.send(Ok(event)).await.is_err() {
-                    let _ = token_tx.send(Some(current_token));
+                    let _ = token_tx.send(current_token);
                     return;
                 }
             }
 
-            let _ = token_tx.send(Some(current_token));
+            let _ = token_tx.send(current_token);
         });
 
         (
@@ -1217,7 +1217,7 @@ mod tests {
         assert_eq!(events[0].record_type.as_deref(), Some("CPLMaster"));
 
         let token = token_rx.await.expect("oneshot should not be dropped");
-        assert_eq!(token.as_deref(), Some("token-final"));
+        assert_eq!(token, "token-final");
     }
 
     #[tokio::test]
@@ -1250,7 +1250,7 @@ mod tests {
         assert_eq!(events[1].record_name, "master-2");
 
         let token = token_rx.await.expect("oneshot should not be dropped");
-        assert_eq!(token.as_deref(), Some("token-page2"));
+        assert_eq!(token, "token-page2");
     }
 
     #[tokio::test]
@@ -1280,7 +1280,7 @@ mod tests {
         assert_eq!(events[0].record_name, "master-1");
 
         let token = token_rx.await.expect("oneshot should not be dropped");
-        assert_eq!(token.as_deref(), Some("token-final"));
+        assert_eq!(token, "token-final");
     }
 
     #[tokio::test]
@@ -1317,8 +1317,7 @@ mod tests {
 
         let token = token_rx.await.expect("oneshot should not be dropped");
         assert_eq!(
-            token.as_deref(),
-            Some("bad-token"),
+            token, "bad-token",
             "on error, should preserve the last-good token for checkpoint"
         );
     }
@@ -1356,7 +1355,7 @@ mod tests {
         );
 
         let token = token_rx.await.expect("oneshot should not be dropped");
-        assert_eq!(token.as_deref(), Some("token-after-delete"));
+        assert_eq!(token, "token-after-delete");
     }
 
     #[tokio::test]

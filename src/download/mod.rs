@@ -1262,7 +1262,7 @@ async fn download_photos_incremental(
         }
 
         // Capture the sync token from this album
-        if let Ok(Some(token)) = token_rx.await {
+        if let Ok(token) = token_rx.await {
             sync_token = Some(token);
         }
     }
