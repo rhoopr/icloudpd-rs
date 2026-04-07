@@ -4263,6 +4263,73 @@ mod tests {
         );
     }
 
+    // ── compute_config_hash equivalence ────────────────────────────────
+
+    /// `compute_config_hash` (app Config) must produce the same hash as
+    /// `hash_download_config` (DownloadConfig) for equivalent settings.
+    /// If they diverge, every watch-mode cycle would think the config
+    /// changed and force a full re-enumeration.
+    #[test]
+    fn test_compute_config_hash_matches_hash_download_config() {
+        use crate::config::Config;
+        use crate::types::{
+            Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LivePhotoSize, RawTreatmentPolicy,
+            VersionSize,
+        };
+        use secrecy::SecretString;
+
+        let dl_config = test_config();
+        let app_config = Config {
+            username: String::new(),
+            password: Some(SecretString::from("x")),
+            password_file: None,
+            password_command: None,
+            directory: dl_config.directory.clone(),
+            cookie_directory: std::path::PathBuf::from("/tmp"),
+            folder_structure: dl_config.folder_structure.clone(),
+            albums: vec![],
+            library: crate::config::LibrarySelection::Single("PrimarySync".into()),
+            temp_suffix: dl_config.temp_suffix.clone(),
+            skip_created_before: None,
+            skip_created_after: None,
+            pid_file: None,
+            notification_script: None,
+            watch_with_interval: None,
+            retry_delay_secs: 5,
+            recent: dl_config.recent,
+            max_retries: 3,
+            threads_num: 1,
+            size: VersionSize::Original,
+            live_photo_size: LivePhotoSize::Original,
+            domain: Domain::Com,
+            live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
+            align_raw: RawTreatmentPolicy::Unchanged,
+            file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
+            auth_only: false,
+            list_albums: false,
+            list_libraries: false,
+            skip_videos: false,
+            skip_photos: false,
+            skip_live_photos: false,
+            force_size: false,
+            set_exif_datetime: false,
+            dry_run: false,
+            no_progress_bar: true,
+            keep_unicode_in_filenames: false,
+            only_print_filenames: false,
+            no_incremental: false,
+            reset_sync_token: false,
+            notify_systemd: false,
+            save_password: false,
+        };
+
+        assert_eq!(
+            hash_download_config(&dl_config),
+            compute_config_hash(&app_config),
+            "compute_config_hash must agree with hash_download_config for identical settings"
+        );
+    }
+
     // ── should_download_fast additional tests ───────────────────────────
 
     #[test]
