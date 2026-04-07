@@ -1160,9 +1160,24 @@ pub async fn download_photos_with_sync(
             {
                 Ok(result) => Ok(result),
                 Err(e) => {
-                    if e.downcast_ref::<SyncTokenError>().is_some_and(
-                        super::icloud::photos::session::SyncTokenError::should_fallback_to_full,
-                    ) {
+                    // Determine whether this error warrants a fallback to full
+                    // enumeration. Token-level errors (invalid, zone not found)
+                    // always trigger fallback. Transient errors (503, network
+                    // timeouts) should NOT — they'd fail again on full enum too.
+                    // Deserialization errors (e.g. Apple returning a different
+                    // JSON shape for an invalid token) are not transient, so
+                    // fall back for those too.
+                    let is_token_error = e
+                        .downcast_ref::<SyncTokenError>()
+                        .is_some_and(SyncTokenError::should_fallback_to_full);
+                    let is_transient = e.downcast_ref::<crate::auth::error::AuthError>().is_some()
+                        || e.downcast_ref::<reqwest::Error>().is_some_and(|r| {
+                            r.status().is_some_and(|s| s == 429 || s.as_u16() >= 500)
+                                || r.is_timeout()
+                                || r.is_connect()
+                        });
+
+                    if is_token_error || !is_transient {
                         tracing::warn!(
                             error = %e,
                             "Incremental sync failed, falling back to full enumeration"
