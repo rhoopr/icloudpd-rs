@@ -912,9 +912,29 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     // Load TOML config early so it can influence log level.
     // If the user explicitly set --config, the file must exist.
-    let config_path = config::expand_tilde(&cli.config);
+    //
+    // Docker fallback: when no --config is passed, the default
+    // ~/.config/kei/config.toml may not exist inside a container (it
+    // resolves to /root/.config/kei/config.toml). Try the Docker
+    // convention /config/config.toml as a fallback so that `docker exec`
+    // subcommands (get-code, submit-code, credential, etc.) automatically
+    // find the same config the Docker CMD uses.
+    const DOCKER_FALLBACK_CONFIG: &str = "/config/config.toml";
     let config_explicitly_set =
-        cli.config != "~/.config/kei/config.toml" && cli.config != "/config/config.toml";
+        cli.config != "~/.config/kei/config.toml" && cli.config != DOCKER_FALLBACK_CONFIG;
+    let (config_path, used_docker_fallback) = {
+        let expanded = config::expand_tilde(&cli.config);
+        if !config_explicitly_set && !expanded.exists() {
+            let docker = PathBuf::from(DOCKER_FALLBACK_CONFIG);
+            if docker.exists() {
+                (docker, true)
+            } else {
+                (expanded, false)
+            }
+        } else {
+            (expanded, false)
+        }
+    };
     let mut toml_config = config::load_toml_config(&config_path, config_explicitly_set)?;
 
     // Resolve log level: CLI > TOML > default (info)
@@ -950,6 +970,13 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         for msg in &report.warnings {
             tracing::warn!("{msg}");
         }
+    }
+
+    if used_docker_fallback {
+        tracing::debug!(
+            path = %config_path.display(),
+            "Using Docker fallback config (default path not found)"
+        );
     }
 
     // Dispatch based on command

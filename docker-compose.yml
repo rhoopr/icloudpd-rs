@@ -18,7 +18,7 @@ services:
     # ── Credential options (pick one) ──────────────────────────────
     #
     # Option 2 (recommended): Encrypted credential store
-    #   First run:  docker exec -it kei kei credential set --username $ICLOUD_USERNAME
+    #   First run:  docker exec -it kei kei credential set --cookie-directory /config --username $ICLOUD_USERNAME
     #   Subsequent: kei decrypts from /config automatically on each re-auth.
     #
     # Option 3: Docker secrets (file-based)
