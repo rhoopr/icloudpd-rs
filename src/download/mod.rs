@@ -1188,9 +1188,7 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_secs() as i64)
                                     .unwrap_or(0);
-                                if mtime_secs < cutoff_secs
-                                    && std::fs::remove_file(&path).is_ok()
-                                {
+                                if mtime_secs < cutoff_secs && std::fs::remove_file(&path).is_ok() {
                                     cleaned += 1;
                                 }
                             }
