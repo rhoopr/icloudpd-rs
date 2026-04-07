@@ -1458,8 +1458,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 // that are newly eligible under the changed config (e.g. a
                 // user switching --size or adding --skip-videos).
                 if let Some(ref db) = state_db {
+                    // Use a separate key from the download-path's "config_hash"
+                    // (which tracks path-affecting fields only). This hash is a
+                    // superset that also includes enumeration filters (albums,
+                    // library, skip_live_photos). Using the same key would cause
+                    // the two hashes to overwrite each other every cycle,
+                    // permanently preventing incremental sync.
                     let config_hash = download::compute_config_hash(&config);
-                    let stored_hash = db.get_metadata("config_hash").await.unwrap_or(None);
+                    let stored_hash = db.get_metadata("enum_config_hash").await.unwrap_or(None);
                     if stored_hash.as_deref() != Some(&config_hash) {
                         if stored_hash.is_some() {
                             tracing::info!(
@@ -1475,7 +1481,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                                 _ => {}
                             }
                         }
-                        let _ = db.set_metadata("config_hash", &config_hash).await;
+                        let _ = db.set_metadata("enum_config_hash", &config_hash).await;
                     }
                 }
 
