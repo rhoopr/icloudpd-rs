@@ -290,6 +290,11 @@ pub struct SubmitCodeArgs {
 }
 
 /// Subcommands for kei.
+///
+/// Every variant that carries [`AuthArgs`] must be listed in
+/// [`Command::inject_env_password`] so that the captured
+/// `ICLOUD_PASSWORD` value is available after the env var has been
+/// scrubbed from the process environment.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     /// Download photos from iCloud (default command)
@@ -386,6 +391,33 @@ impl Cli {
                 auth: self.auth.clone(),
                 sync: self.sync.clone(),
             },
+        }
+    }
+}
+
+impl Command {
+    /// Inject the `ICLOUD_PASSWORD` value captured before `Cli::parse()`.
+    ///
+    /// The env var is removed from the process environment for security
+    /// (prevents leaking via `/proc/*/environ`), but clap's `env` attribute
+    /// never sees it. This method restores it into whichever `AuthArgs`
+    /// the active command carries.
+    pub fn inject_env_password(&mut self, env_password: Option<String>) {
+        let Some(pw) = env_password else { return };
+        let auth = match self {
+            Self::Sync { ref mut auth, .. } => auth,
+            Self::Status(args) => &mut args.auth,
+            Self::RetryFailed(args) => &mut args.auth,
+            Self::ResetState(args) => &mut args.auth,
+            Self::ImportExisting(args) => &mut args.auth,
+            Self::Verify(args) => &mut args.auth,
+            Self::GetCode(args) => &mut args.auth,
+            Self::SubmitCode(args) => &mut args.auth,
+            Self::Credential(args) => &mut args.auth,
+            Self::Setup { .. } => return,
+        };
+        if auth.password.is_none() {
+            auth.password = Some(pw);
         }
     }
 }

@@ -953,7 +953,12 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     }
 
     // Dispatch based on command
-    let command = cli.effective_command();
+    let mut command = cli.effective_command();
+    // Inject the password captured from env before the runtime started,
+    // since we cleared ICLOUD_PASSWORD before Cli::parse() could see it.
+    // Must happen before command dispatch so all subcommands (get-code,
+    // submit-code, etc.) receive the password, not just sync.
+    command.inject_env_password(env_password);
     let is_retry_failed = matches!(command, Command::RetryFailed(_));
     let (auth, sync) = match command {
         Command::Status(args) => return run_status(args, toml_config.as_ref()).await,
@@ -1009,12 +1014,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         Command::Sync { auth, sync } => (auth, sync),
         Command::RetryFailed(args) => (args.auth, args.sync),
     };
-    // Inject the password captured from env before the runtime started,
-    // since we cleared ICLOUD_PASSWORD before Cli::parse() could see it.
-    let mut auth = auth;
-    if auth.password.is_none() {
-        auth.password = env_password;
-    }
     let config = config::Config::build(auth, sync, toml_config)?;
 
     // Install password redaction now that we know the password
@@ -1261,8 +1260,13 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         }
     }
 
-    // Initialize state database
-    let state_db: Option<Arc<dyn state::StateDb>> = {
+    // Initialize state database.
+    // Skip for --dry-run so a preview doesn't create the DB or poison
+    // sync tokens, which would cause a subsequent real sync to believe
+    // nothing has changed and download 0 photos.
+    let state_db: Option<Arc<dyn state::StateDb>> = if config.dry_run {
+        None
+    } else {
         let db_path = config.cookie_directory.join(format!(
             "{}.db",
             auth::session::sanitize_username(&config.username)
@@ -1457,31 +1461,40 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 // enumeration — the stored incremental token would miss assets
                 // that are newly eligible under the changed config (e.g. a
                 // user switching --size or adding --skip-videos).
-                if let Some(ref db) = state_db {
-                    // Use a separate key from the download-path's "config_hash"
-                    // (which tracks path-affecting fields only). This hash is a
-                    // superset that also includes enumeration filters (albums,
-                    // library, skip_live_photos). Using the same key would cause
-                    // the two hashes to overwrite each other every cycle,
-                    // permanently preventing incremental sync.
-                    let config_hash = download::compute_config_hash(&config);
-                    let stored_hash = db.get_metadata("enum_config_hash").await.unwrap_or(None);
-                    if stored_hash.as_deref() != Some(&config_hash) {
-                        if stored_hash.is_some() {
-                            tracing::info!(
-                                "Download config changed since last sync, clearing sync tokens"
-                            );
-                            match db.delete_metadata_by_prefix("sync_token:").await {
-                                Ok(n) if n > 0 => {
-                                    tracing::info!(cleared = n, "Cleared stale sync tokens");
+                if !config.dry_run {
+                    if let Some(ref db) = state_db {
+                        // Use a separate key from the download-path's "config_hash"
+                        // (which tracks path-affecting fields only). This hash is a
+                        // superset that also includes enumeration filters (albums,
+                        // library, skip_live_photos). Using the same key would cause
+                        // the two hashes to overwrite each other every cycle,
+                        // permanently preventing incremental sync.
+                        let config_hash = download::compute_config_hash(&config);
+                        let stored_hash =
+                            db.get_metadata("enum_config_hash").await.unwrap_or(None);
+                        if stored_hash.as_deref() != Some(&config_hash) {
+                            if stored_hash.is_some() {
+                                tracing::info!(
+                                    "Download config changed since last sync, clearing sync tokens"
+                                );
+                                match db.delete_metadata_by_prefix("sync_token:").await {
+                                    Ok(n) if n > 0 => {
+                                        tracing::info!(
+                                            cleared = n,
+                                            "Cleared stale sync tokens"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Failed to clear sync tokens"
+                                        );
+                                    }
+                                    _ => {}
                                 }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "Failed to clear sync tokens");
-                                }
-                                _ => {}
                             }
+                            let _ = db.set_metadata("enum_config_hash", &config_hash).await;
                         }
-                        let _ = db.set_metadata("enum_config_hash", &config_hash).await;
                     }
                 }
 
@@ -1536,7 +1549,8 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 // means all batch flushes are complete. A crash here means the token is
                 // NOT advanced, so assets will replay on next sync (safe, not data loss).
                 let should_store_token =
-                    matches!(sync_result.outcome, download::DownloadOutcome::Success);
+                    matches!(sync_result.outcome, download::DownloadOutcome::Success)
+                        && !config.dry_run;
                 if should_store_token {
                     if let Some(ref token) = sync_result.sync_token {
                         if let Some(ref db) = state_db {

@@ -552,12 +552,12 @@ fn retry_failed_with_no_db_succeeds() {
 //  DRY-RUN SIDE EFFECTS
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Document known behavior: --dry-run writes sync tokens to the state DB.
-/// This is arguably a bug — dry runs should not have side effects.
-/// If this test starts failing, the bug may have been fixed.
+/// Verify that --dry-run does NOT create a state DB or store sync tokens.
+/// A dry run must be side-effect-free so that a subsequent real sync
+/// still performs full enumeration and downloads all photos.
 #[test]
 #[ignore]
-fn dry_run_stores_sync_token_bug() {
+fn dry_run_does_not_create_state_db() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
@@ -589,7 +589,7 @@ fn dry_run_stores_sync_token_bug() {
         .assert()
         .success();
 
-        // Check if any .db file was created in the isolated cookie dir
+        // Verify no .db file was created
         let db_files: Vec<_> = std::fs::read_dir(isolated_cookies.path())
             .expect("read dir")
             .filter_map(|e| e.ok())
@@ -601,12 +601,10 @@ fn dry_run_stores_sync_token_bug() {
             })
             .collect();
 
-        // Known bug: dry-run creates a state DB with sync tokens.
-        // If this assertion starts failing, the bug may have been fixed —
-        // update this test to assert the opposite.
         assert!(
-            !db_files.is_empty(),
-            "known bug: --dry-run should not create a state DB, but currently does"
+            db_files.is_empty(),
+            "--dry-run should not create a state DB, found: {:?}",
+            db_files.iter().map(|e| e.path()).collect::<Vec<_>>()
         );
     });
 }
