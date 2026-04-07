@@ -905,7 +905,8 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // Load TOML config early so it can influence log level.
     // If the user explicitly set --config, the file must exist.
     let config_path = config::expand_tilde(&cli.config);
-    let config_explicitly_set = cli.config != "~/.config/kei/config.toml";
+    let config_explicitly_set =
+        cli.config != "~/.config/kei/config.toml" && cli.config != "/config/config.toml";
     let mut toml_config = config::load_toml_config(&config_path, config_explicitly_set)?;
 
     // Resolve log level: CLI > TOML > default (info)
