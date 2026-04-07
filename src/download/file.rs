@@ -283,6 +283,17 @@ async fn attempt_download<C: DownloadClient>(
         }
     }
 
+    // Defense-in-depth: log when neither size indicator is available.
+    // Post-download checksum verification (CF-1) catches actual corruption,
+    // but this warning helps diagnose transfer anomalies.
+    if expected_size.is_none() && content_length.is_none() {
+        tracing::warn!(
+            path = %path_str,
+            bytes_written,
+            "No expected size or Content-Length available to verify download completeness"
+        );
+    }
+
     // Validate content looks like actual media, not an HTML error page.
     // Apple's CDN occasionally returns HTTP 200 with HTML (rate limit, CAPTCHA,
     // service unavailable) which would otherwise be saved as the final file.
@@ -312,6 +323,27 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
         Ok(format!("{:x}", hasher.finalize()))
     })
     .await?
+}
+
+/// Decode an iCloud API checksum (base64) to a lowercase hex string.
+///
+/// Handles both 32-byte raw SHA-256 and Apple's 33-byte prefixed format
+/// (0x01 prefix byte followed by 32 bytes of SHA-256).
+pub(super) fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_checksum)
+        .context("Failed to decode API checksum from base64")?;
+    let sha_bytes = match bytes.len() {
+        32 => &bytes[..],
+        33 => &bytes[1..],
+        other => anyhow::bail!("Unexpected API checksum length: {other} bytes (expected 32 or 33)"),
+    };
+    let mut hex = String::with_capacity(64);
+    for b in sha_bytes {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok(hex)
 }
 
 /// Validate that downloaded content matches expected format for the file extension.
@@ -1576,5 +1608,68 @@ mod tests {
 
             assert_eq!(std::fs::read(&download_path).unwrap(), full_body);
         }
+    }
+
+    // --- decode_api_checksum tests ---
+
+    #[test]
+    fn decode_api_checksum_32_byte_raw() {
+        // 32 zero bytes, base64-encoded
+        let base64_input = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let hex = decode_api_checksum(&base64_input).unwrap();
+        assert_eq!(hex, "0".repeat(64));
+    }
+
+    #[test]
+    fn decode_api_checksum_33_byte_apple_prefix() {
+        // 0x01 prefix + 32 bytes of 0xFF
+        let mut bytes = vec![0x01u8];
+        bytes.extend_from_slice(&[0xFF; 32]);
+        let base64_input = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let hex = decode_api_checksum(&base64_input).unwrap();
+        assert_eq!(hex, "f".repeat(64));
+    }
+
+    #[test]
+    fn decode_api_checksum_invalid_base64() {
+        let result = decode_api_checksum("not!valid!base64!!!");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("base64"),
+            "error should mention base64"
+        );
+    }
+
+    #[test]
+    fn decode_api_checksum_wrong_length() {
+        // 16 bytes — neither 32 nor 33
+        let base64_input = base64::engine::general_purpose::STANDARD.encode([0xABu8; 16]);
+        let result = decode_api_checksum(&base64_input);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("16 bytes"),
+            "error should include the unexpected length"
+        );
+    }
+
+    #[test]
+    fn decode_api_checksum_roundtrip_with_compute_sha256() {
+        // Verify that decode_api_checksum produces the same hex format as compute_sha256
+        use sha2::{Digest, Sha256};
+        let data = b"test data for checksum roundtrip";
+        let hash = Sha256::digest(data);
+        let expected_hex = format!("{:x}", hash);
+
+        // Simulate Apple's base64-encoded checksum (raw 32-byte)
+        let base64_cksum = base64::engine::general_purpose::STANDARD.encode(hash.as_slice());
+        let decoded_hex = decode_api_checksum(&base64_cksum).unwrap();
+        assert_eq!(decoded_hex, expected_hex);
+
+        // Also test with 33-byte Apple prefix
+        let mut prefixed = vec![0x01u8];
+        prefixed.extend_from_slice(hash.as_slice());
+        let base64_prefixed = base64::engine::general_purpose::STANDARD.encode(&prefixed);
+        let decoded_prefixed = decode_api_checksum(&base64_prefixed).unwrap();
+        assert_eq!(decoded_prefixed, expected_hex);
     }
 }

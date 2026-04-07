@@ -141,7 +141,17 @@ fn extract_versions(
             continue;
         }
 
-        let size = res_entry["size"].as_u64().unwrap_or(0);
+        let size = match res_entry["size"].as_u64() {
+            Some(s) => s,
+            None => {
+                warn!(
+                    asset = %record_name,
+                    field = format_args!("{res_field}.size"),
+                    "Missing size, defaulting to 0"
+                );
+                0
+            }
+        };
 
         let url: Box<str> = if let Some(u) = res_entry["downloadURL"].as_str() {
             u.into()

@@ -364,6 +364,28 @@ impl Config {
             toml_dl.and_then(|d| d.folder_structure.clone()),
             "%Y/%m/%d".to_string(),
         );
+        // Validate folder_structure doesn't contain unrecognized % tokens.
+        // expand_date_format only handles %Y, %m, %d, %H, %M, %S — unknown
+        // tokens like %q are silently preserved as literal "%q" in paths.
+        if !folder_structure.eq_ignore_ascii_case("none") {
+            let format_str = folder_structure
+                .strip_prefix("{:")
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or(&folder_structure);
+            let remaining = format_str
+                .replace("%Y", "")
+                .replace("%m", "")
+                .replace("%d", "")
+                .replace("%H", "")
+                .replace("%M", "")
+                .replace("%S", "");
+            anyhow::ensure!(
+                !remaining.contains('%'),
+                "folder_structure contains unrecognized format token: \
+                 '{folder_structure}'. Supported tokens: %Y, %m, %d, %H, %M, %S"
+            );
+        }
+
         let threads_num = resolve(sync.threads_num, toml_dl.and_then(|d| d.threads_num), 10);
         anyhow::ensure!(
             threads_num >= 1,
@@ -2274,5 +2296,44 @@ mod tests {
         assert!(cfg.list_albums);
         assert!(cfg.list_libraries);
         assert!(cfg.dry_run);
+    }
+
+    #[test]
+    fn test_folder_structure_valid_tokens_accepted() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/%m/%d".to_string());
+        assert!(Config::build(default_auth(), sync, None).is_ok());
+    }
+
+    #[test]
+    fn test_folder_structure_all_tokens_accepted() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/%m/%d/%H/%M/%S".to_string());
+        assert!(Config::build(default_auth(), sync, None).is_ok());
+    }
+
+    #[test]
+    fn test_folder_structure_none_bypasses_validation() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("none".to_string());
+        assert!(Config::build(default_auth(), sync, None).is_ok());
+    }
+
+    #[test]
+    fn test_folder_structure_invalid_token_rejected() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/%X/%d".to_string());
+        let err = Config::build(default_auth(), sync, None).unwrap_err();
+        assert!(
+            err.to_string().contains("unrecognized format token"),
+            "error should mention unrecognized token: {err}"
+        );
+    }
+
+    #[test]
+    fn test_folder_structure_wrapped_format_accepted() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("{:%Y/%m/%d}".to_string());
+        assert!(Config::build(default_auth(), sync, None).is_ok());
     }
 }

@@ -1138,12 +1138,85 @@ struct StreamingResult {
 /// filters `ChangeEvent`s to downloadable assets, and feeds them through
 /// the existing download pipeline. Falls back to `SyncMode::Full` if the
 /// token is invalid or expired.
+/// Remove orphaned `.part` files from the download directory.
+///
+/// Scans the download directory for files ending with `temp_suffix` that are
+/// older than the last completed sync. These are leftovers from interrupted
+/// downloads that will never be resumed (new downloads produce fresh .part files).
+async fn cleanup_orphan_part_files(config: &DownloadConfig) {
+    let db = match &config.state_db {
+        Some(db) => db,
+        None => return,
+    };
+    let cutoff = match db.get_summary().await {
+        Ok(summary) => match summary.last_sync_completed {
+            Some(ts) => ts,
+            None => return, // No prior sync — nothing is orphaned
+        },
+        Err(e) => {
+            tracing::debug!(error = %e, "Could not query last sync time for .part cleanup");
+            return;
+        }
+    };
+
+    let dir = &config.directory;
+    if !dir.exists() {
+        return;
+    }
+
+    let suffix = config.temp_suffix.clone();
+    let dir = dir.to_path_buf();
+    let cutoff_secs = cutoff.timestamp();
+
+    let cleaned = tokio::task::spawn_blocking(move || {
+        let mut cleaned = 0usize;
+        let mut stack = vec![dir];
+        while let Some(current) = stack.pop() {
+            let entries = match std::fs::read_dir(&current) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.ends_with(&suffix) {
+                        if let Ok(meta) = path.metadata() {
+                            if let Ok(mtime) = meta.modified() {
+                                let mtime_secs = mtime
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or(0);
+                                if mtime_secs < cutoff_secs
+                                    && std::fs::remove_file(&path).is_ok()
+                                {
+                                    cleaned += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cleaned
+    })
+    .await
+    .unwrap_or(0);
+
+    if cleaned > 0 {
+        tracing::info!(count = cleaned, "Cleaned up orphaned .part files");
+    }
+}
+
 pub async fn download_photos_with_sync(
     download_client: &Client,
     albums: &[PhotoAlbum],
     config: Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
+    cleanup_orphan_part_files(&config).await;
+
     match &config.sync_mode {
         SyncMode::Full => {
             download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
@@ -1505,12 +1578,12 @@ async fn download_photos_incremental(
         });
     }
 
-    let outcome = if failed > 0 {
+    let outcome = if failed > 0 || pass_result.exif_failures > 0 {
         for task in &pass_result.failed {
             tracing::error!(path = %task.download_path.display(), "Download failed");
         }
         DownloadOutcome::PartialFailure {
-            failed_count: failed,
+            failed_count: failed + pass_result.exif_failures,
         }
     } else {
         DownloadOutcome::Success
@@ -1671,8 +1744,8 @@ where
             let sample_count = download_ctx
                 .downloaded_ids
                 .len()
-                .div_ceil(100) // ~1% sample
-                .clamp(1, 100);
+                .div_ceil(20) // ~5% sample
+                .clamp(5, 500);
             match db.sample_downloaded_paths(sample_count).await {
                 Ok(paths) => {
                     let missing: Vec<_> = paths.iter().filter(|p| !p.exists()).collect();
@@ -1689,7 +1762,8 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to sample downloaded paths");
+                    tracing::warn!(error = %e, "Failed to sample downloaded paths, disabling trust-state");
+                    trust = false;
                 }
             }
         }
@@ -2135,9 +2209,9 @@ async fn build_download_outcome(
             tracing::info!(downloaded = total, failed = 0, total, "  sync results");
         }
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
-        if state_write_failures > 0 || enumeration_errors > 0 {
+        if state_write_failures > 0 || enumeration_errors > 0 || exif_failures > 0 {
             return Ok(DownloadOutcome::PartialFailure {
-                failed_count: state_write_failures + enumeration_errors,
+                failed_count: state_write_failures + enumeration_errors + exif_failures,
             });
         }
         return Ok(DownloadOutcome::Success);
@@ -2207,7 +2281,7 @@ async fn build_download_outcome(
     }
     tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
 
-    let total_failures = failed + state_write_failures;
+    let total_failures = failed + state_write_failures + exif_failures;
     if total_failures > 0 {
         for task in &remaining_failed {
             tracing::error!(path = %task.download_path.display(), "Download failed");
@@ -2489,6 +2563,32 @@ async fn download_single_task(
 
     // Compute SHA-256 of the final file for local verification
     let local_checksum = file::compute_sha256(&task.download_path).await?;
+
+    // Verify downloaded content matches the API-provided checksum.
+    // Use download_checksum (pre-EXIF) when available; for non-EXIF files
+    // local_checksum IS the unmodified download content.
+    let verification_checksum = download_checksum.as_deref().unwrap_or(&local_checksum);
+    match file::decode_api_checksum(&task.checksum) {
+        Ok(expected_hex) => {
+            if verification_checksum != expected_hex {
+                let _ = tokio::fs::remove_file(&task.download_path).await;
+                return Err(DownloadError::ChecksumMismatch {
+                    path: task.download_path.display().to_string().into(),
+                    expected: expected_hex.into(),
+                    computed: verification_checksum.to_string().into(),
+                }
+                .into());
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %task.download_path.display(),
+                api_checksum = %task.checksum,
+                error = %e,
+                "Could not decode API checksum for verification"
+            );
+        }
+    }
 
     Ok((exif_ok, local_checksum, download_checksum))
 }
