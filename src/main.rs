@@ -177,7 +177,7 @@ fn make_password_provider(source: password::PasswordSource) -> impl Fn() -> Opti
     move || match source.resolve() {
         Ok(pw) => pw,
         Err(e) => {
-            tracing::debug!(error = %e, "Password source resolution failed");
+            tracing::error!(error = %e, "Password source resolution failed");
             None
         }
     }
@@ -991,6 +991,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // submit-code, etc.) receive the password, not just sync.
     command.inject_env_password(env_password);
     let is_retry_failed = matches!(command, Command::RetryFailed(_));
+    let mut is_one_shot = is_retry_failed;
     let (auth, sync) = match command {
         Command::Status(args) => return run_status(args, toml_config.as_ref()).await,
         Command::ResetState(args) => return run_reset_state(args, toml_config.as_ref()).await,
@@ -1037,6 +1038,8 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         domain: None,
                         cookie_directory: None,
                     };
+                    // Setup "sync now" is a one-shot initial sync, not a daemon.
+                    is_one_shot = true;
                     (sync_auth, cli::SyncArgs::default())
                 }
                 setup::SetupResult::Done => return Ok(()),
@@ -1047,10 +1050,11 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     };
     let mut config = config::Config::build(auth, sync, toml_config)?;
 
-    // retry-failed is a one-shot operation — never inherit watch mode from
-    // TOML config, which would cause the process to loop forever instead of
-    // exiting after retrying the failed downloads.
-    if is_retry_failed {
+    // One-shot operations — never inherit watch mode from TOML config,
+    // which would cause the process to loop forever instead of exiting.
+    // retry-failed: one-shot by definition.
+    // setup → "sync now": initial test sync, not a daemon.
+    if is_one_shot {
         config.watch_with_interval = None;
     }
 
