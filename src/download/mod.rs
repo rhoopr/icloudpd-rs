@@ -187,6 +187,7 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     hasher.update([u8::from(config.force_size)]);
     hasher.update([u8::from(config.skip_videos)]);
     hasher.update([u8::from(config.skip_photos)]);
+    hasher.update([u8::from(config.skip_live_photos)]);
     // Include timezone offset so TZ changes invalidate trust-state cache
     // (different TZ → different folder paths for date-based structures)
     hasher.update(
@@ -207,8 +208,13 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
 /// Compute the config hash from the app-level `Config`.
 ///
 /// Called from `main.rs` before the sync-mode decision so that stale sync
-/// tokens are cleared when the download config changes. Produces the same
-/// hash as [`hash_download_config`].
+/// tokens are cleared when the download config changes.
+///
+/// This hash is a SUPERSET of [`hash_download_config`]: it includes all
+/// the fields that affect download paths (shared with hash_download_config)
+/// plus enumeration-filter fields (albums, library, skip_live_photos) that
+/// affect WHICH assets are eligible. Changing these filters must invalidate
+/// sync tokens so the next run does a full enumeration.
 pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write;
@@ -239,6 +245,15 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     hasher.update([u8::from(config.force_size)]);
     hasher.update([u8::from(config.skip_videos)]);
     hasher.update([u8::from(config.skip_photos)]);
+    // Enumeration-filter fields: changing these affects WHICH assets are
+    // fetched from iCloud, so sync tokens must be invalidated to avoid
+    // missing assets that are newly eligible under the changed filters.
+    hasher.update([u8::from(config.skip_live_photos)]);
+    for album in &config.albums {
+        hasher.update(album.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(format!("{:?}", config.library).as_bytes());
     hasher.update(
         chrono::Local::now()
             .offset()
@@ -4265,10 +4280,9 @@ mod tests {
 
     // ── compute_config_hash equivalence ────────────────────────────────
 
-    /// `compute_config_hash` (app Config) must produce the same hash as
-    /// `hash_download_config` (DownloadConfig) for equivalent settings.
-    /// If they diverge, every watch-mode cycle would think the config
-    /// changed and force a full re-enumeration.
+    /// `compute_config_hash` includes enumeration-filter fields (albums,
+    /// library, skip_live_photos) that `hash_download_config` doesn't.
+    /// Verify it produces a valid hex hash and is deterministic.
     #[test]
     fn test_compute_config_hash_matches_hash_download_config() {
         use crate::config::Config;
@@ -4323,11 +4337,19 @@ mod tests {
             save_password: false,
         };
 
-        assert_eq!(
-            hash_download_config(&dl_config),
-            compute_config_hash(&app_config),
-            "compute_config_hash must agree with hash_download_config for identical settings"
-        );
+        // compute_config_hash is a superset (includes albums, library, skip_live_photos)
+        // so it won't match hash_download_config. Verify it's deterministic and valid hex.
+        let hash1 = compute_config_hash(&app_config);
+        let hash2 = compute_config_hash(&app_config);
+        assert_eq!(hash1, hash2, "compute_config_hash must be deterministic");
+        assert_eq!(hash1.len(), 16);
+        assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Verify album changes produce a different hash
+        let mut config_with_album = app_config;
+        config_with_album.albums = vec!["Favorites".to_string()];
+        let hash3 = compute_config_hash(&config_with_album);
+        assert_ne!(hash1, hash3, "adding an album must change the hash");
     }
 
     // ── should_download_fast additional tests ───────────────────────────
