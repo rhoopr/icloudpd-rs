@@ -287,17 +287,25 @@ async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
 }
 
 /// Get the database path for a given auth config, merging with TOML defaults.
-fn get_db_path(auth: &cli::AuthArgs, toml: Option<&TomlConfig>) -> PathBuf {
+///
+/// Returns an error if the resolved username is empty, since an empty username
+/// produces a `.db` filename that silently operates on the wrong database.
+fn get_db_path(auth: &cli::AuthArgs, toml: Option<&TomlConfig>) -> anyhow::Result<PathBuf> {
     let (username, _, _, cookie_dir) = config::resolve_auth(auth, toml);
-    cookie_dir.join(format!(
+    if username.is_empty() {
+        anyhow::bail!(
+            "--username is required (or set ICLOUD_USERNAME, or add username to config file)"
+        );
+    }
+    Ok(cookie_dir.join(format!(
         "{}.db",
         auth::session::sanitize_username(&username)
-    ))
+    )))
 }
 
 /// Run the status command.
 async fn run_status(args: cli::StatusArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth, toml);
+    let db_path = get_db_path(&args.auth, toml)?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -355,7 +363,7 @@ async fn run_reset_state(
     args: cli::ResetStateArgs,
     toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth, toml);
+    let db_path = get_db_path(&args.auth, toml)?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -392,7 +400,7 @@ async fn run_reset_state(
 
 /// Run the verify command.
 async fn run_verify(args: cli::VerifyArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth, toml);
+    let db_path = get_db_path(&args.auth, toml)?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -619,7 +627,7 @@ async fn run_import_existing(
     use futures_util::StreamExt;
     use icloud::photos::AssetVersionSize;
 
-    let db_path = get_db_path(&args.auth, toml);
+    let db_path = get_db_path(&args.auth, toml)?;
     let directory = config::expand_tilde(&args.directory);
 
     if !directory.exists() {
