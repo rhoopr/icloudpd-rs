@@ -56,7 +56,9 @@ VOLUME ["/config", "/photos"]
 HEALTHCHECK --interval=60s --timeout=5s --start-period=10m --retries=3 \
   CMD test -f /config/health.json \
    && test "$(jq -r '.consecutive_failures' /config/health.json)" -lt 5 \
-   && test "$(( $(date +%s) - $(date -d "$(jq -r '.last_sync_at' /config/health.json)" +%s) ))" -lt 7200
+   && { LAST=$(jq -r '.last_sync_at' /config/health.json); \
+        [ "$LAST" = "null" ] \
+        || test "$(( $(date +%s) - $(date -d "$LAST" +%s) ))" -lt 7200; }
 
 ENTRYPOINT ["kei"]
 CMD ["sync", "--config", "/config/config.toml", "--cookie-directory", "/config", "--directory", "/photos"]
