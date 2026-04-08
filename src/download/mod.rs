@@ -155,6 +155,13 @@ pub struct SyncResult {
     pub sync_token: Option<String>,
 }
 
+/// Truncate a `DateTime<Utc>` to midnight so that relative date intervals
+/// (e.g. `20d` → `now - 20 days`) produce a stable hash within the same
+/// calendar day.
+fn truncate_date_to_day(dt: Option<DateTime<Utc>>) -> Option<chrono::NaiveDate> {
+    dt.map(|d| d.date_naive())
+}
+
 /// Compute a deterministic hash of the config fields that affect path resolution.
 ///
 /// When this hash changes between runs, we can't trust the state DB's download
@@ -181,8 +188,12 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     // Filter fields: changing these affects which assets are eligible, so we
     // must invalidate the trust-state cache (and stored sync tokens) to avoid
     // skipping newly-eligible assets on incremental syncs.
-    hasher.update(format!("{:?}", config.skip_created_before).as_bytes());
-    hasher.update(format!("{:?}", config.skip_created_after).as_bytes());
+    //
+    // Dates are truncated to day precision before hashing so that relative
+    // intervals like "20d" (resolved to now-minus-20-days at parse time)
+    // produce a stable hash across consecutive runs on the same day.
+    hasher.update(format!("{:?}", truncate_date_to_day(config.skip_created_before)).as_bytes());
+    hasher.update(format!("{:?}", truncate_date_to_day(config.skip_created_after)).as_bytes());
     hasher.update(format!("{:?}", config.recent).as_bytes());
     hasher.update([u8::from(config.force_size)]);
     hasher.update([u8::from(config.skip_videos)]);
@@ -231,8 +242,8 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     hasher.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
     hasher.update(format!("{:?}", config.align_raw).as_bytes());
     hasher.update([u8::from(config.keep_unicode_in_filenames)]);
-    hasher.update(format!("{:?}", skip_created_before).as_bytes());
-    hasher.update(format!("{:?}", skip_created_after).as_bytes());
+    hasher.update(format!("{:?}", truncate_date_to_day(skip_created_before)).as_bytes());
+    hasher.update(format!("{:?}", truncate_date_to_day(skip_created_after)).as_bytes());
     // Note: `recent` is intentionally excluded from this enum hash.
     // Changing --recent should not invalidate sync tokens because the
     // incremental path already applies the recent cap post-fetch.
