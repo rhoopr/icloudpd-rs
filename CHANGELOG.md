@@ -64,6 +64,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Spawned-task panics silently dropped.** Panics in download and enumeration tasks are now propagated to the parent.
 - **Legacy cookie parser didn't recover from corruption.** Corrupt cookie files are now detected and the session re-authenticates.
 - **Retry attempt counter could overflow** on pathological retry counts. Uses saturating arithmetic.
+- **`--set-exif-datetime` silently failed on every JPEG** because `little_exif` determines file type from the extension, and the `.kei-tmp` temp file extension was unrecognized. Switched to in-memory EXIF writing with explicit JPEG type.
+- **Post-download checksum verification warned on 100% of files.** Apple's `fileChecksum` is an MMCS compound signature, not a content hash - the comparison could never succeed. Removed in favor of size and content-type validation.
+- **Config hash changed on every run with relative date intervals** (e.g., `--skip-created-before 20d`). The resolved timestamp included seconds, producing different hashes seconds apart. Now truncated to day precision.
+- **Changing `--recent` forced full library re-enumeration.** The incremental path already applies the recent cap post-fetch, so sync token invalidation was unnecessary. `--recent` is now excluded from the enumeration config hash.
+- **`--dry-run` and `--only-print-filenames` could be combined with `--watch-with-interval`**, creating an infinite no-op loop. Now rejected as conflicts.
+- **`--recent 0` accepted on CLI and in TOML**, producing a no-op sync. Now requires >= 1.
+- **TOML config allowed `password` + `password_file` simultaneously** without error. CLI enforced mutual exclusivity but TOML did not. Now validated at config build time.
+- **Apple HTTP 503 errors dumped raw HTML** into error messages. Server errors now show a clean status message; client errors (4xx) are distinguished with different guidance.
+- **Docker HEALTHCHECK failed on fresh containers** because `date -d "null"` is invalid when `last_sync_at` is null before the first sync. Staleness check is now skipped when no sync has occurred.
+- **Docker HEALTHCHECK `start-period` increased from 10 to 15 minutes** to accommodate first-sync enumeration of large libraries.
+- **`import-existing --no-progress-bar` suppressed the final summary**, leaving Docker users with zero output. Summary now always prints.
 
 [#93]: https://github.com/rhoopr/kei/issues/93
 [#125]: https://github.com/rhoopr/kei/issues/125

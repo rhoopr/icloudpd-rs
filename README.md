@@ -103,7 +103,7 @@ Run `kei --help` for all flags.
 
 kei downloads on a streaming pipeline. It starts fetching files as soon as the first API page comes back, rather than waiting to enumerate the whole library. After the first full sync, it uses Apple's CloudKit syncToken to pull only what changed - a no-change check takes 1-2 API calls.
 
-Downloads run with configurable concurrency (default 10). Partial downloads are saved as `.kei-tmp` files and resumed via HTTP Range headers. Every file is verified against its SHA256 checksum.
+Downloads run with configurable concurrency (default 10). Partial downloads are saved as `.kei-tmp` files and resumed via HTTP Range headers. Every file is verified against its expected size and content-type before being committed to the download directory.
 
 State lives in a SQLite database alongside your session cookies in `~/.config/kei/`. The DB tracks what's been downloaded, what failed, and where files landed on disk. This is what makes `retry-failed`, `verify`, and `import-existing` possible.
 
@@ -126,7 +126,7 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 
 - Parallel downloads with streaming pipeline - files start downloading before enumeration finishes
 - Incremental sync via CloudKit syncTokens - only fetches what changed
-- Resumable transfers with `.kei-tmp` partial files and SHA256 verification
+- Resumable transfers with `.kei-tmp` partial files, size verification, and content validation
 - SQLite state tracking across runs (downloaded, failed, pending)
 - Watch mode with configurable interval, systemd notify, PID file, graceful shutdown
 - Multi-library sync (`--library all` for personal + shared)
