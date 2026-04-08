@@ -80,7 +80,8 @@ pub async fn authenticate(
     session.set_client_id(&client_id);
 
     let mut data: Option<AccountLoginResponse> = None;
-    if session.session_data.contains_key("session_token") {
+    let has_session_token = session.session_data.contains_key("session_token");
+    if has_session_token {
         tracing::debug!("Checking session token validity");
         match twofa::validate_token(&mut session, &endpoints).await {
             Ok(d) => {
@@ -91,6 +92,29 @@ pub async fn authenticate(
                 tracing::debug!(
                     error = %e,
                     "Invalid authentication token, will log in from scratch"
+                );
+            }
+        }
+    }
+
+    // When submit-code provides a code and a session_token already exists
+    // (from a prior SRP by --auth-only or get-code), try /accountLogin
+    // before falling back to SRP. The /validate endpoint above is stricter
+    // and rejects pre-2FA sessions, but /accountLogin works — it returns
+    // account data showing 2FA is required, letting us skip straight to
+    // code submission without re-initiating SRP (which triggers a new
+    // 2FA push from Apple, invalidating the code the user already has).
+    if data.is_none() && code.is_some() && has_session_token {
+        tracing::debug!("Session token exists with code provided, trying accountLogin before SRP");
+        match twofa::authenticate_with_token(&mut session, &endpoints).await {
+            Ok(d) => {
+                tracing::debug!("accountLogin succeeded, skipping SRP");
+                data = Some(d);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "accountLogin failed, falling back to SRP"
                 );
             }
         }
