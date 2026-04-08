@@ -205,6 +205,99 @@ fn make_provider_from_auth(
     make_password_provider(source)
 }
 
+/// Initialize the photos service with automatic 421 retry.
+///
+/// On first attempt, uses the ckdatabasews URL from the auth result. If the
+/// CloudKit service returns 421 Misdirected Request (stale partition), retries
+/// by calling accountLogin to refresh service URLs.
+async fn init_photos_service(
+    auth_result: auth::AuthResult,
+    domain: &str,
+    api_retry_config: retry::RetryConfig,
+) -> anyhow::Result<(auth::SharedSession, icloud::photos::PhotosService)> {
+    let ckdatabasews_url = auth_result
+        .data
+        .webservices
+        .as_ref()
+        .and_then(|ws| ws.ckdatabasews.as_ref())
+        .map(|ep| ep.url.clone())
+        .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
+
+    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
+    let dsid = auth_result
+        .data
+        .ds_info
+        .as_ref()
+        .and_then(|ds| ds.dsid.clone());
+    let params = build_photos_params(&client_id, dsid.as_deref());
+
+    let shared_session: auth::SharedSession =
+        std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
+    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
+
+    tracing::info!("Initializing photos service...");
+    match icloud::photos::PhotosService::new(
+        ckdatabasews_url.clone(),
+        session_box,
+        params.clone(),
+        api_retry_config,
+    )
+    .await
+    {
+        Ok(service) => Ok((shared_session, service)),
+        Err(e) if is_misdirected_request(&e) => {
+            tracing::warn!(
+                url = %ckdatabasews_url,
+                "Service endpoint returned 421 Misdirected Request, \
+                 refreshing service URLs via accountLogin"
+            );
+            let endpoints = auth::endpoints::Endpoints::for_domain(domain)?;
+            let fresh_data = {
+                let mut session = shared_session.write().await;
+                auth::twofa::authenticate_with_token(&mut session, &endpoints).await?
+            };
+
+            let fresh_url = fresh_data
+                .webservices
+                .as_ref()
+                .and_then(|ws| ws.ckdatabasews.as_ref())
+                .map(|ep| ep.url.clone())
+                .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL from accountLogin"))?;
+
+            let client_id = {
+                let session = shared_session.read().await;
+                session.client_id().cloned().unwrap_or_default()
+            };
+            let dsid = fresh_data.ds_info.as_ref().and_then(|ds| ds.dsid.clone());
+            let params = build_photos_params(&client_id, dsid.as_deref());
+
+            let session_box: Box<dyn icloud::photos::PhotosSession> =
+                Box::new(shared_session.clone());
+
+            tracing::info!(url = %fresh_url, "Retrying with fresh service URL");
+            let service = icloud::photos::PhotosService::new(
+                fresh_url,
+                session_box,
+                params,
+                api_retry_config,
+            )
+            .await?;
+
+            Ok((shared_session, service))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Check if an iCloud error is a 421 Misdirected Request from the CloudKit service.
+///
+/// This happens when Apple migrates an account to a different partition but the
+/// cached session still references the old ckdatabasews URL. The fix is to
+/// force a full SRP re-authentication to obtain fresh webservice URLs.
+fn is_misdirected_request(err: &icloud::error::ICloudError) -> bool {
+    matches!(err, icloud::error::ICloudError::Connection(msg) if msg.contains("421"))
+}
+
 /// Attempt to re-authenticate the session.
 ///
 /// First validates the existing session; if invalid, performs full re-authentication.
@@ -681,34 +774,8 @@ async fn run_import_existing(
     )
     .await?;
 
-    let ckdatabasews_url = auth_result
-        .data
-        .webservices
-        .as_ref()
-        .and_then(|ws| ws.ckdatabasews.as_ref())
-        .map(|ep| ep.url.as_str())
-        .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
-
-    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
-    let dsid = auth_result
-        .data
-        .ds_info
-        .as_ref()
-        .and_then(|ds| ds.dsid.clone());
-    let params = build_photos_params(&client_id, dsid.as_deref());
-
-    let shared_session: auth::SharedSession =
-        Arc::new(tokio::sync::RwLock::new(auth_result.session));
-    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-
-    tracing::info!("Initializing photos service...");
-    let photos_service = icloud::photos::PhotosService::new(
-        ckdatabasews_url.to_string(),
-        session_box,
-        params,
-        retry::RetryConfig::default(),
-    )
-    .await?;
+    let (_shared_session, photos_service) =
+        init_photos_service(auth_result, domain.as_str(), retry::RetryConfig::default()).await?;
 
     let all_album = photos_service.all();
     let stream = all_album.photo_stream(args.recent, None, 1);
@@ -1237,42 +1304,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let ckdatabasews_url = auth_result
-        .data
-        .webservices
-        .as_ref()
-        .and_then(|ws| ws.ckdatabasews.as_ref())
-        .map(|ep| ep.url.as_str())
-        .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
-
-    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
-    let dsid = auth_result
-        .data
-        .ds_info
-        .as_ref()
-        .and_then(|ds| ds.dsid.clone());
-    let params = build_photos_params(&client_id, dsid.as_deref());
-
-    let shared_session: auth::SharedSession =
-        std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
-    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-
     let api_retry_config = retry::RetryConfig {
         max_retries: config.max_retries,
         base_delay_secs: config.retry_delay_secs,
         max_delay_secs: 60,
     };
 
-    tracing::info!("Initializing photos service...");
-    let photos_service = icloud::photos::PhotosService::new(
-        ckdatabasews_url.to_string(),
-        session_box,
-        params,
-        api_retry_config,
-    )
-    .await?;
-
-    let mut photos_service = photos_service;
+    let (shared_session, mut photos_service) =
+        init_photos_service(auth_result, config.domain.as_str(), api_retry_config).await?;
 
     if config.list_libraries {
         println!("Private libraries:");

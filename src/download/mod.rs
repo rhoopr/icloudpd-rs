@@ -2090,6 +2090,10 @@ where
                             });
                             break;
                         }
+                    } else {
+                        pb.suspend(|| {
+                            tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
+                        });
                     }
                 } else {
                     pb.suspend(|| {
@@ -2608,13 +2612,14 @@ async fn download_single_task(
                 download_checksum.as_deref().unwrap_or(&local_checksum)
             };
             if computed != decoded.hex {
-                let _ = tokio::fs::remove_file(&task.download_path).await;
-                return Err(DownloadError::ChecksumMismatch {
-                    path: task.download_path.display().to_string().into(),
-                    expected: decoded.hex.into(),
-                    computed: computed.to_string().into(),
-                }
-                .into());
+                tracing::warn!(
+                    path = %task.download_path.display(),
+                    expected = %decoded.hex,
+                    computed = %computed,
+                    algorithm = if decoded.is_sha1 { "SHA-1" } else { "SHA-256" },
+                    "API checksum mismatch (file retained — Apple's fileChecksum \
+                     may be stale)"
+                );
             }
         }
         Err(e) => {
