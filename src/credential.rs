@@ -151,7 +151,15 @@ impl CredentialStore {
     // ── Encrypted file backend ─────────────────────────────────────
 
     fn key_file_path(&self) -> PathBuf {
-        self.config_dir.join(".credential-key")
+        let new_path = self.config_dir.join(".kei-state");
+        // Migrate legacy name silently.
+        if !new_path.exists() {
+            let legacy = self.config_dir.join(".credential-key");
+            if legacy.exists() {
+                let _ = std::fs::rename(&legacy, &new_path);
+            }
+        }
+        new_path
     }
 
     fn credential_file_path(&self) -> PathBuf {
@@ -276,7 +284,7 @@ mod tests {
     use secrecy::ExposeSecret;
 
     /// Each test gets its own subdirectory to avoid parallel test interference
-    /// with the shared `.credential-key` file.
+    /// with the shared `.kei-state` key file.
     fn test_dir(name: &str) -> PathBuf {
         let dir = PathBuf::from(format!("/tmp/claude/test_credential/{name}"));
         let _ = std::fs::remove_dir_all(&dir);
