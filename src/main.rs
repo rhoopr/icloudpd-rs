@@ -1773,7 +1773,13 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                     &config.username,
                 );
             }
-        } // !skip_cycle
+        } else {
+            // Skipped cycle (no changes detected) — still update health so
+            // Docker HEALTHCHECK doesn't mark the container unhealthy after
+            // the 2-hour staleness window when no new photos are uploaded.
+            health.record_success();
+            health.write(&config.cookie_directory);
+        }
 
         if let Some(interval) = config.watch_with_interval {
             if shutdown_token.is_cancelled() {
