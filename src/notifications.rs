@@ -149,7 +149,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("success.sh");
-        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        // Open, write, and close explicitly to avoid "Text file busy" on CI
+        // (the file must be fully closed before exec).
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&script).unwrap();
+            f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+            f.sync_all().unwrap();
+        }
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let status = run_script(&script, "test_event", "msg", "user")
@@ -165,7 +172,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fail.sh");
-        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&script).unwrap();
+            f.write_all(b"#!/bin/sh\nexit 1\n").unwrap();
+            f.sync_all().unwrap();
+        }
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let status = run_script(&script, "test_event", "msg", "user")
@@ -183,14 +195,17 @@ mod tests {
         let script_path = dir.path().join("test_notify.sh");
         let output_path = dir.path().join("test_notify_output.txt");
 
-        std::fs::write(
-            &script_path,
-            format!(
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&script_path).unwrap();
+            write!(
+                f,
                 "#!/bin/sh\necho \"$KEI_EVENT|$KEI_MESSAGE|$KEI_ICLOUD_USERNAME\" > {}\n",
                 output_path.display()
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let notifier = Notifier::new(Some(script_path.clone()));
