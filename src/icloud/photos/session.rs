@@ -7,11 +7,8 @@ use crate::retry::{self, RetryAction, RetryConfig};
 /// Abstracted as a trait so album/library code can be tested with stubs
 /// without hitting the real iCloud API.
 #[async_trait::async_trait]
-#[allow(dead_code)] // get() not called yet; part of public session API for future use
 pub trait PhotosSession: Send + Sync {
     async fn post(&self, url: &str, body: &str, headers: &[(&str, &str)]) -> anyhow::Result<Value>;
-
-    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response>;
 
     /// Clone this session into a new boxed trait object.
     fn clone_box(&self) -> Box<dyn PhotosSession>;
@@ -26,18 +23,9 @@ impl PhotosSession for reqwest::Client {
         for &(k, v) in headers {
             builder = builder.header(k, v);
         }
-        let resp = builder.send().await?;
+        let resp = builder.send().await?.error_for_status()?;
         let json: Value = resp.json().await?;
         Ok(json)
-    }
-
-    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response> {
-        let mut builder = reqwest::Client::get(self, url);
-        for &(k, v) in headers {
-            builder = builder.header(k, v);
-        }
-        let resp = builder.send().await?;
-        Ok(resp)
     }
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -55,26 +43,21 @@ impl PhotosSession for crate::auth::SharedSession {
         PhotosSession::post(&client, url, body, headers).await
     }
 
-    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<reqwest::Response> {
-        let client = self.read().await.http_client();
-        PhotosSession::get(&client, url, headers).await
-    }
-
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
     }
 }
 
-/// CloudKit server error codes that indicate a transient condition.
+/// `CloudKit` server error codes that indicate a transient condition.
 /// These arrive as HTTP 200 with a `serverErrorCode` field in the JSON body.
 const RETRYABLE_SERVER_ERRORS: &[&str] =
     &["RETRY_LATER", "TRY_AGAIN_LATER", "CAS_OP_LOCK", "THROTTLED"];
 
-/// CloudKit server error codes that indicate the iCloud service is not
+/// `CloudKit` server error codes that indicate the iCloud service is not
 /// activated or accessible (e.g. ADP enabled, incomplete iCloud setup).
 const SERVICE_NOT_ACTIVATED_ERRORS: &[&str] = &["ZONE_NOT_FOUND", "AUTHENTICATION_FAILED"];
 
-/// Error type for CloudKit server errors embedded in the JSON response body.
+/// Error type for `CloudKit` server errors embedded in the JSON response body.
 /// These are distinct from HTTP-level errors and represent API-level failures.
 #[derive(Debug, thiserror::Error)]
 #[error("CloudKit server error: {code} — {reason}")]
@@ -99,7 +82,7 @@ fn is_service_not_activated(code: &str, reason: &str) -> bool {
             .contains("private db access disabled")
 }
 
-/// Check a CloudKit JSON response for `serverErrorCode` or per-record errors.
+/// Check a `CloudKit` JSON response for `serverErrorCode` or per-record errors.
 /// Returns `Err` if a server error is found, `Ok(response)` otherwise.
 fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
     // Top-level serverErrorCode (e.g. from CAS Op-Lock)
@@ -128,10 +111,17 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
         .into());
     }
 
-    // Per-record errors in the records array
+    // Per-record errors: filter out errored records and keep valid ones.
+    // Only return Err if ALL records are errored.
     if let Some(records) = response["records"].as_array() {
-        for record in records {
-            if let Some(code) = record["serverErrorCode"].as_str() {
+        let (errored, valid): (Vec<&Value>, Vec<&Value>) = records
+            .iter()
+            .partition(|r| r["serverErrorCode"].as_str().is_some());
+
+        if !errored.is_empty() {
+            let mut last_ck_err = None;
+            for record in &errored {
+                let code = record["serverErrorCode"].as_str().unwrap_or("unknown");
                 let reason = record["reason"].as_str().unwrap_or("unknown").to_string();
                 let retryable = RETRYABLE_SERVER_ERRORS
                     .iter()
@@ -143,14 +133,28 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                     service_not_activated,
                     "CloudKit per-record error: {reason}"
                 );
-                return Err(CloudKitServerError {
+                last_ck_err = Some(CloudKitServerError {
                     code: code.to_string(),
                     reason,
                     retryable,
                     service_not_activated,
-                }
-                .into());
+                });
             }
+
+            if valid.is_empty() {
+                return Err(last_ck_err.expect("errored is non-empty").into());
+            }
+            let total = errored.len() + valid.len();
+            tracing::warn!(
+                errored = errored.len(),
+                valid = valid.len(),
+                total,
+                "Filtered errored records from CloudKit response"
+            );
+            let valid_owned: Vec<Value> = valid.into_iter().cloned().collect();
+            let mut response = response;
+            response["records"] = Value::Array(valid_owned);
+            return Ok(response);
         }
     }
 
@@ -158,7 +162,7 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
 }
 
 /// Classify API errors for retry: network failures, server-side errors
-/// (5xx, 429), and retryable CloudKit server errors are transient;
+/// (5xx, 429), and retryable `CloudKit` server errors are transient;
 /// client errors (4xx) and non-retryable server errors are permanent.
 fn classify_api_error(e: &anyhow::Error) -> RetryAction {
     if let Some(ck_err) = e.downcast_ref::<CloudKitServerError>() {
@@ -182,7 +186,7 @@ fn classify_api_error(e: &anyhow::Error) -> RetryAction {
 
 /// Retry a `session.post()` call with default exponential backoff.
 ///
-/// Inspects each response for CloudKit server errors (`serverErrorCode`)
+/// Inspects each response for `CloudKit` server errors (`serverErrorCode`)
 /// and converts retryable ones (e.g. `TRY_AGAIN_LATER`, `CAS_OP_LOCK`)
 /// into transient errors that trigger automatic retry.
 pub async fn retry_post(
@@ -190,9 +194,9 @@ pub async fn retry_post(
     url: &str,
     body: &str,
     headers: &[(&str, &str)],
+    retry_config: &RetryConfig,
 ) -> anyhow::Result<Value> {
-    let config = RetryConfig::default();
-    retry::retry_with_backoff(&config, classify_api_error, || async {
+    retry::retry_with_backoff(retry_config, classify_api_error, || async {
         let response = session.post(url, body, headers).await?;
         check_cloudkit_errors(response)
     })
@@ -208,7 +212,7 @@ pub enum SyncTokenError {
     /// Zone no longer exists — stop syncing this zone
     #[error("Zone not found: {zone_name}")]
     ZoneNotFound { zone_name: String },
-    /// Unexpected zone-level error (e.g. RETRY_LATER, THROTTLED) —
+    /// Unexpected zone-level error (e.g. `RETRY_LATER`, THROTTLED) —
     /// treat as transient; do NOT advance the sync token.
     #[error("Unexpected zone error in {zone_name}: {error_code}")]
     UnexpectedZoneError {
@@ -220,7 +224,7 @@ pub enum SyncTokenError {
 impl SyncTokenError {
     /// Whether this error should trigger a fallback from incremental to full sync.
     /// Only token/zone-level issues warrant full re-enumeration; transient errors
-    /// (THROTTLED, RETRY_LATER) should propagate without triggering an expensive fallback.
+    /// (THROTTLED, `RETRY_LATER`) should propagate without triggering an expensive fallback.
     pub fn should_fallback_to_full(&self) -> bool {
         matches!(
             self,
@@ -326,18 +330,33 @@ mod tests {
     }
 
     #[test]
-    fn test_check_cloudkit_errors_per_record() {
+    fn test_check_cloudkit_errors_per_record_mixed() {
+        // When some records are valid and some errored, valid ones are kept
         let response = serde_json::json!({
             "records": [
                 {"recordName": "A"},
                 {"serverErrorCode": "RETRY_LATER", "reason": "busy"}
             ]
         });
+        let result = check_cloudkit_errors(response).unwrap();
+        let records = result["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["recordName"], "A");
+    }
+
+    #[test]
+    fn test_check_cloudkit_errors_per_record_all_errored() {
+        // When ALL records are errored, return Err
+        let response = serde_json::json!({
+            "records": [
+                {"serverErrorCode": "RETRY_LATER", "reason": "busy"},
+                {"serverErrorCode": "RETRY_LATER", "reason": "still busy"}
+            ]
+        });
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
         assert_eq!(ck_err.code, "RETRY_LATER");
         assert!(ck_err.retryable);
-        assert!(!ck_err.service_not_activated);
     }
 
     #[test]
@@ -592,5 +611,98 @@ mod tests {
             reason: String::new(),
         };
         assert_eq!(err.to_string(), "Invalid sync token: ");
+    }
+
+    /// T-2: Mock session returns HTTP 503 on first call, 200 on second.
+    /// `retry_post` should retry the call and return the successful response.
+    #[tokio::test]
+    async fn test_retry_post_retries_on_503() {
+        struct RetrySession {
+            call_count: std::sync::atomic::AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl PhotosSession for RetrySession {
+            async fn post(
+                &self,
+                _url: &str,
+                _body: &str,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                let n = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    // First call: simulate 503 via CloudKit serverErrorCode
+                    Ok(serde_json::json!({
+                        "serverErrorCode": "TRY_AGAIN_LATER",
+                        "reason": "Service Unavailable"
+                    }))
+                } else {
+                    // Second call: success
+                    Ok(serde_json::json!({
+                        "records": [{"recordName": "A1"}]
+                    }))
+                }
+            }
+
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                panic!("not needed for test")
+            }
+        }
+
+        let session = RetrySession {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        };
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+
+        let result = retry_post(&session, "https://example.com/api", "{}", &[], &config).await;
+        assert!(
+            result.is_ok(),
+            "retry_post should succeed on second attempt"
+        );
+
+        let response = result.unwrap();
+        let records = response["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["recordName"], "A1");
+
+        // Verify exactly 2 calls were made (1 retry + 1 success)
+        assert_eq!(
+            session.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    /// Build a reqwest::Error with the given HTTP status code (no network needed).
+    fn reqwest_status_error(status: u16) -> anyhow::Error {
+        let http_resp = http::Response::builder()
+            .status(status)
+            .body(Vec::<u8>::new())
+            .unwrap();
+        let resp = reqwest::Response::from(http_resp);
+        resp.error_for_status().unwrap_err().into()
+    }
+
+    #[test]
+    fn test_post_503_is_retryable() {
+        let err = reqwest_status_error(503);
+        assert_eq!(classify_api_error(&err), RetryAction::Retry);
+    }
+
+    #[test]
+    fn test_post_429_is_retryable() {
+        let err = reqwest_status_error(429);
+        assert_eq!(classify_api_error(&err), RetryAction::Retry);
+    }
+
+    #[test]
+    fn test_post_421_aborts() {
+        let err = reqwest_status_error(421);
+        assert_eq!(classify_api_error(&err), RetryAction::Abort);
     }
 }

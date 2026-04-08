@@ -1,4 +1,4 @@
-//! Sync tests with behavioral assertions.
+//! Sync tests with behavioral assertions (live iCloud API).
 //!
 //! Uses the `icloudpd-test` iCloud album with known content:
 //! - GOPR0558.JPG        — regular JPEG photo
@@ -7,7 +7,12 @@
 //! - IMG_0199.DNG        — Apple ProRAW (RAW + JPEG derivative)
 //! - Café_🧠godzill.jpg  — JPEG with unicode filename
 //!
-//! Requires pre-authenticated session. Run with `--test-threads=1`.
+//! All tests are `#[ignore]` — they require iCloud credentials and hit the
+//! live Apple API. Run with:
+//!
+//! ```sh
+//! cargo test --test sync -- --ignored --test-threads=1
+//! ```
 
 mod common;
 
@@ -47,10 +52,9 @@ fn album_cmd(
 // ── Metadata (no downloads) ─────────────────────────────────────────────
 
 #[test]
+#[ignore]
 fn list_albums_prints_album_names() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         common::cmd()
@@ -68,15 +72,14 @@ fn list_albums_prints_album_names() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_META))
             .assert()
             .success()
-            .stdout(predicate::str::contains("Albums:"));
+            .stdout(predicate::str::contains("Library:"));
     });
 }
 
 #[test]
+#[ignore]
 fn list_libraries_prints_output() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         common::cmd()
@@ -102,10 +105,9 @@ fn list_libraries_prints_output() {
 
 /// Downloads the full test album and verifies all expected asset types are present.
 #[test]
+#[ignore]
 fn sync_album_downloads_all_asset_types() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -148,10 +150,9 @@ fn sync_album_downloads_all_asset_types() {
 
 /// Dry-run should list assets but not write any files to disk.
 #[test]
+#[ignore]
 fn sync_dry_run_downloads_nothing() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -172,10 +173,9 @@ fn sync_dry_run_downloads_nothing() {
 
 /// Running sync twice should not re-download or modify any files.
 #[test]
+#[ignore]
 fn sync_idempotent_second_run_noop() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -222,10 +222,9 @@ fn sync_idempotent_second_run_noop() {
 
 /// --skip-videos should exclude all .mov/.mp4 files but still download images.
 #[test]
+#[ignore]
 fn sync_skip_videos_excludes_video_files() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -269,10 +268,9 @@ fn sync_skip_videos_excludes_video_files() {
 
 /// --skip-photos should exclude all image files but still download videos.
 #[test]
+#[ignore]
 fn sync_skip_photos_excludes_image_files() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -301,10 +299,9 @@ fn sync_skip_photos_excludes_image_files() {
 /// --skip-live-photos should exclude Live Photo MOV companions but keep
 /// standalone videos and the Live Photo still image.
 #[test]
+#[ignore]
 fn sync_skip_live_photos_excludes_companions() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -341,10 +338,9 @@ fn sync_skip_live_photos_excludes_companions() {
 
 /// Skipping all media types (videos + photos + live photos) should download nothing.
 #[test]
+#[ignore]
 fn sync_skip_all_media_downloads_nothing() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -366,10 +362,9 @@ fn sync_skip_all_media_downloads_nothing() {
 /// Date filters with extreme values should filter everything out.
 /// Also verifies interval syntax (e.g., "1d") parses correctly.
 #[test]
+#[ignore]
 fn sync_date_filters_exclude_by_creation_date() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         // skip-created-before with far-future date — everything filtered
@@ -419,10 +414,9 @@ fn sync_date_filters_exclude_by_creation_date() {
 /// --size medium should produce photo files significantly smaller than originals.
 /// Medium photos (2048px longest edge) should be well under 2MB.
 #[test]
+#[ignore]
 fn sync_size_medium_produces_smaller_files() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -458,10 +452,9 @@ fn sync_size_medium_produces_smaller_files() {
 
 /// --force-size with an available size should succeed and download files.
 #[test]
+#[ignore]
 fn sync_force_size_succeeds_when_available() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -478,8 +471,12 @@ fn sync_force_size_succeeds_when_available() {
             "--force-size with available size should download files"
         );
 
-        // With --force-size medium, non-RAW files should be smaller than originals
-        let non_raw_files: Vec<_> = files.iter().filter(|p| !is_raw_ext(p)).collect();
+        // With --force-size medium, non-RAW photo files should be smaller than originals.
+        // Videos don't have meaningful medium alternatives so exclude them too.
+        let non_raw_files: Vec<_> = files
+            .iter()
+            .filter(|p| !is_raw_ext(p) && !is_video_ext(p))
+            .collect();
         for f in &non_raw_files {
             let size = std::fs::metadata(f).unwrap().len();
             assert!(
@@ -494,10 +491,9 @@ fn sync_force_size_succeeds_when_available() {
 
 /// --file-match-policy name-id7 should append a 7-character asset ID to every filename.
 #[test]
+#[ignore]
 fn sync_name_id7_appends_asset_id() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -548,10 +544,9 @@ fn sync_name_id7_appends_asset_id() {
 
 /// --folder-structure %Y should place files in year-only directories (e.g., 2024/file.jpg).
 #[test]
+#[ignore]
 fn sync_custom_folder_structure() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -587,10 +582,9 @@ fn sync_custom_folder_structure() {
 /// --keep-unicode-in-filenames should preserve non-ASCII characters
 /// (e.g., Café_🧠godzill.jpg retains the é and 🧠).
 #[test]
+#[ignore]
 fn sync_keep_unicode_preserves_special_chars() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -623,10 +617,9 @@ fn sync_keep_unicode_preserves_special_chars() {
 
 /// --set-exif-datetime should embed DateTimeOriginal in downloaded JPEG files.
 #[test]
+#[ignore]
 fn sync_set_exif_datetime_embeds_date() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -670,10 +663,9 @@ fn sync_set_exif_datetime_embeds_date() {
 /// --align-raw variants (as-is, original, alternative) should produce different
 /// file naming for the RAW+JPEG pair (IMG_0199.DNG).
 #[test]
+#[ignore]
 fn sync_align_raw_controls_raw_naming() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let mut all_filenames: Vec<Vec<String>> = Vec::new();
@@ -736,10 +728,9 @@ fn sync_align_raw_controls_raw_naming() {
 /// --live-photo-mov-filename-policy suffix vs original should produce
 /// different MOV companion filenames for Live Photos.
 #[test]
+#[ignore]
 fn sync_live_photo_mov_policy_controls_naming() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         // Download with "suffix" policy
@@ -784,10 +775,9 @@ fn sync_live_photo_mov_policy_controls_naming() {
 
 /// --temp-suffix .downloading should leave no temp files after a successful sync.
 #[test]
+#[ignore]
 fn sync_temp_suffix_leaves_no_remnants() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -816,10 +806,9 @@ fn sync_temp_suffix_leaves_no_remnants() {
 
 /// --threads-num value should appear as concurrency=N in log output.
 #[test]
+#[ignore]
 fn sync_threads_num_reflected_in_log() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -841,10 +830,9 @@ fn sync_threads_num_reflected_in_log() {
 
 /// --notification-script should be called with ICLOUDPD_EVENT set.
 #[test]
+#[ignore]
 fn sync_notification_script_fires_event() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -854,10 +842,7 @@ fn sync_notification_script_fires_event() {
         let script_path = script_dir.path().join("notify.sh");
         std::fs::write(
             &script_path,
-            format!(
-                "#!/bin/sh\necho \"$ICLOUDPD_EVENT\" > {}\n",
-                marker.display()
-            ),
+            format!("#!/bin/sh\necho \"$KEI_EVENT\" > {}\n", marker.display()),
         )
         .expect("write script");
         #[cfg(unix)]
@@ -887,10 +872,9 @@ fn sync_notification_script_fires_event() {
 
 /// --pid-file should be created during sync and removed after completion.
 #[test]
+#[ignore]
 fn sync_pid_file_cleaned_up_after_sync() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -921,10 +905,9 @@ fn sync_pid_file_cleaned_up_after_sync() {
 
 /// Omitting the "sync" subcommand should work identically to `sync`.
 #[test]
+#[ignore]
 fn sync_bare_invocation_works_like_sync() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -964,10 +947,9 @@ fn sync_bare_invocation_works_like_sync() {
 // ── Error paths (no network) ────────────────────────────────────────────
 
 #[test]
+#[ignore]
 fn sync_without_directory_fails() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::cmd()
         .args([
@@ -989,10 +971,9 @@ fn sync_without_directory_fails() {
 // ── Error paths (auth required) ─────────────────────────────────────────
 
 #[test]
+#[ignore]
 fn sync_nonexistent_album_fails() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -1020,10 +1001,9 @@ fn sync_nonexistent_album_fails() {
 }
 
 #[test]
+#[ignore]
 fn sync_nonexistent_library_fails() {
-    let Some((username, password, cookie_dir)) = common::require_preauth() else {
-        return;
-    };
+    let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
@@ -1057,6 +1037,7 @@ fn sync_nonexistent_library_fails() {
 // ── Bad credentials (LAST — hits auth from scratch, burns rate limit) ───
 
 #[test]
+#[ignore]
 fn zz_bad_credentials_fails() {
     let cookie_dir = tempdir().expect("tempdir");
     let download_dir = tempdir().expect("tempdir");

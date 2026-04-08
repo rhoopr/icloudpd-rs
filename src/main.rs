@@ -1,6 +1,6 @@
 //! kei: photo sync engine — Rust rewrite of icloud-photos-downloader.
 //!
-//! Downloads photos and videos from iCloud via Apple's private CloudKit APIs.
+//! Downloads photos and videos from iCloud via Apple's private `CloudKit` APIs.
 //! Authentication uses SRP-6a with Apple's custom variant, followed by optional
 //! 2FA. Photos are streamed with exponential-backoff retries on transient
 //! failures.
@@ -10,10 +10,13 @@
 mod auth;
 mod cli;
 mod config;
+mod credential;
 mod download;
+mod health;
 mod icloud;
 mod migration;
 mod notifications;
+mod password;
 pub mod retry;
 mod setup;
 mod shutdown;
@@ -21,11 +24,16 @@ mod state;
 mod systemd;
 mod types;
 
+#[cfg(test)]
+mod test_helpers;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
+use password::{ExposeSecret, SecretString};
 use tracing_subscriber::EnvFilter;
 
 /// A writer wrapper that redacts a password string from log output.
@@ -34,20 +42,24 @@ use tracing_subscriber::EnvFilter;
 /// configured password with `********` in each `write()` call.
 struct RedactingWriter<W> {
     inner: W,
-    password: Arc<std::sync::Mutex<Option<String>>>,
+    password: Arc<std::sync::Mutex<Option<SecretString>>>,
 }
 
 impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let password = self.password.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pw) = password.as_deref() {
-            if !pw.is_empty() {
+        let password = self
+            .password
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ref pw) = *password {
+            let pw_str = pw.expose_secret();
+            if !pw_str.is_empty() {
                 // A buffer shorter than the password can't contain it,
                 // avoiding the lossy UTF-8 conversion for short log fragments.
-                if buf.len() >= pw.len() {
+                if buf.len() >= pw_str.len() {
                     let s = String::from_utf8_lossy(buf);
-                    if s.contains(pw) {
-                        let redacted = s.replace(pw, "********");
+                    if s.contains(pw_str) {
+                        let redacted = s.replace(pw_str, "********");
                         self.inner.write_all(redacted.as_bytes())?;
                         return Ok(buf.len());
                     }
@@ -65,7 +77,7 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
 
 /// A `MakeWriter` implementation that produces `RedactingWriter` instances.
 struct RedactingMakeWriter {
-    password: Arc<std::sync::Mutex<Option<String>>>,
+    password: Arc<std::sync::Mutex<Option<SecretString>>>,
 }
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
@@ -88,14 +100,202 @@ use systemd::SystemdNotifier;
 /// Maximum number of re-authentication attempts before giving up.
 const MAX_REAUTH_ATTEMPTS: u32 = 3;
 
-/// Build a password provider closure that returns the given password or
-/// falls back to prompting on stdin.
-fn make_password_provider(password: Option<String>) -> impl Fn() -> Option<String> {
-    move || -> Option<String> {
-        password.clone().or_else(|| {
-            tokio::task::block_in_place(|| rpassword::prompt_password("iCloud Password: ").ok())
-        })
+/// Prevent core dumps from leaking in-memory credentials.
+/// Best-effort: failures are logged but not fatal (Docker containers may
+/// restrict these syscalls).
+fn harden_process() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            tracing::debug!("prctl(PR_SET_DUMPABLE, 0) failed");
+        }
     }
+    #[cfg(unix)]
+    unsafe {
+        let rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::setrlimit(libc::RLIMIT_CORE, &rlim) != 0 {
+            tracing::debug!("setrlimit(RLIMIT_CORE, 0) failed");
+        }
+    }
+}
+
+/// Exit code for partial sync (some downloads failed, but sync was not a total failure).
+const EXIT_PARTIAL: u8 = 2;
+/// Exit code for authentication failures.
+const EXIT_AUTH: u8 = 3;
+
+/// Returned when some (but not all) downloads failed during a sync.
+#[derive(Debug)]
+struct PartialSyncError(usize);
+impl std::fmt::Display for PartialSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} downloads failed", self.0)
+    }
+}
+impl std::error::Error for PartialSyncError {}
+
+/// Query available disk space on the filesystem containing `path`.
+///
+/// Returns `None` if the statvfs call fails (e.g. path doesn't exist yet).
+#[cfg(unix)]
+fn available_disk_space(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// Widen a platform-dependent statvfs field to u64. `as u64` is the only
+    /// portable way since the underlying types (`c_ulong`, `fsblkcnt_t`) vary
+    /// across targets.
+    #[inline]
+    fn widen(v: impl Into<u64>) -> u64 {
+        v.into()
+    }
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        Some(widen(stat.f_bavail) * widen(stat.f_frsize))
+    }
+}
+
+#[cfg(not(unix))]
+fn available_disk_space(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Build a password provider closure from a [`password::PasswordSource`].
+///
+/// The source is evaluated lazily on each call — for `Command` and `File`
+/// sources, this re-executes/re-reads each time, supporting password rotation
+/// and keeping no password in memory between auth cycles.
+fn make_password_provider(source: password::PasswordSource) -> impl Fn() -> Option<SecretString> {
+    move || match source.resolve() {
+        Ok(pw) => pw,
+        Err(e) => {
+            tracing::error!(error = %e, "Password source resolution failed");
+            None
+        }
+    }
+}
+
+/// Build a password provider from CLI auth args, TOML config, and resolved auth fields.
+///
+/// Shared by `run_get_code`, `run_submit_code`, and `run_import_existing`.
+fn make_provider_from_auth(
+    auth: &cli::AuthArgs,
+    password: Option<String>,
+    username: &str,
+    cookie_directory: &Path,
+    toml: Option<&config::TomlConfig>,
+) -> impl Fn() -> Option<SecretString> {
+    let toml_auth = toml.and_then(|t| t.auth.as_ref());
+    let password_command = config::resolve_password_command(auth, toml_auth);
+    let password_file = config::resolve_password_file(auth, toml_auth);
+    let source = password::build_password_source(
+        password.map(SecretString::from).as_ref(),
+        password_command.as_deref(),
+        password_file.as_deref(),
+        credential::CredentialStore::new(username, cookie_directory),
+    );
+    make_password_provider(source)
+}
+
+/// Initialize the photos service with automatic 421 retry.
+///
+/// On first attempt, uses the ckdatabasews URL from the auth result. If the
+/// CloudKit service returns 421 Misdirected Request (stale partition), retries
+/// by calling accountLogin to refresh service URLs.
+async fn init_photos_service(
+    auth_result: auth::AuthResult,
+    domain: &str,
+    api_retry_config: retry::RetryConfig,
+) -> anyhow::Result<(auth::SharedSession, icloud::photos::PhotosService)> {
+    let ckdatabasews_url = auth_result
+        .data
+        .webservices
+        .as_ref()
+        .and_then(|ws| ws.ckdatabasews.as_ref())
+        .map(|ep| ep.url.clone())
+        .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
+
+    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
+    let dsid = auth_result
+        .data
+        .ds_info
+        .as_ref()
+        .and_then(|ds| ds.dsid.clone());
+    let params = build_photos_params(&client_id, dsid.as_deref());
+
+    let shared_session: auth::SharedSession =
+        std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
+    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
+
+    tracing::info!("Initializing photos service...");
+    match icloud::photos::PhotosService::new(
+        ckdatabasews_url.clone(),
+        session_box,
+        params.clone(),
+        api_retry_config,
+    )
+    .await
+    {
+        Ok(service) => Ok((shared_session, service)),
+        Err(e) if is_misdirected_request(&e) => {
+            tracing::warn!(
+                url = %ckdatabasews_url,
+                "Service endpoint returned 421 Misdirected Request, \
+                 refreshing service URLs via accountLogin"
+            );
+            let endpoints = auth::endpoints::Endpoints::for_domain(domain)?;
+            let fresh_data = {
+                let mut session = shared_session.write().await;
+                auth::twofa::authenticate_with_token(&mut session, &endpoints).await?
+            };
+
+            let fresh_url = fresh_data
+                .webservices
+                .as_ref()
+                .and_then(|ws| ws.ckdatabasews.as_ref())
+                .map(|ep| ep.url.clone())
+                .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL from accountLogin"))?;
+
+            let client_id = {
+                let session = shared_session.read().await;
+                session.client_id().cloned().unwrap_or_default()
+            };
+            let dsid = fresh_data.ds_info.as_ref().and_then(|ds| ds.dsid.clone());
+            let params = build_photos_params(&client_id, dsid.as_deref());
+
+            let session_box: Box<dyn icloud::photos::PhotosSession> =
+                Box::new(shared_session.clone());
+
+            tracing::info!(url = %fresh_url, "Retrying with fresh service URL");
+            let service = icloud::photos::PhotosService::new(
+                fresh_url,
+                session_box,
+                params,
+                api_retry_config,
+            )
+            .await?;
+
+            Ok((shared_session, service))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Check if an iCloud error is a 421 Misdirected Request from the CloudKit service.
+///
+/// This happens when Apple migrates an account to a different partition but the
+/// cached session still references the old ckdatabasews URL. The fix is to
+/// force a full SRP re-authentication to obtain fresh webservice URLs.
+fn is_misdirected_request(err: &icloud::error::ICloudError) -> bool {
+    matches!(err, icloud::error::ICloudError::Connection(msg) if msg.contains("421"))
 }
 
 /// Attempt to re-authenticate the session.
@@ -119,7 +319,7 @@ async fn attempt_reauth<F>(
     password_provider: &F,
 ) -> anyhow::Result<()>
 where
-    F: Fn() -> Option<String>,
+    F: Fn() -> Option<SecretString>,
 {
     let mut session = shared_session.write().await;
 
@@ -184,17 +384,25 @@ async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
 }
 
 /// Get the database path for a given auth config, merging with TOML defaults.
-fn get_db_path(auth: &cli::AuthArgs, toml: &Option<TomlConfig>) -> PathBuf {
+///
+/// Returns an error if the resolved username is empty, since an empty username
+/// produces a `.db` filename that silently operates on the wrong database.
+fn get_db_path(auth: &cli::AuthArgs, toml: Option<&TomlConfig>) -> anyhow::Result<PathBuf> {
     let (username, _, _, cookie_dir) = config::resolve_auth(auth, toml);
-    cookie_dir.join(format!(
+    if username.is_empty() {
+        anyhow::bail!(
+            "--username is required (or set ICLOUD_USERNAME, or add username to config file)"
+        );
+    }
+    Ok(cookie_dir.join(format!(
         "{}.db",
         auth::session::sanitize_username(&username)
-    ))
+    )))
 }
 
 /// Run the status command.
-async fn run_status(args: cli::StatusArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth, toml);
+async fn run_status(args: cli::StatusArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
+    let db_path = get_db_path(&args.auth, toml)?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -250,9 +458,9 @@ async fn run_status(args: cli::StatusArgs, toml: &Option<TomlConfig>) -> anyhow:
 /// Run the reset-state command.
 async fn run_reset_state(
     args: cli::ResetStateArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth, toml);
+    let db_path = get_db_path(&args.auth, toml)?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -260,11 +468,11 @@ async fn run_reset_state(
     }
 
     if !args.yes {
+        use std::io::Write;
         println!("This will delete the state database at:");
         println!("  {}", db_path.display());
         println!();
         print!("Are you sure? [y/N] ");
-        use std::io::Write;
         std::io::stdout().flush()?;
 
         let mut input = String::new();
@@ -275,21 +483,21 @@ async fn run_reset_state(
         }
     }
 
-    std::fs::remove_file(&db_path)?;
+    tokio::fs::remove_file(&db_path).await?;
     println!("State database deleted.");
 
     // Also remove WAL and SHM files if they exist
     let wal_path = db_path.with_extension("db-wal");
     let shm_path = db_path.with_extension("db-shm");
-    let _ = std::fs::remove_file(&wal_path);
-    let _ = std::fs::remove_file(&shm_path);
+    let _ = tokio::fs::remove_file(&wal_path).await;
+    let _ = tokio::fs::remove_file(&shm_path).await;
 
     Ok(())
 }
 
 /// Run the verify command.
-async fn run_verify(args: cli::VerifyArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth, toml);
+async fn run_verify(args: cli::VerifyArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
+    let db_path = get_db_path(&args.auth, toml)?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -298,63 +506,70 @@ async fn run_verify(args: cli::VerifyArgs, toml: &Option<TomlConfig>) -> anyhow:
     }
 
     let db = state::SqliteStateDb::open(&db_path).await?;
-    let downloaded = db.get_all_downloaded().await?;
+    let summary = db.get_summary().await?;
 
-    println!("Verifying {} downloaded assets...", downloaded.len());
+    println!("Verifying {} downloaded assets...", summary.downloaded);
     println!();
 
-    let mut missing = 0;
-    let mut corrupted = 0;
-    let mut verified = 0;
+    let mut missing = 0u64;
+    let mut corrupted = 0u64;
+    let mut verified = 0u64;
 
-    for asset in &downloaded {
-        // Sanity check: all assets from get_all_downloaded should have Downloaded status
-        debug_assert_eq!(asset.status, state::AssetStatus::Downloaded);
+    const PAGE_SIZE: u32 = 1000;
+    let mut offset = 0u64;
+    loop {
+        let page = db.get_downloaded_page(offset, PAGE_SIZE).await?;
+        if page.is_empty() {
+            break;
+        }
+        offset += page.len() as u64;
 
-        if let Some(local_path) = &asset.local_path {
-            if !local_path.exists() {
-                let downloaded_at = asset
-                    .downloaded_at
-                    .map(|dt| dt.format("%Y-%m-%d").to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                println!(
-                    "MISSING: {} ({}) - downloaded {}",
-                    local_path.display(),
-                    asset.id,
-                    downloaded_at
-                );
-                missing += 1;
-                continue;
-            }
+        for asset in &page {
+            debug_assert_eq!(asset.status, state::AssetStatus::Downloaded);
 
-            if args.checksums {
-                if let Some(local_cksum) = &asset.local_checksum {
-                    // Verify against locally-computed SHA-256
-                    match verify_local_checksum(local_path, local_cksum).await {
-                        Ok(true) => verified += 1,
-                        Ok(false) => {
-                            println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
-                            corrupted += 1;
+            if let Some(local_path) = &asset.local_path {
+                if !local_path.exists() {
+                    let downloaded_at = asset.downloaded_at.map_or_else(
+                        || "unknown".to_string(),
+                        |dt| dt.format("%Y-%m-%d").to_string(),
+                    );
+                    println!(
+                        "MISSING: {} ({}) - downloaded {}",
+                        local_path.display(),
+                        asset.id,
+                        downloaded_at
+                    );
+                    missing += 1;
+                    continue;
+                }
+
+                if args.checksums {
+                    if let Some(local_cksum) = &asset.local_checksum {
+                        match verify_local_checksum(local_path, local_cksum).await {
+                            Ok(true) => verified += 1,
+                            Ok(false) => {
+                                println!("CORRUPTED: {} ({})", local_path.display(), asset.id);
+                                corrupted += 1;
+                            }
+                            Err(e) => {
+                                println!("ERROR: {} - {}", local_path.display(), e);
+                                corrupted += 1;
+                            }
                         }
-                        Err(e) => {
-                            println!("ERROR: {} - {}", local_path.display(), e);
-                            corrupted += 1;
-                        }
+                    } else {
+                        tracing::debug!(
+                            id = %asset.id,
+                            "No local checksum stored, skipping verification"
+                        );
+                        verified += 1;
                     }
                 } else {
-                    // Pre-v3 asset without local checksum — skip verification
-                    tracing::debug!(
-                        id = %asset.id,
-                        "No local checksum stored, skipping verification"
-                    );
                     verified += 1;
                 }
             } else {
-                verified += 1;
+                println!("NO PATH: {} - no local path recorded", asset.id);
+                missing += 1;
             }
-        } else {
-            println!("NO PATH: {} - no local path recorded", asset.id);
-            missing += 1;
         }
     }
 
@@ -380,14 +595,47 @@ async fn verify_local_checksum(path: &Path, expected_hex: &str) -> anyhow::Resul
 }
 
 /// Run the get-code command: trigger push notification for 2FA.
-async fn run_get_code(args: cli::GetCodeArgs, toml: &Option<TomlConfig>) -> anyhow::Result<()> {
+/// Run the credential subcommand: set, clear, or show backend.
+async fn run_credential(
+    args: cli::CredentialArgs,
+    toml: Option<&TomlConfig>,
+) -> anyhow::Result<()> {
+    let (username, _password, _domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
+
+    if username.is_empty() {
+        anyhow::bail!("--username is required for credential management");
+    }
+
+    let store = credential::CredentialStore::new(&username, &cookie_directory);
+
+    match args.action {
+        cli::CredentialAction::Set => {
+            let pw = rpassword::prompt_password("iCloud Password: ")
+                .map_err(|e| anyhow::anyhow!("Failed to read password: {e}"))?;
+            anyhow::ensure!(!pw.is_empty(), "Password must not be empty");
+            store.store(&pw)?;
+            println!("Password stored in {} backend.", store.backend_name());
+        }
+        cli::CredentialAction::Clear => {
+            store.delete()?;
+            println!("Stored credential removed.");
+        }
+        cli::CredentialAction::Backend => {
+            println!("{}", store.backend_name());
+        }
+    }
+    Ok(())
+}
+
+async fn run_get_code(args: cli::GetCodeArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
     if username.is_empty() {
         anyhow::bail!("--username is required for get-code");
     }
 
-    let password_provider = make_password_provider(password);
+    let password_provider =
+        make_provider_from_auth(&args.auth, password, &username, &cookie_directory, toml);
 
     auth::send_2fa_push(
         &cookie_directory,
@@ -405,7 +653,7 @@ async fn run_get_code(args: cli::GetCodeArgs, toml: &Option<TomlConfig>) -> anyh
 /// Run the submit-code command: authenticate with a pre-provided 2FA code.
 async fn run_submit_code(
     args: cli::SubmitCodeArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
@@ -413,7 +661,8 @@ async fn run_submit_code(
         anyhow::bail!("--username is required for submit-code");
     }
 
-    let password_provider = make_password_provider(password);
+    let password_provider =
+        make_provider_from_auth(&args.auth, password, &username, &cookie_directory, toml);
 
     let result = auth::authenticate(
         &cookie_directory,
@@ -434,31 +683,31 @@ async fn run_submit_code(
     Ok(())
 }
 
-/// Build the query parameters HashMap for the iCloud Photos CloudKit API.
-///
-/// Must match Python's `PyiCloudService.params` for API compatibility.
+/// iCloud web-client build identifiers sent with every CloudKit API request.
+/// Apple embeds these in the JS bundle served by `icloud.com`. To find updated
+/// values: open `icloud.com/photos` in a browser, inspect any CloudKit XHR, and
+/// read `clientBuildNumber` / `clientMasteringNumber` from the query string.
+const ICLOUD_CLIENT_BUILD_NUMBER: &str = "2522Project44";
+const ICLOUD_CLIENT_MASTERING_NUMBER: &str = "2522B2";
+
+/// Build the query parameters `HashMap` for the iCloud Photos `CloudKit` API.
 fn build_photos_params(
     client_id: &str,
     dsid: Option<&str>,
 ) -> std::collections::HashMap<String, serde_json::Value> {
-    let mut params = std::collections::HashMap::new();
+    let mut params: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::with_capacity(4);
     params.insert(
-        "clientBuildNumber".to_string(),
-        serde_json::Value::String("2522Project44".to_string()),
+        "clientBuildNumber".into(),
+        ICLOUD_CLIENT_BUILD_NUMBER.into(),
     );
     params.insert(
-        "clientMasteringNumber".to_string(),
-        serde_json::Value::String("2522B2".to_string()),
+        "clientMasteringNumber".into(),
+        ICLOUD_CLIENT_MASTERING_NUMBER.into(),
     );
-    params.insert(
-        "clientId".to_string(),
-        serde_json::Value::String(client_id.to_string()),
-    );
+    params.insert("clientId".into(), client_id.into());
     if let Some(dsid) = dsid {
-        params.insert(
-            "dsid".to_string(),
-            serde_json::Value::String(dsid.to_string()),
-        );
+        params.insert("dsid".into(), dsid.into());
     }
     params
 }
@@ -469,14 +718,35 @@ fn build_photos_params(
 /// 3. If the file exists and size matches, marking it as downloaded in the DB
 async fn run_import_existing(
     args: cli::ImportArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
     use chrono::Local;
     use futures_util::StreamExt;
     use icloud::photos::AssetVersionSize;
 
-    let db_path = get_db_path(&args.auth, toml);
-    let directory = config::expand_tilde(&args.directory);
+    let db_path = get_db_path(&args.auth, toml)?;
+    let toml_dl = toml.and_then(|t| t.download.as_ref());
+    let toml_photos = toml.and_then(|t| t.photos.as_ref());
+
+    // Resolve directory and path settings from CLI > TOML > default, matching
+    // the sync command's resolution so import-existing looks for files at the
+    // same paths sync would have created.
+    let directory_str = args
+        .directory
+        .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
+        .unwrap_or_default();
+    if directory_str.is_empty() {
+        anyhow::bail!("--directory is required for import-existing");
+    }
+    let directory = config::expand_tilde(&directory_str);
+    let folder_structure = args
+        .folder_structure
+        .or_else(|| toml_dl.and_then(|d| d.folder_structure.clone()))
+        .unwrap_or_else(|| "%Y/%m/%d".to_string());
+    let keep_unicode = args
+        .keep_unicode_in_filenames
+        .or_else(|| toml_photos.and_then(|p| p.keep_unicode_in_filenames))
+        .unwrap_or(false);
 
     if !directory.exists() {
         anyhow::bail!("Directory does not exist: {}", directory.display());
@@ -490,7 +760,8 @@ async fn run_import_existing(
     let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
 
     // Authenticate
-    let password_provider = make_password_provider(password);
+    let password_provider =
+        make_provider_from_auth(&args.auth, password, &username, &cookie_directory, toml);
 
     let auth_result = auth::authenticate(
         &cookie_directory,
@@ -503,30 +774,8 @@ async fn run_import_existing(
     )
     .await?;
 
-    let ckdatabasews_url = auth_result
-        .data
-        .webservices
-        .as_ref()
-        .and_then(|ws| ws.ckdatabasews.as_ref())
-        .map(|ep| ep.url.as_str())
-        .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
-
-    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
-    let dsid = auth_result
-        .data
-        .ds_info
-        .as_ref()
-        .and_then(|ds| ds.dsid.clone());
-    let params = build_photos_params(&client_id, dsid.as_deref());
-
-    let shared_session: auth::SharedSession =
-        Arc::new(tokio::sync::RwLock::new(auth_result.session));
-    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-
-    tracing::info!("Initializing photos service...");
-    let photos_service =
-        icloud::photos::PhotosService::new(ckdatabasews_url.to_string(), session_box, params)
-            .await?;
+    let (_shared_session, photos_service) =
+        init_photos_service(auth_result, domain.as_str(), retry::RetryConfig::default()).await?;
 
     let all_album = photos_service.all();
     let stream = all_album.photo_stream(args.recent, None, 1);
@@ -551,30 +800,41 @@ async fn run_import_existing(
 
         total += 1;
 
-        // Get filename from the asset
-        let filename = match asset.filename() {
-            Some(f) => f.to_string(),
-            None => {
-                tracing::debug!(id = %asset.id(), "Skipping asset with no filename");
-                continue;
-            }
-        };
-
         // Get versions
         if asset.versions().is_empty() {
             tracing::debug!(id = %asset.id(), "Skipping asset with no versions");
             continue;
         }
 
+        // Resolve filename using the same logic as the sync download pipeline:
+        // fingerprint fallback → unicode removal → extension mapping.
+        let raw_filename = if let Some(f) = asset.filename() {
+            f.to_string()
+        } else {
+            let asset_type = asset
+                .versions()
+                .first()
+                .map_or("", |(_, v)| v.asset_type.as_ref());
+            download::paths::generate_fingerprint_filename(asset.id(), asset_type)
+        };
+        let base_filename = if keep_unicode {
+            raw_filename
+        } else {
+            download::paths::remove_unicode_chars(&raw_filename)
+        };
+
         // Get the created date in local time for path computation
         let created_local = asset.created().with_timezone(&Local);
 
         // Check each version (we only check "original" for import since that's
         // what the normal sync would download)
-        if let Some(version) = asset.get_version(&AssetVersionSize::Original) {
+        if let Some(version) = asset.get_version(AssetVersionSize::Original) {
+            // Map extension from UTI type, matching sync pipeline
+            let filename =
+                download::paths::map_filename_extension(&base_filename, &version.asset_type);
             let expected_path = download::paths::local_download_path(
                 &directory,
-                &args.folder_structure,
+                &folder_structure,
                 &created_local,
                 &filename,
             );
@@ -618,6 +878,7 @@ async fn run_import_existing(
                                 version_size.as_str(),
                                 &expected_path,
                                 &local_checksum,
+                                None,
                             )
                             .await
                         {
@@ -641,13 +902,11 @@ async fn run_import_existing(
         }
     }
 
-    if !args.no_progress_bar {
-        println!();
-        println!("Import complete:");
-        println!("  Total assets scanned: {total}");
-        println!("  Files matched:        {matched}");
-        println!("  Unmatched versions:   {unmatched}");
-    }
+    println!();
+    println!("Import complete:");
+    println!("  Total assets scanned: {total}");
+    println!("  Files matched:        {matched}");
+    println!("  Unmatched versions:   {unmatched}");
 
     Ok(())
 }
@@ -667,12 +926,11 @@ async fn resolve_albums(
         let mut album_map = library.albums().await?;
         let mut matched = Vec::new();
         for name in album_names {
-            match album_map.remove(name.as_str()) {
-                Some(album) => matched.push(album),
-                None => {
-                    let available: Vec<&String> = album_map.keys().collect();
-                    anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
-                }
+            if let Some(album) = album_map.remove(name.as_str()) {
+                matched.push(album);
+            } else {
+                let available: Vec<&String> = album_map.keys().collect();
+                anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
             }
         }
         Ok(matched)
@@ -701,27 +959,53 @@ impl Drop for PidFileGuard {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
+/// Per-library state: zone name, sync token key, and resolved albums.
+struct LibraryState {
+    library: icloud::photos::PhotoLibrary,
+    zone_name: String,
+    sync_token_key: String,
+    albums: Vec<icloud::photos::PhotoAlbum>,
+}
+
+fn main() -> ExitCode {
+    // Snapshot and scrub the password env var while truly single-threaded,
+    // before the tokio runtime creates worker threads.
+    let env_password = std::env::var("ICLOUD_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+    // SAFETY: no other threads exist yet — the tokio runtime has not been built.
+    unsafe { std::env::remove_var("ICLOUD_PASSWORD") };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    match rt.block_on(run(env_password)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // 2FA required is not a failure — kei checked auth, told the user
             // what to do, and is done. Exit 0 so `restart: on-failure` won't
             // restart into a loop that hammers Apple's auth endpoints.
             if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(|ae| ae.is_two_factor_required())
+                .is_some_and(auth::error::AuthError::is_two_factor_required)
             {
                 ExitCode::SUCCESS
             } else {
                 eprintln!("Error: {e:#}");
-                ExitCode::FAILURE
+                if e.downcast_ref::<PartialSyncError>().is_some() {
+                    ExitCode::from(EXIT_PARTIAL)
+                } else if e.downcast_ref::<auth::error::AuthError>().is_some() {
+                    ExitCode::from(EXIT_AUTH)
+                } else {
+                    ExitCode::FAILURE
+                }
             }
         }
     }
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
     // Migrate legacy icloudpd-rs paths before loading config, so the
@@ -730,8 +1014,29 @@ async fn run() -> anyhow::Result<()> {
 
     // Load TOML config early so it can influence log level.
     // If the user explicitly set --config, the file must exist.
-    let config_path = config::expand_tilde(&cli.config);
-    let config_explicitly_set = cli.config != "~/.config/kei/config.toml";
+    //
+    // Docker fallback: when no --config is passed, the default
+    // ~/.config/kei/config.toml may not exist inside a container (it
+    // resolves to /root/.config/kei/config.toml). Try the Docker
+    // convention /config/config.toml as a fallback so that `docker exec`
+    // subcommands (get-code, submit-code, credential, etc.) automatically
+    // find the same config the Docker CMD uses.
+    const DOCKER_FALLBACK_CONFIG: &str = "/config/config.toml";
+    let config_explicitly_set =
+        cli.config != "~/.config/kei/config.toml" && cli.config != DOCKER_FALLBACK_CONFIG;
+    let (config_path, used_docker_fallback) = {
+        let expanded = config::expand_tilde(&cli.config);
+        if !config_explicitly_set && !expanded.exists() {
+            let docker = PathBuf::from(DOCKER_FALLBACK_CONFIG);
+            if docker.exists() {
+                (docker, true)
+            } else {
+                (expanded, false)
+            }
+        } else {
+            (expanded, false)
+        }
+    };
     let mut toml_config = config::load_toml_config(&config_path, config_explicitly_set)?;
 
     // Resolve log level: CLI > TOML > default (info)
@@ -751,7 +1056,7 @@ async fn run() -> anyhow::Result<()> {
     // Password redaction: the password is set after config parsing,
     // but tracing must be initialized earlier. Use a shared slot that
     // starts as None and is populated once the password is known.
-    let redact_password: Arc<std::sync::Mutex<Option<String>>> =
+    let redact_password: Arc<std::sync::Mutex<Option<SecretString>>> =
         Arc::new(std::sync::Mutex::new(None));
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -769,20 +1074,36 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    if used_docker_fallback {
+        tracing::debug!(
+            path = %config_path.display(),
+            "Using Docker fallback config (default path not found)"
+        );
+    }
+
     // Dispatch based on command
-    let command = cli.effective_command();
+    let mut command = cli.effective_command();
+    // Inject the password captured from env before the runtime started,
+    // since we cleared ICLOUD_PASSWORD before Cli::parse() could see it.
+    // Must happen before command dispatch so all subcommands (get-code,
+    // submit-code, etc.) receive the password, not just sync.
+    command.inject_env_password(env_password);
     let is_retry_failed = matches!(command, Command::RetryFailed(_));
+    let mut is_one_shot = is_retry_failed;
     let (auth, sync) = match command {
-        Command::Status(args) => return run_status(args, &toml_config).await,
-        Command::ResetState(args) => return run_reset_state(args, &toml_config).await,
-        Command::Verify(args) => return run_verify(args, &toml_config).await,
-        Command::ImportExisting(args) => return run_import_existing(args, &toml_config).await,
-        Command::GetCode(args) => return run_get_code(args, &toml_config).await,
-        Command::SubmitCode(args) => return run_submit_code(args, &toml_config).await,
+        Command::Status(args) => return run_status(args, toml_config.as_ref()).await,
+        Command::ResetState(args) => return run_reset_state(args, toml_config.as_ref()).await,
+        Command::Verify(args) => return run_verify(args, toml_config.as_ref()).await,
+        Command::ImportExisting(args) => {
+            return run_import_existing(args, toml_config.as_ref()).await;
+        }
+        Command::GetCode(args) => return run_get_code(args, toml_config.as_ref()).await,
+        Command::SubmitCode(args) => return run_submit_code(args, toml_config.as_ref()).await,
+        Command::Credential(args) => {
+            return run_credential(args, toml_config.as_ref()).await;
+        }
         Command::Setup { output } => {
-            let path = output
-                .map(|o| config::expand_tilde(&o))
-                .unwrap_or_else(|| config_path.clone());
+            let path = output.map_or_else(|| config_path.clone(), |o| config::expand_tilde(&o));
             match setup::run_setup(&path)? {
                 setup::SetupResult::SyncNow {
                     config_path: cfg_path,
@@ -791,11 +1112,21 @@ async fn run() -> anyhow::Result<()> {
                     // Load .env into process environment for this session
                     let mut env_username = None;
                     let mut env_password = None;
-                    if let Ok(contents) = std::fs::read_to_string(&env_path) {
+                    if let Ok(contents) = tokio::fs::read_to_string(&env_path).await {
                         for line in contents.lines() {
                             if let Some((key, value)) = line.split_once('=') {
                                 let key = key.trim();
+                                // Strip surrounding single or double quotes
+                                // (the setup wizard single-quotes values to
+                                // prevent shell expansion when sourced).
                                 let value = value.trim();
+                                let value = value
+                                    .strip_prefix('\'')
+                                    .and_then(|v| v.strip_suffix('\''))
+                                    .or_else(|| {
+                                        value.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+                                    })
+                                    .unwrap_or(value);
                                 if key == "ICLOUD_USERNAME" {
                                     env_username = Some(value.to_string());
                                 } else if key == "ICLOUD_PASSWORD" {
@@ -809,9 +1140,14 @@ async fn run() -> anyhow::Result<()> {
                     let sync_auth = cli::AuthArgs {
                         username: env_username,
                         password: env_password,
+                        password_file: None,
+                        password_command: None,
+                        save_password: false,
                         domain: None,
                         cookie_directory: None,
                     };
+                    // Setup "sync now" is a one-shot initial sync, not a daemon.
+                    is_one_shot = true;
                     (sync_auth, cli::SyncArgs::default())
                 }
                 setup::SetupResult::Done => return Ok(()),
@@ -820,14 +1156,25 @@ async fn run() -> anyhow::Result<()> {
         Command::Sync { auth, sync } => (auth, sync),
         Command::RetryFailed(args) => (args.auth, args.sync),
     };
-    let config = config::Config::build(auth, sync, cli.log_level, toml_config)?;
+    let mut config = config::Config::build(auth, sync, toml_config)?;
+
+    // One-shot operations — never inherit watch mode from TOML config,
+    // which would cause the process to loop forever instead of exiting.
+    // retry-failed: one-shot by definition.
+    // setup → "sync now": initial test sync, not a daemon.
+    if is_one_shot {
+        config.watch_with_interval = None;
+    }
 
     // Install password redaction now that we know the password
-    if let Some(pw) = &config.password {
+    if let Some(ref pw) = config.password {
         if let Ok(mut guard) = redact_password.lock() {
-            *guard = Some(pw.clone());
+            *guard = Some(SecretString::from(pw.expose_secret().to_owned()));
         }
     }
+
+    // Prevent core dumps from leaking in-memory credentials
+    harden_process();
 
     // Write PID file if requested (before auth so the PID is visible immediately)
     let _pid_guard = config
@@ -837,11 +1184,40 @@ async fn run() -> anyhow::Result<()> {
         .transpose()?;
 
     let sd_notifier = SystemdNotifier::new(config.notify_systemd);
-    let notifier = Notifier::new(config.notification_script);
+    let notifier = Notifier::new(config.notification_script.clone());
 
     tracing::info!(concurrency = config.threads_num, "Starting kei");
 
-    let password_provider = make_password_provider(config.password);
+    if config.username.is_empty() {
+        anyhow::bail!("--username is required");
+    }
+
+    // retry-failed + dry-run is unsupported: dry-run skips the state DB,
+    // but retry-failed needs it to know which assets failed.
+    if is_retry_failed && config.dry_run {
+        anyhow::bail!(
+            "--dry-run cannot be used with retry-failed (retry needs the state database)"
+        );
+    }
+
+    // Validate --directory early (before auth) for commands that need it.
+    // This avoids wasting a 2FA code when the user simply forgot --directory.
+    let needs_directory = !config.auth_only && !config.list_albums && !config.list_libraries;
+    if needs_directory && config.directory.as_os_str().is_empty() {
+        anyhow::bail!(
+            "--directory is required for downloading \
+             (pass --directory on the CLI or set [download] directory in the config file)"
+        );
+    }
+
+    let cred_store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
+    let source = password::build_password_source(
+        config.password.as_ref(),
+        config.password_command.as_deref(),
+        config.password_file.as_deref(),
+        cred_store,
+    );
+    let password_provider = make_password_provider(source);
 
     let auth_result = match auth::authenticate(
         &config.cookie_directory,
@@ -857,7 +1233,7 @@ async fn run() -> anyhow::Result<()> {
         Ok(result) => result,
         Err(e)
             if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(|ae| ae.is_two_factor_required()) =>
+                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
         {
             let msg = format!(
                 "2FA required for {u}. Run: kei get-code",
@@ -893,14 +1269,13 @@ async fn run() -> anyhow::Result<()> {
                         Ok(result) => break 'wait_2fa result,
                         Err(e)
                             if e.downcast_ref::<auth::error::AuthError>()
-                                .is_some_and(|ae| ae.is_two_factor_required()) =>
+                                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
                         {
                             tracing::info!("Session not yet trusted, continuing to wait...");
                             continue 'wait_2fa;
                         }
                         Err(e) if e.to_string().contains("Another kei instance") => {
                             tracing::debug!("Lock held by another process, retrying...");
-                            continue;
                         }
                         Err(e) => return Err(e),
                     }
@@ -912,37 +1287,32 @@ async fn run() -> anyhow::Result<()> {
         Err(e) => return Err(e),
     };
 
+    // Save password to credential store if requested
+    if let (true, Some(ref pw)) = (config.save_password, &config.password) {
+        let store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
+        if let Err(e) = store.store(pw.expose_secret()) {
+            tracing::warn!(error = %e, "Failed to save password to credential store");
+        } else {
+            tracing::info!(
+                backend = store.backend_name(),
+                "Password saved to credential store"
+            );
+        }
+    }
+
     if config.auth_only {
         tracing::info!("Authentication completed successfully");
         return Ok(());
     }
 
-    let ckdatabasews_url = auth_result
-        .data
-        .webservices
-        .as_ref()
-        .and_then(|ws| ws.ckdatabasews.as_ref())
-        .map(|ep| ep.url.as_str())
-        .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
+    let api_retry_config = retry::RetryConfig {
+        max_retries: config.max_retries,
+        base_delay_secs: config.retry_delay_secs,
+        max_delay_secs: 60,
+    };
 
-    let client_id = auth_result.session.client_id().cloned().unwrap_or_default();
-    let dsid = auth_result
-        .data
-        .ds_info
-        .as_ref()
-        .and_then(|ds| ds.dsid.clone());
-    let params = build_photos_params(&client_id, dsid.as_deref());
-
-    let shared_session: auth::SharedSession =
-        std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
-    let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-
-    tracing::info!("Initializing photos service...");
-    let photos_service =
-        icloud::photos::PhotosService::new(ckdatabasews_url.to_string(), session_box, params)
-            .await?;
-
-    let mut photos_service = photos_service;
+    let (shared_session, mut photos_service) =
+        init_photos_service(auth_result, config.domain.as_str(), api_retry_config).await?;
 
     if config.list_libraries {
         println!("Private libraries:");
@@ -989,11 +1359,50 @@ async fn run() -> anyhow::Result<()> {
     }
 
     if config.directory.as_os_str().is_empty() {
-        anyhow::bail!("--directory is required for downloading");
+        anyhow::bail!(
+            "--directory is required for downloading \
+             (pass --directory on the CLI or set [download] directory in the config file)"
+        );
     }
 
-    // Initialize state database
-    let state_db: Option<Arc<dyn state::StateDb>> = {
+    // Validate download directory is writable before spending time on enumeration
+    tokio::fs::create_dir_all(&config.directory)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create download directory {}",
+                config.directory.display()
+            )
+        })?;
+    let probe = config.directory.join(".kei_probe");
+    tokio::fs::write(&probe, b"").await.with_context(|| {
+        format!(
+            "Download directory {} is not writable",
+            config.directory.display()
+        )
+    })?;
+    let _ = tokio::fs::remove_file(&probe).await;
+
+    // Warn if available disk space is low
+    if let Some(avail) = available_disk_space(&config.directory) {
+        const MIN_FREE_BYTES: u64 = 1_073_741_824; // 1 GiB
+        if avail < MIN_FREE_BYTES {
+            let avail_mb = avail / (1024 * 1024);
+            tracing::warn!(
+                available_mb = avail_mb,
+                path = %config.directory.display(),
+                "Low disk space — downloads may fail with disk errors"
+            );
+        }
+    }
+
+    // Initialize state database.
+    // Skip for --dry-run so a preview doesn't create the DB or poison
+    // sync tokens, which would cause a subsequent real sync to believe
+    // nothing has changed and download 0 photos.
+    let state_db: Option<Arc<dyn state::StateDb>> = if config.dry_run {
+        None
+    } else {
         let db_path = config.cookie_directory.join(format!(
             "{}.db",
             auth::session::sanitize_username(&config.username)
@@ -1022,12 +1431,7 @@ async fn run() -> anyhow::Result<()> {
                 Some(db as Arc<dyn state::StateDb>)
             }
             Err(e) => {
-                tracing::warn!(
-                    path = %db_path.display(),
-                    error = %e,
-                    "Failed to open state database, continuing without state tracking"
-                );
-                None
+                anyhow::bail!("Failed to open state database {}: {e}", db_path.display());
             }
         }
     };
@@ -1052,11 +1456,7 @@ async fn run() -> anyhow::Result<()> {
     let skip_created_after = config
         .skip_created_after
         .map(|d| d.with_timezone(&chrono::Utc));
-    let retry_config = retry::RetryConfig {
-        max_retries: config.max_retries,
-        base_delay_secs: config.retry_delay_secs,
-        max_delay_secs: 60,
-    };
+    let retry_config = api_retry_config;
     let live_photo_size = config.live_photo_size.to_asset_version_size();
 
     let build_download_config = |sync_mode: download::SyncMode| -> Arc<download::DownloadConfig> {
@@ -1089,18 +1489,10 @@ async fn run() -> anyhow::Result<()> {
         })
     };
 
-    let shutdown_token = shutdown::install_signal_handler(&sd_notifier)?;
+    let shutdown_token = shutdown::install_signal_handler(sd_notifier)?;
 
     let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;
-
-    // Build per-library state: zone name, sync token key, and resolved albums.
-    struct LibraryState {
-        library: icloud::photos::PhotoLibrary,
-        zone_name: String,
-        sync_token_key: String,
-        albums: Vec<icloud::photos::PhotoAlbum>,
-    }
 
     let mut library_states: Vec<LibraryState> = Vec::with_capacity(libraries.len());
     for library in &libraries {
@@ -1115,6 +1507,8 @@ async fn run() -> anyhow::Result<()> {
         });
     }
     sd_notifier.notify_ready();
+
+    let mut health = health::HealthStatus::new();
 
     loop {
         if shutdown_token.is_cancelled() {
@@ -1198,10 +1592,54 @@ async fn run() -> anyhow::Result<()> {
                     break;
                 }
 
+                // Check if the download config changed since last sync. If so,
+                // clear sync tokens so the subsequent lookup falls back to full
+                // enumeration — the stored incremental token would miss assets
+                // that are newly eligible under the changed config (e.g. a
+                // user switching --size or adding --skip-videos).
+                if !config.dry_run {
+                    if let Some(ref db) = state_db {
+                        // Use a separate key from the download-path's "config_hash"
+                        // (which tracks path-affecting fields only). This hash is a
+                        // superset that also includes enumeration filters (albums,
+                        // library, skip_live_photos). Using the same key would cause
+                        // the two hashes to overwrite each other every cycle,
+                        // permanently preventing incremental sync.
+                        let config_hash = download::compute_config_hash(&config);
+                        let stored_hash = db.get_metadata("enum_config_hash").await.unwrap_or(None);
+                        if stored_hash.as_deref() != Some(&config_hash) {
+                            if stored_hash.is_some() {
+                                tracing::info!(
+                                    "Download config changed since last sync, clearing sync tokens"
+                                );
+                                match db.delete_metadata_by_prefix("sync_token:").await {
+                                    Ok(n) if n > 0 => {
+                                        tracing::info!(cleared = n, "Cleared stale sync tokens");
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Failed to clear sync tokens"
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let _ = db.set_metadata("enum_config_hash", &config_hash).await;
+                        }
+                    }
+                }
+
                 // Determine sync mode per-library
-                let sync_mode = if config.no_incremental {
-                    if library_states.len() == 1 {
+                // retry-failed must always use full enumeration: incremental
+                // sync only returns NEW iCloud changes, missing previously-
+                // failed assets that were already enumerated but not downloaded.
+                let sync_mode = if is_retry_failed || config.no_incremental {
+                    if config.no_incremental && library_states.len() == 1 {
                         tracing::info!("Incremental sync disabled via --no-incremental, performing full enumeration");
+                    }
+                    if is_retry_failed {
+                        tracing::info!("Retry-failed requires full enumeration to find previously-failed assets");
                     }
                     download::SyncMode::Full
                 } else if let Some(ref db) = state_db {
@@ -1245,8 +1683,12 @@ async fn run() -> anyhow::Result<()> {
                 // For full sync this is safe (state DB tracks individual failures for retry).
                 // For incremental sync, advancing the token on partial failure would lose
                 // change events for failed assets — they'd never appear in the next delta.
+                // Note: the token is stored after download_photos_with_sync returns, which
+                // means all batch flushes are complete. A crash here means the token is
+                // NOT advanced, so assets will replay on next sync (safe, not data loss).
                 let should_store_token =
-                    matches!(sync_result.outcome, download::DownloadOutcome::Success);
+                    matches!(sync_result.outcome, download::DownloadOutcome::Success)
+                        && !config.dry_run;
                 if should_store_token {
                     if let Some(ref token) = sync_result.sync_token {
                         if let Some(ref db) = state_db {
@@ -1282,6 +1724,16 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
 
+            // Update health status for Docker HEALTHCHECK observability.
+            if cycle_session_expired {
+                health.record_failure("session expired");
+            } else if cycle_failed_count > 0 {
+                health.record_failure(&format!("{cycle_failed_count} downloads failed"));
+            } else {
+                health.record_success();
+            }
+            health.write(&config.cookie_directory);
+
             // Handle aggregate outcome across all libraries
             if cycle_session_expired {
                 reauth_attempts += 1;
@@ -1310,7 +1762,7 @@ async fn run() -> anyhow::Result<()> {
                     }
                     Err(e)
                         if e.downcast_ref::<auth::error::AuthError>()
-                            .is_some_and(|ae| ae.is_two_factor_required()) =>
+                            .is_some_and(auth::error::AuthError::is_two_factor_required) =>
                     {
                         // 2FA is user action, not a failed attempt — don't
                         // burn reauth_attempts so false wakeups from get-code
@@ -1354,7 +1806,7 @@ async fn run() -> anyhow::Result<()> {
                         "Some downloads failed this cycle, will retry next cycle"
                     );
                 } else {
-                    anyhow::bail!("{cycle_failed_count} downloads failed");
+                    return Err(PartialSyncError(cycle_failed_count).into());
                 }
             } else {
                 reauth_attempts = 0;
@@ -1364,7 +1816,13 @@ async fn run() -> anyhow::Result<()> {
                     &config.username,
                 );
             }
-        } // !skip_cycle
+        } else {
+            // Skipped cycle (no changes detected) — still update health so
+            // Docker HEALTHCHECK doesn't mark the container unhealthy after
+            // the 2-hour staleness window when no new photos are uploaded.
+            health.record_success();
+            health.write(&config.cookie_directory);
+        }
 
         if let Some(interval) = config.watch_with_interval {
             if shutdown_token.is_cancelled() {
@@ -1374,8 +1832,8 @@ async fn run() -> anyhow::Result<()> {
             sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
             tracing::info!(interval_secs = interval, "Waiting before next cycle");
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
-                _ = shutdown_token.cancelled() => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                () = shutdown_token.cancelled() => {
                     tracing::info!("Shutdown during wait, exiting...");
                     break;
                 }
@@ -1440,9 +1898,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_local_checksum_match() {
-        let dir = PathBuf::from("/tmp/claude/checksum_tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("local_match.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("local_match.bin");
         let content = b"hello world";
         std::fs::write(&file_path, content).unwrap();
 
@@ -1452,9 +1909,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_local_checksum_mismatch() {
-        let dir = PathBuf::from("/tmp/claude/checksum_tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("local_mismatch.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("local_mismatch.bin");
         std::fs::write(&file_path, b"hello world").unwrap();
 
         assert!(!verify_local_checksum(
@@ -1467,8 +1923,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_local_checksum_nonexistent_file_errors() {
-        let result =
-            verify_local_checksum(Path::new("/tmp/claude/nonexistent_file_abc.bin"), "abcd").await;
+        let dir = tempfile::tempdir().unwrap();
+        let result = verify_local_checksum(&dir.path().join("nonexistent_file.bin"), "abcd").await;
         assert!(result.is_err());
     }
 
@@ -1476,7 +1932,7 @@ mod tests {
     fn redacting_writer_replaces_password() {
         use std::io::Write;
 
-        let password = Arc::new(std::sync::Mutex::new(Some("s3cret".to_string())));
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from("s3cret"))));
         let mut buf = Vec::new();
         {
             let mut writer = RedactingWriter {
@@ -1494,7 +1950,8 @@ mod tests {
     fn redacting_writer_no_password_passthrough() {
         use std::io::Write;
 
-        let password = Arc::new(std::sync::Mutex::new(None));
+        let password: Arc<std::sync::Mutex<Option<SecretString>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let mut buf = Vec::new();
         {
             let mut writer = RedactingWriter {
@@ -1511,7 +1968,9 @@ mod tests {
     fn redacting_writer_empty_password_passthrough() {
         use std::io::Write;
 
-        let password = Arc::new(std::sync::Mutex::new(Some(String::new())));
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from(
+            String::new(),
+        ))));
         let mut buf = Vec::new();
         {
             let mut writer = RedactingWriter {
@@ -1529,7 +1988,9 @@ mod tests {
         use std::io::Write;
 
         // Buffer shorter than the password can't contain it
-        let password = Arc::new(std::sync::Mutex::new(Some("longpassword".to_string())));
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from(
+            "longpassword",
+        ))));
         let mut buf = Vec::new();
         {
             let mut writer = RedactingWriter {
@@ -1546,7 +2007,8 @@ mod tests {
     fn redacting_writer_flush() {
         use std::io::Write;
 
-        let password = Arc::new(std::sync::Mutex::new(None));
+        let password: Arc<std::sync::Mutex<Option<SecretString>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let mut buf = Vec::new();
         let mut writer = RedactingWriter {
             inner: &mut buf,
@@ -1556,11 +2018,22 @@ mod tests {
     }
 
     #[test]
-    fn make_password_provider_with_some() {
-        let provider = make_password_provider(Some("mypass".to_string()));
-        assert_eq!(provider(), Some("mypass".to_string()));
+    fn make_password_provider_with_direct_source() {
+        let source = password::PasswordSource::Direct(Arc::new(SecretString::from("mypass")));
+        let provider = make_password_provider(source);
+        let result = provider().unwrap();
+        assert_eq!(result.expose_secret(), "mypass");
         // Can be called multiple times
-        assert_eq!(provider(), Some("mypass".to_string()));
+        let result2 = provider().unwrap();
+        assert_eq!(result2.expose_secret(), "mypass");
+    }
+
+    #[test]
+    fn make_password_provider_with_command_source() {
+        let source = password::PasswordSource::Command("echo cmd_test".to_string());
+        let provider = make_password_provider(source);
+        let result = provider().unwrap();
+        assert_eq!(result.expose_secret(), "cmd_test");
     }
 
     // ── build_photos_params tests ───────────────────────────────────────
@@ -1571,11 +2044,15 @@ mod tests {
 
         assert_eq!(
             params.get("clientBuildNumber"),
-            Some(&serde_json::Value::String("2522Project44".to_string()))
+            Some(&serde_json::Value::String(
+                ICLOUD_CLIENT_BUILD_NUMBER.to_string()
+            ))
         );
         assert_eq!(
             params.get("clientMasteringNumber"),
-            Some(&serde_json::Value::String("2522B2".to_string()))
+            Some(&serde_json::Value::String(
+                ICLOUD_CLIENT_MASTERING_NUMBER.to_string()
+            ))
         );
         assert_eq!(
             params.get("clientId"),
@@ -1610,5 +2087,86 @@ mod tests {
             params.get("dsid"),
             Some(&serde_json::Value::String("12345".to_string()))
         );
+    }
+
+    // ── Watch-mode control flow tests ──────────────────────────────────
+
+    use tokio_util::sync::CancellationToken;
+
+    /// Run the watch-loop pattern and return how many cycles completed.
+    async fn run_watch_loop(
+        shutdown_token: &CancellationToken,
+        watch_with_interval: Option<u64>,
+    ) -> u32 {
+        let mut cycles = 0u32;
+        loop {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            cycles += 1;
+            if let Some(interval) = watch_with_interval {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                    _ = shutdown_token.cancelled() => { break; }
+                }
+            } else {
+                break;
+            }
+        }
+        cycles
+    }
+
+    /// The watch loop uses `tokio::select!` to make the inter-cycle sleep
+    /// interruptible by a shutdown signal. Cancellation breaks out promptly
+    /// despite a long interval.
+    #[tokio::test]
+    async fn watch_sleep_exits_promptly_on_shutdown() {
+        let shutdown_token = CancellationToken::new();
+        let token_clone = shutdown_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token_clone.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let cycles = run_watch_loop(&shutdown_token, Some(3600)).await;
+
+        assert_eq!(cycles, 1);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// A pre-cancelled token prevents any cycle from starting.
+    #[test]
+    fn watch_loop_skips_cycle_when_already_cancelled() {
+        let shutdown_token = CancellationToken::new();
+        shutdown_token.cancel();
+
+        let mut cycles_started = 0u32;
+        loop {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            cycles_started += 1;
+        }
+        assert_eq!(cycles_started, 0);
+    }
+
+    /// When `watch_with_interval` is None the loop executes exactly once.
+    #[tokio::test]
+    async fn watch_loop_runs_once_without_interval() {
+        let shutdown_token = CancellationToken::new();
+        assert_eq!(run_watch_loop(&shutdown_token, None).await, 1);
+    }
+
+    /// Shutdown during inter-cycle sleep completes exactly one cycle.
+    #[tokio::test]
+    async fn watch_loop_completes_one_cycle_then_exits_on_shutdown() {
+        let shutdown_token = CancellationToken::new();
+        let token_clone = shutdown_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token_clone.cancel();
+        });
+        assert_eq!(run_watch_loop(&shutdown_token, Some(3600)).await, 1);
     }
 }

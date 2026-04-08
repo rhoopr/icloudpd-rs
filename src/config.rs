@@ -1,3 +1,4 @@
+use crate::password::SecretString;
 use crate::types::{
     Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
     RawTreatmentPolicy, VersionSize,
@@ -31,6 +32,8 @@ pub(crate) struct TomlNotifications {
 pub(crate) struct TomlAuth {
     pub username: Option<String>,
     pub password: Option<String>,
+    pub password_file: Option<String>,
+    pub password_command: Option<String>,
     pub domain: Option<Domain>,
     pub cookie_directory: Option<String>,
 }
@@ -96,6 +99,23 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
         Ok(contents) => {
             let config: TomlConfig = toml::from_str(&contents)
                 .context(format!("Failed to parse config file {}", path.display()))?;
+            // Warn if config contains a password and file permissions are too open
+            #[cfg(unix)]
+            if config.auth.as_ref().is_some_and(|a| a.password.is_some()) {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(meta) = std::fs::metadata(path) {
+                    let mode = meta.mode();
+                    if mode & 0o077 != 0 {
+                        tracing::warn!(
+                            path = %path.display(),
+                            mode = format_args!("{mode:o}"),
+                            "Config file contains password but is group/world-readable. \
+                             Consider: chmod 600 {}",
+                            path.display()
+                        );
+                    }
+                }
+            }
             Ok(Some(config))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
@@ -108,7 +128,7 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
 /// Which library (or libraries) to sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibrarySelection {
-    /// A single named library (e.g. "PrimarySync", "SharedSync-ABCD1234").
+    /// A single named library (e.g. "`PrimarySync`", "SharedSync-ABCD1234").
     Single(String),
     /// All available libraries (primary + private + shared).
     All,
@@ -126,8 +146,8 @@ impl std::fmt::Display for LibrarySelection {
 /// Application configuration.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - Heap types first (String, PathBuf, Vec, `Option<String>`)
-/// - DateTime fields (12-16 bytes each)
+/// - Heap types first (String, `PathBuf`, Vec, `Option<String>`)
+/// - `DateTime` fields (12-16 bytes each)
 /// - 8-byte primitives (u64, `Option<u64>`)
 /// - 4-byte primitives (u32, `Option<u32>`)
 /// - 2-byte primitives (u16)
@@ -136,7 +156,9 @@ impl std::fmt::Display for LibrarySelection {
 pub struct Config {
     // Heap types first
     pub username: String,
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
+    pub password_file: Option<PathBuf>,
+    pub password_command: Option<String>,
     pub directory: PathBuf,
     pub cookie_directory: PathBuf,
     pub folder_structure: String,
@@ -167,8 +189,6 @@ pub struct Config {
     pub size: VersionSize,
     pub live_photo_size: LivePhotoSize,
     pub domain: Domain,
-    #[allow(dead_code)] // Copied from CLI but read from cli.log_level directly in main.rs
-    pub log_level: LogLevel,
     pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub align_raw: RawTreatmentPolicy,
     pub file_match_policy: FileMatchPolicy,
@@ -189,6 +209,7 @@ pub struct Config {
     pub no_incremental: bool,
     pub reset_sync_token: bool,
     pub notify_systemd: bool,
+    pub save_password: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -219,18 +240,20 @@ fn resolve<T>(cli: Option<T>, toml: Option<T>, default: T) -> T {
     cli.or(toml).unwrap_or(default)
 }
 
-/// For boolean flags: CLI flag present (true) wins, else TOML, else false.
-fn resolve_flag(cli_flag: bool, toml_val: Option<bool>) -> bool {
-    cli_flag || toml_val.unwrap_or(false)
+/// For boolean flags: CLI explicit value wins, then TOML, then false.
+/// `Option<bool>` allows the CLI to explicitly pass `--flag false` to
+/// override a TOML `true`.
+fn resolve_flag(cli_flag: Option<bool>, toml_val: Option<bool>) -> bool {
+    cli_flag.or(toml_val).unwrap_or(false)
 }
 
 /// Resolve auth fields from CLI auth args + optional TOML config.
-/// Returns (username, password, domain, cookie_directory).
+/// Returns (username, password, domain, `cookie_directory`).
 pub(crate) fn resolve_auth(
     auth: &crate::cli::AuthArgs,
-    toml: &Option<TomlConfig>,
+    toml: Option<&TomlConfig>,
 ) -> (String, Option<String>, Domain, PathBuf) {
-    let toml_auth = toml.as_ref().and_then(|t| t.auth.as_ref());
+    let toml_auth = toml.and_then(|t| t.auth.as_ref());
 
     let username = resolve(
         auth.username.clone(),
@@ -255,16 +278,89 @@ pub(crate) fn resolve_auth(
     (username, password, domain, cookie_directory)
 }
 
+/// Resolve `password_file` from CLI + TOML.
+pub(crate) fn resolve_password_file(
+    auth: &crate::cli::AuthArgs,
+    toml_auth: Option<&TomlAuth>,
+) -> Option<PathBuf> {
+    auth.password_file
+        .as_deref()
+        .or_else(|| toml_auth.and_then(|a| a.password_file.as_deref()))
+        .map(expand_tilde)
+}
+
+/// Resolve `password_command` from CLI + TOML.
+pub(crate) fn resolve_password_command(
+    auth: &crate::cli::AuthArgs,
+    toml_auth: Option<&TomlAuth>,
+) -> Option<String> {
+    auth.password_command
+        .clone()
+        .or_else(|| toml_auth.and_then(|a| a.password_command.clone()))
+}
+
 impl Config {
     /// Build a Config by merging CLI args with optional TOML config.
     /// Resolution order: CLI > TOML > hardcoded default.
     pub fn build(
         auth: crate::cli::AuthArgs,
         sync: crate::cli::SyncArgs,
-        log_level: Option<LogLevel>,
         toml: Option<TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let (username, password, domain, cookie_directory) = resolve_auth(&auth, &toml);
+        let toml_auth = toml.as_ref().and_then(|t| t.auth.as_ref());
+        let (username, password_str, domain, cookie_directory) = resolve_auth(&auth, toml.as_ref());
+        let password_file = resolve_password_file(&auth, toml_auth);
+        let password_command = resolve_password_command(&auth, toml_auth);
+        let save_password = auth.save_password;
+
+        // Reject explicitly provided empty username/password (CLI value_parser
+        // catches the CLI case; this catches empty strings from TOML).
+        if auth.username.is_some()
+            || toml
+                .as_ref()
+                .and_then(|t| t.auth.as_ref()?.username.as_ref())
+                .is_some()
+        {
+            anyhow::ensure!(!username.is_empty(), "username must not be empty");
+        }
+        if let Some(ref pw) = password_str {
+            anyhow::ensure!(!pw.is_empty(), "password must not be empty");
+        }
+
+        // Reject multiple password sources in TOML (CLI enforces this via
+        // conflicts_with, but TOML has no such mechanism).
+        if let Some(toml_a) = toml_auth {
+            let sources = [
+                toml_a.password.is_some(),
+                toml_a.password_file.is_some(),
+                toml_a.password_command.is_some(),
+            ];
+            anyhow::ensure!(
+                sources.iter().filter(|&&s| s).count() <= 1,
+                "config file sets multiple password sources (password, password_file, \
+                 password_command) — pick one"
+            );
+        }
+
+        // Convert plain password string to SecretString
+        let password = password_str.map(SecretString::from);
+
+        // Validate cookie directory early: check that the path is usable
+        // (exists or can be created) so we fail with a clear message rather
+        // than erroring deep in auth setup.
+        if let Some(existing) = cookie_directory.ancestors().find(|a| a.exists()) {
+            anyhow::ensure!(
+                existing.is_dir(),
+                "cookie directory path contains a non-directory component: {}",
+                existing.display()
+            );
+        }
+        std::fs::create_dir_all(&cookie_directory).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot create cookie directory {}: {e}",
+                cookie_directory.display()
+            )
+        })?;
 
         let toml_dl = toml.as_ref().and_then(|t| t.download.as_ref());
         let toml_retry = toml_dl.and_then(|d| d.retry.as_ref());
@@ -283,6 +379,28 @@ impl Config {
             toml_dl.and_then(|d| d.folder_structure.clone()),
             "%Y/%m/%d".to_string(),
         );
+        // Validate folder_structure doesn't contain unrecognized % tokens.
+        // expand_date_format only handles %Y, %m, %d, %H, %M, %S — unknown
+        // tokens like %q are silently preserved as literal "%q" in paths.
+        if !folder_structure.eq_ignore_ascii_case("none") {
+            let format_str = folder_structure
+                .strip_prefix("{:")
+                .and_then(|s| s.strip_suffix('}'))
+                .unwrap_or(&folder_structure);
+            let remaining = format_str
+                .replace("%Y", "")
+                .replace("%m", "")
+                .replace("%d", "")
+                .replace("%H", "")
+                .replace("%M", "")
+                .replace("%S", "");
+            anyhow::ensure!(
+                !remaining.contains('%'),
+                "folder_structure contains unrecognized format token: \
+                 '{folder_structure}'. Supported tokens: %Y, %m, %d, %H, %M, %S"
+            );
+        }
+
         let threads_num = resolve(sync.threads_num, toml_dl.and_then(|d| d.threads_num), 10);
         anyhow::ensure!(
             threads_num >= 1,
@@ -305,6 +423,9 @@ impl Config {
         // Retry
         let max_retries = resolve(sync.max_retries, toml_retry.and_then(|r| r.max_retries), 3);
         let retry_delay_secs = resolve(sync.retry_delay, toml_retry.and_then(|r| r.delay), 5);
+        if retry_delay_secs == 0 {
+            anyhow::bail!("retry delay must be >= 1, got 0");
+        }
 
         // Filters
         let library_str = resolve(
@@ -331,6 +452,9 @@ impl Config {
             toml_filters.and_then(|f| f.skip_live_photos),
         );
         let recent = sync.recent.or_else(|| toml_filters.and_then(|f| f.recent));
+        if let Some(0) = recent {
+            anyhow::bail!("recent must be >= 1 (got 0)");
+        }
         let skip_created_before_str = sync
             .skip_created_before
             .or_else(|| toml_filters.and_then(|f| f.skip_created_before.clone()));
@@ -353,10 +477,17 @@ impl Config {
             toml_photos.and_then(|p| p.size),
             VersionSize::Original,
         );
+        // When --size adjusted and live-photo-size is not explicitly set,
+        // default to adjusted live photo companions too.
+        let default_live_photo_size = if size == VersionSize::Adjusted {
+            LivePhotoSize::Adjusted
+        } else {
+            LivePhotoSize::Original
+        };
         let live_photo_size = resolve(
             sync.live_photo_size,
             toml_photos.and_then(|p| p.live_photo_size),
-            LivePhotoSize::Original,
+            default_live_photo_size,
         );
         let live_photo_mov_filename_policy = resolve(
             sync.live_photo_mov_filename_policy,
@@ -383,6 +514,11 @@ impl Config {
         let watch_with_interval = sync
             .watch_with_interval
             .or_else(|| toml_watch.and_then(|w| w.interval));
+        if let Some(n) = watch_with_interval {
+            if n < 60 {
+                anyhow::bail!("watch interval must be >= 60 seconds, got {n}");
+            }
+        }
         let notify_systemd = resolve_flag(
             sync.notify_systemd,
             toml_watch.and_then(|w| w.notify_systemd),
@@ -400,16 +536,18 @@ impl Config {
             .or_else(|| toml_notif.and_then(|n| n.script.clone()))
             .map(|s| expand_tilde(&s));
 
-        // Log level
-        let resolved_log_level = resolve(
-            log_level,
-            toml.as_ref().and_then(|t| t.log_level),
-            LogLevel::Info,
-        );
+        if skip_videos && skip_photos && skip_live_photos {
+            tracing::warn!(
+                "All media types are being skipped (--skip-videos, --skip-photos, \
+                 --skip-live-photos) — nothing will be downloaded"
+            );
+        }
 
         Ok(Self {
             username,
             password,
+            password_file,
+            password_command,
             directory,
             cookie_directory,
             folder_structure,
@@ -428,7 +566,6 @@ impl Config {
             size,
             live_photo_size,
             domain,
-            log_level: resolved_log_level,
             live_photo_mov_filename_policy,
             align_raw,
             file_match_policy,
@@ -447,6 +584,7 @@ impl Config {
             no_incremental: sync.no_incremental,
             reset_sync_token: sync.reset_sync_token,
             notify_systemd,
+            save_password,
         })
     }
 }
@@ -485,6 +623,7 @@ pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>>
 mod tests {
     use super::*;
     use crate::cli::{AuthArgs, SyncArgs};
+    use secrecy::ExposeSecret;
 
     #[test]
     fn test_expand_tilde_with_home() {
@@ -702,6 +841,9 @@ mod tests {
         AuthArgs {
             username: Some("u@example.com".to_string()),
             password: None,
+            password_file: None,
+            password_command: None,
+            save_password: false,
             domain: None,
             cookie_directory: None,
         }
@@ -713,7 +855,7 @@ mod tests {
 
     #[test]
     fn test_build_defaults_no_toml() {
-        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
         assert_eq!(cfg.username, "u@example.com");
         assert_eq!(cfg.threads_num, 10);
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
@@ -726,7 +868,6 @@ mod tests {
         assert_eq!(cfg.temp_suffix, ".kei-tmp");
         assert!(matches!(cfg.size, VersionSize::Original));
         assert!(matches!(cfg.domain, Domain::Com));
-        assert!(matches!(cfg.log_level, LogLevel::Info));
     }
 
     #[test]
@@ -740,7 +881,7 @@ mod tests {
             library = "SharedSync-ABC"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.threads_num, 4);
         assert_eq!(cfg.folder_structure, "%Y-%m");
         assert_eq!(
@@ -764,7 +905,7 @@ mod tests {
         sync.threads_num = Some(8);
         sync.library = Some("PrimarySync".to_string());
 
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.threads_num, 8);
         assert_eq!(
             cfg.library,
@@ -776,7 +917,7 @@ mod tests {
     fn test_library_all_value() {
         let mut sync = default_sync();
         sync.library = Some("all".to_string());
-        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
         assert_eq!(cfg.library, LibrarySelection::All);
     }
 
@@ -784,7 +925,7 @@ mod tests {
     fn test_library_all_case_insensitive() {
         let mut sync = default_sync();
         sync.library = Some("ALL".to_string());
-        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
         assert_eq!(cfg.library, LibrarySelection::All);
     }
 
@@ -795,13 +936,13 @@ mod tests {
             library = "all"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.library, LibrarySelection::All);
     }
 
     #[test]
     fn test_build_hardcoded_default_when_both_absent() {
-        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
         assert_eq!(cfg.threads_num, 10);
         assert!(matches!(cfg.align_raw, RawTreatmentPolicy::Unchanged));
     }
@@ -816,7 +957,7 @@ mod tests {
             skip_videos = true
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(cfg.set_exif_datetime);
         assert!(cfg.skip_videos);
     }
@@ -829,9 +970,25 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
-        sync.skip_videos = true;
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        sync.skip_videos = Some(true);
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(cfg.skip_videos);
+    }
+
+    #[test]
+    fn test_build_cli_false_overrides_toml_true() {
+        let toml_str = r#"
+            [filters]
+            skip_videos = true
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.skip_videos = Some(false);
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
+        assert!(
+            !cfg.skip_videos,
+            "CLI --skip-videos false should override TOML true"
+        );
     }
 
     #[test]
@@ -841,7 +998,7 @@ mod tests {
             threads_num = 0
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let result = Config::build(default_auth(), default_sync(), None, Some(toml));
+        let result = Config::build(default_auth(), default_sync(), Some(toml));
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("threads_num"),
@@ -858,7 +1015,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut auth = default_auth();
         auth.username = None; // Simulate no CLI username
-        let cfg = Config::build(auth, default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(auth, default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.username, "toml@example.com");
     }
 
@@ -869,7 +1026,7 @@ mod tests {
             username = "toml@example.com"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.username, "u@example.com");
     }
 
@@ -880,7 +1037,7 @@ mod tests {
             albums = ["Favorites", "Vacation"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.albums, vec!["Favorites", "Vacation"]);
     }
 
@@ -893,34 +1050,8 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.albums = vec!["Screenshots".to_string()];
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.albums, vec!["Screenshots"]);
-    }
-
-    #[test]
-    fn test_build_log_level_from_toml() {
-        let toml_str = r#"
-            log_level = "debug"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
-        assert!(matches!(cfg.log_level, LogLevel::Debug));
-    }
-
-    #[test]
-    fn test_build_cli_log_level_overrides_toml() {
-        let toml_str = r#"
-            log_level = "debug"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            default_auth(),
-            default_sync(),
-            Some(LogLevel::Warn),
-            Some(toml),
-        )
-        .unwrap();
-        assert!(matches!(cfg.log_level, LogLevel::Warn));
     }
 
     #[test]
@@ -931,9 +1062,101 @@ mod tests {
             pid_file = "/run/test.pid"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(1800));
         assert_eq!(cfg.pid_file, Some(PathBuf::from("/run/test.pid")));
+    }
+
+    #[test]
+    fn test_build_watch_interval_below_minimum_from_toml_rejected() {
+        for interval in [0, 1, 59] {
+            let toml_str = format!(
+                r#"
+                [watch]
+                interval = {interval}
+            "#
+            );
+            let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
+            let result = Config::build(default_auth(), default_sync(), Some(toml));
+            assert!(result.is_err(), "interval {interval} should be rejected");
+            assert!(
+                result.unwrap_err().to_string().contains("watch interval"),
+                "Error should mention watch interval"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_retry_delay_zero_from_toml_rejected() {
+        let toml_str = r#"
+            [download.retry]
+            delay = 0
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(default_auth(), default_sync(), Some(toml));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("retry delay"),
+            "Error should mention retry delay"
+        );
+    }
+
+    #[test]
+    fn test_build_empty_username_from_toml_rejected() {
+        let toml_str = r#"
+            [auth]
+            username = ""
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut auth = default_auth();
+        auth.username = None;
+        let result = Config::build(auth, default_sync(), Some(toml));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("username"),
+            "Error should mention username"
+        );
+    }
+
+    #[test]
+    fn test_build_empty_password_from_toml_rejected() {
+        let toml_str = r#"
+            [auth]
+            password = ""
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(default_auth(), default_sync(), Some(toml));
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("password"),
+            "Error should mention password"
+        );
+    }
+
+    #[test]
+    fn test_build_cookie_directory_under_file_rejected() {
+        // Create a regular file, then try to use a path under it as cookie dir
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("kei_config_test_cookie_file");
+        std::fs::write(&tmp, b"not a dir").unwrap();
+        let path = tmp.join("nested").join("cookies");
+        let mut auth = default_auth();
+        auth.cookie_directory = Some(path.to_string_lossy().to_string());
+        let result = Config::build(auth, default_sync(), None);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("cookie directory"),
+            "Error should mention cookie directory"
+        );
+    }
+
+    #[test]
+    fn test_build_cookie_directory_nonexistent_rejected() {
+        let mut auth = default_auth();
+        // Use a path with a null byte which is invalid on all platforms
+        auth.cookie_directory = Some("\0invalid/cookies".to_string());
+        let result = Config::build(auth, default_sync(), None);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -944,7 +1167,7 @@ mod tests {
             skip_created_after = "2025-01-01"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(cfg.skip_created_before.is_some());
         assert!(cfg.skip_created_after.is_some());
     }
@@ -976,6 +1199,7 @@ mod tests {
             ("original", LivePhotoSize::Original),
             ("medium", LivePhotoSize::Medium),
             ("thumb", LivePhotoSize::Thumb),
+            ("adjusted", LivePhotoSize::Adjusted),
         ] {
             let toml_str = format!("[photos]\nlive_photo_size = \"{input}\"");
             let config: TomlConfig = toml::from_str(&toml_str).unwrap();
@@ -1241,9 +1465,8 @@ mod tests {
 
     #[test]
     fn test_load_toml_config_valid_file() {
-        let dir = PathBuf::from("/tmp/claude/config-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.toml");
         std::fs::write(
             &path,
             r#"
@@ -1258,52 +1481,45 @@ mod tests {
             result.unwrap().auth.unwrap().username.as_deref(),
             Some("disk@example.com")
         );
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_load_toml_config_valid_file_required() {
-        let dir = PathBuf::from("/tmp/claude/config-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test-required.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-required.toml");
         std::fs::write(&path, "log_level = \"warn\"").unwrap();
         let result = load_toml_config(&path, true).unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().log_level, Some(LogLevel::Warn));
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_load_toml_config_invalid_toml_syntax() {
-        let dir = PathBuf::from("/tmp/claude/config-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("bad-syntax.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-syntax.toml");
         std::fs::write(&path, "this is not valid toml [[[").unwrap();
         let result = load_toml_config(&path, false);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Failed to parse config file"), "got: {err}");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn test_load_toml_config_empty_file() {
-        let dir = PathBuf::from("/tmp/claude/config-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("empty.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.toml");
         std::fs::write(&path, "").unwrap();
         let result = load_toml_config(&path, false).unwrap();
         let config = result.unwrap();
         assert!(config.auth.is_none());
         assert!(config.download.is_none());
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Config::build: exhaustive field merge tests ────────────────
 
     #[test]
     fn test_build_all_defaults_no_toml_exhaustive() {
-        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
         // Auth
         assert_eq!(cfg.username, "u@example.com");
         assert!(cfg.password.is_none());
@@ -1349,7 +1565,6 @@ mod tests {
         assert!(!cfg.notify_systemd);
         assert!(cfg.pid_file.is_none());
         // Misc
-        assert!(matches!(cfg.log_level, LogLevel::Info));
         assert!(!cfg.auth_only);
         assert!(!cfg.list_albums);
         assert!(!cfg.list_libraries);
@@ -1368,8 +1583,11 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut auth = default_auth();
         auth.password = Some("cli-pw".to_string());
-        let cfg = Config::build(auth, default_sync(), None, Some(toml)).unwrap();
-        assert_eq!(cfg.password.as_deref(), Some("cli-pw"));
+        let cfg = Config::build(auth, default_sync(), Some(toml)).unwrap();
+        assert_eq!(
+            cfg.password.as_ref().map(|s| s.expose_secret()),
+            Some("cli-pw")
+        );
     }
 
     #[test]
@@ -1379,8 +1597,11 @@ mod tests {
             password = "toml-pw"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
-        assert_eq!(cfg.password.as_deref(), Some("toml-pw"));
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
+        assert_eq!(
+            cfg.password.as_ref().map(|s| s.expose_secret()),
+            Some("toml-pw")
+        );
     }
 
     #[test]
@@ -1392,7 +1613,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut auth = default_auth();
         auth.domain = Some(Domain::Com);
-        let cfg = Config::build(auth, default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(auth, default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.domain, Domain::Com));
     }
 
@@ -1403,45 +1624,48 @@ mod tests {
             domain = "cn"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.domain, Domain::Cn));
+    }
+
+    /// Escape backslashes for embedding a path in a TOML string literal.
+    fn toml_escape(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('\\', "\\\\")
     }
 
     #[test]
     fn test_build_cookie_directory_cli_overrides_toml() {
-        let toml_str = r#"
-            [auth]
-            cookie_directory = "/toml/cookies"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cli_path = dir.path().join("cli_cookies");
+        let toml_path = dir.path().join("toml_cookies");
+        let toml_str = format!("[auth]\ncookie_directory = \"{}\"", toml_escape(&toml_path));
+        let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
         let mut auth = default_auth();
-        auth.cookie_directory = Some("/cli/cookies".to_string());
-        let cfg = Config::build(auth, default_sync(), None, Some(toml)).unwrap();
-        assert_eq!(cfg.cookie_directory, PathBuf::from("/cli/cookies"));
+        auth.cookie_directory = Some(cli_path.to_string_lossy().to_string());
+        let cfg = Config::build(auth, default_sync(), Some(toml)).unwrap();
+        assert_eq!(cfg.cookie_directory, cli_path);
     }
 
     #[test]
     fn test_build_cookie_directory_from_toml() {
-        let toml_str = r#"
-            [auth]
-            cookie_directory = "/toml/cookies"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
-        assert_eq!(cfg.cookie_directory, PathBuf::from("/toml/cookies"));
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("toml_cookies");
+        let toml_str = format!("[auth]\ncookie_directory = \"{}\"", toml_escape(&toml_path));
+        let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
+        assert_eq!(cfg.cookie_directory, toml_path);
     }
 
     #[test]
     fn test_build_cookie_directory_tilde_expansion() {
-        let toml_str = r#"
-            [auth]
-            cookie_directory = "~/my-cookies"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(cfg.cookie_directory, home.join("my-cookies"));
-        }
+        // Use a path under the home directory that we can actually create
+        let home = dirs::home_dir().expect("home dir required for test");
+        let unique = format!(".kei-test-{}", std::process::id());
+        let toml_str = format!("[auth]\ncookie_directory = \"~/{unique}\"");
+        let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
+        assert_eq!(cfg.cookie_directory, home.join(&unique));
+        let _ = std::fs::remove_dir(&cfg.cookie_directory);
     }
 
     #[test]
@@ -1451,7 +1675,7 @@ mod tests {
             directory = "~/photos"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         if let Some(home) = dirs::home_dir() {
             assert_eq!(cfg.directory, home.join("photos"));
         }
@@ -1466,7 +1690,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d".to_string());
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
     }
 
@@ -1479,7 +1703,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.temp_suffix = Some(".cli-tmp".to_string());
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.temp_suffix, ".cli-tmp");
     }
 
@@ -1490,7 +1714,7 @@ mod tests {
             temp_suffix = ".downloading"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.temp_suffix, ".downloading");
     }
 
@@ -1503,7 +1727,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.max_retries = Some(10);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.max_retries, 10);
     }
 
@@ -1516,7 +1740,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.retry_delay = Some(30);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.retry_delay_secs, 30);
     }
 
@@ -1527,7 +1751,7 @@ mod tests {
             delay = 15
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.retry_delay_secs, 15);
     }
 
@@ -1540,7 +1764,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.size = Some(VersionSize::Medium);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(matches!(cfg.size, VersionSize::Medium));
     }
 
@@ -1551,7 +1775,7 @@ mod tests {
             size = "thumb"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.size, VersionSize::Thumb));
     }
 
@@ -1564,7 +1788,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.live_photo_size = Some(LivePhotoSize::Medium);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Medium));
     }
 
@@ -1575,8 +1799,25 @@ mod tests {
             live_photo_size = "thumb"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.live_photo_size, LivePhotoSize::Thumb));
+    }
+
+    #[test]
+    fn test_build_live_photo_size_defaults_to_adjusted_when_size_adjusted() {
+        let mut sync = default_sync();
+        sync.size = Some(VersionSize::Adjusted);
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
+        assert!(matches!(cfg.live_photo_size, LivePhotoSize::Adjusted));
+    }
+
+    #[test]
+    fn test_build_live_photo_size_explicit_overrides_adjusted_default() {
+        let mut sync = default_sync();
+        sync.size = Some(VersionSize::Adjusted);
+        sync.live_photo_size = Some(LivePhotoSize::Original);
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
+        assert!(matches!(cfg.live_photo_size, LivePhotoSize::Original));
     }
 
     #[test]
@@ -1588,7 +1829,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.live_photo_mov_filename_policy = Some(LivePhotoMovFilenamePolicy::Suffix);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(matches!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Suffix
@@ -1602,7 +1843,7 @@ mod tests {
             live_photo_mov_filename_policy = "original"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Original
@@ -1618,7 +1859,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.align_raw = Some(RawTreatmentPolicy::PreferAlternative);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(matches!(
             cfg.align_raw,
             RawTreatmentPolicy::PreferAlternative
@@ -1634,7 +1875,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.file_match_policy = Some(FileMatchPolicy::NameSizeDedupWithSuffix);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert!(matches!(
             cfg.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
@@ -1648,7 +1889,7 @@ mod tests {
             file_match_policy = "name-id7"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(matches!(cfg.file_match_policy, FileMatchPolicy::NameId7));
     }
 
@@ -1674,7 +1915,7 @@ mod tests {
             notify_systemd = true
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(cfg.set_exif_datetime);
         assert!(cfg.no_progress_bar);
         assert!(cfg.skip_videos);
@@ -1688,15 +1929,15 @@ mod tests {
     #[test]
     fn test_build_all_boolean_flags_cli_overrides() {
         let mut sync = default_sync();
-        sync.set_exif_datetime = true;
-        sync.no_progress_bar = true;
-        sync.skip_videos = true;
-        sync.skip_photos = true;
-        sync.skip_live_photos = true;
-        sync.force_size = true;
-        sync.keep_unicode_in_filenames = true;
-        sync.notify_systemd = true;
-        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        sync.set_exif_datetime = Some(true);
+        sync.no_progress_bar = Some(true);
+        sync.skip_videos = Some(true);
+        sync.skip_photos = Some(true);
+        sync.skip_live_photos = Some(true);
+        sync.force_size = Some(true);
+        sync.keep_unicode_in_filenames = Some(true);
+        sync.notify_systemd = Some(true);
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
         assert!(cfg.set_exif_datetime);
         assert!(cfg.no_progress_bar);
         assert!(cfg.skip_videos);
@@ -1715,7 +1956,7 @@ mod tests {
             skip_photos = false
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(!cfg.skip_videos);
         assert!(!cfg.skip_photos);
     }
@@ -1731,7 +1972,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.watch_with_interval = Some(600);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(600));
     }
 
@@ -1744,7 +1985,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.pid_file = Some(PathBuf::from("/cli/pid"));
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.pid_file, Some(PathBuf::from("/cli/pid")));
     }
 
@@ -1757,7 +1998,7 @@ mod tests {
             script = "/config/notify.sh"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(
             cfg.notification_script,
             Some(PathBuf::from("/config/notify.sh"))
@@ -1773,7 +2014,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.notification_script = Some("/cli/notify.sh".to_string());
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(
             cfg.notification_script,
             Some(PathBuf::from("/cli/notify.sh"))
@@ -1782,7 +2023,7 @@ mod tests {
 
     #[test]
     fn test_build_notification_script_none_by_default() {
-        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
         assert!(cfg.notification_script.is_none());
     }
 
@@ -1810,7 +2051,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.recent = Some(100);
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.recent, Some(100));
     }
 
@@ -1821,7 +2062,7 @@ mod tests {
             recent = 500
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert_eq!(cfg.recent, Some(500));
     }
 
@@ -1836,7 +2077,7 @@ mod tests {
         let mut sync = default_sync();
         sync.skip_created_before = Some("2023-06-01".to_string());
         sync.skip_created_after = Some("2024-06-01".to_string());
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         let before = cfg.skip_created_before.unwrap();
         assert_eq!(
             before.date_naive(),
@@ -1856,7 +2097,7 @@ mod tests {
             skip_created_before = "30d"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         let before = cfg.skip_created_before.unwrap();
         let expected = chrono::Local::now() - chrono::Duration::days(30);
         assert!((before - expected).num_seconds().abs() < 2);
@@ -1869,7 +2110,7 @@ mod tests {
             skip_created_before = "not-a-date"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let result = Config::build(default_auth(), default_sync(), None, Some(toml));
+        let result = Config::build(default_auth(), default_sync(), Some(toml));
         assert!(result.is_err());
     }
 
@@ -1877,14 +2118,17 @@ mod tests {
 
     #[test]
     fn test_build_full_toml_all_sections() {
-        let toml_str = r#"
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_path = dir.path().join("full_cookies");
+        let toml_str = format!(
+            r#"
             log_level = "warn"
 
             [auth]
             username = "full@example.com"
             password = "fullpw"
             domain = "cn"
-            cookie_directory = "/full/cookies"
+            cookie_directory = "{cookie}"
 
             [download]
             directory = "/full/photos"
@@ -1915,14 +2159,19 @@ mod tests {
             [watch]
             interval = 900
             pid_file = "/full/pid"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        "#,
+            cookie = toml_escape(&cookie_path)
+        );
+        let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         // default_auth username overrides toml
         assert_eq!(cfg.username, "u@example.com");
-        assert_eq!(cfg.password.as_deref(), Some("fullpw"));
+        assert_eq!(
+            cfg.password.as_ref().map(|s| s.expose_secret()),
+            Some("fullpw")
+        );
         assert!(matches!(cfg.domain, Domain::Cn));
-        assert_eq!(cfg.cookie_directory, PathBuf::from("/full/cookies"));
+        assert_eq!(cfg.cookie_directory, cookie_path);
         assert_eq!(cfg.directory, PathBuf::from("/full/photos"));
         assert_eq!(cfg.folder_structure, "%Y");
         assert_eq!(cfg.threads_num, 2);
@@ -1952,7 +2201,6 @@ mod tests {
         assert!(cfg.force_size);
         assert_eq!(cfg.watch_with_interval, Some(900));
         assert_eq!(cfg.pid_file, Some(PathBuf::from("/full/pid")));
-        assert!(matches!(cfg.log_level, LogLevel::Warn));
     }
 
     // ── resolve_auth tests ─────────────────────────────────────────
@@ -1970,10 +2218,13 @@ mod tests {
         let auth = AuthArgs {
             username: None,
             password: None,
+            password_file: None,
+            password_command: None,
+            save_password: false,
             domain: None,
             cookie_directory: None,
         };
-        let (username, password, domain, cookie_dir) = resolve_auth(&auth, &Some(toml));
+        let (username, password, domain, cookie_dir) = resolve_auth(&auth, Some(&toml));
         assert_eq!(username, "toml@example.com");
         assert_eq!(password.as_deref(), Some("toml-pw"));
         assert!(matches!(domain, Domain::Cn));
@@ -1993,10 +2244,13 @@ mod tests {
         let auth = AuthArgs {
             username: Some("cli@example.com".to_string()),
             password: Some("cli-pw".to_string()),
+            password_file: None,
+            password_command: None,
+            save_password: false,
             domain: Some(Domain::Com),
             cookie_directory: Some("/cli/cookies".to_string()),
         };
-        let (username, password, domain, cookie_dir) = resolve_auth(&auth, &Some(toml));
+        let (username, password, domain, cookie_dir) = resolve_auth(&auth, Some(&toml));
         assert_eq!(username, "cli@example.com");
         assert_eq!(password.as_deref(), Some("cli-pw"));
         assert!(matches!(domain, Domain::Com));
@@ -2008,10 +2262,13 @@ mod tests {
         let auth = AuthArgs {
             username: None,
             password: None,
+            password_file: None,
+            password_command: None,
+            save_password: false,
             domain: None,
             cookie_directory: None,
         };
-        let (username, password, domain, cookie_dir) = resolve_auth(&auth, &None);
+        let (username, password, domain, cookie_dir) = resolve_auth(&auth, None);
         assert!(username.is_empty());
         assert!(password.is_none());
         assert!(matches!(domain, Domain::Com));
@@ -2027,13 +2284,13 @@ mod tests {
             albums = []
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(default_auth(), default_sync(), None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), Some(toml)).unwrap();
         assert!(cfg.albums.is_empty());
     }
 
     #[test]
     fn test_build_albums_no_toml_no_cli() {
-        let cfg = Config::build(default_auth(), default_sync(), None, None).unwrap();
+        let cfg = Config::build(default_auth(), default_sync(), None).unwrap();
         assert!(cfg.albums.is_empty());
     }
 
@@ -2046,7 +2303,7 @@ mod tests {
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
         sync.directory = Some("/cli/photos".to_string());
-        let cfg = Config::build(default_auth(), sync, None, Some(toml)).unwrap();
+        let cfg = Config::build(default_auth(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/cli/photos"));
     }
 
@@ -2059,10 +2316,49 @@ mod tests {
         sync.list_albums = true;
         sync.list_libraries = true;
         sync.dry_run = true;
-        let cfg = Config::build(default_auth(), sync, None, None).unwrap();
+        let cfg = Config::build(default_auth(), sync, None).unwrap();
         assert!(cfg.auth_only);
         assert!(cfg.list_albums);
         assert!(cfg.list_libraries);
         assert!(cfg.dry_run);
+    }
+
+    #[test]
+    fn test_folder_structure_valid_tokens_accepted() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/%m/%d".to_string());
+        assert!(Config::build(default_auth(), sync, None).is_ok());
+    }
+
+    #[test]
+    fn test_folder_structure_all_tokens_accepted() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/%m/%d/%H/%M/%S".to_string());
+        assert!(Config::build(default_auth(), sync, None).is_ok());
+    }
+
+    #[test]
+    fn test_folder_structure_none_bypasses_validation() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("none".to_string());
+        assert!(Config::build(default_auth(), sync, None).is_ok());
+    }
+
+    #[test]
+    fn test_folder_structure_invalid_token_rejected() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/%X/%d".to_string());
+        let err = Config::build(default_auth(), sync, None).unwrap_err();
+        assert!(
+            err.to_string().contains("unrecognized format token"),
+            "error should mention unrecognized token: {err}"
+        );
+    }
+
+    #[test]
+    fn test_folder_structure_wrapped_format_accepted() {
+        let mut sync = default_sync();
+        sync.folder_structure = Some("{:%Y/%m/%d}".to_string());
+        assert!(Config::build(default_auth(), sync, None).is_ok());
     }
 }

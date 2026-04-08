@@ -76,19 +76,19 @@ pub fn cmd() -> assert_cmd::Command {
     assert_cmd::cargo_bin_cmd!("kei")
 }
 
-/// Skip the current test when credentials are not configured.
+/// Return credentials from the environment, panicking if not set.
 ///
-/// Returns `(username, password)` if both `ICLOUD_USERNAME` and
-/// `ICLOUD_PASSWORD` are set, otherwise prints a message and returns `None`.
-#[allow(dead_code)]
-pub fn creds_or_skip() -> Option<(String, String)> {
+/// All callers are `#[ignore]` tests — if someone explicitly opts in via
+/// `--ignored` without configuring credentials, a loud failure is correct.
+fn require_creds() -> (String, String) {
     init_env();
-    let username = std::env::var("ICLOUD_USERNAME").ok()?;
-    let password = std::env::var("ICLOUD_PASSWORD").ok()?;
-    if username.is_empty() || password.is_empty() {
-        return None;
-    }
-    Some((username, password))
+    let username = std::env::var("ICLOUD_USERNAME")
+        .expect("ICLOUD_USERNAME must be set (see tests/README.md)");
+    let password = std::env::var("ICLOUD_PASSWORD")
+        .expect("ICLOUD_PASSWORD must be set (see tests/README.md)");
+    assert!(!username.is_empty(), "ICLOUD_USERNAME must not be empty");
+    assert!(!password.is_empty(), "ICLOUD_PASSWORD must not be empty");
+    (username, password)
 }
 
 /// Path to the shared pre-authenticated cookie directory.
@@ -245,33 +245,25 @@ pub fn with_auth_retry(f: impl Fn()) {
 /// is used per test run. **Auth-requiring tests must run single-threaded:**
 ///
 /// ```sh
-/// cargo test --test sync -- --test-threads=1
+/// cargo test --test sync -- --ignored --test-threads=1
 /// ```
 ///
 /// On the first call, runs `--auth-only` to validate (and refresh if needed)
 /// the session cookies. This prevents stale-session failures mid-run.
 ///
-/// Panics (aborting the test) if:
-/// - Credentials are not configured
-/// - Session validation/refresh fails
+/// Panics if credentials are not configured or session validation fails.
 #[allow(dead_code)]
-pub fn require_preauth() -> Option<(String, String, PathBuf)> {
+pub fn require_preauth() -> (String, String, PathBuf) {
     if RATE_LIMITED.load(Ordering::SeqCst) {
         eprintln!("\n*** ABORTING: Apple 503 rate limit detected in earlier test ***");
         std::process::exit(1);
     }
     throttle();
-    let (username, password) = match creds_or_skip() {
-        Some(creds) => creds,
-        None => {
-            eprintln!("Skipping: ICLOUD_USERNAME / ICLOUD_PASSWORD not set");
-            return None;
-        }
-    };
+    let (username, password) = require_creds();
     let dir = cookie_dir();
     AUTH_CREDS.get_or_init(|| (username.clone(), password.clone(), dir.clone()));
     ensure_session(&username, &password, &dir);
-    Some((username, password, dir))
+    (username, password, dir)
 }
 
 /// Recursively collect all regular files under `dir`, sorted for deterministic ordering.

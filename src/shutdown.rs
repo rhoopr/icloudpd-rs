@@ -13,11 +13,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::systemd::SystemdNotifier;
 
+/// How long to wait for graceful shutdown before force-exiting.
+/// Aligned with `stop_grace_period` in docker-compose.yml.
+const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Install signal handlers and return a [`CancellationToken`] that is
 /// cancelled on the first SIGINT / SIGTERM / SIGHUP.  A second signal
 /// force-exits the process.
 pub(crate) fn install_signal_handler(
-    notifier: &SystemdNotifier,
+    notifier: SystemdNotifier,
 ) -> anyhow::Result<CancellationToken> {
     let token = CancellationToken::new();
     let count = Arc::new(AtomicU32::new(0));
@@ -32,7 +36,7 @@ pub(crate) fn install_signal_handler(
     };
 
     let handler_token = token.clone();
-    let handler_notifier = *notifier;
+    let handler_notifier = notifier;
     tokio::spawn(async move {
         loop {
             #[cfg(unix)]
@@ -58,6 +62,15 @@ pub(crate) fn install_signal_handler(
                 tracing::info!("Received shutdown signal, finishing current downloads...");
                 tracing::info!("Press Ctrl+C again to force exit");
                 handler_token.cancel();
+                // Force exit if graceful shutdown hangs (e.g. NFS stall,
+                // dead CDN connection). Matches docker-compose
+                // stop_grace_period so the app exits cleanly before Docker
+                // sends SIGKILL.
+                tokio::spawn(async {
+                    tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT).await;
+                    tracing::warn!("Graceful shutdown timed out, forcing exit");
+                    std::process::exit(130);
+                });
             } else {
                 tracing::warn!("Force exit requested");
                 std::process::exit(130);
@@ -91,7 +104,7 @@ mod tests {
     #[tokio::test]
     async fn install_returns_live_token() {
         let notifier = SystemdNotifier::new(false);
-        let token = install_signal_handler(&notifier).unwrap();
+        let token = install_signal_handler(notifier).unwrap();
         assert!(!token.is_cancelled());
     }
 }

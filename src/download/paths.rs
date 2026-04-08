@@ -6,20 +6,17 @@ use base64::Engine;
 use chrono::{DateTime, Datelike, Local, Timelike};
 use rustc_hash::FxHashMap;
 
-/// Build the local download path for a photo asset.
+/// Build the date-based parent directory for a photo asset (without filename).
 ///
 /// `folder_structure` is a date format string such as `"{:%Y/%m/%d}"`. The
 /// special value `"none"` (case-insensitive) disables date-based folders.
-pub(crate) fn local_download_path(
+pub(crate) fn local_download_dir(
     directory: &Path,
     folder_structure: &str,
     created_date: &DateTime<Local>,
-    filename: &str,
 ) -> PathBuf {
-    let clean = clean_filename(filename);
-
     if folder_structure.eq_ignore_ascii_case("none") {
-        return directory.join(&clean);
+        return directory.to_path_buf();
     }
 
     // Extract format from Python-style {:%Y/%m/%d} wrapper if present
@@ -35,13 +32,27 @@ pub(crate) fn local_download_path(
 
     // Split on "/" and join as path components to handle cross-platform paths.
     // This converts "{:%Y/%m/%d}" format like "2025/01/15" into proper PathBuf.
+    // Each component is sanitized to prevent path traversal (e.g. "../../etc").
     let mut path = directory.to_path_buf();
     for component in date_path.split('/') {
         if !component.is_empty() {
-            path = path.join(component);
+            path = path.join(sanitize_path_component(component));
         }
     }
-    path.join(&clean)
+    path
+}
+
+/// Build the local download path for a photo asset.
+///
+/// `folder_structure` is a date format string such as `"{:%Y/%m/%d}"`. The
+/// special value `"none"` (case-insensitive) disables date-based folders.
+pub(crate) fn local_download_path(
+    directory: &Path,
+    folder_structure: &str,
+    created_date: &DateTime<Local>,
+    filename: &str,
+) -> PathBuf {
+    local_download_dir(directory, folder_structure, created_date).join(clean_filename(filename))
 }
 
 /// Expand date format tokens (%Y, %m, %d, %H, %M, %S) in a single pass.
@@ -88,13 +99,40 @@ fn expand_date_format(format_str: &str, date: &DateTime<Local>) -> String {
     result
 }
 
-/// Clean a filename by removing characters that are invalid on common
-/// filesystems: `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`.
+/// Maximum filename length in bytes for common filesystems (ext4, APFS, NTFS).
+const MAX_FILENAME_BYTES: usize = 255;
+
+/// Clean a filename by replacing characters that are invalid on common
+/// filesystems (`/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`) and control
+/// characters (including NUL) with `_`. Truncates filenames exceeding 255
+/// bytes, preserving the file extension.
 pub(crate) fn clean_filename(filename: &str) -> String {
-    filename
+    let cleaned: String = filename
         .chars()
-        .filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
-        .collect()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    if cleaned.len() <= MAX_FILENAME_BYTES {
+        return cleaned;
+    }
+
+    // Preserve the extension (e.g. ".jpg") when truncating, but only if it
+    // leaves room for at least one stem character.
+    if let Some(dot) = cleaned.rfind('.') {
+        let ext = &cleaned[dot..];
+        if ext.len() < MAX_FILENAME_BYTES {
+            let stem_end = cleaned[..dot].floor_char_boundary(MAX_FILENAME_BYTES - ext.len());
+            return format!("{}{ext}", &cleaned[..stem_end]);
+        }
+    }
+
+    cleaned[..cleaned.floor_char_boundary(MAX_FILENAME_BYTES)].to_string()
 }
 
 /// Sanitize a path component (e.g. album name) to prevent path traversal
@@ -102,7 +140,7 @@ pub(crate) fn clean_filename(filename: &str) -> String {
 ///
 /// - Strips leading/trailing dots and spaces
 /// - Replaces `..` sequences with `_`
-/// - Removes filesystem-invalid characters via `clean_filename()`
+/// - Replaces filesystem-invalid characters via `clean_filename()`
 /// - Prefixes Windows reserved names (CON, NUL, PRN, etc.) with `_`
 pub(crate) fn sanitize_path_component(name: &str) -> String {
     // First clean invalid filesystem characters
@@ -157,7 +195,7 @@ pub(crate) fn sanitize_path_component(name: &str) -> String {
 /// Remove non-ASCII (unicode) characters from a filename, keeping only
 /// ASCII characters.
 pub(crate) fn remove_unicode_chars(filename: &str) -> String {
-    filename.chars().filter(|c| c.is_ascii()).collect()
+    filename.chars().filter(char::is_ascii).collect()
 }
 
 /// Add a size-based deduplication suffix to a filename.
@@ -168,24 +206,21 @@ pub(crate) fn remove_unicode_chars(filename: &str) -> String {
 /// Formats the size directly into the result string, avoiding an intermediate
 /// `size.to_string()` allocation.
 pub(crate) fn add_dedup_suffix(path: &str, size: u64) -> String {
-    match path.rfind('.') {
-        Some(dot_pos) => {
-            let (stem, ext) = path.split_at(dot_pos);
-            // Pre-allocate: stem + "-" + max 20 digits for u64 + ext
-            let mut result = String::with_capacity(stem.len() + 1 + 20 + ext.len());
-            result.push_str(stem);
-            result.push('-');
-            let _ = write!(result, "{size}");
-            result.push_str(ext);
-            result
-        }
-        None => {
-            let mut result = String::with_capacity(path.len() + 1 + 20);
-            result.push_str(path);
-            result.push('-');
-            let _ = write!(result, "{size}");
-            result
-        }
+    if let Some(dot_pos) = path.rfind('.') {
+        let (stem, ext) = path.split_at(dot_pos);
+        // Pre-allocate: stem + "-" + max 20 digits for u64 + ext
+        let mut result = String::with_capacity(stem.len() + 1 + 20 + ext.len());
+        result.push_str(stem);
+        result.push('-');
+        let _ = write!(result, "{size}");
+        result.push_str(ext);
+        result
+    } else {
+        let mut result = String::with_capacity(path.len() + 1 + 20);
+        result.push_str(path);
+        result.push('-');
+        let _ = write!(result, "{size}");
+        result
     }
 }
 
@@ -193,28 +228,25 @@ pub(crate) fn add_dedup_suffix(path: &str, size: u64) -> String {
 ///
 /// For example, `"photo.jpg"` with suffix `"abc"` becomes `"photo-abc.jpg"`.
 pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
-    match path.rfind('.') {
-        Some(dot_pos) => {
-            let (stem, ext) = path.split_at(dot_pos);
-            // Pre-allocate exact size needed
-            let mut result = String::with_capacity(stem.len() + 1 + suffix.len() + ext.len());
-            result.push_str(stem);
-            result.push('-');
-            result.push_str(suffix);
-            result.push_str(ext);
-            result
-        }
-        None => {
-            let mut result = String::with_capacity(path.len() + 1 + suffix.len());
-            result.push_str(path);
-            result.push('-');
-            result.push_str(suffix);
-            result
-        }
+    if let Some(dot_pos) = path.rfind('.') {
+        let (stem, ext) = path.split_at(dot_pos);
+        // Pre-allocate exact size needed
+        let mut result = String::with_capacity(stem.len() + 1 + suffix.len() + ext.len());
+        result.push_str(stem);
+        result.push('-');
+        result.push_str(suffix);
+        result.push_str(ext);
+        result
+    } else {
+        let mut result = String::with_capacity(path.len() + 1 + suffix.len());
+        result.push_str(path);
+        result.push('-');
+        result.push_str(suffix);
+        result
     }
 }
 
-/// Map UTI asset_type strings to standardized uppercase file extensions.
+/// Map UTI `asset_type` strings to standardized uppercase file extensions.
 ///
 /// Matches `icloudpd`'s `ITEM_TYPE_EXTENSIONS` mapping.
 const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
@@ -296,7 +328,7 @@ pub(crate) fn live_photo_mov_path_suffix(filename: &str) -> String {
     }
 }
 
-/// Pre-built HashMap for O(1) asset type lookups instead of linear scan.
+/// Pre-built `HashMap` for O(1) asset type lookups instead of linear scan.
 static ITEM_TYPE_MAP: LazyLock<FxHashMap<&'static str, &'static str>> =
     LazyLock::new(|| ITEM_TYPE_EXTENSIONS.iter().copied().collect());
 
@@ -309,15 +341,14 @@ pub(crate) fn item_type_extension(asset_type: &str) -> &'static str {
 
 /// Generate a fallback filename from the asset ID when `filenameEnc` is absent.
 ///
-/// Replaces non-alphanumeric characters with underscores and truncates to 12 chars,
-/// then appends the extension derived from the asset's UTI type.
-/// Matches Python's `generate_fingerprint_filename()`.
+/// Uses a SHA-256 hash of the full asset ID (first 12 hex chars = 48 bits)
+/// for collision resistance, instead of just taking the first 12 alphanumeric
+/// characters which can collide when IDs differ only in non-alphanumeric
+/// positions.
 pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) -> String {
-    let fingerprint: String = asset_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .take(12)
-        .collect();
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(asset_id.as_bytes());
+    let fingerprint = &format!("{hash:x}")[..12];
     let ext = item_type_extension(asset_type);
     format!("{fingerprint}.{ext}")
 }
@@ -368,6 +399,7 @@ pub(crate) fn normalize_ampm(s: &str) -> String {
             i += 1;
         } else {
             // Multi-byte UTF-8: decode the char and advance past it
+            // Safe: i < len and bytes[i] >= 0x80 guarantees a multi-byte char starts here
             let ch = s[i..].chars().next().unwrap();
             result.push(ch);
             i += ch.len_utf8();
@@ -376,52 +408,131 @@ pub(crate) fn normalize_ampm(s: &str) -> String {
     result
 }
 
-/// Find a file on disk that differs only in AM/PM whitespace from the expected path.
+/// Read all entries in `dir`, returning a filename→size map.
 ///
-/// When the expected file doesn't exist, this checks sibling files in the same
-/// directory for an AM/PM whitespace variant (e.g., `1.40.01 PM.PNG` vs
-/// `1.40.01\u{202F}PM.PNG` vs `1.40.01PM.PNG`).
+/// This is the blocking I/O primitive used by `DirCache`. Extracted so it can
+/// be called from both sync (`ensure_dir`) and async (`ensure_dir_async`) paths.
+fn read_dir_entries(dir: &Path) -> FxHashMap<String, u64> {
+    std::fs::read_dir(dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_str()?.to_string();
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    Some((name, size))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Cached directory listing that amortizes filesystem syscalls.
 ///
-/// On first call for a given parent directory, reads and caches all filenames.
-/// Subsequent calls for files in the same directory reuse the cache, avoiding
-/// repeated `read_dir` syscalls in hot loops.
+/// For each parent directory, a single `read_dir` populates a filename→size map.
+/// All subsequent existence checks and size lookups for files in that directory
+/// are served from the cache — eliminating per-file `stat()` calls that would
+/// otherwise block the tokio runtime when called from an async task.
 ///
-/// Returns the matching variant's full path, or `None` if no match is found.
-pub(crate) fn find_ampm_variant_cached(
-    path: &Path,
-    dir_cache: &mut std::collections::HashMap<PathBuf, Vec<String>>,
-) -> Option<PathBuf> {
-    let filename = path.file_name()?.to_str()?;
-    let normalized = normalize_ampm(filename);
+/// Async callers should pre-populate directories with `ensure_dir_async()` before
+/// entering tight sync loops (e.g. `filter_asset_to_tasks`), so that the sync
+/// lookup methods (`exists`, `file_size`, `find_ampm_variant`) never hit disk.
+pub(crate) struct DirCache {
+    dirs: std::collections::HashMap<PathBuf, FxHashMap<String, u64>>,
+}
 
-    // Early exit: if normalizing doesn't change the name, there's no AM/PM to vary
-    if normalized == filename {
-        return None;
-    }
-
-    let parent = path.parent()?;
-    let filenames = dir_cache.entry(parent.to_path_buf()).or_insert_with(|| {
-        std::fs::read_dir(parent)
-            .ok()
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter_map(|e| e.file_name().to_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    });
-
-    for sibling in filenames {
-        if sibling == filename {
-            continue;
-        }
-        if normalize_ampm(sibling) == normalized {
-            return Some(parent.join(sibling));
+impl DirCache {
+    pub fn new() -> Self {
+        Self {
+            dirs: std::collections::HashMap::new(),
         }
     }
 
-    None
+    /// Invalidate all cached entries. Use after writing files to disk.
+    #[cfg(test)]
+    pub fn clear(&mut self) {
+        self.dirs.clear();
+    }
+
+    /// Pre-populate the cache for `dir` on the blocking threadpool.
+    ///
+    /// Call this from async code before using the sync lookup methods, so that
+    /// the subsequent `ensure_dir` calls are guaranteed cache-hits with no
+    /// blocking I/O on the tokio worker thread.
+    pub async fn ensure_dir_async(&mut self, dir: &Path) {
+        if self.dirs.contains_key(dir) {
+            return;
+        }
+        let dir_buf = dir.to_path_buf();
+        let entries = tokio::task::spawn_blocking({
+            let d = dir_buf.clone();
+            move || read_dir_entries(&d)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(dir = %dir_buf.display(), error = %e, "Failed to read directory entries");
+            FxHashMap::default()
+        });
+        self.dirs.insert(dir_buf, entries);
+    }
+
+    /// Check whether `path` exists on disk, using cached directory listings.
+    pub fn exists(&mut self, path: &Path) -> bool {
+        let Some(filename) = path.file_name().and_then(|f| f.to_str()) else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        self.ensure_dir(parent).contains_key(filename)
+    }
+
+    /// Return the file size for `path` if it exists, using cached directory listings.
+    /// Avoids a separate `std::fs::metadata()` call.
+    pub fn file_size(&mut self, path: &Path) -> Option<u64> {
+        let filename = path.file_name()?.to_str()?;
+        let parent = path.parent()?;
+        self.ensure_dir(parent).get(filename).copied()
+    }
+
+    /// Find a file on disk that differs only in AM/PM whitespace from `path`.
+    ///
+    /// Checks sibling files in the same directory for an AM/PM whitespace variant
+    /// (e.g., `1.40.01 PM.PNG` vs `1.40.01\u{202F}PM.PNG` vs `1.40.01PM.PNG`).
+    pub fn find_ampm_variant(&mut self, path: &Path) -> Option<PathBuf> {
+        let filename = path.file_name()?.to_str()?;
+        let normalized = normalize_ampm(filename);
+
+        // Early exit: if normalizing doesn't change the name, there's no AM/PM to vary
+        if normalized == filename {
+            return None;
+        }
+
+        let parent = path.parent()?;
+        let entries = self.ensure_dir(parent);
+
+        for sibling in entries.keys() {
+            if sibling == filename {
+                continue;
+            }
+            if normalize_ampm(sibling) == normalized {
+                return Some(parent.join(sibling.as_str()));
+            }
+        }
+
+        None
+    }
+
+    /// Populate the cache for `dir` if not already present (blocking I/O).
+    ///
+    /// In async contexts, prefer `ensure_dir_async()` to avoid blocking the
+    /// tokio worker thread — especially on slow or network-attached storage.
+    fn ensure_dir(&mut self, dir: &Path) -> &FxHashMap<String, u64> {
+        self.dirs
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| read_dir_entries(dir))
+    }
 }
 
 /// Generate a live photo MOV filename using the "original" policy.
@@ -440,11 +551,12 @@ pub(crate) fn live_photo_mov_path_original(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn test_clean_filename() {
-        assert_eq!(clean_filename("photo:1.jpg"), "photo1.jpg");
-        assert_eq!(clean_filename("a/b\\c*d?e\"f<g>h|i"), "abcdefghi");
+        assert_eq!(clean_filename("photo:1.jpg"), "photo_1.jpg");
+        assert_eq!(clean_filename("a/b\\c*d?e\"f<g>h|i"), "a_b_c_d_e_f_g_h_i");
         assert_eq!(clean_filename("normal.jpg"), "normal.jpg");
     }
 
@@ -604,18 +716,18 @@ mod tests {
 
     #[test]
     fn test_generate_fingerprint_filename() {
-        // Matches Python: re.sub("[^0-9a-zA-Z]", "_", asset_id)[0:12]
+        // SHA-256 based: first 12 hex chars of hash(asset_id)
         assert_eq!(
             generate_fingerprint_filename("CCPO9c3V/MTwWZJ9bw==", "public.jpeg"),
-            "CCPO9c3V_MTw.JPG"
+            "8b2ee97b47e6.JPG"
         );
         assert_eq!(
             generate_fingerprint_filename("ABC", "public.heic"),
-            "ABC.HEIC"
+            "b5d4045c3f46.HEIC"
         );
         assert_eq!(
             generate_fingerprint_filename("a/b+c=d!e@f#g$h%i", "public.png"),
-            "a_b_c_d_e_f_.PNG"
+            "bed2f1035094.PNG"
         );
     }
 
@@ -670,8 +782,8 @@ mod tests {
 
         // Look for the narrow-no-break-space variant
         let query = dir.join("Screenshot at 1.40.01\u{202F}PM.PNG");
-        let mut cache = std::collections::HashMap::new();
-        let found = find_ampm_variant_cached(&query, &mut cache);
+        let mut cache = DirCache::new();
+        let found = cache.find_ampm_variant(&query);
         assert!(found.is_some());
         assert_eq!(found.unwrap(), existing);
 
@@ -680,18 +792,62 @@ mod tests {
 
     #[test]
     fn test_find_ampm_variant_returns_none_for_non_ampm() {
-        let path = Path::new("/tmp/claude/nonexistent/photo.jpg");
-        let mut cache = std::collections::HashMap::new();
-        assert!(find_ampm_variant_cached(path, &mut cache).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.jpg");
+        let mut cache = DirCache::new();
+        assert!(cache.find_ampm_variant(&path).is_none());
+    }
+
+    #[test]
+    fn test_dir_cache_exists() {
+        use std::fs;
+        let dir = std::env::temp_dir().join("claude").join("dir_cache_exists");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("photo.jpg"), b"data").unwrap();
+
+        let mut cache = DirCache::new();
+        assert!(cache.exists(&dir.join("photo.jpg")));
+        assert!(!cache.exists(&dir.join("missing.jpg")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dir_cache_file_size() {
+        use std::fs;
+        let dir = std::env::temp_dir()
+            .join("claude")
+            .join("dir_cache_file_size");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("photo.jpg"), b"12345").unwrap();
+
+        let mut cache = DirCache::new();
+        assert_eq!(cache.file_size(&dir.join("photo.jpg")), Some(5));
+        assert_eq!(cache.file_size(&dir.join("missing.jpg")), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dir_cache_nonexistent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("no_such_subdir/file.jpg");
+        let mut cache = DirCache::new();
+        assert!(!cache.exists(&nonexistent));
+        assert_eq!(cache.file_size(&nonexistent), None);
     }
 
     #[test]
     fn test_sanitize_path_component_traversal() {
-        // clean_filename removes "/" so "../etc/passwd" → "..etcpasswd" → "_etcpasswd"
-        assert_eq!(sanitize_path_component("../etc/passwd"), "_etcpasswd");
+        // clean_filename replaces "/" with "_" so "../etc/passwd" → ".._etc_passwd" → "__etc_passwd"
+        assert_eq!(sanitize_path_component("../etc/passwd"), "__etc_passwd");
         assert_eq!(sanitize_path_component(".."), "_");
-        // "foo/../bar" → clean removes "/" → "foo..bar" → replace ".." → "foo_bar"
-        assert_eq!(sanitize_path_component("foo/../bar"), "foo_bar");
+        // "foo/../bar" → clean replaces "/" → "foo_.._bar" → replace ".." → "foo___bar"
+        assert_eq!(sanitize_path_component("foo/../bar"), "foo___bar");
     }
 
     #[test]
@@ -738,7 +894,222 @@ mod tests {
     fn test_generate_fingerprint_filename_unknown_type() {
         assert_eq!(
             generate_fingerprint_filename("asset123", "some.unknown.type"),
-            "asset123.unknown"
+            "01d6235dcbf6.unknown"
+        );
+    }
+
+    #[test]
+    fn test_clean_filename_null_bytes() {
+        assert_eq!(clean_filename("photo\0.jpg"), "photo_.jpg");
+    }
+
+    #[test]
+    fn test_clean_filename_empty_string() {
+        assert_eq!(clean_filename(""), "");
+    }
+
+    #[test]
+    fn test_clean_filename_all_invalid_chars() {
+        assert_eq!(clean_filename("/:*?\"<>|\\"), "_________");
+    }
+
+    #[test]
+    fn test_clean_filename_truncates_long_name_with_extension() {
+        let long_stem = "a".repeat(300);
+        let filename = format!("{long_stem}.jpg");
+        let result = clean_filename(&filename);
+        assert!(result.len() <= 255);
+        assert!(result.ends_with(".jpg"));
+    }
+
+    #[test]
+    fn test_clean_filename_truncates_long_name_without_extension() {
+        let filename = "a".repeat(300);
+        let result = clean_filename(&filename);
+        assert_eq!(result.len(), 255);
+    }
+
+    #[test]
+    fn test_clean_filename_no_truncation_at_limit() {
+        let filename = format!("{}.jpg", "a".repeat(251));
+        assert_eq!(filename.len(), 255);
+        assert_eq!(clean_filename(&filename), filename);
+    }
+
+    #[test]
+    fn test_clean_filename_truncates_multibyte_on_char_boundary() {
+        // Each '日' is 3 bytes; ensure we don't split mid-character
+        let stem = "日".repeat(100); // 300 bytes
+        let filename = format!("{stem}.jpg");
+        let result = clean_filename(&filename);
+        assert!(result.len() <= 255);
+        assert!(result.ends_with(".jpg"));
+        // Stem should be truncated to a whole number of 3-byte chars
+        let stem_part = &result[..result.len() - 4];
+        assert_eq!(stem_part.len() % 3, 0);
+    }
+
+    #[test]
+    fn test_clean_filename_truncates_oversized_extension() {
+        let filename = format!("a.{}", "x".repeat(300));
+        let result = clean_filename(&filename);
+        assert_eq!(result.len(), 255);
+    }
+
+    #[test]
+    fn test_sanitize_path_component_control_characters() {
+        let result = sanitize_path_component("album\ttab\nnewline");
+        assert_eq!(result, "album_tab_newline");
+    }
+
+    #[test]
+    fn test_sanitize_path_component_long_input() {
+        // Very long album names (>255 bytes) are truncated
+        let long_name = "a".repeat(1000);
+        let result = sanitize_path_component(&long_name);
+        assert_eq!(result.len(), 255);
+    }
+
+    #[test]
+    fn test_sanitize_path_component_unicode_with_traversal() {
+        // Unicode album name with path traversal attempt
+        assert_eq!(
+            sanitize_path_component("日本語/../secrets"),
+            "日本語___secrets"
+        );
+    }
+
+    #[test]
+    fn test_local_download_path_none_folder_structure() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = local_download_path(dir, "none", &date, "IMG_0001.JPG");
+        assert_eq!(result, PathBuf::from("/photos/IMG_0001.JPG"));
+    }
+
+    #[test]
+    fn test_local_download_path_none_case_insensitive() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        assert_eq!(
+            local_download_path(dir, "NONE", &date, "photo.jpg"),
+            PathBuf::from("/photos/photo.jpg")
+        );
+        assert_eq!(
+            local_download_path(dir, "None", &date, "photo.jpg"),
+            PathBuf::from("/photos/photo.jpg")
+        );
+    }
+
+    #[test]
+    fn test_local_download_path_date_based_folder() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = local_download_path(dir, "{:%Y/%m/%d}", &date, "IMG_0001.JPG");
+        assert_eq!(result, PathBuf::from("/photos/2025/06/15/IMG_0001.JPG"));
+    }
+
+    #[test]
+    fn test_local_download_path_without_python_wrapper() {
+        // Format string without {: ... } wrapper
+        let dir = Path::new("/photos");
+        let date = chrono::Local.with_ymd_and_hms(2025, 1, 5, 9, 5, 3).unwrap();
+        let result = local_download_path(dir, "%Y-%m-%d", &date, "photo.jpg");
+        assert_eq!(result, PathBuf::from("/photos/2025-01-05/photo.jpg"));
+    }
+
+    #[test]
+    fn test_local_download_path_with_time_components() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 12, 31, 23, 59, 59)
+            .unwrap();
+        let result = local_download_path(dir, "{:%Y/%m/%d/%H-%M-%S}", &date, "photo.jpg");
+        assert_eq!(
+            result,
+            PathBuf::from("/photos/2025/12/31/23-59-59/photo.jpg")
+        );
+    }
+
+    #[test]
+    fn test_expand_date_format_unknown_token_preserved() {
+        // Unknown % tokens should keep the % sign
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = expand_date_format("%Y-%Z-%d", &date);
+        // %Z is unknown, so "%" is kept, then "Z" is processed as literal
+        assert_eq!(result, "2025-%Z-15");
+    }
+
+    #[test]
+    fn test_expand_date_format_trailing_percent() {
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = expand_date_format("%Y/%m/%d%", &date);
+        assert_eq!(result, "2025/06/15%");
+    }
+
+    #[test]
+    fn test_generate_fingerprint_filename_empty_id() {
+        let result = generate_fingerprint_filename("", "public.jpeg");
+        assert_eq!(result, "e3b0c44298fc.JPG");
+    }
+
+    #[test]
+    fn test_local_download_path_cleans_invalid_chars_in_filename() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = local_download_path(dir, "none", &date, "photo:1.jpg");
+        assert_eq!(result, PathBuf::from("/photos/photo_1.jpg"));
+    }
+
+    #[test]
+    fn test_local_download_path_traversal_in_folder_structure() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+
+        // ".." components are neutralised — path stays inside directory
+        assert_eq!(
+            local_download_path(dir, "../../etc", &date, "passwd"),
+            PathBuf::from("/photos/_/_/etc/passwd")
+        );
+        assert_eq!(
+            local_download_path(dir, "../../%Y", &date, "photo.jpg"),
+            PathBuf::from("/photos/_/_/2025/photo.jpg")
+        );
+        assert_eq!(
+            local_download_path(dir, "{:../../%Y}", &date, "photo.jpg"),
+            PathBuf::from("/photos/_/_/2025/photo.jpg")
+        );
+    }
+
+    #[test]
+    fn test_normalize_ampm_no_break_space_u00a0() {
+        // U+00A0 (NO-BREAK SPACE) before AM should also be stripped
+        assert_eq!(
+            normalize_ampm("Screenshot at 10.30.00\u{00A0}AM.PNG"),
+            "Screenshot at 10.30.00AM.PNG"
+        );
+    }
+
+    #[test]
+    fn test_normalize_ampm_lowercase_pm() {
+        // AM/PM matching is case-insensitive in the check
+        assert_eq!(
+            normalize_ampm("Screenshot at 1.40.01 pm.PNG"),
+            "Screenshot at 1.40.01pm.PNG"
         );
     }
 }

@@ -9,7 +9,7 @@ use crate::icloud::photos::AssetVersionSize;
 /// Version size key for state tracking.
 ///
 /// This is a 1-byte enum representing the version size, saving ~23 bytes
-/// per AssetRecord compared to storing as a String.
+/// per `AssetRecord` compared to storing as a String.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum VersionSizeKey {
@@ -21,11 +21,12 @@ pub enum VersionSizeKey {
     LiveOriginal = 5,
     LiveMedium = 6,
     LiveThumb = 7,
+    LiveAdjusted = 8,
 }
 
 impl VersionSizeKey {
     /// Convert to the string stored in the database.
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Original => "original",
             Self::Medium => "medium",
@@ -35,6 +36,7 @@ impl VersionSizeKey {
             Self::LiveOriginal => "live_original",
             Self::LiveMedium => "live_medium",
             Self::LiveThumb => "live_thumb",
+            Self::LiveAdjusted => "live_adjusted",
         }
     }
 
@@ -49,6 +51,7 @@ impl VersionSizeKey {
             "live_original" | "liveoriginal" => Some(Self::LiveOriginal),
             "live_medium" | "livemedium" => Some(Self::LiveMedium),
             "live_thumb" | "livethumb" => Some(Self::LiveThumb),
+            "live_adjusted" | "liveadjusted" => Some(Self::LiveAdjusted),
             _ => None,
         }
     }
@@ -65,6 +68,7 @@ impl From<AssetVersionSize> for VersionSizeKey {
             AssetVersionSize::LiveOriginal => Self::LiveOriginal,
             AssetVersionSize::LiveMedium => Self::LiveMedium,
             AssetVersionSize::LiveThumb => Self::LiveThumb,
+            AssetVersionSize::LiveAdjusted => Self::LiveAdjusted,
         }
     }
 }
@@ -82,8 +86,8 @@ pub enum AssetStatus {
 
 impl AssetStatus {
     /// Convert to the string stored in the database.
-    #[allow(dead_code)] // Symmetric with from_str; used in tests
-    pub fn as_str(&self) -> &'static str {
+    #[cfg(test)]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Downloaded => "downloaded",
@@ -113,7 +117,7 @@ pub enum MediaType {
 
 impl MediaType {
     /// Convert to the string stored in the database.
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Photo => "photo",
             Self::Video => "video",
@@ -139,7 +143,7 @@ impl MediaType {
 /// Fields are ordered for optimal memory layout:
 /// - 8-byte aligned heap types first (String, `Option<PathBuf>`, `Option<String>`)
 /// - 8-byte primitives (u64)
-/// - DateTime fields (12-16 bytes each)
+/// - `DateTime` fields (12-16 bytes each)
 /// - 4-byte primitives (u32)
 /// - 1-byte enums grouped at the end
 #[derive(Debug, Clone)]
@@ -178,7 +182,7 @@ pub struct AssetRecord {
     pub download_attempts: u32,
 
     // 1-byte enums grouped together
-    /// Version size key (e.g., Original, Medium, LiveOriginal).
+    /// Version size key (e.g., Original, Medium, `LiveOriginal`).
     pub version_size: VersionSizeKey,
     /// Type of media (photo, video, live photo).
     pub media_type: MediaType,
@@ -188,7 +192,6 @@ pub struct AssetRecord {
 
 impl AssetRecord {
     /// Create a new pending asset record.
-    #[allow(clippy::too_many_arguments)] // Matches SQL table columns
     pub fn new_pending(
         id: String,
         version_size: VersionSizeKey,
@@ -265,6 +268,7 @@ mod tests {
             VersionSizeKey::LiveOriginal,
             VersionSizeKey::LiveMedium,
             VersionSizeKey::LiveThumb,
+            VersionSizeKey::LiveAdjusted,
         ] {
             assert_eq!(VersionSizeKey::from_str(key.as_str()), Some(key));
         }
@@ -284,6 +288,10 @@ mod tests {
         assert_eq!(
             VersionSizeKey::from_str("livethumb"),
             Some(VersionSizeKey::LiveThumb)
+        );
+        assert_eq!(
+            VersionSizeKey::from_str("liveadjusted"),
+            Some(VersionSizeKey::LiveAdjusted)
         );
     }
 
@@ -374,11 +382,6 @@ mod tests {
     }
 
     #[test]
-    fn test_version_size_key_is_one_byte() {
-        assert_eq!(size_of::<VersionSizeKey>(), 1);
-    }
-
-    #[test]
     fn test_asset_status_is_one_byte() {
         assert_eq!(size_of::<AssetStatus>(), 1);
     }
@@ -427,6 +430,7 @@ mod tests {
             (AssetVersionSize::LiveOriginal, VersionSizeKey::LiveOriginal),
             (AssetVersionSize::LiveMedium, VersionSizeKey::LiveMedium),
             (AssetVersionSize::LiveThumb, VersionSizeKey::LiveThumb),
+            (AssetVersionSize::LiveAdjusted, VersionSizeKey::LiveAdjusted),
         ];
         for (avs, expected) in conversions {
             assert_eq!(VersionSizeKey::from(avs), expected, "{:?}", avs);

@@ -2,7 +2,7 @@ use crate::types::VersionSize;
 
 /// Information about a downloadable asset version.
 ///
-/// Uses `Box<str>` instead of `String` for url, asset_type, and checksum
+/// Uses `Box<str>` instead of `String` for url, `asset_type`, and checksum
 /// to save 8 bytes per field (16 vs 24 bytes) since these strings are
 /// never mutated after construction.
 #[derive(Debug, Clone)]
@@ -33,6 +33,7 @@ pub enum AssetVersionSize {
     LiveOriginal = 5,
     LiveMedium = 6,
     LiveThumb = 7,
+    LiveAdjusted = 8,
 }
 
 impl From<VersionSize> for AssetVersionSize {
@@ -94,9 +95,10 @@ mod tests {
             AssetVersionSize::LiveOriginal as u8,
             AssetVersionSize::LiveMedium as u8,
             AssetVersionSize::LiveThumb as u8,
+            AssetVersionSize::LiveAdjusted as u8,
         ];
 
-        // Check all 8 variants have unique values
+        // Check all variants have unique values
         let unique: std::collections::HashSet<u8> = variants.iter().copied().collect();
         assert_eq!(
             unique.len(),

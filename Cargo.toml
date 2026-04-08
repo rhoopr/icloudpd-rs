@@ -1,6 +1,6 @@
 [package]
 name = "kei"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 
 [[bin]]
@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-m
 
 # HTTP
 reqwest = { version = "0.13", features = ["cookies", "json", "stream", "http2"] }
+bytes = "1"
 futures-util = "0.3"
 tokio-stream = "0.1"
 tokio-util = "0.7"
@@ -32,7 +33,11 @@ pbkdf2 = { version = "0.12", features = ["simple"] }
 hmac = "0.12"
 num-bigint = "0.4"
 base64 = "0.22"
-uuid = { version = "1", features = ["v1", "v4"] }
+uuid = { version = "1", features = ["v4"] }
+
+# Credential security
+secrecy = "0.10"
+aes-gcm = "0.10"
 
 # Dates
 chrono = { version = "0.4", features = ["serde"] }
@@ -71,13 +76,24 @@ urlencoding = "2"
 # SQLite state tracking
 rusqlite = { version = "0.39", features = ["bundled"] }
 
+# System
+libc = "0.2"
+
 # Memory optimization
 smallvec = "1.15"
 rustc-hash = "2.1"
 data-encoding = "2.10.0"
+sha1 = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
 sd-notify = "0.5"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -85,6 +101,9 @@ predicates = "3"
 tempfile = "3"
 dotenvy = "0.15"
 rusqlite = { version = "0.39", features = ["bundled"] }
+http = "1"
+wiremock = "0.6"
+tracing-test = "0.2"
 
 [[test]]
 name = "cli"

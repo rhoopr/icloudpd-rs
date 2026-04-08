@@ -81,7 +81,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `--xmp-sidecar` | Planned | [#19](https://github.com/rhoopr/kei/issues/19) |
 | `--smtp-*` (all SMTP flags) | Planned | [#31](https://github.com/rhoopr/kei/issues/31) |
 | `--use-os-locale` | Not planned | - |
-| `--password-provider` | Not applicable - uses `ICLOUD_PASSWORD` env var or interactive prompt | - |
+| `--password-provider` | Replaced by `--password-file`, `--password-command`, or `kei credential set` | - |
 | `--mfa-provider` | Not applicable - uses trusted device with `get-code` + `submit-code` | - |
 
 ### New in kei (no Python equivalent)
@@ -89,6 +89,10 @@ Most flags are the same or very close. Here's the full mapping:
 | Flag / command | What it does |
 |----------------|-------------|
 | `--config <path>` | TOML config file. [Guide](https://github.com/rhoopr/kei/wiki/Configuration) |
+| `--password-file <path>` | Read password from a file. Supports Docker secrets (`/run/secrets/icloud_password`). |
+| `--password-command <cmd>` | Obtain password from a shell command (1Password, Vault, pass). |
+| `--save-password` | Persist password to OS keyring or encrypted file after successful auth. |
+| `credential set\|clear\|backend` | Manage stored credentials. See [Credentials](https://github.com/rhoopr/kei/wiki/Credentials). |
 | `--max-retries` | Retry limit per download (Python hardcoded `MAX_RETRIES = 0`) |
 | `--retry-delay` | Base delay for exponential backoff |
 | `--temp-suffix` | Suffix for partial downloads (default: `.kei-tmp`) |
@@ -123,14 +127,16 @@ services:
     image: ghcr.io/rhoopr/kei:latest
     container_name: kei
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       - ICLOUD_USERNAME=${ICLOUD_USERNAME}
-      - ICLOUD_PASSWORD=${ICLOUD_PASSWORD}
       - TZ=${TZ:-UTC}
     volumes:
       - ./config:/config
       - /path/to/photos:/photos
 ```
+
+For password management, use `kei credential set` (encrypted store), Docker secrets (`--password-file /run/secrets/icloud_password`), or an external secret manager (`--password-command`). See the [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) wiki page for details. Avoid `ICLOUD_PASSWORD` in environment variables — it's visible in `docker inspect`.
 
 Optional `config/config.toml`:
 

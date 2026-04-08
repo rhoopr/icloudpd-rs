@@ -20,7 +20,10 @@ pub use types::{AssetItemType, AssetVersionSize, ChangeReason};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Context;
 use serde_json::{json, Value};
+
+use crate::retry::RetryConfig;
 use tracing::{debug, error};
 
 use crate::icloud::error::ICloudError;
@@ -34,6 +37,7 @@ pub struct PhotosService {
     primary_library: PhotoLibrary,
     private_libraries: Option<HashMap<String, PhotoLibrary>>,
     shared_libraries: Option<HashMap<String, PhotoLibrary>>,
+    retry_config: RetryConfig,
 }
 
 impl std::fmt::Debug for PhotosService {
@@ -53,13 +57,14 @@ impl PhotosService {
         service_root: String,
         session: Box<dyn PhotosSession>,
         mut params: HashMap<String, Value>,
+        retry_config: RetryConfig,
     ) -> Result<Self, ICloudError> {
         params.insert("remapEnums".to_string(), Value::Bool(true));
         params.insert("getCurrentSyncToken".to_string(), Value::Bool(true));
 
         let params = Arc::new(params);
         let service_endpoint = Self::build_service_endpoint(&service_root, "private");
-        let zone_id = json!({"zoneName": "PrimarySync"});
+        let zone_id = Arc::new(json!({"zoneName": "PrimarySync"}));
 
         let lib_session = session.clone_box();
 
@@ -69,6 +74,7 @@ impl PhotosService {
             lib_session,
             zone_id,
             "private".to_string(),
+            retry_config,
         )
         .await?;
 
@@ -79,6 +85,7 @@ impl PhotosService {
             primary_library,
             private_libraries: None,
             shared_libraries: None,
+            retry_config,
         })
     }
 
@@ -98,7 +105,7 @@ impl PhotosService {
 
     /// Look up a library by zone name.
     ///
-    /// Checks the primary library first ("PrimarySync"), then searches private
+    /// Checks the primary library first ("`PrimarySync`"), then searches private
     /// and shared libraries. Lazily fetches library lists on first call.
     pub async fn get_library(&mut self, name: &str) -> anyhow::Result<&PhotoLibrary> {
         if name == "PrimarySync" {
@@ -179,17 +186,19 @@ impl PhotosService {
             &url,
             "{}",
             &[("Content-type", "text/plain")],
+            &self.retry_config,
         )
         .await?;
 
-        let zone_list: cloudkit::ZoneListResponse = serde_json::from_value(response)?;
+        let zone_list: cloudkit::ZoneListResponse =
+            serde_json::from_value(response).context("failed to parse zone list response")?;
 
         for zone in &zone_list.zones {
             if zone.deleted.unwrap_or(false) {
                 continue;
             }
             let zone_name = zone.zone_id.zone_name.clone();
-            let zone_id = serde_json::to_value(&zone.zone_id)?;
+            let zone_id = Arc::new(serde_json::to_value(&zone.zone_id)?);
             let ep = self.get_service_endpoint(library_type);
             let lib_session = self.session.clone_box();
 
@@ -199,6 +208,7 @@ impl PhotosService {
                 lib_session,
                 zone_id,
                 library_type.to_string(),
+                self.retry_config,
             )
             .await
             {
@@ -237,9 +247,11 @@ impl PhotosService {
             &url,
             &body.to_string(),
             &[("Content-type", "text/plain")],
+            &self.retry_config,
         )
         .await?;
-        let parsed: ChangesDatabaseResponse = serde_json::from_value(response)?;
+        let parsed: ChangesDatabaseResponse = serde_json::from_value(response)
+            .context("failed to parse changes database response")?;
         Ok(parsed)
     }
 }
@@ -277,14 +289,6 @@ mod tests {
             Ok(self.response.clone())
         }
 
-        async fn get(
-            &self,
-            _url: &str,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<reqwest::Response> {
-            panic!("CapturingSession::get should not be called");
-        }
-
         fn clone_box(&self) -> Box<dyn session::PhotosSession> {
             panic!("CapturingSession::clone_box should not be called");
         }
@@ -304,6 +308,7 @@ mod tests {
             primary_library: dummy_library,
             private_libraries: None,
             shared_libraries: None,
+            retry_config: RetryConfig::default(),
         }
     }
 
@@ -319,14 +324,6 @@ mod tests {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             panic!("PanicSession::post should not be called");
-        }
-
-        async fn get(
-            &self,
-            _url: &str,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<reqwest::Response> {
-            panic!("PanicSession::get should not be called");
         }
 
         fn clone_box(&self) -> Box<dyn session::PhotosSession> {

@@ -1,4 +1,4 @@
-//! Thin wrapper around systemd sd_notify integration.
+//! Thin wrapper around systemd `sd_notify` integration.
 //!
 //! All functions are no-ops when `enabled` is false or on non-Linux platforms.
 //! This keeps the rest of the codebase free from `#[cfg]` conditionals.
@@ -16,7 +16,7 @@ impl SystemdNotifier {
     }
 
     /// Send `READY=1` to systemd (service startup complete).
-    pub(crate) fn notify_ready(&self) {
+    pub(crate) fn notify_ready(self) {
         if !self.enabled {
             return;
         }
@@ -24,7 +24,7 @@ impl SystemdNotifier {
     }
 
     /// Send `STOPPING=1` to systemd (service shutting down).
-    pub(crate) fn notify_stopping(&self) {
+    pub(crate) fn notify_stopping(self) {
         if !self.enabled {
             return;
         }
@@ -32,7 +32,7 @@ impl SystemdNotifier {
     }
 
     /// Send `STATUS=<msg>` to systemd (human-readable status).
-    pub(crate) fn notify_status(&self, msg: &str) {
+    pub(crate) fn notify_status(self, msg: &str) {
         if !self.enabled {
             return;
         }
@@ -40,7 +40,7 @@ impl SystemdNotifier {
     }
 
     /// Send `WATCHDOG=1` to systemd (keepalive ping).
-    pub(crate) fn notify_watchdog(&self) {
+    pub(crate) fn notify_watchdog(self) {
         if !self.enabled {
             return;
         }
@@ -48,44 +48,52 @@ impl SystemdNotifier {
     }
 
     #[cfg(target_os = "linux")]
-    fn send_impl_ready(&self) {
+    fn send_impl_ready(self) {
         if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
             tracing::debug!(error = %e, "sd_notify READY failed");
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn send_impl_ready(&self) {}
+    fn send_impl_ready(self) {
+        let _ = self;
+    }
 
     #[cfg(target_os = "linux")]
-    fn send_impl_stopping(&self) {
+    fn send_impl_stopping(self) {
         if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Stopping]) {
             tracing::debug!(error = %e, "sd_notify STOPPING failed");
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn send_impl_stopping(&self) {}
+    fn send_impl_stopping(self) {
+        let _ = self;
+    }
 
     #[cfg(target_os = "linux")]
-    fn send_impl_status(&self, msg: &str) {
+    fn send_impl_status(self, msg: &str) {
         if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Status(msg)]) {
             tracing::debug!(error = %e, "sd_notify STATUS failed");
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn send_impl_status(&self, _msg: &str) {}
+    fn send_impl_status(self, _msg: &str) {
+        let _ = self;
+    }
 
     #[cfg(target_os = "linux")]
-    fn send_impl_watchdog(&self) {
+    fn send_impl_watchdog(self) {
         if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]) {
             tracing::debug!(error = %e, "sd_notify WATCHDOG failed");
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn send_impl_watchdog(&self) {}
+    fn send_impl_watchdog(self) {
+        let _ = self;
+    }
 }
 
 #[cfg(test)]

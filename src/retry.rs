@@ -32,6 +32,7 @@ impl RetryConfig {
     /// Compute the delay for a given retry attempt (0-indexed).
     ///
     /// Formula: `min(base_delay * 2^retry, max_delay) + random_jitter(0..base_delay)`
+    #[must_use]
     pub fn delay_for_retry(&self, retry: u32) -> std::time::Duration {
         let exp_delay = self
             .base_delay_secs
@@ -54,6 +55,10 @@ impl RetryConfig {
 ///
 /// Returns the first `Ok` result, or the last error if retries are exhausted
 /// or the classifier returns `Abort`.
+/// # Errors
+///
+/// Returns the last error if all retry attempts are exhausted or the
+/// classifier returns `Abort` for a non-retryable error.
 pub async fn retry_with_backoff<F, Fut, T, E, C>(
     config: &RetryConfig,
     classifier: C,
@@ -65,7 +70,7 @@ where
     C: Fn(&E) -> RetryAction,
     E: std::fmt::Display,
 {
-    let total_attempts = config.max_retries + 1;
+    let total_attempts = config.max_retries.saturating_add(1);
 
     for attempt in 0..total_attempts {
         match operation().await {
@@ -215,6 +220,92 @@ mod tests {
         .await;
         assert_eq!(result.unwrap(), 99);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_retry_logs_structured_fields_on_retryable_error() {
+        let config = RetryConfig {
+            max_retries: 2,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+        let _result: Result<i32, String> = retry_with_backoff(
+            &config,
+            |_| RetryAction::Retry,
+            || {
+                let cc = cc.clone();
+                async move {
+                    let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < 1 {
+                        Err("transient failure".to_string())
+                    } else {
+                        Ok(42)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(logs_contain("Retryable error, retrying"));
+        assert!(logs_contain("attempt=1"));
+        assert!(logs_contain("total_attempts=3"));
+        assert!(logs_contain("transient failure"));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_retry_logs_each_attempt() {
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let _result: Result<i32, String> = retry_with_backoff(
+            &config,
+            |_| RetryAction::Retry,
+            || async { Err::<i32, _>("keep failing".to_string()) },
+        )
+        .await;
+
+        // Should log attempts 1, 2, 3 (but not 4 — last attempt just returns the error)
+        assert!(logs_contain("attempt=1"));
+        assert!(logs_contain("attempt=2"));
+        assert!(logs_contain("attempt=3"));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_retry_no_log_on_success() {
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let result: Result<i32, String> =
+            retry_with_backoff(&config, |_| RetryAction::Retry, || async { Ok(42) }).await;
+        assert_eq!(result.unwrap(), 42);
+        assert!(!logs_contain("Retryable error"));
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_retry_no_log_on_abort() {
+        let config = RetryConfig {
+            max_retries: 3,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let _result: Result<i32, String> = retry_with_backoff(
+            &config,
+            |_| RetryAction::Abort,
+            || async { Err::<i32, _>("fatal".to_string()) },
+        )
+        .await;
+        // Abort returns immediately without logging retry
+        assert!(!logs_contain("Retryable error"));
     }
 
     #[tokio::test]

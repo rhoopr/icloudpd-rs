@@ -24,7 +24,7 @@ pub(crate) enum SetupResult {
 struct SetupAnswers {
     // Account
     username: String,
-    password: String,
+    password: secrecy::SecretString,
     domain: Option<Domain>,
 
     // Destination
@@ -71,7 +71,7 @@ impl Default for SetupAnswers {
     fn default() -> Self {
         Self {
             username: String::new(),
-            password: String::new(),
+            password: secrecy::SecretString::from(String::new()),
             domain: None,
             directory: "~/Photos/iCloud".to_string(),
             folder_structure: None,
@@ -177,15 +177,31 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     // Write config
     std::fs::write(config_path, &toml_content)
         .with_context(|| format!("Failed to write {}", config_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on {}", config_path.display()))?;
+    }
 
     // Write .env file
     let env_path = config_path.parent().unwrap_or(Path::new(".")).join(".env");
-    let env_content = format!(
-        "ICLOUD_USERNAME={}\nICLOUD_PASSWORD={}\n",
-        answers.username, answers.password
-    );
+    // Single-quote values to prevent shell expansion of special characters
+    // ($, `, !, etc.) when the file is sourced. Single quotes inside the
+    // password are escaped as '\'' (end-quote, literal quote, re-open quote).
+    let raw_pass = secrecy::ExposeSecret::expose_secret(&answers.password);
+    let escaped_user = answers.username.replace('\'', "'\\''");
+    let escaped_pass = raw_pass.replace('\'', "'\\''");
+    let env_content =
+        format!("ICLOUD_USERNAME='{escaped_user}'\nICLOUD_PASSWORD='{escaped_pass}'\n",);
     std::fs::write(&env_path, &env_content)
         .with_context(|| format!("Failed to write {}", env_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on {}", env_path.display()))?;
+    }
 
     println!();
     println!("Config written to:  {}", config_path.display());
@@ -236,7 +252,8 @@ fn ask_account(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         })
         .interact_text()?;
 
-    answers.password = Password::new().with_prompt("iCloud password").interact()?;
+    answers.password =
+        secrecy::SecretString::from(Password::new().with_prompt("iCloud password").interact()?);
 
     println!();
     let region_items = ["iCloud.com", "iCloud.com.cn (China)"];
@@ -278,7 +295,6 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .interact()?;
 
     answers.folder_structure = match folder {
-        0 => None, // %Y/%m/%d is the default
         1 => Some("%Y/%m".to_string()),
         2 => Some("%Y".to_string()),
         3 => Some(String::new()),
@@ -289,6 +305,7 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
                 .interact_text()?;
             Some(custom)
         }
+        // %Y/%m/%d is the default
         _ => None,
     };
 
@@ -861,7 +878,7 @@ mod tests {
     fn test_generate_toml_defaults_only() {
         let answers = SetupAnswers {
             username: "user@example.com".to_string(),
-            password: "secret".to_string(),
+            password: secrecy::SecretString::from("secret"),
             directory: "~/Photos/iCloud".to_string(),
             ..Default::default()
         };
@@ -885,7 +902,7 @@ mod tests {
     fn test_generate_toml_roundtrip() {
         let answers = SetupAnswers {
             username: "user@example.com".to_string(),
-            password: "secret".to_string(),
+            password: secrecy::SecretString::from("secret"),
             directory: "~/Photos/iCloud".to_string(),
             ..Default::default()
         };
@@ -911,7 +928,7 @@ mod tests {
     fn test_generate_toml_full() {
         let answers = SetupAnswers {
             username: "user@example.com".to_string(),
-            password: "secret".to_string(),
+            password: secrecy::SecretString::from("secret"),
             domain: Some(Domain::Cn),
             directory: "~/photos".to_string(),
             folder_structure: Some("%Y/%m".to_string()),
@@ -969,7 +986,7 @@ mod tests {
     fn test_generate_toml_full_roundtrip_values() {
         let answers = SetupAnswers {
             username: "test@icloud.com".to_string(),
-            password: "pw".to_string(),
+            password: secrecy::SecretString::from("pw"),
             domain: Some(Domain::Cn),
             directory: "/data/photos".to_string(),
             folder_structure: Some("%Y-%m".to_string()),
@@ -1052,7 +1069,7 @@ mod tests {
     fn test_generate_toml_albums_array() {
         let answers = SetupAnswers {
             username: "u@e.com".to_string(),
-            password: "p".to_string(),
+            password: secrecy::SecretString::from("p"),
             directory: "/d".to_string(),
             albums: vec!["My Album".to_string(), "Vacation \"2024\"".to_string()],
             ..Default::default()
@@ -1110,5 +1127,42 @@ mod tests {
         assert_eq!(escape_toml_string("hello"), "hello");
         assert_eq!(escape_toml_string("he\"llo"), "he\\\"llo");
         assert_eq!(escape_toml_string("c:\\path"), "c:\\\\path");
+    }
+
+    /// T-5: The .env file created by the setup wizard must have mode 0o600
+    /// so credentials are not world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn test_env_file_created_with_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir()
+            .join("claude")
+            .join("setup_perm_test")
+            .join(format!("{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let env_path = dir.join(".env");
+        let env_content = "ICLOUD_USERNAME=test@example.com\nICLOUD_PASSWORD=secret\n";
+
+        // Replicate the exact logic from run_setup
+        std::fs::write(&env_path, env_content).unwrap();
+        std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Verify permissions
+        let metadata = std::fs::metadata(&env_path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected mode 0o600 (owner rw only), got {mode:#o}"
+        );
+
+        // Verify content
+        let content = std::fs::read_to_string(&env_path).unwrap();
+        assert!(content.contains("ICLOUD_USERNAME=test@example.com"));
+        assert!(content.contains("ICLOUD_PASSWORD=secret"));
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

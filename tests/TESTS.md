@@ -4,13 +4,13 @@
 
 | File | Tests | Auth Required | Network |
 |------|------:|:---:|:---:|
-| Unit tests (`src/`) | 541 | No | No |
-| `cli.rs` | 67 | No | No |
-| `state.rs` | 4 | No | No |
-| `state_auth.rs` | 13 | Yes | Yes |
-| `sync.rs` | 27 | Mostly | Yes |
+| Unit tests (`src/`) | 974 | No | No |
+| `cli.rs` | 79 | No | No |
+| `state.rs` | 10 | No | No |
+| `state_auth.rs` | 13 (ignored) | Yes | Yes |
+| `sync.rs` | 27 (ignored) | Yes | Yes |
 | `setup_auth.rs` | 1 (ignored) | Yes | Yes |
-| **Total** | **652** | | |
+| **Total** | **1104** | | |
 
 ## Running Tests
 
@@ -18,11 +18,14 @@
 # Pre-commit safe (no auth, no network)
 cargo test --bin kei --test cli --test state
 
+# Live iCloud tests (requires pre-auth session + icloudpd-test album)
+cargo test --test sync --test state_auth -- --ignored --test-threads=1
+
 # Full suite (requires pre-auth session + icloudpd-test album)
 ./tests/run-all-tests.sh
 
 # Single test
-cargo test --test sync sync_dry_run_downloads_nothing -- --test-threads=1
+cargo test --test sync sync_dry_run_downloads_nothing -- --ignored --test-threads=1
 ```
 
 See `tests/README.md` for setup instructions.
@@ -31,7 +34,7 @@ See `tests/README.md` for setup instructions.
 
 ## Unit Tests (`cargo test --bin kei`)
 
-541 tests across 31 source modules. All offline, no credentials needed. Covers
+974 tests across 31 source modules. All offline, no credentials needed. Covers
 CLI parsing, config, download pipeline, path resolution, EXIF, iCloud API
 client, session management, SRP auth, state DB, retry logic, and shutdown.
 
@@ -39,7 +42,7 @@ client, session management, SRP auth, state DB, retry logic, and shutdown.
 
 ## CLI Tests (`tests/cli.rs`)
 
-67 tests. Pure argument parsing — no network, no credentials. Validates that
+79 tests. Pure argument parsing — no network, no credentials. Validates that
 every subcommand, flag, and enum value is accepted or rejected correctly.
 
 ### Help Output (8 tests)
@@ -150,7 +153,18 @@ every subcommand, flag, and enum value is accepted or rejected correctly.
 | `cookie_directory_flag_works_on_verify` | `--cookie-directory` works on verify |
 | `password_flag_works_on_submit_code` | `-p` works on submit-code |
 
-### Misc (4 tests)
+### Exit Codes (6 tests)
+
+| Test | Confirms |
+|------|----------|
+| `exit_code_0_on_help` | `--help` → exit 0 |
+| `exit_code_0_on_version` | `--version` → exit 0 |
+| `exit_code_1_on_missing_username` | Missing `--username` → exit 1, stderr contains "--username is required" |
+| `exit_code_3_on_empty_password_file` | Empty `--password-file` → exit 3 (auth failure) |
+| `exit_code_3_on_newline_only_password_file` | Newline-only `--password-file` → exit 3 (auth failure) |
+| `exit_code_2_on_invalid_argument` | Empty `--username ""` → exit 2 (clap validation) |
+
+### Misc (5 tests)
 
 | Test | Confirms |
 |------|----------|
@@ -164,8 +178,8 @@ every subcommand, flag, and enum value is accepted or rejected correctly.
 
 ## State Tests — No Auth (`tests/state.rs`)
 
-4 tests. No credentials or network needed. Tests state subcommands against
-absent databases.
+10 tests. No credentials or network needed. Tests state subcommands and
+metadata operations against absent/fresh databases.
 
 | Test | What It Does | Confirms |
 |------|-------------|----------|
@@ -178,7 +192,11 @@ absent databases.
 
 ## State Tests — Auth Required (`tests/state_auth.rs`)
 
-13 tests. Require pre-authenticated session. Run with `--test-threads=1`.
+13 tests, all `#[ignore]`. Require pre-authenticated session. Run with:
+
+```sh
+cargo test --test state_auth -- --ignored --test-threads=1
+```
 
 ### Status (1 test)
 
@@ -222,8 +240,12 @@ absent databases.
 
 ## Sync Tests (`tests/sync.rs`)
 
-27 tests. Uses the `icloudpd-test` album for deterministic behavioral assertions.
-Require pre-authenticated session. Run with `--test-threads=1`.
+27 tests, all `#[ignore]`. Uses the `icloudpd-test` album for deterministic behavioral assertions.
+Require pre-authenticated session. Run with:
+
+```sh
+cargo test --test sync -- --ignored --test-threads=1
+```
 
 ### Test Album (`icloudpd-test`)
 

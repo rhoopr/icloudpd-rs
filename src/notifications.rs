@@ -105,16 +105,15 @@ async fn run_script(
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
 
-    match tokio::time::timeout(SCRIPT_TIMEOUT, child.wait()).await {
-        Ok(result) => Ok(result?),
-        Err(_) => {
-            tracing::warn!("Notification script timed out, killing");
-            child.kill().await.ok();
-            anyhow::bail!(
-                "notification script timed out after {}s",
-                SCRIPT_TIMEOUT.as_secs()
-            )
-        }
+    if let Ok(result) = tokio::time::timeout(SCRIPT_TIMEOUT, child.wait()).await {
+        Ok(result?)
+    } else {
+        tracing::warn!("Notification script timed out, killing");
+        child.kill().await.ok();
+        anyhow::bail!(
+            "notification script timed out after {}s",
+            SCRIPT_TIMEOUT.as_secs()
+        )
     }
 }
 
@@ -148,18 +147,22 @@ mod tests {
     async fn run_script_success() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = PathBuf::from("/tmp/claude/notify_tests");
-        std::fs::create_dir_all(&dir).ok();
-        let script = dir.join("success.sh");
-        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("success.sh");
+        // Open, write, and close explicitly to avoid "Text file busy" on CI
+        // (the file must be fully closed before exec).
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&script).unwrap();
+            f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+            f.sync_all().unwrap();
+        }
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let status = run_script(&script, "test_event", "msg", "user")
             .await
             .unwrap();
         assert!(status.success());
-
-        let _ = std::fs::remove_file(&script);
     }
 
     #[cfg(unix)]
@@ -167,18 +170,20 @@ mod tests {
     async fn run_script_nonzero_exit() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = PathBuf::from("/tmp/claude/notify_tests");
-        std::fs::create_dir_all(&dir).ok();
-        let script = dir.join("fail.sh");
-        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fail.sh");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&script).unwrap();
+            f.write_all(b"#!/bin/sh\nexit 1\n").unwrap();
+            f.sync_all().unwrap();
+        }
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let status = run_script(&script, "test_event", "msg", "user")
             .await
             .unwrap();
         assert!(!status.success());
-
-        let _ = std::fs::remove_file(&script);
     }
 
     #[cfg(unix)]
@@ -186,34 +191,40 @@ mod tests {
     async fn notify_runs_script_with_env_vars() {
         use std::os::unix::fs::PermissionsExt;
 
-        let script_path = PathBuf::from("/tmp/claude/test_notify.sh");
-        let output_path = PathBuf::from("/tmp/claude/test_notify_output.txt");
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("test_notify.sh");
+        let output_path = dir.path().join("test_notify_output.txt");
 
-        // Clean up from previous runs
-        let _ = std::fs::remove_file(&output_path);
-        std::fs::create_dir_all("/tmp/claude").ok();
-
-        std::fs::write(
-            &script_path,
-            format!(
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&script_path).unwrap();
+            write!(
+                f,
                 "#!/bin/sh\necho \"$KEI_EVENT|$KEI_MESSAGE|$KEI_ICLOUD_USERNAME\" > {}\n",
                 output_path.display()
-            ),
-        )
-        .unwrap();
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let notifier = Notifier::new(Some(script_path.clone()));
         notifier.notify(Event::TwoFaRequired, "Need 2FA code", "test@example.com");
 
-        // Wait for the spawned background task to complete
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for the spawned background task to complete (poll instead of fixed sleep)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if output_path.exists() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "notification script did not produce output within timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         let output = std::fs::read_to_string(&output_path).unwrap();
         assert_eq!(output.trim(), "2fa_required|Need 2FA code|test@example.com");
-
-        // Clean up
-        let _ = std::fs::remove_file(&script_path);
-        let _ = std::fs::remove_file(&output_path);
     }
 }

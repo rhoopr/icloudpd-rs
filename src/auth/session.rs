@@ -31,13 +31,36 @@ const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7
 /// (HTTP requests) with exclusive writes (session refresh / re-auth).
 pub type SharedSession = Arc<tokio::sync::RwLock<Session>>;
 
+/// Maximum length for sanitized usernames used in file paths.
+/// Long usernames are truncated and suffixed with a hash to stay under OS limits.
+const MAX_SANITIZED_USERNAME_LEN: usize = 64;
+
 /// Sanitize a username by keeping only word characters (alphanumeric + underscore).
 /// Equivalent to Python's `re.match(r"\w", c)` filter.
+/// Truncates to [`MAX_SANITIZED_USERNAME_LEN`] with a hash suffix if too long,
+/// preventing OS "File name too long" errors.
 pub fn sanitize_username(username: &str) -> String {
-    username
+    let sanitized: String = username
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_')
-        .collect()
+        .collect();
+    if sanitized.len() <= MAX_SANITIZED_USERNAME_LEN {
+        sanitized
+    } else {
+        // Use a simple hash (FNV-like) to keep uniqueness in truncated names
+        let hash = sanitized.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        let prefix_len = MAX_SANITIZED_USERNAME_LEN - 17; // room for "_" + 16 hex digits
+                                                          // Find the last char boundary at or before prefix_len to avoid
+                                                          // panicking on multi-byte UTF-8 (e.g. CJK usernames).
+        let prefix_end = sanitized[..prefix_len]
+            .char_indices()
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(prefix_len);
+        format!("{}_{:016x}", &sanitized[..prefix_end], hash)
+    }
 }
 
 /// Check if a Set-Cookie header string represents an expired cookie.
@@ -58,6 +81,49 @@ fn is_cookie_expired(cookie_str: &str, now: &chrono::DateTime<chrono::Utc>) -> b
 struct CookieEntry {
     url: String,
     cookie: String,
+}
+
+/// Parse legacy tab-separated cookie file format into `CookieEntry` values.
+///
+/// Each line is `URL<TAB>cookie-string`. Comment lines (`#`), blank lines,
+/// and `Set-Cookie3:` headers are skipped. Lines without a tab are ignored.
+fn parse_legacy_cookies(contents: &str) -> Vec<CookieEntry> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("Set-Cookie3:")
+            {
+                return None;
+            }
+            let (url_str, cookie_str) = trimmed.split_once('\t')?;
+            Some(CookieEntry {
+                url: url_str.to_string(),
+                cookie: cookie_str.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Atomically write `data` to `path` via a temp file + rename.
+/// Sets 0o600 permissions on Unix before renaming, so the file is never
+/// world-readable even momentarily.
+async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    fs::write(&tmp, data)
+        .await
+        .with_context(|| format!("Failed to write temp file {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("Failed to rename {} to {}", tmp.display(), path.display()))?;
+    Ok(())
 }
 
 /// HTTP session wrapper that persists cookies and session data to disk,
@@ -142,43 +208,30 @@ impl Session {
                 Ok(contents) => {
                     let now = chrono::Utc::now();
                     // Try JSON format first, fall back to legacy tab-separated format
-                    if let Ok(entries) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
-                        for entry in entries {
-                            if is_cookie_expired(&entry.cookie, &now) {
-                                tracing::debug!(url = %entry.url, "Pruning expired cookie");
-                                continue;
-                            }
-                            if let Ok(url) = entry.url.parse::<url::Url>() {
-                                cookie_jar.add_cookie_str(&entry.cookie, &url);
-                            }
+                    let entries =
+                        if let Ok(entries) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
+                            entries
+                        } else {
+                            parse_legacy_cookies(&contents)
+                        };
+                    for entry in entries {
+                        if is_cookie_expired(&entry.cookie, &now) {
+                            tracing::debug!(url = %entry.url, "Pruning expired cookie");
+                            continue;
                         }
-                    } else {
-                        for line in contents.lines() {
-                            let trimmed = line.trim();
-                            if trimmed.starts_with('#')
-                                || trimmed.is_empty()
-                                || trimmed.starts_with("Set-Cookie3:")
-                            {
-                                continue;
-                            }
-                            if let Some((url_str, cookie_str)) = trimmed.split_once('\t') {
-                                if is_cookie_expired(cookie_str, &now) {
-                                    tracing::debug!(url = %url_str, "Pruning expired cookie");
-                                    continue;
-                                }
-                                if let Ok(url) = url_str.parse::<url::Url>() {
-                                    cookie_jar.add_cookie_str(cookie_str, &url);
-                                }
-                            }
+                        if let Ok(url) = entry.url.parse::<url::Url>() {
+                            cookie_jar.add_cookie_str(&entry.cookie, &url);
                         }
                     }
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        if let Err(e) = std::fs::set_permissions(
+                        if let Err(e) = fs::set_permissions(
                             &cookiejar_path,
                             std::fs::Permissions::from_mode(0o600),
-                        ) {
+                        )
+                        .await
+                        {
                             tracing::warn!(error = %e, "Could not set cookie file permissions");
                         }
                     }
@@ -235,13 +288,13 @@ impl Session {
                             })
                             .collect()
                     }
-                    Err(_) => {
-                        tracing::info!("Session file corrupt, starting fresh");
+                    Err(e) => {
+                        tracing::info!(path = %session_path.display(), error = %e, "Session file corrupt, starting fresh");
                         HashMap::new()
                     }
                 },
-                Err(_) => {
-                    tracing::info!("Session file does not exist");
+                Err(e) => {
+                    tracing::info!(path = %session_path.display(), error = %e, "Could not read session file, starting fresh");
                     HashMap::new()
                 }
             }
@@ -291,7 +344,7 @@ impl Session {
     pub async fn post(
         &mut self,
         url: &str,
-        body: Option<String>,
+        body: Option<&str>,
         extra_headers: Option<HeaderMap>,
     ) -> Result<Response> {
         let mut builder = self.client.post(url);
@@ -299,7 +352,9 @@ impl Session {
             builder = builder.headers(h);
         }
         if let Some(b) = body {
-            builder = builder.header("Content-Type", "application/json").body(b);
+            builder = builder
+                .header("Content-Type", "application/json")
+                .body(b.to_owned());
         }
 
         tracing::debug!(url = %url, "POST");
@@ -331,7 +386,7 @@ impl Session {
             if let Some(val) = headers.get(header_name) {
                 if let Ok(val_str) = val.to_str() {
                     let existing = self.session_data.get(session_key);
-                    if existing.map(|s| s.as_str()) != Some(val_str) {
+                    if existing.map(std::string::String::as_str) != Some(val_str) {
                         self.session_data
                             .insert(session_key.to_string(), val_str.to_string());
                         session_changed = true;
@@ -343,16 +398,11 @@ impl Session {
         if session_changed {
             let session_path = self.session_path();
             let json = serde_json::to_string_pretty(&self.session_data)?;
-            fs::write(&session_path, &json).await.with_context(|| {
-                format!("Failed to write session data to {}", session_path.display())
-            })?;
-            #[cfg(unix)]
-            {
-                // Session files contain auth tokens — restrict to owner-only
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                std::fs::set_permissions(&session_path, perms)?;
-            }
+            atomic_write(&session_path, json.as_bytes())
+                .await
+                .with_context(|| {
+                    format!("Failed to write session data to {}", session_path.display())
+                })?;
             tracing::debug!("Saved session data to file");
         }
 
@@ -434,15 +484,12 @@ impl Session {
             }
         }
 
-        fs::write(&cookiejar_path, serde_json::to_string_pretty(&entries)?)
-            .await
-            .with_context(|| format!("Failed to write cookies to {}", cookiejar_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&cookiejar_path, perms)?;
-        }
+        atomic_write(
+            &cookiejar_path,
+            serde_json::to_string_pretty(&entries)?.as_bytes(),
+        )
+        .await
+        .with_context(|| format!("Failed to write cookies to {}", cookiejar_path.display()))?;
 
         Ok(())
     }
@@ -607,6 +654,37 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_username_long_truncated() {
+        let long_name = "a".repeat(500);
+        let sanitized = sanitize_username(&long_name);
+        assert!(
+            sanitized.len() <= MAX_SANITIZED_USERNAME_LEN,
+            "sanitized length {} exceeds max {}",
+            sanitized.len(),
+            MAX_SANITIZED_USERNAME_LEN
+        );
+    }
+
+    #[test]
+    fn test_sanitize_username_long_is_deterministic() {
+        let long_name = "a".repeat(500);
+        assert_eq!(sanitize_username(&long_name), sanitize_username(&long_name));
+    }
+
+    #[test]
+    fn test_sanitize_username_different_long_names_differ() {
+        let name1 = "a".repeat(500);
+        let name2 = "b".repeat(500);
+        assert_ne!(sanitize_username(&name1), sanitize_username(&name2));
+    }
+
+    #[test]
+    fn test_sanitize_username_at_boundary_not_truncated() {
+        let name = "a".repeat(MAX_SANITIZED_USERNAME_LEN);
+        assert_eq!(sanitize_username(&name), name);
+    }
+
+    #[test]
     fn test_sanitize_username_all_special() {
         assert_eq!(sanitize_username("@.+-!"), "");
     }
@@ -697,5 +775,106 @@ mod tests {
             .unwrap();
 
         assert_eq!(mtime1, mtime2, "File should not have been rewritten");
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_basic() {
+        let input = "https://example.com\tfoo=bar\nhttps://other.com\tbaz=qux";
+        let entries = parse_legacy_cookies(input);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].url, "https://example.com");
+        assert_eq!(entries[0].cookie, "foo=bar");
+        assert_eq!(entries[1].url, "https://other.com");
+        assert_eq!(entries[1].cookie, "baz=qux");
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_skips_comments_and_blanks() {
+        let input = "# This is a comment\n\nhttps://example.com\tfoo=bar\n  \n# Another comment";
+        let entries = parse_legacy_cookies(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cookie, "foo=bar");
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_skips_set_cookie3_header() {
+        let input = "Set-Cookie3: some header\nhttps://example.com\tfoo=bar";
+        let entries = parse_legacy_cookies(input);
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_skips_malformed_lines() {
+        let input = "no-tab-here\nhttps://example.com\tfoo=bar\nalso no tab";
+        let entries = parse_legacy_cookies(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].url, "https://example.com");
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_empty_input() {
+        assert!(parse_legacy_cookies("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_legacy_cookies_preserves_cookie_with_tabs() {
+        // Tab in cookie value after the first split
+        let input = "https://example.com\tfoo=bar\textra";
+        let entries = parse_legacy_cookies(input);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cookie, "foo=bar\textra");
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_session_file_recovers() {
+        let dir = test_dir("corrupt_session");
+        let sanitized = sanitize_username("user@test.com");
+        let session_path = dir.join(format!("{sanitized}.session"));
+
+        std::fs::write(&session_path, "not valid json {{{{").unwrap();
+
+        let session = Session::new(&dir, "user@test.com", "https://example.com", None)
+            .await
+            .expect("Should recover from corrupt session file");
+
+        assert!(session.session_data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_no_partial_file_on_success() {
+        let dir = test_dir("atomic_write");
+        let path = dir.join("test_file");
+
+        atomic_write(&path, b"hello world").await.unwrap();
+
+        assert!(path.exists());
+        assert!(!dir.join("test_file.tmp").exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_preserves_existing_on_overwrite() {
+        let dir = test_dir("atomic_overwrite");
+        let path = dir.join("data");
+
+        std::fs::write(&path, "original").unwrap();
+        atomic_write(&path, b"updated").await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated");
+        assert!(!dir.join("data.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_atomic_write_sets_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("atomic_perms");
+        let path = dir.join("secret");
+
+        atomic_write(&path, b"sensitive data").await.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "File should be owner-only, got {:o}", mode);
     }
 }

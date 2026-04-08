@@ -12,11 +12,75 @@ use super::endpoints::Endpoints;
 use super::session::Session;
 use crate::auth::error::AuthError;
 
+/// Buffered HTTP response for SRP authentication steps.
+/// Decouples the SRP flow from `reqwest::Response` for testability.
+pub(crate) struct SrpResponse {
+    pub(crate) status: u16,
+    body: Vec<u8>,
+}
+
+impl SrpResponse {
+    fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    fn is_client_error(&self) -> bool {
+        (400..500).contains(&self.status)
+    }
+
+    fn is_server_error(&self) -> bool {
+        (500..600).contains(&self.status)
+    }
+
+    fn json<T: serde::de::DeserializeOwned>(&self) -> serde_json::Result<T> {
+        serde_json::from_slice(&self.body)
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+/// Abstracts the HTTP transport used by SRP authentication.
+/// Production code uses `Session`; tests inject stub responses.
+#[async_trait::async_trait]
+pub(crate) trait SrpTransport {
+    async fn post(
+        &mut self,
+        url: &str,
+        body: Option<&str>,
+        headers: Option<HeaderMap>,
+    ) -> Result<SrpResponse>;
+    fn session_data(&self) -> &HashMap<String, String>;
+}
+
+#[async_trait::async_trait]
+impl SrpTransport for Session {
+    async fn post(
+        &mut self,
+        url: &str,
+        body: Option<&str>,
+        headers: Option<HeaderMap>,
+    ) -> Result<SrpResponse> {
+        let response = Session::post(self, url, body, headers).await?;
+        let status = response.status().as_u16();
+        let bytes = response.bytes().await?;
+        Ok(SrpResponse {
+            status,
+            body: bytes.to_vec(),
+        })
+    }
+
+    fn session_data(&self) -> &HashMap<String, String> {
+        &self.session_data
+    }
+}
+
 /// Apple's public OAuth widget key — embedded in icloud.com's JavaScript.
 pub(crate) const APPLE_WIDGET_KEY: &str =
     "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d";
 
-/// RFC 5054 2048-bit SRP group prime (same as srp::groups::G_2048).
+/// RFC 5054 2048-bit SRP group prime (same as `srp::groups::G_2048`).
 const N_HEX: &str = concat!(
     "AC6BDB41324A9A9BF166DE5E1389582FAF72B6651987EE07FC319294",
     "3DB56050A37329CBB4A099ED8193E0757767A13DD52312AB4B03310D",
@@ -51,7 +115,7 @@ fn derive_apple_password(password: &str, protocol: &str, salt: &[u8], iterations
         pbkdf2::pbkdf2_hmac::<Sha256>(hex_str.as_bytes(), salt, iterations, &mut key);
     } else {
         pbkdf2::pbkdf2_hmac::<Sha256>(&hash, salt, iterations, &mut key);
-    };
+    }
 
     key
 }
@@ -103,7 +167,7 @@ fn compute_u(a_pub: &BigUint, b_pub: &BigUint, n: &BigUint) -> BigUint {
 
 /// Compute M1 = H(H(N) XOR H(g) | H(username) | salt | A | B | K).
 /// Note: `no_username_in_x` only affects x computation, NOT M1.
-/// M1 always uses the real username (apple_id).
+/// M1 always uses the real username (`apple_id`).
 ///
 /// Returns a fixed 32-byte array, avoiding heap allocation.
 fn compute_m1(
@@ -229,7 +293,7 @@ pub(crate) fn get_auth_headers(
 /// - no username in the x computation (Python's `no_username_in_x()`)
 /// - PBKDF2-derived password key
 pub async fn authenticate_srp(
-    session: &mut Session,
+    transport: &mut impl SrpTransport,
     endpoints: &Endpoints,
     apple_id: &str,
     password: &str,
@@ -257,35 +321,56 @@ pub async fn authenticate_srp(
     let referer = format!("{}/", endpoints.auth_root);
     let overrides: [(&str, &str); 2] = [("Origin", endpoints.auth_root), ("Referer", &referer)];
 
-    let init_headers =
-        get_auth_headers(domain, client_id, &session.session_data, Some(&overrides))?;
+    let init_headers = get_auth_headers(
+        domain,
+        client_id,
+        transport.session_data(),
+        Some(&overrides),
+    )?;
 
     tracing::debug!(apple_id = %apple_id, "Initiating SRP authentication");
 
     let init_url = format!("{}/signin/init", endpoints.auth);
-    let response = session
-        .post(&init_url, Some(init_body.to_string()), Some(init_headers))
+    let init_body = init_body.to_string();
+    let response = transport
+        .post(&init_url, Some(&init_body), Some(init_headers))
         .await?;
 
-    let status = response.status();
-    if status.as_u16() == 401 {
+    if response.status == 401 {
         return Err(AuthError::FailedLogin("Failed to initiate SRP authentication".into()).into());
     }
-    if !status.is_success() && status.as_u16() != 409 {
-        let text = response.text().await.unwrap_or_default();
+    if !response.is_success() && response.status != 409 {
+        let text = response.text();
+        let message = if text.contains('<') {
+            format!("HTTP {} from Apple auth service", response.status)
+        } else {
+            text
+        };
         return Err(AuthError::ApiError {
-            code: status.as_u16(),
-            message: text,
+            code: response.status,
+            message,
         }
         .into());
     }
 
-    let body: super::responses::SrpInitResponse = response
-        .json()
-        .await
-        .context("Failed to parse SRP init response as JSON")?;
+    let body: super::responses::SrpInitResponse = response.json().with_context(|| {
+        let text = response.text();
+        let mut n = text.len().min(200);
+        while n > 0 && !text.is_char_boundary(n) {
+            n -= 1;
+        }
+        format!(
+            "SRP init: expected JSON but got (HTTP {}): {:?}",
+            response.status,
+            &text[..n]
+        )
+    })?;
 
     let iterations = u32::try_from(body.iteration).context("SRP iteration count exceeds u32")?;
+    anyhow::ensure!(
+        iterations <= 1_000_000,
+        "SRP iteration count {iterations} exceeds safety limit"
+    );
 
     let salt = BASE64
         .decode(&body.salt)
@@ -331,8 +416,8 @@ pub async fn authenticate_srp(
     let m1_b64 = BASE64.encode(m1);
     let m2_b64 = BASE64.encode(m2);
 
-    let trust_tokens: Vec<String> = session
-        .session_data
+    let trust_tokens: Vec<String> = transport
+        .session_data()
         .get("trust_token")
         .filter(|t| !t.is_empty())
         .map(|t| vec![t.clone()])
@@ -350,44 +435,62 @@ pub async fn authenticate_srp(
     // Rebuild headers — init response may have rotated scnt/session_id
     let referer = format!("{}/", endpoints.auth_root);
     let overrides: [(&str, &str); 2] = [("Origin", endpoints.auth_root), ("Referer", &referer)];
-    let complete_headers =
-        get_auth_headers(domain, client_id, &session.session_data, Some(&overrides))?;
+    let complete_headers = get_auth_headers(
+        domain,
+        client_id,
+        transport.session_data(),
+        Some(&overrides),
+    )?;
     let complete_url = format!(
         "{}/signin/complete?isRememberMeEnabled=true",
         endpoints.auth
     );
-    let response = session
-        .post(
-            &complete_url,
-            Some(complete_body.to_string()),
-            Some(complete_headers),
-        )
+    let complete_body = complete_body.to_string();
+    let response = transport
+        .post(&complete_url, Some(&complete_body), Some(complete_headers))
         .await?;
 
-    let status = response.status();
-    if status.as_u16() == 409 {
+    if response.status == 409 {
         // 409 is Apple's signal that credentials are valid but 2FA is needed
         tracing::debug!("SRP complete returned 409: two-factor authentication required");
         return Ok(());
-    } else if status.as_u16() == 412 {
+    } else if response.status == 412 {
         tracing::debug!("SRP complete returned 412: attempting repair");
-        let repair_headers = get_auth_headers(domain, client_id, &session.session_data, None)?;
+        let repair_headers = get_auth_headers(domain, client_id, transport.session_data(), None)?;
         let repair_url = format!("{}/repair/complete", endpoints.auth);
-        let repair_response = session
-            .post(&repair_url, Some("{}".to_string()), Some(repair_headers))
+        let repair_response = transport
+            .post(&repair_url, Some("{}"), Some(repair_headers))
             .await?;
-        if !repair_response.status().is_success() {
-            let text = repair_response.text().await.unwrap_or_default();
+        if !repair_response.is_success() {
             return Err(AuthError::ApiError {
                 code: 412,
-                message: format!("Repair failed: {text}"),
+                message: format!("Repair failed: {}", repair_response.text()),
             }
             .into());
         }
-    } else if status.is_client_error() || status.is_server_error() {
-        let text = response.text().await.unwrap_or_default();
+    } else if response.is_server_error() {
+        let status = response.status;
+        let body = response.text();
+        let detail = if body.contains('<') {
+            // HTML error page — show just the status code
+            String::new()
+        } else {
+            format!(": {body}")
+        };
+        return Err(AuthError::FailedLogin(format!(
+            "Apple returned HTTP {status}{detail} — this is usually a temporary \
+             Apple server issue, try again in a few minutes"
+        ))
+        .into());
+    } else if response.is_client_error() {
+        let body = response.text();
+        let detail = if body.contains('<') {
+            String::new()
+        } else {
+            format!(": {body}")
+        };
         return Err(
-            AuthError::FailedLogin(format!("Invalid email/password combination: {text}")).into(),
+            AuthError::FailedLogin(format!("Invalid email/password combination{detail}")).into(),
         );
     }
 
@@ -489,5 +592,200 @@ mod tests {
             headers.get("X-Apple-ID-Session-Id").unwrap(),
             "test_session"
         );
+    }
+
+    // --- SRP orchestration tests ---
+
+    fn srp_init_body(b_b64: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "salt": BASE64.encode(b"salt1234"),
+            "b": b_b64,
+            "c": "challenge_token",
+            "iteration": 1,
+            "protocol": "s2k"
+        }))
+        .unwrap()
+    }
+
+    /// A valid SRP init response with B = 2 (non-zero mod N).
+    fn valid_init_response() -> SrpResponse {
+        SrpResponse {
+            status: 200,
+            body: srp_init_body(&BASE64.encode([2u8])),
+        }
+    }
+
+    struct StubSrpTransport {
+        responses: std::collections::VecDeque<SrpResponse>,
+        session_data: HashMap<String, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl SrpTransport for StubSrpTransport {
+        async fn post(
+            &mut self,
+            _url: &str,
+            _body: Option<&str>,
+            _headers: Option<HeaderMap>,
+        ) -> Result<SrpResponse> {
+            Ok(self
+                .responses
+                .pop_front()
+                .expect("StubSrpTransport: no more responses"))
+        }
+
+        fn session_data(&self) -> &HashMap<String, String> {
+            &self.session_data
+        }
+    }
+
+    fn stub(responses: Vec<SrpResponse>) -> StubSrpTransport {
+        StubSrpTransport {
+            responses: responses.into(),
+            session_data: HashMap::new(),
+        }
+    }
+
+    async fn run_srp(responses: Vec<SrpResponse>) -> Result<()> {
+        let mut t = stub(responses);
+        let ep = Endpoints::for_domain("com").unwrap();
+        authenticate_srp(&mut t, &ep, "u@test.com", "p", "c", "com").await
+    }
+
+    #[tokio::test]
+    async fn srp_init_401_returns_failed_login() {
+        let err = run_srp(vec![SrpResponse {
+            status: 401,
+            body: vec![],
+        }])
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Failed to initiate SRP"));
+    }
+
+    #[tokio::test]
+    async fn srp_init_500_returns_api_error() {
+        let err = run_srp(vec![SrpResponse {
+            status: 500,
+            body: b"server error".to_vec(),
+        }])
+        .await
+        .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        assert!(matches!(auth_err, AuthError::ApiError { code: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn srp_init_invalid_json_returns_parse_error() {
+        let err = run_srp(vec![SrpResponse {
+            status: 200,
+            body: b"not json".to_vec(),
+        }])
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("SRP init: expected JSON"));
+    }
+
+    #[tokio::test]
+    async fn srp_b_mod_n_zero_returns_error() {
+        let err = run_srp(vec![SrpResponse {
+            status: 200,
+            body: srp_init_body(&BASE64.encode([0u8])),
+        }])
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("B mod N is zero"));
+    }
+
+    #[tokio::test]
+    async fn srp_happy_path() {
+        run_srp(vec![
+            valid_init_response(),
+            SrpResponse {
+                status: 200,
+                body: vec![],
+            },
+        ])
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn srp_complete_409_signals_2fa_required() {
+        run_srp(vec![
+            valid_init_response(),
+            SrpResponse {
+                status: 409,
+                body: vec![],
+            },
+        ])
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn srp_complete_412_repair_succeeds() {
+        run_srp(vec![
+            valid_init_response(),
+            SrpResponse {
+                status: 412,
+                body: vec![],
+            },
+            SrpResponse {
+                status: 200,
+                body: vec![],
+            },
+        ])
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn srp_complete_412_repair_fails() {
+        let err = run_srp(vec![
+            valid_init_response(),
+            SrpResponse {
+                status: 412,
+                body: vec![],
+            },
+            SrpResponse {
+                status: 500,
+                body: b"repair broken".to_vec(),
+            },
+        ])
+        .await
+        .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        assert!(matches!(auth_err, AuthError::ApiError { code: 412, .. }));
+    }
+
+    #[tokio::test]
+    async fn srp_complete_client_error_returns_failed_login() {
+        let err = run_srp(vec![
+            valid_init_response(),
+            SrpResponse {
+                status: 403,
+                body: b"forbidden".to_vec(),
+            },
+        ])
+        .await
+        .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        assert!(matches!(auth_err, AuthError::FailedLogin(_)));
+    }
+
+    #[tokio::test]
+    async fn srp_complete_server_error_returns_failed_login() {
+        let err = run_srp(vec![
+            valid_init_response(),
+            SrpResponse {
+                status: 502,
+                body: b"bad gateway".to_vec(),
+            },
+        ])
+        .await
+        .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        assert!(matches!(auth_err, AuthError::FailedLogin(_)));
     }
 }

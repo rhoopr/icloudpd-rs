@@ -4,19 +4,54 @@ use crate::types::{
 };
 use clap::{Parser, Subcommand};
 
+/// Reject empty strings at CLI parse time.
+fn non_empty_string(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        Err("value must not be empty".to_string())
+    } else {
+        Ok(s.to_string())
+    }
+}
+
+/// Validate that a string is exactly 6 ASCII digits.
+fn parse_2fa_code(s: &str) -> Result<String, String> {
+    if s.len() == 6 && s.chars().all(|c| c.is_ascii_digit()) {
+        Ok(s.to_string())
+    } else {
+        Err("must be exactly 6 digits".to_string())
+    }
+}
+
 /// Authentication arguments shared across all commands and subcommands.
 /// Username is optional at the clap level; validated at runtime after TOML merge.
 #[derive(Parser, Debug, Clone)]
 pub struct AuthArgs {
     /// Apple ID email address
-    #[arg(short = 'u', long, env = "ICLOUD_USERNAME")]
+    #[arg(short = 'u', long, env = "ICLOUD_USERNAME", value_parser = non_empty_string)]
     pub username: Option<String>,
 
     /// iCloud password (if not provided, will prompt).
     /// WARNING: passing via --password is visible in process listings.
-    /// Prefer the ICLOUD_PASSWORD environment variable instead.
-    #[arg(short = 'p', long, env = "ICLOUD_PASSWORD")]
+    /// Prefer the `ICLOUD_PASSWORD` environment variable instead.
+    #[arg(short = 'p', long, env = "ICLOUD_PASSWORD", value_parser = non_empty_string)]
     pub password: Option<String>,
+
+    /// Read password from a file on each auth attempt.
+    /// Supports Docker secrets (e.g., /run/secrets/icloud_password).
+    /// Trailing newline is stripped.
+    #[arg(long, conflicts_with = "password")]
+    pub password_file: Option<String>,
+
+    /// Execute a shell command to obtain the password on each auth attempt.
+    /// Supports external secret managers (1Password, Vault, pass).
+    /// Example: --password-command "op read 'op://vault/icloud/password'"
+    #[arg(long, conflicts_with_all = ["password", "password_file"])]
+    pub password_command: Option<String>,
+
+    /// After successful auth, persist the password to the credential store
+    /// (OS keyring or encrypted file).
+    #[arg(long)]
+    pub save_password: bool,
 
     /// iCloud domain (com or cn)
     #[arg(long, value_enum)]
@@ -31,26 +66,26 @@ pub struct AuthArgs {
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
     /// Local directory for downloads
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, value_parser = non_empty_string)]
     pub directory: Option<String>,
 
     /// Only authenticate (create/update session tokens)
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["watch_with_interval", "list_albums", "list_libraries"])]
     pub auth_only: bool,
 
     /// List available albums
-    #[arg(short = 'l', long)]
+    #[arg(short = 'l', long, conflicts_with_all = ["watch_with_interval", "list_libraries"])]
     pub list_albums: bool,
 
     /// List available libraries
-    #[arg(long)]
+    #[arg(long, conflicts_with = "watch_with_interval")]
     pub list_libraries: bool,
 
     /// Album(s) to download
-    #[arg(short = 'a', long = "album")]
+    #[arg(short = 'a', long = "album", value_parser = non_empty_string)]
     pub albums: Vec<String>,
 
-    /// Library to download (default: PrimarySync, use "all" for all libraries)
+    /// Library to download (default: `PrimarySync`, use "all" for all libraries)
     #[arg(long)]
     pub library: Option<String>,
 
@@ -63,52 +98,52 @@ pub struct SyncArgs {
     pub live_photo_size: Option<LivePhotoSize>,
 
     /// Number of recent photos to download
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub recent: Option<u32>,
 
     /// Number of concurrent download threads (default: 10)
     #[arg(long = "threads-num", value_parser = clap::value_parser!(u16).range(1..))]
     pub threads_num: Option<u16>,
 
-    /// Don't download videos
-    #[arg(long)]
-    pub skip_videos: bool,
+    /// Don't download videos (pass `false` to override config file)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub skip_videos: Option<bool>,
 
-    /// Don't download photos
-    #[arg(long)]
-    pub skip_photos: bool,
+    /// Don't download photos (pass `false` to override config file)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub skip_photos: Option<bool>,
 
-    /// Don't download live photos
-    #[arg(long)]
-    pub skip_live_photos: bool,
+    /// Don't download live photos (pass `false` to override config file)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub skip_live_photos: Option<bool>,
 
     /// Only download requested size (don't fall back to original)
-    #[arg(long)]
-    pub force_size: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub force_size: Option<bool>,
 
     /// Folder structure for organizing downloads
     #[arg(long)]
     pub folder_structure: Option<String>,
 
-    /// Write DateTimeOriginal EXIF tag if missing
-    #[arg(long)]
-    pub set_exif_datetime: bool,
+    /// Write `DateTimeOriginal` EXIF tag if missing
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub set_exif_datetime: Option<bool>,
 
     /// Do not modify local system or iCloud
-    #[arg(long)]
+    #[arg(long, conflicts_with = "watch_with_interval")]
     pub dry_run: bool,
 
-    /// Run continuously, waiting N seconds between runs
-    #[arg(long)]
+    /// Run continuously, waiting N seconds between runs (minimum: 60)
+    #[arg(long, value_parser = clap::value_parser!(u64).range(60..))]
     pub watch_with_interval: Option<u64>,
 
     /// Disable progress bar
-    #[arg(long)]
-    pub no_progress_bar: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub no_progress_bar: Option<bool>,
 
     /// Keep Unicode in filenames
-    #[arg(long)]
-    pub keep_unicode_in_filenames: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub keep_unicode_in_filenames: Option<bool>,
 
     /// Live photo MOV filename policy
     #[arg(long, value_enum)]
@@ -131,15 +166,15 @@ pub struct SyncArgs {
     pub skip_created_after: Option<String>,
 
     /// Only print filenames without downloading
-    #[arg(long)]
+    #[arg(long, conflicts_with = "watch_with_interval")]
     pub only_print_filenames: bool,
 
-    /// Max retries per download (default: 3, 0 = no retries)
-    #[arg(long)]
+    /// Max retries per download (default: 3, 0 = no retries, max: 100)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=100))]
     pub max_retries: Option<u32>,
 
-    /// Initial retry delay in seconds (default: 5)
-    #[arg(long)]
+    /// Initial retry delay in seconds (default: 5, range: 1–3600)
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub retry_delay: Option<u64>,
 
     /// Temp file suffix for partial downloads (default: .kei-tmp).
@@ -155,17 +190,17 @@ pub struct SyncArgs {
     #[arg(long)]
     pub reset_sync_token: bool,
 
-    /// Send systemd sd_notify messages (READY, STOPPING, STATUS).
+    /// Send systemd `sd_notify` messages (READY, STOPPING, STATUS).
     /// Only effective on Linux with a systemd service unit.
-    #[arg(long)]
-    pub notify_systemd: bool,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub notify_systemd: Option<bool>,
 
     /// Write PID to file (for service managers).
     #[arg(long)]
     pub pid_file: Option<std::path::PathBuf>,
 
     /// Script to run on events (2FA required, sync complete, etc.).
-    /// Called with KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME env vars.
+    /// Called with `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars.
     #[arg(long)]
     pub notification_script: Option<String>,
 }
@@ -209,15 +244,19 @@ pub struct ImportArgs {
     pub auth: AuthArgs,
 
     /// Local directory containing existing downloads
-    #[arg(short = 'd', long)]
-    pub directory: String,
+    #[arg(short = 'd', long, value_parser = non_empty_string)]
+    pub directory: Option<String>,
 
     /// Folder structure used for existing downloads
-    #[arg(long, default_value = "%Y/%m/%d")]
-    pub folder_structure: String,
+    #[arg(long)]
+    pub folder_structure: Option<String>,
+
+    /// Keep Unicode in filenames (must match what was used during sync)
+    #[arg(long)]
+    pub keep_unicode_in_filenames: Option<bool>,
 
     /// Number of recent photos to check
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub recent: Option<u32>,
 
     /// Disable progress bar
@@ -250,10 +289,16 @@ pub struct SubmitCodeArgs {
     pub auth: AuthArgs,
 
     /// 6-digit 2FA code from your trusted device
+    #[arg(value_parser = parse_2fa_code)]
     pub code: String,
 }
 
 /// Subcommands for kei.
+///
+/// Every variant that carries [`AuthArgs`] must be listed in
+/// [`Command::inject_env_password`] so that the captured
+/// `ICLOUD_PASSWORD` value is available after the env var has been
+/// scrubbed from the process environment.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     /// Download photos from iCloud (default command)
@@ -286,12 +331,36 @@ pub enum Command {
     /// Submit a 2FA code non-interactively (for Docker / headless use)
     SubmitCode(SubmitCodeArgs),
 
+    /// Manage stored credentials (OS keyring or encrypted file)
+    Credential(CredentialArgs),
+
     /// Interactively generate a config file
     Setup {
         /// Output path (overrides --config)
         #[arg(short = 'o', long)]
         output: Option<String>,
     },
+}
+
+/// Arguments for the credential subcommand.
+#[derive(Parser, Debug, Clone)]
+pub struct CredentialArgs {
+    #[command(flatten)]
+    pub auth: AuthArgs,
+
+    #[command(subcommand)]
+    pub action: CredentialAction,
+}
+
+/// Credential management actions.
+#[derive(Subcommand, Debug, Clone)]
+pub enum CredentialAction {
+    /// Store a password in the credential store (prompts interactively)
+    Set,
+    /// Remove a stored password
+    Clear,
+    /// Show which credential backend is active (keyring, encrypted-file, none)
+    Backend,
 }
 
 #[derive(Parser, Debug)]
@@ -317,15 +386,201 @@ pub struct Cli {
     pub sync: SyncArgs,
 }
 
+impl AuthArgs {
+    /// Merge top-level (fallback) auth args into self.
+    /// Subcommand values take precedence; top-level fills in gaps.
+    fn merge_from(&mut self, fallback: &AuthArgs) {
+        if self.username.is_none() {
+            self.username.clone_from(&fallback.username);
+        }
+        if self.password.is_none() {
+            self.password.clone_from(&fallback.password);
+        }
+        if self.password_file.is_none() {
+            self.password_file.clone_from(&fallback.password_file);
+        }
+        if self.password_command.is_none() {
+            self.password_command.clone_from(&fallback.password_command);
+        }
+        self.save_password = self.save_password || fallback.save_password;
+        if self.domain.is_none() {
+            self.domain = fallback.domain;
+        }
+        if self.cookie_directory.is_none() {
+            self.cookie_directory.clone_from(&fallback.cookie_directory);
+        }
+    }
+}
+
+impl SyncArgs {
+    /// Merge top-level (fallback) sync args into self.
+    /// Subcommand values take precedence; top-level fills in gaps.
+    fn merge_from(&mut self, fallback: &SyncArgs) {
+        if self.directory.is_none() {
+            self.directory.clone_from(&fallback.directory);
+        }
+        self.auth_only = self.auth_only || fallback.auth_only;
+        self.list_albums = self.list_albums || fallback.list_albums;
+        self.list_libraries = self.list_libraries || fallback.list_libraries;
+        if self.albums.is_empty() {
+            self.albums.clone_from(&fallback.albums);
+        }
+        if self.library.is_none() {
+            self.library.clone_from(&fallback.library);
+        }
+        if self.size.is_none() {
+            self.size = fallback.size;
+        }
+        if self.live_photo_size.is_none() {
+            self.live_photo_size = fallback.live_photo_size;
+        }
+        if self.recent.is_none() {
+            self.recent = fallback.recent;
+        }
+        if self.threads_num.is_none() {
+            self.threads_num = fallback.threads_num;
+        }
+        if self.skip_videos.is_none() {
+            self.skip_videos = fallback.skip_videos;
+        }
+        if self.skip_photos.is_none() {
+            self.skip_photos = fallback.skip_photos;
+        }
+        if self.skip_live_photos.is_none() {
+            self.skip_live_photos = fallback.skip_live_photos;
+        }
+        if self.force_size.is_none() {
+            self.force_size = fallback.force_size;
+        }
+        if self.folder_structure.is_none() {
+            self.folder_structure.clone_from(&fallback.folder_structure);
+        }
+        if self.set_exif_datetime.is_none() {
+            self.set_exif_datetime = fallback.set_exif_datetime;
+        }
+        self.dry_run = self.dry_run || fallback.dry_run;
+        if self.watch_with_interval.is_none() {
+            self.watch_with_interval = fallback.watch_with_interval;
+        }
+        if self.no_progress_bar.is_none() {
+            self.no_progress_bar = fallback.no_progress_bar;
+        }
+        if self.keep_unicode_in_filenames.is_none() {
+            self.keep_unicode_in_filenames = fallback.keep_unicode_in_filenames;
+        }
+        if self.live_photo_mov_filename_policy.is_none() {
+            self.live_photo_mov_filename_policy = fallback.live_photo_mov_filename_policy;
+        }
+        if self.align_raw.is_none() {
+            self.align_raw = fallback.align_raw;
+        }
+        if self.file_match_policy.is_none() {
+            self.file_match_policy = fallback.file_match_policy;
+        }
+        if self.skip_created_before.is_none() {
+            self.skip_created_before
+                .clone_from(&fallback.skip_created_before);
+        }
+        if self.skip_created_after.is_none() {
+            self.skip_created_after
+                .clone_from(&fallback.skip_created_after);
+        }
+        self.only_print_filenames = self.only_print_filenames || fallback.only_print_filenames;
+        if self.max_retries.is_none() {
+            self.max_retries = fallback.max_retries;
+        }
+        if self.retry_delay.is_none() {
+            self.retry_delay = fallback.retry_delay;
+        }
+        if self.temp_suffix.is_none() {
+            self.temp_suffix.clone_from(&fallback.temp_suffix);
+        }
+        self.no_incremental = self.no_incremental || fallback.no_incremental;
+        self.reset_sync_token = self.reset_sync_token || fallback.reset_sync_token;
+        if self.notify_systemd.is_none() {
+            self.notify_systemd = fallback.notify_systemd;
+        }
+        if self.pid_file.is_none() {
+            self.pid_file.clone_from(&fallback.pid_file);
+        }
+        if self.notification_script.is_none() {
+            self.notification_script
+                .clone_from(&fallback.notification_script);
+        }
+    }
+}
+
 impl Cli {
     /// Get the effective command, treating bare invocation as sync.
+    ///
+    /// When a subcommand is present, top-level auth/sync args are merged
+    /// as fallbacks so `kei --username X sync` works the same as
+    /// `kei sync --username X`.
     pub fn effective_command(&self) -> Command {
         match &self.command {
-            Some(cmd) => cmd.clone(),
+            Some(cmd) => {
+                let mut cmd = cmd.clone();
+                cmd.merge_top_level_args(&self.auth, &self.sync);
+                cmd
+            }
             None => Command::Sync {
                 auth: self.auth.clone(),
                 sync: self.sync.clone(),
             },
+        }
+    }
+}
+
+impl Command {
+    /// Merge top-level CLI auth/sync args as fallbacks into the subcommand's
+    /// own args. This makes `kei --username X sync` equivalent to
+    /// `kei sync --username X`.
+    fn merge_top_level_args(&mut self, top_auth: &AuthArgs, top_sync: &SyncArgs) {
+        match self {
+            Self::Sync {
+                ref mut auth,
+                ref mut sync,
+            } => {
+                auth.merge_from(top_auth);
+                sync.merge_from(top_sync);
+            }
+            Self::RetryFailed(args) => {
+                args.auth.merge_from(top_auth);
+                args.sync.merge_from(top_sync);
+            }
+            Self::Status(args) => args.auth.merge_from(top_auth),
+            Self::ResetState(args) => args.auth.merge_from(top_auth),
+            Self::ImportExisting(args) => args.auth.merge_from(top_auth),
+            Self::Verify(args) => args.auth.merge_from(top_auth),
+            Self::GetCode(args) => args.auth.merge_from(top_auth),
+            Self::SubmitCode(args) => args.auth.merge_from(top_auth),
+            Self::Credential(args) => args.auth.merge_from(top_auth),
+            Self::Setup { .. } => {}
+        }
+    }
+
+    /// Inject the `ICLOUD_PASSWORD` value captured before `Cli::parse()`.
+    ///
+    /// The env var is removed from the process environment for security
+    /// (prevents leaking via `/proc/*/environ`), but clap's `env` attribute
+    /// never sees it. This method restores it into whichever `AuthArgs`
+    /// the active command carries.
+    pub fn inject_env_password(&mut self, env_password: Option<String>) {
+        let Some(pw) = env_password else { return };
+        let auth = match self {
+            Self::Sync { ref mut auth, .. } => auth,
+            Self::Status(args) => &mut args.auth,
+            Self::RetryFailed(args) => &mut args.auth,
+            Self::ResetState(args) => &mut args.auth,
+            Self::ImportExisting(args) => &mut args.auth,
+            Self::Verify(args) => &mut args.auth,
+            Self::GetCode(args) => &mut args.auth,
+            Self::SubmitCode(args) => &mut args.auth,
+            Self::Credential(args) => &mut args.auth,
+            Self::Setup { .. } => return,
+        };
+        if auth.password.is_none() {
+            auth.password = Some(pw);
         }
     }
 }
@@ -559,9 +814,9 @@ mod tests {
     }
 
     #[test]
-    fn test_notify_systemd_default_false() {
+    fn test_notify_systemd_default_none() {
         let cli = parse(&base_args());
-        assert!(!cli.sync.notify_systemd);
+        assert_eq!(cli.sync.notify_systemd, None);
     }
 
     #[test]
@@ -569,7 +824,7 @@ mod tests {
         let mut args = base_args();
         args.push("--notify-systemd");
         let cli = parse(&args);
-        assert!(cli.sync.notify_systemd);
+        assert_eq!(cli.sync.notify_systemd, Some(true));
     }
 
     #[test]
@@ -683,6 +938,98 @@ mod tests {
     }
 
     #[test]
+    fn test_password_file_flag() {
+        let mut args = base_args();
+        args.extend(["--password-file", "/run/secrets/pw"]);
+        let cli = parse(&args);
+        assert_eq!(cli.auth.password_file.as_deref(), Some("/run/secrets/pw"));
+    }
+
+    #[test]
+    fn test_password_command_flag() {
+        let mut args = base_args();
+        args.extend(["--password-command", "op read 'op://vault/icloud/pw'"]);
+        let cli = parse(&args);
+        assert_eq!(
+            cli.auth.password_command.as_deref(),
+            Some("op read 'op://vault/icloud/pw'")
+        );
+    }
+
+    #[test]
+    fn test_password_conflicts_with_password_file() {
+        let mut args = base_args();
+        args.extend(["--password", "pw", "--password-file", "/tmp/pw.txt"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_password_conflicts_with_password_command() {
+        let mut args = base_args();
+        args.extend(["--password", "pw", "--password-command", "echo pw"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_password_file_conflicts_with_password_command() {
+        let mut args = base_args();
+        args.extend([
+            "--password-file",
+            "/tmp/pw",
+            "--password-command",
+            "echo pw",
+        ]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_save_password_flag() {
+        let mut args = base_args();
+        args.push("--save-password");
+        let cli = parse(&args);
+        assert!(cli.auth.save_password);
+    }
+
+    #[test]
+    fn test_save_password_default_false() {
+        let cli = parse(&base_args());
+        assert!(!cli.auth.save_password);
+    }
+
+    #[test]
+    fn test_credential_set_subcommand() {
+        let cli =
+            Cli::try_parse_from(["kei", "credential", "--username", "test@example.com", "set"])
+                .unwrap();
+        if let Some(Command::Credential(args)) = cli.command {
+            assert!(matches!(args.action, CredentialAction::Set));
+            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
+        } else {
+            panic!("Expected Credential command");
+        }
+    }
+
+    #[test]
+    fn test_credential_clear_subcommand() {
+        let cli = Cli::try_parse_from(["kei", "credential", "clear"]).unwrap();
+        if let Some(Command::Credential(args)) = cli.command {
+            assert!(matches!(args.action, CredentialAction::Clear));
+        } else {
+            panic!("Expected Credential command");
+        }
+    }
+
+    #[test]
+    fn test_credential_backend_subcommand() {
+        let cli = Cli::try_parse_from(["kei", "credential", "backend"]).unwrap();
+        if let Some(Command::Credential(args)) = cli.command {
+            assert!(matches!(args.action, CredentialAction::Backend));
+        } else {
+            panic!("Expected Credential command");
+        }
+    }
+
+    #[test]
     fn test_cookie_directory_custom() {
         let mut args = base_args();
         args.extend(["--cookie-directory", "/tmp/claude/cookies"]);
@@ -745,7 +1092,15 @@ mod tests {
         let mut args = base_args();
         args.push("--skip-videos");
         let cli = parse(&args);
-        assert!(cli.sync.skip_videos);
+        assert_eq!(cli.sync.skip_videos, Some(true));
+    }
+
+    #[test]
+    fn test_skip_videos_explicit_false() {
+        let mut args = base_args();
+        args.extend(["--skip-videos", "false"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.skip_videos, Some(false));
     }
 
     #[test]
@@ -753,7 +1108,7 @@ mod tests {
         let mut args = base_args();
         args.push("--skip-photos");
         let cli = parse(&args);
-        assert!(cli.sync.skip_photos);
+        assert_eq!(cli.sync.skip_photos, Some(true));
     }
 
     #[test]
@@ -761,7 +1116,7 @@ mod tests {
         let mut args = base_args();
         args.push("--skip-live-photos");
         let cli = parse(&args);
-        assert!(cli.sync.skip_live_photos);
+        assert_eq!(cli.sync.skip_live_photos, Some(true));
     }
 
     #[test]
@@ -769,7 +1124,7 @@ mod tests {
         let mut args = base_args();
         args.push("--force-size");
         let cli = parse(&args);
-        assert!(cli.sync.force_size);
+        assert_eq!(cli.sync.force_size, Some(true));
     }
 
     #[test]
@@ -777,7 +1132,7 @@ mod tests {
         let mut args = base_args();
         args.push("--set-exif-datetime");
         let cli = parse(&args);
-        assert!(cli.sync.set_exif_datetime);
+        assert_eq!(cli.sync.set_exif_datetime, Some(true));
     }
 
     #[test]
@@ -785,7 +1140,7 @@ mod tests {
         let mut args = base_args();
         args.push("--no-progress-bar");
         let cli = parse(&args);
-        assert!(cli.sync.no_progress_bar);
+        assert_eq!(cli.sync.no_progress_bar, Some(true));
     }
 
     #[test]
@@ -793,7 +1148,7 @@ mod tests {
         let mut args = base_args();
         args.push("--keep-unicode-in-filenames");
         let cli = parse(&args);
-        assert!(cli.sync.keep_unicode_in_filenames);
+        assert_eq!(cli.sync.keep_unicode_in_filenames, Some(true));
     }
 
     // ── Enum variants ──────────────────────────────────────────────
@@ -931,6 +1286,63 @@ mod tests {
     }
 
     #[test]
+    fn test_watch_with_interval_rejects_below_minimum() {
+        let mut args = base_args();
+        args.extend(["--watch-with-interval", "0"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+
+        let mut args = base_args();
+        args.extend(["--watch-with-interval", "59"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+
+        let mut args = base_args();
+        args.extend(["--watch-with-interval", "60"]);
+        assert!(Cli::try_parse_from(&args).is_ok());
+    }
+
+    #[test]
+    fn test_auth_only_conflicts_with_watch() {
+        let mut args = base_args();
+        args.extend(["--auth-only", "--watch-with-interval", "300"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_auth_only_conflicts_with_list_albums() {
+        let mut args = base_args();
+        args.extend(["--auth-only", "--list-albums"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_auth_only_conflicts_with_list_libraries() {
+        let mut args = base_args();
+        args.extend(["--auth-only", "--list-libraries"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_list_albums_conflicts_with_watch() {
+        let mut args = base_args();
+        args.extend(["--list-albums", "--watch-with-interval", "300"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_list_libraries_conflicts_with_watch() {
+        let mut args = base_args();
+        args.extend(["--list-libraries", "--watch-with-interval", "300"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_list_albums_conflicts_with_list_libraries() {
+        let mut args = base_args();
+        args.extend(["--list-albums", "--list-libraries"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
     fn test_skip_created_before() {
         let mut args = base_args();
         args.extend(["--skip-created-before", "2024-01-01"]);
@@ -1014,8 +1426,8 @@ mod tests {
         .unwrap();
         if let Some(Command::ImportExisting(args)) = cli.command {
             assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
-            assert_eq!(args.directory, "/photos");
-            assert_eq!(args.folder_structure, "%Y/%m/%d");
+            assert_eq!(args.directory.as_deref(), Some("/photos"));
+            assert!(args.folder_structure.is_none());
             assert!(args.recent.is_none());
         } else {
             panic!("Expected ImportExisting command");
@@ -1190,6 +1602,112 @@ mod tests {
         } else {
             panic!("Expected SubmitCode command");
         }
+    }
+
+    // ── input validation ────────────────────────────────────────────
+
+    #[test]
+    fn test_empty_username_rejected() {
+        let args = ["kei", "--username", ""];
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn test_empty_password_rejected() {
+        let mut args = base_args();
+        args.extend(["--password", ""]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_empty_directory_rejected() {
+        let args = ["kei", "--username", "user@example.com", "--directory", ""];
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn test_empty_album_rejected() {
+        let mut args = base_args();
+        args.extend(["--album", ""]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_empty_import_directory_rejected() {
+        let args = [
+            "kei",
+            "import-existing",
+            "--username",
+            "user@example.com",
+            "--directory",
+            "",
+        ];
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_non_digits() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", "abcdef"]).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_too_short() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", "12345"]).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_too_long() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", "1234567"]).is_err());
+    }
+
+    #[test]
+    fn test_submit_code_rejects_empty() {
+        assert!(Cli::try_parse_from(["kei", "submit-code", ""]).is_err());
+    }
+
+    #[test]
+    fn test_retry_delay_rejects_zero() {
+        let mut args = base_args();
+        args.extend(["--retry-delay", "0"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_retry_delay_accepts_one() {
+        let mut args = base_args();
+        args.extend(["--retry-delay", "1"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.retry_delay, Some(1));
+    }
+
+    #[test]
+    fn test_retry_delay_rejects_above_3600() {
+        let mut args = base_args();
+        args.extend(["--retry-delay", "3601"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_retry_delay_accepts_3600() {
+        let mut args = base_args();
+        args.extend(["--retry-delay", "3600"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.retry_delay, Some(3600));
+    }
+
+    #[test]
+    fn test_max_retries_rejects_above_100() {
+        let mut args = base_args();
+        args.extend(["--max-retries", "101"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
+    fn test_max_retries_accepts_100() {
+        let mut args = base_args();
+        args.extend(["--max-retries", "100"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.max_retries, Some(100));
     }
 
     // ── no-incremental / reset-sync-token flags ───────────────────

@@ -8,7 +8,6 @@
   <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/v/release/rhoopr/kei?color=blue&label=version" alt="Version"></a>
   <a href="https://github.com/rhoopr/kei/actions"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/ci.yml?label=build" alt="Build"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
-  <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/downloads/rhoopr/kei/total?color=green" alt="Downloads"></a>
   <a href="https://github.com/rhoopr/homebrew-kei"><img src="https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew" alt="Homebrew"></a>
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
 </p>
@@ -76,6 +75,8 @@ kei -u you@example.com -d ~/Photos/iCloud
 
 You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to approve 2FA on a trusted device. Downloads start right after.
 
+For long-running setups (Docker, cron, systemd), use `--password-file`, `--password-command`, or `kei credential set` to avoid storing passwords in environment variables. See the [wiki](https://github.com/rhoopr/kei/wiki/Credentials) for details.
+
 ## Usage
 
 ```sh
@@ -101,7 +102,7 @@ Run `kei --help` for all flags.
 
 kei downloads on a streaming pipeline. It starts fetching files as soon as the first API page comes back, rather than waiting to enumerate the whole library. After the first full sync, it uses Apple's CloudKit syncToken to pull only what changed - a no-change check takes 1-2 API calls.
 
-Downloads run with configurable concurrency (default 10). Partial downloads are saved as `.kei-tmp` files and resumed via HTTP Range headers. Every file is verified against its SHA256 checksum.
+Downloads run with configurable concurrency (default 10). Partial downloads are saved as `.kei-tmp` files and resumed via HTTP Range headers. Every file is verified against its expected size and content-type before being committed to the download directory.
 
 State lives in a SQLite database alongside your session cookies in `~/.config/kei/`. The DB tracks what's been downloaded, what failed, and where files landed on disk. This is what makes `retry-failed`, `verify`, and `import-existing` possible.
 
@@ -118,19 +119,23 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 | `import-existing` | Import local files into the state DB so they aren't re-downloaded. |
 | `get-code` | Request a 2FA code from Apple. Triggers a push to your trusted devices. |
 | `submit-code` | Submit a 2FA code non-interactively. For Docker and headless setups. |
+| `credential` | Manage stored passwords (OS keyring or encrypted file). `set`, `clear`, `backend`. |
 
 ## Features
 
 - Parallel downloads with streaming pipeline - files start downloading before enumeration finishes
 - Incremental sync via CloudKit syncTokens - only fetches what changed
-- Resumable transfers with `.kei-tmp` partial files and SHA256 verification
+- Resumable transfers with `.kei-tmp` partial files, size verification, and content validation
 - SQLite state tracking across runs (downloaded, failed, pending)
 - Watch mode with configurable interval, systemd notify, PID file, graceful shutdown
 - Multi-library sync (`--library all` for personal + shared)
+- Flexible password sources: interactive prompt, env var, `--password-file`, `--password-command`, or OS keyring
 - Date-based folder structure, live photo MOV pairing, EXIF datetime stamping
 - Multi-arch Docker images (amd64/arm64) with headless 2FA via `get-code` + `submit-code`
 - Notification scripts on events: `2fa_required`, `sync_complete`, `sync_failed`, `session_expired`
 - Content filtering: skip videos/photos/live photos, date ranges, `--recent N`
+- Adjusted video and edited live photo MOV downloads (`--size adjusted`)
+- Structured exit codes (0 success, 2 partial, 3 auth) for scripting
 - Exponential backoff retries with transient vs. permanent error classification
 - TOML config file with `setup` wizard, CLI flags override config values
 
@@ -139,7 +144,6 @@ State lives in a SQLite database alongside your session cookies in `~/.config/ke
 - [Wiki](https://github.com/rhoopr/kei/wiki) - configuration, Docker, troubleshooting
 - [Migration Guide](docs/migration-from-python.md) - switching from `icloudpd`
 - [Changelog](CHANGELOG.md)
-- [Roadmap](docs/roadmap.md)
 - [How iCloud's Incremental Sync Works](https://robhooper.xyz/blog-synctoken) - deep dive on CloudKit syncTokens
 
 ## Contributing

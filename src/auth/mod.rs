@@ -14,6 +14,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
 use self::endpoints::Endpoints;
@@ -60,7 +61,7 @@ impl std::fmt::Debug for AuthResult {
 pub async fn authenticate(
     cookie_dir: &Path,
     apple_id: &str,
-    password_provider: &dyn Fn() -> Option<String>,
+    password_provider: &dyn Fn() -> Option<SecretString>,
     domain: &str,
     client_id: Option<String>,
     timeout_secs: Option<u64>,
@@ -79,7 +80,8 @@ pub async fn authenticate(
     session.set_client_id(&client_id);
 
     let mut data: Option<AccountLoginResponse> = None;
-    if session.session_data.contains_key("session_token") {
+    let has_session_token = session.session_data.contains_key("session_token");
+    if has_session_token {
         tracing::debug!("Checking session token validity");
         match twofa::validate_token(&mut session, &endpoints).await {
             Ok(d) => {
@@ -95,6 +97,29 @@ pub async fn authenticate(
         }
     }
 
+    // When submit-code provides a code and a session_token already exists
+    // (from a prior SRP by --auth-only or get-code), try /accountLogin
+    // before falling back to SRP. The /validate endpoint above is stricter
+    // and rejects pre-2FA sessions, but /accountLogin works — it returns
+    // account data showing 2FA is required, letting us skip straight to
+    // code submission without re-initiating SRP (which triggers a new
+    // 2FA push from Apple, invalidating the code the user already has).
+    if data.is_none() && code.is_some() && has_session_token {
+        tracing::debug!("Session token exists with code provided, trying accountLogin before SRP");
+        match twofa::authenticate_with_token(&mut session, &endpoints).await {
+            Ok(d) => {
+                tracing::debug!("accountLogin succeeded, skipping SRP");
+                data = Some(d);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "accountLogin failed, falling back to SRP"
+                );
+            }
+        }
+    }
+
     if data.is_none() {
         let password = password_provider()
             .ok_or_else(|| AuthError::FailedLogin("Password provider returned no data".into()))?;
@@ -105,11 +130,12 @@ pub async fn authenticate(
             &mut session,
             &endpoints,
             apple_id,
-            &password,
+            password.expose_secret(),
             &client_id,
             domain,
         )
         .await?;
+        // `password` (SecretString) dropped here, zeroing memory
 
         let account_data = twofa::authenticate_with_token(&mut session, &endpoints).await?;
         data = Some(account_data);
@@ -178,7 +204,7 @@ pub async fn authenticate(
 pub async fn send_2fa_push(
     cookie_dir: &Path,
     apple_id: &str,
-    password_provider: &dyn Fn() -> Option<String>,
+    password_provider: &dyn Fn() -> Option<SecretString>,
     domain: &str,
 ) -> Result<()> {
     let endpoints = Endpoints::for_domain(domain)?;
@@ -204,7 +230,7 @@ pub async fn send_2fa_push(
             &mut session,
             &endpoints,
             apple_id,
-            &password,
+            password.expose_secret(),
             &client_id,
             domain,
         )
@@ -233,7 +259,7 @@ pub async fn validate_session(session: &mut Session, domain: &str) -> Result<boo
 }
 
 /// Apple's HSA2 (two-step verification v2) requires all three conditions:
-/// the account uses HSAv2, the browser isn't trusted yet, and the account
+/// the account uses `HSAv2`, the browser isn't trusted yet, and the account
 /// has a device capable of receiving verification codes.
 fn check_requires_2fa(data: &AccountLoginResponse) -> bool {
     let (hsa_version, has_qualifying_device) = match &data.ds_info {
@@ -267,6 +293,8 @@ mod tests {
             hsa_challenge_required: challenge,
             hsa_trusted_browser: trusted,
             domain_to_use: None,
+            has_error: false,
+            service_errors: Vec::new(),
         }
     }
 
@@ -302,6 +330,8 @@ mod tests {
             hsa_challenge_required: true,
             hsa_trusted_browser: false,
             domain_to_use: None,
+            has_error: false,
+            service_errors: Vec::new(),
         };
         assert!(!check_requires_2fa(&resp));
     }
