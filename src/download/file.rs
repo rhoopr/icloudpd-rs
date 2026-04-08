@@ -373,9 +373,10 @@ fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum>
 /// Validate that downloaded content matches expected format for the file extension.
 ///
 /// For known media types (JPEG, PNG, HEIC, MOV, etc.), checks magic bytes in the
-/// file header. For unknown extensions, rejects content that looks like HTML.
-/// Deleting the .part file and returning a retryable error prevents HTML error
-/// pages from being persisted as valid downloads.
+/// file header. Magic byte mismatches are logged as warnings but allowed through,
+/// since format variants exist (e.g. classic QuickTime MOV without `ftyp` box).
+/// HTML content is always rejected as a hard error — Apple's CDN occasionally
+/// returns error pages with HTTP 200.
 fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,
@@ -394,15 +395,32 @@ fn validate_downloaded_content(
 
     let header = &buf[..n];
 
+    // Reject HTML content regardless of extension. Apple's CDN sometimes returns
+    // error/rate-limit pages as HTTP 200 with text/html bodies.
+    let trimmed = header
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map_or(header, |pos| &header[pos..]);
+
+    if trimmed.starts_with(b"<!")
+        || (trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case(b"<html"))
+    {
+        return Err(DownloadError::InvalidContent {
+            path: download_path.display().to_string(),
+            reason: "file contains HTML (likely a CDN error page)".into(),
+        });
+    }
+
     let ext = download_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    // For known media types, validate magic bytes.
-    // This catches HTML error pages AND any other corrupted content.
-    let magic_match = match ext.as_str() {
+    // For known media types, check magic bytes. Mismatches are warnings, not errors,
+    // because format variants exist (e.g. classic QuickTime MOV files starting with
+    // `wide`/`mdat` instead of `ftyp`).
+    let magic_ok = match ext.as_str() {
         "jpg" | "jpeg" => Some(n >= 2 && header[..2] == [0xFF, 0xD8]),
         "png" => Some(n >= 4 && header[..4] == [0x89, 0x50, 0x4E, 0x47]),
         "heic" | "heif" | "mov" | "mp4" | "m4v" => Some(n >= 8 && header[4..8] == *b"ftyp"),
@@ -416,30 +434,12 @@ fn validate_downloaded_content(
         _ => None,
     };
 
-    match magic_match {
-        Some(false) => {
-            return Err(DownloadError::InvalidContent {
-                path: download_path.display().to_string(),
-                reason: format!("file header does not match expected format for .{ext}"),
-            });
-        }
-        Some(true) => return Ok(()),
-        None => {}
-    }
-
-    // For unrecognized extensions, reject obvious HTML error pages.
-    let trimmed = header
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .map_or(header, |pos| &header[pos..]);
-
-    if trimmed.starts_with(b"<!")
-        || (trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case(b"<html"))
-    {
-        return Err(DownloadError::InvalidContent {
-            path: download_path.display().to_string(),
-            reason: "file contains HTML (likely a CDN error page)".into(),
-        });
+    if magic_ok == Some(false) {
+        tracing::warn!(
+            path = %download_path.display(),
+            header = %format_args!("{:02x?}", &header[..n.min(8)]),
+            "File header does not match expected format for .{ext}, saving anyway",
+        );
     }
 
     Ok(())
@@ -722,6 +722,43 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_classic_qt_mov_wide_atom() {
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x08]); // box size
+        buf[4..8].copy_from_slice(b"wide");
+        buf[8..12].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        let (part, dest, _dir) = write_temp_file("IMG_1711_HEVC.MOV", &buf);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_classic_qt_mov_mdat_atom() {
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&[0x00, 0x00, 0x10, 0x00]);
+        buf[4..8].copy_from_slice(b"mdat");
+        let (part, dest, _dir) = write_temp_file("live_photo.MOV", &buf);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_classic_qt_mov_moov_atom() {
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x20]);
+        buf[4..8].copy_from_slice(b"moov");
+        let (part, dest, _dir) = write_temp_file("clip.mov", &buf);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_classic_qt_mov_free_atom() {
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x10]);
+        buf[4..8].copy_from_slice(b"free");
+        let (part, dest, _dir) = write_temp_file("video.MOV", &buf);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
     fn validate_rejects_html_error_page_as_mov() {
         let html = b"<!DOCTYPE html>\n<html><body>Service Temporarily Unavailable</body></html>";
         let (part, dest, _dir) = write_temp_file("clip.mov", html);
@@ -757,11 +794,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_wrong_magic_for_png() {
-        // Write JPEG magic but with .png extension
+    fn validate_warns_but_accepts_mismatched_heic_magic() {
+        // Non-ftyp header with .heic extension — warn but accept
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x08]);
+        buf[4..8].copy_from_slice(b"wide");
+        let (part, dest, _dir) = write_temp_file("photo.heic", &buf);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_warns_but_accepts_mismatched_png_magic() {
+        // JPEG magic with .png extension — warn but accept
         let (part, dest, _dir) = write_temp_file("photo.png", &[0xFF, 0xD8, 0xFF, 0xE0]);
-        let err = validate_downloaded_content(&part, &dest).unwrap_err();
-        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
@@ -816,7 +862,7 @@ mod tests {
         let html_body = b"<!DOCTYPE html><html>Service Unavailable</html>";
         let (part, dest, _dir) = write_temp_file("cdn_error.heic", html_body);
 
-        // Validate rejects — magic bytes don't match ftyp header
+        // Validate rejects — HTML content detected before magic byte check
         let err = validate_downloaded_content(&part, &dest).unwrap_err();
         assert!(
             matches!(err, DownloadError::InvalidContent { .. }),
