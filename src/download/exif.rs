@@ -42,9 +42,16 @@ pub(crate) fn get_photo_exif(path: &Path) -> Result<Option<String>> {
 /// `"YYYY:MM:DD HH:MM:SS"` format.
 pub(crate) fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
     use little_exif::exif_tag::ExifTag;
+    use little_exif::filetype::FileExtension;
     use little_exif::metadata::Metadata;
 
-    let mut metadata = match Metadata::new_from_path(path) {
+    // Read the file into memory and use write_to_vec with an explicit
+    // FileExtension::JPEG.  write_to_file derives the type from the file
+    // extension, which fails for .kei-tmp / .part temp files.
+    let mut buf =
+        std::fs::read(path).with_context(|| format!("Reading {} for EXIF", path.display()))?;
+
+    let mut metadata = match Metadata::new_from_vec(&buf, FileExtension::JPEG) {
         Ok(m) => m,
         Err(_) => Metadata::new(),
     };
@@ -52,8 +59,11 @@ pub(crate) fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
     metadata.set_tag(ExifTag::DateTimeOriginal(datetime_str.to_string()));
     metadata.set_tag(ExifTag::CreateDate(datetime_str.to_string()));
     metadata
-        .write_to_file(path)
-        .with_context(|| format!("Writing EXIF metadata to {}", path.display()))?;
+        .write_to_vec(&mut buf, FileExtension::JPEG)
+        .with_context(|| format!("Writing EXIF metadata for {}", path.display()))?;
+
+    std::fs::write(path, &buf)
+        .with_context(|| format!("Writing EXIF result to {}", path.display()))?;
 
     tracing::debug!(
         datetime = %datetime_str,
