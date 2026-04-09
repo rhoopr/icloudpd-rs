@@ -18,7 +18,7 @@ services:
     # ── Credential options (pick one) ──────────────────────────────
     #
     # Option 2 (recommended): Encrypted credential store
-    #   First run:  docker exec -it kei kei credential set --cookie-directory /config --username $ICLOUD_USERNAME
+    #   First run:  docker exec -it kei kei password set
     #   Subsequent: kei decrypts from /config automatically on each re-auth.
     #
     # Option 3: Docker secrets (file-based)
@@ -27,7 +27,7 @@ services:
     #   command: >-
     #     sync
     #     --config /config/config.toml
-    #     --cookie-directory /config
+    #     --data-dir /config
     #     --directory /photos
     #     --password-file /run/secrets/icloud_password
     #
@@ -35,7 +35,7 @@ services:
     #   command: >-
     #     sync
     #     --config /config/config.toml
-    #     --cookie-directory /config
+    #     --data-dir /config
     #     --directory /photos
     #     --password-command "cat /run/secrets/icloud_password"
 

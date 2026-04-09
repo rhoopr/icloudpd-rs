@@ -532,19 +532,23 @@ impl Session {
 mod tests {
     use super::*;
 
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join("claude")
-            .join("session_tests")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Return a unique temp directory for a session test.
+    ///
+    /// Uses `tempfile` instead of a fixed `/tmp/claude/...` path so
+    /// parallel test runs (and rapid sequential `cargo test` invocations)
+    /// never share lock files.
+    ///
+    /// Returns `(TempDir, PathBuf)` -- the `TempDir` handle must be kept
+    /// alive for the test's duration to prevent early cleanup.
+    fn test_dir(_name: &str) -> (tempfile::TempDir, PathBuf) {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().to_path_buf();
+        (td, path)
     }
 
     #[tokio::test]
     async fn test_lock_file_prevents_concurrent_sessions() {
-        let dir = test_dir("lock_concurrent");
+        let (_td, dir) = test_dir("lock_concurrent");
         let _s1 = Session::new(&dir, "user@test.com", "https://example.com", None)
             .await
             .expect("First session should succeed");
@@ -562,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lock_file_different_users_allowed() {
-        let dir = test_dir("lock_different_users");
+        let (_td, dir) = test_dir("lock_different_users");
         let _s1 = Session::new(&dir, "alice@test.com", "https://example.com", None)
             .await
             .unwrap();
@@ -573,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lock_released_on_drop() {
-        let dir = test_dir("lock_release");
+        let (_td, dir) = test_dir("lock_release");
         {
             let _s = Session::new(&dir, "user@test.com", "https://example.com", None)
                 .await
@@ -586,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cookiejar_directory_at_path_skipped() {
-        let dir = test_dir("cookie_dir_skip");
+        let (_td, dir) = test_dir("cookie_dir_skip");
         let sanitized = sanitize_username("user@test.com");
         let cookiejar_path = dir.join(&sanitized);
 
@@ -603,7 +607,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expired_cookies_pruned_on_load() {
-        let dir = test_dir("cookie_prune");
+        let (_td, dir) = test_dir("cookie_prune");
         let sanitized = sanitize_username("user@test.com");
         let cookie_path = dir.join(&sanitized);
 
@@ -703,7 +707,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_jar_cookies_saves_and_reloads() {
-        let dir = test_dir("persist_jar");
+        let (_td, dir) = test_dir("persist_jar");
         let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
             .await
             .unwrap();
@@ -759,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_jar_cookies_no_redundant_writes() {
-        let dir = test_dir("persist_no_dup");
+        let (_td, dir) = test_dir("persist_no_dup");
         let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
             .await
             .unwrap();
@@ -839,7 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_corrupt_session_file_recovers() {
-        let dir = test_dir("corrupt_session");
+        let (_td, dir) = test_dir("corrupt_session");
         let sanitized = sanitize_username("user@test.com");
         let session_path = dir.join(format!("{sanitized}.session"));
 
@@ -854,7 +858,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_atomic_write_no_partial_file_on_success() {
-        let dir = test_dir("atomic_write");
+        let (_td, dir) = test_dir("atomic_write");
         let path = dir.join("test_file");
 
         atomic_write(&path, b"hello world").await.unwrap();
@@ -866,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_atomic_write_preserves_existing_on_overwrite() {
-        let dir = test_dir("atomic_overwrite");
+        let (_td, dir) = test_dir("atomic_overwrite");
         let path = dir.join("data");
 
         std::fs::write(&path, "original").unwrap();
@@ -881,7 +885,7 @@ mod tests {
     async fn test_atomic_write_sets_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = test_dir("atomic_perms");
+        let (_td, dir) = test_dir("atomic_perms");
         let path = dir.join("secret");
 
         atomic_write(&path, b"sensitive data").await.unwrap();

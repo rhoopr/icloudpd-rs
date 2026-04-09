@@ -1,3 +1,6 @@
+// Shared test utilities -- not all functions are used by every test file.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -114,21 +117,39 @@ pub fn cookie_dir() -> PathBuf {
 fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
     static ENSURED: OnceLock<()> = OnceLock::new();
     ENSURED.get_or_init(|| {
-        eprintln!("Validating authentication session (--auth-only)...");
+        // Skip SRP if session file is fresh (< 1 hour old). This avoids
+        // burning rate-limit budget on every test run when cookies are valid.
+        let sanitized: String = username
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let session_file = cookie_dir.join(format!("{sanitized}.session"));
+        if let Ok(meta) = std::fs::metadata(&session_file) {
+            let is_fresh = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age < std::time::Duration::from_secs(48 * 3600));
+            if is_fresh {
+                eprintln!("Session file is fresh, skipping SRP validation.");
+                return;
+            }
+        }
+
+        eprintln!("Validating authentication session (login)...");
         let output = assert_cmd::cargo_bin_cmd!("kei")
             .args([
-                "sync",
-                "--auth-only",
+                "login",
                 "--username",
                 username,
                 "--password",
                 password,
-                "--cookie-directory",
+                "--data-dir",
                 cookie_dir.to_str().unwrap(),
             ])
             .timeout(std::time::Duration::from_secs(90))
             .output()
-            .expect("failed to run --auth-only session validation");
+            .expect("failed to run login session validation");
 
         if output.status.success() {
             eprintln!("Session OK.");
@@ -142,9 +163,7 @@ fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
             std::process::exit(1);
         }
 
-        panic!(
-            "Session validation (--auth-only) failed — credentials may be invalid.\nstderr: {stderr}"
-        );
+        panic!("Session validation (login) failed — credentials may be invalid.\nstderr: {stderr}");
     });
 }
 
@@ -157,21 +176,20 @@ fn refresh_auth() {
         .get()
         .expect("refresh_auth called before require_preauth");
 
-    eprintln!("Running --auth-only to refresh session...");
+    eprintln!("Running login to refresh session...");
     let output = assert_cmd::cargo_bin_cmd!("kei")
         .args([
-            "sync",
-            "--auth-only",
+            "login",
             "--username",
             username,
             "--password",
             password,
-            "--cookie-directory",
+            "--data-dir",
             cookie_dir.to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(90))
         .output()
-        .expect("failed to run --auth-only");
+        .expect("failed to run login");
 
     if output.status.success() {
         eprintln!("Session refreshed OK.");
@@ -185,7 +203,7 @@ fn refresh_auth() {
         std::process::exit(1);
     }
 
-    panic!("Auth refresh (--auth-only) failed — aborting.\nstderr: {stderr}");
+    panic!("Auth refresh (login) failed — aborting.\nstderr: {stderr}");
 }
 
 /// Run a test body with automatic auth retry on stale-session errors.

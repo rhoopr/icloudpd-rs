@@ -1112,4 +1112,110 @@ mod tests {
             "Screenshot at 1.40.01pm.PNG"
         );
     }
+
+    #[test]
+    fn test_remove_unicode_chars_combining_characters() {
+        // U+0301 (combining acute accent) is non-ASCII and gets stripped,
+        // but the base 'e' is ASCII and remains
+        assert_eq!(remove_unicode_chars("cafe\u{0301}.jpg"), "cafe.jpg");
+    }
+
+    #[test]
+    fn test_clean_filename_zero_width_space() {
+        // U+200B (zero-width space) is not a control char in Rust,
+        // so it passes through clean_filename unchanged
+        assert_eq!(
+            clean_filename("photo\u{200B}name.jpg"),
+            "photo\u{200B}name.jpg"
+        );
+    }
+
+    #[test]
+    fn test_clean_filename_zero_width_joiner() {
+        // U+200D (zero-width joiner) is not a control char in Rust,
+        // so it passes through clean_filename unchanged
+        assert_eq!(clean_filename("pic\u{200D}file.jpg"), "pic\u{200D}file.jpg");
+    }
+
+    #[test]
+    fn test_clean_filename_rtl_mark() {
+        // U+200F (right-to-left mark) is not a control char in Rust,
+        // so it passes through clean_filename unchanged
+        assert_eq!(
+            clean_filename("photo\u{200F}name.jpg"),
+            "photo\u{200F}name.jpg"
+        );
+    }
+
+    #[test]
+    fn test_remove_unicode_chars_emoji_only_filename() {
+        // All emoji are non-ASCII and get stripped, leaving only ".jpg"
+        assert_eq!(remove_unicode_chars("🌅🏔️.jpg"), ".jpg");
+    }
+
+    #[test]
+    fn test_remove_unicode_chars_emoji_only_no_extension() {
+        // All emoji are non-ASCII; nothing remains
+        assert_eq!(remove_unicode_chars("🌅🏔️"), "");
+    }
+
+    #[test]
+    fn test_sanitize_path_component_extension_only() {
+        // ".jpg" has a leading dot that gets stripped, leaving "jpg"
+        assert_eq!(sanitize_path_component(".jpg"), "jpg");
+    }
+
+    #[test]
+    fn test_sanitize_path_component_all_spaces() {
+        // All spaces are trimmed, leaving empty, which falls back to "_"
+        assert_eq!(sanitize_path_component("   "), "_");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_sanitize_path_component_windows_reserved_with_extension() {
+        assert_eq!(sanitize_path_component("CON.txt"), "_CON.txt");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_sanitize_path_component_reserved_with_extension_non_windows() {
+        // On non-Windows, reserved names are not prefixed
+        assert_eq!(sanitize_path_component("CON.txt"), "CON.txt");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_sanitize_path_component_windows_reserved_case_insensitive() {
+        assert_eq!(sanitize_path_component("con"), "_con");
+        assert_eq!(sanitize_path_component("Con"), "_Con");
+        assert_eq!(sanitize_path_component("cOn"), "_cOn");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_sanitize_path_component_reserved_case_insensitive_non_windows() {
+        // On non-Windows, reserved names are not prefixed
+        assert_eq!(sanitize_path_component("con"), "con");
+        assert_eq!(sanitize_path_component("Con"), "Con");
+        assert_eq!(sanitize_path_component("cOn"), "cOn");
+    }
+
+    #[test]
+    fn test_clean_filename_mixed_invalid_chars() {
+        // '<', '>', '|' are all invalid filesystem chars and get replaced with '_'
+        assert_eq!(clean_filename("photo<>|name.jpg"), "photo___name.jpg");
+    }
+
+    #[test]
+    fn test_clean_filename_newline() {
+        // Newline is a control character and gets replaced with '_'
+        assert_eq!(clean_filename("photo\nname.jpg"), "photo_name.jpg");
+    }
+
+    #[test]
+    fn test_clean_filename_tab() {
+        // Tab is a control character and gets replaced with '_'
+        assert_eq!(clean_filename("photo\tname.jpg"), "photo_name.jpg");
+    }
 }

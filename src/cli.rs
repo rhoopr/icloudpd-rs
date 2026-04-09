@@ -24,14 +24,16 @@ fn parse_2fa_code(s: &str) -> Result<String, String> {
     }
 }
 
-/// Authentication arguments shared across all commands and subcommands.
-/// Username is optional at the clap level; validated at runtime after TOML merge.
-#[derive(Parser, Debug, Clone)]
-pub struct AuthArgs {
-    /// Apple ID email address
-    #[arg(short = 'u', long, env = "ICLOUD_USERNAME", value_parser = non_empty_string)]
-    pub username: Option<String>,
+/// Print a deprecation warning to stderr.
+fn deprecation_warning(old: &str, new: &str) {
+    eprintln!("warning: `{old}` is deprecated, use `{new}` instead");
+}
 
+/// Password arguments shared across commands that authenticate.
+/// Flattened only onto commands that actually need a password (sync, login,
+/// list, import-existing, password).
+#[derive(Parser, Debug, Clone, Default)]
+pub struct PasswordArgs {
     /// iCloud password (if not provided, will prompt).
     /// WARNING: passing via --password is visible in process listings.
     /// Prefer the `ICLOUD_PASSWORD` environment variable instead.
@@ -41,94 +43,74 @@ pub struct AuthArgs {
     /// Read password from a file on each auth attempt.
     /// Supports Docker secrets (e.g., /run/secrets/icloud_password).
     /// Trailing newline is stripped.
-    #[arg(long, conflicts_with = "password")]
+    #[arg(long, env = "KEI_PASSWORD_FILE", conflicts_with = "password")]
     pub password_file: Option<String>,
 
     /// Execute a shell command to obtain the password on each auth attempt.
     /// Supports external secret managers (1Password, Vault, pass).
     /// Example: --password-command "op read 'op://vault/icloud/password'"
-    #[arg(long, conflicts_with_all = ["password", "password_file"])]
+    #[arg(long, env = "KEI_PASSWORD_COMMAND", conflicts_with_all = ["password", "password_file"])]
     pub password_command: Option<String>,
 
     /// After successful auth, persist the password to the credential store
     /// (OS keyring or encrypted file).
     #[arg(long)]
     pub save_password: bool,
-
-    /// iCloud domain (com or cn)
-    #[arg(long, value_enum)]
-    pub domain: Option<Domain>,
-
-    /// Directory for cookies/session data
-    #[arg(long)]
-    pub cookie_directory: Option<String>,
 }
 
 /// Arguments for the sync command (also used as default when no subcommand).
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
     /// Local directory for downloads
-    #[arg(short = 'd', long, value_parser = non_empty_string)]
+    #[arg(short = 'd', long, env = "KEI_DIRECTORY", value_parser = non_empty_string)]
     pub directory: Option<String>,
 
-    /// Only authenticate (create/update session tokens)
-    #[arg(long, conflicts_with_all = ["watch_with_interval", "list_albums", "list_libraries"])]
-    pub auth_only: bool,
-
-    /// List available albums
-    #[arg(short = 'l', long, conflicts_with_all = ["watch_with_interval", "list_libraries"])]
-    pub list_albums: bool,
-
-    /// List available libraries
-    #[arg(long, conflicts_with = "watch_with_interval")]
-    pub list_libraries: bool,
-
     /// Album(s) to download
-    #[arg(short = 'a', long = "album", value_parser = non_empty_string)]
+    #[arg(short = 'a', long = "album", env = "KEI_ALBUM", value_parser = non_empty_string)]
     pub albums: Vec<String>,
 
     /// Library to download (default: `PrimarySync`, use "all" for all libraries)
-    #[arg(long)]
+    #[arg(long, env = "KEI_LIBRARY")]
     pub library: Option<String>,
 
     /// Image size to download
-    #[arg(long, value_enum)]
+    #[arg(long, env = "KEI_SIZE", value_enum)]
     pub size: Option<VersionSize>,
 
     /// Live photo video size
-    #[arg(long, value_enum)]
+    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum)]
     pub live_photo_size: Option<LivePhotoSize>,
 
     /// Number of recent photos to download
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, env = "KEI_RECENT", value_parser = clap::value_parser!(u32).range(1..))]
     pub recent: Option<u32>,
 
     /// Number of concurrent download threads (default: 10)
-    #[arg(long = "threads-num", value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long = "threads-num", env = "KEI_THREADS_NUM", value_parser = clap::value_parser!(u16).range(1..))]
     pub threads_num: Option<u16>,
 
     /// Don't download videos (pass `false` to override config file)
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    #[arg(long, env = "KEI_SKIP_VIDEOS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub skip_videos: Option<bool>,
 
     /// Don't download photos (pass `false` to override config file)
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    #[arg(long, env = "KEI_SKIP_PHOTOS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub skip_photos: Option<bool>,
 
     /// Don't download live photos (pass `false` to override config file)
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    #[arg(long, env = "KEI_SKIP_LIVE_PHOTOS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true, hide = true)]
     pub skip_live_photos: Option<bool>,
 
     /// Only download requested size (don't fall back to original)
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    #[arg(long, env = "KEI_FORCE_SIZE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub force_size: Option<bool>,
 
     /// Folder structure for organizing downloads
-    #[arg(long)]
+    #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
 
     /// Write `DateTimeOriginal` EXIF tag if missing
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    #[arg(long, env = "KEI_SET_EXIF_DATETIME", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub set_exif_datetime: Option<bool>,
 
     /// Do not modify local system or iCloud
@@ -136,35 +118,35 @@ pub struct SyncArgs {
     pub dry_run: bool,
 
     /// Run continuously, waiting N seconds between runs (minimum: 60)
-    #[arg(long, value_parser = clap::value_parser!(u64).range(60..))]
+    #[arg(long, env = "KEI_WATCH_WITH_INTERVAL", value_parser = clap::value_parser!(u64).range(60..))]
     pub watch_with_interval: Option<u64>,
 
     /// Disable progress bar
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    #[arg(long, env = "KEI_NO_PROGRESS_BAR", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub no_progress_bar: Option<bool>,
 
     /// Keep Unicode in filenames
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    #[arg(long, env = "KEI_KEEP_UNICODE_IN_FILENAMES", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub keep_unicode_in_filenames: Option<bool>,
 
     /// Live photo MOV filename policy
-    #[arg(long, value_enum)]
+    #[arg(long, env = "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY", value_enum)]
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
     /// RAW treatment policy
-    #[arg(long, value_enum)]
+    #[arg(long, env = "KEI_ALIGN_RAW", value_enum)]
     pub align_raw: Option<RawTreatmentPolicy>,
 
     /// File matching and dedup policy
-    #[arg(long, value_enum)]
+    #[arg(long, env = "KEI_FILE_MATCH_POLICY", value_enum)]
     pub file_match_policy: Option<FileMatchPolicy>,
 
     /// Skip assets created before this ISO date or interval (e.g., 2025-01-02 or 20d)
-    #[arg(long)]
+    #[arg(long, env = "KEI_SKIP_CREATED_BEFORE")]
     pub skip_created_before: Option<String>,
 
     /// Skip assets created after this ISO date or interval
-    #[arg(long)]
+    #[arg(long, env = "KEI_SKIP_CREATED_AFTER")]
     pub skip_created_after: Option<String>,
 
     /// Only print filenames without downloading
@@ -172,85 +154,78 @@ pub struct SyncArgs {
     pub only_print_filenames: bool,
 
     /// Max retries per download (default: 3, 0 = no retries, max: 100)
-    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=100))]
+    #[arg(long, env = "KEI_MAX_RETRIES", value_parser = clap::value_parser!(u32).range(0..=100))]
     pub max_retries: Option<u32>,
 
-    /// Initial retry delay in seconds (default: 5, range: 1–3600)
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    /// Initial retry delay in seconds (default: 5, range: 1-3600)
+    #[arg(long, env = "KEI_RETRY_DELAY", value_parser = clap::value_parser!(u64).range(1..=3600))]
     pub retry_delay: Option<u64>,
 
     /// Temp file suffix for partial downloads (default: .kei-tmp).
     /// Change if the default conflicts with your filesystem (e.g. Nextcloud rejects .part).
-    #[arg(long)]
+    #[arg(long, env = "KEI_TEMP_SUFFIX")]
     pub temp_suffix: Option<String>,
 
     /// Force full library enumeration even if a sync token exists
     #[arg(long)]
     pub no_incremental: bool,
 
-    /// Clear stored sync tokens before syncing (recovery tool)
-    #[arg(long)]
-    pub reset_sync_token: bool,
-
     /// Send systemd `sd_notify` messages (READY, STOPPING, STATUS).
     /// Only effective on Linux with a systemd service unit.
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    #[arg(long, env = "KEI_NOTIFY_SYSTEMD", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub notify_systemd: Option<bool>,
 
     /// Write PID to file (for service managers).
-    #[arg(long)]
+    #[arg(long, env = "KEI_PID_FILE")]
     pub pid_file: Option<std::path::PathBuf>,
 
     /// Script to run on events (2FA required, sync complete, etc.).
     /// Called with `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars.
-    #[arg(long)]
+    #[arg(long, env = "KEI_NOTIFICATION_SCRIPT")]
     pub notification_script: Option<String>,
+
+    /// Re-sync only previously failed assets
+    #[arg(long, conflicts_with_all = ["dry_run", "watch_with_interval"])]
+    pub retry_failed: bool,
+
+    // ── Hidden compat flags (deprecated, still parse) ──────────────
+    /// Deprecated: use `kei login` instead
+    #[arg(long, hide = true, conflicts_with_all = ["watch_with_interval"])]
+    pub auth_only: bool,
+
+    /// Deprecated: use `kei list albums` instead
+    #[arg(short = 'l', long, hide = true, conflicts_with_all = ["watch_with_interval"])]
+    pub list_albums: bool,
+
+    /// Deprecated: use `kei list libraries` instead
+    #[arg(long, hide = true, conflicts_with = "watch_with_interval")]
+    pub list_libraries: bool,
+
+    /// Deprecated: use `kei reset sync-token` instead
+    #[arg(long, hide = true)]
+    pub reset_sync_token: bool,
 }
 
 /// Arguments for the status command.
 #[derive(Parser, Debug, Clone)]
 pub struct StatusArgs {
-    #[command(flatten)]
-    pub auth: AuthArgs,
-
     /// Show failed assets with error messages
     #[arg(long)]
     pub failed: bool,
-}
-
-/// Arguments for the retry-failed command.
-#[derive(Parser, Debug, Clone)]
-pub struct RetryFailedArgs {
-    #[command(flatten)]
-    pub auth: AuthArgs,
-
-    #[command(flatten)]
-    pub sync: SyncArgs,
-}
-
-/// Arguments for the reset-state command.
-#[derive(Parser, Debug, Clone)]
-pub struct ResetStateArgs {
-    #[command(flatten)]
-    pub auth: AuthArgs,
-
-    /// Skip confirmation prompt
-    #[arg(long, short = 'y')]
-    pub yes: bool,
 }
 
 /// Arguments for the import-existing command.
 #[derive(Parser, Debug, Clone)]
 pub struct ImportArgs {
     #[command(flatten)]
-    pub auth: AuthArgs,
+    pub password: PasswordArgs,
 
     /// Local directory containing existing downloads
-    #[arg(short = 'd', long, value_parser = non_empty_string)]
+    #[arg(short = 'd', long, env = "KEI_DIRECTORY", value_parser = non_empty_string)]
     pub directory: Option<String>,
 
     /// Folder structure used for existing downloads
-    #[arg(long)]
+    #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
 
     /// Keep Unicode in filenames (must match what was used during sync)
@@ -269,73 +244,64 @@ pub struct ImportArgs {
 /// Arguments for the verify command.
 #[derive(Parser, Debug, Clone)]
 pub struct VerifyArgs {
-    #[command(flatten)]
-    pub auth: AuthArgs,
-
     /// Verify checksums (slower but more thorough)
     #[arg(long)]
     pub checksums: bool,
 }
 
-/// Arguments for the get-code command.
-#[derive(Parser, Debug, Clone)]
-pub struct GetCodeArgs {
-    #[command(flatten)]
-    pub auth: AuthArgs,
-}
+// ── New subcommand types ─────────────────────────────────────────────
 
-/// Arguments for the submit-code command.
-#[derive(Parser, Debug, Clone)]
-pub struct SubmitCodeArgs {
-    #[command(flatten)]
-    pub auth: AuthArgs,
-
-    /// 6-digit 2FA code from your trusted device
-    #[arg(value_parser = parse_2fa_code)]
-    pub code: String,
-}
-
-/// Subcommands for kei.
-///
-/// Every variant that carries [`AuthArgs`] must be listed in
-/// [`Command::inject_env_password`] so that the captured
-/// `ICLOUD_PASSWORD` value is available after the env var has been
-/// scrubbed from the process environment.
-#[derive(Subcommand, Debug, Clone)]
-pub enum Command {
-    /// Download photos from iCloud (default command)
-    Sync {
-        #[command(flatten)]
-        auth: AuthArgs,
-
-        #[command(flatten)]
-        sync: SyncArgs,
-    },
-
-    /// Show sync status and database summary
-    Status(StatusArgs),
-
-    /// Reset failed downloads to pending and re-sync
-    RetryFailed(RetryFailedArgs),
-
-    /// Delete the state database and start fresh
-    ResetState(ResetStateArgs),
-
-    /// Import existing local files into the state database
-    ImportExisting(ImportArgs),
-
-    /// Verify downloaded files exist and optionally check checksums
-    Verify(VerifyArgs),
-
+/// Login subcommands.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum LoginCommand {
     /// Request a 2FA code be sent to your trusted devices
-    GetCode(GetCodeArgs),
-
+    GetCode,
     /// Submit a 2FA code non-interactively (for Docker / headless use)
-    SubmitCode(SubmitCodeArgs),
+    SubmitCode {
+        /// 6-digit 2FA code from your trusted device
+        #[arg(value_parser = parse_2fa_code)]
+        code: String,
+    },
+}
 
-    /// Manage stored credentials (OS keyring or encrypted file)
-    Credential(CredentialArgs),
+/// List subcommands.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ListCommand {
+    /// List available albums
+    Albums,
+    /// List available libraries
+    Libraries,
+}
 
+/// Password management actions.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum PasswordAction {
+    /// Store a password in the credential store (prompts interactively)
+    Set,
+    /// Remove a stored password
+    Clear,
+    /// Show which credential backend is active (keyring, encrypted-file, none)
+    Backend,
+}
+
+/// Reset subcommands.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ResetCommand {
+    /// Delete the state database and start fresh
+    State {
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Clear stored sync tokens so the next sync does a full enumeration
+    SyncToken,
+}
+
+/// Config management actions.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ConfigAction {
+    /// Dump resolved config as TOML and exit
+    Show,
     /// Interactively generate a config file
     Setup {
         /// Output path (overrides --config)
@@ -344,18 +310,8 @@ pub enum Command {
     },
 }
 
-/// Arguments for the credential subcommand.
-#[derive(Parser, Debug, Clone)]
-pub struct CredentialArgs {
-    #[command(flatten)]
-    pub auth: AuthArgs,
-
-    #[command(subcommand)]
-    pub action: CredentialAction,
-}
-
-/// Credential management actions.
-#[derive(Subcommand, Debug, Clone)]
+/// Credential management actions (legacy, hidden).
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum CredentialAction {
     /// Store a password in the credential store (prompts interactively)
     Set,
@@ -365,53 +321,168 @@ pub enum CredentialAction {
     Backend,
 }
 
+/// Subcommands for kei.
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Download photos from iCloud (default command)
+    Sync {
+        #[command(flatten)]
+        password: PasswordArgs,
+
+        #[command(flatten)]
+        sync: SyncArgs,
+    },
+
+    /// Authenticate interactively (creates/refreshes session tokens)
+    Login {
+        #[command(flatten)]
+        password: PasswordArgs,
+
+        #[command(subcommand)]
+        subcommand: Option<LoginCommand>,
+    },
+
+    /// List available albums or libraries
+    List {
+        #[command(flatten)]
+        password: PasswordArgs,
+
+        #[command(subcommand)]
+        what: ListCommand,
+    },
+
+    /// Manage stored credentials (OS keyring or encrypted file)
+    Password {
+        #[command(flatten)]
+        password: PasswordArgs,
+
+        #[command(subcommand)]
+        action: PasswordAction,
+    },
+
+    /// Reset state database or sync tokens
+    Reset {
+        #[command(subcommand)]
+        what: ResetCommand,
+    },
+
+    /// Config management
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+
+    /// Show sync status and database summary
+    Status(StatusArgs),
+
+    /// Import existing local files into the state database
+    ImportExisting(ImportArgs),
+
+    /// Verify downloaded files exist and optionally check checksums
+    Verify(VerifyArgs),
+
+    // ── Hidden legacy aliases (deprecated, still parse) ──────────
+    /// Deprecated: use `kei login get-code`
+    #[command(hide = true)]
+    GetCode {
+        #[command(flatten)]
+        password: PasswordArgs,
+    },
+
+    /// Deprecated: use `kei login submit-code`
+    #[command(hide = true)]
+    SubmitCode {
+        #[command(flatten)]
+        password: PasswordArgs,
+
+        /// 6-digit 2FA code from your trusted device
+        #[arg(value_parser = parse_2fa_code)]
+        code: String,
+    },
+
+    /// Deprecated: use `kei password`
+    #[command(hide = true)]
+    Credential {
+        #[command(flatten)]
+        password: PasswordArgs,
+
+        #[command(subcommand)]
+        action: CredentialAction,
+    },
+
+    /// Deprecated: use `kei sync --retry-failed`
+    #[command(hide = true)]
+    RetryFailed {
+        #[command(flatten)]
+        password: PasswordArgs,
+
+        #[command(flatten)]
+        sync: SyncArgs,
+    },
+
+    /// Deprecated: use `kei reset state`
+    #[command(hide = true)]
+    ResetState {
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Deprecated: use `kei reset sync-token`
+    #[command(hide = true)]
+    ResetSyncToken,
+
+    /// Deprecated: use `kei config setup`
+    #[command(hide = true)]
+    Setup {
+        /// Output path (overrides --config)
+        #[arg(short = 'o', long)]
+        output: Option<String>,
+    },
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "kei", about = "kei: photo sync engine", version)]
 pub struct Cli {
+    // ── Global options ──────────────────────────────────────────────
     /// Log level
-    #[arg(long, value_enum, global = true)]
+    #[arg(long, value_enum, global = true, env = "KEI_LOG_LEVEL")]
     pub log_level: Option<LogLevel>,
 
     /// Path to TOML config file
-    #[arg(long, global = true, default_value = "~/.config/kei/config.toml")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "~/.config/kei/config.toml",
+        env = "KEI_CONFIG"
+    )]
     pub config: String,
+
+    /// Apple ID email address
+    #[arg(short = 'u', long, global = true, env = "ICLOUD_USERNAME", value_parser = non_empty_string)]
+    pub username: Option<String>,
+
+    /// iCloud domain (com or cn)
+    #[arg(long, global = true, value_enum, env = "KEI_DOMAIN")]
+    pub domain: Option<Domain>,
+
+    /// Directory for sessions, state DB, and credentials
+    #[arg(long, global = true, env = "KEI_DATA_DIR")]
+    pub data_dir: Option<String>,
+
+    /// Deprecated: use --data-dir
+    #[arg(long, global = true, hide = true)]
+    pub cookie_directory: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    // Backwards compatibility: allow all sync args at top level
-    // These are only used when no subcommand is provided
+    // ── Backward compat: bare invocation = sync ────────────────────
     #[command(flatten)]
-    pub auth: AuthArgs,
+    pub password: PasswordArgs,
 
     #[command(flatten)]
     pub sync: SyncArgs,
-}
-
-impl AuthArgs {
-    /// Merge top-level (fallback) auth args into self.
-    /// Subcommand values take precedence; top-level fills in gaps.
-    fn merge_from(&mut self, fallback: &AuthArgs) {
-        if self.username.is_none() {
-            self.username.clone_from(&fallback.username);
-        }
-        if self.password.is_none() {
-            self.password.clone_from(&fallback.password);
-        }
-        if self.password_file.is_none() {
-            self.password_file.clone_from(&fallback.password_file);
-        }
-        if self.password_command.is_none() {
-            self.password_command.clone_from(&fallback.password_command);
-        }
-        self.save_password = self.save_password || fallback.save_password;
-        if self.domain.is_none() {
-            self.domain = fallback.domain;
-        }
-        if self.cookie_directory.is_none() {
-            self.cookie_directory.clone_from(&fallback.cookie_directory);
-        }
-    }
 }
 
 impl SyncArgs {
@@ -509,55 +580,173 @@ impl SyncArgs {
             self.notification_script
                 .clone_from(&fallback.notification_script);
         }
+        self.retry_failed = self.retry_failed || fallback.retry_failed;
+    }
+}
+
+impl PasswordArgs {
+    /// Merge top-level (fallback) password args into self.
+    fn merge_from(&mut self, fallback: &PasswordArgs) {
+        if self.password.is_none() {
+            self.password.clone_from(&fallback.password);
+        }
+        if self.password_file.is_none() {
+            self.password_file.clone_from(&fallback.password_file);
+        }
+        if self.password_command.is_none() {
+            self.password_command.clone_from(&fallback.password_command);
+        }
+        self.save_password = self.save_password || fallback.save_password;
     }
 }
 
 impl Cli {
     /// Get the effective command, treating bare invocation as sync.
     ///
-    /// When a subcommand is present, top-level auth/sync args are merged
-    /// as fallbacks so `kei --username X sync` works the same as
-    /// `kei sync --username X`.
+    /// When a subcommand is present, top-level password/sync args are merged
+    /// as fallbacks so `kei --password X sync` works the same as
+    /// `kei sync --password X`.
+    ///
+    /// Legacy subcommands and compat flags are mapped to their new equivalents
+    /// with deprecation warnings to stderr.
     pub fn effective_command(&self) -> Command {
-        match &self.command {
+        let cmd = match &self.command {
             Some(cmd) => {
                 let mut cmd = cmd.clone();
-                cmd.merge_top_level_args(&self.auth, &self.sync);
+                cmd.merge_top_level_args(&self.password, &self.sync);
                 cmd
             }
-            None => Command::Sync {
-                auth: self.auth.clone(),
-                sync: self.sync.clone(),
-            },
+            None => {
+                // Check hidden compat flags on bare invocation
+                if self.sync.auth_only {
+                    deprecation_warning("--auth-only", "kei login");
+                    return Command::Login {
+                        password: self.password.clone(),
+                        subcommand: None,
+                    };
+                }
+                if self.sync.list_albums {
+                    deprecation_warning("--list-albums", "kei list albums");
+                    return Command::List {
+                        password: self.password.clone(),
+                        what: ListCommand::Albums,
+                    };
+                }
+                if self.sync.list_libraries {
+                    deprecation_warning("--list-libraries", "kei list libraries");
+                    return Command::List {
+                        password: self.password.clone(),
+                        what: ListCommand::Libraries,
+                    };
+                }
+                Command::Sync {
+                    password: self.password.clone(),
+                    sync: self.sync.clone(),
+                }
+            }
+        };
+
+        // Map legacy subcommands to new equivalents
+        match cmd {
+            Command::GetCode { password } => {
+                deprecation_warning("kei get-code", "kei login get-code");
+                Command::Login {
+                    password,
+                    subcommand: Some(LoginCommand::GetCode),
+                }
+            }
+            Command::SubmitCode { password, code } => {
+                deprecation_warning("kei submit-code", "kei login submit-code");
+                Command::Login {
+                    password,
+                    subcommand: Some(LoginCommand::SubmitCode { code }),
+                }
+            }
+            Command::Credential { password, action } => {
+                deprecation_warning("kei credential", "kei password");
+                let new_action = match action {
+                    CredentialAction::Set => PasswordAction::Set,
+                    CredentialAction::Clear => PasswordAction::Clear,
+                    CredentialAction::Backend => PasswordAction::Backend,
+                };
+                Command::Password {
+                    password,
+                    action: new_action,
+                }
+            }
+            Command::RetryFailed { password, mut sync } => {
+                deprecation_warning("kei retry-failed", "kei sync --retry-failed");
+                sync.retry_failed = true;
+                Command::Sync { password, sync }
+            }
+            Command::ResetState { yes } => {
+                deprecation_warning("kei reset-state", "kei reset state");
+                Command::Reset {
+                    what: ResetCommand::State { yes },
+                }
+            }
+            Command::ResetSyncToken => {
+                deprecation_warning("kei reset-sync-token", "kei reset sync-token");
+                Command::Reset {
+                    what: ResetCommand::SyncToken,
+                }
+            }
+            Command::Setup { output } => {
+                deprecation_warning("kei setup", "kei config setup");
+                Command::Config {
+                    action: ConfigAction::Setup { output },
+                }
+            }
+            // Handle compat flags on sync subcommand (e.g. `kei sync --auth-only`)
+            Command::Sync {
+                ref password,
+                ref sync,
+            } if sync.auth_only => {
+                deprecation_warning("--auth-only", "kei login");
+                Command::Login {
+                    password: password.clone(),
+                    subcommand: None,
+                }
+            }
+            Command::Sync {
+                ref password,
+                ref sync,
+            } if sync.list_albums => {
+                deprecation_warning("--list-albums", "kei list albums");
+                Command::List {
+                    password: password.clone(),
+                    what: ListCommand::Albums,
+                }
+            }
+            Command::Sync {
+                ref password,
+                ref sync,
+            } if sync.list_libraries => {
+                deprecation_warning("--list-libraries", "kei list libraries");
+                Command::List {
+                    password: password.clone(),
+                    what: ListCommand::Libraries,
+                }
+            }
+            other => other,
         }
     }
 }
 
 impl Command {
-    /// Merge top-level CLI auth/sync args as fallbacks into the subcommand's
-    /// own args. This makes `kei --username X sync` equivalent to
-    /// `kei sync --username X`.
-    fn merge_top_level_args(&mut self, top_auth: &AuthArgs, top_sync: &SyncArgs) {
+    /// Merge top-level CLI password/sync args as fallbacks into the
+    /// subcommand's own args.
+    fn merge_top_level_args(&mut self, top_password: &PasswordArgs, top_sync: &SyncArgs) {
+        // Merge sync args for commands that carry them
         match self {
-            Self::Sync {
-                ref mut auth,
-                ref mut sync,
-            } => {
-                auth.merge_from(top_auth);
+            Self::Sync { sync, .. } | Self::RetryFailed { sync, .. } => {
                 sync.merge_from(top_sync);
             }
-            Self::RetryFailed(args) => {
-                args.auth.merge_from(top_auth);
-                args.sync.merge_from(top_sync);
-            }
-            Self::Status(args) => args.auth.merge_from(top_auth),
-            Self::ResetState(args) => args.auth.merge_from(top_auth),
-            Self::ImportExisting(args) => args.auth.merge_from(top_auth),
-            Self::Verify(args) => args.auth.merge_from(top_auth),
-            Self::GetCode(args) => args.auth.merge_from(top_auth),
-            Self::SubmitCode(args) => args.auth.merge_from(top_auth),
-            Self::Credential(args) => args.auth.merge_from(top_auth),
-            Self::Setup { .. } => {}
+            _ => {}
+        }
+        // Merge password args for commands that carry them
+        if let Some(pw) = self.password_args_mut() {
+            pw.merge_from(top_password);
         }
     }
 
@@ -565,24 +754,36 @@ impl Command {
     ///
     /// The env var is removed from the process environment for security
     /// (prevents leaking via `/proc/*/environ`), but clap's `env` attribute
-    /// never sees it. This method restores it into whichever `AuthArgs`
+    /// never sees it. This method restores it into whichever `PasswordArgs`
     /// the active command carries.
     pub fn inject_env_password(&mut self, env_password: Option<String>) {
         let Some(pw) = env_password else { return };
-        let auth = match self {
-            Self::Sync { ref mut auth, .. } => auth,
-            Self::Status(args) => &mut args.auth,
-            Self::RetryFailed(args) => &mut args.auth,
-            Self::ResetState(args) => &mut args.auth,
-            Self::ImportExisting(args) => &mut args.auth,
-            Self::Verify(args) => &mut args.auth,
-            Self::GetCode(args) => &mut args.auth,
-            Self::SubmitCode(args) => &mut args.auth,
-            Self::Credential(args) => &mut args.auth,
-            Self::Setup { .. } => return,
-        };
-        if auth.password.is_none() {
-            auth.password = Some(pw);
+        if let Some(args) = self.password_args_mut() {
+            if args.password.is_none() {
+                args.password = Some(pw);
+            }
+        }
+    }
+
+    /// Return a mutable reference to the command's `PasswordArgs`, if any.
+    fn password_args_mut(&mut self) -> Option<&mut PasswordArgs> {
+        match self {
+            Self::Sync { password, .. }
+            | Self::Login { password, .. }
+            | Self::List { password, .. }
+            | Self::Password { password, .. }
+            | Self::GetCode { password, .. }
+            | Self::SubmitCode { password, .. }
+            | Self::Credential { password, .. }
+            | Self::RetryFailed { password, .. } => Some(password),
+            Self::ImportExisting(args) => Some(&mut args.password),
+            Self::Reset { .. }
+            | Self::Config { .. }
+            | Self::Status(_)
+            | Self::Verify(_)
+            | Self::ResetState { .. }
+            | Self::ResetSyncToken
+            | Self::Setup { .. } => None,
         }
     }
 }
@@ -600,270 +801,30 @@ mod tests {
         vec!["kei", "--username", "test@example.com"]
     }
 
+    // ── Global args ───────────────────────────────────────────────
+
     #[test]
-    fn test_library_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.library.is_none());
+    fn test_username_global() {
+        let cli = parse(&["kei", "--username", "test@example.com"]);
+        assert_eq!(cli.username.as_deref(), Some("test@example.com"));
     }
 
     #[test]
-    fn test_library_accepts_custom_value() {
-        let mut args = base_args();
-        args.extend(["--library", "SharedSync-ABCD1234"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.library.as_deref(), Some("SharedSync-ABCD1234"));
+    fn test_domain_global() {
+        let cli = parse(&["kei", "--domain", "cn"]);
+        assert_eq!(cli.domain, Some(Domain::Cn));
     }
 
     #[test]
-    fn test_threads_num_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.threads_num.is_none());
+    fn test_data_dir_global() {
+        let cli = parse(&["kei", "--data-dir", "/config"]);
+        assert_eq!(cli.data_dir.as_deref(), Some("/config"));
     }
 
     #[test]
-    fn test_threads_num_accepts_valid_value() {
-        let mut args = base_args();
-        args.extend(["--threads-num", "8"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.threads_num, Some(8));
-    }
-
-    #[test]
-    fn test_threads_num_rejects_zero() {
-        let mut args = base_args();
-        args.extend(["--threads-num", "0"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_dry_run_default_false() {
-        let cli = parse(&base_args());
-        assert!(!cli.sync.dry_run);
-    }
-
-    #[test]
-    fn test_size_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.size.is_none());
-    }
-
-    #[test]
-    fn test_size_accepts_value() {
-        let mut args = base_args();
-        args.extend(["--size", "medium"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.size, Some(VersionSize::Medium));
-    }
-
-    #[test]
-    fn test_recent_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.recent.is_none());
-    }
-
-    #[test]
-    fn test_recent_accepts_value() {
-        let mut args = base_args();
-        args.extend(["--recent", "50"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.recent, Some(50));
-    }
-
-    #[test]
-    fn test_max_retries_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.max_retries.is_none());
-    }
-
-    #[test]
-    fn test_max_retries_custom() {
-        let mut args = base_args();
-        args.extend(["--max-retries", "10"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.max_retries, Some(10));
-    }
-
-    #[test]
-    fn test_max_retries_zero_disables() {
-        let mut args = base_args();
-        args.extend(["--max-retries", "0"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.max_retries, Some(0));
-    }
-
-    #[test]
-    fn test_retry_delay_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.retry_delay.is_none());
-    }
-
-    #[test]
-    fn test_retry_delay_custom() {
-        let mut args = base_args();
-        args.extend(["--retry-delay", "15"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.retry_delay, Some(15));
-    }
-
-    #[test]
-    fn test_temp_suffix_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.temp_suffix.is_none());
-    }
-
-    #[test]
-    fn test_temp_suffix_custom() {
-        let mut args = base_args();
-        args.extend(["--temp-suffix", ".downloading"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.temp_suffix.as_deref(), Some(".downloading"));
-    }
-
-    #[test]
-    fn test_align_raw_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.align_raw.is_none());
-    }
-
-    #[test]
-    fn test_align_raw_accepts_original() {
-        let mut args = base_args();
-        args.extend(["--align-raw", "original"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.align_raw, Some(RawTreatmentPolicy::PreferOriginal));
-    }
-
-    #[test]
-    fn test_align_raw_accepts_alternative() {
-        let mut args = base_args();
-        args.extend(["--align-raw", "alternative"]);
-        let cli = parse(&args);
-        assert_eq!(
-            cli.sync.align_raw,
-            Some(RawTreatmentPolicy::PreferAlternative)
-        );
-    }
-
-    #[test]
-    fn test_align_raw_rejects_invalid() {
-        let mut args = base_args();
-        args.extend(["--align-raw", "bogus"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_sync_subcommand() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "sync",
-            "--username",
-            "test@example.com",
-            "--directory",
-            "/photos",
-        ])
-        .unwrap();
-        assert!(matches!(cli.command, Some(Command::Sync { .. })));
-    }
-
-    #[test]
-    fn test_status_subcommand() {
-        let cli = Cli::try_parse_from(["kei", "status", "--username", "test@example.com"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Status(_))));
-    }
-
-    #[test]
-    fn test_status_subcommand_without_username() {
-        let cli = Cli::try_parse_from(["kei", "status"]).unwrap();
-        if let Some(Command::Status(args)) = cli.command {
-            assert!(args.auth.username.is_none());
-        } else {
-            panic!("Expected Status command");
-        }
-    }
-
-    #[test]
-    fn test_status_with_failed_flag() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "status",
-            "--username",
-            "test@example.com",
-            "--failed",
-        ])
-        .unwrap();
-        if let Some(Command::Status(args)) = cli.command {
-            assert!(args.failed);
-        } else {
-            panic!("Expected Status command");
-        }
-    }
-
-    #[test]
-    fn test_reset_state_subcommand() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "reset-state",
-            "--username",
-            "test@example.com",
-            "--yes",
-        ])
-        .unwrap();
-        if let Some(Command::ResetState(args)) = cli.command {
-            assert!(args.yes);
-        } else {
-            panic!("Expected ResetState command");
-        }
-    }
-
-    #[test]
-    fn test_notify_systemd_default_none() {
-        let cli = parse(&base_args());
-        assert_eq!(cli.sync.notify_systemd, None);
-    }
-
-    #[test]
-    fn test_notify_systemd_flag() {
-        let mut args = base_args();
-        args.push("--notify-systemd");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.notify_systemd, Some(true));
-    }
-
-    #[test]
-    fn test_pid_file_default_none() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.pid_file.is_none());
-    }
-
-    #[test]
-    fn test_pid_file_flag() {
-        let mut args = base_args();
-        args.extend(["--pid-file", "/tmp/claude/test.pid"]);
-        let cli = parse(&args);
-        assert_eq!(
-            cli.sync.pid_file,
-            Some(std::path::PathBuf::from("/tmp/claude/test.pid"))
-        );
-    }
-
-    #[test]
-    fn test_backwards_compatibility_no_subcommand() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "--username",
-            "test@example.com",
-            "--directory",
-            "/photos",
-        ])
-        .unwrap();
-        assert!(cli.command.is_none());
-        match cli.effective_command() {
-            Command::Sync { auth, sync } => {
-                assert_eq!(auth.username.as_deref(), Some("test@example.com"));
-                assert_eq!(sync.directory, Some("/photos".to_string()));
-            }
-            _ => panic!("Expected Sync command"),
-        }
+    fn test_cookie_directory_compat() {
+        let cli = parse(&["kei", "--cookie-directory", "/cookies"]);
+        assert_eq!(cli.cookie_directory.as_deref(), Some("/cookies"));
     }
 
     #[test]
@@ -880,63 +841,361 @@ mod tests {
         assert_eq!(cli.config, "/etc/kei.toml");
     }
 
-    #[test]
-    fn test_domain_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.auth.domain.is_none());
-    }
-
-    #[test]
-    fn test_domain_accepts_cn() {
-        let mut args = base_args();
-        args.extend(["--domain", "cn"]);
-        let cli = parse(&args);
-        assert_eq!(cli.auth.domain, Some(Domain::Cn));
-    }
-
-    #[test]
-    fn test_cookie_directory_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.auth.cookie_directory.is_none());
-    }
-
-    #[test]
-    fn test_log_level_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.log_level.is_none());
-    }
-
-    #[test]
-    fn test_log_level_accepts_value() {
-        let mut args = base_args();
-        args.extend(["--log-level", "debug"]);
-        let cli = parse(&args);
-        assert_eq!(cli.log_level, Some(LogLevel::Debug));
-    }
-
-    // ── Username is optional at clap level ─────────────────────────
+    // ── Bare invocation (no subcommand = sync) ────────────────────
 
     #[test]
     fn test_bare_invocation_without_username() {
         let cli = Cli::try_parse_from(["kei"]).unwrap();
-        assert!(cli.auth.username.is_none());
+        assert!(cli.username.is_none());
         assert!(cli.command.is_none());
     }
 
-    // ── Auth flags ─────────────────────────────────────────────────
+    #[test]
+    fn test_backwards_compatibility_no_subcommand() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "--username",
+            "test@example.com",
+            "--directory",
+            "/photos",
+        ])
+        .unwrap();
+        assert!(cli.command.is_none());
+        match cli.effective_command() {
+            Command::Sync { sync, .. } => {
+                assert_eq!(sync.directory, Some("/photos".to_string()));
+            }
+            _ => panic!("Expected Sync command"),
+        }
+    }
+
+    // ── New subcommands ───────────────────────────────────────────
+
+    #[test]
+    fn test_login_subcommand() {
+        let cli = Cli::try_parse_from(["kei", "login"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Login {
+                subcommand: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_login_get_code() {
+        let cli = Cli::try_parse_from(["kei", "login", "get-code"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Login {
+                subcommand: Some(LoginCommand::GetCode),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_login_submit_code() {
+        let cli = Cli::try_parse_from(["kei", "login", "submit-code", "123456"]).unwrap();
+        match cli.effective_command() {
+            Command::Login {
+                subcommand: Some(LoginCommand::SubmitCode { code }),
+                ..
+            } => assert_eq!(code, "123456"),
+            _ => panic!("Expected Login SubmitCode"),
+        }
+    }
+
+    #[test]
+    fn test_list_albums() {
+        let cli = Cli::try_parse_from(["kei", "list", "albums"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::List {
+                what: ListCommand::Albums,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_list_libraries() {
+        let cli = Cli::try_parse_from(["kei", "list", "libraries"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::List {
+                what: ListCommand::Libraries,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_password_set() {
+        let cli = Cli::try_parse_from(["kei", "password", "set"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Password {
+                action: PasswordAction::Set,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_password_clear() {
+        let cli = Cli::try_parse_from(["kei", "password", "clear"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Password {
+                action: PasswordAction::Clear,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_password_backend() {
+        let cli = Cli::try_parse_from(["kei", "password", "backend"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Password {
+                action: PasswordAction::Backend,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reset_state() {
+        let cli = Cli::try_parse_from(["kei", "reset", "state", "--yes"]).unwrap();
+        match cli.effective_command() {
+            Command::Reset {
+                what: ResetCommand::State { yes },
+            } => assert!(yes),
+            _ => panic!("Expected Reset State"),
+        }
+    }
+
+    #[test]
+    fn test_reset_sync_token() {
+        let cli = Cli::try_parse_from(["kei", "reset", "sync-token"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Reset {
+                what: ResetCommand::SyncToken,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_config_show() {
+        let cli = Cli::try_parse_from(["kei", "config", "show"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Config {
+                action: ConfigAction::Show,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_config_setup() {
+        let cli = Cli::try_parse_from(["kei", "config", "setup"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Config {
+                action: ConfigAction::Setup { output: None },
+            }
+        ));
+    }
+
+    #[test]
+    fn test_config_setup_with_output() {
+        let cli =
+            Cli::try_parse_from(["kei", "config", "setup", "-o", "/tmp/config.toml"]).unwrap();
+        match cli.effective_command() {
+            Command::Config {
+                action: ConfigAction::Setup { output },
+            } => assert_eq!(output.as_deref(), Some("/tmp/config.toml")),
+            _ => panic!("Expected Config Setup"),
+        }
+    }
+
+    #[test]
+    fn test_sync_retry_failed_flag() {
+        let cli = Cli::try_parse_from(["kei", "sync", "--retry-failed", "--directory", "/photos"])
+            .unwrap();
+        match cli.effective_command() {
+            Command::Sync { sync, .. } => assert!(sync.retry_failed),
+            _ => panic!("Expected Sync"),
+        }
+    }
+
+    // ── Legacy subcommand compat ──────────────────────────────────
+
+    #[test]
+    fn test_legacy_get_code_maps_to_login() {
+        let cli = Cli::try_parse_from(["kei", "get-code"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Login {
+                subcommand: Some(LoginCommand::GetCode),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_legacy_submit_code_maps_to_login() {
+        let cli = Cli::try_parse_from(["kei", "submit-code", "123456"]).unwrap();
+        match cli.effective_command() {
+            Command::Login {
+                subcommand: Some(LoginCommand::SubmitCode { code }),
+                ..
+            } => assert_eq!(code, "123456"),
+            _ => panic!("Expected Login SubmitCode"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_credential_maps_to_password() {
+        let cli = Cli::try_parse_from(["kei", "credential", "set"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Password {
+                action: PasswordAction::Set,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_legacy_retry_failed_maps_to_sync() {
+        let cli = Cli::try_parse_from(["kei", "retry-failed", "--directory", "/photos"]).unwrap();
+        match cli.effective_command() {
+            Command::Sync { sync, .. } => {
+                assert!(sync.retry_failed);
+                assert_eq!(sync.directory, Some("/photos".to_string()));
+            }
+            _ => panic!("Expected Sync with retry_failed"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_reset_state_maps_to_reset() {
+        let cli = Cli::try_parse_from(["kei", "reset-state", "--yes"]).unwrap();
+        match cli.effective_command() {
+            Command::Reset {
+                what: ResetCommand::State { yes },
+            } => assert!(yes),
+            _ => panic!("Expected Reset State"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_reset_sync_token_maps_to_reset() {
+        let cli = Cli::try_parse_from(["kei", "reset-sync-token"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Reset {
+                what: ResetCommand::SyncToken,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_legacy_setup_maps_to_config() {
+        let cli = Cli::try_parse_from(["kei", "setup"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Config {
+                action: ConfigAction::Setup { output: None },
+            }
+        ));
+    }
+
+    #[test]
+    fn test_legacy_auth_only_maps_to_login() {
+        let cli = Cli::try_parse_from(["kei", "--auth-only"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Login {
+                subcommand: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_legacy_list_albums_maps_to_list() {
+        let cli = Cli::try_parse_from(["kei", "--list-albums"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::List {
+                what: ListCommand::Albums,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sync_auth_only_maps_to_login() {
+        let cli = Cli::try_parse_from(["kei", "sync", "--auth-only"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Login {
+                subcommand: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sync_list_albums_maps_to_list() {
+        let cli = Cli::try_parse_from(["kei", "sync", "--list-albums"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::List {
+                what: ListCommand::Albums,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sync_list_libraries_maps_to_list() {
+        let cli = Cli::try_parse_from(["kei", "sync", "--list-libraries"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::List {
+                what: ListCommand::Libraries,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_legacy_list_libraries_maps_to_list() {
+        let cli = Cli::try_parse_from(["kei", "--list-libraries"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::List {
+                what: ListCommand::Libraries,
+                ..
+            }
+        ));
+    }
+
+    // ── Password args ─────────────────────────────────────────────
 
     #[test]
     fn test_password_flag() {
         let mut args = base_args();
         args.extend(["--password", "secret123"]);
         let cli = parse(&args);
-        assert_eq!(cli.auth.password.as_deref(), Some("secret123"));
-    }
-
-    #[test]
-    fn test_password_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.auth.password.is_none());
+        assert_eq!(cli.password.password.as_deref(), Some("secret123"));
     }
 
     #[test]
@@ -944,7 +1203,10 @@ mod tests {
         let mut args = base_args();
         args.extend(["--password-file", "/run/secrets/pw"]);
         let cli = parse(&args);
-        assert_eq!(cli.auth.password_file.as_deref(), Some("/run/secrets/pw"));
+        assert_eq!(
+            cli.password.password_file.as_deref(),
+            Some("/run/secrets/pw")
+        );
     }
 
     #[test]
@@ -953,7 +1215,7 @@ mod tests {
         args.extend(["--password-command", "op read 'op://vault/icloud/pw'"]);
         let cli = parse(&args);
         assert_eq!(
-            cli.auth.password_command.as_deref(),
+            cli.password.password_command.as_deref(),
             Some("op read 'op://vault/icloud/pw'")
         );
     }
@@ -989,104 +1251,64 @@ mod tests {
         let mut args = base_args();
         args.push("--save-password");
         let cli = parse(&args);
-        assert!(cli.auth.save_password);
+        assert!(cli.password.save_password);
     }
 
-    #[test]
-    fn test_save_password_default_false() {
-        let cli = parse(&base_args());
-        assert!(!cli.auth.save_password);
-    }
+    // ── Sync args ─────────────────────────────────────────────────
 
     #[test]
-    fn test_credential_set_subcommand() {
-        let cli =
-            Cli::try_parse_from(["kei", "credential", "--username", "test@example.com", "set"])
-                .unwrap();
-        if let Some(Command::Credential(args)) = cli.command {
-            assert!(matches!(args.action, CredentialAction::Set));
-            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
-        } else {
-            panic!("Expected Credential command");
-        }
-    }
-
-    #[test]
-    fn test_credential_clear_subcommand() {
-        let cli = Cli::try_parse_from(["kei", "credential", "clear"]).unwrap();
-        if let Some(Command::Credential(args)) = cli.command {
-            assert!(matches!(args.action, CredentialAction::Clear));
-        } else {
-            panic!("Expected Credential command");
-        }
-    }
-
-    #[test]
-    fn test_credential_backend_subcommand() {
-        let cli = Cli::try_parse_from(["kei", "credential", "backend"]).unwrap();
-        if let Some(Command::Credential(args)) = cli.command {
-            assert!(matches!(args.action, CredentialAction::Backend));
-        } else {
-            panic!("Expected Credential command");
-        }
-    }
-
-    #[test]
-    fn test_cookie_directory_custom() {
+    fn test_library_accepts_custom_value() {
         let mut args = base_args();
-        args.extend(["--cookie-directory", "/tmp/claude/cookies"]);
+        args.extend(["--library", "SharedSync-ABCD1234"]);
         let cli = parse(&args);
-        assert_eq!(
-            cli.auth.cookie_directory.as_deref(),
-            Some("/tmp/claude/cookies")
-        );
+        assert_eq!(cli.sync.library.as_deref(), Some("SharedSync-ABCD1234"));
     }
 
     #[test]
-    fn test_domain_accepts_com() {
+    fn test_threads_num_accepts_valid_value() {
         let mut args = base_args();
-        args.extend(["--domain", "com"]);
+        args.extend(["--threads-num", "8"]);
         let cli = parse(&args);
-        assert_eq!(cli.auth.domain, Some(Domain::Com));
+        assert_eq!(cli.sync.threads_num, Some(8));
     }
 
     #[test]
-    fn test_domain_rejects_invalid() {
+    fn test_threads_num_rejects_zero() {
         let mut args = base_args();
-        args.extend(["--domain", "uk"]);
+        args.extend(["--threads-num", "0"]);
         assert!(Cli::try_parse_from(&args).is_err());
     }
 
-    // ── Boolean flags ──────────────────────────────────────────────
-
     #[test]
-    fn test_auth_only_flag() {
+    fn test_max_retries_custom() {
         let mut args = base_args();
-        args.push("--auth-only");
+        args.extend(["--max-retries", "10"]);
         let cli = parse(&args);
-        assert!(cli.sync.auth_only);
+        assert_eq!(cli.sync.max_retries, Some(10));
     }
 
     #[test]
-    fn test_auth_only_default_false() {
-        let cli = parse(&base_args());
-        assert!(!cli.sync.auth_only);
+    fn test_max_retries_zero_disables() {
+        let mut args = base_args();
+        args.extend(["--max-retries", "0"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.max_retries, Some(0));
     }
 
     #[test]
-    fn test_list_albums_flag() {
+    fn test_retry_delay_custom() {
         let mut args = base_args();
-        args.push("--list-albums");
+        args.extend(["--retry-delay", "15"]);
         let cli = parse(&args);
-        assert!(cli.sync.list_albums);
+        assert_eq!(cli.sync.retry_delay, Some(15));
     }
 
     #[test]
-    fn test_list_libraries_flag() {
+    fn test_temp_suffix_custom() {
         let mut args = base_args();
-        args.push("--list-libraries");
+        args.extend(["--temp-suffix", ".downloading"]);
         let cli = parse(&args);
-        assert!(cli.sync.list_libraries);
+        assert_eq!(cli.sync.temp_suffix.as_deref(), Some(".downloading"));
     }
 
     #[test]
@@ -1153,6 +1375,36 @@ mod tests {
         assert_eq!(cli.sync.keep_unicode_in_filenames, Some(true));
     }
 
+    #[test]
+    fn test_notify_systemd_flag() {
+        let mut args = base_args();
+        args.push("--notify-systemd");
+        let cli = parse(&args);
+        assert_eq!(cli.sync.notify_systemd, Some(true));
+    }
+
+    #[test]
+    fn test_pid_file_flag() {
+        let mut args = base_args();
+        args.extend(["--pid-file", "/tmp/claude/test.pid"]);
+        let cli = parse(&args);
+        assert_eq!(
+            cli.sync.pid_file,
+            Some(std::path::PathBuf::from("/tmp/claude/test.pid"))
+        );
+    }
+
+    #[test]
+    fn test_notification_script_flag() {
+        let mut args = base_args();
+        args.extend(["--notification-script", "/path/to/notify.sh"]);
+        let cli = parse(&args);
+        assert_eq!(
+            cli.sync.notification_script.as_deref(),
+            Some("/path/to/notify.sh")
+        );
+    }
+
     // ── Enum variants ──────────────────────────────────────────────
 
     #[test]
@@ -1207,11 +1459,28 @@ mod tests {
     }
 
     #[test]
-    fn test_align_raw_accepts_as_is() {
+    fn test_align_raw_all_variants() {
+        for (input, expected) in [
+            ("as-is", RawTreatmentPolicy::Unchanged),
+            ("original", RawTreatmentPolicy::PreferOriginal),
+            ("alternative", RawTreatmentPolicy::PreferAlternative),
+        ] {
+            let mut args = base_args();
+            args.extend(["--align-raw", input]);
+            let cli = parse(&args);
+            assert_eq!(
+                cli.sync.align_raw,
+                Some(expected),
+                "align_raw variant: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_align_raw_rejects_invalid() {
         let mut args = base_args();
-        args.extend(["--align-raw", "as-is"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.align_raw, Some(RawTreatmentPolicy::Unchanged));
+        args.extend(["--align-raw", "bogus"]);
+        assert!(Cli::try_parse_from(&args).is_err());
     }
 
     #[test]
@@ -1260,23 +1529,11 @@ mod tests {
     }
 
     #[test]
-    fn test_folder_structure_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.folder_structure.is_none());
-    }
-
-    #[test]
     fn test_directory_custom() {
         let mut args = base_args();
         args.extend(["--directory", "/photos"]);
         let cli = parse(&args);
         assert_eq!(cli.sync.directory.as_deref(), Some("/photos"));
-    }
-
-    #[test]
-    fn test_directory_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.directory.is_none());
     }
 
     #[test]
@@ -1300,48 +1557,6 @@ mod tests {
         let mut args = base_args();
         args.extend(["--watch-with-interval", "60"]);
         assert!(Cli::try_parse_from(&args).is_ok());
-    }
-
-    #[test]
-    fn test_auth_only_conflicts_with_watch() {
-        let mut args = base_args();
-        args.extend(["--auth-only", "--watch-with-interval", "300"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_auth_only_conflicts_with_list_albums() {
-        let mut args = base_args();
-        args.extend(["--auth-only", "--list-albums"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_auth_only_conflicts_with_list_libraries() {
-        let mut args = base_args();
-        args.extend(["--auth-only", "--list-libraries"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_list_albums_conflicts_with_watch() {
-        let mut args = base_args();
-        args.extend(["--list-albums", "--watch-with-interval", "300"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_list_libraries_conflicts_with_watch() {
-        let mut args = base_args();
-        args.extend(["--list-libraries", "--watch-with-interval", "300"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_list_albums_conflicts_with_list_libraries() {
-        let mut args = base_args();
-        args.extend(["--list-albums", "--list-libraries"]);
-        assert!(Cli::try_parse_from(&args).is_err());
     }
 
     #[test]
@@ -1374,239 +1589,7 @@ mod tests {
         assert!(cli.sync.albums.is_empty());
     }
 
-    // ── Subcommands without username ───────────────────────────────
-
-    #[test]
-    fn test_verify_subcommand_without_username() {
-        let cli = Cli::try_parse_from(["kei", "verify"]).unwrap();
-        if let Some(Command::Verify(args)) = cli.command {
-            assert!(args.auth.username.is_none());
-            assert!(!args.checksums);
-        } else {
-            panic!("Expected Verify command");
-        }
-    }
-
-    #[test]
-    fn test_verify_subcommand_with_checksums() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "verify",
-            "--username",
-            "test@example.com",
-            "--checksums",
-        ])
-        .unwrap();
-        if let Some(Command::Verify(args)) = cli.command {
-            assert!(args.checksums);
-        } else {
-            panic!("Expected Verify command");
-        }
-    }
-
-    #[test]
-    fn test_reset_state_subcommand_without_username() {
-        let cli = Cli::try_parse_from(["kei", "reset-state"]).unwrap();
-        if let Some(Command::ResetState(args)) = cli.command {
-            assert!(args.auth.username.is_none());
-            assert!(!args.yes);
-        } else {
-            panic!("Expected ResetState command");
-        }
-    }
-
-    #[test]
-    fn test_import_existing_subcommand() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "import-existing",
-            "--username",
-            "test@example.com",
-            "--directory",
-            "/photos",
-        ])
-        .unwrap();
-        if let Some(Command::ImportExisting(args)) = cli.command {
-            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
-            assert_eq!(args.directory.as_deref(), Some("/photos"));
-            assert!(args.folder_structure.is_none());
-            assert!(args.recent.is_none());
-        } else {
-            panic!("Expected ImportExisting command");
-        }
-    }
-
-    #[test]
-    fn test_import_existing_without_username() {
-        let cli =
-            Cli::try_parse_from(["kei", "import-existing", "--directory", "/photos"]).unwrap();
-        if let Some(Command::ImportExisting(args)) = cli.command {
-            assert!(args.auth.username.is_none());
-        } else {
-            panic!("Expected ImportExisting command");
-        }
-    }
-
-    #[test]
-    fn test_retry_failed_subcommand() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "retry-failed",
-            "--username",
-            "test@example.com",
-            "--directory",
-            "/photos",
-        ])
-        .unwrap();
-        if let Some(Command::RetryFailed(args)) = cli.command {
-            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
-            assert_eq!(args.sync.directory.as_deref(), Some("/photos"));
-        } else {
-            panic!("Expected RetryFailed command");
-        }
-    }
-
-    #[test]
-    fn test_retry_failed_without_username() {
-        let cli = Cli::try_parse_from(["kei", "retry-failed"]).unwrap();
-        if let Some(Command::RetryFailed(args)) = cli.command {
-            assert!(args.auth.username.is_none());
-        } else {
-            panic!("Expected RetryFailed command");
-        }
-    }
-
-    // ── --config global flag works with all subcommands ────────────
-
-    #[test]
-    fn test_config_global_with_sync_subcommand() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "sync",
-            "--config",
-            "/custom/config.toml",
-            "--username",
-            "test@example.com",
-        ])
-        .unwrap();
-        assert_eq!(cli.config, "/custom/config.toml");
-    }
-
-    #[test]
-    fn test_config_global_with_status_subcommand() {
-        let cli =
-            Cli::try_parse_from(["kei", "status", "--config", "/custom/config.toml"]).unwrap();
-        assert_eq!(cli.config, "/custom/config.toml");
-    }
-
-    #[test]
-    fn test_config_global_with_verify_subcommand() {
-        let cli =
-            Cli::try_parse_from(["kei", "verify", "--config", "/custom/config.toml"]).unwrap();
-        assert_eq!(cli.config, "/custom/config.toml");
-    }
-
-    #[test]
-    fn test_config_global_with_reset_state_subcommand() {
-        let cli =
-            Cli::try_parse_from(["kei", "reset-state", "--config", "/custom/config.toml"]).unwrap();
-        assert_eq!(cli.config, "/custom/config.toml");
-    }
-
-    #[test]
-    fn test_config_global_before_subcommand() {
-        let cli =
-            Cli::try_parse_from(["kei", "--config", "/custom/config.toml", "status"]).unwrap();
-        assert_eq!(cli.config, "/custom/config.toml");
-        assert!(matches!(cli.command, Some(Command::Status(_))));
-    }
-
-    // ── get-code subcommand ─────────────────────────────────────
-
-    #[test]
-    fn test_get_code_subcommand() {
-        let cli =
-            Cli::try_parse_from(["kei", "get-code", "--username", "test@example.com"]).unwrap();
-        if let Some(Command::GetCode(args)) = cli.command {
-            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
-        } else {
-            panic!("Expected GetCode command");
-        }
-    }
-
-    #[test]
-    fn test_get_code_without_username() {
-        let cli = Cli::try_parse_from(["kei", "get-code"]).unwrap();
-        if let Some(Command::GetCode(args)) = cli.command {
-            assert!(args.auth.username.is_none());
-        } else {
-            panic!("Expected GetCode command");
-        }
-    }
-
-    #[test]
-    fn test_get_code_with_config() {
-        let cli =
-            Cli::try_parse_from(["kei", "get-code", "--config", "/custom/config.toml"]).unwrap();
-        assert_eq!(cli.config, "/custom/config.toml");
-        assert!(matches!(cli.command, Some(Command::GetCode(_))));
-    }
-
-    // ── submit-code subcommand ────────────────────────────────────
-
-    #[test]
-    fn test_submit_code_subcommand() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "submit-code",
-            "--username",
-            "test@example.com",
-            "123456",
-        ])
-        .unwrap();
-        if let Some(Command::SubmitCode(args)) = cli.command {
-            assert_eq!(args.auth.username.as_deref(), Some("test@example.com"));
-            assert_eq!(args.code, "123456");
-        } else {
-            panic!("Expected SubmitCode command");
-        }
-    }
-
-    #[test]
-    fn test_submit_code_without_username() {
-        let cli = Cli::try_parse_from(["kei", "submit-code", "123456"]).unwrap();
-        if let Some(Command::SubmitCode(args)) = cli.command {
-            assert!(args.auth.username.is_none());
-            assert_eq!(args.code, "123456");
-        } else {
-            panic!("Expected SubmitCode command");
-        }
-    }
-
-    #[test]
-    fn test_submit_code_requires_code_arg() {
-        assert!(Cli::try_parse_from(["kei", "submit-code"]).is_err());
-    }
-
-    #[test]
-    fn test_submit_code_with_config() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "submit-code",
-            "--config",
-            "/custom/config.toml",
-            "654321",
-        ])
-        .unwrap();
-        assert_eq!(cli.config, "/custom/config.toml");
-        if let Some(Command::SubmitCode(args)) = cli.command {
-            assert_eq!(args.code, "654321");
-        } else {
-            panic!("Expected SubmitCode command");
-        }
-    }
-
-    // ── input validation ────────────────────────────────────────────
+    // ── Input validation ───────────────────────────────────────────
 
     #[test]
     fn test_empty_username_rejected() {
@@ -1632,19 +1615,6 @@ mod tests {
         let mut args = base_args();
         args.extend(["--album", ""]);
         assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_empty_import_directory_rejected() {
-        let args = [
-            "kei",
-            "import-existing",
-            "--username",
-            "user@example.com",
-            "--directory",
-            "",
-        ];
-        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]
@@ -1712,13 +1682,7 @@ mod tests {
         assert_eq!(cli.sync.max_retries, Some(100));
     }
 
-    // ── no-incremental / reset-sync-token flags ───────────────────
-
-    #[test]
-    fn test_no_incremental_default_false() {
-        let cli = parse(&base_args());
-        assert!(!cli.sync.no_incremental);
-    }
+    // ── no-incremental / reset-sync-token compat flags ───────────
 
     #[test]
     fn test_no_incremental_flag() {
@@ -1729,13 +1693,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_sync_token_default_false() {
-        let cli = parse(&base_args());
-        assert!(!cli.sync.reset_sync_token);
-    }
-
-    #[test]
-    fn test_reset_sync_token_flag() {
+    fn test_reset_sync_token_compat_flag() {
         let mut args = base_args();
         args.push("--reset-sync-token");
         let cli = parse(&args);
@@ -1752,22 +1710,76 @@ mod tests {
         assert!(cli.sync.reset_sync_token);
     }
 
-    // ── notification-script flag ──────────────────────────────────
+    // ── Sync subcommand ───────────────────────────────────────────
 
     #[test]
-    fn test_notification_script_none_by_default() {
-        let cli = parse(&base_args());
-        assert!(cli.sync.notification_script.is_none());
+    fn test_sync_subcommand() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "sync",
+            "--username",
+            "test@example.com",
+            "--directory",
+            "/photos",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Some(Command::Sync { .. })));
     }
 
     #[test]
-    fn test_notification_script_flag() {
-        let mut args = base_args();
-        args.extend(["--notification-script", "/path/to/notify.sh"]);
-        let cli = parse(&args);
-        assert_eq!(
-            cli.sync.notification_script.as_deref(),
-            Some("/path/to/notify.sh")
-        );
+    fn test_status_subcommand() {
+        let cli = Cli::try_parse_from(["kei", "status"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Status(_))));
+    }
+
+    #[test]
+    fn test_status_with_failed_flag() {
+        let cli = Cli::try_parse_from(["kei", "status", "--failed"]).unwrap();
+        if let Some(Command::Status(args)) = cli.command {
+            assert!(args.failed);
+        } else {
+            panic!("Expected Status command");
+        }
+    }
+
+    // ── Global flags work with subcommands ────────────────────────
+
+    #[test]
+    fn test_config_global_before_subcommand() {
+        let cli =
+            Cli::try_parse_from(["kei", "--config", "/custom/config.toml", "status"]).unwrap();
+        assert_eq!(cli.config, "/custom/config.toml");
+        assert!(matches!(cli.command, Some(Command::Status(_))));
+    }
+
+    #[test]
+    fn test_username_global_before_subcommand() {
+        let cli = Cli::try_parse_from(["kei", "--username", "test@example.com", "sync"]).unwrap();
+        assert_eq!(cli.username.as_deref(), Some("test@example.com"));
+    }
+
+    // ── import-existing ───────────────────────────────────────────
+
+    #[test]
+    fn test_import_existing_subcommand() {
+        let cli =
+            Cli::try_parse_from(["kei", "import-existing", "--directory", "/photos"]).unwrap();
+        if let Some(Command::ImportExisting(args)) = cli.command {
+            assert_eq!(args.directory.as_deref(), Some("/photos"));
+            assert!(args.folder_structure.is_none());
+            assert!(args.recent.is_none());
+        } else {
+            panic!("Expected ImportExisting command");
+        }
+    }
+
+    #[test]
+    fn test_verify_subcommand() {
+        let cli = Cli::try_parse_from(["kei", "verify", "--checksums"]).unwrap();
+        if let Some(Command::Verify(args)) = cli.command {
+            assert!(args.checksums);
+        } else {
+            panic!("Expected Verify command");
+        }
     }
 }

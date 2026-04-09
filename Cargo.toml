@@ -114,10 +114,6 @@ name = "sync"
 path = "tests/sync.rs"
 
 [[test]]
-name = "state"
-path = "tests/state.rs"
-
-[[test]]
 name = "state_auth"
 path = "tests/state_auth.rs"
 

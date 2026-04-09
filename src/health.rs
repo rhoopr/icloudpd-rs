@@ -117,4 +117,59 @@ mod tests {
         let h = HealthStatus::new();
         h.write(&dir.path().join("nonexistent_subdir"));
     }
+
+    #[test]
+    fn failure_with_special_chars_produces_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = HealthStatus::new();
+        h.record_failure("error with \"quotes\" and\nnewlines");
+        h.write(dir.path());
+
+        let contents = std::fs::read_to_string(dir.path().join("health.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(
+            parsed["last_error"].as_str().unwrap(),
+            "error with \"quotes\" and\nnewlines"
+        );
+    }
+
+    #[test]
+    fn multiple_failures_increment_correctly() {
+        let mut h = HealthStatus::new();
+        for _ in 0..5 {
+            h.record_failure("err");
+        }
+        assert_eq!(h.consecutive_failures, 5);
+    }
+
+    #[test]
+    fn success_after_failures_resets_count() {
+        let mut h = HealthStatus::new();
+        h.record_failure("e1");
+        h.record_failure("e2");
+        h.record_failure("e3");
+        h.record_success();
+
+        assert_eq!(h.consecutive_failures, 0);
+        assert!(h.last_error.is_none());
+    }
+
+    #[test]
+    fn health_json_timestamps_are_iso8601() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = HealthStatus::new();
+        h.record_success();
+        h.write(dir.path());
+
+        let contents = std::fs::read_to_string(dir.path().join("health.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+
+        for key in &["last_sync_at", "last_success_at"] {
+            let ts = parsed[key].as_str().unwrap();
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(ts).is_ok(),
+                "{key} timestamp is not ISO 8601: {ts}"
+            );
+        }
+    }
 }

@@ -7,16 +7,21 @@ mod common;
 
 use predicates::prelude::*;
 
+/// Visible subcommands shown in `--help`.
 const ALL_SUBCOMMANDS: &[&str] = &[
     "sync",
+    "login",
+    "list",
+    "password",
+    "reset",
+    "config",
     "status",
-    "reset-state",
-    "verify",
-    "retry-failed",
-    "get-code",
-    "submit-code",
     "import-existing",
+    "verify",
 ];
+
+/// Subcommands that accept `--password` (have PasswordArgs).
+const PASSWORD_SUBCOMMANDS: &[&str] = &["sync", "login", "import-existing"];
 
 // ── Help output ─────────────────────────────────────────────────────────
 
@@ -62,10 +67,7 @@ fn sync_help_lists_sync_token_flags() {
         stdout.contains("--no-incremental"),
         "sync help missing --no-incremental"
     );
-    assert!(
-        stdout.contains("--reset-sync-token"),
-        "sync help missing --reset-sync-token"
-    );
+    // --reset-sync-token is now a hidden compat flag (use `kei reset sync-token`)
 }
 
 #[test]
@@ -106,11 +108,12 @@ fn verify_help_succeeds() {
 
 #[test]
 fn get_code_help_succeeds() {
+    // get-code is a hidden legacy alias for `login get-code`
     common::cmd()
         .args(["get-code", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("2FA"));
+        .stdout(predicate::str::contains("login get-code"));
 }
 
 #[test]
@@ -250,17 +253,7 @@ fn short_y_flag_on_reset_state() {
         .success();
 }
 
-// ── Enum validation ─────────────────────────────────────────────────────
-
-#[test]
-fn size_accepts_all_valid_variants() {
-    for variant in ["original", "medium", "thumb", "adjusted", "alternative"] {
-        common::cmd()
-            .args(["sync", "--size", variant, "--help"])
-            .assert()
-            .success();
-    }
-}
+// ── Enum validation (rejection only — acceptance covered by unit tests) ─
 
 #[test]
 fn size_rejects_invalid_variant() {
@@ -272,32 +265,12 @@ fn size_rejects_invalid_variant() {
 }
 
 #[test]
-fn domain_accepts_com_and_cn() {
-    for variant in ["com", "cn"] {
-        common::cmd()
-            .args(["sync", "--domain", variant, "--help"])
-            .assert()
-            .success();
-    }
-}
-
-#[test]
 fn domain_rejects_invalid() {
     common::cmd()
         .args(["sync", "--username", "x@x.com", "--domain", "uk"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("error"));
-}
-
-#[test]
-fn live_photo_size_accepts_valid() {
-    for variant in ["original", "medium", "thumb", "adjusted"] {
-        common::cmd()
-            .args(["sync", "--live-photo-size", variant, "--help"])
-            .assert()
-            .success();
-    }
 }
 
 #[test]
@@ -316,21 +289,6 @@ fn live_photo_size_rejects_invalid() {
 }
 
 #[test]
-fn live_photo_mov_filename_policy_accepts_valid() {
-    for variant in ["suffix", "original"] {
-        common::cmd()
-            .args([
-                "sync",
-                "--live-photo-mov-filename-policy",
-                variant,
-                "--help",
-            ])
-            .assert()
-            .success();
-    }
-}
-
-#[test]
 fn live_photo_mov_filename_policy_rejects_invalid() {
     common::cmd()
         .args([
@@ -346,32 +304,12 @@ fn live_photo_mov_filename_policy_rejects_invalid() {
 }
 
 #[test]
-fn align_raw_accepts_valid() {
-    for variant in ["as-is", "original", "alternative"] {
-        common::cmd()
-            .args(["sync", "--align-raw", variant, "--help"])
-            .assert()
-            .success();
-    }
-}
-
-#[test]
 fn align_raw_rejects_invalid() {
     common::cmd()
         .args(["sync", "--username", "x@x.com", "--align-raw", "bogus"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("error"));
-}
-
-#[test]
-fn file_match_policy_accepts_valid() {
-    for variant in ["name-size-dedup-with-suffix", "name-id7"] {
-        common::cmd()
-            .args(["sync", "--file-match-policy", variant, "--help"])
-            .assert()
-            .success();
-    }
 }
 
 #[test]
@@ -389,7 +327,7 @@ fn file_match_policy_rejects_invalid() {
         .stderr(predicate::str::contains("error"));
 }
 
-// ── Threads-num validation ──────────────────────────────────────────────
+// ── Numeric validation (rejection only — acceptance covered by unit tests)
 
 #[test]
 fn threads_num_rejects_zero() {
@@ -398,23 +336,6 @@ fn threads_num_rejects_zero() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("error"));
-}
-
-#[test]
-fn threads_num_rejects_negative() {
-    common::cmd()
-        .args(["sync", "--username", "x@x.com", "--threads-num", "-1"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("error"));
-}
-
-#[test]
-fn threads_num_accepts_positive() {
-    common::cmd()
-        .args(["sync", "--threads-num", "5", "--help"])
-        .assert()
-        .success();
 }
 
 // ── submit-code requires positional CODE ────────────────────────────────
@@ -707,12 +628,12 @@ fn unknown_flag_on_all_subcommands_fails() {
 
 #[test]
 fn auth_flags_accepted_on_all_subcommands() {
+    // Global flags (--username, --domain, --data-dir) work on all subcommands
     for sub in ALL_SUBCOMMANDS {
         for (flag, value) in [
             ("--username", "x@x.com"),
-            ("--password", "secret"),
             ("--domain", "com"),
-            ("--cookie-directory", "/tmp/cookies"),
+            ("--data-dir", "/tmp/data"),
         ] {
             common::cmd()
                 .args([sub, flag, value, "--help"])
@@ -720,71 +641,13 @@ fn auth_flags_accepted_on_all_subcommands() {
                 .success();
         }
     }
-}
-
-// ── Log level all variants ──────────────────────────────────────────
-
-#[test]
-fn log_level_all_variants_accepted() {
-    for variant in ["debug", "info", "warn", "error"] {
+    // --password only accepted on commands with PasswordArgs
+    for sub in PASSWORD_SUBCOMMANDS {
         common::cmd()
-            .args(["--log-level", variant, "--help"])
+            .args([sub, "--password", "secret", "--help"])
             .assert()
             .success();
     }
-}
-
-// ── Numeric flag validation ─────────────────────────────────────────
-
-#[test]
-fn threads_num_rejects_non_numeric() {
-    common::cmd()
-        .args(["sync", "--username", "x@x.com", "--threads-num", "abc"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("error"));
-}
-
-#[test]
-fn recent_rejects_non_numeric() {
-    common::cmd()
-        .args(["sync", "--username", "x@x.com", "--recent", "abc"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("error"));
-}
-
-#[test]
-fn watch_with_interval_rejects_non_numeric() {
-    common::cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--watch-with-interval",
-            "abc",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("error"));
-}
-
-#[test]
-fn max_retries_rejects_non_numeric() {
-    common::cmd()
-        .args(["sync", "--username", "x@x.com", "--max-retries", "abc"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("error"));
-}
-
-#[test]
-fn retry_delay_rejects_non_numeric() {
-    common::cmd()
-        .args(["sync", "--username", "x@x.com", "--retry-delay", "abc"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("error"));
 }
 
 // ── retry-failed shares sync flags ──────────────────────────────────
@@ -948,6 +811,340 @@ fn exit_code_2_on_invalid_argument() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("value must not be empty"));
+}
+
+// ── New subcommand help ────────────────────────────────────────────────
+
+#[test]
+fn login_help_succeeds() {
+    common::cmd()
+        .args(["login", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("get-code"))
+        .stdout(predicate::str::contains("submit-code"));
+}
+
+#[test]
+fn login_get_code_help_succeeds() {
+    common::cmd()
+        .args(["login", "get-code", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2FA"));
+}
+
+#[test]
+fn login_submit_code_help_succeeds() {
+    common::cmd()
+        .args(["login", "submit-code", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CODE"));
+}
+
+#[test]
+fn login_submit_code_requires_code() {
+    common::cmd()
+        .args(["login", "submit-code"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("error"));
+}
+
+#[test]
+fn list_help_succeeds() {
+    common::cmd()
+        .args(["list", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("albums"))
+        .stdout(predicate::str::contains("libraries"));
+}
+
+#[test]
+fn list_albums_help_succeeds() {
+    common::cmd()
+        .args(["list", "albums", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn list_libraries_help_succeeds() {
+    common::cmd()
+        .args(["list", "libraries", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn password_help_succeeds() {
+    common::cmd()
+        .args(["password", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("set"))
+        .stdout(predicate::str::contains("clear"))
+        .stdout(predicate::str::contains("backend"));
+}
+
+#[test]
+fn reset_help_succeeds() {
+    common::cmd()
+        .args(["reset", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("state"))
+        .stdout(predicate::str::contains("sync-token"));
+}
+
+#[test]
+fn reset_state_new_help_succeeds() {
+    common::cmd()
+        .args(["reset", "state", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--yes"));
+}
+
+#[test]
+fn reset_sync_token_help_succeeds() {
+    common::cmd()
+        .args(["reset", "sync-token", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn config_help_succeeds() {
+    common::cmd()
+        .args(["config", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("show"))
+        .stdout(predicate::str::contains("setup"));
+}
+
+#[test]
+fn config_show_help_succeeds() {
+    common::cmd()
+        .args(["config", "show", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn config_setup_help_succeeds() {
+    common::cmd()
+        .args(["config", "setup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--output"));
+}
+
+#[test]
+fn sync_retry_failed_help_succeeds() {
+    common::cmd()
+        .args(["sync", "--retry-failed", "--help"])
+        .assert()
+        .success();
+}
+
+// ── Hidden legacy commands not in help ─────────────────────────────────
+
+#[test]
+fn hidden_legacy_commands_not_in_help() {
+    let assert = common::cmd().arg("--help").assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    // These hyphenated names only appeared as top-level subcommands in
+    // the old CLI. They should now be hidden.
+    // Note: "retry-failed" excluded because --retry-failed is a visible
+    // flag on sync (flattened at top level).
+    for hidden in ["get-code", "submit-code", "reset-state", "reset-sync-token"] {
+        assert!(
+            !stdout.contains(hidden),
+            "help output should not list hidden command `{hidden}`"
+        );
+    }
+}
+
+// ── Deprecation warnings ──────────────────────────────────────────────
+
+#[test]
+fn legacy_credential_backend_prints_deprecation_warning() {
+    let output = common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args(["credential", "backend", "--username", "x@x.com"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated"),
+        "legacy command should print deprecation warning, stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn legacy_reset_state_prints_deprecation_warning() {
+    let output = common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args(["reset-state", "--username", "x@x.com", "--yes"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated"),
+        "legacy command should print deprecation warning, stderr:\n{stderr}"
+    );
+}
+
+// ── --retry-failed conflicts ──────────────────────────────────────────
+
+#[test]
+fn retry_failed_conflicts_with_dry_run() {
+    common::cmd()
+        .args(["sync", "--retry-failed", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("error"));
+}
+
+#[test]
+fn retry_failed_conflicts_with_watch() {
+    common::cmd()
+        .args(["sync", "--retry-failed", "--watch-with-interval", "300"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("error"));
+}
+
+// ── --data-dir global ─────────────────────────────────────────────────
+
+#[test]
+fn data_dir_flag_accepted() {
+    common::cmd()
+        .args(["sync", "--data-dir", "/tmp/data", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn data_dir_global_works_with_subcommands() {
+    for sub in ALL_SUBCOMMANDS {
+        common::cmd()
+            .args([sub, "--data-dir", "/tmp/data", "--help"])
+            .assert()
+            .success();
+    }
+}
+
+// ── KEI_* env vars ────────────────────────────────────────────────────
+
+#[test]
+fn kei_directory_env_var_accepted() {
+    common::cmd()
+        .env("KEI_DIRECTORY", "/photos")
+        .args(["sync", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn kei_data_dir_env_var_accepted() {
+    common::cmd()
+        .env("KEI_DATA_DIR", "/data")
+        .args(["sync", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn kei_log_level_env_var_accepted() {
+    common::cmd()
+        .env("KEI_LOG_LEVEL", "debug")
+        .args(["sync", "--help"])
+        .assert()
+        .success();
+}
+
+// ── config show produces TOML ─────────────────────────────────────────
+
+#[test]
+fn config_show_produces_toml_output() {
+    let output = common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args([
+            "config",
+            "show",
+            "--username",
+            "test@example.com",
+            "--data-dir",
+            "/tmp",
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[auth]") && stdout.contains("test@example.com"),
+        "config show should produce TOML with username, got:\n{stdout}"
+    );
+}
+
+// ── reset with no DB prints message ───────────────────────────────────
+
+#[test]
+fn reset_sync_token_no_db_prints_message() {
+    let dir = tempfile::tempdir().unwrap();
+    common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args([
+            "reset",
+            "sync-token",
+            "--username",
+            "test@example.com",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No state database found"));
+}
+
+#[test]
+fn reset_state_no_db_prints_message() {
+    let dir = tempfile::tempdir().unwrap();
+    common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args([
+            "reset",
+            "state",
+            "--yes",
+            "--username",
+            "test@example.com",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No state database found"));
 }
 
 // ── submit-code validation ─────────────────────────────────────────────

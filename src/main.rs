@@ -183,19 +183,19 @@ fn make_password_provider(source: password::PasswordSource) -> impl Fn() -> Opti
     }
 }
 
-/// Build a password provider from CLI auth args, TOML config, and resolved auth fields.
+/// Build a password provider from CLI password args, TOML config, and resolved auth fields.
 ///
-/// Shared by `run_get_code`, `run_submit_code`, and `run_import_existing`.
+/// Shared by `run_login`, `run_list`, and `run_import_existing`.
 fn make_provider_from_auth(
-    auth: &cli::AuthArgs,
+    pw: &cli::PasswordArgs,
     password: Option<String>,
     username: &str,
     cookie_directory: &Path,
     toml: Option<&config::TomlConfig>,
 ) -> impl Fn() -> Option<SecretString> {
     let toml_auth = toml.and_then(|t| t.auth.as_ref());
-    let password_command = config::resolve_password_command(auth, toml_auth);
-    let password_file = config::resolve_password_file(auth, toml_auth);
+    let password_command = config::resolve_password_command(pw, toml_auth);
+    let password_file = config::resolve_password_file(pw, toml_auth);
     let source = password::build_password_source(
         password.map(SecretString::from).as_ref(),
         password_command.as_deref(),
@@ -387,8 +387,9 @@ async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
 ///
 /// Returns an error if the resolved username is empty, since an empty username
 /// produces a `.db` filename that silently operates on the wrong database.
-fn get_db_path(auth: &cli::AuthArgs, toml: Option<&TomlConfig>) -> anyhow::Result<PathBuf> {
-    let (username, _, _, cookie_dir) = config::resolve_auth(auth, toml);
+fn get_db_path(globals: &config::GlobalArgs, toml: Option<&TomlConfig>) -> anyhow::Result<PathBuf> {
+    let (username, _, _, cookie_dir) =
+        config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
     if username.is_empty() {
         anyhow::bail!(
             "--username is required (or set ICLOUD_USERNAME, or add username to config file)"
@@ -401,8 +402,12 @@ fn get_db_path(auth: &cli::AuthArgs, toml: Option<&TomlConfig>) -> anyhow::Resul
 }
 
 /// Run the status command.
-async fn run_status(args: cli::StatusArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth, toml)?;
+async fn run_status(
+    args: cli::StatusArgs,
+    globals: &config::GlobalArgs,
+    toml: Option<&TomlConfig>,
+) -> anyhow::Result<()> {
+    let db_path = get_db_path(globals, toml)?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -457,17 +462,18 @@ async fn run_status(args: cli::StatusArgs, toml: Option<&TomlConfig>) -> anyhow:
 
 /// Run the reset-state command.
 async fn run_reset_state(
-    args: cli::ResetStateArgs,
+    yes: bool,
+    globals: &config::GlobalArgs,
     toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth, toml)?;
+    let db_path = get_db_path(globals, toml)?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
         return Ok(());
     }
 
-    if !args.yes {
+    if !yes {
         use std::io::Write;
         println!("This will delete the state database at:");
         println!("  {}", db_path.display());
@@ -495,9 +501,37 @@ async fn run_reset_state(
     Ok(())
 }
 
+/// Run the reset-sync-token command.
+async fn run_reset_sync_token(
+    globals: &config::GlobalArgs,
+    toml: Option<&TomlConfig>,
+) -> anyhow::Result<()> {
+    let db_path = get_db_path(globals, toml)?;
+
+    if !db_path.exists() {
+        println!("No state database found at {}", db_path.display());
+        return Ok(());
+    }
+
+    let db = state::SqliteStateDb::open(&db_path).await?;
+    db.set_metadata("db_sync_token", "").await?;
+    let cleared = db.delete_metadata_by_prefix("sync_token:").await?;
+    println!(
+        "Cleared sync tokens ({} zone token{} + db token). Next sync will do a full enumeration.",
+        cleared,
+        if cleared == 1 { "" } else { "s" }
+    );
+
+    Ok(())
+}
+
 /// Run the verify command.
-async fn run_verify(args: cli::VerifyArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
-    let db_path = get_db_path(&args.auth, toml)?;
+async fn run_verify(
+    args: cli::VerifyArgs,
+    globals: &config::GlobalArgs,
+    toml: Option<&TomlConfig>,
+) -> anyhow::Result<()> {
+    let db_path = get_db_path(globals, toml)?;
 
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
@@ -594,92 +628,185 @@ async fn verify_local_checksum(path: &Path, expected_hex: &str) -> anyhow::Resul
     Ok(actual == expected_hex)
 }
 
-/// Run the get-code command: trigger push notification for 2FA.
-/// Run the credential subcommand: set, clear, or show backend.
-async fn run_credential(
-    args: cli::CredentialArgs,
+/// Run the password subcommand: set, clear, or show backend.
+async fn run_password(
+    action: cli::PasswordAction,
+    globals: &config::GlobalArgs,
+    pw: &cli::PasswordArgs,
     toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
-    let (username, _password, _domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
+    let (username, _password, _domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
 
     if username.is_empty() {
-        anyhow::bail!("--username is required for credential management");
+        anyhow::bail!("--username is required for password management");
     }
 
     let store = credential::CredentialStore::new(&username, &cookie_directory);
 
-    match args.action {
-        cli::CredentialAction::Set => {
-            let pw = rpassword::prompt_password("iCloud Password: ")
+    match action {
+        cli::PasswordAction::Set => {
+            let input = rpassword::prompt_password("iCloud Password: ")
                 .map_err(|e| anyhow::anyhow!("Failed to read password: {e}"))?;
-            anyhow::ensure!(!pw.is_empty(), "Password must not be empty");
-            store.store(&pw)?;
+            anyhow::ensure!(!input.is_empty(), "Password must not be empty");
+            store.store(&input)?;
             println!("Password stored in {} backend.", store.backend_name());
         }
-        cli::CredentialAction::Clear => {
+        cli::PasswordAction::Clear => {
             store.delete()?;
             println!("Stored credential removed.");
         }
-        cli::CredentialAction::Backend => {
+        cli::PasswordAction::Backend => {
             println!("{}", store.backend_name());
         }
     }
     Ok(())
 }
 
-async fn run_get_code(args: cli::GetCodeArgs, toml: Option<&TomlConfig>) -> anyhow::Result<()> {
-    let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
+/// Run the login command: authenticate, request 2FA push, or submit a 2FA code.
+async fn run_login(
+    subcommand: Option<cli::LoginCommand>,
+    pw: &cli::PasswordArgs,
+    globals: &config::GlobalArgs,
+    toml: Option<&TomlConfig>,
+) -> anyhow::Result<()> {
+    let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
 
     if username.is_empty() {
-        anyhow::bail!("--username is required for get-code");
+        anyhow::bail!("--username is required for login");
     }
 
     let password_provider =
-        make_provider_from_auth(&args.auth, password, &username, &cookie_directory, toml);
+        make_provider_from_auth(pw, password, &username, &cookie_directory, toml);
 
-    auth::send_2fa_push(
-        &cookie_directory,
-        &username,
-        &password_provider,
-        domain.as_str(),
-    )
-    .await?;
-
-    println!("2FA code requested. Check your trusted devices, then run:");
-    println!("  kei submit-code <CODE>");
+    match subcommand {
+        Some(cli::LoginCommand::GetCode) => {
+            auth::send_2fa_push(
+                &cookie_directory,
+                &username,
+                &password_provider,
+                domain.as_str(),
+            )
+            .await?;
+            println!("2FA code requested. Check your trusted devices, then run:");
+            println!("  kei login submit-code <CODE>");
+        }
+        Some(cli::LoginCommand::SubmitCode { code }) => {
+            let result = auth::authenticate(
+                &cookie_directory,
+                &username,
+                &password_provider,
+                domain.as_str(),
+                None,
+                None,
+                Some(&code),
+            )
+            .await?;
+            if result.requires_2fa {
+                println!("2FA code accepted. Session is now authenticated.");
+            } else {
+                println!("Session is already authenticated.");
+            }
+        }
+        None => {
+            // Bare "kei login" = auth-only
+            auth::authenticate(
+                &cookie_directory,
+                &username,
+                &password_provider,
+                domain.as_str(),
+                None,
+                None,
+                None,
+            )
+            .await?;
+            tracing::info!("Authentication completed successfully");
+        }
+    }
     Ok(())
 }
 
-/// Run the submit-code command: authenticate with a pre-provided 2FA code.
-async fn run_submit_code(
-    args: cli::SubmitCodeArgs,
+/// Run the list command: list albums or libraries.
+async fn run_list(
+    what: cli::ListCommand,
+    pw: &cli::PasswordArgs,
+    globals: &config::GlobalArgs,
     toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
-    let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
+    let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
 
     if username.is_empty() {
-        anyhow::bail!("--username is required for submit-code");
+        anyhow::bail!("--username is required");
     }
 
     let password_provider =
-        make_provider_from_auth(&args.auth, password, &username, &cookie_directory, toml);
+        make_provider_from_auth(pw, password, &username, &cookie_directory, toml);
 
-    let result = auth::authenticate(
+    let auth_result = auth::authenticate(
         &cookie_directory,
         &username,
         &password_provider,
         domain.as_str(),
         None,
         None,
-        Some(&args.code),
+        None,
     )
     .await?;
 
-    if result.requires_2fa {
-        println!("2FA code accepted. Session is now authenticated.");
-    } else {
-        println!("Session is already authenticated.");
+    let api_retry_config = retry::RetryConfig::default();
+    let (_shared_session, mut photos_service) =
+        init_photos_service(auth_result, domain.as_str(), api_retry_config).await?;
+
+    match what {
+        cli::ListCommand::Libraries => {
+            println!("Private libraries:");
+            let private = photos_service.fetch_private_libraries().await?;
+            for name in private.keys() {
+                println!("  {name}");
+            }
+            println!("Shared libraries:");
+            let shared = photos_service.fetch_shared_libraries().await?;
+            for name in shared.keys() {
+                println!("  {name}");
+            }
+        }
+        cli::ListCommand::Albums => {
+            // Resolve library selection from TOML
+            let toml_filters = toml.and_then(|t| t.filters.as_ref());
+            let library_str = toml_filters
+                .and_then(|f| f.library.clone())
+                .unwrap_or_else(|| "PrimarySync".to_string());
+            let libraries = if library_str.eq_ignore_ascii_case("all") {
+                photos_service.all_libraries().await?
+            } else {
+                vec![photos_service.get_library(&library_str).await?.clone()]
+            };
+            for library in &libraries {
+                println!("Library: {}", library.zone_name());
+                let albums = library.albums().await?;
+                for name in albums.keys() {
+                    println!("  {name}");
+                }
+            }
+        }
     }
+    Ok(())
+}
+
+/// Run the config show command: dump resolved config as TOML.
+async fn run_config_show(
+    globals: &config::GlobalArgs,
+    toml: Option<&TomlConfig>,
+) -> anyhow::Result<()> {
+    let cfg = config::Config::build(
+        globals,
+        cli::PasswordArgs::default(),
+        cli::SyncArgs::default(),
+        toml.cloned(),
+    )?;
+    let toml_config = cfg.to_toml();
+    let output = toml::to_string_pretty(&toml_config)
+        .map_err(|e| anyhow::anyhow!("failed to serialize config: {e}"))?;
+    print!("{output}");
     Ok(())
 }
 
@@ -718,13 +845,14 @@ fn build_photos_params(
 /// 3. If the file exists and size matches, marking it as downloaded in the DB
 async fn run_import_existing(
     args: cli::ImportArgs,
+    globals: &config::GlobalArgs,
     toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
     use chrono::Local;
     use futures_util::StreamExt;
     use icloud::photos::AssetVersionSize;
 
-    let db_path = get_db_path(&args.auth, toml)?;
+    let db_path = get_db_path(globals, toml)?;
     let toml_dl = toml.and_then(|t| t.download.as_ref());
     let toml_photos = toml.and_then(|t| t.photos.as_ref());
 
@@ -756,12 +884,13 @@ async fn run_import_existing(
     let db = Arc::new(state::SqliteStateDb::open(&db_path).await?);
     tracing::info!(path = %db_path.display(), "State database opened");
 
-    // Resolve auth from CLI + TOML
-    let (username, password, domain, cookie_directory) = config::resolve_auth(&args.auth, toml);
+    // Resolve auth from globals + TOML
+    let (username, password, domain, cookie_directory) =
+        config::resolve_auth(globals, &args.password, toml);
 
     // Authenticate
     let password_provider =
-        make_provider_from_auth(&args.auth, password, &username, &cookie_directory, toml);
+        make_provider_from_auth(&args.password, password, &username, &cookie_directory, toml);
 
     let auth_result = auth::authenticate(
         &cookie_directory,
@@ -1088,84 +1217,114 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         );
     }
 
+    // Build globals from CLI early (username, domain, data_dir, cookie_directory).
+    let mut globals = config::GlobalArgs::from_cli(&cli);
+
     // Dispatch based on command
     let mut command = cli.effective_command();
     // Inject the password captured from env before the runtime started,
     // since we cleared ICLOUD_PASSWORD before Cli::parse() could see it.
-    // Must happen before command dispatch so all subcommands (get-code,
-    // submit-code, etc.) receive the password, not just sync.
+    // Must happen before command dispatch so all subcommands (login,
+    // list, etc.) receive the password, not just sync.
     command.inject_env_password(env_password);
-    let is_retry_failed = matches!(command, Command::RetryFailed(_));
-    let mut is_one_shot = is_retry_failed;
-    let (auth, sync) = match command {
-        Command::Status(args) => return run_status(args, toml_config.as_ref()).await,
-        Command::ResetState(args) => return run_reset_state(args, toml_config.as_ref()).await,
-        Command::Verify(args) => return run_verify(args, toml_config.as_ref()).await,
+    let (is_one_shot, pw, sync) = match command {
+        Command::Status(args) => {
+            return run_status(args, &globals, toml_config.as_ref()).await;
+        }
+        Command::Reset { what } => match what {
+            cli::ResetCommand::State { yes } => {
+                return run_reset_state(yes, &globals, toml_config.as_ref()).await;
+            }
+            cli::ResetCommand::SyncToken => {
+                return run_reset_sync_token(&globals, toml_config.as_ref()).await;
+            }
+        },
+        Command::Verify(args) => {
+            return run_verify(args, &globals, toml_config.as_ref()).await;
+        }
         Command::ImportExisting(args) => {
-            return run_import_existing(args, toml_config.as_ref()).await;
+            return run_import_existing(args, &globals, toml_config.as_ref()).await;
         }
-        Command::GetCode(args) => return run_get_code(args, toml_config.as_ref()).await,
-        Command::SubmitCode(args) => return run_submit_code(args, toml_config.as_ref()).await,
-        Command::Credential(args) => {
-            return run_credential(args, toml_config.as_ref()).await;
+        Command::Login {
+            password,
+            subcommand,
+        } => {
+            return run_login(subcommand, &password, &globals, toml_config.as_ref()).await;
         }
-        Command::Setup { output } => {
-            let path = output.map_or_else(|| config_path.clone(), |o| config::expand_tilde(&o));
-            match setup::run_setup(&path)? {
-                setup::SetupResult::SyncNow {
-                    config_path: cfg_path,
-                    env_path,
-                } => {
-                    // Load .env into process environment for this session
-                    let mut env_username = None;
-                    let mut env_password = None;
-                    if let Ok(contents) = tokio::fs::read_to_string(&env_path).await {
-                        for line in contents.lines() {
-                            if let Some((key, value)) = line.split_once('=') {
-                                let key = key.trim();
-                                // Strip surrounding single or double quotes
-                                // (the setup wizard single-quotes values to
-                                // prevent shell expansion when sourced).
-                                let value = value.trim();
-                                let value = value
-                                    .strip_prefix('\'')
-                                    .and_then(|v| v.strip_suffix('\''))
-                                    .or_else(|| {
-                                        value.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
-                                    })
-                                    .unwrap_or(value);
-                                if key == "ICLOUD_USERNAME" {
-                                    env_username = Some(value.to_string());
-                                } else if key == "ICLOUD_PASSWORD" {
-                                    env_password = Some(value.to_string());
+        Command::Password { password, action } => {
+            return run_password(action, &globals, &password, toml_config.as_ref()).await;
+        }
+        Command::List { password, what } => {
+            return run_list(what, &password, &globals, toml_config.as_ref()).await;
+        }
+        Command::Config { action } => match action {
+            cli::ConfigAction::Show => {
+                return run_config_show(&globals, toml_config.as_ref()).await;
+            }
+            cli::ConfigAction::Setup { output } => {
+                let path = output.map_or_else(|| config_path.clone(), |o| config::expand_tilde(&o));
+                match setup::run_setup(&path)? {
+                    setup::SetupResult::SyncNow {
+                        config_path: cfg_path,
+                        env_path,
+                    } => {
+                        // Load .env into process environment for this session
+                        let mut env_username = None;
+                        let mut env_password = None;
+                        if let Ok(contents) = tokio::fs::read_to_string(&env_path).await {
+                            for line in contents.lines() {
+                                if let Some((key, value)) = line.split_once('=') {
+                                    let key = key.trim();
+                                    // Strip surrounding single or double quotes
+                                    // (the setup wizard single-quotes values to
+                                    // prevent shell expansion when sourced).
+                                    let value = value.trim();
+                                    let value = value
+                                        .strip_prefix('\'')
+                                        .and_then(|v| v.strip_suffix('\''))
+                                        .or_else(|| {
+                                            value
+                                                .strip_prefix('"')
+                                                .and_then(|v| v.strip_suffix('"'))
+                                        })
+                                        .unwrap_or(value);
+                                    if key == "ICLOUD_USERNAME" {
+                                        env_username = Some(value.to_string());
+                                    } else if key == "ICLOUD_PASSWORD" {
+                                        env_password = Some(value.to_string());
+                                    }
                                 }
                             }
                         }
+                        // Reload TOML from the newly written config
+                        toml_config = config::load_toml_config(&cfg_path, true)?;
+                        // Override globals with env values from setup
+                        if let Some(u) = env_username {
+                            globals.username = Some(u);
+                        }
+                        let sync_pw = cli::PasswordArgs {
+                            password: env_password,
+                            ..cli::PasswordArgs::default()
+                        };
+                        // Setup "sync now" is a one-shot initial sync, not a daemon.
+                        (true, sync_pw, cli::SyncArgs::default())
                     }
-                    // Reload TOML from the newly written config
-                    toml_config = config::load_toml_config(&cfg_path, true)?;
-                    let sync_auth = cli::AuthArgs {
-                        username: env_username,
-                        password: env_password,
-                        password_file: None,
-                        password_command: None,
-                        save_password: false,
-                        domain: None,
-                        cookie_directory: None,
-                    };
-                    // Setup "sync now" is a one-shot initial sync, not a daemon.
-                    is_one_shot = true;
-                    (sync_auth, cli::SyncArgs::default())
+                    setup::SetupResult::Done => return Ok(()),
                 }
-                setup::SetupResult::Done => return Ok(()),
             }
-        }
-        Command::Sync { auth, sync } => (auth, sync),
-        Command::RetryFailed(args) => (args.auth, args.sync),
+        },
+        Command::Sync { password, sync } => (sync.retry_failed, password, sync),
+        // Legacy variants should never reach here (effective_command maps them)
+        _ => unreachable!("legacy command variants should be mapped by effective_command()"),
     };
+    let is_retry_failed = sync.retry_failed;
+    let reset_sync_token = sync.reset_sync_token;
     let toml_existed = toml_config.is_some();
-    let cli_cookie_directory = auth.cookie_directory.clone();
-    let mut config = config::Config::build(auth, sync, toml_config)?;
+    let cli_data_dir = globals
+        .data_dir
+        .clone()
+        .or(globals.cookie_directory.clone());
+    let mut config = config::Config::build(&globals, pw, sync, toml_config)?;
 
     // On first run (no config file), persist CLI-provided values so
     // subsequent runs don't need the same flags again. Only when the
@@ -1173,7 +1332,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // writes at the default location during tests or one-off runs.
     if !toml_existed && config_explicitly_set {
         if let Err(e) =
-            config::persist_first_run_config(&config_path, &config, cli_cookie_directory.as_deref())
+            config::persist_first_run_config(&config_path, &config, cli_data_dir.as_deref())
         {
             tracing::warn!(error = %e, "Failed to save first-run config");
         }
@@ -1221,10 +1380,9 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         );
     }
 
-    // Validate --directory early (before auth) for commands that need it.
-    // This avoids wasting a 2FA code when the user simply forgot --directory.
-    let needs_directory = !config.auth_only && !config.list_albums && !config.list_libraries;
-    if needs_directory && config.directory.as_os_str().is_empty() {
+    // Validate --directory early (before auth) to avoid wasting a 2FA code
+    // when the user simply forgot --directory.
+    if config.directory.as_os_str().is_empty() {
         anyhow::bail!(
             "--directory is required for downloading \
              (pass --directory on the CLI or set [download] directory in the config file)"
@@ -1321,11 +1479,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         }
     }
 
-    if config.auth_only {
-        tracing::info!("Authentication completed successfully");
-        return Ok(());
-    }
-
     let api_retry_config = retry::RetryConfig {
         max_retries: config.max_retries,
         base_delay_secs: config.retry_delay_secs,
@@ -1334,20 +1487,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     let (shared_session, mut photos_service) =
         init_photos_service(auth_result, config.domain.as_str(), api_retry_config).await?;
-
-    if config.list_libraries {
-        println!("Private libraries:");
-        let private = photos_service.fetch_private_libraries().await?;
-        for name in private.keys() {
-            println!("  {name}");
-        }
-        println!("Shared libraries:");
-        let shared = photos_service.fetch_shared_libraries().await?;
-        for name in shared.keys() {
-            println!("  {name}");
-        }
-        return Ok(());
-    }
 
     // Resolve the selected library/libraries
     let libraries: Vec<icloud::photos::PhotoLibrary> = match &config.library {
@@ -1367,24 +1506,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),
         "Resolved libraries"
     );
-
-    if config.list_albums {
-        for library in &libraries {
-            println!("Library: {}", library.zone_name());
-            let albums = library.albums().await?;
-            for name in albums.keys() {
-                println!("  {name}");
-            }
-        }
-        return Ok(());
-    }
-
-    if config.directory.as_os_str().is_empty() {
-        anyhow::bail!(
-            "--directory is required for downloading \
-             (pass --directory on the CLI or set [download] directory in the config file)"
-        );
-    }
 
     // Validate download directory is writable before spending time on enumeration
     tokio::fs::create_dir_all(&config.directory)
@@ -1457,8 +1578,8 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         }
     };
 
-    // Handle --reset-sync-token: clear stored tokens before the sync loop
-    if config.reset_sync_token {
+    // Handle --reset-sync-token (hidden compat flag): clear stored tokens before the sync loop
+    if reset_sync_token {
         if let Some(ref db) = state_db {
             db.set_metadata("db_sync_token", "").await.ok();
             for library in &libraries {
