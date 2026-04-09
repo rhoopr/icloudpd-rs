@@ -14,7 +14,7 @@
 
 ---
 
-Fast, parallel photo sync from iCloud to local storage. Single binary, runs unattended.
+Fast, parallel photo sync from iCloud to local storage. Single binary, runs unattended. Google Takeout and Immich are next.
 
 - **Parallel downloads** - configurable concurrency (default 10), files start downloading before enumeration finishes
 - **Incremental sync** - scans large libraries in seconds via CloudKit sync tokens, only fetches what changed
