@@ -19,7 +19,7 @@ The import is idempotent - running it multiple times is safe. It uses `upsert` o
 ## Step 2: Run your first sync
 
 ```sh
-kei --username you@example.com --directory ~/Photos/iCloud
+kei sync --username you@example.com --directory ~/Photos/iCloud
 ```
 
 You'll need to authenticate fresh - kei can't reuse Python's `~/.pyicloud` session cookies (different format). After the first 2FA approval, sessions are persisted to `~/.config/kei/cookies/` and reused on subsequent runs.

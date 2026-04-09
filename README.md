@@ -57,13 +57,13 @@ cargo build --release
 ## Quick start
 
 ```sh
-kei -u you@example.com -d ~/Photos/iCloud
+kei sync -u you@example.com -d ~/Photos/iCloud
 ```
 
-You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to approve 2FA on a trusted device. Downloads start right after. On first run, kei saves your username and directory to `~/.config/kei/config.toml` so subsequent runs need no flags:
+You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to approve 2FA on a trusted device. Downloads start right after. On first run, kei saves your username and directory to `~/.config/kei/config.toml` so subsequent runs are just:
 
 ```sh
-kei
+kei sync
 ```
 
 Or use the interactive wizard: `kei config setup`.
@@ -74,22 +74,22 @@ For long-running setups (Docker, cron, systemd), use `--password-file`, `--passw
 
 ```sh
 # Specific albums, skip videos, last 100 photos only
-kei --album "Favorites" --recent 100 --skip-videos
+kei sync --album "Favorites" --recent 100 --skip-videos
 
 # All libraries (personal + shared) in one run
-kei --library all
+kei sync --library all
 
 # Keep syncing every hour
-kei --watch-with-interval 3600
+kei sync --watch-with-interval 3600
 
 # Preview what would download
-kei --only-print-filenames
+kei sync --only-print-filenames
 
 # Dry run (no writes to disk)
-kei --dry-run
+kei sync --dry-run
 ```
 
-Run `kei --help` for all flags, or see the [wiki](https://github.com/rhoopr/kei/wiki) for the full CLI reference.
+Run `kei sync --help` for all flags, or see the [wiki](https://github.com/rhoopr/kei/wiki) for the full CLI reference.
 
 ## How it works
 
@@ -103,7 +103,7 @@ State lives in a SQLite database alongside your session data (see `--data-dir`).
 
 | Command | |
 |---|---|
-| `sync` | Download photos (default when no subcommand given) |
+| `sync` | Download photos |
 | `login` | Authenticate and complete 2FA |
 | `list` | List albums or libraries |
 | `password` | Manage stored credentials (`set`, `clear`, `backend`) |
