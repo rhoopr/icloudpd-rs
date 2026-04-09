@@ -1037,7 +1037,15 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             (expanded, false)
         }
     };
-    let mut toml_config = config::load_toml_config(&config_path, config_explicitly_set)?;
+    // When --config is explicitly set but the file doesn't exist, allow it
+    // if the parent directory exists (auto-config will create the file).
+    // Otherwise require the file to exist so typos in --config paths error.
+    let config_required = config_explicitly_set
+        && !(
+            // File doesn't exist but parent dir does: auto-config will create it
+            !config_path.exists() && config_path.parent().is_some_and(|p| p.is_dir())
+        );
+    let mut toml_config = config::load_toml_config(&config_path, config_required)?;
 
     // Resolve log level: CLI > TOML > default (info)
     let effective_log_level = cli
