@@ -236,6 +236,7 @@ mod tests {
         assert!(!dst_dir.join("subdir").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn migrate_directory_skips_symlinks() {
         let tmp = tempfile::tempdir().unwrap();
@@ -269,6 +270,7 @@ mod tests {
         assert!(dst_dir.exists()); // dst_dir is still created
     }
 
+    #[cfg(unix)]
     #[test]
     fn migrate_file_read_only_dest_parent_returns_error() {
         use std::os::unix::fs::PermissionsExt;
@@ -279,7 +281,6 @@ mod tests {
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();
         std::fs::write(&src, "data").unwrap();
 
-        // Create the dest parent dir and make it read-only
         let readonly_dir = base.join("readonly");
         std::fs::create_dir_all(&readonly_dir).unwrap();
         std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o444)).unwrap();
