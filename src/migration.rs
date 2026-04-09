@@ -235,4 +235,60 @@ mod tests {
         assert_eq!(count, 1);
         assert!(!dst_dir.join("subdir").exists());
     }
+
+    #[test]
+    fn migrate_directory_skips_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let src_dir = base.join("old");
+        let dst_dir = base.join("new");
+
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let real_file = base.join("real.txt");
+        std::fs::write(&real_file, "target content").unwrap();
+        std::os::unix::fs::symlink(&real_file, src_dir.join("link.txt")).unwrap();
+        std::fs::write(src_dir.join("regular.txt"), "regular").unwrap();
+
+        let count = migrate_directory_contents(&src_dir, &dst_dir).unwrap();
+        assert_eq!(count, 1);
+        assert!(dst_dir.join("regular.txt").exists());
+        assert!(!dst_dir.join("link.txt").exists());
+    }
+
+    #[test]
+    fn migrate_directory_empty_source_returns_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let src_dir = base.join("empty_src");
+        let dst_dir = base.join("dst");
+
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let count = migrate_directory_contents(&src_dir, &dst_dir).unwrap();
+        assert_eq!(count, 0);
+        assert!(dst_dir.exists()); // dst_dir is still created
+    }
+
+    #[test]
+    fn migrate_file_read_only_dest_parent_returns_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let src = base.join("src/config.toml");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, "data").unwrap();
+
+        // Create the dest parent dir and make it read-only
+        let readonly_dir = base.join("readonly");
+        std::fs::create_dir_all(&readonly_dir).unwrap();
+        std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let dst = readonly_dir.join("subdir/config.toml");
+        let result = migrate_file(&src, &dst);
+        assert!(result.is_err());
+
+        // Restore permissions so tempdir cleanup succeeds
+        std::fs::set_permissions(&readonly_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }

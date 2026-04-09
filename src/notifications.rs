@@ -96,7 +96,11 @@ async fn run_script(
     message: &str,
     username: &str,
 ) -> anyhow::Result<std::process::ExitStatus> {
-    let mut child = tokio::process::Command::new(script)
+    // Execute via /bin/sh to avoid ETXTBSY ("Text file busy") races when
+    // the script file was recently written or replaced (e.g. config reload,
+    // `kei setup`, parallel tests). Scripts with shebangs work fine via sh.
+    let mut child = tokio::process::Command::new("/bin/sh")
+        .arg(script)
         .env("KEI_EVENT", event)
         .env("KEI_MESSAGE", message)
         .env("KEI_ICLOUD_USERNAME", username)
@@ -142,24 +146,13 @@ mod tests {
         notifier.notify(Event::SyncComplete, "test message", "user@example.com");
     }
 
-    /// Write a shell script to a temp dir, avoiding ETXTBSY ("Text file busy")
-    /// races on CI. Writes to a staging file first, then renames so the final
-    /// path was never opened for writing by this process.
+    /// Write a shell script to a temp dir. No executable permission needed
+    /// since `run_script` invokes scripts via `/bin/sh`.
     #[cfg(unix)]
     fn write_test_script(dir: &std::path::Path, name: &str, body: &[u8]) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
-        let staging = dir.join(format!("{name}.tmp"));
-        let final_path = dir.join(name);
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&staging).unwrap();
-            f.write_all(body).unwrap();
-            f.sync_all().unwrap();
-        }
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::rename(&staging, &final_path).unwrap();
-        final_path
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
     }
 
     #[cfg(unix)]

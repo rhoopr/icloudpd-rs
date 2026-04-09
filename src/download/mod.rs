@@ -4431,9 +4431,6 @@ mod tests {
             live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
             align_raw: RawTreatmentPolicy::Unchanged,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
-            auth_only: false,
-            list_albums: false,
-            list_libraries: false,
             skip_videos: false,
             skip_photos: false,
             skip_live_photos: false,
@@ -4444,7 +4441,6 @@ mod tests {
             keep_unicode_in_filenames: false,
             only_print_filenames: false,
             no_incremental: false,
-            reset_sync_token: false,
             notify_systemd: false,
             save_password: false,
         };
@@ -5293,6 +5289,181 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "should exit promptly after cancellation, took {elapsed:?}"
+        );
+    }
+
+    // ── compute_config_hash tests ──────────────────────────────────
+
+    /// Build a `Config` via `Config::build` with the given overrides.
+    /// Uses a tempdir for cookie_directory so tests don't touch the real filesystem.
+    fn build_config_with(
+        cookie_dir: &std::path::Path,
+        directory: &str,
+        overrides: impl FnOnce(&mut crate::cli::SyncArgs),
+    ) -> crate::config::Config {
+        use crate::cli::SyncArgs;
+        use crate::config::GlobalArgs;
+
+        let globals = GlobalArgs {
+            username: Some("test@example.com".to_string()),
+            domain: None,
+            data_dir: Some(cookie_dir.to_string_lossy().into_owned()),
+            cookie_directory: None,
+        };
+        let mut sync = SyncArgs {
+            directory: Some(directory.to_string()),
+            ..SyncArgs::default()
+        };
+        overrides(&mut sync);
+        crate::config::Config::build(&globals, crate::cli::PasswordArgs::default(), sync, None)
+            .expect("Config::build should succeed")
+    }
+
+    #[test]
+    fn test_compute_config_hash_same_config_same_hash() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |_| {});
+        assert_eq!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_directory() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos/a", |_| {});
+        let b = build_config_with(tmp.path(), "/photos/b", |_| {});
+        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_size() {
+        use crate::types::VersionSize;
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.size = Some(VersionSize::Medium);
+        });
+        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_skip_videos() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.skip_videos = Some(true);
+        });
+        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_albums() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.albums = vec!["Favorites".to_string()];
+        });
+        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_recent_same_hash() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.recent = Some(100);
+        });
+        assert_eq!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "recent is intentionally excluded from the config hash"
+        );
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_dry_run_same_hash() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.dry_run = true;
+        });
+        assert_eq!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "dry_run is a per-run flag and should not affect the config hash"
+        );
+    }
+
+    // ── filter_asset_to_tasks edge-case tests ──────────────────────
+
+    #[test]
+    fn test_filter_asset_no_versions_produces_empty() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "NO_VERSIONS", "fields": {
+                "filenameEnc": {"value": "empty.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "Asset with no versions should produce no tasks"
+        );
+    }
+
+    #[test]
+    fn test_filter_skip_created_before_excludes_old_asset() {
+        // Asset created 2020-06-15 (epoch ms)
+        let asset = TestPhotoAsset::new("OLD_1")
+            .asset_date(1592179200000.0) // 2020-06-15T00:00:00Z
+            .build();
+        let mut config = test_config();
+        // skip_created_before = 2024-01-01
+        config.skip_created_before = Some(
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc(),
+        );
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "Asset created in 2020 should be excluded by skip_created_before=2024"
+        );
+    }
+
+    #[test]
+    fn test_filter_skip_created_after_excludes_new_asset() {
+        // Asset created 2025-06-15 (epoch ms)
+        let asset = TestPhotoAsset::new("NEW_1")
+            .asset_date(1750003200000.0) // 2025-06-15T00:00:00Z
+            .build();
+        let mut config = test_config();
+        // skip_created_after = 2023-01-01
+        config.skip_created_after = Some(
+            chrono::NaiveDate::from_ymd_opt(2023, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc(),
+        );
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "Asset created in 2025 should be excluded by skip_created_after=2023"
+        );
+    }
+
+    #[test]
+    fn test_filter_force_size_missing_version_no_fallback() {
+        // Asset only has Original; request Medium with force_size=true
+        let asset = TestPhotoAsset::new("FORCE_1").build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = true;
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "force_size=true with missing Medium version should not fall back to Original"
         );
     }
 }

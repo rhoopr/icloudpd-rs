@@ -154,9 +154,7 @@ fn strip_trailing_newline(s: &str) -> &str {
 mod tests {
     use super::*;
 
-    fn write_test_file(name: &str, contents: &str) -> PathBuf {
-        let dir = PathBuf::from("/tmp/claude/test_pw");
-        std::fs::create_dir_all(&dir).unwrap();
+    fn write_test_file(dir: &std::path::Path, name: &str, contents: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, contents).unwrap();
         path
@@ -188,7 +186,8 @@ mod tests {
 
     #[test]
     fn read_password_file_normal() {
-        let path = write_test_file("pw_normal.txt", "my_secret\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(dir.path(), "pw.txt", "my_secret\n");
         assert_eq!(
             read_password_file(&path).unwrap().expose_secret(),
             "my_secret"
@@ -197,7 +196,8 @@ mod tests {
 
     #[test]
     fn read_password_file_no_newline() {
-        let path = write_test_file("pw_no_nl.txt", "my_secret");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(dir.path(), "pw.txt", "my_secret");
         assert_eq!(
             read_password_file(&path).unwrap().expose_secret(),
             "my_secret"
@@ -206,7 +206,8 @@ mod tests {
 
     #[test]
     fn read_password_file_crlf() {
-        let path = write_test_file("pw_crlf.txt", "my_secret\r\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(dir.path(), "pw.txt", "my_secret\r\n");
         assert_eq!(
             read_password_file(&path).unwrap().expose_secret(),
             "my_secret"
@@ -215,21 +216,24 @@ mod tests {
 
     #[test]
     fn read_password_file_empty() {
-        let path = write_test_file("pw_empty.txt", "");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(dir.path(), "pw.txt", "");
         let err = read_password_file(&path).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
     }
 
     #[test]
     fn read_password_file_only_newline() {
-        let path = write_test_file("pw_only_nl.txt", "\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(dir.path(), "pw.txt", "\n");
         let err = read_password_file(&path).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
     }
 
     #[test]
     fn read_password_file_missing() {
-        let path = PathBuf::from("/tmp/claude/test_pw/nonexistent.txt");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.txt");
         let err = read_password_file(&path).unwrap_err();
         assert!(err.to_string().contains("Failed to read"), "{err}");
     }
@@ -287,7 +291,8 @@ mod tests {
 
     #[test]
     fn password_source_file_resolve() {
-        let path = write_test_file("pw_source.txt", "file_pw\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(dir.path(), "pw_source.txt", "file_pw\n");
         let source = PasswordSource::File(path);
         assert_eq!(
             source.resolve().unwrap().unwrap().expose_secret(),

@@ -283,18 +283,17 @@ mod tests {
     use super::*;
     use secrecy::ExposeSecret;
 
-    /// Each test gets its own subdirectory to avoid parallel test interference
-    /// with the shared `.kei-state` key file.
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = PathBuf::from(format!("/tmp/claude/test_credential/{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Each test gets its own temp directory to avoid parallel test
+    /// interference with the shared `.kei-state` key file.
+    fn test_dir(_name: &str) -> (tempfile::TempDir, PathBuf) {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().to_path_buf();
+        (td, path)
     }
 
     #[test]
     fn encrypted_file_store_retrieve_cycle() {
-        let dir = test_dir("store_retrieve");
+        let (_td, dir) = test_dir("store_retrieve");
         let store = CredentialStore::new("user@example.com", &dir);
         store.file_store("super_secret_pw").unwrap();
         let retrieved = store.file_retrieve().unwrap().unwrap();
@@ -303,7 +302,7 @@ mod tests {
 
     #[test]
     fn encrypted_file_missing_returns_none() {
-        let dir = test_dir("missing");
+        let (_td, dir) = test_dir("missing");
         let store = CredentialStore::new("user@example.com", &dir);
         let result = store.file_retrieve().unwrap();
         assert!(result.is_none());
@@ -311,7 +310,7 @@ mod tests {
 
     #[test]
     fn encrypted_file_delete() {
-        let dir = test_dir("delete");
+        let (_td, dir) = test_dir("delete");
         let store = CredentialStore::new("user@example.com", &dir);
         store.file_store("to_be_deleted").unwrap();
         assert!(store.credential_file_path().exists());
@@ -324,7 +323,7 @@ mod tests {
 
     #[test]
     fn encrypted_file_corrupt_data() {
-        let dir = test_dir("corrupt");
+        let (_td, dir) = test_dir("corrupt");
         let store = CredentialStore::new("user@example.com", &dir);
         store.file_store("valid").unwrap();
         // Overwrite credential with garbage (too short)
@@ -335,7 +334,7 @@ mod tests {
 
     #[test]
     fn encrypted_file_wrong_key() {
-        let dir = test_dir("wrong_key");
+        let (_td, dir) = test_dir("wrong_key");
         let store = CredentialStore::new("user@example.com", &dir);
         store.file_store("secret").unwrap();
         // Overwrite key with different random key
@@ -350,7 +349,7 @@ mod tests {
 
     #[test]
     fn encrypted_file_key_generation() {
-        let dir = test_dir("keygen");
+        let (_td, dir) = test_dir("keygen");
         let store = CredentialStore::new("user@example.com", &dir);
         assert!(!store.key_file_path().exists());
 
@@ -363,7 +362,7 @@ mod tests {
 
     #[test]
     fn has_credential_with_file() {
-        let dir = test_dir("has_cred");
+        let (_td, dir) = test_dir("has_cred");
         let store = CredentialStore::new("user@example.com", &dir);
         assert!(!store.credential_file_path().exists());
 
@@ -373,7 +372,7 @@ mod tests {
 
     #[test]
     fn atomic_write_sync_permissions() {
-        let dir = test_dir("atomic_perms");
+        let (_td, dir) = test_dir("atomic_perms");
         let path = dir.join("test_atomic.bin");
         atomic_write_sync(&path, b"test data").unwrap();
 

@@ -65,4 +65,4 @@ HEALTHCHECK --interval=60s --timeout=5s --start-period=15m --retries=3 \
         || test "$(( $(date +%s) - $(date -d "$LAST" +%s) ))" -lt 7200; }
 
 ENTRYPOINT ["kei"]
-CMD ["sync", "--config", "/config/config.toml", "--cookie-directory", "/config", "--directory", "/photos"]
+CMD ["sync", "--config", "/config/config.toml", "--data-dir", "/config", "--directory", "/photos"]
