@@ -252,7 +252,7 @@ pub struct VerifyArgs {
 // ── New subcommand types ─────────────────────────────────────────────
 
 /// Login subcommands.
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum LoginCommand {
     /// Request a 2FA code be sent to your trusted devices
     GetCode,
@@ -265,7 +265,7 @@ pub enum LoginCommand {
 }
 
 /// List subcommands.
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum ListCommand {
     /// List available albums
     Albums,
@@ -274,7 +274,7 @@ pub enum ListCommand {
 }
 
 /// Password management actions.
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum PasswordAction {
     /// Store a password in the credential store (prompts interactively)
     Set,
@@ -285,7 +285,7 @@ pub enum PasswordAction {
 }
 
 /// Reset subcommands.
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum ResetCommand {
     /// Delete the state database and start fresh
     State {
@@ -298,7 +298,7 @@ pub enum ResetCommand {
 }
 
 /// Config management actions.
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum ConfigAction {
     /// Dump resolved config as TOML and exit
     Show,
@@ -311,7 +311,7 @@ pub enum ConfigAction {
 }
 
 /// Credential management actions (legacy, hidden).
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum CredentialAction {
     /// Store a password in the credential store (prompts interactively)
     Set,
@@ -737,63 +737,16 @@ impl Command {
     /// Merge top-level CLI password/sync args as fallbacks into the
     /// subcommand's own args.
     fn merge_top_level_args(&mut self, top_password: &PasswordArgs, top_sync: &SyncArgs) {
+        // Merge sync args for commands that carry them
         match self {
-            Self::Sync {
-                ref mut password,
-                ref mut sync,
-            } => {
-                password.merge_from(top_password);
+            Self::Sync { sync, .. } | Self::RetryFailed { sync, .. } => {
                 sync.merge_from(top_sync);
             }
-            Self::Login {
-                ref mut password, ..
-            } => {
-                password.merge_from(top_password);
-            }
-            Self::List {
-                ref mut password, ..
-            } => {
-                password.merge_from(top_password);
-            }
-            Self::Password {
-                ref mut password, ..
-            } => {
-                password.merge_from(top_password);
-            }
-            Self::ImportExisting(args) => {
-                args.password.merge_from(top_password);
-            }
-            // Legacy aliases also merge
-            Self::GetCode {
-                ref mut password, ..
-            } => {
-                password.merge_from(top_password);
-            }
-            Self::SubmitCode {
-                ref mut password, ..
-            } => {
-                password.merge_from(top_password);
-            }
-            Self::Credential {
-                ref mut password, ..
-            } => {
-                password.merge_from(top_password);
-            }
-            Self::RetryFailed {
-                ref mut password,
-                ref mut sync,
-            } => {
-                password.merge_from(top_password);
-                sync.merge_from(top_sync);
-            }
-            // These commands don't carry password/sync args
-            Self::Reset { .. }
-            | Self::Config { .. }
-            | Self::Status(_)
-            | Self::Verify(_)
-            | Self::ResetState { .. }
-            | Self::ResetSyncToken
-            | Self::Setup { .. } => {}
+            _ => {}
+        }
+        // Merge password args for commands that carry them
+        if let Some(pw) = self.password_args_mut() {
+            pw.merge_from(top_password);
         }
     }
 
@@ -805,42 +758,32 @@ impl Command {
     /// the active command carries.
     pub fn inject_env_password(&mut self, env_password: Option<String>) {
         let Some(pw) = env_password else { return };
-        let password_args = match self {
-            Self::Sync {
-                ref mut password, ..
-            } => password,
-            Self::Login {
-                ref mut password, ..
-            } => password,
-            Self::List {
-                ref mut password, ..
-            } => password,
-            Self::Password {
-                ref mut password, ..
-            } => password,
-            Self::ImportExisting(args) => &mut args.password,
-            Self::GetCode {
-                ref mut password, ..
-            } => password,
-            Self::SubmitCode {
-                ref mut password, ..
-            } => password,
-            Self::Credential {
-                ref mut password, ..
-            } => password,
-            Self::RetryFailed {
-                ref mut password, ..
-            } => password,
+        if let Some(args) = self.password_args_mut() {
+            if args.password.is_none() {
+                args.password = Some(pw);
+            }
+        }
+    }
+
+    /// Return a mutable reference to the command's `PasswordArgs`, if any.
+    fn password_args_mut(&mut self) -> Option<&mut PasswordArgs> {
+        match self {
+            Self::Sync { password, .. }
+            | Self::Login { password, .. }
+            | Self::List { password, .. }
+            | Self::Password { password, .. }
+            | Self::GetCode { password, .. }
+            | Self::SubmitCode { password, .. }
+            | Self::Credential { password, .. }
+            | Self::RetryFailed { password, .. } => Some(password),
+            Self::ImportExisting(args) => Some(&mut args.password),
             Self::Reset { .. }
             | Self::Config { .. }
             | Self::Status(_)
             | Self::Verify(_)
             | Self::ResetState { .. }
             | Self::ResetSyncToken
-            | Self::Setup { .. } => return,
-        };
-        if password_args.password.is_none() {
-            password_args.password = Some(pw);
+            | Self::Setup { .. } => None,
         }
     }
 }
