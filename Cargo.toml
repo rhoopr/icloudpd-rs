@@ -67,6 +67,9 @@ rand = "0.10"
 # File locking
 fs4 = "0.13"
 
+# Glob pattern matching
+glob = "0.3"
+
 # Misc
 url = "2"
 dirs = "6"

@@ -966,6 +966,7 @@ async fn run_import_existing(
                 &folder_structure,
                 &created_local,
                 &filename,
+                None, // import-existing doesn't have album context
             );
 
             if expected_path.exists() {
@@ -1048,22 +1049,39 @@ async fn run_import_existing(
 async fn resolve_albums(
     library: &icloud::photos::PhotoLibrary,
     album_names: &[String],
+    exclude_albums: &[String],
 ) -> anyhow::Result<Vec<icloud::photos::PhotoAlbum>> {
+    if album_names.is_empty() && exclude_albums.is_empty() {
+        return Ok(vec![library.all()]);
+    }
+
     if album_names.is_empty() {
-        Ok(vec![library.all()])
-    } else {
+        // No --album but --exclude-album is set: fetch all albums and filter.
         let mut album_map = library.albums().await?;
-        let mut matched = Vec::new();
-        for name in album_names {
-            if let Some(album) = album_map.remove(name.as_str()) {
-                matched.push(album);
-            } else {
-                let available: Vec<&String> = album_map.keys().collect();
-                anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
+        for name in exclude_albums {
+            if album_map.remove(name.as_str()).is_none() {
+                tracing::warn!(album = name, "Excluded album not found, ignoring");
             }
         }
-        Ok(matched)
+        return Ok(album_map.into_values().collect());
     }
+
+    // Explicit --album list: resolve and exclude.
+    let mut album_map = library.albums().await?;
+    let mut matched = Vec::new();
+    for name in album_names {
+        if exclude_albums.iter().any(|e| e == name) {
+            tracing::info!(album = name, "Album excluded by --exclude-album");
+            continue;
+        }
+        if let Some(album) = album_map.remove(name.as_str()) {
+            matched.push(album);
+        } else {
+            let available: Vec<&String> = album_map.keys().collect();
+            anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
+        }
+    }
+    Ok(matched)
 }
 
 /// RAII guard that writes the current PID to a file on creation and removes
@@ -1600,6 +1618,12 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         .map(|d| d.with_timezone(&chrono::Utc));
     let retry_config = api_retry_config;
     let live_photo_size = config.live_photo_size.to_asset_version_size();
+    // Compile glob patterns once (already validated in Config::build)
+    let filename_exclude_patterns: Vec<glob::Pattern> = config
+        .filename_exclude
+        .iter()
+        .map(|p| glob::Pattern::new(p).expect("validated in Config::build"))
+        .collect();
 
     let build_download_config = |sync_mode: download::SyncMode| -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
@@ -1615,7 +1639,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             concurrent_downloads: config.threads_num as usize,
             recent: config.recent,
             retry: retry_config,
-            skip_live_photos: config.skip_live_photos,
+            live_photo_mode: config.live_photo_mode,
             live_photo_size,
             live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
             align_raw: config.align_raw,
@@ -1624,10 +1648,12 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             file_match_policy: config.file_match_policy,
             force_size: config.force_size,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,
+            filename_exclude: filename_exclude_patterns.clone(),
             temp_suffix: config.temp_suffix.clone(),
             state_db: state_db.clone(),
             retry_only: is_retry_failed,
             sync_mode,
+            album_name: None,
         })
     };
 
@@ -1640,7 +1666,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     for library in &libraries {
         let zone_name = library.zone_name().to_string();
         let sync_token_key = format!("sync_token:{zone_name}");
-        let albums = resolve_albums(library, &config.albums).await?;
+        let albums = resolve_albums(library, &config.albums, &config.exclude_albums).await?;
         library_states.push(LibraryState {
             library: library.clone(),
             zone_name,
@@ -1994,7 +2020,9 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
             // Re-resolve albums per-library to discover newly created iCloud albums
             for lib_state in &mut library_states {
-                match resolve_albums(&lib_state.library, &config.albums).await {
+                match resolve_albums(&lib_state.library, &config.albums, &config.exclude_albums)
+                    .await
+                {
                     Ok(refreshed) => lib_state.albums = refreshed,
                     Err(e) => {
                         tracing::warn!(

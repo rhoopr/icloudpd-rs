@@ -74,6 +74,23 @@ pub enum LivePhotoMovFilenamePolicy {
     Original,
 }
 
+/// Controls which components of live photos are downloaded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LivePhotoMode {
+    /// Download both the still image and the MOV video
+    #[default]
+    Both,
+    /// Download only the still image, skip the MOV
+    #[value(name = "image-only")]
+    ImageOnly,
+    /// Download only the MOV video, skip the still image
+    #[value(name = "video-only")]
+    VideoOnly,
+    /// Skip live photos entirely (both image and MOV)
+    Skip,
+}
+
 impl LivePhotoSize {
     pub fn to_asset_version_size(self) -> crate::icloud::photos::AssetVersionSize {
         use crate::icloud::photos::AssetVersionSize;
@@ -199,6 +216,21 @@ mod tests {
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, expected);
             let parsed: RawTreatmentPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn live_photo_mode_serde_round_trip() {
+        for (variant, expected) in [
+            (LivePhotoMode::Both, "\"both\""),
+            (LivePhotoMode::ImageOnly, "\"image-only\""),
+            (LivePhotoMode::VideoOnly, "\"video-only\""),
+            (LivePhotoMode::Skip, "\"skip\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let parsed: LivePhotoMode = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, variant);
         }
     }

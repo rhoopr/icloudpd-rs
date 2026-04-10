@@ -295,6 +295,15 @@ impl PhotoAsset {
     pub fn contains_version(&self, key: AssetVersionSize) -> bool {
         self.versions.iter().any(|(k, _)| *k == key)
     }
+
+    /// Whether this asset is a live photo (image with a companion video).
+    pub fn is_live_photo(&self) -> bool {
+        self.item_type() == Some(AssetItemType::Image)
+            && (self.contains_version(AssetVersionSize::LiveOriginal)
+                || self.contains_version(AssetVersionSize::LiveMedium)
+                || self.contains_version(AssetVersionSize::LiveThumb)
+                || self.contains_version(AssetVersionSize::LiveAdjusted))
+    }
 }
 
 impl std::fmt::Display for PhotoAsset {

@@ -1148,12 +1148,14 @@ fn config_multiple_password_sources_in_toml() {
 }
 
 #[test]
-fn config_invalid_folder_structure_token() {
+fn config_strftime_folder_structure_accepted() {
+    // Full strftime support: %B (month name), %q, etc. are no longer rejected.
+    // The process may fail auth, but it should NOT fail config validation.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nfolder_structure = \"%Y/%q\"\n",
+        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nfolder_structure = \"%Y/%B/%d\"\n",
     )
     .unwrap();
 
@@ -1166,8 +1168,9 @@ fn config_invalid_folder_structure_token() {
             dir.path().to_str().unwrap(),
         ])
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains("unrecognized format token"));
+        // Should get past config validation (no "unrecognized format token" error).
+        // Fails on auth, not on config.
+        .stderr(predicate::str::contains("unrecognized format token").not());
 }
 
 #[test]
