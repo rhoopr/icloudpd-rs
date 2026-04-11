@@ -98,11 +98,6 @@ impl PhotosService {
         format!("{service_root}/database/1/com.apple.photos.cloud/production/{library_type}")
     }
 
-    /// Return the "All Photos" album from the primary library.
-    pub fn all(&self) -> PhotoAlbum {
-        self.primary_library.all()
-    }
-
     /// Look up a library by zone name.
     ///
     /// Checks the primary library first ("`PrimarySync`"), then searches private

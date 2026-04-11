@@ -236,6 +236,10 @@ pub struct ImportArgs {
     #[command(flatten)]
     pub password: PasswordArgs,
 
+    /// Library to import (default: PrimarySync, use "all" for all libraries)
+    #[arg(long, env = "KEI_LIBRARY")]
+    pub library: Option<String>,
+
     /// Local directory containing existing downloads
     #[arg(short = 'd', long, env = "KEI_DIRECTORY", value_parser = non_empty_string)]
     pub directory: Option<String>,
@@ -362,6 +366,10 @@ pub enum Command {
     List {
         #[command(flatten)]
         password: PasswordArgs,
+
+        /// Library to list albums from (default: PrimarySync, use "all" for all)
+        #[arg(long, env = "KEI_LIBRARY")]
+        library: Option<String>,
 
         #[command(subcommand)]
         what: ListCommand,
@@ -645,6 +653,7 @@ impl Cli {
                     deprecation_warning("--list-albums", "kei list albums");
                     return Command::List {
                         password: self.password.clone(),
+                        library: self.sync.library.clone(),
                         what: ListCommand::Albums,
                     };
                 }
@@ -652,6 +661,7 @@ impl Cli {
                     deprecation_warning("--list-libraries", "kei list libraries");
                     return Command::List {
                         password: self.password.clone(),
+                        library: self.sync.library.clone(),
                         what: ListCommand::Libraries,
                     };
                 }
@@ -731,6 +741,7 @@ impl Cli {
                 deprecation_warning("--list-albums", "kei list albums");
                 Command::List {
                     password: password.clone(),
+                    library: sync.library.clone(),
                     what: ListCommand::Albums,
                 }
             }
@@ -741,6 +752,7 @@ impl Cli {
                 deprecation_warning("--list-libraries", "kei list libraries");
                 Command::List {
                     password: password.clone(),
+                    library: sync.library.clone(),
                     what: ListCommand::Libraries,
                 }
             }
@@ -1817,6 +1829,37 @@ mod tests {
         } else {
             panic!("Expected ImportExisting command");
         }
+    }
+
+    #[test]
+    fn test_import_existing_library_flag() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "import-existing",
+            "--library",
+            "SharedSync-ABCD1234",
+            "--directory",
+            "/photos",
+        ])
+        .unwrap();
+        if let Some(Command::ImportExisting(args)) = cli.command {
+            assert_eq!(args.library.as_deref(), Some("SharedSync-ABCD1234"));
+        } else {
+            panic!("Expected ImportExisting command");
+        }
+    }
+
+    #[test]
+    fn test_list_albums_library_flag() {
+        let cli = Cli::try_parse_from(["kei", "list", "--library", "all", "albums"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::List {
+                library: Some(ref l),
+                what: ListCommand::Albums,
+                ..
+            } if l == "all"
+        ));
     }
 
     #[test]
