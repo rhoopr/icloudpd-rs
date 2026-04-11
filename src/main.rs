@@ -208,12 +208,13 @@ fn make_provider_from_auth(
 /// Initialize the photos service with automatic 421 retry.
 ///
 /// On first attempt, uses the ckdatabasews URL from the auth result. If the
-/// CloudKit service returns 421 Misdirected Request (stale partition), retries
-/// by validating the session token first (which returns fresh service URLs
-/// without needing credentials), then falls back to accountLogin.
+/// CloudKit service returns 421 Misdirected Request (stale partition), performs
+/// a full SRP re-authentication to obtain fresh service URLs from Apple.
 async fn init_photos_service(
     auth_result: auth::AuthResult,
+    username: &str,
     domain: &str,
+    password_provider: &dyn Fn() -> Option<SecretString>,
     api_retry_config: retry::RetryConfig,
 ) -> anyhow::Result<(auth::SharedSession, icloud::photos::PhotosService)> {
     let ckdatabasews_url = auth_result
@@ -250,24 +251,40 @@ async fn init_photos_service(
             tracing::warn!(
                 url = %ckdatabasews_url,
                 "Service endpoint returned 421 Misdirected Request, \
-                 refreshing service URLs"
+                 performing full re-authentication for fresh service URLs"
             );
-            let endpoints = auth::endpoints::Endpoints::for_domain(domain)?;
+
+            // Full SRP re-auth is required: both /validate and /accountLogin
+            // return the same stale partition URLs. Only a fresh SRP handshake
+            // causes Apple to assign the correct partition.
+            //
+            // We perform SRP + accountLogin directly on the existing session
+            // rather than creating a new Session via auth::authenticate(),
+            // which would conflict with the existing lock and require
+            // destructive session file deletion.
             let fresh_data = {
+                let password = password_provider().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Password required for re-authentication after 421, \
+                         but no password is available"
+                    )
+                })?;
+                let endpoints = auth::endpoints::Endpoints::for_domain(domain)?;
                 let mut session = shared_session.write().await;
-                match auth::twofa::validate_token(&mut session, &endpoints).await {
-                    Ok(data) => {
-                        tracing::debug!("Session validated, got fresh service URLs");
-                        data
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            "Session validation failed, trying accountLogin"
-                        );
-                        auth::twofa::authenticate_with_token(&mut session, &endpoints).await?
-                    }
-                }
+                let client_id = session
+                    .client_id()
+                    .cloned()
+                    .unwrap_or_else(|| format!("auth-{}", uuid::Uuid::new_v4()));
+                auth::srp::authenticate_srp(
+                    &mut *session,
+                    &endpoints,
+                    username,
+                    password.expose_secret(),
+                    &client_id,
+                    domain,
+                )
+                .await?;
+                auth::twofa::authenticate_with_token(&mut session, &endpoints).await?
             };
 
             let fresh_url = fresh_data
@@ -275,7 +292,7 @@ async fn init_photos_service(
                 .as_ref()
                 .and_then(|ws| ws.ckdatabasews.as_ref())
                 .map(|ep| ep.url.clone())
-                .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL from accountLogin"))?;
+                .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL after re-authentication"))?;
 
             let client_id = {
                 let session = shared_session.read().await;
@@ -305,8 +322,8 @@ async fn init_photos_service(
 /// Check if an iCloud error is a 421 Misdirected Request from the CloudKit service.
 ///
 /// This happens when Apple migrates an account to a different partition but the
-/// cached session still references the old ckdatabasews URL. Recovery validates
-/// the session token to obtain fresh webservice URLs without re-authenticating.
+/// cached session still references the old ckdatabasews URL. Recovery requires
+/// a full SRP re-authentication to obtain fresh service URLs from Apple.
 fn is_misdirected_request(err: &icloud::error::ICloudError) -> bool {
     matches!(err, icloud::error::ICloudError::Connection(msg) if msg.contains("421"))
 }
@@ -766,8 +783,14 @@ async fn run_list(
     .await?;
 
     let api_retry_config = retry::RetryConfig::default();
-    let (_shared_session, mut photos_service) =
-        init_photos_service(auth_result, domain.as_str(), api_retry_config).await?;
+    let (_shared_session, mut photos_service) = init_photos_service(
+        auth_result,
+        &username,
+        domain.as_str(),
+        &password_provider,
+        api_retry_config,
+    )
+    .await?;
 
     match what {
         cli::ListCommand::Libraries => {
@@ -916,8 +939,14 @@ async fn run_import_existing(
     )
     .await?;
 
-    let (_shared_session, photos_service) =
-        init_photos_service(auth_result, domain.as_str(), retry::RetryConfig::default()).await?;
+    let (_shared_session, photos_service) = init_photos_service(
+        auth_result,
+        &username,
+        domain.as_str(),
+        &password_provider,
+        retry::RetryConfig::default(),
+    )
+    .await?;
 
     let all_album = photos_service.all();
     let stream = all_album.photo_stream(args.recent, None, 1);
@@ -1575,8 +1604,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         max_delay_secs: 60,
     };
 
-    let (shared_session, mut photos_service) =
-        init_photos_service(auth_result, config.domain.as_str(), api_retry_config).await?;
+    let (shared_session, mut photos_service) = init_photos_service(
+        auth_result,
+        &config.username,
+        config.domain.as_str(),
+        &password_provider,
+        api_retry_config,
+    )
+    .await?;
 
     // Resolve the selected library/libraries
     let libraries: Vec<icloud::photos::PhotoLibrary> = match &config.library {
