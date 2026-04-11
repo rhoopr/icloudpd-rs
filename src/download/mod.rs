@@ -331,6 +331,8 @@ pub(crate) struct DownloadConfig {
     pub(crate) album_name: Option<Arc<str>>,
     /// Asset IDs to exclude (from `--exclude-album` without `--album`).
     pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
+    /// Maximum download attempts per asset before giving up (0 = unlimited).
+    pub(crate) max_download_attempts: u32,
 }
 
 impl DownloadConfig {
@@ -389,6 +391,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("sync_mode", &self.sync_mode)
             .field("album_name", &self.album_name)
             .field("exclude_asset_ids_count", &self.exclude_asset_ids.len())
+            .field("max_download_attempts", &self.max_download_attempts)
             .finish()
     }
 }
@@ -437,6 +440,9 @@ struct DownloadContext {
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced.
     known_ids: FxHashSet<Box<str>>,
+    /// Per-asset maximum download attempt count (from failed assets).
+    /// Used to skip assets that have exceeded `max_download_attempts`.
+    attempt_counts: FxHashMap<Box<str>, u32>,
 }
 
 impl DownloadContext {
@@ -484,10 +490,22 @@ impl DownloadContext {
             FxHashSet::default()
         };
 
+        let attempt_counts: FxHashMap<Box<str>, u32> = db
+            .get_attempt_counts()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to load attempt counts from state DB");
+                Default::default()
+            })
+            .into_iter()
+            .map(|(id, count)| (id.into_boxed_str(), count))
+            .collect();
+
         Self {
             downloaded_ids,
             downloaded_checksums,
             known_ids,
+            attempt_counts,
         }
     }
 
@@ -2149,6 +2167,23 @@ where
                         producer_pb.inc(1);
                     } else {
                         for task in tasks {
+                            // Skip assets that have exceeded the retry limit.
+                            if config.max_download_attempts > 0 {
+                                if let Some(&attempts) =
+                                    download_ctx.attempt_counts.get(task.asset_id.as_ref())
+                                {
+                                    if attempts >= config.max_download_attempts {
+                                        tracing::warn!(
+                                            asset_id = %task.asset_id,
+                                            attempts,
+                                            max = config.max_download_attempts,
+                                            "Skipping asset: exceeded max download attempts"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
                             if config.retry_only
                                 && !download_ctx.known_ids.contains(task.asset_id.as_ref())
                             {
@@ -2941,6 +2976,7 @@ mod tests {
             temp_suffix: ".kei-tmp".to_string(),
             state_db: None,
             retry_only: false,
+            max_download_attempts: 10,
             sync_mode: SyncMode::Full,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
@@ -5353,6 +5389,9 @@ mod tests {
             &self,
         ) -> Result<HashMap<(String, String), String>, StateError> {
             unimplemented!()
+        }
+        async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+            Ok(HashMap::new())
         }
         async fn get_metadata(&self, _: &str) -> Result<Option<String>, StateError> {
             unimplemented!()

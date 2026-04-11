@@ -1364,6 +1364,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         _ => unreachable!("legacy command variants should be mapped by effective_command()"),
     };
     let is_retry_failed = sync.retry_failed;
+    let max_download_attempts = sync.max_download_attempts.unwrap_or(10);
     let reset_sync_token = sync.reset_sync_token;
     let toml_existed = toml_config.is_some();
     let cli_data_dir = globals
@@ -1683,6 +1684,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             temp_suffix: config.temp_suffix.clone(),
             state_db: state_db.clone(),
             retry_only: is_retry_failed,
+            max_download_attempts,
             sync_mode,
             album_name: None,
             exclude_asset_ids,
@@ -1693,6 +1695,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;
+    let mut last_cycle_failed_count: usize = 0;
 
     let mut library_states: Vec<LibraryState> = Vec::with_capacity(libraries.len());
     for library in &libraries {
@@ -2012,11 +2015,13 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         failed_count = cycle_failed_count,
                         "Some downloads failed this cycle, will retry next cycle"
                     );
+                    last_cycle_failed_count = cycle_failed_count;
                 } else {
                     return Err(PartialSyncError(cycle_failed_count).into());
                 }
             } else {
                 reauth_attempts = 0;
+                last_cycle_failed_count = 0;
                 notifier.notify(
                     notifications::Event::SyncComplete,
                     "Sync completed successfully",
@@ -2095,7 +2100,11 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    if last_cycle_failed_count > 0 {
+        Err(PartialSyncError(last_cycle_failed_count).into())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

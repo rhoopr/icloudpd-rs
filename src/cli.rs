@@ -200,6 +200,10 @@ pub struct SyncArgs {
     #[arg(long, conflicts_with_all = ["dry_run", "watch_with_interval"])]
     pub retry_failed: bool,
 
+    /// Maximum download attempts per asset before skipping (default: 10)
+    #[arg(long, env = "KEI_MAX_DOWNLOAD_ATTEMPTS")]
+    pub max_download_attempts: Option<u32>,
+
     // ── Hidden compat flags (deprecated, still parse) ──────────────
     /// Deprecated: use `kei login` instead
     #[arg(long, hide = true, conflicts_with_all = ["watch_with_interval"])]
@@ -1092,6 +1096,36 @@ mod tests {
                 assert_eq!(sync.directory, Some("/photos".to_string()));
             }
             _ => panic!("Expected Sync with retry_failed"),
+        }
+    }
+
+    #[test]
+    fn test_max_download_attempts_cli_parse() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "sync",
+            "--max-download-attempts",
+            "5",
+            "--directory",
+            "/photos",
+        ])
+        .unwrap();
+        match cli.effective_command() {
+            Command::Sync { sync, .. } => {
+                assert_eq!(sync.max_download_attempts, Some(5));
+            }
+            _ => panic!("Expected Sync"),
+        }
+    }
+
+    #[test]
+    fn test_max_download_attempts_defaults_to_none() {
+        let cli = Cli::try_parse_from(["kei", "sync", "--directory", "/photos"]).unwrap();
+        match cli.effective_command() {
+            Command::Sync { sync, .. } => {
+                assert_eq!(sync.max_download_attempts, None);
+            }
+            _ => panic!("Expected Sync"),
         }
     }
 
