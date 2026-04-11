@@ -2168,19 +2168,19 @@ where
                     } else {
                         for task in tasks {
                             // Skip assets that have exceeded the retry limit.
-                            if config.max_download_attempts > 0 {
-                                if let Some(&attempts) =
-                                    download_ctx.attempt_counts.get(task.asset_id.as_ref())
+                            if let Some(&attempts) =
+                                download_ctx.attempt_counts.get(task.asset_id.as_ref())
+                            {
+                                if config.max_download_attempts > 0
+                                    && attempts >= config.max_download_attempts
                                 {
-                                    if attempts >= config.max_download_attempts {
-                                        tracing::warn!(
-                                            asset_id = %task.asset_id,
-                                            attempts,
-                                            max = config.max_download_attempts,
-                                            "Skipping asset: exceeded max download attempts"
-                                        );
-                                        continue;
-                                    }
+                                    tracing::warn!(
+                                        asset_id = %task.asset_id,
+                                        attempts,
+                                        max = config.max_download_attempts,
+                                        "Skipping asset: exceeded max download attempts"
+                                    );
+                                    continue;
                                 }
                             }
 

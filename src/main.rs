@@ -1695,7 +1695,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;
-    let mut last_cycle_failed_count: usize = 0;
+    let mut last_cycle_failed_count = 0usize;
 
     let mut library_states: Vec<LibraryState> = Vec::with_capacity(libraries.len());
     for library in &libraries {
@@ -1714,7 +1714,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     sd_notifier.notify_ready();
 
     let mut health = health::HealthStatus::new();
-    let mut consecutive_album_refresh_failures: u32 = 0;
+    let mut consecutive_album_refresh_failures = 0u32;
 
     loop {
         if shutdown_token.is_cancelled() {

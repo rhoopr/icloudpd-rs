@@ -1810,10 +1810,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_attempt_counts() {
-        let dir = test_dir();
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        // Create two assets
         for id in ["A", "B"] {
             let record = TestAssetRecord::new(id)
                 .checksum(&format!("ck_{id}"))
@@ -1823,19 +1821,14 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
         }
 
-        // Fail asset A three times
         db.mark_failed("A", "original", "error 1").await.unwrap();
         db.mark_failed("A", "original", "error 2").await.unwrap();
         db.mark_failed("A", "original", "error 3").await.unwrap();
-
-        // Fail asset B once
         db.mark_failed("B", "original", "error 1").await.unwrap();
 
         let counts = db.get_attempt_counts().await.unwrap();
-        assert_eq!(counts.get("A"), Some(&3), "A should have 3 attempts");
-        assert_eq!(counts.get("B"), Some(&1), "B should have 1 attempt");
-
-        drop(dir);
+        assert_eq!(counts.get("A"), Some(&3));
+        assert_eq!(counts.get("B"), Some(&1));
     }
 
     #[tokio::test]

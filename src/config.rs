@@ -243,6 +243,7 @@ fn validate_directory(path: &Path) -> anyhow::Result<()> {
     ];
     let s = path.to_string_lossy();
     let trimmed = s.trim_end_matches('/');
+    // trimmed.is_empty() catches "/" (trimmed to "")
     if trimmed.is_empty() || DENIED.contains(&trimmed) {
         anyhow::bail!(
             "Refusing to use system directory '{}' as download directory",
