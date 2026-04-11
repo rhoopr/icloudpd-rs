@@ -268,7 +268,7 @@ impl PhotoLibrary {
 #[cfg(test)]
 impl PhotoLibrary {
     /// Test-only constructor that bypasses the indexing check.
-    pub(super) fn new_stub(session: Box<dyn PhotosSession>) -> Self {
+    pub(crate) fn new_stub(session: Box<dyn PhotosSession>) -> Self {
         Self {
             service_endpoint: Arc::from("https://stub.example.com"),
             params: Arc::new(HashMap::new()),

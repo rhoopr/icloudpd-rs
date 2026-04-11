@@ -131,7 +131,7 @@ pub enum DownloadOutcome {
 }
 
 /// How the sync should enumerate photos from iCloud.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncMode {
     /// Full enumeration via records/query (existing behavior).
     /// On completion, captures the syncToken for future incremental syncs.
@@ -197,7 +197,7 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     hasher.update([u8::from(config.force_size)]);
     hasher.update([u8::from(config.skip_videos)]);
     hasher.update([u8::from(config.skip_photos)]);
-    hasher.update(format!("{:?}", config.live_photo_mode).as_bytes());
+    hasher.update([config.live_photo_mode as u8]);
     // filename_exclude patterns affect which assets are eligible
     let mut sorted_excludes: Vec<&str> =
         config.filename_exclude.iter().map(|p| p.as_str()).collect();
@@ -262,7 +262,7 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     // Enumeration-filter fields: changing these affects WHICH assets are
     // fetched from iCloud, so sync tokens must be invalidated to avoid
     // missing assets that are newly eligible under the changed filters.
-    hasher.update(format!("{:?}", config.live_photo_mode).as_bytes());
+    hasher.update([config.live_photo_mode as u8]);
     for album in &config.albums {
         hasher.update(album.as_bytes());
         hasher.update(b"\0");
@@ -335,12 +335,16 @@ pub(crate) struct DownloadConfig {
 
 impl DownloadConfig {
     /// Clone this config with a different `album_name`, for per-album processing
-    /// when `{album}` is in `folder_structure`.
+    /// when `{album}` is in `folder_structure`. Pre-expands the `{album}` token
+    /// in `folder_structure` so `local_download_dir` avoids per-asset
+    /// sanitize/escape/replace allocations.
     fn with_album_name(&self, name: Arc<str>) -> Self {
+        let album_ref = Some(name.as_ref()).filter(|n: &&str| !n.is_empty());
+        let folder_structure = paths::expand_album_token(&self.folder_structure, album_ref);
         Self {
             album_name: Some(name),
             directory: self.directory.clone(),
-            folder_structure: self.folder_structure.clone(),
+            folder_structure,
             filename_exclude: self.filename_exclude.clone(),
             temp_suffix: self.temp_suffix.clone(),
             state_db: self.state_db.clone(),
@@ -1431,6 +1435,11 @@ async fn download_photos_full_with_token(
         };
         let mut token_receivers = Vec::with_capacity(albums.len());
 
+        // When {album} is in folder_structure, albums are processed sequentially
+        // so each gets its own per-album path expansion. Cross-album download
+        // concurrency is intentionally sacrificed for correct path placement.
+        // Assets appearing in multiple albums are downloaded once per album,
+        // each to its respective album directory.
         for (album, &count) in albums.iter().zip(&album_counts) {
             if shutdown_token.is_cancelled() {
                 break;
@@ -1651,6 +1660,9 @@ async fn download_photos_incremental(
     let mut skipped_by_state = 0usize;
     let mut album_configs: FxHashMap<Arc<str>, Arc<DownloadConfig>> = FxHashMap::default();
 
+    // In {album} mode, assets in multiple albums are processed once per album,
+    // each downloading to the album-specific directory. Configs are cached per
+    // album name to avoid redundant allocations.
     for (asset, album_name) in &downloadable_assets {
         let effective_config: &Arc<DownloadConfig> = if uses_album_token {
             album_configs
@@ -1948,7 +1960,9 @@ where
                     _ => {}
                 }
             }
-            let _ = db.set_metadata("config_hash", &config_hash).await;
+            if let Err(e) = db.set_metadata("config_hash", &config_hash).await {
+                tracing::warn!(error = %e, "Failed to persist config_hash");
+            }
         }
         trust = trust && !download_ctx.downloaded_ids.is_empty();
 
@@ -3761,6 +3775,42 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_skip_candidates_skip_mode() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert!(
+            candidates.is_empty(),
+            "Skip mode should exclude live photos entirely"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_skip_mode_non_live_passes() {
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "Skip mode should not affect non-live photos"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_video_only_mode() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // Should have only the MOV companion, no primary image
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, VersionSizeKey::LiveOriginal);
+    }
+
+    #[test]
     fn test_extract_skip_candidates_date_before_filter() {
         let asset = TestPhotoAsset::new("TEST_1").build(); // assetDate = 1736899200000 = 2025-01-15
         let mut config = test_config();
@@ -5539,6 +5589,26 @@ mod tests {
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
             s.albums = vec!["Favorites".to_string()];
+        });
+        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_exclude_albums() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.exclude_albums = vec!["Hidden".to_string()];
+        });
+        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_live_photo_mode() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.live_photo_mode = Some(LivePhotoMode::Skip);
         });
         assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
     }

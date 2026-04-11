@@ -6,6 +6,34 @@ use base64::Engine;
 use chrono::{DateTime, Local};
 use rustc_hash::FxHashMap;
 
+/// Strip the legacy Python-style `{:%Y/%m/%d}` wrapper, returning the inner
+/// format string. Returns the input unchanged if the wrapper is absent.
+fn strip_python_wrapper(folder_structure: &str) -> &str {
+    if folder_structure.starts_with("{:") && folder_structure.ends_with('}') {
+        &folder_structure[2..folder_structure.len() - 1]
+    } else {
+        folder_structure
+    }
+}
+
+/// Expand the `{album}` token in a folder structure format string.
+///
+/// Strips the Python-style wrapper, sanitizes the album name as a path
+/// component, escapes `%` for chrono strftime, and replaces `{album}`.
+/// Returns the original `folder_structure` (wrapper-stripped) unchanged if
+/// `{album}` is absent.
+pub(crate) fn expand_album_token(folder_structure: &str, album_name: Option<&str>) -> String {
+    let format_str = strip_python_wrapper(folder_structure);
+    if !format_str.contains("{album}") {
+        return format_str.to_string();
+    }
+    let safe_name = album_name
+        .filter(|n| !n.is_empty())
+        .map(|n| sanitize_path_component(n).replace('%', "%%"))
+        .unwrap_or_default();
+    format_str.replace("{album}", &safe_name)
+}
+
 /// Build the date-based parent directory for a photo asset (without filename).
 ///
 /// `folder_structure` is a strftime format string such as `"%Y/%m/%d"`. The
@@ -22,33 +50,10 @@ pub(crate) fn local_download_dir(
         return directory.to_path_buf();
     }
 
-    // Extract format from Python-style {:%Y/%m/%d} wrapper if present
-    let format_str = if folder_structure.starts_with("{:") && folder_structure.ends_with('}') {
-        &folder_structure[2..folder_structure.len() - 1]
-    } else {
-        folder_structure
-    };
-
-    // Expand {album} token before strftime, sanitizing the album name as a
-    // path component to prevent traversal. Empty/missing album names produce
-    // an empty replacement so the {album} path component is skipped.
-    // Percent signs in album names are escaped to %% so chrono's strftime
-    // treats them as literal '%' rather than format specifiers.
-    let expanded;
-    let strftime_input = if format_str.contains("{album}") {
-        let safe_name = album_name
-            .filter(|n| !n.is_empty())
-            .map(sanitize_path_component)
-            .map(|s| s.replace('%', "%%"))
-            .unwrap_or_default();
-        expanded = format_str.replace("{album}", &safe_name);
-        expanded.as_str()
-    } else {
-        format_str
-    };
+    let expanded = expand_album_token(folder_structure, album_name);
 
     // Use chrono's strftime for full format token support (%Y, %m, %d, %B, etc.)
-    let date_path = created_date.format(strftime_input).to_string();
+    let date_path = created_date.format(&expanded).to_string();
 
     // Split on "/" and join as path components to handle cross-platform paths.
     // Each component is sanitized to prevent path traversal (e.g. "../../etc").

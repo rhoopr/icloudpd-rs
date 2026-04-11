@@ -1646,13 +1646,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         .map(|d| d.with_timezone(&chrono::Utc));
     let retry_config = api_retry_config;
     let live_photo_size = config.live_photo_size.to_asset_version_size();
-    // Compile glob patterns once (already validated in Config::build)
-    let filename_exclude_patterns: Vec<glob::Pattern> = config
-        .filename_exclude
-        .iter()
-        .map(|p| glob::Pattern::new(p).expect("validated in Config::build"))
-        .collect();
-
     let build_download_config = |sync_mode: download::SyncMode,
                                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>|
      -> Arc<download::DownloadConfig> {
@@ -1678,7 +1671,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             file_match_policy: config.file_match_policy,
             force_size: config.force_size,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,
-            filename_exclude: filename_exclude_patterns.clone(),
+            filename_exclude: config.filename_exclude.clone(),
             temp_suffix: config.temp_suffix.clone(),
             state_db: state_db.clone(),
             retry_only: is_retry_failed,
@@ -1826,7 +1819,10 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                                     _ => {}
                                 }
                             }
-                            let _ = db.set_metadata("enum_config_hash", &config_hash).await;
+                            if let Err(e) = db.set_metadata("enum_config_hash", &config_hash).await
+                            {
+                                tracing::warn!(error = %e, "Failed to persist enum_config_hash");
+                            }
                         }
                     }
                 }
@@ -2052,7 +2048,11 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             .await
             .ok(); // Best-effort pre-check; mid-sync re-auth handles failures
 
-            // Re-resolve albums per-library to discover newly created iCloud albums
+            // Re-resolve albums per-library to discover newly created iCloud albums.
+            // TODO: When --exclude-album is set without --album, this re-fetches the
+            // entire excluded album(s) to collect asset IDs. For large excluded albums
+            // this is expensive -- consider caching exclude_asset_ids across watch
+            // cycles and only refreshing when the album's sync token changes.
             for lib_state in &mut library_states {
                 match resolve_albums(&lib_state.library, &config.albums, &config.exclude_albums)
                     .await
@@ -2375,5 +2375,177 @@ mod tests {
             token_clone.cancel();
         });
         assert_eq!(run_watch_loop(&shutdown_token, Some(3600)).await, 1);
+    }
+
+    // ── resolve_albums tests ──────────────────────────────────────────
+
+    use crate::icloud::photos::PhotoLibrary;
+    use crate::test_helpers::MockPhotosSession;
+
+    /// Build a `PhotoLibrary` stub with a preconfigured mock session.
+    fn stub_library(mock: MockPhotosSession) -> PhotoLibrary {
+        PhotoLibrary::new_stub(Box::new(mock))
+    }
+
+    /// CloudKit folder record for a user album. The albumNameEnc field is
+    /// base64-encoded.
+    fn folder_record(record_name: &str, album_name: &str) -> serde_json::Value {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(album_name);
+        serde_json::json!({
+            "recordName": record_name,
+            "recordType": "CPLAlbumByPositionLive",
+            "fields": {
+                "albumNameEnc": {"value": encoded},
+                "isDeleted": {"value": false}
+            }
+        })
+    }
+
+    /// A single paired CPLMaster+CPLAsset page for photo streaming.
+    fn asset_page(record_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "records": [
+                {
+                    "recordName": record_name,
+                    "recordType": "CPLMaster",
+                    "fields": {
+                        "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
+                        "resOriginalRes": {"value": {
+                            "downloadURL": "https://example.com/photo.jpg",
+                            "size": 1024,
+                            "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                        }},
+                        "resOriginalFileType": {"value": "public.jpeg"},
+                        "itemType": {"value": "public.jpeg"},
+                        "adjustmentRenderType": {"value": 0, "type": "INT64"}
+                    }
+                },
+                {
+                    "recordName": format!("asset-{record_name}"),
+                    "recordType": "CPLAsset",
+                    "fields": {
+                        "masterRef": {
+                            "value": {"recordName": record_name, "zoneID": {"zoneName": "PrimarySync"}},
+                            "type": "REFERENCE"
+                        },
+                        "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                        "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                    }
+                }
+            ]
+        })
+    }
+
+    /// Batch album count response.
+    fn album_count_response(count: u64) -> serde_json::Value {
+        serde_json::json!({
+            "batch": [{"records": [{"fields": {"itemCount": {"value": count}}}]}]
+        })
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_no_album_no_exclude() {
+        let mock = MockPhotosSession::new();
+        let library = stub_library(mock);
+        let (albums, exclude_ids) = resolve_albums(&library, &[], &[]).await.unwrap();
+        assert_eq!(albums.len(), 1, "should return library.all()");
+        assert!(exclude_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_exclude_not_found_warns() {
+        // fetch_folders returns one album "Vacation", but we exclude "Nonexistent"
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []})); // fetch_folders: no user albums
+        let library = stub_library(mock);
+
+        let (albums, exclude_ids) = resolve_albums(&library, &[], &["Nonexistent".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(albums.len(), 1, "should return library.all()");
+        assert!(exclude_ids.is_empty(), "non-existent album produces no IDs");
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_explicit_album_found() {
+        // fetch_folders returns "Vacation" album
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation")
+        ]}));
+        let library = stub_library(mock);
+
+        let (albums, exclude_ids) = resolve_albums(&library, &["Vacation".to_string()], &[])
+            .await
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        assert!(exclude_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_explicit_album_not_found_errors() {
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []})); // no user albums
+        let library = stub_library(mock);
+
+        let result = resolve_albums(&library, &["DoesNotExist".to_string()], &[]).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_explicit_album_with_exclusion() {
+        // Two albums: Vacation and Hidden. Exclude Hidden.
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation"),
+            folder_record("FOLDER_2", "Hidden")
+        ]}));
+        let library = stub_library(mock);
+
+        let (albums, exclude_ids) = resolve_albums(
+            &library,
+            &["Vacation".to_string(), "Hidden".to_string()],
+            &["Hidden".to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            albums.len(),
+            1,
+            "Hidden should be excluded from matched albums"
+        );
+        assert!(
+            exclude_ids.is_empty(),
+            "explicit album path doesn't populate exclude IDs"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_exclude_without_album_collects_ids() {
+        // The mock session needs to handle:
+        // 1. fetch_folders (original session) → returns album "Hidden"
+        // 2. album.len() (cloned session) → returns count
+        // 3. photo_stream fetcher (re-cloned session) → returns one asset page
+        // 4. photo_stream fetcher 2nd call → returns empty (end of stream)
+        let mock = MockPhotosSession::new()
+            // 1. fetch_folders
+            .ok(serde_json::json!({"records": [
+                folder_record("FOLDER_1", "Hidden")
+            ]}))
+            // Remaining responses are cloned into the album's session:
+            // 2. album.len() batch query
+            .ok(album_count_response(1))
+            // 3. photo_stream fetcher: first page with one asset
+            .ok(asset_page("MASTER_1"))
+            // 4. photo_stream fetcher: empty page (end)
+            .ok(serde_json::json!({"records": []}));
+        let library = stub_library(mock);
+
+        let (albums, exclude_ids) = resolve_albums(&library, &[], &["Hidden".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(albums.len(), 1, "should return library.all()");
+        assert!(
+            exclude_ids.contains("MASTER_1"),
+            "should contain the excluded asset ID"
+        );
     }
 }

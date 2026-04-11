@@ -76,6 +76,7 @@ pub enum LivePhotoMovFilenamePolicy {
 
 /// Controls which components of live photos are downloaded.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[repr(u8)]
 #[serde(rename_all = "kebab-case")]
 pub enum LivePhotoMode {
     /// Download both the still image and the MOV video

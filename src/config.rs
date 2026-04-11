@@ -168,7 +168,7 @@ pub struct Config {
     pub folder_structure: String,
     pub albums: Vec<String>,
     pub exclude_albums: Vec<String>,
-    pub filename_exclude: Vec<String>,
+    pub filename_exclude: Vec<glob::Pattern>,
     pub library: LibrarySelection,
     pub temp_suffix: String,
 
@@ -525,19 +525,21 @@ impl Config {
         } else {
             sync.exclude_albums
         };
-        let filename_exclude = if sync.filename_exclude.is_empty() {
+        let filename_exclude_strs = if sync.filename_exclude.is_empty() {
             toml_filters
                 .and_then(|f| f.filename_exclude.clone())
                 .unwrap_or_default()
         } else {
             sync.filename_exclude
         };
-        // Validate glob patterns early
-        for pattern in &filename_exclude {
-            glob::Pattern::new(pattern).map_err(|e| {
-                anyhow::anyhow!("invalid --filename-exclude pattern '{pattern}': {e}")
-            })?;
-        }
+        // Compile glob patterns once during build
+        let filename_exclude: Vec<glob::Pattern> = filename_exclude_strs
+            .iter()
+            .map(|p| {
+                glob::Pattern::new(p)
+                    .map_err(|e| anyhow::anyhow!("invalid --filename-exclude pattern '{p}': {e}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
         let recent = sync.recent.or_else(|| toml_filters.and_then(|f| f.recent));
         if let Some(0) = recent {
             anyhow::bail!("recent must be >= 1 (got 0)");
@@ -756,7 +758,12 @@ impl Config {
                 filename_exclude: if self.filename_exclude.is_empty() {
                     None
                 } else {
-                    Some(self.filename_exclude.clone())
+                    Some(
+                        self.filename_exclude
+                            .iter()
+                            .map(|p| p.as_str().to_string())
+                            .collect(),
+                    )
                 },
                 skip_videos: if self.skip_videos { Some(true) } else { None },
                 skip_photos: if self.skip_photos { Some(true) } else { None },
@@ -3200,7 +3207,8 @@ mod tests {
             Some(toml),
         )
         .unwrap();
-        assert_eq!(cfg.filename_exclude, vec!["*.AAE", "*.TMP"]);
+        let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
+        assert_eq!(patterns, vec!["*.AAE", "*.TMP"]);
     }
 
     #[test]
@@ -3225,5 +3233,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.exclude_albums, vec!["Hidden", "Trash"]);
+    }
+
+    #[test]
+    fn test_contradictory_date_filter_succeeds() {
+        // before >= after is a warning, not an error -- Config::build should succeed
+        let mut sync = default_sync();
+        sync.skip_created_before = Some("2025-06-01".to_string());
+        sync.skip_created_after = Some("2025-01-01".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None);
+        assert!(
+            cfg.is_ok(),
+            "Contradictory date filters should warn, not error"
+        );
+        let cfg = cfg.unwrap();
+        assert!(cfg.skip_created_before >= cfg.skip_created_after);
+    }
+
+    #[test]
+    fn test_exclude_album_cli_overrides_toml() {
+        let mut sync = default_sync();
+        sync.exclude_albums = vec!["CLI_Album".to_string()];
+        let toml_str = "[filters]\nexclude_albums = [\"TOML_Album\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert_eq!(cfg.exclude_albums, vec!["CLI_Album"]);
+    }
+
+    #[test]
+    fn test_exclude_album_falls_back_to_toml() {
+        let toml_str = "[filters]\nexclude_albums = [\"TOML_Album\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.exclude_albums, vec!["TOML_Album"]);
+    }
+
+    #[test]
+    fn test_filename_exclude_cli_overrides_toml() {
+        let mut sync = default_sync();
+        sync.filename_exclude = vec!["*.AAE".to_string()];
+        let toml_str = "[filters]\nfilename_exclude = [\"*.TMP\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
+        assert_eq!(patterns, vec!["*.AAE"]);
+    }
+
+    #[test]
+    fn test_filename_exclude_falls_back_to_toml() {
+        let toml_str = "[filters]\nfilename_exclude = [\"*.TMP\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
+        assert_eq!(patterns, vec!["*.TMP"]);
     }
 }
