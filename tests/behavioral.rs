@@ -2185,6 +2185,7 @@ fn log_level_default_info() {
 #[test]
 fn log_level_debug() {
     let dir = tempfile::tempdir().unwrap();
+    let dl_dir = dir.path().join("photos");
     let out = clean_cmd()
         .args([
             "--log-level",
@@ -2193,7 +2194,7 @@ fn log_level_debug() {
             "--username",
             "x@x.com",
             "--directory",
-            "/photos",
+            dl_dir.to_str().unwrap(),
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])

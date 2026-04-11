@@ -1435,6 +1435,36 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         );
     }
 
+    // Validate download directory is writable before spending time on authentication.
+    tokio::fs::create_dir_all(&config.directory)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create download directory {}",
+                config.directory.display()
+            )
+        })?;
+    let probe = config.directory.join(".kei_probe");
+    tokio::fs::write(&probe, b"").await.with_context(|| {
+        format!(
+            "Download directory {} is not writable",
+            config.directory.display()
+        )
+    })?;
+    let _ = tokio::fs::remove_file(&probe).await;
+
+    // Abort if available disk space is too low.
+    if let Some(avail) = available_disk_space(&config.directory) {
+        const MIN_FREE_BYTES: u64 = 1_073_741_824; // 1 GiB
+        if avail < MIN_FREE_BYTES {
+            let avail_mb = avail / (1024 * 1024);
+            anyhow::bail!(
+                "Insufficient disk space: only {avail_mb} MiB available in {} (minimum 1 GiB)",
+                config.directory.display()
+            );
+        }
+    }
+
     let cred_store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
     let source = password::build_password_source(
         config.password.as_ref(),
@@ -1552,37 +1582,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),
         "Resolved libraries"
     );
-
-    // Validate download directory is writable before spending time on enumeration
-    tokio::fs::create_dir_all(&config.directory)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create download directory {}",
-                config.directory.display()
-            )
-        })?;
-    let probe = config.directory.join(".kei_probe");
-    tokio::fs::write(&probe, b"").await.with_context(|| {
-        format!(
-            "Download directory {} is not writable",
-            config.directory.display()
-        )
-    })?;
-    let _ = tokio::fs::remove_file(&probe).await;
-
-    // Warn if available disk space is low
-    if let Some(avail) = available_disk_space(&config.directory) {
-        const MIN_FREE_BYTES: u64 = 1_073_741_824; // 1 GiB
-        if avail < MIN_FREE_BYTES {
-            let avail_mb = avail / (1024 * 1024);
-            tracing::warn!(
-                available_mb = avail_mb,
-                path = %config.directory.display(),
-                "Low disk space — downloads may fail with disk errors"
-            );
-        }
-    }
 
     // Initialize state database.
     // Skip for --dry-run so a preview doesn't create the DB or poison

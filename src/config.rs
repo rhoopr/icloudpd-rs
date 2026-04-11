@@ -235,6 +235,23 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Reject system directories that should never be used as a download target.
+fn validate_directory(path: &Path) -> anyhow::Result<()> {
+    const DENIED: &[&str] = &[
+        "/bin", "/sbin", "/usr", "/etc", "/dev", "/proc", "/sys", "/boot", "/lib", "/lib64",
+        "/var", "/root",
+    ];
+    let s = path.to_string_lossy();
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() || DENIED.contains(&trimmed) {
+        anyhow::bail!(
+            "Refusing to use system directory '{}' as download directory",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Pick CLI value, then TOML value, then hardcoded default.
 fn resolve<T>(cli: Option<T>, toml: Option<T>, default: T) -> T {
     cli.or(toml).unwrap_or(default)
@@ -454,6 +471,9 @@ impl Config {
             .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
             .map(|d| expand_tilde(&d))
             .unwrap_or_default();
+        if !directory.as_os_str().is_empty() {
+            validate_directory(&directory)?;
+        }
         let folder_structure = resolve(
             sync.folder_structure,
             toml_dl.and_then(|d| d.folder_structure.clone()),
@@ -3431,5 +3451,32 @@ mod tests {
         .unwrap();
         let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
         assert_eq!(patterns, vec!["*.TMP"]);
+    }
+
+    #[test]
+    fn test_validate_directory_rejects_root() {
+        assert!(validate_directory(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn test_validate_directory_rejects_system_paths() {
+        for path in ["/usr", "/etc", "/boot", "/sys", "/proc", "/dev", "/var"] {
+            assert!(
+                validate_directory(Path::new(path)).is_err(),
+                "should reject {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_directory_rejects_trailing_slash() {
+        assert!(validate_directory(Path::new("/etc/")).is_err());
+    }
+
+    #[test]
+    fn test_validate_directory_accepts_normal_paths() {
+        assert!(validate_directory(Path::new("/home/user/photos")).is_ok());
+        assert!(validate_directory(Path::new("/mnt/photos")).is_ok());
+        assert!(validate_directory(Path::new("/data/sync")).is_ok());
     }
 }
