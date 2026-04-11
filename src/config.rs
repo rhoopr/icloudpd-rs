@@ -1,6 +1,6 @@
 use crate::password::SecretString;
 use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
+    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
     RawTreatmentPolicy, VersionSize,
 };
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
@@ -63,6 +63,8 @@ pub(crate) struct TomlRetry {
 pub(crate) struct TomlFilters {
     pub library: Option<String>,
     pub albums: Option<Vec<String>>,
+    pub exclude_albums: Option<Vec<String>>,
+    pub filename_exclude: Option<Vec<String>>,
     pub skip_videos: Option<bool>,
     pub skip_photos: Option<bool>,
     pub skip_live_photos: Option<bool>,
@@ -76,6 +78,7 @@ pub(crate) struct TomlFilters {
 pub(crate) struct TomlPhotos {
     pub size: Option<VersionSize>,
     pub live_photo_size: Option<LivePhotoSize>,
+    pub live_photo_mode: Option<LivePhotoMode>,
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
     pub align_raw: Option<RawTreatmentPolicy>,
     pub file_match_policy: Option<FileMatchPolicy>,
@@ -164,6 +167,8 @@ pub struct Config {
     pub cookie_directory: PathBuf,
     pub folder_structure: String,
     pub albums: Vec<String>,
+    pub exclude_albums: Vec<String>,
+    pub filename_exclude: Vec<glob::Pattern>,
     pub library: LibrarySelection,
     pub temp_suffix: String,
 
@@ -190,6 +195,7 @@ pub struct Config {
     pub size: VersionSize,
     pub live_photo_size: LivePhotoSize,
     pub domain: Domain,
+    pub live_photo_mode: LivePhotoMode,
     pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub align_raw: RawTreatmentPolicy,
     pub file_match_policy: FileMatchPolicy,
@@ -197,7 +203,6 @@ pub struct Config {
     // All booleans grouped together
     pub skip_videos: bool,
     pub skip_photos: bool,
-    pub skip_live_photos: bool,
     pub force_size: bool,
     pub set_exif_datetime: bool,
     pub dry_run: bool,
@@ -228,6 +233,24 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+/// Reject system directories that should never be used as a download target.
+fn validate_directory(path: &Path) -> anyhow::Result<()> {
+    const DENIED: &[&str] = &[
+        "/bin", "/sbin", "/usr", "/etc", "/dev", "/proc", "/sys", "/boot", "/lib", "/lib64",
+        "/var", "/root",
+    ];
+    let s = path.to_string_lossy();
+    let trimmed = s.trim_end_matches('/');
+    // trimmed.is_empty() catches "/" (trimmed to "")
+    if trimmed.is_empty() || DENIED.contains(&trimmed) {
+        anyhow::bail!(
+            "Refusing to use system directory '{}' as download directory",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Pick CLI value, then TOML value, then hardcoded default.
@@ -449,33 +472,14 @@ impl Config {
             .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
             .map(|d| expand_tilde(&d))
             .unwrap_or_default();
+        if !directory.as_os_str().is_empty() {
+            validate_directory(&directory)?;
+        }
         let folder_structure = resolve(
             sync.folder_structure,
             toml_dl.and_then(|d| d.folder_structure.clone()),
             "%Y/%m/%d".to_string(),
         );
-        // Validate folder_structure doesn't contain unrecognized % tokens.
-        // expand_date_format only handles %Y, %m, %d, %H, %M, %S — unknown
-        // tokens like %q are silently preserved as literal "%q" in paths.
-        if !folder_structure.eq_ignore_ascii_case("none") {
-            let format_str = folder_structure
-                .strip_prefix("{:")
-                .and_then(|s| s.strip_suffix('}'))
-                .unwrap_or(&folder_structure);
-            let remaining = format_str
-                .replace("%Y", "")
-                .replace("%m", "")
-                .replace("%d", "")
-                .replace("%H", "")
-                .replace("%M", "")
-                .replace("%S", "");
-            anyhow::ensure!(
-                !remaining.contains('%'),
-                "folder_structure contains unrecognized format token: \
-                 '{folder_structure}'. Supported tokens: %Y, %m, %d, %H, %M, %S"
-            );
-        }
-
         let threads_num = resolve(sync.threads_num, toml_dl.and_then(|d| d.threads_num), 10);
         anyhow::ensure!(
             threads_num >= 1,
@@ -522,10 +526,41 @@ impl Config {
         };
         let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
         let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
-        let skip_live_photos = resolve_flag(
-            sync.skip_live_photos,
-            toml_filters.and_then(|f| f.skip_live_photos),
-        );
+        // Resolve live photo mode: --live-photo-mode > --skip-live-photos > TOML photos > TOML filters compat
+        let live_photo_mode = if let Some(mode) = sync.live_photo_mode {
+            mode
+        } else if sync.skip_live_photos == Some(true) {
+            crate::cli::deprecation_warning("--skip-live-photos", "--live-photo-mode skip");
+            LivePhotoMode::Skip
+        } else if let Some(mode) = toml_photos.and_then(|p| p.live_photo_mode) {
+            mode
+        } else if toml_filters.and_then(|f| f.skip_live_photos) == Some(true) {
+            LivePhotoMode::Skip
+        } else {
+            LivePhotoMode::Both
+        };
+        let exclude_albums = if sync.exclude_albums.is_empty() {
+            toml_filters
+                .and_then(|f| f.exclude_albums.clone())
+                .unwrap_or_default()
+        } else {
+            sync.exclude_albums
+        };
+        let filename_exclude_strs = if sync.filename_exclude.is_empty() {
+            toml_filters
+                .and_then(|f| f.filename_exclude.clone())
+                .unwrap_or_default()
+        } else {
+            sync.filename_exclude
+        };
+        // Compile glob patterns once during build
+        let filename_exclude: Vec<glob::Pattern> = filename_exclude_strs
+            .iter()
+            .map(|p| {
+                glob::Pattern::new(p)
+                    .map_err(|e| anyhow::anyhow!("invalid --filename-exclude pattern '{p}': {e}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
         let recent = sync.recent.or_else(|| toml_filters.and_then(|f| f.recent));
         if let Some(0) = recent {
             anyhow::bail!("recent must be >= 1 (got 0)");
@@ -545,6 +580,16 @@ impl Config {
             .as_deref()
             .map(parse_date_or_interval)
             .transpose()?;
+
+        if let (Some(before), Some(after)) = (&skip_created_before, &skip_created_after) {
+            if before >= after {
+                tracing::warn!(
+                    before = %before.format("%Y-%m-%d"),
+                    after = %after.format("%Y-%m-%d"),
+                    "skip-created-before >= skip-created-after, no assets can match",
+                );
+            }
+        }
 
         // Photos
         let size = resolve(
@@ -611,10 +656,10 @@ impl Config {
             .or_else(|| toml_notif.and_then(|n| n.script.clone()))
             .map(|s| expand_tilde(&s));
 
-        if skip_videos && skip_photos && skip_live_photos {
+        if skip_videos && skip_photos && live_photo_mode == LivePhotoMode::Skip {
             tracing::warn!(
                 "All media types are being skipped (--skip-videos, --skip-photos, \
-                 --skip-live-photos) — nothing will be downloaded"
+                 --live-photo-mode skip) -- nothing will be downloaded"
             );
         }
 
@@ -627,6 +672,8 @@ impl Config {
             cookie_directory,
             folder_structure,
             albums,
+            exclude_albums,
+            filename_exclude,
             library,
             temp_suffix,
             skip_created_before,
@@ -641,12 +688,12 @@ impl Config {
             size,
             live_photo_size,
             domain,
+            live_photo_mode,
             live_photo_mov_filename_policy,
             align_raw,
             file_match_policy,
             skip_videos,
             skip_photos,
-            skip_live_photos,
             force_size,
             set_exif_datetime,
             dry_run: sync.dry_run,
@@ -724,16 +771,27 @@ impl Config {
                 } else {
                     Some(self.albums.clone())
                 },
+                exclude_albums: if self.exclude_albums.is_empty() {
+                    None
+                } else {
+                    Some(self.exclude_albums.clone())
+                },
+                filename_exclude: if self.filename_exclude.is_empty() {
+                    None
+                } else {
+                    Some(
+                        self.filename_exclude
+                            .iter()
+                            .map(|p| p.as_str().to_string())
+                            .collect(),
+                    )
+                },
                 skip_videos: if self.skip_videos { Some(true) } else { None },
                 skip_photos: if self.skip_photos { Some(true) } else { None },
-                skip_live_photos: if self.skip_live_photos {
-                    Some(true)
-                } else {
-                    None
-                },
-                recent: None,              // per-run
+                skip_live_photos: None, // deprecated, use live_photo_mode in [photos]
+                recent: None,           // per-run
                 skip_created_before: None, // per-run
-                skip_created_after: None,  // per-run
+                skip_created_after: None, // per-run
             }),
             photos: Some(TomlPhotos {
                 size: if self.size == VersionSize::Original {
@@ -745,6 +803,11 @@ impl Config {
                     None
                 } else {
                     Some(self.live_photo_size)
+                },
+                live_photo_mode: if self.live_photo_mode == LivePhotoMode::Both {
+                    None
+                } else {
+                    Some(self.live_photo_mode)
                 },
                 live_photo_mov_filename_policy: if self.live_photo_mov_filename_policy
                     == LivePhotoMovFilenamePolicy::Suffix
@@ -896,7 +959,9 @@ pub(crate) fn persist_first_run_config(
 /// - ISO datetime: `"2025-01-02T14:30:00"` (local time)
 pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>> {
     if let Some(days_str) = s.strip_suffix('d') {
-        if let Ok(days) = days_str.parse::<i64>() {
+        if let Ok(days) = days_str.parse::<u64>() {
+            let days =
+                i64::try_from(days).map_err(|_| anyhow::anyhow!("interval '{s}' is too large"))?;
             return Ok(Local::now() - chrono::Duration::days(days));
         }
     }
@@ -978,6 +1043,12 @@ mod tests {
     fn test_parse_invalid_date() {
         assert!(parse_date_or_interval("not-a-date").is_err());
         assert!(parse_date_or_interval("").is_err());
+    }
+
+    #[test]
+    fn test_parse_negative_interval_rejected() {
+        assert!(parse_date_or_interval("-5d").is_err());
+        assert!(parse_date_or_interval("-1d").is_err());
     }
 
     // ── TOML parsing tests ──────────────────────────────────────────
@@ -1911,7 +1982,7 @@ mod tests {
         assert!(cfg.albums.is_empty());
         assert!(!cfg.skip_videos);
         assert!(!cfg.skip_photos);
-        assert!(!cfg.skip_live_photos);
+        assert_eq!(cfg.live_photo_mode, LivePhotoMode::Both);
         assert!(cfg.recent.is_none());
         assert!(cfg.skip_created_before.is_none());
         assert!(cfg.skip_created_after.is_none());
@@ -2361,7 +2432,7 @@ mod tests {
         assert!(cfg.no_progress_bar);
         assert!(cfg.skip_videos);
         assert!(cfg.skip_photos);
-        assert!(cfg.skip_live_photos);
+        assert_eq!(cfg.live_photo_mode, LivePhotoMode::Skip);
         assert!(cfg.force_size);
         assert!(cfg.keep_unicode_in_filenames);
         assert!(cfg.notify_systemd);
@@ -2383,7 +2454,7 @@ mod tests {
         assert!(cfg.no_progress_bar);
         assert!(cfg.skip_videos);
         assert!(cfg.skip_photos);
-        assert!(cfg.skip_live_photos);
+        assert_eq!(cfg.live_photo_mode, LivePhotoMode::Skip);
         assert!(cfg.force_size);
         assert!(cfg.keep_unicode_in_filenames);
         assert!(cfg.notify_systemd);
@@ -2820,14 +2891,12 @@ mod tests {
     }
 
     #[test]
-    fn test_folder_structure_invalid_token_rejected() {
+    fn test_folder_structure_strftime_tokens_accepted() {
+        // Full strftime support: %B (month name), %X (locale time), etc. are valid
         let mut sync = default_sync();
-        sync.folder_structure = Some("%Y/%X/%d".to_string());
-        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
-        assert!(
-            err.to_string().contains("unrecognized format token"),
-            "error should mention unrecognized token: {err}"
-        );
+        sync.folder_structure = Some("%Y/%B/%d".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure, "%Y/%B/%d");
     }
 
     #[test]
@@ -2914,6 +2983,139 @@ mod tests {
         assert!(filters.recent.is_none());
         assert!(filters.skip_created_before.is_none());
         assert!(filters.skip_created_after.is_none());
+    }
+
+    #[test]
+    fn test_to_toml_roundtrip_exclude_albums() {
+        let mut sync = default_sync();
+        sync.exclude_albums = vec!["Hidden".to_string(), "Trash".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let filters = toml.filters.as_ref().unwrap();
+        assert_eq!(
+            filters.exclude_albums.as_deref(),
+            Some(&["Hidden".to_string(), "Trash".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn test_to_toml_roundtrip_filename_exclude() {
+        let mut sync = default_sync();
+        sync.filename_exclude = vec!["*.AAE".to_string(), "Screenshot*".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let filters = toml.filters.as_ref().unwrap();
+        assert_eq!(
+            filters.filename_exclude.as_deref(),
+            Some(&["*.AAE".to_string(), "Screenshot*".to_string()][..])
+        );
+        // Round-trip: serialize then deserialize
+        let serialized = ::toml::to_string_pretty(&toml).unwrap();
+        let parsed: TomlConfig = ::toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            parsed.filters.as_ref().unwrap().filename_exclude.as_deref(),
+            Some(&["*.AAE".to_string(), "Screenshot*".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn test_to_toml_roundtrip_live_photo_mode() {
+        let mut sync = default_sync();
+        sync.live_photo_mode = Some(crate::types::LivePhotoMode::ImageOnly);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        assert_eq!(
+            toml.photos.as_ref().unwrap().live_photo_mode,
+            Some(crate::types::LivePhotoMode::ImageOnly)
+        );
+        // Round-trip
+        let serialized = ::toml::to_string_pretty(&toml).unwrap();
+        let parsed: TomlConfig = ::toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            parsed.photos.as_ref().unwrap().live_photo_mode,
+            Some(crate::types::LivePhotoMode::ImageOnly)
+        );
+    }
+
+    #[test]
+    fn test_to_toml_empty_exclude_albums_omitted() {
+        let cfg =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let toml = cfg.to_toml();
+        assert!(toml.filters.as_ref().unwrap().exclude_albums.is_none());
+    }
+
+    #[test]
+    fn test_to_toml_default_live_photo_mode_omitted() {
+        let cfg =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let toml = cfg.to_toml();
+        assert!(toml.photos.as_ref().unwrap().live_photo_mode.is_none());
+    }
+
+    // ── TOML-only skip_live_photos legacy path ──────────────────────
+
+    #[test]
+    fn test_toml_skip_live_photos_legacy_maps_to_skip_mode() {
+        let toml_str = r#"
+            [auth]
+            username = "u@example.com"
+
+            [filters]
+            skip_live_photos = true
+        "#;
+        let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::Skip);
+    }
+
+    #[test]
+    fn test_toml_skip_live_photos_false_stays_both() {
+        let toml_str = r#"
+            [auth]
+            username = "u@example.com"
+
+            [filters]
+            skip_live_photos = false
+        "#;
+        let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::Both);
+    }
+
+    #[test]
+    fn test_toml_photos_live_photo_mode_overrides_filters_skip_live_photos() {
+        let toml_str = r#"
+            [auth]
+            username = "u@example.com"
+
+            [filters]
+            skip_live_photos = true
+
+            [photos]
+            live_photo_mode = "image-only"
+        "#;
+        let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::ImageOnly);
     }
 
     // ── resolve_data_dir() tests ────────────────────────────────────
@@ -3120,5 +3322,162 @@ mod tests {
             parsed.auth.as_ref().unwrap().password_file.as_deref(),
             Some("/run/secrets/pw")
         );
+    }
+
+    // ── Filter + LivePhotoMode config resolution ──────────────────
+
+    #[test]
+    fn test_live_photo_mode_cli_overrides_toml() {
+        let mut sync = default_sync();
+        sync.live_photo_mode = Some(LivePhotoMode::ImageOnly);
+        let toml_str = "[photos]\nlive_photo_mode = \"skip\"\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert_eq!(cfg.live_photo_mode, LivePhotoMode::ImageOnly);
+    }
+
+    #[test]
+    fn test_live_photo_mode_from_toml() {
+        let toml_str = "[photos]\nlive_photo_mode = \"video-only\"\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
+    }
+
+    #[test]
+    fn test_filename_exclude_from_toml() {
+        let toml_str = "[filters]\nfilename_exclude = [\"*.AAE\", \"*.TMP\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
+        assert_eq!(patterns, vec!["*.AAE", "*.TMP"]);
+    }
+
+    #[test]
+    fn test_filename_exclude_invalid_glob_rejected() {
+        let mut sync = default_sync();
+        sync.filename_exclude = vec!["[invalid".to_string()];
+        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid --filename-exclude pattern"));
+    }
+
+    #[test]
+    fn test_exclude_albums_from_toml() {
+        let toml_str = "[filters]\nexclude_albums = [\"Hidden\", \"Trash\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.exclude_albums, vec!["Hidden", "Trash"]);
+    }
+
+    #[test]
+    fn test_contradictory_date_filter_succeeds() {
+        // before >= after is a warning, not an error -- Config::build should succeed
+        let mut sync = default_sync();
+        sync.skip_created_before = Some("2025-06-01".to_string());
+        sync.skip_created_after = Some("2025-01-01".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None);
+        assert!(
+            cfg.is_ok(),
+            "Contradictory date filters should warn, not error"
+        );
+        let cfg = cfg.unwrap();
+        assert!(cfg.skip_created_before >= cfg.skip_created_after);
+    }
+
+    #[test]
+    fn test_exclude_album_cli_overrides_toml() {
+        let mut sync = default_sync();
+        sync.exclude_albums = vec!["CLI_Album".to_string()];
+        let toml_str = "[filters]\nexclude_albums = [\"TOML_Album\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert_eq!(cfg.exclude_albums, vec!["CLI_Album"]);
+    }
+
+    #[test]
+    fn test_exclude_album_falls_back_to_toml() {
+        let toml_str = "[filters]\nexclude_albums = [\"TOML_Album\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.exclude_albums, vec!["TOML_Album"]);
+    }
+
+    #[test]
+    fn test_filename_exclude_cli_overrides_toml() {
+        let mut sync = default_sync();
+        sync.filename_exclude = vec!["*.AAE".to_string()];
+        let toml_str = "[filters]\nfilename_exclude = [\"*.TMP\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
+        assert_eq!(patterns, vec!["*.AAE"]);
+    }
+
+    #[test]
+    fn test_filename_exclude_falls_back_to_toml() {
+        let toml_str = "[filters]\nfilename_exclude = [\"*.TMP\"]\n";
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        let patterns: Vec<&str> = cfg.filename_exclude.iter().map(|p| p.as_str()).collect();
+        assert_eq!(patterns, vec!["*.TMP"]);
+    }
+
+    #[test]
+    fn test_validate_directory_rejects_root() {
+        assert!(validate_directory(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn test_validate_directory_rejects_system_paths() {
+        for path in ["/usr", "/etc", "/boot", "/sys", "/proc", "/dev", "/var"] {
+            assert!(
+                validate_directory(Path::new(path)).is_err(),
+                "should reject {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_directory_rejects_trailing_slash() {
+        assert!(validate_directory(Path::new("/etc/")).is_err());
+    }
+
+    #[test]
+    fn test_validate_directory_accepts_normal_paths() {
+        assert!(validate_directory(Path::new("/home/user/photos")).is_ok());
+        assert!(validate_directory(Path::new("/mnt/photos")).is_ok());
+        assert!(validate_directory(Path::new("/data/sync")).is_ok());
     }
 }

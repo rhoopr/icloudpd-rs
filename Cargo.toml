@@ -1,6 +1,6 @@
 [package]
 name = "kei"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2021"
 
 [[bin]]
@@ -66,6 +66,9 @@ rand = "0.10"
 
 # File locking
 fs4 = "0.13"
+
+# Glob pattern matching
+glob = "0.3"
 
 # Misc
 url = "2"

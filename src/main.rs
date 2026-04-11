@@ -966,6 +966,7 @@ async fn run_import_existing(
                 &folder_structure,
                 &created_local,
                 &filename,
+                None, // import-existing doesn't have album context
             );
 
             if expected_path.exists() {
@@ -1040,30 +1041,72 @@ async fn run_import_existing(
     Ok(())
 }
 
-/// Resolve which albums to download from.
+/// Resolve which albums to download from, plus any asset IDs to exclude.
 ///
 /// When no `--album` names are specified, returns `library.all()` (a cheap
 /// in-memory construction, no API call). When names are given, calls
 /// `library.albums().await` to discover user-created albums from iCloud.
+///
+/// The returned `FxHashSet<String>` contains asset IDs from excluded albums
+/// that should be filtered out at download time. This is only populated when
+/// `--exclude-album` is set without `--album`, because the all-photos stream
+/// doesn't carry album membership per asset.
 async fn resolve_albums(
     library: &icloud::photos::PhotoLibrary,
     album_names: &[String],
-) -> anyhow::Result<Vec<icloud::photos::PhotoAlbum>> {
+    exclude_albums: &[String],
+) -> anyhow::Result<(
+    Vec<icloud::photos::PhotoAlbum>,
+    rustc_hash::FxHashSet<String>,
+)> {
+    use futures_util::StreamExt;
+
+    let empty_ids = rustc_hash::FxHashSet::default();
+
+    if album_names.is_empty() && exclude_albums.is_empty() {
+        return Ok((vec![library.all()], empty_ids));
+    }
+
     if album_names.is_empty() {
-        Ok(vec![library.all()])
-    } else {
-        let mut album_map = library.albums().await?;
-        let mut matched = Vec::new();
-        for name in album_names {
-            if let Some(album) = album_map.remove(name.as_str()) {
-                matched.push(album);
+        // No --album but --exclude-album is set: use library.all() as the
+        // base (all photos) and pre-collect asset IDs from excluded albums
+        // so they can be filtered at download time. This avoids silently
+        // dropping photos that aren't in any named album.
+        let album_map = library.albums().await?;
+        let mut exclude_ids = rustc_hash::FxHashSet::default();
+        for name in exclude_albums {
+            if let Some(album) = album_map.get(name.as_str()) {
+                let count = album.len().await.unwrap_or(0);
+                tracing::info!(album = name, count, "Pre-fetching excluded album asset IDs");
+                let (stream, _token_rx) = album.photo_stream_with_token(None, Some(count), 1);
+                tokio::pin!(stream);
+                while let Some(Ok(asset)) = stream.next().await {
+                    exclude_ids.insert(asset.id().to_string());
+                }
             } else {
-                let available: Vec<&String> = album_map.keys().collect();
-                anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
+                tracing::warn!(album = name, "Excluded album not found, ignoring");
             }
         }
-        Ok(matched)
+        tracing::info!(count = exclude_ids.len(), "Collected excluded asset IDs");
+        return Ok((vec![library.all()], exclude_ids));
     }
+
+    // Explicit --album list: resolve and exclude.
+    let mut album_map = library.albums().await?;
+    let mut matched = Vec::new();
+    for name in album_names {
+        if exclude_albums.iter().any(|e| e == name) {
+            tracing::info!(album = name, "Album excluded by --exclude-album");
+            continue;
+        }
+        if let Some(album) = album_map.remove(name.as_str()) {
+            matched.push(album);
+        } else {
+            let available: Vec<&String> = album_map.keys().collect();
+            anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
+        }
+    }
+    Ok((matched, empty_ids))
 }
 
 /// RAII guard that writes the current PID to a file on creation and removes
@@ -1094,6 +1137,9 @@ struct LibraryState {
     zone_name: String,
     sync_token_key: String,
     albums: Vec<icloud::photos::PhotoAlbum>,
+    /// Asset IDs from excluded albums, used to filter out assets when
+    /// `--exclude-album` is set without explicit `--album`.
+    exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
 }
 
 fn main() -> ExitCode {
@@ -1318,6 +1364,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         _ => unreachable!("legacy command variants should be mapped by effective_command()"),
     };
     let is_retry_failed = sync.retry_failed;
+    let max_download_attempts = sync.max_download_attempts.unwrap_or(10);
     let reset_sync_token = sync.reset_sync_token;
     let toml_existed = toml_config.is_some();
     let cli_data_dir = globals
@@ -1387,6 +1434,36 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             "--directory is required for downloading \
              (pass --directory on the CLI or set [download] directory in the config file)"
         );
+    }
+
+    // Validate download directory is writable before spending time on authentication.
+    tokio::fs::create_dir_all(&config.directory)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create download directory {}",
+                config.directory.display()
+            )
+        })?;
+    let probe = config.directory.join(".kei_probe");
+    tokio::fs::write(&probe, b"").await.with_context(|| {
+        format!(
+            "Download directory {} is not writable",
+            config.directory.display()
+        )
+    })?;
+    let _ = tokio::fs::remove_file(&probe).await;
+
+    // Abort if available disk space is too low.
+    if let Some(avail) = available_disk_space(&config.directory) {
+        const MIN_FREE_BYTES: u64 = 1_073_741_824; // 1 GiB
+        if avail < MIN_FREE_BYTES {
+            let avail_mb = avail / (1024 * 1024);
+            anyhow::bail!(
+                "Insufficient disk space: only {avail_mb} MiB available in {} (minimum 1 GiB)",
+                config.directory.display()
+            );
+        }
     }
 
     let cred_store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
@@ -1507,37 +1584,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         "Resolved libraries"
     );
 
-    // Validate download directory is writable before spending time on enumeration
-    tokio::fs::create_dir_all(&config.directory)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create download directory {}",
-                config.directory.display()
-            )
-        })?;
-    let probe = config.directory.join(".kei_probe");
-    tokio::fs::write(&probe, b"").await.with_context(|| {
-        format!(
-            "Download directory {} is not writable",
-            config.directory.display()
-        )
-    })?;
-    let _ = tokio::fs::remove_file(&probe).await;
-
-    // Warn if available disk space is low
-    if let Some(avail) = available_disk_space(&config.directory) {
-        const MIN_FREE_BYTES: u64 = 1_073_741_824; // 1 GiB
-        if avail < MIN_FREE_BYTES {
-            let avail_mb = avail / (1024 * 1024);
-            tracing::warn!(
-                available_mb = avail_mb,
-                path = %config.directory.display(),
-                "Low disk space — downloads may fail with disk errors"
-            );
-        }
-    }
-
     // Initialize state database.
     // Skip for --dry-run so a preview doesn't create the DB or poison
     // sync tokens, which would cause a subsequent real sync to believe
@@ -1581,12 +1627,21 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // Handle --reset-sync-token (hidden compat flag): clear stored tokens before the sync loop
     if reset_sync_token {
         if let Some(ref db) = state_db {
-            db.set_metadata("db_sync_token", "").await.ok();
+            let mut cleared_ok = true;
+            if let Err(e) = db.set_metadata("db_sync_token", "").await {
+                tracing::warn!(error = %e, "Failed to clear db_sync_token");
+                cleared_ok = false;
+            }
             for library in &libraries {
                 let key = format!("sync_token:{}", library.zone_name());
-                db.set_metadata(&key, "").await.ok();
+                if let Err(e) = db.set_metadata(&key, "").await {
+                    tracing::warn!(error = %e, key = %key, "Failed to clear sync token");
+                    cleared_ok = false;
+                }
             }
-            tracing::info!("Cleared stored sync tokens");
+            if cleared_ok {
+                tracing::info!("Cleared stored sync tokens");
+            }
         }
     }
 
@@ -1600,8 +1655,9 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         .map(|d| d.with_timezone(&chrono::Utc));
     let retry_config = api_retry_config;
     let live_photo_size = config.live_photo_size.to_asset_version_size();
-
-    let build_download_config = |sync_mode: download::SyncMode| -> Arc<download::DownloadConfig> {
+    let build_download_config = |sync_mode: download::SyncMode,
+                                 exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>|
+     -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
             directory: config.directory.clone(),
             folder_structure: config.folder_structure.clone(),
@@ -1615,7 +1671,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             concurrent_downloads: config.threads_num as usize,
             recent: config.recent,
             retry: retry_config,
-            skip_live_photos: config.skip_live_photos,
+            live_photo_mode: config.live_photo_mode,
             live_photo_size,
             live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
             align_raw: config.align_raw,
@@ -1624,10 +1680,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             file_match_policy: config.file_match_policy,
             force_size: config.force_size,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,
+            filename_exclude: config.filename_exclude.clone(),
             temp_suffix: config.temp_suffix.clone(),
             state_db: state_db.clone(),
             retry_only: is_retry_failed,
+            max_download_attempts,
             sync_mode,
+            album_name: None,
+            exclude_asset_ids,
         })
     };
 
@@ -1635,22 +1695,26 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;
+    let mut last_cycle_failed_count = 0usize;
 
     let mut library_states: Vec<LibraryState> = Vec::with_capacity(libraries.len());
     for library in &libraries {
         let zone_name = library.zone_name().to_string();
         let sync_token_key = format!("sync_token:{zone_name}");
-        let albums = resolve_albums(library, &config.albums).await?;
+        let (albums, exclude_ids) =
+            resolve_albums(library, &config.albums, &config.exclude_albums).await?;
         library_states.push(LibraryState {
             library: library.clone(),
             zone_name,
             sync_token_key,
             albums,
+            exclude_asset_ids: Arc::new(exclude_ids),
         });
     }
     sd_notifier.notify_ready();
 
     let mut health = health::HealthStatus::new();
+    let mut consecutive_album_refresh_failures = 0u32;
 
     loop {
         if shutdown_token.is_cancelled() {
@@ -1767,7 +1831,10 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                                     _ => {}
                                 }
                             }
-                            let _ = db.set_metadata("enum_config_hash", &config_hash).await;
+                            if let Err(e) = db.set_metadata("enum_config_hash", &config_hash).await
+                            {
+                                tracing::warn!(error = %e, "Failed to persist enum_config_hash");
+                            }
                         }
                     }
                 }
@@ -1811,7 +1878,8 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 };
                 tracing::debug!(sync_mode = sync_mode_label, zone = %lib_state.zone_name, "Starting sync cycle");
 
-                let download_config = build_download_config(sync_mode);
+                let download_config =
+                    build_download_config(sync_mode, Arc::clone(&lib_state.exclude_asset_ids));
                 let download_client = shared_session.read().await.download_client();
                 let sync_result = download::download_photos_with_sync(
                     &download_client,
@@ -1947,11 +2015,13 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         failed_count = cycle_failed_count,
                         "Some downloads failed this cycle, will retry next cycle"
                     );
+                    last_cycle_failed_count = cycle_failed_count;
                 } else {
                     return Err(PartialSyncError(cycle_failed_count).into());
                 }
             } else {
                 reauth_attempts = 0;
+                last_cycle_failed_count = 0;
                 notifier.notify(
                     notifications::Event::SyncComplete,
                     "Sync completed successfully",
@@ -1992,16 +2062,36 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             .await
             .ok(); // Best-effort pre-check; mid-sync re-auth handles failures
 
-            // Re-resolve albums per-library to discover newly created iCloud albums
+            // Re-resolve albums per-library to discover newly created iCloud albums.
+            // TODO: When --exclude-album is set without --album, this re-fetches the
+            // entire excluded album(s) to collect asset IDs. For large excluded albums
+            // this is expensive -- consider caching exclude_asset_ids across watch
+            // cycles and only refreshing when the album's sync token changes.
             for lib_state in &mut library_states {
-                match resolve_albums(&lib_state.library, &config.albums).await {
-                    Ok(refreshed) => lib_state.albums = refreshed,
+                match resolve_albums(&lib_state.library, &config.albums, &config.exclude_albums)
+                    .await
+                {
+                    Ok((refreshed, exclude_ids)) => {
+                        lib_state.albums = refreshed;
+                        lib_state.exclude_asset_ids = Arc::new(exclude_ids);
+                        consecutive_album_refresh_failures = 0;
+                    }
                     Err(e) => {
-                        tracing::warn!(
-                            zone = %lib_state.zone_name,
-                            error = %e,
-                            "Failed to refresh albums, reusing previous set"
-                        );
+                        consecutive_album_refresh_failures += 1;
+                        if consecutive_album_refresh_failures >= 3 {
+                            tracing::error!(
+                                zone = %lib_state.zone_name,
+                                error = %e,
+                                consecutive_failures = consecutive_album_refresh_failures,
+                                "Repeated album refresh failures, reusing previous set"
+                            );
+                        } else {
+                            tracing::warn!(
+                                zone = %lib_state.zone_name,
+                                error = %e,
+                                "Failed to refresh albums, reusing previous set"
+                            );
+                        }
                     }
                 }
             }
@@ -2010,7 +2100,11 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
+    if last_cycle_failed_count > 0 {
+        Err(PartialSyncError(last_cycle_failed_count).into())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2310,5 +2404,197 @@ mod tests {
             token_clone.cancel();
         });
         assert_eq!(run_watch_loop(&shutdown_token, Some(3600)).await, 1);
+    }
+
+    // ── resolve_albums tests ──────────────────────────────────────────
+
+    use crate::icloud::photos::PhotoLibrary;
+    use crate::test_helpers::MockPhotosSession;
+
+    /// Build a `PhotoLibrary` stub with a preconfigured mock session.
+    fn stub_library(mock: MockPhotosSession) -> PhotoLibrary {
+        PhotoLibrary::new_stub(Box::new(mock))
+    }
+
+    /// CloudKit folder record for a user album. The albumNameEnc field is
+    /// base64-encoded.
+    fn folder_record(record_name: &str, album_name: &str) -> serde_json::Value {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(album_name);
+        serde_json::json!({
+            "recordName": record_name,
+            "recordType": "CPLAlbumByPositionLive",
+            "fields": {
+                "albumNameEnc": {"value": encoded},
+                "isDeleted": {"value": false}
+            }
+        })
+    }
+
+    /// A single paired CPLMaster+CPLAsset page for photo streaming.
+    fn asset_page(record_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "records": [
+                {
+                    "recordName": record_name,
+                    "recordType": "CPLMaster",
+                    "fields": {
+                        "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
+                        "resOriginalRes": {"value": {
+                            "downloadURL": "https://example.com/photo.jpg",
+                            "size": 1024,
+                            "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                        }},
+                        "resOriginalFileType": {"value": "public.jpeg"},
+                        "itemType": {"value": "public.jpeg"},
+                        "adjustmentRenderType": {"value": 0, "type": "INT64"}
+                    }
+                },
+                {
+                    "recordName": format!("asset-{record_name}"),
+                    "recordType": "CPLAsset",
+                    "fields": {
+                        "masterRef": {
+                            "value": {"recordName": record_name, "zoneID": {"zoneName": "PrimarySync"}},
+                            "type": "REFERENCE"
+                        },
+                        "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                        "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                    }
+                }
+            ]
+        })
+    }
+
+    /// Batch album count response.
+    fn album_count_response(count: u64) -> serde_json::Value {
+        serde_json::json!({
+            "batch": [{"records": [{"fields": {"itemCount": {"value": count}}}]}]
+        })
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_no_album_no_exclude() {
+        let mock = MockPhotosSession::new();
+        let library = stub_library(mock);
+        let (albums, exclude_ids) = resolve_albums(&library, &[], &[]).await.unwrap();
+        assert_eq!(albums.len(), 1, "should return library.all()");
+        assert!(exclude_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_exclude_not_found_warns() {
+        // fetch_folders returns one album "Vacation", but we exclude "Nonexistent"
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []})); // fetch_folders: no user albums
+        let library = stub_library(mock);
+
+        let (albums, exclude_ids) = resolve_albums(&library, &[], &["Nonexistent".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(albums.len(), 1, "should return library.all()");
+        assert!(exclude_ids.is_empty(), "non-existent album produces no IDs");
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_explicit_album_found() {
+        // fetch_folders returns "Vacation" album
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation")
+        ]}));
+        let library = stub_library(mock);
+
+        let (albums, exclude_ids) = resolve_albums(&library, &["Vacation".to_string()], &[])
+            .await
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        assert!(exclude_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_explicit_album_not_found_errors() {
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": []})); // no user albums
+        let library = stub_library(mock);
+
+        let result = resolve_albums(&library, &["DoesNotExist".to_string()], &[]).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_explicit_album_with_exclusion() {
+        // Two albums: Vacation and Hidden. Exclude Hidden.
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation"),
+            folder_record("FOLDER_2", "Hidden")
+        ]}));
+        let library = stub_library(mock);
+
+        let (albums, exclude_ids) = resolve_albums(
+            &library,
+            &["Vacation".to_string(), "Hidden".to_string()],
+            &["Hidden".to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            albums.len(),
+            1,
+            "Hidden should be excluded from matched albums"
+        );
+        assert!(
+            exclude_ids.is_empty(),
+            "explicit album path doesn't populate exclude IDs"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_exclude_without_album_collects_ids() {
+        // The mock session needs to handle:
+        // 1. fetch_folders (original session) → returns album "Hidden"
+        // 2. album.len() (cloned session) → returns count
+        // 3. photo_stream fetcher (re-cloned session) → returns one asset page
+        // 4. photo_stream fetcher 2nd call → returns empty (end of stream)
+        let mock = MockPhotosSession::new()
+            // 1. fetch_folders
+            .ok(serde_json::json!({"records": [
+                folder_record("FOLDER_1", "Hidden")
+            ]}))
+            // Remaining responses are cloned into the album's session:
+            // 2. album.len() batch query
+            .ok(album_count_response(1))
+            // 3. photo_stream fetcher: first page with one asset
+            .ok(asset_page("MASTER_1"))
+            // 4. photo_stream fetcher: empty page (end)
+            .ok(serde_json::json!({"records": []}));
+        let library = stub_library(mock);
+
+        let (albums, exclude_ids) = resolve_albums(&library, &[], &["Hidden".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(albums.len(), 1, "should return library.all()");
+        assert!(
+            exclude_ids.contains("MASTER_1"),
+            "should contain the excluded asset ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_same_album_in_both_yields_empty() {
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation")
+        ]}));
+        let library = stub_library(mock);
+
+        let (albums, _) = resolve_albums(
+            &library,
+            &["Vacation".to_string()],
+            &["Vacation".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            albums.is_empty(),
+            "album present in both --album and --exclude-album should yield zero albums"
+        );
     }
 }

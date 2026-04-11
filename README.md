@@ -5,9 +5,12 @@
 <h1 align="center">kei: photo sync engine</h1>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/built_with-Rust-dea584?logo=rust" alt="Built with Rust">
+  <a href="LICENSE.md"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
   <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/v/release/rhoopr/kei?color=blue&label=version" alt="Version"></a>
   <a href="https://github.com/rhoopr/kei/actions/workflows/docker.yml"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/docker.yml?branch=main&label=build&logo=github" alt="Build"></a>
-  <a href="LICENSE.md"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
+  <br>
+  <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/downloads/rhoopr/kei/total?logo=github&label=downloads" alt="Downloads"></a>
   <a href="https://github.com/rhoopr/homebrew-kei"><img src="https://img.shields.io/badge/homebrew-tap-FBB040?logo=homebrew" alt="Homebrew"></a>
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
 </p>
@@ -119,8 +122,8 @@ State lives in a SQLite database alongside your session data (see `--data-dir`).
 - Watch mode with systemd notify, PID file, graceful shutdown
 - Multi-library sync (`--library all` for personal + shared)
 - Flexible password sources: prompt, env var, file, shell command, OS keyring
-- Content filtering: skip videos/photos/live photos, date ranges, albums, `--recent N`
-- Date-based folder structure, live photo MOV pairing, EXIF datetime stamping
+- Content filtering: live photo mode, filename globs, album exclusions, date ranges, `--recent N`
+- Flexible folder structure with `{album}` token and full strftime support, EXIF datetime stamping
 - Multi-arch Docker images (amd64/arm64) with headless 2FA
 - Notification scripts on events (2FA required, sync complete, failures)
 - TOML config with env var overrides (`KEI_*`) for every flag

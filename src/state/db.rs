@@ -111,6 +111,11 @@ pub trait StateDb: Send + Sync {
         &self,
     ) -> Result<HashMap<(String, String), String>, StateError>;
 
+    /// Get per-asset maximum download attempt counts for failed assets.
+    ///
+    /// Returns a map of asset_id -> max(download_attempts).
+    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError>;
+
     /// Get a metadata value by key.
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
 
@@ -603,6 +608,32 @@ impl StateDb for SqliteStateDb {
             .map_err(|e| StateError::query(&e))?;
 
         Ok(checksums)
+    }
+
+    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StateError::Query(e.to_string()))?;
+
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, MAX(download_attempts) FROM assets \
+                 WHERE download_attempts > 0 GROUP BY id",
+            )
+            .map_err(|e| StateError::query(&e))?;
+
+        let counts = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((id, u32::try_from(count).unwrap_or(u32::MAX)))
+            })
+            .map_err(|e| StateError::query(&e))?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| StateError::query(&e))?;
+
+        Ok(counts)
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
@@ -1775,5 +1806,35 @@ mod tests {
 
         let result = SqliteStateDb::open(&path).await;
         assert!(result.is_err(), "opening a truncated DB should fail");
+    }
+
+    #[tokio::test]
+    async fn test_get_attempt_counts() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for id in ["A", "B"] {
+            let record = TestAssetRecord::new(id)
+                .checksum(&format!("ck_{id}"))
+                .filename(&format!("{id}.jpg"))
+                .size(1000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+        }
+
+        db.mark_failed("A", "original", "error 1").await.unwrap();
+        db.mark_failed("A", "original", "error 2").await.unwrap();
+        db.mark_failed("A", "original", "error 3").await.unwrap();
+        db.mark_failed("B", "original", "error 1").await.unwrap();
+
+        let counts = db.get_attempt_counts().await.unwrap();
+        assert_eq!(counts.get("A"), Some(&3));
+        assert_eq!(counts.get("B"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn test_get_attempt_counts_empty() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let counts = db.get_attempt_counts().await.unwrap();
+        assert!(counts.is_empty());
     }
 }

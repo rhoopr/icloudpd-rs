@@ -3,35 +3,59 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use base64::Engine;
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Local};
 use rustc_hash::FxHashMap;
+
+/// Strip the legacy Python-style `{:%Y/%m/%d}` wrapper, returning the inner
+/// format string. Returns the input unchanged if the wrapper is absent.
+fn strip_python_wrapper(folder_structure: &str) -> &str {
+    if folder_structure.starts_with("{:") && folder_structure.ends_with('}') {
+        &folder_structure[2..folder_structure.len() - 1]
+    } else {
+        folder_structure
+    }
+}
+
+/// Expand the `{album}` token in a folder structure format string.
+///
+/// Strips the Python-style wrapper, sanitizes the album name as a path
+/// component, escapes `%` for chrono strftime, and replaces `{album}`.
+/// Returns the original `folder_structure` (wrapper-stripped) unchanged if
+/// `{album}` is absent.
+pub(crate) fn expand_album_token(folder_structure: &str, album_name: Option<&str>) -> String {
+    let format_str = strip_python_wrapper(folder_structure);
+    if !format_str.contains("{album}") {
+        return format_str.to_string();
+    }
+    let safe_name = album_name
+        .filter(|n| !n.is_empty())
+        .map(|n| sanitize_path_component(n).replace('%', "%%"))
+        .unwrap_or_default();
+    format_str.replace("{album}", &safe_name)
+}
 
 /// Build the date-based parent directory for a photo asset (without filename).
 ///
-/// `folder_structure` is a date format string such as `"{:%Y/%m/%d}"`. The
-/// special value `"none"` (case-insensitive) disables date-based folders.
+/// `folder_structure` is a strftime format string such as `"%Y/%m/%d"`. The
+/// legacy Python-style `"{:%Y/%m/%d}"` wrapper is also accepted. The custom
+/// `{album}` token is expanded to the album name before strftime processing.
+/// The special value `"none"` (case-insensitive) disables date-based folders.
 pub(crate) fn local_download_dir(
     directory: &Path,
     folder_structure: &str,
     created_date: &DateTime<Local>,
+    album_name: Option<&str>,
 ) -> PathBuf {
     if folder_structure.eq_ignore_ascii_case("none") {
         return directory.to_path_buf();
     }
 
-    // Extract format from Python-style {:%Y/%m/%d} wrapper if present
-    let format_str = if folder_structure.starts_with("{:") && folder_structure.ends_with('}') {
-        &folder_structure[2..folder_structure.len() - 1]
-    } else {
-        folder_structure
-    };
+    let expanded = expand_album_token(folder_structure, album_name);
 
-    // Build date path in a single allocation by scanning for % tokens
-    // and replacing them inline, avoiding 6 intermediate String allocations.
-    let date_path = expand_date_format(format_str, created_date);
+    // Use chrono's strftime for full format token support (%Y, %m, %d, %B, etc.)
+    let date_path = created_date.format(&expanded).to_string();
 
     // Split on "/" and join as path components to handle cross-platform paths.
-    // This converts "{:%Y/%m/%d}" format like "2025/01/15" into proper PathBuf.
     // Each component is sanitized to prevent path traversal (e.g. "../../etc").
     let mut path = directory.to_path_buf();
     for component in date_path.split('/') {
@@ -44,59 +68,19 @@ pub(crate) fn local_download_dir(
 
 /// Build the local download path for a photo asset.
 ///
-/// `folder_structure` is a date format string such as `"{:%Y/%m/%d}"`. The
-/// special value `"none"` (case-insensitive) disables date-based folders.
+/// `folder_structure` is a strftime format string such as `"%Y/%m/%d"`. The
+/// legacy Python-style `"{:%Y/%m/%d}"` wrapper is also accepted. The custom
+/// `{album}` token is expanded to the album name before strftime processing.
+/// The special value `"none"` (case-insensitive) disables date-based folders.
 pub(crate) fn local_download_path(
     directory: &Path,
     folder_structure: &str,
     created_date: &DateTime<Local>,
     filename: &str,
+    album_name: Option<&str>,
 ) -> PathBuf {
-    local_download_dir(directory, folder_structure, created_date).join(clean_filename(filename))
-}
-
-/// Expand date format tokens (%Y, %m, %d, %H, %M, %S) in a single pass.
-///
-/// Avoids the 6 intermediate String allocations from chained `.replace()` calls.
-fn expand_date_format(format_str: &str, date: &DateTime<Local>) -> String {
-    let mut result = String::with_capacity(format_str.len() + 8);
-    let mut chars = format_str.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            match chars.peek() {
-                Some('Y') => {
-                    chars.next();
-                    let _ = write!(result, "{:04}", date.year());
-                }
-                Some('m') => {
-                    chars.next();
-                    let _ = write!(result, "{:02}", date.month());
-                }
-                Some('d') => {
-                    chars.next();
-                    let _ = write!(result, "{:02}", date.day());
-                }
-                Some('H') => {
-                    chars.next();
-                    let _ = write!(result, "{:02}", date.hour());
-                }
-                Some('M') => {
-                    chars.next();
-                    let _ = write!(result, "{:02}", date.minute());
-                }
-                Some('S') => {
-                    chars.next();
-                    let _ = write!(result, "{:02}", date.second());
-                }
-                _ => result.push(c), // Unknown token, keep the %
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
+    local_download_dir(directory, folder_structure, created_date, album_name)
+        .join(clean_filename(filename))
 }
 
 /// Maximum filename length in bytes for common filesystems (ext4, APFS, NTFS).
@@ -985,7 +969,7 @@ mod tests {
         let date = chrono::Local
             .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
             .unwrap();
-        let result = local_download_path(dir, "none", &date, "IMG_0001.JPG");
+        let result = local_download_path(dir, "none", &date, "IMG_0001.JPG", None);
         assert_eq!(result, PathBuf::from("/photos/IMG_0001.JPG"));
     }
 
@@ -996,11 +980,11 @@ mod tests {
             .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
             .unwrap();
         assert_eq!(
-            local_download_path(dir, "NONE", &date, "photo.jpg"),
+            local_download_path(dir, "NONE", &date, "photo.jpg", None),
             PathBuf::from("/photos/photo.jpg")
         );
         assert_eq!(
-            local_download_path(dir, "None", &date, "photo.jpg"),
+            local_download_path(dir, "None", &date, "photo.jpg", None),
             PathBuf::from("/photos/photo.jpg")
         );
     }
@@ -1011,7 +995,7 @@ mod tests {
         let date = chrono::Local
             .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
             .unwrap();
-        let result = local_download_path(dir, "{:%Y/%m/%d}", &date, "IMG_0001.JPG");
+        let result = local_download_path(dir, "{:%Y/%m/%d}", &date, "IMG_0001.JPG", None);
         assert_eq!(result, PathBuf::from("/photos/2025/06/15/IMG_0001.JPG"));
     }
 
@@ -1020,7 +1004,7 @@ mod tests {
         // Format string without {: ... } wrapper
         let dir = Path::new("/photos");
         let date = chrono::Local.with_ymd_and_hms(2025, 1, 5, 9, 5, 3).unwrap();
-        let result = local_download_path(dir, "%Y-%m-%d", &date, "photo.jpg");
+        let result = local_download_path(dir, "%Y-%m-%d", &date, "photo.jpg", None);
         assert_eq!(result, PathBuf::from("/photos/2025-01-05/photo.jpg"));
     }
 
@@ -1030,31 +1014,11 @@ mod tests {
         let date = chrono::Local
             .with_ymd_and_hms(2025, 12, 31, 23, 59, 59)
             .unwrap();
-        let result = local_download_path(dir, "{:%Y/%m/%d/%H-%M-%S}", &date, "photo.jpg");
+        let result = local_download_path(dir, "{:%Y/%m/%d/%H-%M-%S}", &date, "photo.jpg", None);
         assert_eq!(
             result,
             PathBuf::from("/photos/2025/12/31/23-59-59/photo.jpg")
         );
-    }
-
-    #[test]
-    fn test_expand_date_format_unknown_token_preserved() {
-        // Unknown % tokens should keep the % sign
-        let date = chrono::Local
-            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
-            .unwrap();
-        let result = expand_date_format("%Y-%Z-%d", &date);
-        // %Z is unknown, so "%" is kept, then "Z" is processed as literal
-        assert_eq!(result, "2025-%Z-15");
-    }
-
-    #[test]
-    fn test_expand_date_format_trailing_percent() {
-        let date = chrono::Local
-            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
-            .unwrap();
-        let result = expand_date_format("%Y/%m/%d%", &date);
-        assert_eq!(result, "2025/06/15%");
     }
 
     #[test]
@@ -1069,7 +1033,7 @@ mod tests {
         let date = chrono::Local
             .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
             .unwrap();
-        let result = local_download_path(dir, "none", &date, "photo:1.jpg");
+        let result = local_download_path(dir, "none", &date, "photo:1.jpg", None);
         assert_eq!(result, PathBuf::from("/photos/photo_1.jpg"));
     }
 
@@ -1082,15 +1046,15 @@ mod tests {
 
         // ".." components are neutralised — path stays inside directory
         assert_eq!(
-            local_download_path(dir, "../../etc", &date, "passwd"),
+            local_download_path(dir, "../../etc", &date, "passwd", None),
             PathBuf::from("/photos/_/_/etc/passwd")
         );
         assert_eq!(
-            local_download_path(dir, "../../%Y", &date, "photo.jpg"),
+            local_download_path(dir, "../../%Y", &date, "photo.jpg", None),
             PathBuf::from("/photos/_/_/2025/photo.jpg")
         );
         assert_eq!(
-            local_download_path(dir, "{:../../%Y}", &date, "photo.jpg"),
+            local_download_path(dir, "{:../../%Y}", &date, "photo.jpg", None),
             PathBuf::from("/photos/_/_/2025/photo.jpg")
         );
     }
@@ -1217,5 +1181,110 @@ mod tests {
     fn test_clean_filename_tab() {
         // Tab is a control character and gets replaced with '_'
         assert_eq!(clean_filename("photo\tname.jpg"), "photo_name.jpg");
+    }
+
+    #[test]
+    fn test_strftime_month_name_token() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 1, 15, 10, 0, 0)
+            .unwrap();
+        let result = local_download_path(dir, "%Y/%B/%d", &date, "photo.jpg", None);
+        assert_eq!(result, PathBuf::from("/photos/2025/January/15/photo.jpg"));
+    }
+
+    #[test]
+    fn test_album_token_expansion() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = local_download_path(
+            dir,
+            "{album}/%Y/%m/%d",
+            &date,
+            "photo.jpg",
+            Some("Vacation"),
+        );
+        assert_eq!(
+            result,
+            PathBuf::from("/photos/Vacation/2025/06/15/photo.jpg")
+        );
+    }
+
+    #[test]
+    fn test_album_token_none_becomes_empty() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = local_download_path(dir, "{album}/%Y/%m/%d", &date, "photo.jpg", None);
+        // Empty album name means the {album} component is empty, so it's skipped
+        assert_eq!(result, PathBuf::from("/photos/2025/06/15/photo.jpg"));
+    }
+
+    #[test]
+    fn test_album_token_empty_string_skipped() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        // The "All Photos" album has name "" -- should behave like None
+        let result = local_download_path(dir, "{album}/%Y/%m/%d", &date, "photo.jpg", Some(""));
+        assert_eq!(result, PathBuf::from("/photos/2025/06/15/photo.jpg"));
+    }
+
+    #[test]
+    fn test_album_token_sanitized() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("../etc"));
+        // Path traversal in album name is neutralized
+        assert!(!result.to_str().unwrap().contains("../"));
+    }
+
+    #[test]
+    fn test_album_token_percent_escaped() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        // Album name containing % should not be interpreted as strftime
+        let result =
+            local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("My %d Album"));
+        let result_str = result.to_str().unwrap();
+        // %d should be literal, not expanded to "15"
+        assert!(
+            result_str.contains("%d"),
+            "percent in album name should be literal, got: {result_str}"
+        );
+        assert!(
+            !result_str.contains("/15/"),
+            "album %d should not expand to day number, got: {result_str}"
+        );
+    }
+
+    #[test]
+    fn test_album_token_trailing_percent_no_panic() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        // Trailing % in album name must not panic
+        let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("50% Off"));
+        assert!(result.to_str().unwrap().contains("50% Off"));
+    }
+
+    #[test]
+    fn test_no_album_token_ignores_album_name() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        // Without {album} in format, album_name is ignored
+        let result = local_download_path(dir, "%Y/%m/%d", &date, "photo.jpg", Some("Vacation"));
+        assert_eq!(result, PathBuf::from("/photos/2025/06/15/photo.jpg"));
     }
 }

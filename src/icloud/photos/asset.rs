@@ -175,13 +175,17 @@ fn extract_versions(
             continue;
         };
 
-        let asset_type: Box<str> = fields[type_field]["value"]
-            .as_str()
-            .unwrap_or_else(|| {
-                tracing::warn!("Missing expected field: {type_field}");
-                ""
-            })
-            .into();
+        let asset_type: Box<str> = match fields[type_field]["value"].as_str() {
+            Some(s) if !s.is_empty() => s.into(),
+            _ => {
+                tracing::warn!(
+                    asset = %record_name,
+                    field = %type_field,
+                    "Missing or empty asset type, skipping version"
+                );
+                continue;
+            }
+        };
 
         versions.push((
             *key,
@@ -294,6 +298,15 @@ impl PhotoAsset {
     /// Check if a specific version exists.
     pub fn contains_version(&self, key: AssetVersionSize) -> bool {
         self.versions.iter().any(|(k, _)| *k == key)
+    }
+
+    /// Whether this asset is a live photo (image with a companion video).
+    pub fn is_live_photo(&self) -> bool {
+        self.item_type() == Some(AssetItemType::Image)
+            && (self.contains_version(AssetVersionSize::LiveOriginal)
+                || self.contains_version(AssetVersionSize::LiveMedium)
+                || self.contains_version(AssetVersionSize::LiveThumb)
+                || self.contains_version(AssetVersionSize::LiveAdjusted))
     }
 }
 
@@ -1630,5 +1643,114 @@ mod tests {
         // Flush should be empty — everything was paired
         let flushed = buffer.flush();
         assert!(flushed.is_empty());
+    }
+
+    #[test]
+    fn test_is_live_photo_true() {
+        let asset = make_asset(
+            json!({
+                "recordName": "LIVE_1",
+                "fields": {
+                    "filenameEnc": {"value": "IMG_0001.HEIC", "type": "STRING"},
+                    "itemType": {"value": "public.heic"},
+                    "resOriginalRes": {"value": {
+                        "size": 2000, "downloadURL": "https://example.com/heic",
+                        "fileChecksum": "heic_ck"
+                    }},
+                    "resOriginalFileType": {"value": "public.heic"},
+                    "resOriginalVidComplRes": {"value": {
+                        "size": 3000, "downloadURL": "https://example.com/mov",
+                        "fileChecksum": "mov_ck"
+                    }},
+                    "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
+                }
+            }),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        assert!(asset.is_live_photo());
+    }
+
+    #[test]
+    fn test_is_live_photo_false_no_companion() {
+        let asset = make_asset(
+            json!({
+                "recordName": "PHOTO_1",
+                "fields": {
+                    "itemType": {"value": "public.jpeg"},
+                    "resOriginalRes": {"value": {
+                        "size": 1000, "downloadURL": "https://example.com/jpg",
+                        "fileChecksum": "jpg_ck"
+                    }}
+                }
+            }),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        assert!(!asset.is_live_photo());
+    }
+
+    #[test]
+    fn test_is_live_photo_false_for_movie() {
+        let asset = make_asset(
+            json!({
+                "recordName": "VID_1",
+                "fields": {
+                    "itemType": {"value": "com.apple.quicktime-movie"},
+                    "resOriginalRes": {"value": {
+                        "size": 5000, "downloadURL": "https://example.com/mov",
+                        "fileChecksum": "vid_ck"
+                    }},
+                    "resOriginalVidComplRes": {"value": {
+                        "size": 3000, "downloadURL": "https://example.com/mov2",
+                        "fileChecksum": "mov2_ck"
+                    }}
+                }
+            }),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        assert!(
+            !asset.is_live_photo(),
+            "Movies with video companion are not live photos"
+        );
+    }
+
+    #[test]
+    fn test_versions_skips_empty_asset_type() {
+        // When resOriginalFileType is missing, the version should be excluded.
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "ck_orig"
+                }}
+                // resOriginalFileType intentionally omitted
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "Version with missing asset type should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_versions_skips_null_asset_type() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "ck_orig"
+                }},
+                "resOriginalFileType": {"value": null}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "Version with null asset type should be skipped"
+        );
     }
 }

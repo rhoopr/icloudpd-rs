@@ -1,5 +1,5 @@
 use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
+    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
     RawTreatmentPolicy, VersionSize,
 };
 use clap::{Parser, Subcommand};
@@ -25,7 +25,7 @@ fn parse_2fa_code(s: &str) -> Result<String, String> {
 }
 
 /// Print a deprecation warning to stderr.
-fn deprecation_warning(old: &str, new: &str) {
+pub(crate) fn deprecation_warning(old: &str, new: &str) {
     eprintln!("warning: `{old}` is deprecated, use `{new}` instead");
 }
 
@@ -69,6 +69,14 @@ pub struct SyncArgs {
     #[arg(short = 'a', long = "album", env = "KEI_ALBUM", value_parser = non_empty_string)]
     pub albums: Vec<String>,
 
+    /// Album(s) to exclude from sync
+    #[arg(long = "exclude-album", env = "KEI_EXCLUDE_ALBUM", value_delimiter = ',', value_parser = non_empty_string)]
+    pub exclude_albums: Vec<String>,
+
+    /// Exclude files matching glob pattern(s) (e.g. "*.AAE", "Screenshot*")
+    #[arg(long = "filename-exclude", env = "KEI_FILENAME_EXCLUDE", value_delimiter = ',', value_parser = non_empty_string)]
+    pub filename_exclude: Vec<String>,
+
     /// Library to download (default: `PrimarySync`, use "all" for all libraries)
     #[arg(long, env = "KEI_LIBRARY")]
     pub library: Option<String>,
@@ -97,7 +105,11 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_SKIP_PHOTOS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub skip_photos: Option<bool>,
 
-    /// Don't download live photos (pass `false` to override config file)
+    /// Live photo handling: both, image-only, video-only, skip
+    #[arg(long, env = "KEI_LIVE_PHOTO_MODE", value_enum)]
+    pub live_photo_mode: Option<LivePhotoMode>,
+
+    /// Deprecated: use `--live-photo-mode skip` instead
     #[arg(long, env = "KEI_SKIP_LIVE_PHOTOS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true, hide = true)]
     pub skip_live_photos: Option<bool>,
 
@@ -105,7 +117,7 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_FORCE_SIZE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub force_size: Option<bool>,
 
-    /// Folder structure for organizing downloads
+    /// Folder structure for organizing downloads (e.g., "%Y/%m/%d", "{album}/%Y/%B", "none")
     #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
 
@@ -145,7 +157,7 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_SKIP_CREATED_BEFORE")]
     pub skip_created_before: Option<String>,
 
-    /// Skip assets created after this ISO date or interval
+    /// Skip assets created after this ISO date or interval (e.g., 2025-01-02 or 20d)
     #[arg(long, env = "KEI_SKIP_CREATED_AFTER")]
     pub skip_created_after: Option<String>,
 
@@ -187,6 +199,10 @@ pub struct SyncArgs {
     /// Re-sync only previously failed assets
     #[arg(long, conflicts_with_all = ["dry_run", "watch_with_interval"])]
     pub retry_failed: bool,
+
+    /// Maximum download attempts per asset before skipping (default: 10)
+    #[arg(long, env = "KEI_MAX_DOWNLOAD_ATTEMPTS")]
+    pub max_download_attempts: Option<u32>,
 
     // ── Hidden compat flags (deprecated, still parse) ──────────────
     /// Deprecated: use `kei login` instead
@@ -1084,6 +1100,36 @@ mod tests {
     }
 
     #[test]
+    fn test_max_download_attempts_cli_parse() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "sync",
+            "--max-download-attempts",
+            "5",
+            "--directory",
+            "/photos",
+        ])
+        .unwrap();
+        match cli.effective_command() {
+            Command::Sync { sync, .. } => {
+                assert_eq!(sync.max_download_attempts, Some(5));
+            }
+            _ => panic!("Expected Sync"),
+        }
+    }
+
+    #[test]
+    fn test_max_download_attempts_defaults_to_none() {
+        let cli = Cli::try_parse_from(["kei", "sync", "--directory", "/photos"]).unwrap();
+        match cli.effective_command() {
+            Command::Sync { sync, .. } => {
+                assert_eq!(sync.max_download_attempts, None);
+            }
+            _ => panic!("Expected Sync"),
+        }
+    }
+
+    #[test]
     fn test_legacy_reset_state_maps_to_reset() {
         let cli = Cli::try_parse_from(["kei", "reset-state", "--yes"]).unwrap();
         match cli.effective_command() {
@@ -1781,5 +1827,67 @@ mod tests {
         } else {
             panic!("Expected Verify command");
         }
+    }
+
+    // ── New filter flags ───────────────────────────────────────────
+
+    #[test]
+    fn test_live_photo_mode_all_variants() {
+        for (flag, expected) in [
+            ("both", LivePhotoMode::Both),
+            ("image-only", LivePhotoMode::ImageOnly),
+            ("video-only", LivePhotoMode::VideoOnly),
+            ("skip", LivePhotoMode::Skip),
+        ] {
+            let mut args = base_args();
+            args.extend(["--live-photo-mode", flag]);
+            let cli = parse(&args);
+            assert_eq!(cli.sync.live_photo_mode, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_skip_live_photos_compat_still_parses() {
+        let mut args = base_args();
+        args.push("--skip-live-photos");
+        let cli = parse(&args);
+        assert_eq!(cli.sync.skip_live_photos, Some(true));
+    }
+
+    #[test]
+    fn test_filename_exclude_single() {
+        let mut args = base_args();
+        args.extend(["--filename-exclude", "*.AAE"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.filename_exclude, vec!["*.AAE"]);
+    }
+
+    #[test]
+    fn test_filename_exclude_multiple() {
+        let mut args = base_args();
+        args.extend([
+            "--filename-exclude",
+            "*.AAE",
+            "--filename-exclude",
+            "Screenshot*",
+        ]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.filename_exclude, vec!["*.AAE", "Screenshot*"]);
+    }
+
+    #[test]
+    fn test_exclude_album_single() {
+        let mut args = base_args();
+        args.extend(["--exclude-album", "Hidden"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.exclude_albums, vec!["Hidden"]);
+    }
+
+    #[test]
+    fn test_exclude_album_multiple() {
+        let mut args = base_args();
+        args.extend(["--exclude-album", "Hidden", "--exclude-album", "Trash"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.exclude_albums, vec!["Hidden", "Trash"]);
     }
 }

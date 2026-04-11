@@ -35,9 +35,18 @@ use crate::icloud::photos::{
 };
 use crate::retry::RetryConfig;
 use crate::state::{AssetRecord, MediaType, StateDb, SyncRunStats, VersionSizeKey};
-use crate::types::{FileMatchPolicy, LivePhotoMovFilenamePolicy, RawTreatmentPolicy};
+use crate::types::{
+    FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawTreatmentPolicy,
+};
 
 use error::DownloadError;
+
+/// Case-insensitive glob matching options for filename exclusion patterns.
+const GLOB_CASE_INSENSITIVE: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: false,
+    require_literal_separator: false,
+    require_literal_leading_dot: false,
+};
 
 /// Determine the media type for an asset based on version size and item type.
 pub fn determine_media_type(
@@ -58,18 +67,8 @@ pub fn determine_media_type(
         _ => {
             if asset.item_type() == Some(AssetItemType::Movie) {
                 MediaType::Video
-            } else if asset.item_type() == Some(AssetItemType::Image) {
-                // Could be live photo image or regular photo
-                // Check if asset has live photo versions
-                if asset.contains_version(AssetVersionSize::LiveOriginal)
-                    || asset.contains_version(AssetVersionSize::LiveMedium)
-                    || asset.contains_version(AssetVersionSize::LiveThumb)
-                    || asset.contains_version(AssetVersionSize::LiveAdjusted)
-                {
-                    MediaType::LivePhotoImage
-                } else {
-                    MediaType::Photo
-                }
+            } else if asset.is_live_photo() {
+                MediaType::LivePhotoImage
             } else {
                 MediaType::Photo
             }
@@ -132,7 +131,7 @@ pub enum DownloadOutcome {
 }
 
 /// How the sync should enumerate photos from iCloud.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncMode {
     /// Full enumeration via records/query (existing behavior).
     /// On completion, captures the syncToken for future incremental syncs.
@@ -198,7 +197,15 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     hasher.update([u8::from(config.force_size)]);
     hasher.update([u8::from(config.skip_videos)]);
     hasher.update([u8::from(config.skip_photos)]);
-    hasher.update([u8::from(config.skip_live_photos)]);
+    hasher.update([config.live_photo_mode as u8]);
+    // filename_exclude patterns affect which assets are eligible
+    let mut sorted_excludes: Vec<&str> =
+        config.filename_exclude.iter().map(|p| p.as_str()).collect();
+    sorted_excludes.sort_unstable();
+    for pattern in &sorted_excludes {
+        hasher.update(pattern.as_bytes());
+        hasher.update(b"\0");
+    }
     let hash = hasher.finalize();
     let mut hex = String::with_capacity(16);
     // First 8 bytes is plenty for collision avoidance in this context
@@ -215,7 +222,7 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
 ///
 /// This hash is a SUPERSET of [`hash_download_config`]: it includes all
 /// the fields that affect download paths (shared with hash_download_config)
-/// plus enumeration-filter fields (albums, library, skip_live_photos) that
+/// plus enumeration-filter fields (albums, library, live_photo_mode) that
 /// affect WHICH assets are eligible. Changing these filters must invalidate
 /// sync tokens so the next run does a full enumeration.
 pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
@@ -255,9 +262,24 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     // Enumeration-filter fields: changing these affects WHICH assets are
     // fetched from iCloud, so sync tokens must be invalidated to avoid
     // missing assets that are newly eligible under the changed filters.
-    hasher.update([u8::from(config.skip_live_photos)]);
+    hasher.update([config.live_photo_mode as u8]);
     for album in &config.albums {
         hasher.update(album.as_bytes());
+        hasher.update(b"\0");
+    }
+    let mut sorted_excludes: Vec<&str> = config.exclude_albums.iter().map(|s| s.as_str()).collect();
+    sorted_excludes.sort_unstable();
+    for name in &sorted_excludes {
+        hasher.update(b"exclude:");
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+    }
+    let mut sorted_fn_excludes: Vec<&str> =
+        config.filename_exclude.iter().map(|s| s.as_str()).collect();
+    sorted_fn_excludes.sort_unstable();
+    for pattern in &sorted_fn_excludes {
+        hasher.update(b"fnexclude:");
+        hasher.update(pattern.as_bytes());
         hasher.update(b"\0");
     }
     hasher.update(format!("{:?}", config.library).as_bytes());
@@ -284,7 +306,7 @@ pub(crate) struct DownloadConfig {
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
     pub(crate) retry: RetryConfig,
-    pub(crate) skip_live_photos: bool,
+    pub(crate) live_photo_mode: LivePhotoMode,
     pub(crate) live_photo_size: AssetVersionSize,
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub(crate) align_raw: RawTreatmentPolicy,
@@ -293,6 +315,8 @@ pub(crate) struct DownloadConfig {
     pub(crate) file_match_policy: FileMatchPolicy,
     pub(crate) force_size: bool,
     pub(crate) keep_unicode_in_filenames: bool,
+    /// Compiled glob patterns for filename exclusion.
+    pub(crate) filename_exclude: Vec<glob::Pattern>,
     /// Temp file suffix for partial downloads (e.g. `.kei-tmp`).
     pub(crate) temp_suffix: String,
     /// State database for tracking download progress.
@@ -302,6 +326,35 @@ pub(crate) struct DownloadConfig {
     pub(crate) retry_only: bool,
     /// Sync mode: full enumeration or incremental delta via syncToken.
     pub(crate) sync_mode: SyncMode,
+    /// Album name for `{album}` token in folder_structure. Set per-album when
+    /// processing albums individually.
+    pub(crate) album_name: Option<Arc<str>>,
+    /// Asset IDs to exclude (from `--exclude-album` without `--album`).
+    pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
+    /// Maximum download attempts per asset before giving up (0 = unlimited).
+    pub(crate) max_download_attempts: u32,
+}
+
+impl DownloadConfig {
+    /// Clone this config with a different `album_name`, for per-album processing
+    /// when `{album}` is in `folder_structure`. Pre-expands the `{album}` token
+    /// in `folder_structure` so `local_download_dir` avoids per-asset
+    /// sanitize/escape/replace allocations.
+    fn with_album_name(&self, name: Arc<str>) -> Self {
+        let album_ref = Some(name.as_ref()).filter(|n: &&str| !n.is_empty());
+        let folder_structure = paths::expand_album_token(&self.folder_structure, album_ref);
+        Self {
+            album_name: Some(name),
+            directory: self.directory.clone(),
+            folder_structure,
+            filename_exclude: self.filename_exclude.clone(),
+            temp_suffix: self.temp_suffix.clone(),
+            state_db: self.state_db.clone(),
+            sync_mode: self.sync_mode.clone(),
+            exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
+            ..*self
+        }
+    }
 }
 
 impl std::fmt::Debug for DownloadConfig {
@@ -319,7 +372,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
             .field("retry", &self.retry)
-            .field("skip_live_photos", &self.skip_live_photos)
+            .field("live_photo_mode", &self.live_photo_mode)
             .field("live_photo_size", &self.live_photo_size)
             .field(
                 "live_photo_mov_filename_policy",
@@ -331,10 +384,14 @@ impl std::fmt::Debug for DownloadConfig {
             .field("file_match_policy", &self.file_match_policy)
             .field("force_size", &self.force_size)
             .field("keep_unicode_in_filenames", &self.keep_unicode_in_filenames)
+            .field("filename_exclude", &self.filename_exclude)
             .field("temp_suffix", &self.temp_suffix)
             .field("state_db", &self.state_db.is_some())
             .field("retry_only", &self.retry_only)
             .field("sync_mode", &self.sync_mode)
+            .field("album_name", &self.album_name)
+            .field("exclude_asset_ids_count", &self.exclude_asset_ids.len())
+            .field("max_download_attempts", &self.max_download_attempts)
             .finish()
     }
 }
@@ -383,6 +440,9 @@ struct DownloadContext {
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced.
     known_ids: FxHashSet<Box<str>>,
+    /// Per-asset maximum download attempt count (from failed assets).
+    /// Used to skip assets that have exceeded `max_download_attempts`.
+    attempt_counts: FxHashMap<Box<str>, u32>,
 }
 
 impl DownloadContext {
@@ -430,10 +490,22 @@ impl DownloadContext {
             FxHashSet::default()
         };
 
+        let attempt_counts: FxHashMap<Box<str>, u32> = db
+            .get_attempt_counts()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to load attempt counts from state DB");
+                Default::default()
+            })
+            .into_iter()
+            .map(|(id, count)| (id.into_boxed_str(), count))
+            .collect();
+
         Self {
             downloaded_ids,
             downloaded_checksums,
             known_ids,
+            attempt_counts,
         }
     }
 
@@ -579,11 +651,21 @@ fn extract_skip_candidates<'a>(
     asset: &'a crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> SmallVec<[(VersionSizeKey, &'a str); 2]> {
-    // Content type filters — same as filter_asset_to_tasks
+    // Excluded album assets -- same as filter_asset_to_tasks
+    if config.exclude_asset_ids.contains(asset.id()) {
+        return SmallVec::new();
+    }
+
+    // Content type filters -- same as filter_asset_to_tasks
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
         return SmallVec::new();
     }
     if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
+        return SmallVec::new();
+    }
+
+    let is_live_photo = asset.is_live_photo();
+    if config.live_photo_mode == LivePhotoMode::Skip && is_live_photo {
         return SmallVec::new();
     }
 
@@ -600,25 +682,46 @@ fn extract_skip_candidates<'a>(
         }
     }
 
+    // Filename exclusion -- mirrors filter_asset_to_tasks
+    if !config.filename_exclude.is_empty() {
+        if let Some(filename) = asset.filename() {
+            if config
+                .filename_exclude
+                .iter()
+                .any(|p| p.matches_with(filename, GLOB_CASE_INSENSITIVE))
+            {
+                return SmallVec::new();
+            }
+        }
+    }
+
     let versions = asset.versions();
     let mut result = SmallVec::new();
 
     // Primary version (with fallback to Original, same logic as filter_asset_to_tasks)
+    // VideoOnly: skip primary image for live photos.
+    let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
     let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
         versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     };
-    let primary = version_with_fallback(
-        &get_version,
-        config.size,
-        AssetVersionSize::Original,
-        config.force_size,
-    );
-    if let Some((v, effective_size)) = primary {
-        result.push((VersionSizeKey::from(effective_size), v.checksum.as_ref()));
+    if !skip_primary {
+        let primary = version_with_fallback(
+            &get_version,
+            config.size,
+            AssetVersionSize::Original,
+            config.force_size,
+        );
+        if let Some((v, effective_size)) = primary {
+            result.push((VersionSizeKey::from(effective_size), v.checksum.as_ref()));
+        }
     }
 
     // Live photo companion (with fallback to LiveOriginal, mirrors primary logic)
-    if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
+    if matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Both | LivePhotoMode::VideoOnly
+    ) && asset.item_type() == Some(AssetItemType::Image)
+    {
         let live = version_with_fallback(
             &get_version,
             config.live_photo_size,
@@ -663,8 +766,12 @@ async fn pre_ensure_asset_dir(
     config: &DownloadConfig,
 ) {
     let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
-    let parent =
-        paths::local_download_dir(&config.directory, &config.folder_structure, &created_local);
+    let parent = paths::local_download_dir(
+        &config.directory,
+        &config.folder_structure,
+        &created_local,
+        config.album_name.as_deref(),
+    );
     dir_cache.ensure_dir_async(&parent).await;
 }
 
@@ -681,12 +788,23 @@ fn filter_asset_to_tasks(
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
 ) -> SmallVec<[DownloadTask; 2]> {
+    if config.exclude_asset_ids.contains(asset.id()) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
+        return SmallVec::new();
+    }
     if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
         tracing::debug!(asset_id = %asset.id(), "Skipping video (skip_videos enabled)");
         return SmallVec::new();
     }
     if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
         tracing::debug!(asset_id = %asset.id(), "Skipping photo (skip_photos enabled)");
+        return SmallVec::new();
+    }
+
+    // LivePhotoMode::Skip: skip live photo assets entirely (both image and MOV)
+    let is_live_photo = asset.is_live_photo();
+    if config.live_photo_mode == LivePhotoMode::Skip && is_live_photo {
+        tracing::debug!(asset_id = %asset.id(), "Skipping live photo (live_photo_mode=skip)");
         return SmallVec::new();
     }
 
@@ -722,6 +840,17 @@ fn filter_asset_to_tasks(
         &fallback_filename
     };
 
+    // Filename exclusion: match raw filename against glob patterns before any
+    // cleaning or unicode stripping, so patterns match the original iCloud name.
+    if config
+        .filename_exclude
+        .iter()
+        .any(|p| p.matches_with(raw_filename, GLOB_CASE_INSENSITIVE))
+    {
+        tracing::debug!(asset_id = %asset.id(), filename = raw_filename, "Skipping (filename_exclude match)");
+        return SmallVec::new();
+    }
+
     // Strip non-ASCII characters unless --keep-unicode-in-filenames is set.
     // Matches Python's default behavior of calling remove_unicode_chars() on filenames.
     let base_filename = if config.keep_unicode_in_filenames {
@@ -755,7 +884,10 @@ fn filter_asset_to_tasks(
         Some((v, s)) => (Some(v), s),
         None => (None, config.size),
     };
-    if let Some(version) = version {
+    // VideoOnly mode: skip the primary image for live photos, only emit MOV.
+    let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
+
+    if let Some(version) = version.filter(|_| !skip_primary) {
         // Map the file extension based on the version's UTI asset_type
         let mapped_filename = paths::map_filename_extension(&base_filename, &version.asset_type);
 
@@ -779,6 +911,7 @@ fn filter_asset_to_tasks(
             &config.folder_structure,
             &created_local,
             &filename,
+            config.album_name.as_deref(),
         );
         // Determine the final download path, applying size-based deduplication if needed.
         // Check both on-disk files AND in-flight downloads (claimed_paths) to handle
@@ -813,13 +946,19 @@ fn filter_asset_to_tasks(
                             &config.folder_structure,
                             &created_local,
                             &dedup_filename,
+                            config.album_name.as_deref(),
                         );
                         // Use normalize() for lookup to avoid PathBuf clone
                         let dedup_key = NormalizedPath::normalize(&dedup_path);
                         if dir_cache.exists(&dedup_path)
                             || claimed_paths.contains_key(dedup_key.as_ref())
                         {
-                            None // deduped version already downloaded or claimed
+                            tracing::info!(
+                                asset_id = asset.id(),
+                                path = %dedup_path.display(),
+                                "Skipping asset: dedup path already exists"
+                            );
+                            None
                         } else {
                             tracing::debug!(
                                 path = %download_path.display(),
@@ -835,6 +974,11 @@ fn filter_asset_to_tasks(
                 FileMatchPolicy::NameId7 => {
                     // name-id7 policy adds asset ID to ALL filenames, not just collisions.
                     // If the file exists, it's already downloaded, skip.
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %download_path.display(),
+                        "Skipping asset: file exists (name-id7)"
+                    );
                     None
                 }
             }
@@ -864,13 +1008,19 @@ fn filter_asset_to_tasks(
                             &config.folder_structure,
                             &created_local,
                             &dedup_filename,
+                            config.album_name.as_deref(),
                         );
                         // Use normalize() for lookup to avoid PathBuf clone
                         let dedup_key = NormalizedPath::normalize(&dedup_path);
                         if dir_cache.exists(&dedup_path)
                             || claimed_paths.contains_key(dedup_key.as_ref())
                         {
-                            None // deduped version already downloaded or claimed
+                            tracing::info!(
+                                asset_id = asset.id(),
+                                path = %dedup_path.display(),
+                                "Skipping asset: dedup path already claimed in-flight"
+                            );
+                            None
                         } else {
                             tracing::debug!(
                                 path = %download_path.display(),
@@ -883,7 +1033,14 @@ fn filter_asset_to_tasks(
                         }
                     }
                 }
-                FileMatchPolicy::NameId7 => None,
+                FileMatchPolicy::NameId7 => {
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %download_path.display(),
+                        "Skipping asset: path claimed in-flight (name-id7)"
+                    );
+                    None
+                }
             }
         } else {
             Some(download_path.clone())
@@ -911,10 +1068,14 @@ fn filter_asset_to_tasks(
         }
     }
 
-    // Live photo MOV companion — only for images.
-    // Falls back from LiveAdjusted → LiveOriginal when adjusted isn't available
+    // Live photo MOV companion -- only for images.
+    // Falls back from LiveAdjusted -> LiveOriginal when adjusted isn't available
     // (mirrors the primary version fallback logic), unless --force-size is set.
-    if !config.skip_live_photos && asset.item_type() == Some(AssetItemType::Image) {
+    if matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Both | LivePhotoMode::VideoOnly
+    ) && asset.item_type() == Some(AssetItemType::Image)
+    {
         let (live_version_opt, effective_live_size) = match version_with_fallback(
             &get_version,
             config.live_photo_size,
@@ -946,6 +1107,7 @@ fn filter_asset_to_tasks(
                 &config.folder_structure,
                 &created_local,
                 &mov_filename,
+                config.album_name.as_deref(),
             );
             // If the path already exists (on disk or claimed), it may be a different
             // file (e.g. a regular video) that collides with the live photo companion
@@ -958,6 +1120,11 @@ fn filter_asset_to_tasks(
             let final_mov_path = if let Some(on_disk_size) = dir_cache.file_size(&mov_path) {
                 if on_disk_size == live_version.size {
                     // Same size — likely already downloaded, skip.
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %mov_path.display(),
+                        "Skipping live photo MOV: already exists with same size"
+                    );
                     None
                 } else {
                     // Collision with a different file — deduplicate.
@@ -967,12 +1134,18 @@ fn filter_asset_to_tasks(
                         &config.folder_structure,
                         &created_local,
                         &dedup_filename,
+                        config.album_name.as_deref(),
                     );
                     let dedup_key = NormalizedPath::normalize(&dedup_path);
                     if dir_cache.exists(&dedup_path)
                         || claimed_paths.contains_key(dedup_key.as_ref())
                     {
-                        None // deduped version already downloaded or claimed
+                        tracing::info!(
+                            asset_id = asset.id(),
+                            path = %dedup_path.display(),
+                            "Skipping live photo MOV: dedup path already exists"
+                        );
+                        None
                     } else {
                         tracing::debug!(
                             path = %mov_path.display(),
@@ -985,7 +1158,12 @@ fn filter_asset_to_tasks(
             } else if let Some(&claimed_size) = claimed_paths.get(mov_key.as_ref()) {
                 // Path is claimed by an in-flight download
                 if claimed_size == live_version.size {
-                    None // Same size, likely duplicate
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %mov_path.display(),
+                        "Skipping live photo MOV: in-flight with same size"
+                    );
+                    None
                 } else {
                     // Collision with in-flight download — deduplicate.
                     let dedup_filename = paths::insert_suffix(&mov_filename, asset.id());
@@ -994,11 +1172,17 @@ fn filter_asset_to_tasks(
                         &config.folder_structure,
                         &created_local,
                         &dedup_filename,
+                        config.album_name.as_deref(),
                     );
                     let dedup_key = NormalizedPath::normalize(&dedup_path);
                     if dir_cache.exists(&dedup_path)
                         || claimed_paths.contains_key(dedup_key.as_ref())
                     {
+                        tracing::info!(
+                            asset_id = asset.id(),
+                            path = %dedup_path.display(),
+                            "Skipping live photo MOV: dedup path already claimed in-flight"
+                        );
                         None
                     } else {
                         tracing::debug!(
@@ -1297,6 +1481,7 @@ async fn download_photos_full_with_token(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
+    let uses_album_token = config.folder_structure.contains("{album}");
 
     // Build token-aware streams for each album
     let mut album_counts: Vec<u64> = Vec::with_capacity(albums.len());
@@ -1308,33 +1493,86 @@ async fn download_photos_full_with_token(
         total = total.min(u64::from(recent));
     }
 
-    // Create photo_stream_with_token for each album and collect token receivers
-    let mut token_receivers = Vec::with_capacity(albums.len());
-    let streams: Vec<_> = albums
-        .iter()
-        .zip(&album_counts)
-        .map(|(album, &count)| {
+    // When {album} is in folder_structure, process each album separately so that
+    // the album name can be threaded into path expansion. Otherwise, merge all
+    // album streams for maximum download concurrency across albums.
+    let (streaming_result, token_receivers) = if uses_album_token {
+        let mut combined_result = StreamingResult {
+            downloaded: 0,
+            exif_failures: 0,
+            failed: Vec::new(),
+            auth_errors: 0,
+            state_write_failures: 0,
+            enumeration_errors: 0,
+            assets_seen: 0,
+        };
+        let mut token_receivers = Vec::with_capacity(albums.len());
+
+        // When {album} is in folder_structure, albums are processed sequentially
+        // so each gets its own per-album path expansion. Cross-album download
+        // concurrency is intentionally sacrificed for correct path placement.
+        // Assets appearing in multiple albums are downloaded once per album,
+        // each to its respective album directory.
+        for (album, &count) in albums.iter().zip(&album_counts) {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            let album_config = Arc::new(config.with_album_name(album.name.clone()));
+
             let (stream, token_rx) = album.photo_stream_with_token(
                 config.recent,
                 Some(count),
                 config.concurrent_downloads,
             );
             token_receivers.push(token_rx);
-            stream
-        })
-        .collect();
 
-    let combined = stream::select_all(streams);
+            let result = stream_and_download_from_stream(
+                download_client,
+                stream,
+                &album_config,
+                total,
+                shutdown_token.clone(),
+            )
+            .await?;
 
-    // Run the streaming download pipeline with the combined stream
-    let streaming_result = stream_and_download_from_stream(
-        download_client,
-        combined,
-        config,
-        total,
-        shutdown_token.clone(),
-    )
-    .await?;
+            combined_result.downloaded += result.downloaded;
+            combined_result.exif_failures += result.exif_failures;
+            combined_result.failed.extend(result.failed);
+            combined_result.auth_errors += result.auth_errors;
+            combined_result.state_write_failures += result.state_write_failures;
+            combined_result.enumeration_errors += result.enumeration_errors;
+            combined_result.assets_seen += result.assets_seen;
+        }
+
+        (combined_result, token_receivers)
+    } else {
+        let mut token_receivers = Vec::with_capacity(albums.len());
+        let streams: Vec<_> = albums
+            .iter()
+            .zip(&album_counts)
+            .map(|(album, &count)| {
+                let (stream, token_rx) = album.photo_stream_with_token(
+                    config.recent,
+                    Some(count),
+                    config.concurrent_downloads,
+                );
+                token_receivers.push(token_rx);
+                stream
+            })
+            .collect();
+
+        let combined = stream::select_all(streams);
+        let result = stream_and_download_from_stream(
+            download_client,
+            combined,
+            config,
+            total,
+            shutdown_token.clone(),
+        )
+        .await?;
+
+        (result, token_receivers)
+    };
 
     // Warn if enumeration saw significantly fewer assets than the API reported.
     // This catches silent pagination truncation, dropped pages, or API hiccups
@@ -1393,9 +1631,12 @@ async fn download_photos_incremental(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
+    let uses_album_token = config.folder_structure.contains("{album}");
 
-    // Collect change events from all albums, counting and filtering in a single pass
-    let mut downloadable_assets: Vec<PhotoAsset> = Vec::new();
+    // Collect change events from all albums, counting and filtering in a single pass.
+    // Each asset is paired with its source album name so that {album} token
+    // expansion works correctly in the incremental path.
+    let mut downloadable_assets: Vec<(PhotoAsset, Arc<str>)> = Vec::new();
     let mut sync_token: Option<String> = None;
     let mut created_count = 0u64;
     let mut soft_deleted_count = 0u64;
@@ -1417,7 +1658,7 @@ async fn download_photos_incremental(
                 ChangeReason::Created => {
                     created_count += 1;
                     if let Some(asset) = event.asset {
-                        downloadable_assets.push(asset);
+                        downloadable_assets.push((asset, Arc::clone(&album.name)));
                     }
                 }
                 ChangeReason::SoftDeleted => {
@@ -1483,16 +1724,30 @@ async fn download_photos_incremental(
         DownloadContext::default()
     };
 
-    // Convert assets to download tasks, using state DB fast-skip where possible
+    // Convert assets to download tasks, using state DB fast-skip where possible.
+    // When {album} is in folder_structure, create per-album configs so the album
+    // name is threaded into path expansion (mirrors full sync behaviour).
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
     let mut dir_cache = paths::DirCache::new();
     let mut skipped_by_state = 0usize;
+    let mut album_configs: FxHashMap<Arc<str>, Arc<DownloadConfig>> = FxHashMap::default();
 
-    for asset in &downloadable_assets {
+    // In {album} mode, assets in multiple albums are processed once per album,
+    // each downloading to the album-specific directory. Configs are cached per
+    // album name to avoid redundant allocations.
+    for (asset, album_name) in &downloadable_assets {
+        let effective_config: &Arc<DownloadConfig> = if uses_album_token {
+            album_configs
+                .entry(Arc::clone(album_name))
+                .or_insert_with(|| Arc::new(config.with_album_name(Arc::clone(album_name))))
+        } else {
+            config
+        };
+
         // Fast-skip: if state DB confirms all versions are already downloaded
         // with matching checksums, skip the filesystem check entirely.
-        let candidates = extract_skip_candidates(asset, config);
+        let candidates = extract_skip_candidates(asset, effective_config);
         if !candidates.is_empty()
             && candidates.iter().all(|&(vs, cs)| {
                 matches!(
@@ -1505,8 +1760,9 @@ async fn download_photos_incremental(
             continue;
         }
 
-        pre_ensure_asset_dir(&mut dir_cache, asset, config).await;
-        let asset_tasks = filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache);
+        pre_ensure_asset_dir(&mut dir_cache, asset, effective_config).await;
+        let asset_tasks =
+            filter_asset_to_tasks(asset, effective_config, &mut claimed_paths, &mut dir_cache);
 
         // Upsert state records so mark_downloaded/mark_failed can find them.
         // Without this, the UPDATE in mark_downloaded matches 0 rows and the
@@ -1619,17 +1875,19 @@ async fn download_photos_incremental(
         });
     }
 
-    let outcome =
-        if failed > 0 || pass_result.exif_failures > 0 || pass_result.state_write_failures > 0 {
-            for task in &pass_result.failed {
-                tracing::error!(path = %task.download_path.display(), "Download failed");
-            }
-            DownloadOutcome::PartialFailure {
-                failed_count: failed + pass_result.exif_failures + pass_result.state_write_failures,
-            }
-        } else {
-            DownloadOutcome::Success
-        };
+    let outcome = if failed > 0
+        || pass_result.exif_failures > 0
+        || pass_result.state_write_failures > 0
+    {
+        for task in &pass_result.failed {
+            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
+        }
+        DownloadOutcome::PartialFailure {
+            failed_count: failed + pass_result.exif_failures + pass_result.state_write_failures,
+        }
+    } else {
+        DownloadOutcome::Success
+    };
 
     Ok(SyncResult {
         outcome,
@@ -1777,7 +2035,9 @@ where
                     _ => {}
                 }
             }
-            let _ = db.set_metadata("config_hash", &config_hash).await;
+            if let Err(e) = db.set_metadata("config_hash", &config_hash).await {
+                tracing::warn!(error = %e, "Failed to persist config_hash");
+            }
         }
         trust = trust && !download_ctx.downloaded_ids.is_empty();
 
@@ -1907,9 +2167,30 @@ where
                         producer_pb.inc(1);
                     } else {
                         for task in tasks {
+                            // Skip assets that have exceeded the retry limit.
+                            if let Some(&attempts) =
+                                download_ctx.attempt_counts.get(task.asset_id.as_ref())
+                            {
+                                if config.max_download_attempts > 0
+                                    && attempts >= config.max_download_attempts
+                                {
+                                    tracing::warn!(
+                                        asset_id = %task.asset_id,
+                                        attempts,
+                                        max = config.max_download_attempts,
+                                        "Skipping asset: exceeded max download attempts"
+                                    );
+                                    continue;
+                                }
+                            }
+
                             if config.retry_only
                                 && !download_ctx.known_ids.contains(task.asset_id.as_ref())
                             {
+                                tracing::debug!(
+                                    asset_id = %task.asset_id,
+                                    "Skipping new asset in retry-only mode"
+                                );
                                 continue;
                             }
 
@@ -2107,12 +2388,12 @@ where
                         }
                     } else {
                         pb.suspend(|| {
-                            tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
+                            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
                         });
                     }
                 } else {
                     pb.suspend(|| {
-                        tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
+                        tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
                     });
                 }
                 if let Some(db) = &state_db {
@@ -2330,7 +2611,7 @@ async fn build_download_outcome(
     let total_failures = failed + state_write_failures + exif_failures;
     if total_failures > 0 {
         for task in &remaining_failed {
-            tracing::error!(path = %task.download_path.display(), "Download failed");
+            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
         }
         return Ok(DownloadOutcome::PartialFailure {
             failed_count: total_failures,
@@ -2443,7 +2724,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                     }
                 } else {
                     pb.suspend(|| {
-                        tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
+                        tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
                     });
                 }
                 if let Some(db) = &state_db {
@@ -2682,7 +2963,7 @@ mod tests {
             concurrent_downloads: 1,
             recent: None,
             retry: RetryConfig::default(),
-            skip_live_photos: false,
+            live_photo_mode: LivePhotoMode::Both,
             live_photo_size: AssetVersionSize::LiveOriginal,
             live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
             align_raw: RawTreatmentPolicy::Unchanged,
@@ -2691,10 +2972,14 @@ mod tests {
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
+            filename_exclude: Vec::new(),
             temp_suffix: ".kei-tmp".to_string(),
             state_db: None,
             retry_only: false,
+            max_download_attempts: 10,
             sync_mode: SyncMode::Full,
+            album_name: None,
+            exclude_asset_ids: Arc::new(FxHashSet::default()),
         }
     }
 
@@ -2882,10 +3167,10 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_skips_live_photo_when_configured() {
+    fn test_filter_skips_live_photo_mov_when_image_only() {
         let asset = test_live_photo_asset();
         let mut config = test_config();
-        config.skip_live_photos = true;
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
@@ -3576,14 +3861,50 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_skip_candidates_skip_live_photos() {
+    fn test_extract_skip_candidates_image_only_mode() {
         let asset = test_live_photo_asset();
         let mut config = test_config();
-        config.skip_live_photos = true;
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
         let candidates = extract_skip_candidates(&asset, &config);
         // Should still have the primary HEIC version, just not the MOV companion
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, VersionSizeKey::Original);
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_skip_mode() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert!(
+            candidates.is_empty(),
+            "Skip mode should exclude live photos entirely"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_skip_mode_non_live_passes() {
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "Skip mode should not affect non-live photos"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_video_only_mode() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // Should have only the MOV companion, no primary image
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, VersionSizeKey::LiveOriginal);
     }
 
     #[test]
@@ -4393,14 +4714,14 @@ mod tests {
     // ── compute_config_hash equivalence ────────────────────────────────
 
     /// `compute_config_hash` includes enumeration-filter fields (albums,
-    /// library, skip_live_photos) that `hash_download_config` doesn't.
+    /// library, live_photo_mode) that `hash_download_config` doesn't.
     /// Verify it produces a valid hex hash and is deterministic.
     #[test]
     fn test_compute_config_hash_matches_hash_download_config() {
         use crate::config::Config;
         use crate::types::{
-            Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LivePhotoSize, RawTreatmentPolicy,
-            VersionSize,
+            Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize,
+            RawTreatmentPolicy, VersionSize,
         };
         use secrecy::SecretString;
 
@@ -4414,6 +4735,8 @@ mod tests {
             cookie_directory: std::path::PathBuf::from("/tmp"),
             folder_structure: dl_config.folder_structure.clone(),
             albums: vec![],
+            exclude_albums: vec![],
+            filename_exclude: vec![],
             library: crate::config::LibrarySelection::Single("PrimarySync".into()),
             temp_suffix: dl_config.temp_suffix.clone(),
             skip_created_before: None,
@@ -4428,12 +4751,12 @@ mod tests {
             size: VersionSize::Original,
             live_photo_size: LivePhotoSize::Original,
             domain: Domain::Com,
+            live_photo_mode: LivePhotoMode::Both,
             live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
             align_raw: RawTreatmentPolicy::Unchanged,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             skip_videos: false,
             skip_photos: false,
-            skip_live_photos: false,
             force_size: false,
             set_exif_datetime: false,
             dry_run: false,
@@ -4445,7 +4768,7 @@ mod tests {
             save_password: false,
         };
 
-        // compute_config_hash is a superset (includes albums, library, skip_live_photos)
+        // compute_config_hash is a superset (includes albums, library, live_photo_mode)
         // so it won't match hash_download_config. Verify it's deterministic and valid hex.
         let hash1 = compute_config_hash(&app_config);
         let hash2 = compute_config_hash(&app_config);
@@ -4943,6 +5266,7 @@ mod tests {
             &config.folder_structure,
             &tasks[0].created_local,
             "photo.JPG",
+            config.album_name.as_deref(),
         );
         fs::create_dir_all(original_path.parent().unwrap()).unwrap();
         fs::write(&original_path, vec![0u8; 1000]).unwrap();
@@ -5065,6 +5389,9 @@ mod tests {
             &self,
         ) -> Result<HashMap<(String, String), String>, StateError> {
             unimplemented!()
+        }
+        async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+            Ok(HashMap::new())
         }
         async fn get_metadata(&self, _: &str) -> Result<Option<String>, StateError> {
             unimplemented!()
@@ -5367,6 +5694,26 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_config_hash_different_exclude_albums() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.exclude_albums = vec!["Hidden".to_string()];
+        });
+        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
+    fn test_compute_config_hash_different_live_photo_mode() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.live_photo_mode = Some(LivePhotoMode::Skip);
+        });
+        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+    }
+
+    #[test]
     fn test_compute_config_hash_different_recent_same_hash() {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
@@ -5464,6 +5811,257 @@ mod tests {
         assert!(
             filter_asset_fresh(&asset, &config).is_empty(),
             "force_size=true with missing Medium version should not fall back to Original"
+        );
+    }
+
+    // ── LivePhotoMode + filename_exclude filter tests ─────────────
+
+    #[test]
+    fn test_filter_skip_mode_skips_live_photo_entirely() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks.is_empty(),
+            "Skip mode should produce no tasks for live photos"
+        );
+    }
+
+    #[test]
+    fn test_filter_video_only_mode_skips_primary_keeps_mov() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        // The task should be the MOV companion
+        assert!(tasks[0].download_path.to_str().unwrap().contains(".MOV"));
+    }
+
+    #[test]
+    fn test_filter_filename_exclude_matches() {
+        let asset = TestPhotoAsset::new("EXCL_1")
+            .filename("IMG_0001.AAE")
+            .build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(tasks.is_empty(), "*.AAE pattern should exclude AAE files");
+    }
+
+    #[test]
+    fn test_filter_filename_exclude_case_insensitive() {
+        let asset = TestPhotoAsset::new("EXCL_2").filename("Photo.aae").build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks.is_empty(),
+            "Pattern matching should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn test_filter_filename_exclude_no_match_passes() {
+        let asset = TestPhotoAsset::new("EXCL_3")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(!tasks.is_empty(), "Non-matching files should pass through");
+    }
+
+    // ── exclude_asset_ids filter tests ─────────────────────────────
+
+    #[test]
+    fn test_filter_exclude_asset_ids_blocks_matching() {
+        let asset = TestPhotoAsset::new("EXCLUDED_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        let mut ids = FxHashSet::default();
+        ids.insert("EXCLUDED_1".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(tasks.is_empty(), "Asset in exclude set should be filtered");
+    }
+
+    #[test]
+    fn test_filter_exclude_asset_ids_passes_non_matching() {
+        let asset = TestPhotoAsset::new("KEEP_1")
+            .filename("IMG_0002.JPG")
+            .build();
+        let mut config = test_config();
+        let mut ids = FxHashSet::default();
+        ids.insert("OTHER_ID".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(!tasks.is_empty(), "Asset not in exclude set should pass");
+    }
+
+    #[test]
+    fn test_skip_candidates_exclude_asset_ids() {
+        let asset = TestPhotoAsset::new("SKIP_EXCL_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        let mut ids = FxHashSet::default();
+        ids.insert("SKIP_EXCL_1".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert!(
+            candidates.is_empty(),
+            "extract_skip_candidates should return empty for excluded assets"
+        );
+    }
+
+    #[test]
+    fn test_hash_changes_on_live_photo_mode() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.live_photo_mode = LivePhotoMode::Skip;
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_changes_on_filename_exclude() {
+        let config1 = test_config();
+        let mut config2 = test_config();
+        config2.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    // ── with_album_name tests ─────────────────────────────────────
+
+    #[test]
+    fn test_with_album_name_expands_album_token() {
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y/%m/%d".to_string();
+        let derived = config.with_album_name(Arc::from("Vacation"));
+        assert_eq!(derived.folder_structure, "Vacation/%Y/%m/%d");
+    }
+
+    #[test]
+    fn test_with_album_name_sets_album_name_field() {
+        let config = test_config();
+        assert!(config.album_name.is_none());
+        let derived = config.with_album_name(Arc::from("Favorites"));
+        assert_eq!(derived.album_name.as_deref(), Some("Favorites"));
+    }
+
+    #[test]
+    fn test_with_album_name_preserves_all_fields() {
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y".to_string();
+        config.skip_videos = true;
+        config.skip_photos = true;
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
+        config.force_size = true;
+        config.keep_unicode_in_filenames = true;
+        config.dry_run = true;
+        config.set_exif_datetime = true;
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        config.temp_suffix = ".custom-tmp".to_string();
+        let derived = config.with_album_name(Arc::from("Test"));
+        assert!(derived.skip_videos);
+        assert!(derived.skip_photos);
+        assert_eq!(derived.live_photo_mode, LivePhotoMode::ImageOnly);
+        assert!(derived.force_size);
+        assert!(derived.keep_unicode_in_filenames);
+        assert!(derived.dry_run);
+        assert!(derived.set_exif_datetime);
+        assert_eq!(derived.filename_exclude.len(), 1);
+        assert_eq!(derived.temp_suffix, ".custom-tmp");
+        assert_eq!(derived.directory, config.directory);
+    }
+
+    #[test]
+    fn test_with_album_name_empty_name_leaves_token_stripped() {
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y/%m/%d".to_string();
+        let derived = config.with_album_name(Arc::from(""));
+        // Empty album name should strip the {album}/ prefix
+        assert!(!derived.folder_structure.contains("{album}"));
+        assert!(derived.album_name.as_deref() == Some(""));
+    }
+
+    #[test]
+    fn test_with_album_name_no_token_in_structure() {
+        let config = test_config(); // folder_structure = "%Y/%m/%d"
+        let derived = config.with_album_name(Arc::from("MyAlbum"));
+        // No {album} token, so structure should be unchanged
+        assert_eq!(derived.folder_structure, "%Y/%m/%d");
+        assert_eq!(derived.album_name.as_deref(), Some("MyAlbum"));
+    }
+
+    #[test]
+    fn test_with_album_name_sanitizes_special_chars() {
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y".to_string();
+        let derived = config.with_album_name(Arc::from("My/Album"));
+        // The expand_album_token sanitizes path separators
+        assert!(
+            !derived.folder_structure.contains('/')
+                || !derived.folder_structure.starts_with("My/Album")
+        );
+    }
+
+    // ── extract_skip_candidates: filename_exclude ─────────────────
+
+    #[test]
+    fn test_extract_skip_candidates_filename_exclude_matches() {
+        let asset = TestPhotoAsset::new("TEST_1").filename("photo.AAE").build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        assert!(
+            extract_skip_candidates(&asset, &config).is_empty(),
+            "filename_exclude should filter in extract_skip_candidates"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_filename_exclude_no_match_passes() {
+        let asset = TestPhotoAsset::new("TEST_1").build(); // filename = "test_photo.jpg"
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        assert!(
+            !extract_skip_candidates(&asset, &config).is_empty(),
+            "non-matching filename should pass through"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_filename_exclude_case_insensitive() {
+        let asset = TestPhotoAsset::new("TEST_1").filename("photo.aae").build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        assert!(
+            extract_skip_candidates(&asset, &config).is_empty(),
+            "filename_exclude should be case-insensitive"
+        );
+    }
+
+    // ── compute_config_hash: filename_exclude ─────────────────────
+
+    #[test]
+    fn test_compute_config_hash_different_filename_exclude() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos", |_| {});
+        let b = build_config_with(tmp.path(), "/photos", |s| {
+            s.filename_exclude = vec!["*.AAE".to_string()];
+        });
+        assert_ne!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "changing filename_exclude should change the config hash"
         );
     }
 }
