@@ -935,7 +935,12 @@ fn filter_asset_to_tasks(
                         if dir_cache.exists(&dedup_path)
                             || claimed_paths.contains_key(dedup_key.as_ref())
                         {
-                            None // deduped version already downloaded or claimed
+                            tracing::info!(
+                                asset_id = asset.id(),
+                                path = %dedup_path.display(),
+                                "Skipping asset: dedup path already exists"
+                            );
+                            None
                         } else {
                             tracing::debug!(
                                 path = %download_path.display(),
@@ -951,6 +956,11 @@ fn filter_asset_to_tasks(
                 FileMatchPolicy::NameId7 => {
                     // name-id7 policy adds asset ID to ALL filenames, not just collisions.
                     // If the file exists, it's already downloaded, skip.
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %download_path.display(),
+                        "Skipping asset: file exists (name-id7)"
+                    );
                     None
                 }
             }
@@ -987,7 +997,12 @@ fn filter_asset_to_tasks(
                         if dir_cache.exists(&dedup_path)
                             || claimed_paths.contains_key(dedup_key.as_ref())
                         {
-                            None // deduped version already downloaded or claimed
+                            tracing::info!(
+                                asset_id = asset.id(),
+                                path = %dedup_path.display(),
+                                "Skipping asset: dedup path already claimed in-flight"
+                            );
+                            None
                         } else {
                             tracing::debug!(
                                 path = %download_path.display(),
@@ -1000,7 +1015,14 @@ fn filter_asset_to_tasks(
                         }
                     }
                 }
-                FileMatchPolicy::NameId7 => None,
+                FileMatchPolicy::NameId7 => {
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %download_path.display(),
+                        "Skipping asset: path claimed in-flight (name-id7)"
+                    );
+                    None
+                }
             }
         } else {
             Some(download_path.clone())
@@ -1080,6 +1102,11 @@ fn filter_asset_to_tasks(
             let final_mov_path = if let Some(on_disk_size) = dir_cache.file_size(&mov_path) {
                 if on_disk_size == live_version.size {
                     // Same size — likely already downloaded, skip.
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %mov_path.display(),
+                        "Skipping live photo MOV: already exists with same size"
+                    );
                     None
                 } else {
                     // Collision with a different file — deduplicate.
@@ -1095,7 +1122,12 @@ fn filter_asset_to_tasks(
                     if dir_cache.exists(&dedup_path)
                         || claimed_paths.contains_key(dedup_key.as_ref())
                     {
-                        None // deduped version already downloaded or claimed
+                        tracing::info!(
+                            asset_id = asset.id(),
+                            path = %dedup_path.display(),
+                            "Skipping live photo MOV: dedup path already exists"
+                        );
+                        None
                     } else {
                         tracing::debug!(
                             path = %mov_path.display(),
@@ -1108,7 +1140,12 @@ fn filter_asset_to_tasks(
             } else if let Some(&claimed_size) = claimed_paths.get(mov_key.as_ref()) {
                 // Path is claimed by an in-flight download
                 if claimed_size == live_version.size {
-                    None // Same size, likely duplicate
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %mov_path.display(),
+                        "Skipping live photo MOV: in-flight with same size"
+                    );
+                    None
                 } else {
                     // Collision with in-flight download — deduplicate.
                     let dedup_filename = paths::insert_suffix(&mov_filename, asset.id());
@@ -1123,6 +1160,11 @@ fn filter_asset_to_tasks(
                     if dir_cache.exists(&dedup_path)
                         || claimed_paths.contains_key(dedup_key.as_ref())
                     {
+                        tracing::info!(
+                            asset_id = asset.id(),
+                            path = %dedup_path.display(),
+                            "Skipping live photo MOV: dedup path already claimed in-flight"
+                        );
                         None
                     } else {
                         tracing::debug!(
@@ -1815,17 +1857,19 @@ async fn download_photos_incremental(
         });
     }
 
-    let outcome =
-        if failed > 0 || pass_result.exif_failures > 0 || pass_result.state_write_failures > 0 {
-            for task in &pass_result.failed {
-                tracing::error!(path = %task.download_path.display(), "Download failed");
-            }
-            DownloadOutcome::PartialFailure {
-                failed_count: failed + pass_result.exif_failures + pass_result.state_write_failures,
-            }
-        } else {
-            DownloadOutcome::Success
-        };
+    let outcome = if failed > 0
+        || pass_result.exif_failures > 0
+        || pass_result.state_write_failures > 0
+    {
+        for task in &pass_result.failed {
+            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
+        }
+        DownloadOutcome::PartialFailure {
+            failed_count: failed + pass_result.exif_failures + pass_result.state_write_failures,
+        }
+    } else {
+        DownloadOutcome::Success
+    };
 
     Ok(SyncResult {
         outcome,
@@ -2108,6 +2152,10 @@ where
                             if config.retry_only
                                 && !download_ctx.known_ids.contains(task.asset_id.as_ref())
                             {
+                                tracing::debug!(
+                                    asset_id = %task.asset_id,
+                                    "Skipping new asset in retry-only mode"
+                                );
                                 continue;
                             }
 
@@ -2305,12 +2353,12 @@ where
                         }
                     } else {
                         pb.suspend(|| {
-                            tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
+                            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
                         });
                     }
                 } else {
                     pb.suspend(|| {
-                        tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
+                        tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
                     });
                 }
                 if let Some(db) = &state_db {
@@ -2528,7 +2576,7 @@ async fn build_download_outcome(
     let total_failures = failed + state_write_failures + exif_failures;
     if total_failures > 0 {
         for task in &remaining_failed {
-            tracing::error!(path = %task.download_path.display(), "Download failed");
+            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
         }
         return Ok(DownloadOutcome::PartialFailure {
             failed_count: total_failures,
@@ -2641,7 +2689,7 @@ async fn run_download_pass(config: PassConfig<'_>, tasks: Vec<DownloadTask>) -> 
                     }
                 } else {
                     pb.suspend(|| {
-                        tracing::error!(path = %task.download_path.display(), error = %e, "Download failed");
+                        tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
                     });
                 }
                 if let Some(db) = &state_db {

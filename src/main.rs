@@ -1627,12 +1627,21 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // Handle --reset-sync-token (hidden compat flag): clear stored tokens before the sync loop
     if reset_sync_token {
         if let Some(ref db) = state_db {
-            db.set_metadata("db_sync_token", "").await.ok();
+            let mut cleared_ok = true;
+            if let Err(e) = db.set_metadata("db_sync_token", "").await {
+                tracing::warn!(error = %e, "Failed to clear db_sync_token");
+                cleared_ok = false;
+            }
             for library in &libraries {
                 let key = format!("sync_token:{}", library.zone_name());
-                db.set_metadata(&key, "").await.ok();
+                if let Err(e) = db.set_metadata(&key, "").await {
+                    tracing::warn!(error = %e, key = %key, "Failed to clear sync token");
+                    cleared_ok = false;
+                }
             }
-            tracing::info!("Cleared stored sync tokens");
+            if cleared_ok {
+                tracing::info!("Cleared stored sync tokens");
+            }
         }
     }
 
@@ -1703,6 +1712,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     sd_notifier.notify_ready();
 
     let mut health = health::HealthStatus::new();
+    let mut consecutive_album_refresh_failures: u32 = 0;
 
     loop {
         if shutdown_token.is_cancelled() {
@@ -2060,13 +2070,24 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                     Ok((refreshed, exclude_ids)) => {
                         lib_state.albums = refreshed;
                         lib_state.exclude_asset_ids = Arc::new(exclude_ids);
+                        consecutive_album_refresh_failures = 0;
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            zone = %lib_state.zone_name,
-                            error = %e,
-                            "Failed to refresh albums, reusing previous set"
-                        );
+                        consecutive_album_refresh_failures += 1;
+                        if consecutive_album_refresh_failures >= 3 {
+                            tracing::error!(
+                                zone = %lib_state.zone_name,
+                                error = %e,
+                                consecutive_failures = consecutive_album_refresh_failures,
+                                "Repeated album refresh failures, reusing previous set"
+                            );
+                        } else {
+                            tracing::warn!(
+                                zone = %lib_state.zone_name,
+                                error = %e,
+                                "Failed to refresh albums, reusing previous set"
+                            );
+                        }
                     }
                 }
             }
