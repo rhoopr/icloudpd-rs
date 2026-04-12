@@ -51,11 +51,6 @@ pub struct PasswordArgs {
     /// Example: --password-command "op read 'op://vault/icloud/password'"
     #[arg(long, env = "KEI_PASSWORD_COMMAND", conflicts_with_all = ["password", "password_file"])]
     pub password_command: Option<String>,
-
-    /// After successful auth, persist the password to the credential store
-    /// (OS keyring or encrypted file).
-    #[arg(long)]
-    pub save_password: bool,
 }
 
 /// Arguments for the sync command (also used as default when no subcommand).
@@ -195,6 +190,11 @@ pub struct SyncArgs {
     /// Called with `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars.
     #[arg(long, env = "KEI_NOTIFICATION_SCRIPT")]
     pub notification_script: Option<String>,
+
+    /// After successful auth, persist the password to the credential store
+    /// (OS keyring or encrypted file).
+    #[arg(long)]
+    pub save_password: bool,
 
     /// Re-sync only previously failed assets
     #[arg(long, conflicts_with_all = ["dry_run", "watch_with_interval"])]
@@ -620,7 +620,6 @@ impl PasswordArgs {
         if self.password_command.is_none() {
             self.password_command.clone_from(&fallback.password_command);
         }
-        self.save_password = self.save_password || fallback.save_password;
     }
 }
 
@@ -1309,7 +1308,7 @@ mod tests {
         let mut args = base_args();
         args.push("--save-password");
         let cli = parse(&args);
-        assert!(cli.password.save_password);
+        assert!(cli.sync.save_password);
     }
 
     // ── Sync args ─────────────────────────────────────────────────

@@ -424,7 +424,7 @@ impl Config {
             resolve_auth(globals, &pw, toml.as_ref());
         let password_file = resolve_password_file(&pw, toml_auth);
         let password_command = resolve_password_command(&pw, toml_auth);
-        let save_password = pw.save_password;
+        let save_password = sync.save_password;
 
         // Reject explicitly provided empty username/password (CLI value_parser
         // catches the CLI case; this catches empty strings from TOML).
