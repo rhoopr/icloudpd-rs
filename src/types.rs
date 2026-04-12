@@ -1,5 +1,61 @@
 use serde::{Deserialize, Serialize};
 
+/// Whether an asset is an image or a video.
+///
+/// Provider-agnostic — each provider adapter maps its native classification
+/// (e.g., iCloud UTI strings) into this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssetItemType {
+    Image,
+    Movie,
+}
+
+/// Version size key for asset versions.
+///
+/// Uses `#[repr(u8)]` to guarantee 1-byte size for better struct packing.
+/// Provider-agnostic — maps to every provider's concept of resolution tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AssetVersionSize {
+    Original = 0,
+    Alternative = 1,
+    Medium = 2,
+    Thumb = 3,
+    Adjusted = 4,
+    LiveOriginal = 5,
+    LiveMedium = 6,
+    LiveThumb = 7,
+    LiveAdjusted = 8,
+}
+
+impl From<VersionSize> for AssetVersionSize {
+    fn from(v: VersionSize) -> Self {
+        match v {
+            VersionSize::Original => Self::Original,
+            VersionSize::Medium => Self::Medium,
+            VersionSize::Thumb => Self::Thumb,
+            VersionSize::Adjusted => Self::Adjusted,
+            VersionSize::Alternative => Self::Alternative,
+        }
+    }
+}
+
+/// Reason for a record change in a delta/incremental sync response.
+///
+/// Provider-agnostic — each provider maps its native change types into
+/// these categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeReason {
+    /// New or modified record (state DB determines which).
+    Created,
+    /// Soft-deleted (moved to trash / recently deleted).
+    SoftDeleted,
+    /// Permanently purged from the provider.
+    HardDeleted,
+    /// Hidden from the main library view.
+    Hidden,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VersionSize {
@@ -93,8 +149,7 @@ pub enum LivePhotoMode {
 }
 
 impl LivePhotoSize {
-    pub fn to_asset_version_size(self) -> crate::icloud::photos::AssetVersionSize {
-        use crate::icloud::photos::AssetVersionSize;
+    pub fn to_asset_version_size(self) -> AssetVersionSize {
         match self {
             Self::Original => AssetVersionSize::LiveOriginal,
             Self::Medium => AssetVersionSize::LiveMedium,
@@ -107,7 +162,6 @@ impl LivePhotoSize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::icloud::photos::AssetVersionSize;
 
     #[test]
     fn test_live_photo_size_to_asset_version_size() {
@@ -247,5 +301,44 @@ mod tests {
             let parsed: LivePhotoMovFilenamePolicy = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, variant);
         }
+    }
+
+    #[test]
+    fn from_version_size_all_variants() {
+        for (input, expected) in [
+            (VersionSize::Original, AssetVersionSize::Original),
+            (VersionSize::Medium, AssetVersionSize::Medium),
+            (VersionSize::Thumb, AssetVersionSize::Thumb),
+            (VersionSize::Adjusted, AssetVersionSize::Adjusted),
+            (VersionSize::Alternative, AssetVersionSize::Alternative),
+        ] {
+            assert_eq!(AssetVersionSize::from(input), expected, "from {input:?}");
+        }
+    }
+
+    #[test]
+    fn asset_version_size_is_one_byte() {
+        assert_eq!(std::mem::size_of::<AssetVersionSize>(), 1);
+    }
+
+    #[test]
+    fn asset_version_size_variants_have_distinct_repr_values() {
+        let variants = [
+            AssetVersionSize::Original as u8,
+            AssetVersionSize::Alternative as u8,
+            AssetVersionSize::Medium as u8,
+            AssetVersionSize::Thumb as u8,
+            AssetVersionSize::Adjusted as u8,
+            AssetVersionSize::LiveOriginal as u8,
+            AssetVersionSize::LiveMedium as u8,
+            AssetVersionSize::LiveThumb as u8,
+            AssetVersionSize::LiveAdjusted as u8,
+        ];
+        let unique: std::collections::HashSet<u8> = variants.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            variants.len(),
+            "all repr(u8) values must be distinct"
+        );
     }
 }

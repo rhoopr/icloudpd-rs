@@ -29,14 +29,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::types::AssetVersion;
-use crate::icloud::photos::{
-    AssetItemType, AssetVersionSize, ChangeReason, PhotoAlbum, PhotoAsset, SyncTokenError,
-    VersionsMap,
-};
+use crate::icloud::photos::{PhotoAlbum, PhotoAsset, SyncTokenError, VersionsMap};
 use crate::retry::RetryConfig;
 use crate::state::{AssetRecord, MediaType, StateDb, SyncRunStats, VersionSizeKey};
 use crate::types::{
-    FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawTreatmentPolicy,
+    AssetItemType, AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode,
+    LivePhotoMovFilenamePolicy, RawTreatmentPolicy,
 };
 
 use error::DownloadError;
@@ -1263,9 +1261,15 @@ struct PendingStateWrite {
     download_checksum: Option<String>,
 }
 
+/// Maximum retry attempts for deferred state writes.
+const STATE_WRITE_MAX_RETRIES: u32 = 6;
+
 /// Retry all pending state writes that failed during the download loop.
 ///
-/// Each write is attempted up to 3 times with exponential backoff (100ms, 200ms).
+/// Each write is attempted up to [`STATE_WRITE_MAX_RETRIES`] times with
+/// exponential backoff (200ms, 400ms, 800ms, 1.6s, 3.2s). SQLite lock
+/// contention is transient, so generous retries prevent files from ending
+/// up on disk but untracked in the state DB.
 /// Returns the number of writes that still failed after all retries.
 async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWrite]) -> usize {
     if pending.is_empty() {
@@ -1275,7 +1279,7 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
     let mut failures = 0;
     for write in pending {
         let mut succeeded = false;
-        for attempt in 1..=3u32 {
+        for attempt in 1..=STATE_WRITE_MAX_RETRIES {
             match db
                 .mark_downloaded(
                     &write.asset_id,
@@ -1291,20 +1295,25 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
                     break;
                 }
                 Err(e) => {
-                    if attempt < 3 {
+                    if attempt < STATE_WRITE_MAX_RETRIES {
                         tracing::debug!(
                             asset_id = %write.asset_id,
                             attempt,
                             error = %e,
                             "State write retry failed, will retry"
                         );
-                        tokio::time::sleep(Duration::from_millis(u64::from(attempt) * 100)).await;
+                        tokio::time::sleep(Duration::from_millis(
+                            200 * u64::from(1u32 << (attempt - 1)),
+                        ))
+                        .await;
                     } else {
                         tracing::error!(
                             asset_id = %write.asset_id,
                             path = %write.download_path.display(),
                             error = %e,
-                            "State write failed after 3 attempts — file on disk but untracked, will be re-downloaded next sync"
+                            "State write failed after {STATE_WRITE_MAX_RETRIES} attempts — \
+                             file on disk but untracked; next sync will detect it via \
+                             filesystem check and skip re-download"
                         );
                     }
                 }
@@ -2896,15 +2905,7 @@ async fn download_single_task(
 
     // Atomic rename: .part → final (only when EXIF path was used)
     if let Some(part) = &part_path {
-        tokio::fs::rename(part, &task.download_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to rename {} to {}",
-                    part.display(),
-                    task.download_path.display()
-                )
-            })?;
+        file::rename_part_to_final(part, &task.download_path).await?;
     }
 
     tracing::debug!(path = %task.download_path.display(), "Downloaded");
@@ -5475,8 +5476,8 @@ mod tests {
 
     #[tokio::test]
     async fn flush_pending_state_writes_reports_persistent_failure() {
-        // Fail all 3 attempts (initial call already failed once, so 3 retries = 3 failures)
-        let db = FailingStateDb::new(3);
+        // Fail all attempts — must exceed STATE_WRITE_MAX_RETRIES
+        let db = FailingStateDb::new(STATE_WRITE_MAX_RETRIES as usize);
         let pending = vec![PendingStateWrite {
             asset_id: "A1".into(),
             version_size: VersionSizeKey::Original,
@@ -5491,12 +5492,9 @@ mod tests {
 
     #[tokio::test]
     async fn flush_pending_state_writes_partial_recovery() {
-        // 2 failures: first write fails all 3 attempts, second write fails once then succeeds
-        // Total calls: write1 (3 fails) + write2 (1 fail + 1 success) = 4 fails needed
-        // But FailingStateDb counts globally, so we need 4 failures total.
-        // write1: attempts 1,2,3 all fail (3 failures consumed), write1 reported as failure
-        // write2: attempt 1 fails (4th failure consumed), attempt 2 succeeds
-        let db = FailingStateDb::new(4);
+        // First write exhausts all STATE_WRITE_MAX_RETRIES attempts (reported as failure).
+        // Second write fails once more then succeeds on retry.
+        let db = FailingStateDb::new(STATE_WRITE_MAX_RETRIES as usize + 1);
         let pending = vec![
             PendingStateWrite {
                 asset_id: "A1".into(),

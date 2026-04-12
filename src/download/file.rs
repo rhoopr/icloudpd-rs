@@ -158,10 +158,20 @@ async fn attempt_download<C: DownloadClient>(
         Ok(meta) if meta.len() > 0 => {
             // Discard stale .part files from crashed runs to avoid resuming
             // from potentially corrupt bytes.
-            let stale = meta.modified().ok().is_some_and(|mtime| {
-                mtime.elapsed().unwrap_or(std::time::Duration::ZERO)
-                    > std::time::Duration::from_secs(STALE_PART_FILE_SECS)
-            });
+            let stale = match meta.modified() {
+                Ok(mtime) => {
+                    mtime.elapsed().unwrap_or(std::time::Duration::ZERO)
+                        > std::time::Duration::from_secs(STALE_PART_FILE_SECS)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %part_path.display(),
+                        error = %e,
+                        "Cannot read .part file mtime, treating as stale"
+                    );
+                    true
+                }
+            };
             if stale {
                 tracing::warn!(
                     path = %part_path.display(),
@@ -326,10 +336,44 @@ async fn attempt_download<C: DownloadClient>(
     }
 
     if !skip_rename {
-        fs::rename(&part_path, download_path).await?;
+        rename_part_to_final(part_path, download_path).await?;
     }
 
     Ok(())
+}
+
+/// Rename a `.part` file to its final destination, handling the case where
+/// a concurrent download already placed the final file. If the destination
+/// exists, the redundant `.part` file is removed instead of overwriting.
+pub(super) async fn rename_part_to_final(
+    part_path: &Path,
+    final_path: &Path,
+) -> anyhow::Result<()> {
+    match fs::rename(part_path, final_path).await {
+        Ok(()) => Ok(()),
+        Err(_) if final_path.is_file() => {
+            // Another task won the race — clean up our .part file.
+            tracing::debug!(
+                path = %final_path.display(),
+                "Destination already exists, removing redundant .part file"
+            );
+            if let Err(rm_err) = fs::remove_file(part_path).await {
+                tracing::warn!(
+                    path = %part_path.display(),
+                    error = %rm_err,
+                    "Failed to remove redundant .part file"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to rename {} to {}",
+                part_path.display(),
+                final_path.display()
+            )
+        }),
+    }
 }
 
 /// Compute the SHA-256 hash of a file, returning a hex-encoded string.

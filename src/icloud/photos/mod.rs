@@ -15,7 +15,6 @@ pub use album::PhotoAlbum;
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
 pub use session::{PhotosSession, SyncTokenError};
-pub use types::{AssetItemType, AssetVersionSize, ChangeReason};
 
 use std::collections::HashMap;
 use std::sync::Arc;

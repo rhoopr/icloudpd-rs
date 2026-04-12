@@ -969,7 +969,7 @@ async fn run_import_existing(
 ) -> anyhow::Result<()> {
     use chrono::Local;
     use futures_util::StreamExt;
-    use icloud::photos::AssetVersionSize;
+    use types::AssetVersionSize;
 
     let db_path = get_db_path(globals, toml)?;
     let toml_dl = toml.and_then(|t| t.download.as_ref());

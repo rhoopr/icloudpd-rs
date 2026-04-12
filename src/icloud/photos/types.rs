@@ -1,4 +1,7 @@
-use crate::types::VersionSize;
+// Re-export provider-agnostic types from the core module so that existing
+// iCloud-internal imports (`super::types::AssetVersionSize`, etc.) continue
+// to resolve without changing every file in `icloud/photos/`.
+pub use crate::types::{AssetItemType, AssetVersionSize, ChangeReason};
 
 /// Information about a downloadable asset version.
 ///
@@ -11,99 +14,4 @@ pub struct AssetVersion {
     pub url: Box<str>,
     pub asset_type: Box<str>,
     pub checksum: Box<str>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AssetItemType {
-    Image,
-    Movie,
-}
-
-/// Version size key for asset versions.
-///
-/// Uses `#[repr(u8)]` to guarantee 1-byte size for better struct packing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum AssetVersionSize {
-    Original = 0,
-    Alternative = 1,
-    Medium = 2,
-    Thumb = 3,
-    Adjusted = 4,
-    LiveOriginal = 5,
-    LiveMedium = 6,
-    LiveThumb = 7,
-    LiveAdjusted = 8,
-}
-
-impl From<VersionSize> for AssetVersionSize {
-    fn from(v: VersionSize) -> Self {
-        match v {
-            VersionSize::Original => Self::Original,
-            VersionSize::Medium => Self::Medium,
-            VersionSize::Thumb => Self::Thumb,
-            VersionSize::Adjusted => Self::Adjusted,
-            VersionSize::Alternative => Self::Alternative,
-        }
-    }
-}
-
-/// Reason for a record change in a `changes/zone` delta response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeReason {
-    /// New record (new or modified; state DB needed to distinguish)
-    Created,
-    /// Moved to Recently Deleted (fields.isDeleted == 1)
-    SoftDeleted,
-    /// Permanently purged (record.deleted == true, recordType unknown)
-    HardDeleted,
-    /// Moved to Hidden album (fields.isHidden == 1)
-    Hidden,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::VersionSize;
-
-    #[test]
-    fn from_version_size_all_variants() {
-        for (input, expected) in [
-            (VersionSize::Original, AssetVersionSize::Original),
-            (VersionSize::Medium, AssetVersionSize::Medium),
-            (VersionSize::Thumb, AssetVersionSize::Thumb),
-            (VersionSize::Adjusted, AssetVersionSize::Adjusted),
-            (VersionSize::Alternative, AssetVersionSize::Alternative),
-        ] {
-            assert_eq!(AssetVersionSize::from(input), expected, "from {input:?}");
-        }
-    }
-
-    #[test]
-    fn asset_version_size_is_one_byte() {
-        assert_eq!(std::mem::size_of::<AssetVersionSize>(), 1);
-    }
-
-    #[test]
-    fn asset_version_size_variants_have_distinct_repr_values() {
-        let variants = [
-            AssetVersionSize::Original as u8,
-            AssetVersionSize::Alternative as u8,
-            AssetVersionSize::Medium as u8,
-            AssetVersionSize::Thumb as u8,
-            AssetVersionSize::Adjusted as u8,
-            AssetVersionSize::LiveOriginal as u8,
-            AssetVersionSize::LiveMedium as u8,
-            AssetVersionSize::LiveThumb as u8,
-            AssetVersionSize::LiveAdjusted as u8,
-        ];
-
-        // Check all variants have unique values
-        let unique: std::collections::HashSet<u8> = variants.iter().copied().collect();
-        assert_eq!(
-            unique.len(),
-            variants.len(),
-            "all repr(u8) values must be distinct"
-        );
-    }
 }
