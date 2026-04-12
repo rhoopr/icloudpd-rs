@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.1] - 2026-04-12
+
+### Fixed
+
+- Replace blocking `std::fs::metadata` with `tokio::fs::metadata` in 2FA polling loop.
+- Log `touch_last_seen` database errors instead of silently discarding them.
+
+### Changed
+
+- Return `Option<&str>` from `Session::client_id` instead of `Option<&String>`.
+- Remove unnecessary `async` from `run_password` and `run_config_show`.
+- Narrow 12 `pub` items to `pub(crate)` for tighter internal visibility.
+- Add `const fn` on 10 predicate/constructor functions.
+- Extract `TWO_FA_POLL_SECS` and `STALE_PART_FILE_SECS` named constants.
+- Apply clippy pedantic/nursery fixes across 30 files (redundant closures, `Self` usage, idiomatic bindings, structured tracing, thiserror on `PartialSyncError`, `let-else`, lazy `or_else`).
+
 ## [0.7.0] - 2026-04-11
 
 ### Added
