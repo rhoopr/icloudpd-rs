@@ -51,11 +51,6 @@ pub struct PasswordArgs {
     /// Example: --password-command "op read 'op://vault/icloud/password'"
     #[arg(long, env = "KEI_PASSWORD_COMMAND", conflicts_with_all = ["password", "password_file"])]
     pub password_command: Option<String>,
-
-    /// After successful auth, persist the password to the credential store
-    /// (OS keyring or encrypted file).
-    #[arg(long)]
-    pub save_password: bool,
 }
 
 /// Arguments for the sync command (also used as default when no subcommand).
@@ -196,6 +191,11 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_NOTIFICATION_SCRIPT")]
     pub notification_script: Option<String>,
 
+    /// After successful auth, persist the password to the credential store
+    /// (OS keyring or encrypted file).
+    #[arg(long)]
+    pub save_password: bool,
+
     /// Re-sync only previously failed assets
     #[arg(long, conflicts_with_all = ["dry_run", "watch_with_interval"])]
     pub retry_failed: bool,
@@ -235,6 +235,10 @@ pub struct StatusArgs {
 pub struct ImportArgs {
     #[command(flatten)]
     pub password: PasswordArgs,
+
+    /// Library to import (default: PrimarySync, use "all" for all libraries)
+    #[arg(long, env = "KEI_LIBRARY")]
+    pub library: Option<String>,
 
     /// Local directory containing existing downloads
     #[arg(short = 'd', long, env = "KEI_DIRECTORY", value_parser = non_empty_string)]
@@ -362,6 +366,10 @@ pub enum Command {
     List {
         #[command(flatten)]
         password: PasswordArgs,
+
+        /// Library to list albums from (default: PrimarySync, use "all" for all)
+        #[arg(long, env = "KEI_LIBRARY")]
+        library: Option<String>,
 
         #[command(subcommand)]
         what: ListCommand,
@@ -596,6 +604,7 @@ impl SyncArgs {
             self.notification_script
                 .clone_from(&fallback.notification_script);
         }
+        self.save_password = self.save_password || fallback.save_password;
         self.retry_failed = self.retry_failed || fallback.retry_failed;
     }
 }
@@ -612,7 +621,6 @@ impl PasswordArgs {
         if self.password_command.is_none() {
             self.password_command.clone_from(&fallback.password_command);
         }
-        self.save_password = self.save_password || fallback.save_password;
     }
 }
 
@@ -645,6 +653,7 @@ impl Cli {
                     deprecation_warning("--list-albums", "kei list albums");
                     return Command::List {
                         password: self.password.clone(),
+                        library: self.sync.library.clone(),
                         what: ListCommand::Albums,
                     };
                 }
@@ -652,6 +661,7 @@ impl Cli {
                     deprecation_warning("--list-libraries", "kei list libraries");
                     return Command::List {
                         password: self.password.clone(),
+                        library: self.sync.library.clone(),
                         what: ListCommand::Libraries,
                     };
                 }
@@ -731,6 +741,7 @@ impl Cli {
                 deprecation_warning("--list-albums", "kei list albums");
                 Command::List {
                     password: password.clone(),
+                    library: sync.library.clone(),
                     what: ListCommand::Albums,
                 }
             }
@@ -741,6 +752,7 @@ impl Cli {
                 deprecation_warning("--list-libraries", "kei list libraries");
                 Command::List {
                     password: password.clone(),
+                    library: sync.library.clone(),
                     what: ListCommand::Libraries,
                 }
             }
@@ -1297,7 +1309,17 @@ mod tests {
         let mut args = base_args();
         args.push("--save-password");
         let cli = parse(&args);
-        assert!(cli.password.save_password);
+        assert!(cli.sync.save_password);
+    }
+
+    #[test]
+    fn test_save_password_merges_into_subcommand() {
+        let cli = parse(&["kei", "--username", "u@e.com", "--save-password", "sync"]);
+        if let Command::Sync { sync, .. } = cli.effective_command() {
+            assert!(sync.save_password);
+        } else {
+            panic!("expected Sync command");
+        }
     }
 
     // ── Sync args ─────────────────────────────────────────────────
@@ -1817,6 +1839,37 @@ mod tests {
         } else {
             panic!("Expected ImportExisting command");
         }
+    }
+
+    #[test]
+    fn test_import_existing_library_flag() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "import-existing",
+            "--library",
+            "SharedSync-ABCD1234",
+            "--directory",
+            "/photos",
+        ])
+        .unwrap();
+        if let Some(Command::ImportExisting(args)) = cli.command {
+            assert_eq!(args.library.as_deref(), Some("SharedSync-ABCD1234"));
+        } else {
+            panic!("Expected ImportExisting command");
+        }
+    }
+
+    #[test]
+    fn test_list_albums_library_flag() {
+        let cli = Cli::try_parse_from(["kei", "list", "--library", "all", "albums"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::List {
+                library: Some(ref l),
+                what: ListCommand::Albums,
+                ..
+            } if l == "all"
+        ));
     }
 
     #[test]

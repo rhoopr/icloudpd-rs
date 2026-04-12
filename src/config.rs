@@ -58,7 +58,7 @@ pub(crate) struct TomlRetry {
     pub delay: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlFilters {
     pub library: Option<String>,
@@ -136,6 +136,21 @@ pub enum LibrarySelection {
     Single(String),
     /// All available libraries (primary + private + shared).
     All,
+}
+
+/// Resolve library selection from CLI flag > TOML config > default (`PrimarySync`).
+pub(crate) fn resolve_library_selection(
+    cli_library: Option<String>,
+    toml_filters: Option<&TomlFilters>,
+) -> LibrarySelection {
+    let library_str = cli_library
+        .or_else(|| toml_filters.and_then(|f| f.library.clone()))
+        .unwrap_or_else(|| "PrimarySync".to_string());
+    if library_str.eq_ignore_ascii_case("all") {
+        LibrarySelection::All
+    } else {
+        LibrarySelection::Single(library_str)
+    }
 }
 
 impl std::fmt::Display for LibrarySelection {
@@ -409,7 +424,7 @@ impl Config {
             resolve_auth(globals, &pw, toml.as_ref());
         let password_file = resolve_password_file(&pw, toml_auth);
         let password_command = resolve_password_command(&pw, toml_auth);
-        let save_password = pw.save_password;
+        let save_password = sync.save_password;
 
         // Reject explicitly provided empty username/password (CLI value_parser
         // catches the CLI case; this catches empty strings from TOML).
@@ -507,16 +522,7 @@ impl Config {
         }
 
         // Filters
-        let library_str = resolve(
-            sync.library,
-            toml_filters.and_then(|f| f.library.clone()),
-            "PrimarySync".to_string(),
-        );
-        let library = if library_str.eq_ignore_ascii_case("all") {
-            LibrarySelection::All
-        } else {
-            LibrarySelection::Single(library_str)
-        };
+        let library = resolve_library_selection(sync.library, toml_filters);
         let albums = if sync.albums.is_empty() {
             toml_filters
                 .and_then(|f| f.albums.clone())
@@ -3479,5 +3485,56 @@ mod tests {
         assert!(validate_directory(Path::new("/home/user/photos")).is_ok());
         assert!(validate_directory(Path::new("/mnt/photos")).is_ok());
         assert!(validate_directory(Path::new("/data/sync")).is_ok());
+    }
+
+    // ── resolve_library_selection ──────────────────────────────────
+
+    #[test]
+    fn resolve_library_defaults_to_primary_sync() {
+        let result = resolve_library_selection(None, None);
+        assert_eq!(result, LibrarySelection::Single("PrimarySync".to_string()));
+    }
+
+    #[test]
+    fn resolve_library_cli_overrides_toml() {
+        let toml_filters = TomlFilters {
+            library: Some("SharedSync-FROM-TOML".to_string()),
+            ..Default::default()
+        };
+        let result =
+            resolve_library_selection(Some("SharedSync-FROM-CLI".to_string()), Some(&toml_filters));
+        assert_eq!(
+            result,
+            LibrarySelection::Single("SharedSync-FROM-CLI".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_library_falls_back_to_toml() {
+        let toml_filters = TomlFilters {
+            library: Some("SharedSync-ABCD".to_string()),
+            ..Default::default()
+        };
+        let result = resolve_library_selection(None, Some(&toml_filters));
+        assert_eq!(
+            result,
+            LibrarySelection::Single("SharedSync-ABCD".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_library_all_case_insensitive() {
+        assert_eq!(
+            resolve_library_selection(Some("ALL".to_string()), None),
+            LibrarySelection::All
+        );
+        assert_eq!(
+            resolve_library_selection(Some("All".to_string()), None),
+            LibrarySelection::All
+        );
+        assert_eq!(
+            resolve_library_selection(Some("all".to_string()), None),
+            LibrarySelection::All
+        );
     }
 }

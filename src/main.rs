@@ -759,6 +759,7 @@ async fn run_login(
 async fn run_list(
     what: cli::ListCommand,
     pw: &cli::PasswordArgs,
+    library: Option<String>,
     globals: &config::GlobalArgs,
     toml: Option<&TomlConfig>,
 ) -> anyhow::Result<()> {
@@ -806,16 +807,9 @@ async fn run_list(
             }
         }
         cli::ListCommand::Albums => {
-            // Resolve library selection from TOML
-            let toml_filters = toml.and_then(|t| t.filters.as_ref());
-            let library_str = toml_filters
-                .and_then(|f| f.library.clone())
-                .unwrap_or_else(|| "PrimarySync".to_string());
-            let libraries = if library_str.eq_ignore_ascii_case("all") {
-                photos_service.all_libraries().await?
-            } else {
-                vec![photos_service.get_library(&library_str).await?.clone()]
-            };
+            let selection =
+                config::resolve_library_selection(library, toml.and_then(|t| t.filters.as_ref()));
+            let libraries = resolve_libraries(&selection, &mut photos_service).await?;
             for library in &libraries {
                 println!("Library: {}", library.zone_name());
                 let albums = library.albums().await?;
@@ -939,7 +933,7 @@ async fn run_import_existing(
     )
     .await?;
 
-    let (_shared_session, photos_service) = init_photos_service(
+    let (_shared_session, mut photos_service) = init_photos_service(
         auth_result,
         &username,
         domain.as_str(),
@@ -948,9 +942,10 @@ async fn run_import_existing(
     )
     .await?;
 
-    let all_album = photos_service.all();
-    let stream = all_album.photo_stream(args.recent, None, 1);
-    tokio::pin!(stream);
+    // Resolve library selection (CLI > TOML > default PrimarySync)
+    let toml_filters = toml.and_then(|t| t.filters.as_ref());
+    let selection = config::resolve_library_selection(args.library, toml_filters);
+    let libraries = resolve_libraries(&selection, &mut photos_service).await?;
 
     if !args.no_progress_bar {
         println!("Scanning iCloud assets and matching with local files...");
@@ -960,107 +955,118 @@ async fn run_import_existing(
     let mut unmatched = 0u64;
     let mut total = 0u64;
 
-    while let Some(result) = stream.next().await {
-        let asset: icloud::photos::PhotoAsset = match result {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(error = %e, "Error fetching asset");
+    for library in &libraries {
+        tracing::info!(zone = %library.zone_name(), "Scanning library");
+        let all_album = library.all();
+        let stream = all_album.photo_stream(args.recent, None, 1);
+        tokio::pin!(stream);
+
+        while let Some(result) = stream.next().await {
+            let asset: icloud::photos::PhotoAsset = match result {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Error fetching asset");
+                    continue;
+                }
+            };
+
+            total += 1;
+
+            // Get versions
+            if asset.versions().is_empty() {
+                tracing::debug!(id = %asset.id(), "Skipping asset with no versions");
                 continue;
             }
-        };
 
-        total += 1;
+            // Resolve filename using the same logic as the sync download pipeline:
+            // fingerprint fallback → unicode removal → extension mapping.
+            let raw_filename = if let Some(f) = asset.filename() {
+                f.to_string()
+            } else {
+                let asset_type = asset
+                    .versions()
+                    .first()
+                    .map_or("", |(_, v)| v.asset_type.as_ref());
+                download::paths::generate_fingerprint_filename(asset.id(), asset_type)
+            };
+            let base_filename = if keep_unicode {
+                raw_filename
+            } else {
+                download::paths::remove_unicode_chars(&raw_filename)
+            };
 
-        // Get versions
-        if asset.versions().is_empty() {
-            tracing::debug!(id = %asset.id(), "Skipping asset with no versions");
-            continue;
-        }
+            // Get the created date in local time for path computation
+            let created_local = asset.created().with_timezone(&Local);
 
-        // Resolve filename using the same logic as the sync download pipeline:
-        // fingerprint fallback → unicode removal → extension mapping.
-        let raw_filename = if let Some(f) = asset.filename() {
-            f.to_string()
-        } else {
-            let asset_type = asset
-                .versions()
-                .first()
-                .map_or("", |(_, v)| v.asset_type.as_ref());
-            download::paths::generate_fingerprint_filename(asset.id(), asset_type)
-        };
-        let base_filename = if keep_unicode {
-            raw_filename
-        } else {
-            download::paths::remove_unicode_chars(&raw_filename)
-        };
+            // Check each version (we only check "original" for import since that's
+            // what the normal sync would download)
+            if let Some(version) = asset.get_version(AssetVersionSize::Original) {
+                // Map extension from UTI type, matching sync pipeline
+                let filename =
+                    download::paths::map_filename_extension(&base_filename, &version.asset_type);
+                let expected_path = download::paths::local_download_path(
+                    &directory,
+                    &folder_structure,
+                    &created_local,
+                    &filename,
+                    None, // import-existing doesn't have album context
+                );
 
-        // Get the created date in local time for path computation
-        let created_local = asset.created().with_timezone(&Local);
+                if expected_path.exists() {
+                    // Check size matches
+                    if let Ok(metadata) = std::fs::metadata(&expected_path) {
+                        if metadata.len() == version.size {
+                            // File exists with matching size - mark as downloaded
+                            let version_size = state::VersionSizeKey::Original;
+                            let media_type = download::determine_media_type(version_size, &asset);
+                            let record = state::AssetRecord::new_pending(
+                                asset.id().to_string(),
+                                version_size,
+                                version.checksum.to_string(),
+                                filename.clone(),
+                                asset.created(),
+                                Some(asset.added_date()),
+                                version.size,
+                                media_type,
+                            );
 
-        // Check each version (we only check "original" for import since that's
-        // what the normal sync would download)
-        if let Some(version) = asset.get_version(AssetVersionSize::Original) {
-            // Map extension from UTI type, matching sync pipeline
-            let filename =
-                download::paths::map_filename_extension(&base_filename, &version.asset_type);
-            let expected_path = download::paths::local_download_path(
-                &directory,
-                &folder_structure,
-                &created_local,
-                &filename,
-                None, // import-existing doesn't have album context
-            );
-
-            if expected_path.exists() {
-                // Check size matches
-                if let Ok(metadata) = std::fs::metadata(&expected_path) {
-                    if metadata.len() == version.size {
-                        // File exists with matching size - mark as downloaded
-                        let version_size = state::VersionSizeKey::Original;
-                        let media_type = download::determine_media_type(version_size, &asset);
-                        let record = state::AssetRecord::new_pending(
-                            asset.id().to_string(),
-                            version_size,
-                            version.checksum.to_string(),
-                            filename.clone(),
-                            asset.created(),
-                            Some(asset.added_date()),
-                            version.size,
-                            media_type,
-                        );
-
-                        if let Err(e) = db.upsert_seen(&record).await {
-                            tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to record asset");
-                            continue;
-                        }
-
-                        let local_checksum = match download::file::compute_sha256(&expected_path)
-                            .await
-                        {
-                            Ok(hash) => hash,
-                            Err(e) => {
-                                tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
+                            if let Err(e) = db.upsert_seen(&record).await {
+                                tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to record asset");
                                 continue;
                             }
-                        };
 
-                        if let Err(e) = db
-                            .mark_downloaded(
-                                asset.id(),
-                                version_size.as_str(),
+                            let local_checksum = match download::file::compute_sha256(
                                 &expected_path,
-                                &local_checksum,
-                                None,
                             )
                             .await
-                        {
-                            tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to mark as downloaded");
-                            continue;
-                        }
+                            {
+                                Ok(hash) => hash,
+                                Err(e) => {
+                                    tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
+                                    continue;
+                                }
+                            };
 
-                        matched += 1;
-                        if !args.no_progress_bar && matched.is_multiple_of(100) {
-                            println!("  Matched {matched} files so far...");
+                            if let Err(e) = db
+                                .mark_downloaded(
+                                    asset.id(),
+                                    version_size.as_str(),
+                                    &expected_path,
+                                    &local_checksum,
+                                    None,
+                                )
+                                .await
+                            {
+                                tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to mark as downloaded");
+                                continue;
+                            }
+
+                            matched += 1;
+                            if !args.no_progress_bar && matched.is_multiple_of(100) {
+                                println!("  Matched {matched} files so far...");
+                            }
+                        } else {
+                            unmatched += 1;
                         }
                     } else {
                         unmatched += 1;
@@ -1068,8 +1074,6 @@ async fn run_import_existing(
                 } else {
                     unmatched += 1;
                 }
-            } else {
-                unmatched += 1;
             }
         }
     }
@@ -1081,6 +1085,25 @@ async fn run_import_existing(
     println!("  Unmatched versions:   {unmatched}");
 
     Ok(())
+}
+
+/// Resolve a `LibrarySelection` into concrete `PhotoLibrary` instances.
+async fn resolve_libraries(
+    selection: &config::LibrarySelection,
+    photos_service: &mut icloud::photos::PhotosService,
+) -> anyhow::Result<Vec<icloud::photos::PhotoLibrary>> {
+    match selection {
+        config::LibrarySelection::All => {
+            tracing::info!("Using all available libraries");
+            photos_service.all_libraries().await
+        }
+        config::LibrarySelection::Single(name) => {
+            if name != "PrimarySync" {
+                tracing::info!(library = %name, "Using non-default library");
+            }
+            Ok(vec![photos_service.get_library(name).await?.clone()])
+        }
+    }
 }
 
 /// Resolve which albums to download from, plus any asset IDs to exclude.
@@ -1342,8 +1365,12 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         Command::Password { password, action } => {
             return run_password(action, &globals, &password, toml_config.as_ref()).await;
         }
-        Command::List { password, what } => {
-            return run_list(what, &password, &globals, toml_config.as_ref()).await;
+        Command::List {
+            password,
+            library,
+            what,
+        } => {
+            return run_list(what, &password, library, &globals, toml_config.as_ref()).await;
         }
         Command::Config { action } => match action {
             cli::ConfigAction::Show => {
@@ -1534,7 +1561,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 .is_some_and(auth::error::AuthError::is_two_factor_required) =>
         {
             let msg = format!(
-                "2FA required for {u}. Run: kei get-code",
+                "2FA required for {u}. Run: kei login get-code",
                 u = config.username
             );
             tracing::warn!(message = %msg, "2FA required");
@@ -1614,18 +1641,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     .await?;
 
     // Resolve the selected library/libraries
-    let libraries: Vec<icloud::photos::PhotoLibrary> = match &config.library {
-        config::LibrarySelection::All => {
-            tracing::info!("Using all available libraries");
-            photos_service.all_libraries().await?
-        }
-        config::LibrarySelection::Single(name) => {
-            if name != "PrimarySync" {
-                tracing::info!(library = %name, "Using non-default library");
-            }
-            vec![photos_service.get_library(name).await?.clone()]
-        }
-    };
+    let libraries = resolve_libraries(&config.library, &mut photos_service).await?;
     tracing::info!(
         count = libraries.len(),
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),
@@ -2028,7 +2044,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         reauth_attempts -= 1;
 
                         let msg = format!(
-                            "2FA required for {u}. Run: kei get-code",
+                            "2FA required for {u}. Run: kei login get-code",
                             u = config.username
                         );
                         tracing::warn!(message = %msg, "2FA required");
