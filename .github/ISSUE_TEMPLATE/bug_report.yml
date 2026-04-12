@@ -46,7 +46,7 @@ body:
     attributes:
       label: Version
       description: "Output of `kei --version`, or the Docker image tag."
-      placeholder: "v0.7.0"
+      placeholder: "v0.7.1"
     validations:
       required: true
 
