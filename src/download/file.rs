@@ -91,6 +91,7 @@ pub(super) fn temp_download_path(
 /// place so the caller can modify it before performing the rename.
 /// Retries with exponential backoff on transient failures.
 /// Download options that control post-download behavior and verification.
+#[derive(Debug, Clone, Copy)]
 pub(super) struct DownloadOpts {
     /// Keep the `.part` file instead of renaming to the final path.
     pub skip_rename: bool,

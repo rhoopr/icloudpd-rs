@@ -47,7 +47,7 @@ const GLOB_CASE_INSENSITIVE: glob::MatchOptions = glob::MatchOptions {
 };
 
 /// Determine the media type for an asset based on version size and item type.
-pub fn determine_media_type(
+pub(crate) fn determine_media_type(
     version_size: VersionSizeKey,
     asset: &crate::icloud::photos::PhotoAsset,
 ) -> MediaType {

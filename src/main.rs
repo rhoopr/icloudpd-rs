@@ -105,12 +105,16 @@ const MAX_REAUTH_ATTEMPTS: u32 = 3;
 /// restrict these syscalls).
 fn harden_process() {
     #[cfg(target_os = "linux")]
+    // SAFETY: PR_SET_DUMPABLE with value 0 is a simple prctl flag toggle.
+    // No pointer arguments; failure is non-fatal (logged and ignored).
     unsafe {
         if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
             tracing::debug!("prctl(PR_SET_DUMPABLE, 0) failed");
         }
     }
     #[cfg(unix)]
+    // SAFETY: rlim is stack-allocated and fully initialized. setrlimit reads
+    // from the pointer but does not store it. Failure is non-fatal.
     unsafe {
         let rlim = libc::rlimit {
             rlim_cur: 0,
@@ -149,6 +153,9 @@ fn available_disk_space(path: &Path) -> Option<u64> {
     }
 
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is zeroed before the call. libc::statvfs writes into
+    // the provided buffer and does not retain the pointer. c_path is valid
+    // for the duration of the call.
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(c_path.as_ptr(), &raw mut stat) != 0 {

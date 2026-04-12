@@ -8,7 +8,7 @@ use std::time::Duration;
 
 /// Events that trigger notification scripts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Event {
+pub(crate) enum Event {
     /// 2FA code is needed (session expired in headless mode)
     TwoFaRequired,
     /// Sync cycle completed successfully
@@ -33,7 +33,7 @@ impl Event {
 /// Notification dispatcher. Holds an optional script path.
 /// When no script is configured, all methods are no-ops.
 #[derive(Debug, Clone)]
-pub struct Notifier {
+pub(crate) struct Notifier {
     script: Option<PathBuf>,
 }
 

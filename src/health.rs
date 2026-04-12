@@ -5,10 +5,10 @@ use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct HealthStatus {
-    pub last_sync_at: Option<DateTime<Utc>>,
-    pub last_success_at: Option<DateTime<Utc>>,
-    pub consecutive_failures: u32,
-    pub last_error: Option<String>,
+    pub(crate) last_sync_at: Option<DateTime<Utc>>,
+    pub(crate) last_success_at: Option<DateTime<Utc>>,
+    pub(crate) consecutive_failures: u32,
+    pub(crate) last_error: Option<String>,
 }
 
 impl HealthStatus {
