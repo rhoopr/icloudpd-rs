@@ -7,6 +7,13 @@ body:
       value: |
         Thanks for reporting a bug. Please fill out the sections below so we can reproduce and fix the issue.
 
+  - type: checkboxes
+    id: adp-check
+    attributes:
+      label: Advanced Data Protection
+      options:
+        - label: I have confirmed that ADP is disabled or web access is allowed for iCloud data
+
   - type: textarea
     id: observed
     attributes:
