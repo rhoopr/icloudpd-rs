@@ -27,6 +27,7 @@ mod types;
 #[cfg(test)]
 mod test_helpers;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -309,12 +310,10 @@ async fn init_photos_service(
     // Expensive fix: clear session state, perform fresh SRP + 2FA login.
     // Handles cases where stale session headers cause wrong partition routing.
     //
-    // We must delete the persisted session file first. Otherwise
-    // `authenticate()` finds the still-valid session_token, calls
-    // `/validate` (which succeeds), and returns the same stale ckdatabasews
-    // URL without ever performing SRP. Removing the file forces a fresh
-    // SRP login → `/accountLogin`, giving Apple the best chance of
-    // returning an updated partition URL.
+    // Clear routing-related session state (session_token, session_id, scnt)
+    // so `authenticate()` falls through to fresh SRP instead of the validate
+    // shortcut. We preserve trust_token so SRP can include it in `trustTokens`,
+    // letting Apple recognise this as a trusted device and skip 2FA.
     tracing::warn!(
         url = %ckdatabasews_url,
         "Fresh connection pool did not resolve 421, performing full re-authentication"
@@ -324,13 +323,26 @@ async fn init_photos_service(
         session.release_lock()?;
     }
     let session_file = auth::session_file_path(cookie_directory, username);
-    if let Err(e) = tokio::fs::remove_file(&session_file).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                path = %session_file.display(),
-                error = %e,
-                "Could not remove session file before re-authentication"
-            );
+    match tokio::fs::read_to_string(&session_file).await {
+        Ok(contents) => {
+            match serde_json::from_str::<HashMap<String, serde_json::Value>>(&contents) {
+                Ok(mut map) => {
+                    map.retain(|k, _| k == "trust_token" || k == "client_id");
+                    if let Ok(json) = serde_json::to_string_pretty(&map) {
+                        if let Err(e) = tokio::fs::write(&session_file, json.as_bytes()).await {
+                            tracing::warn!(error = %e, "Could not rewrite session file, removing");
+                            let _ = tokio::fs::remove_file(&session_file).await;
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = tokio::fs::remove_file(&session_file).await;
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&session_file).await;
         }
     }
     let new_auth = auth::authenticate(
