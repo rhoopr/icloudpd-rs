@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.7] - 2026-04-13
+
+### Changed
+
+- **ADP detection softened to warning** - `iCDPEnabled` only indicates ADP is active on the account, not whether web access is blocked. Users with ADP enabled and "Access iCloud Data on the Web" turned on have a valid config. The hard bail is now a warning log, allowing the sync to proceed. ([#99])
+
+[#99]: https://github.com/rhoopr/kei/issues/99
+
 ## [0.7.6] - 2026-04-13
 
 ### Added
