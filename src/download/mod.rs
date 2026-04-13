@@ -2522,7 +2522,10 @@ where
             tracing::error!(error = ?e, "Asset producer task panicked");
             (true, ProducerSkipSummary::default())
         }
-        Err(_) => (false, ProducerSkipSummary::default()),
+        Err(e) => {
+            tracing::warn!(error = ?e, "Asset producer task failed (skip counts lost)");
+            (false, ProducerSkipSummary::default())
+        }
     };
 
     let assets_seen_count = assets_seen.load(std::sync::atomic::Ordering::Relaxed);
@@ -5724,6 +5727,25 @@ mod tests {
     fn test_producer_skip_summary_default_is_zero() {
         let skips = ProducerSkipSummary::default();
         assert_eq!(skips.total(), 0);
+    }
+
+    /// The producer relies on `AssetDisposition` ordering via `.max()` to
+    /// pick the highest-priority outcome when an asset has mixed task results.
+    /// If variant order changes, `.max()` silently picks the wrong winner.
+    #[test]
+    fn test_asset_disposition_ordering() {
+        use AssetDisposition::*;
+        assert!(Forwarded > OnDisk);
+        assert!(OnDisk > AmpmVariant);
+        assert!(AmpmVariant > StateSkip);
+        assert!(StateSkip > RetryExhausted);
+        assert!(RetryExhausted > RetryOnly);
+        assert!(RetryOnly > Unresolved);
+
+        // .max() picks the highest priority
+        assert_eq!(Unresolved.max(Forwarded), Forwarded);
+        assert_eq!(OnDisk.max(RetryExhausted), OnDisk);
+        assert_eq!(RetryOnly.max(RetryExhausted), RetryExhausted);
     }
 
     /// NB-1: When a CancellationToken fires during a download pass with
