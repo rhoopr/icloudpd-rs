@@ -164,7 +164,7 @@ pub(crate) fn extract_metadata(
     let (latitude, longitude, altitude) = decode_location(master_fields, asset_fields);
 
     let mut meta = crate::state::types::AssetMetadata {
-        source: "icloud".to_string(),
+        source: crate::state::types::SOURCE_ICLOUD.to_string(),
         is_favorite: decode_plain_bool(&asset_fields["isFavorite"]),
         is_hidden: decode_plain_bool(&asset_fields["isHidden"]),
         is_deleted: decode_plain_bool(&asset_fields["isDeleted"]),

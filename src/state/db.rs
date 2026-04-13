@@ -326,7 +326,7 @@ impl StateDb for SqliteStateDb {
         let meta = record.metadata.as_deref();
 
         // Precompute metadata fields (default to None/false when metadata absent)
-        let source = meta.map_or("icloud", |m| m.source.as_str());
+        let source = meta.map_or(super::types::SOURCE_ICLOUD, |m| m.source.as_str());
         let is_favorite = meta.is_some_and(|m| m.is_favorite);
         let is_hidden = meta.is_some_and(|m| m.is_hidden);
         let is_archived = meta.is_some_and(|m| m.is_archived);
@@ -832,26 +832,36 @@ impl StateDb for SqliteStateDb {
     ) -> Result<(), StateError> {
         let conn = self.acquire_lock("upsert_asset_albums")?;
 
-        conn.execute(
-            "DELETE FROM asset_albums WHERE asset_id = ?1",
-            rusqlite::params![asset_id],
-        )
-        .map_err(|e| StateError::query(&e))?;
+        // Atomic DELETE+INSERT to avoid data loss on crash between statements
+        conn.execute_batch("SAVEPOINT album_upsert")
+            .map_err(|e| StateError::query(&e))?;
 
-        if !albums.is_empty() {
-            let mut stmt = conn
-                .prepare_cached(
+        let result = (|| {
+            conn.execute(
+                "DELETE FROM asset_albums WHERE asset_id = ?1",
+                rusqlite::params![asset_id],
+            )?;
+
+            if !albums.is_empty() {
+                let mut stmt = conn.prepare_cached(
                     "INSERT INTO asset_albums (asset_id, album_name, source) VALUES (?1, ?2, ?3)",
-                )
-                .map_err(|e| StateError::query(&e))?;
+                )?;
+                for (album_name, source) in albums {
+                    stmt.execute(rusqlite::params![asset_id, album_name, source])?;
+                }
+            }
+            Ok::<(), rusqlite::Error>(())
+        })();
 
-            for (album_name, source) in albums {
-                stmt.execute(rusqlite::params![asset_id, album_name, source])
-                    .map_err(|e| StateError::query(&e))?;
+        match result {
+            Ok(()) => conn
+                .execute_batch("RELEASE album_upsert")
+                .map_err(|e| StateError::query(&e)),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK TO album_upsert");
+                Err(StateError::query(&e))
             }
         }
-
-        Ok(())
     }
 
     async fn upsert_asset_people(
@@ -861,24 +871,35 @@ impl StateDb for SqliteStateDb {
     ) -> Result<(), StateError> {
         let conn = self.acquire_lock("upsert_asset_people")?;
 
-        conn.execute(
-            "DELETE FROM asset_people WHERE asset_id = ?1",
-            rusqlite::params![asset_id],
-        )
-        .map_err(|e| StateError::query(&e))?;
+        conn.execute_batch("SAVEPOINT people_upsert")
+            .map_err(|e| StateError::query(&e))?;
 
-        if !people.is_empty() {
-            let mut stmt = conn
-                .prepare_cached("INSERT INTO asset_people (asset_id, person_name) VALUES (?1, ?2)")
-                .map_err(|e| StateError::query(&e))?;
+        let result = (|| {
+            conn.execute(
+                "DELETE FROM asset_people WHERE asset_id = ?1",
+                rusqlite::params![asset_id],
+            )?;
 
-            for name in people {
-                stmt.execute(rusqlite::params![asset_id, name])
-                    .map_err(|e| StateError::query(&e))?;
+            if !people.is_empty() {
+                let mut stmt = conn.prepare_cached(
+                    "INSERT INTO asset_people (asset_id, person_name) VALUES (?1, ?2)",
+                )?;
+                for name in people {
+                    stmt.execute(rusqlite::params![asset_id, name])?;
+                }
+            }
+            Ok::<(), rusqlite::Error>(())
+        })();
+
+        match result {
+            Ok(()) => conn
+                .execute_batch("RELEASE people_upsert")
+                .map_err(|e| StateError::query(&e)),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK TO people_upsert");
+                Err(StateError::query(&e))
             }
         }
-
-        Ok(())
     }
 
     async fn get_asset_albums(&self, asset_id: &str) -> Result<Vec<String>, StateError> {

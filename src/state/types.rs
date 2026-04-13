@@ -8,6 +8,9 @@ use sha2::{Digest, Sha256};
 
 use crate::types::AssetVersionSize;
 
+/// Provider identifier for iCloud assets.
+pub const SOURCE_ICLOUD: &str = "icloud";
+
 /// Version size key for state tracking.
 ///
 /// This is a 1-byte enum representing the version size, saving ~23 bytes
@@ -145,11 +148,7 @@ impl MediaType {
 /// Boxed inside `AssetRecord` (`Option<Box<AssetMetadata>>`) to avoid
 /// inflating the base record on code paths that don't use metadata.
 ///
-/// Fields are ordered for optimal memory layout:
-/// - Heap types first (String, `Vec`, `Option<String>`)
-/// - f64 fields
-/// - i32/i64 fields
-/// - bool fields last
+/// Fields are grouped by type for readability (heap types, f64, integers, bools).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssetMetadata {
     // Heap types
@@ -242,10 +241,10 @@ impl AssetMetadata {
         hash_opt_str(&mut hasher, self.burst_id.as_deref());
         hash_opt_str(&mut hasher, self.media_subtype.as_deref());
 
-        // Keywords: sorted for determinism
-        let mut sorted_kw = self.keywords.clone();
+        // Keywords: sort refs to avoid cloning the Vec
+        let mut sorted_kw: Vec<&str> = self.keywords.iter().map(String::as_str).collect();
         sorted_kw.sort_unstable();
-        for kw in &sorted_kw {
+        for kw in sorted_kw {
             hasher.update(kw.as_bytes());
             hasher.update(b"\0");
         }
@@ -263,7 +262,7 @@ impl AssetMetadata {
 impl Default for AssetMetadata {
     fn default() -> Self {
         Self {
-            source: "icloud".to_string(),
+            source: SOURCE_ICLOUD.to_string(),
             title: None,
             description: None,
             keywords: Vec::new(),

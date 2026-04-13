@@ -39,6 +39,8 @@ use crate::types::{
 
 use error::DownloadError;
 
+use crate::state::types::SOURCE_ICLOUD;
+
 /// Case-insensitive glob matching options for filename exclusion patterns.
 const GLOB_CASE_INSENSITIVE: glob::MatchOptions = glob::MatchOptions {
     case_sensitive: false,
@@ -1679,25 +1681,19 @@ async fn download_photos_incremental(
                         downloadable_assets.push((asset, Arc::clone(&album.name)));
                     }
                 }
-                ChangeReason::SoftDeleted => {
-                    soft_deleted_count += 1;
+                ChangeReason::SoftDeleted | ChangeReason::HardDeleted => {
+                    if event.reason == ChangeReason::SoftDeleted {
+                        soft_deleted_count += 1;
+                    } else {
+                        hard_deleted_count += 1;
+                    }
                     if let Some(db) = &config.state_db {
                         let ts = chrono::Utc::now().timestamp();
                         if let Err(e) = db.mark_asset_deleted(&event.record_name, Some(ts)).await {
                             tracing::warn!(asset_id = %event.record_name, error = %e, "Failed to mark asset deleted");
                         }
                     }
-                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Marked soft-deleted");
-                }
-                ChangeReason::HardDeleted => {
-                    hard_deleted_count += 1;
-                    if let Some(db) = &config.state_db {
-                        let ts = chrono::Utc::now().timestamp();
-                        if let Err(e) = db.mark_asset_deleted(&event.record_name, Some(ts)).await {
-                            tracing::warn!(asset_id = %event.record_name, error = %e, "Failed to mark asset deleted");
-                        }
-                    }
-                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Marked hard-deleted");
+                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, reason = ?event.reason, "Marked deleted");
                 }
                 ChangeReason::Hidden => {
                     hidden_count += 1;
@@ -1803,6 +1799,7 @@ async fn download_photos_incremental(
         // Without this, the UPDATE in mark_downloaded matches 0 rows and the
         // file ends up on disk but untracked in the state DB.
         if let Some(db) = &config.state_db {
+            let cloned_meta = asset.metadata().cloned().map(Box::new);
             for task in &asset_tasks {
                 let media_type = determine_media_type(task.version_size, asset);
                 let mut record = AssetRecord::new_pending(
@@ -1819,9 +1816,7 @@ async fn download_photos_incremental(
                     task.size,
                     media_type,
                 );
-                if let Some(meta) = asset.metadata().cloned() {
-                    record.metadata = Some(Box::new(meta));
-                }
+                record.metadata = cloned_meta.clone();
                 if let Err(e) = db.upsert_seen(&record).await {
                     tracing::warn!(
                         asset_id = %task.asset_id,
@@ -1829,12 +1824,14 @@ async fn download_photos_incremental(
                         "Failed to record asset in state DB"
                     );
                 }
+            }
 
-                // Track album membership
-                let albums = [(album_name.to_string(), "icloud".to_string())];
-                if let Err(e) = db.upsert_asset_albums(&task.asset_id, &albums).await {
+            // Track album membership (once per asset, not per version)
+            if let Some(first_task) = asset_tasks.first() {
+                let albums = [(album_name.to_string(), SOURCE_ICLOUD.to_string())];
+                if let Err(e) = db.upsert_asset_albums(&first_task.asset_id, &albums).await {
                     tracing::warn!(
-                        asset_id = %task.asset_id,
+                        asset_id = %first_task.asset_id,
                         error = %e,
                         "Failed to record album membership"
                     );
@@ -2216,6 +2213,20 @@ where
                         skipped_by_filter += 1;
                         producer_pb.inc(1);
                     } else {
+                        let asset_meta = asset.metadata().cloned().map(Box::new);
+                        // Track album membership once per asset, not per version
+                        if let Some(db) = &producer_state_db {
+                            if let Some(album) = config.album_name.as_deref() {
+                                let albums = [(album.to_string(), SOURCE_ICLOUD.to_string())];
+                                if let Err(e) = db.upsert_asset_albums(asset.id(), &albums).await {
+                                    tracing::warn!(
+                                        asset_id = %asset.id(),
+                                        error = %e,
+                                        "Failed to record album membership"
+                                    );
+                                }
+                            }
+                        }
                         for task in tasks {
                             // Skip assets that have exceeded the retry limit.
                             if let Some(&attempts) =
@@ -2260,29 +2271,13 @@ where
                                     task.size,
                                     media_type,
                                 );
-                                if let Some(meta) = asset.metadata().cloned() {
-                                    record.metadata = Some(Box::new(meta));
-                                }
+                                record.metadata = asset_meta.clone();
                                 if let Err(e) = db.upsert_seen(&record).await {
                                     tracing::warn!(
                                         asset_id = %task.asset_id,
                                         error = %e,
                                         "Failed to record asset"
                                     );
-                                }
-
-                                // Track album membership
-                                if let Some(album) = config.album_name.as_deref() {
-                                    let albums = [(album.to_string(), "icloud".to_string())];
-                                    if let Err(e) =
-                                        db.upsert_asset_albums(&task.asset_id, &albums).await
-                                    {
-                                        tracing::warn!(
-                                            asset_id = %task.asset_id,
-                                            error = %e,
-                                            "Failed to record album membership"
-                                        );
-                                    }
                                 }
 
                                 match download_ctx.should_download_fast(

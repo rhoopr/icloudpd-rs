@@ -1,4 +1,3 @@
-use base64::Engine;
 use chrono::{DateTime, TimeZone, Utc};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
@@ -55,28 +54,8 @@ pub struct PhotoAsset {
 }
 
 /// Decode filename from `CloudKit`'s `filenameEnc` field.
-/// Apple uses either plain STRING or base64-encoded `ENCRYPTED_BYTES` depending
-/// on the user's iCloud configuration.
 fn decode_filename(fields: &Value) -> Option<String> {
-    let enc = &fields["filenameEnc"];
-    if enc.is_null() {
-        return None;
-    }
-    let value = enc["value"].as_str()?;
-    let enc_type = enc["type"].as_str().unwrap_or("STRING");
-    match enc_type {
-        "STRING" => Some(value.to_string()),
-        "ENCRYPTED_BYTES" => {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(value)
-                .ok()?;
-            String::from_utf8(decoded).ok()
-        }
-        other => {
-            warn!(enc_type = %other, "Unsupported filenameEnc type");
-            None
-        }
-    }
+    super::decode::decode_enc_string(&fields["filenameEnc"])
 }
 
 /// Convert an `f64` millisecond timestamp to a `DateTime<Utc>`, returning
