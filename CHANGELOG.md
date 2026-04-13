@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.5] - 2026-04-13
+
+### Fixed
+
+- **421 recovery retries with exponential backoff** - After both recovery strategies fail (connection pool reset and full re-auth), kei now retries 3 more times with 10s/30s/60s backoff and fresh connection pools on each attempt. Handles transient Apple-side partition routing issues that resolve on their own. ([#199])
+- CloudKit error responses (including 421) now have their response body captured and logged at DEBUG level for diagnostics, instead of being silently discarded.
+
 ## [0.7.4] - 2026-04-13
 
 ### Fixed

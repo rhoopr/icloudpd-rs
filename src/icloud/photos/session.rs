@@ -23,7 +23,25 @@ impl PhotosSession for reqwest::Client {
         for &(k, v) in headers {
             builder = builder.header(k, v);
         }
-        let resp = builder.send().await?.error_for_status()?;
+        let resp = builder.send().await?;
+        let status = resp.status();
+
+        if status.is_client_error() || status.is_server_error() {
+            let url = resp.url().to_string();
+            let resp_body = resp.text().await.unwrap_or_default();
+            if !resp_body.is_empty() {
+                tracing::debug!(
+                    status = %status,
+                    url = %url,
+                    body = %resp_body,
+                    "CloudKit error response body"
+                );
+            }
+            // Format matches reqwest's error_for_status() output so
+            // is_misdirected_request() and other string-based checks work.
+            anyhow::bail!("HTTP status client error ({status}) for url ({url})");
+        }
+
         let json: Value = resp.json().await?;
         Ok(json)
     }

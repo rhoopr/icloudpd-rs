@@ -209,18 +209,20 @@ fn make_provider_from_auth(
 
 /// Initialize the photos service with automatic 421 recovery.
 ///
-/// On 421 Misdirected Request, tries two recovery strategies in order:
+/// On 421 Misdirected Request, tries three recovery strategies in order:
 ///
 /// 1. **Reset HTTP clients** (cheap): drops the connection pool and retries
 ///    with fresh TCP/HTTP2 connections. Fixes cases where HTTP/2 connection
 ///    routing directed the request to the wrong CloudKit partition server.
 ///
-/// 2. **Full re-authentication** (expensive): clears session state and
-///    performs a fresh SRP login. Fixes cases where stale session headers
-///    (scnt, session_id) cause CloudKit to route to the wrong partition.
-///    May require password + 2FA from the user.
+/// 2. **Full re-authentication** (expensive): deletes the persisted session
+///    file and performs a fresh SRP login. Fixes cases where stale session
+///    headers (scnt, session_id) cause CloudKit to route to the wrong
+///    partition. May require password + 2FA from the user.
 ///
-/// If both strategies fail, the error from the second attempt is returned.
+/// 3. **Backoff retries**: if both strategies fail, retries with exponential
+///    backoff (10s, 30s, 60s) with fresh connection pools. Handles transient
+///    Apple-side partition routing issues that resolve on their own.
 async fn init_photos_service(
     auth_result: auth::AuthResult,
     cookie_directory: &Path,
@@ -362,11 +364,61 @@ async fn init_photos_service(
     }
 
     let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-    let service =
-        icloud::photos::PhotosService::new(fresh_url, session_box, new_params, api_retry_config)
-            .await?;
+    match icloud::photos::PhotosService::new(
+        fresh_url.clone(),
+        session_box,
+        new_params.clone(),
+        api_retry_config,
+    )
+    .await
+    {
+        Ok(service) => return Ok((shared_session, service)),
+        Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
+        Err(_) => {}
+    }
 
-    Ok((shared_session, service))
+    // ── Recovery strategy 3: retry with exponential backoff ───────────
+    // Both strategies failed. Apple's partition routing may be transiently
+    // broken (account migration, infrastructure issue). Wait and retry
+    // with fresh connection pools on each attempt.
+    const BACKOFF_SECS: &[u64] = &[10, 30, 60];
+    for (i, &delay) in BACKOFF_SECS.iter().enumerate() {
+        tracing::warn!(
+            attempt = i + 1,
+            max_attempts = BACKOFF_SECS.len(),
+            delay_secs = delay,
+            url = %fresh_url,
+            "All recovery strategies failed, retrying after backoff"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+
+        {
+            let mut session = shared_session.write().await;
+            session.reset_http_clients()?;
+        }
+
+        let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
+        match icloud::photos::PhotosService::new(
+            fresh_url.clone(),
+            session_box,
+            new_params.clone(),
+            api_retry_config,
+        )
+        .await
+        {
+            Ok(service) => return Ok((shared_session, service)),
+            Err(e) if !is_misdirected_request(&e) => return Err(e.into()),
+            Err(_) => {}
+        }
+    }
+
+    anyhow::bail!(
+        "421 Misdirected Request persists on {} after re-authentication and {} \
+         backoff retries. This is likely an Apple-side partition routing issue \
+         -- please try again later.",
+        fresh_url,
+        BACKOFF_SECS.len()
+    )
 }
 
 /// Check if an iCloud error is a 421 Misdirected Request from the CloudKit service.
