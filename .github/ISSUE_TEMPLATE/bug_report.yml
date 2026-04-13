@@ -12,7 +12,7 @@ body:
     attributes:
       label: Advanced Data Protection
       options:
-        - label: I have confirmed that ADP is disabled or web access is allowed for iCloud data
+        - label: I have confirmed that ADP is disabled and "Access iCloud Data on the Web" is enabled
 
   - type: textarea
     id: observed
