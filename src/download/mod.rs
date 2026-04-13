@@ -1337,6 +1337,20 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
     failures
 }
 
+/// Per-asset outcome in the producer's task loop. Ordered by ascending
+/// priority so `.max()` picks the winner when an asset has tasks with
+/// mixed outcomes (e.g. one version on disk, another sent for download).
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+enum AssetDisposition {
+    Unresolved,
+    RetryOnly,
+    RetryExhausted,
+    StateSkip,
+    AmpmVariant,
+    OnDisk,
+    Forwarded,
+}
+
 /// Breakdown of assets skipped during the producer phase.
 ///
 /// Every asset from the API stream must be accounted for: either it ends up
@@ -2229,15 +2243,7 @@ where
                         skips.by_filter += 1;
                         producer_pb.inc(1);
                     } else {
-                        // Per-asset disposition tracking: each asset ends up
-                        // in exactly one bucket (sent for download, or one of
-                        // the skip categories).
-                        let mut any_task_sent = false;
-                        let mut had_retry_exhausted = false;
-                        let mut had_retry_only = false;
-                        let mut had_on_disk = false;
-                        let mut had_ampm = false;
-                        let mut had_state_skip = false;
+                        let mut disposition = AssetDisposition::Unresolved;
 
                         for task in tasks {
                             // Skip assets that have exceeded the retry limit.
@@ -2253,7 +2259,7 @@ where
                                         max = config.max_download_attempts,
                                         "Skipping asset: exceeded max download attempts"
                                     );
-                                    had_retry_exhausted = true;
+                                    disposition = disposition.max(AssetDisposition::RetryExhausted);
                                     continue;
                                 }
                             }
@@ -2265,7 +2271,7 @@ where
                                     asset_id = %task.asset_id,
                                     "Skipping new asset in retry-only mode"
                                 );
-                                had_retry_only = true;
+                                disposition = disposition.max(AssetDisposition::RetryOnly);
                                 continue;
                             }
 
@@ -2300,13 +2306,13 @@ where
                                     false,
                                 ) {
                                     Some(true) => {
-                                        any_task_sent = true;
+                                        disposition = AssetDisposition::Forwarded;
                                         if task_tx.send(task).await.is_err() {
                                             return skips;
                                         }
                                     }
                                     Some(false) => {
-                                        had_state_skip = true;
+                                        disposition = disposition.max(AssetDisposition::StateSkip);
                                         tracing::debug!(
                                             asset_id = %task.asset_id,
                                             "Skipping (state confirms no download needed)"
@@ -2316,7 +2322,7 @@ where
                                         // Directory was pre-populated above, so these
                                         // are cache-hits -- no blocking I/O.
                                         if dir_cache.exists(&task.download_path) {
-                                            had_on_disk = true;
+                                            disposition = disposition.max(AssetDisposition::OnDisk);
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
                                                 path = %task.download_path.display(),
@@ -2326,7 +2332,8 @@ where
                                             .find_ampm_variant(&task.download_path)
                                             .is_some()
                                         {
-                                            had_ampm = true;
+                                            disposition =
+                                                disposition.max(AssetDisposition::AmpmVariant);
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
                                                 path = %task.download_path.display(),
@@ -2338,7 +2345,7 @@ where
                                                 path = %task.download_path.display(),
                                                 "File missing, will re-download"
                                             );
-                                            any_task_sent = true;
+                                            disposition = AssetDisposition::Forwarded;
                                             if task_tx.send(task).await.is_err() {
                                                 return skips;
                                             }
@@ -2346,29 +2353,21 @@ where
                                     }
                                 }
                             } else {
-                                any_task_sent = true;
+                                disposition = AssetDisposition::Forwarded;
                                 if task_tx.send(task).await.is_err() {
                                     return skips;
                                 }
                             }
                         }
 
-                        // Classify the asset into exactly one bucket.
-                        // If any task was sent for download, the asset will
-                        // appear in downloaded/failed -- don't also count it
-                        // as skipped.
-                        if any_task_sent {
-                            assets_forwarded += 1;
-                        } else if had_on_disk {
-                            skips.on_disk += 1;
-                        } else if had_ampm {
-                            skips.ampm_variant += 1;
-                        } else if had_state_skip {
-                            skips.by_state += 1;
-                        } else if had_retry_exhausted {
-                            skips.retry_exhausted += 1;
-                        } else if had_retry_only {
-                            skips.retry_only += 1;
+                        match disposition {
+                            AssetDisposition::Forwarded => assets_forwarded += 1,
+                            AssetDisposition::OnDisk => skips.on_disk += 1,
+                            AssetDisposition::AmpmVariant => skips.ampm_variant += 1,
+                            AssetDisposition::StateSkip => skips.by_state += 1,
+                            AssetDisposition::RetryExhausted => skips.retry_exhausted += 1,
+                            AssetDisposition::RetryOnly => skips.retry_only += 1,
+                            AssetDisposition::Unresolved => {}
                         }
 
                         producer_pb.inc(1);
