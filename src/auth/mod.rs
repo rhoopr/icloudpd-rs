@@ -352,6 +352,7 @@ mod tests {
             domain_to_use: None,
             has_error: false,
             service_errors: Vec::new(),
+            i_cdp_enabled: false,
         }
     }
 
@@ -389,6 +390,7 @@ mod tests {
             domain_to_use: None,
             has_error: false,
             service_errors: Vec::new(),
+            i_cdp_enabled: false,
         };
         assert!(!check_requires_2fa(&resp));
     }

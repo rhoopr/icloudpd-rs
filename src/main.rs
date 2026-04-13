@@ -231,6 +231,16 @@ async fn init_photos_service(
     password_provider: &dyn Fn() -> Option<SecretString>,
     api_retry_config: retry::RetryConfig,
 ) -> anyhow::Result<(auth::SharedSession, icloud::photos::PhotosService)> {
+    if auth_result.data.i_cdp_enabled {
+        anyhow::bail!(
+            "Advanced Data Protection (ADP) is enabled on this account.\n\n\
+             ADP encrypts iCloud data end-to-end, which blocks the web API that\n\
+             kei uses to access photos. To use kei, either disable ADP or enable\n\
+             web access for iCloud data in:\n  \
+             Settings > Apple ID > iCloud > Advanced Data Protection"
+        );
+    }
+
     let ckdatabasews_url = auth_result
         .data
         .webservices
@@ -342,6 +352,16 @@ async fn init_photos_service(
         .map(|ep| ep.url.clone())
         .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL after re-authentication"))?;
 
+    if new_auth.data.i_cdp_enabled {
+        anyhow::bail!(
+            "Advanced Data Protection (ADP) is enabled on this account.\n\n\
+             ADP encrypts iCloud data end-to-end, which blocks the web API that\n\
+             kei uses to access photos. To use kei, either disable ADP or enable\n\
+             web access for iCloud data in:\n  \
+             Settings > Apple ID > iCloud > Advanced Data Protection"
+        );
+    }
+
     if fresh_url != ckdatabasews_url {
         tracing::info!(
             old_url = %ckdatabasews_url,
@@ -414,8 +434,11 @@ async fn init_photos_service(
 
     anyhow::bail!(
         "421 Misdirected Request persists on {} after re-authentication and {} \
-         backoff retries. This is likely an Apple-side partition routing issue \
-         -- please try again later.",
+         backoff retries.\n\n\
+         If Advanced Data Protection (ADP) is enabled on this account, that's the\n\
+         cause -- ADP blocks the web API that kei uses. Disable ADP or enable web\n\
+         access in: Settings > Apple ID > iCloud > Advanced Data Protection\n\n\
+         Otherwise, this is likely a transient Apple-side routing issue. Try again later.",
         fresh_url,
         BACKOFF_SECS.len()
     )

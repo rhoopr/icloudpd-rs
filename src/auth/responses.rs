@@ -51,6 +51,11 @@ pub struct AccountLoginResponse {
     pub has_error: bool,
     #[serde(default, alias = "service_errors")]
     pub service_errors: Vec<AppleServiceError>,
+    /// Whether Advanced Data Protection (iCloud end-to-end encryption) is
+    /// active on the account.  Apple names this field `iCDPEnabled` in the
+    /// `/accountLogin` and `/validate` responses.
+    #[serde(default, alias = "iCDPEnabled")]
+    pub i_cdp_enabled: bool,
 }
 
 impl AccountLoginResponse {
