@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.9] - 2026-04-13
+
+### Fixed
+
+- **421 re-auth no longer triggers 2FA** - strategy 2 was deleting the entire session file, which nuked `trust_token`. Apple treated every re-auth as a new device and demanded 2FA. Now rewrites the session file keeping only `trust_token` and `client_id`, clearing routing state (`session_token`, `session_id`, `scnt`). SRP still runs fresh but sends the preserved token in `trustTokens` so Apple can skip 2FA for recognised devices. Session file writes are now atomic. ([#204])
+
+[#204]: https://github.com/rhoopr/kei/pull/204
+
 ## [0.7.8] - 2026-04-13
 
 ### Fixed
