@@ -2181,6 +2181,7 @@ where
         let mut dir_cache = paths::DirCache::new();
         let mut seen_ids: FxHashSet<Box<str>> = FxHashSet::default();
         let mut skips = ProducerSkipSummary::default();
+        let mut assets_forwarded = 0u64;
         tokio::pin!(combined);
         while let Some(result) = combined.next().await {
             if producer_shutdown.is_cancelled() {
@@ -2228,9 +2229,15 @@ where
                         skips.by_filter += 1;
                         producer_pb.inc(1);
                     } else {
-                        let mut any_task_reached_checks = false;
+                        // Per-asset disposition tracking: each asset ends up
+                        // in exactly one bucket (sent for download, or one of
+                        // the skip categories).
+                        let mut any_task_sent = false;
                         let mut had_retry_exhausted = false;
                         let mut had_retry_only = false;
+                        let mut had_on_disk = false;
+                        let mut had_ampm = false;
+                        let mut had_state_skip = false;
 
                         for task in tasks {
                             // Skip assets that have exceeded the retry limit.
@@ -2261,8 +2268,6 @@ where
                                 had_retry_only = true;
                                 continue;
                             }
-
-                            any_task_reached_checks = true;
 
                             if let Some(db) = &producer_state_db {
                                 let media_type = determine_media_type(task.version_size, &asset);
@@ -2295,12 +2300,13 @@ where
                                     false,
                                 ) {
                                     Some(true) => {
+                                        any_task_sent = true;
                                         if task_tx.send(task).await.is_err() {
                                             return skips;
                                         }
                                     }
                                     Some(false) => {
-                                        skips.by_state += 1;
+                                        had_state_skip = true;
                                         tracing::debug!(
                                             asset_id = %task.asset_id,
                                             "Skipping (state confirms no download needed)"
@@ -2310,7 +2316,7 @@ where
                                         // Directory was pre-populated above, so these
                                         // are cache-hits -- no blocking I/O.
                                         if dir_cache.exists(&task.download_path) {
-                                            skips.on_disk += 1;
+                                            had_on_disk = true;
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
                                                 path = %task.download_path.display(),
@@ -2320,7 +2326,7 @@ where
                                             .find_ampm_variant(&task.download_path)
                                             .is_some()
                                         {
-                                            skips.ampm_variant += 1;
+                                            had_ampm = true;
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
                                                 path = %task.download_path.display(),
@@ -2332,25 +2338,37 @@ where
                                                 path = %task.download_path.display(),
                                                 "File missing, will re-download"
                                             );
+                                            any_task_sent = true;
                                             if task_tx.send(task).await.is_err() {
                                                 return skips;
                                             }
                                         }
                                     }
                                 }
-                            } else if task_tx.send(task).await.is_err() {
-                                return skips;
+                            } else {
+                                any_task_sent = true;
+                                if task_tx.send(task).await.is_err() {
+                                    return skips;
+                                }
                             }
                         }
 
-                        // If no task made it past the retry gates, count
-                        // the asset in the appropriate skip bucket.
-                        if !any_task_reached_checks {
-                            if had_retry_exhausted {
-                                skips.retry_exhausted += 1;
-                            } else if had_retry_only {
-                                skips.retry_only += 1;
-                            }
+                        // Classify the asset into exactly one bucket.
+                        // If any task was sent for download, the asset will
+                        // appear in downloaded/failed -- don't also count it
+                        // as skipped.
+                        if any_task_sent {
+                            assets_forwarded += 1;
+                        } else if had_on_disk {
+                            skips.on_disk += 1;
+                        } else if had_ampm {
+                            skips.ampm_variant += 1;
+                        } else if had_state_skip {
+                            skips.by_state += 1;
+                        } else if had_retry_exhausted {
+                            skips.retry_exhausted += 1;
+                        } else if had_retry_only {
+                            skips.retry_only += 1;
                         }
 
                         producer_pb.inc(1);
@@ -2376,6 +2394,24 @@ where
                     retry_only = skips.retry_only,
                     total = total_skipped,
                     "Skipped assets"
+                );
+            });
+        }
+
+        // Invariant: every unique asset must be either skipped or forwarded.
+        // Duplicates and enum errors are outside the unique-asset count.
+        let seen = assets_seen_producer.load(std::sync::atomic::Ordering::Relaxed);
+        let skipped_unique = (total_skipped - skips.duplicates) as u64;
+        let accounted = skipped_unique + assets_forwarded;
+        if accounted != seen {
+            producer_pb.suspend(|| {
+                tracing::warn!(
+                    assets_seen = seen,
+                    accounted,
+                    forwarded = assets_forwarded,
+                    skipped = skipped_unique,
+                    duplicates = skips.duplicates,
+                    "Asset accounting mismatch -- some assets may be untracked"
                 );
             });
         }
