@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.4] - 2026-04-13
+
+### Fixed
+
+- **421 recovery still returned stale partition URL** - Strategy 2 ("full re-auth") called `authenticate()`, which found the persisted session token, validated it (token was fine), and returned the same `ckdatabasews` URL without ever performing SRP. Now deletes the session file before re-authenticating so a fresh SRP login is forced, giving Apple's `/accountLogin` a clean session context to return an updated partition URL. ([#199])
+
 ## [0.7.3] - 2026-04-13
 
 ### Fixed

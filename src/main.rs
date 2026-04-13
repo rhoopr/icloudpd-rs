@@ -296,6 +296,13 @@ async fn init_photos_service(
     // ── Recovery strategy 2: full re-authentication ────────────────────
     // Expensive fix: clear session state, perform fresh SRP + 2FA login.
     // Handles cases where stale session headers cause wrong partition routing.
+    //
+    // We must delete the persisted session file first. Otherwise
+    // `authenticate()` finds the still-valid session_token, calls
+    // `/validate` (which succeeds), and returns the same stale ckdatabasews
+    // URL without ever performing SRP. Removing the file forces a fresh
+    // SRP login → `/accountLogin`, giving Apple the best chance of
+    // returning an updated partition URL.
     tracing::warn!(
         url = %ckdatabasews_url,
         "Fresh connection pool did not resolve 421, performing full re-authentication"
@@ -303,6 +310,16 @@ async fn init_photos_service(
     {
         let session = shared_session.read().await;
         session.release_lock()?;
+    }
+    let session_file = auth::session_file_path(cookie_directory, username);
+    if let Err(e) = tokio::fs::remove_file(&session_file).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %session_file.display(),
+                error = %e,
+                "Could not remove session file before re-authentication"
+            );
+        }
     }
     let new_auth = auth::authenticate(
         cookie_directory,
