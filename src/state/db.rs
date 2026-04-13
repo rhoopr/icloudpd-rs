@@ -206,6 +206,16 @@ impl SqliteStateDb {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Acquire the database lock, adding the operation name to any error.
+    fn acquire_lock(
+        &self,
+        operation: &str,
+    ) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, StateError> {
+        self.conn
+            .lock()
+            .map_err(|e| StateError::Query(format!("{operation}: {e}")))
+    }
 }
 
 #[async_trait]
@@ -220,10 +230,7 @@ impl StateDb for SqliteStateDb {
     ) -> Result<bool, StateError> {
         // Query DB in a separate scope to ensure MutexGuard is dropped before any await
         let result: Option<(String, String, Option<String>)> = {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|e| StateError::Query(e.to_string()))?;
+            let conn = self.acquire_lock("should_download")?;
 
             conn.query_row(
                 "SELECT status, checksum, local_path FROM assets WHERE id = ?1 AND version_size = ?2",
@@ -287,10 +294,7 @@ impl StateDb for SqliteStateDb {
     async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
         let last_seen_at = Utc::now().timestamp();
 
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("upsert_seen")?;
 
         // Use INSERT OR REPLACE to handle both insert and update
         // But preserve existing status, downloaded_at, local_path, download_attempts, last_error
@@ -334,10 +338,7 @@ impl StateDb for SqliteStateDb {
     ) -> Result<(), StateError> {
         let downloaded_at = Utc::now().timestamp();
 
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("mark_downloaded")?;
 
         conn.execute(
             "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
@@ -363,10 +364,7 @@ impl StateDb for SqliteStateDb {
         version_size: &str,
         error: &str,
     ) -> Result<(), StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("mark_failed")?;
 
         conn.execute(
             "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, last_error = ?1 WHERE id = ?2 AND version_size = ?3",
@@ -378,10 +376,7 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("get_failed")?;
 
         let mut stmt = conn
             .prepare(
@@ -399,10 +394,7 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn get_summary(&self) -> Result<SyncSummary, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("get_summary")?;
 
         let (total_assets, downloaded, pending, failed) = conn
             .query_row(
@@ -464,10 +456,7 @@ impl StateDb for SqliteStateDb {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<AssetRecord>, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("get_downloaded_page")?;
 
         let mut stmt = conn
             .prepare(
@@ -490,10 +479,7 @@ impl StateDb for SqliteStateDb {
     async fn start_sync_run(&self) -> Result<i64, StateError> {
         let started_at = Utc::now().timestamp();
 
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("start_sync_run")?;
 
         conn.execute(
             "INSERT INTO sync_runs (started_at) VALUES (?1)",
@@ -512,10 +498,7 @@ impl StateDb for SqliteStateDb {
         let assets_failed = i64::try_from(stats.assets_failed).unwrap_or(i64::MAX);
         let interrupted = i32::from(stats.interrupted);
 
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("complete_sync_run")?;
 
         conn.execute(
             "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, assets_failed = ?4, interrupted = ?5 WHERE id = ?6",
@@ -527,10 +510,7 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn reset_failed(&self) -> Result<u64, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("reset_failed")?;
 
         let rows = conn
             .execute(
@@ -543,31 +523,36 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("get_downloaded_ids")?;
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM assets WHERE status = 'downloaded'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StateError::query(&e))?;
+        let count = usize::try_from(count).unwrap_or(0);
 
         let mut stmt = conn
             .prepare_cached("SELECT id, version_size FROM assets WHERE status = 'downloaded'")
             .map_err(|e| StateError::query(&e))?;
 
-        let ids = stmt
+        let mut ids = HashSet::with_capacity(count);
+        let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|e| StateError::query(&e))?
-            .collect::<Result<HashSet<_>, _>>()
             .map_err(|e| StateError::query(&e))?;
+        for row in rows {
+            ids.insert(row.map_err(|e| StateError::query(&e))?);
+        }
 
         Ok(ids)
     }
 
     async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("get_all_known_ids")?;
 
         let mut stmt = conn
             .prepare_cached("SELECT DISTINCT id FROM assets")
@@ -585,10 +570,16 @@ impl StateDb for SqliteStateDb {
     async fn get_downloaded_checksums(
         &self,
     ) -> Result<HashMap<(String, String), String>, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("get_downloaded_checksums")?;
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM assets WHERE status = 'downloaded'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StateError::query(&e))?;
+        let count = usize::try_from(count).unwrap_or(0);
 
         let mut stmt = conn
             .prepare_cached(
@@ -596,25 +587,25 @@ impl StateDb for SqliteStateDb {
             )
             .map_err(|e| StateError::query(&e))?;
 
-        let checksums = stmt
+        let mut checksums = HashMap::with_capacity(count);
+        let rows = stmt
             .query_map([], |row| {
                 Ok((
                     (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
                     row.get::<_, String>(2)?,
                 ))
             })
-            .map_err(|e| StateError::query(&e))?
-            .collect::<Result<HashMap<_, _>, _>>()
             .map_err(|e| StateError::query(&e))?;
+        for row in rows {
+            let (key, val) = row.map_err(|e| StateError::query(&e))?;
+            checksums.insert(key, val);
+        }
 
         Ok(checksums)
     }
 
     async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("get_attempt_counts")?;
 
         let mut stmt = conn
             .prepare_cached(
@@ -637,10 +628,7 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("get_metadata")?;
 
         let value = conn
             .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
@@ -653,10 +641,7 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("set_metadata")?;
 
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -668,10 +653,7 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("delete_metadata_by_prefix")?;
 
         let deleted = conn
             .execute(
@@ -684,10 +666,7 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn touch_last_seen(&self, asset_id: &str) -> Result<(), StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("touch_last_seen")?;
 
         let now = Utc::now().timestamp();
         conn.execute(
@@ -700,10 +679,7 @@ impl StateDb for SqliteStateDb {
     }
 
     async fn sample_downloaded_paths(&self, limit: usize) -> Result<Vec<PathBuf>, StateError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StateError::Query(e.to_string()))?;
+        let conn = self.acquire_lock("sample_downloaded_paths")?;
 
         let mut stmt = conn
             .prepare_cached(

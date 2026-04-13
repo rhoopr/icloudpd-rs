@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
-use crate::icloud::photos::AssetVersionSize;
+use crate::types::AssetVersionSize;
 
 /// Version size key for state tracking.
 ///

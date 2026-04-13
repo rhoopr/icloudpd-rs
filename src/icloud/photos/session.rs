@@ -62,12 +62,12 @@ const SERVICE_NOT_ACTIVATED_ERRORS: &[&str] = &["ZONE_NOT_FOUND", "AUTHENTICATIO
 #[derive(Debug, thiserror::Error)]
 #[error("CloudKit server error: {code} — {reason}")]
 pub struct CloudKitServerError {
-    pub code: String,
-    pub reason: String,
-    pub retryable: bool,
+    pub(crate) code: Box<str>,
+    pub(crate) reason: Box<str>,
+    pub(crate) retryable: bool,
     /// True when the error indicates the iCloud service is not activated
     /// (ADP enabled, incomplete setup, or private db access disabled).
-    pub service_not_activated: bool,
+    pub(crate) service_not_activated: bool,
 }
 
 /// Check whether an error code or reason indicates the iCloud service is not
@@ -90,12 +90,11 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
         let reason = response["reason"]
             .as_str()
             .or_else(|| response["serverErrorMessage"].as_str())
-            .unwrap_or("unknown")
-            .to_string();
+            .unwrap_or("unknown");
         let retryable = RETRYABLE_SERVER_ERRORS
             .iter()
             .any(|&s| s.eq_ignore_ascii_case(code));
-        let service_not_activated = is_service_not_activated(code, &reason);
+        let service_not_activated = is_service_not_activated(code, reason);
         tracing::warn!(
             error_code = code,
             retryable,
@@ -103,8 +102,8 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
             "CloudKit server error: {reason}"
         );
         return Err(CloudKitServerError {
-            code: code.to_string(),
-            reason,
+            code: code.into(),
+            reason: reason.into(),
             retryable,
             service_not_activated,
         }
@@ -122,11 +121,11 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
             let mut last_ck_err = None;
             for record in &errored {
                 let code = record["serverErrorCode"].as_str().unwrap_or("unknown");
-                let reason = record["reason"].as_str().unwrap_or("unknown").to_string();
+                let reason = record["reason"].as_str().unwrap_or("unknown");
                 let retryable = RETRYABLE_SERVER_ERRORS
                     .iter()
                     .any(|&s| s.eq_ignore_ascii_case(code));
-                let service_not_activated = is_service_not_activated(code, &reason);
+                let service_not_activated = is_service_not_activated(code, reason);
                 tracing::warn!(
                     error_code = code,
                     retryable,
@@ -134,8 +133,8 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                     "CloudKit per-record error: {reason}"
                 );
                 last_ck_err = Some(CloudKitServerError {
-                    code: code.to_string(),
-                    reason,
+                    code: code.into(),
+                    reason: reason.into(),
                     retryable,
                     service_not_activated,
                 });
@@ -307,7 +306,7 @@ mod tests {
         });
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
-        assert_eq!(ck_err.code, "TRY_AGAIN_LATER");
+        assert_eq!(&*ck_err.code, "TRY_AGAIN_LATER");
         assert!(ck_err.retryable);
         assert!(!ck_err.service_not_activated);
         assert_eq!(classify_api_error(&err), RetryAction::Retry);
@@ -352,7 +351,7 @@ mod tests {
         });
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
-        assert_eq!(ck_err.code, "RETRY_LATER");
+        assert_eq!(&*ck_err.code, "RETRY_LATER");
         assert!(ck_err.retryable);
     }
 
@@ -479,7 +478,7 @@ mod tests {
         });
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
-        assert_eq!(ck_err.reason, "fallback message");
+        assert_eq!(&*ck_err.reason, "fallback message");
     }
 
     #[test]
@@ -489,7 +488,7 @@ mod tests {
         });
         let err = check_cloudkit_errors(response).unwrap_err();
         let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
-        assert_eq!(ck_err.reason, "unknown");
+        assert_eq!(&*ck_err.reason, "unknown");
     }
 
     #[test]

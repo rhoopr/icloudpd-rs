@@ -91,6 +91,7 @@ pub(super) fn temp_download_path(
 /// place so the caller can modify it before performing the rename.
 /// Retries with exponential backoff on transient failures.
 /// Download options that control post-download behavior and verification.
+#[derive(Debug, Clone, Copy)]
 pub(super) struct DownloadOpts {
     /// Keep the `.part` file instead of renaming to the final path.
     pub skip_rename: bool,
@@ -158,10 +159,20 @@ async fn attempt_download<C: DownloadClient>(
         Ok(meta) if meta.len() > 0 => {
             // Discard stale .part files from crashed runs to avoid resuming
             // from potentially corrupt bytes.
-            let stale = meta.modified().ok().is_some_and(|mtime| {
-                mtime.elapsed().unwrap_or(std::time::Duration::ZERO)
-                    > std::time::Duration::from_secs(STALE_PART_FILE_SECS)
-            });
+            let stale = match meta.modified() {
+                Ok(mtime) => {
+                    mtime.elapsed().unwrap_or(std::time::Duration::ZERO)
+                        > std::time::Duration::from_secs(STALE_PART_FILE_SECS)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %part_path.display(),
+                        error = %e,
+                        "Cannot read .part file mtime, treating as stale"
+                    );
+                    true
+                }
+            };
             if stale {
                 tracing::warn!(
                     path = %part_path.display(),
@@ -326,10 +337,45 @@ async fn attempt_download<C: DownloadClient>(
     }
 
     if !skip_rename {
-        fs::rename(&part_path, download_path).await?;
+        rename_part_to_final(part_path, download_path).await?;
     }
 
     Ok(())
+}
+
+/// Rename a `.part` file to its final destination, handling the case where
+/// a concurrent download already placed the final file. If the destination
+/// exists, the redundant `.part` file is removed instead of overwriting.
+pub(super) async fn rename_part_to_final(
+    part_path: &Path,
+    final_path: &Path,
+) -> anyhow::Result<()> {
+    match fs::rename(part_path, final_path).await {
+        Ok(()) => Ok(()),
+        Err(rename_err) if fs::try_exists(final_path).await.unwrap_or(false) => {
+            // Another task won the race — clean up our .part file.
+            tracing::debug!(
+                path = %final_path.display(),
+                error = %rename_err,
+                "Destination already exists, removing redundant .part file"
+            );
+            if let Err(rm_err) = fs::remove_file(part_path).await {
+                tracing::warn!(
+                    path = %part_path.display(),
+                    error = %rm_err,
+                    "Failed to remove redundant .part file"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to rename {} to {}",
+                part_path.display(),
+                final_path.display()
+            )
+        }),
+    }
 }
 
 /// Compute the SHA-256 hash of a file, returning a hex-encoded string.
@@ -1804,5 +1850,46 @@ mod tests {
         let decoded = decode_api_checksum("AXY53EmM03WU8iZY1QgKZ79gMyMi").unwrap();
         assert!(decoded.is_sha1);
         assert_eq!(decoded.hex.len(), 40); // 20 bytes = 40 hex chars
+    }
+
+    #[tokio::test]
+    async fn rename_part_to_final_happy_path() {
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("photo.part");
+        let final_path = dir.path().join("photo.jpg");
+        tokio::fs::write(&part, b"image data").await.unwrap();
+
+        rename_part_to_final(&part, &final_path).await.unwrap();
+
+        assert!(!part.exists());
+        assert!(final_path.exists());
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"image data");
+    }
+
+    #[tokio::test]
+    async fn rename_part_to_final_destination_already_exists() {
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("photo.part");
+        let final_path = dir.path().join("photo.jpg");
+        tokio::fs::write(&final_path, b"existing").await.unwrap();
+        tokio::fs::write(&part, b"duplicate").await.unwrap();
+
+        // Should succeed regardless of platform behavior:
+        // - Linux: rename atomically overwrites (Ok path)
+        // - Windows: rename fails, guard detects existing file and cleans .part
+        rename_part_to_final(&part, &final_path).await.unwrap();
+
+        assert!(!part.exists(), ".part should not remain");
+        assert!(final_path.exists(), "final file should exist");
+    }
+
+    #[tokio::test]
+    async fn rename_part_to_final_nonexistent_part_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("missing.part");
+        let final_path = dir.path().join("photo.jpg");
+
+        let result = rename_part_to_final(&part, &final_path).await;
+        assert!(result.is_err(), "should fail when .part doesn't exist");
     }
 }
