@@ -63,10 +63,10 @@ cargo build --release
 ## Quick start
 
 ```sh
-kei sync -u you@example.com -d ~/Photos/iCloud
+kei sync -u you@example.com -d ~/Photos/iCloud --save-password
 ```
 
-You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to approve 2FA on a trusted device. Downloads start right after. On first run, kei saves your username and directory to `~/.config/kei/config.toml` so subsequent runs are just:
+You'll be prompted for your password (or set `ICLOUD_PASSWORD`), then asked to approve 2FA on a trusted device. Downloads start right after. `--save-password` encrypts your password in the OS keyring (or an AES-256 file on headless systems), and kei saves your username and directory to `~/.config/kei/config.toml`, so subsequent runs are just:
 
 ```sh
 kei sync
@@ -74,7 +74,7 @@ kei sync
 
 Or use the interactive wizard: `kei config setup`.
 
-For long-running setups (Docker, cron, systemd), use `--password-file`, `--password-command`, or `kei password set` to avoid storing passwords in environment variables. See the [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) wiki page.
+For Docker, cron, and systemd setups, `--password-file` and `--password-command` give you more control over secret delivery. See the [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) wiki page.
 
 ## Usage
 
