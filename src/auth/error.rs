@@ -65,6 +65,18 @@ impl AuthError {
         matches!(self, Self::LockContention(_))
     }
 
+    /// Check if this error indicates Apple is rate limiting requests (HTTP 503).
+    ///
+    /// When rate limited, callers should back off rather than escalating to
+    /// heavier auth flows (e.g. SRP) which would worsen the rate limit.
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            Self::ApiError { code, .. } => *code == 503,
+            Self::ServiceError { code, .. } => code == "http_503",
+            _ => false,
+        }
+    }
+
     /// Build a `ServiceError` with an enriched message for well-known Apple error codes.
     pub(crate) fn service_error(code: &str, raw_message: &str) -> Self {
         let upper = code.to_ascii_uppercase();
@@ -213,6 +225,61 @@ mod tests {
         assert!(err.to_string().contains("Something broke"));
         assert!(!err.to_string().contains("wait"));
         assert!(!err.to_string().contains("set up"));
+    }
+
+    #[test]
+    fn api_error_503_is_rate_limited() {
+        let err = AuthError::ApiError {
+            code: 503,
+            message: "HTTP 503 from Apple auth service".into(),
+        };
+        assert!(err.is_rate_limited());
+    }
+
+    #[test]
+    fn service_error_http_503_is_rate_limited() {
+        let err = AuthError::ServiceError {
+            code: "http_503".into(),
+            message: "Apple server error during validation (HTTP 503)".into(),
+        };
+        assert!(err.is_rate_limited());
+    }
+
+    #[test]
+    fn api_error_other_codes_not_rate_limited() {
+        for code in [401, 403, 421, 500, 502, 504] {
+            let err = AuthError::ApiError {
+                code,
+                message: "test".into(),
+            };
+            assert!(
+                !err.is_rate_limited(),
+                "code {code} should not be rate limited"
+            );
+        }
+    }
+
+    #[test]
+    fn service_error_other_codes_not_rate_limited() {
+        for code in ["http_500", "http_502", "AUTH-401", "test"] {
+            let err = AuthError::ServiceError {
+                code: code.into(),
+                message: "test".into(),
+            };
+            assert!(
+                !err.is_rate_limited(),
+                "code {code} should not be rate limited"
+            );
+        }
+    }
+
+    #[test]
+    fn non_api_variants_not_rate_limited() {
+        assert!(!AuthError::FailedLogin("test".into()).is_rate_limited());
+        assert!(!AuthError::InvalidToken("test".into()).is_rate_limited());
+        assert!(!AuthError::TwoFactorFailed("test".into()).is_rate_limited());
+        assert!(!AuthError::TwoFactorRequired.is_rate_limited());
+        assert!(!AuthError::LockContention("test".into()).is_rate_limited());
     }
 
     #[test]
