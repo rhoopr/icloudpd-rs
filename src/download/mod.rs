@@ -703,6 +703,7 @@ pub async fn download_photos_with_sync(
     config: Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
+    let sync_started_at = chrono::Utc::now().timestamp();
     cleanup_orphan_part_files(&config).await;
 
     // Give every non-downloaded asset a fresh start this sync:
@@ -811,7 +812,7 @@ pub async fn download_photos_with_sync(
     // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.
     if let Some(db) = &config.state_db {
         if !shutdown_token.is_cancelled() {
-            match db.promote_pending_to_failed().await {
+            match db.promote_pending_to_failed(sync_started_at).await {
                 Ok(promoted) if promoted > 0 => {
                     tracing::warn!(
                         count = promoted,

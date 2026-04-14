@@ -509,6 +509,14 @@ where
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
                     if tasks.is_empty() {
+                        // Asset was enumerated but produced no tasks (files on
+                        // disk or dedup'd). Update last_seen_at so
+                        // promote_pending_to_failed knows this asset was seen.
+                        if let Some(db) = &producer_state_db {
+                            if let Err(e) = db.touch_last_seen(asset.id()).await {
+                                tracing::debug!(error = %e, asset_id = asset.id(), "Failed to touch last_seen for on-disk asset");
+                            }
+                        }
                         skips.by_filter += 1;
                         producer_pb.inc(1);
                     } else {
@@ -1725,7 +1733,7 @@ mod tests {
         async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
             Ok((0, 0, 0))
         }
-        async fn promote_pending_to_failed(&self) -> Result<u64, StateError> {
+        async fn promote_pending_to_failed(&self, _seen_since: i64) -> Result<u64, StateError> {
             Ok(0)
         }
         async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {

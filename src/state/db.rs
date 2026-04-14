@@ -97,13 +97,13 @@ pub trait StateDb: Send + Sync {
     /// (failed_reset, pending_reset, total_pending).
     async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError>;
 
-    /// Promote all remaining pending assets to failed.
+    /// Promote stale pending assets to failed.
     ///
-    /// Called at the end of a non-interrupted sync run. Pending is a transient
-    /// state that should only exist during a sync — anything still pending
-    /// when the run finishes either wasn't enumerated by the API or failed
-    /// silently. Returns the number of assets promoted.
-    async fn promote_pending_to_failed(&self) -> Result<u64, StateError>;
+    /// Called at the end of a non-interrupted sync run. Only promotes pending
+    /// assets whose `last_seen_at` is before `seen_since` - assets seen
+    /// during this sync (including on-disk skips) are left alone.
+    /// Returns the number of assets promoted.
+    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError>;
 
     // ── Bulk read operations ──
 
@@ -560,14 +560,14 @@ impl StateDb for SqliteStateDb {
         Ok((failed, pending, total_pending))
     }
 
-    async fn promote_pending_to_failed(&self) -> Result<u64, StateError> {
+    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
         let conn = self.acquire_lock("promote_pending_to_failed")?;
 
         let promoted = conn
             .execute(
                 "UPDATE assets SET status = 'failed', last_error = 'Not resolved during sync' \
-                 WHERE status = 'pending'",
-                [],
+                 WHERE status = 'pending' AND (last_seen_at IS NULL OR last_seen_at < ?1)",
+                rusqlite::params![seen_since],
             )
             .map_err(|e| StateError::query(&e))? as u64;
 
@@ -1885,7 +1885,9 @@ mod tests {
         assert_eq!(before.pending, 2);
         assert_eq!(before.failed, 1);
 
-        let promoted = db.promote_pending_to_failed().await.unwrap();
+        // Use a future timestamp so all pending assets are considered stale
+        let future = chrono::Utc::now().timestamp() + 3600;
+        let promoted = db.promote_pending_to_failed(future).await.unwrap();
         assert_eq!(promoted, 2);
 
         let after = db.get_summary().await.unwrap();
