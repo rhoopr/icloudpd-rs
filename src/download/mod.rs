@@ -82,6 +82,108 @@ fn truncate_date_to_day(dt: Option<DateTime<Utc>>) -> Option<chrono::NaiveDate> 
     dt.map(|d| d.date_naive())
 }
 
+/// Hash an `Option<NaiveDate>` with a tag byte for `None`/`Some` and the
+/// "YYYY-MM-DD" Display representation for the date value.
+fn hash_optional_date(hasher: &mut sha2::Sha256, date: Option<chrono::NaiveDate>) {
+    use sha2::Digest;
+    match date {
+        None => hasher.update([0]),
+        Some(d) => {
+            hasher.update([1]);
+            hasher.update(d.to_string().as_bytes());
+        }
+    }
+}
+
+/// Hash an `Option<u32>` with a tag byte for `None`/`Some` and the
+/// little-endian bytes of the inner value.
+fn hash_optional_u32(hasher: &mut sha2::Sha256, val: Option<u32>) {
+    use sha2::Digest;
+    match val {
+        None => hasher.update([0]),
+        Some(n) => {
+            hasher.update([1]);
+            hasher.update(n.to_le_bytes());
+        }
+    }
+}
+
+/// Finalize a SHA-256 hasher into a 16-char hex string (first 8 bytes).
+fn finalize_hash(hasher: sha2::Sha256) -> String {
+    use sha2::Digest;
+    use std::fmt::Write;
+
+    let hash = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    // First 8 bytes is plenty for collision avoidance in this context
+    for &b in &hash[..8] {
+        let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+    }
+    hex
+}
+
+/// Fields shared between [`hash_download_config`] and [`compute_config_hash`]
+/// that affect path resolution and asset eligibility.
+struct SharedHashFields<'a> {
+    directory: &'a std::path::Path,
+    folder_structure: &'a str,
+    size: AssetVersionSize,
+    live_photo_size: AssetVersionSize,
+    file_match_policy: FileMatchPolicy,
+    live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
+    align_raw: RawTreatmentPolicy,
+    keep_unicode_in_filenames: bool,
+    skip_created_before: Option<DateTime<Utc>>,
+    skip_created_after: Option<DateTime<Utc>>,
+    force_size: bool,
+    skip_videos: bool,
+    skip_photos: bool,
+    live_photo_mode: LivePhotoMode,
+    filename_exclude: &'a [glob::Pattern],
+}
+
+/// Hash the shared config fields into the hasher. All enum values use
+/// `repr(u8)` byte representations and dates use "YYYY-MM-DD" Display
+/// format for stability across compiler/library upgrades.
+fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
+    use sha2::Digest;
+
+    hasher.update(f.directory.as_os_str().as_encoded_bytes());
+    hasher.update(b"\0");
+    hasher.update(f.folder_structure.as_bytes());
+    hasher.update(b"\0");
+    hasher.update([f.size as u8]);
+    hasher.update([f.live_photo_size as u8]);
+    hasher.update([f.file_match_policy as u8]);
+    hasher.update([f.live_photo_mov_filename_policy as u8]);
+    hasher.update([f.align_raw as u8]);
+    hasher.update([u8::from(f.keep_unicode_in_filenames)]);
+    // Filter fields: changing these affects which assets are eligible, so we
+    // must invalidate the trust-state cache (and stored sync tokens) to avoid
+    // skipping newly-eligible assets on incremental syncs.
+    //
+    // Dates are truncated to day precision before hashing so that relative
+    // intervals like "20d" (resolved to now-minus-20-days at parse time)
+    // produce a stable hash across consecutive runs on the same day.
+    hash_optional_date(hasher, truncate_date_to_day(f.skip_created_before));
+    hash_optional_date(hasher, truncate_date_to_day(f.skip_created_after));
+    hasher.update([u8::from(f.force_size)]);
+    hasher.update([u8::from(f.skip_videos)]);
+    hasher.update([u8::from(f.skip_photos)]);
+    hasher.update([f.live_photo_mode as u8]);
+    // filename_exclude patterns affect which assets are eligible
+    let mut sorted_excludes: Vec<&str> = f
+        .filename_exclude
+        .iter()
+        .map(glob::Pattern::as_str)
+        .collect();
+    sorted_excludes.sort_unstable();
+    for pattern in &sorted_excludes {
+        hasher.update(pattern.as_bytes());
+        hasher.update(b"\0");
+    }
+}
+
 /// Compute a deterministic hash of the config fields that affect path resolution.
 ///
 /// When this hash changes between runs, we can't trust the state DB's download
@@ -92,51 +194,31 @@ fn truncate_date_to_day(dt: Option<DateTime<Utc>>) -> Option<chrono::NaiveDate> 
 /// before the incremental-vs-full decision when the download config changes.
 pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     use sha2::{Digest, Sha256};
-    use std::fmt::Write;
 
     let mut hasher = Sha256::new();
-    hasher.update(config.directory.as_os_str().as_encoded_bytes());
-    hasher.update(b"\0");
-    hasher.update(config.folder_structure.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(format!("{:?}", config.size).as_bytes());
-    hasher.update(format!("{:?}", config.live_photo_size).as_bytes());
-    hasher.update(format!("{:?}", config.file_match_policy).as_bytes());
-    hasher.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
-    hasher.update(format!("{:?}", config.align_raw).as_bytes());
-    hasher.update([u8::from(config.keep_unicode_in_filenames)]);
-    // Filter fields: changing these affects which assets are eligible, so we
-    // must invalidate the trust-state cache (and stored sync tokens) to avoid
-    // skipping newly-eligible assets on incremental syncs.
-    //
-    // Dates are truncated to day precision before hashing so that relative
-    // intervals like "20d" (resolved to now-minus-20-days at parse time)
-    // produce a stable hash across consecutive runs on the same day.
-    hasher.update(format!("{:?}", truncate_date_to_day(config.skip_created_before)).as_bytes());
-    hasher.update(format!("{:?}", truncate_date_to_day(config.skip_created_after)).as_bytes());
-    hasher.update(format!("{:?}", config.recent).as_bytes());
-    hasher.update([u8::from(config.force_size)]);
-    hasher.update([u8::from(config.skip_videos)]);
-    hasher.update([u8::from(config.skip_photos)]);
-    hasher.update([config.live_photo_mode as u8]);
-    // filename_exclude patterns affect which assets are eligible
-    let mut sorted_excludes: Vec<&str> = config
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    sorted_excludes.sort_unstable();
-    for pattern in &sorted_excludes {
-        hasher.update(pattern.as_bytes());
-        hasher.update(b"\0");
-    }
-    let hash = hasher.finalize();
-    let mut hex = String::with_capacity(16);
-    // First 8 bytes is plenty for collision avoidance in this context
-    for &b in &hash[..8] {
-        let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
-    }
-    hex
+    hash_shared_fields(
+        &mut hasher,
+        &SharedHashFields {
+            directory: &config.directory,
+            folder_structure: &config.folder_structure,
+            size: config.size,
+            live_photo_size: config.live_photo_size,
+            file_match_policy: config.file_match_policy,
+            live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
+            align_raw: config.align_raw,
+            keep_unicode_in_filenames: config.keep_unicode_in_filenames,
+            skip_created_before: config.skip_created_before,
+            skip_created_after: config.skip_created_after,
+            force_size: config.force_size,
+            skip_videos: config.skip_videos,
+            skip_photos: config.skip_photos,
+            live_photo_mode: config.live_photo_mode,
+            filename_exclude: &config.filename_exclude,
+        },
+    );
+    // `recent` affects which already-downloaded assets to trust/skip
+    hash_optional_u32(&mut hasher, config.recent);
+    finalize_hash(hasher)
 }
 
 /// Compute the config hash from the app-level `Config`.
@@ -151,7 +233,6 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
 /// sync tokens so the next run does a full enumeration.
 pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     use sha2::{Digest, Sha256};
-    use std::fmt::Write;
 
     let size: AssetVersionSize = config.size.into();
     let live_photo_size = config.live_photo_size.to_asset_version_size();
@@ -163,30 +244,35 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
         .map(|d| d.with_timezone(&chrono::Utc));
 
     let mut hasher = Sha256::new();
-    hasher.update(config.directory.as_os_str().as_encoded_bytes());
-    hasher.update(b"\0");
-    hasher.update(config.folder_structure.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(format!("{size:?}").as_bytes());
-    hasher.update(format!("{live_photo_size:?}").as_bytes());
-    hasher.update(format!("{:?}", config.file_match_policy).as_bytes());
-    hasher.update(format!("{:?}", config.live_photo_mov_filename_policy).as_bytes());
-    hasher.update(format!("{:?}", config.align_raw).as_bytes());
-    hasher.update([u8::from(config.keep_unicode_in_filenames)]);
-    hasher.update(format!("{:?}", truncate_date_to_day(skip_created_before)).as_bytes());
-    hasher.update(format!("{:?}", truncate_date_to_day(skip_created_after)).as_bytes());
+    hash_shared_fields(
+        &mut hasher,
+        &SharedHashFields {
+            directory: &config.directory,
+            folder_structure: &config.folder_structure,
+            size,
+            live_photo_size,
+            file_match_policy: config.file_match_policy,
+            live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
+            align_raw: config.align_raw,
+            keep_unicode_in_filenames: config.keep_unicode_in_filenames,
+            skip_created_before,
+            skip_created_after,
+            force_size: config.force_size,
+            skip_videos: config.skip_videos,
+            skip_photos: config.skip_photos,
+            live_photo_mode: config.live_photo_mode,
+            filename_exclude: &config.filename_exclude,
+        },
+    );
     // Note: `recent` is intentionally excluded from this enum hash.
     // Changing --recent should not invalidate sync tokens because the
     // incremental path already applies the recent cap post-fetch.
     // `recent` IS included in hash_download_config (trust-state) so
     // changing it still triggers filesystem re-verification.
-    hasher.update([u8::from(config.force_size)]);
-    hasher.update([u8::from(config.skip_videos)]);
-    hasher.update([u8::from(config.skip_photos)]);
+
     // Enumeration-filter fields: changing these affects WHICH assets are
     // fetched from iCloud, so sync tokens must be invalidated to avoid
     // missing assets that are newly eligible under the changed filters.
-    hasher.update([config.live_photo_mode as u8]);
     for album in &config.albums {
         hasher.update(album.as_bytes());
         hasher.update(b"\0");
@@ -202,24 +288,15 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
         hasher.update(name.as_bytes());
         hasher.update(b"\0");
     }
-    let mut sorted_fn_excludes: Vec<&str> = config
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    sorted_fn_excludes.sort_unstable();
-    for pattern in &sorted_fn_excludes {
-        hasher.update(b"fnexclude:");
-        hasher.update(pattern.as_bytes());
-        hasher.update(b"\0");
+    // Library selection: tag byte + name bytes for Single variant
+    match &config.library {
+        crate::config::LibrarySelection::All => hasher.update([0]),
+        crate::config::LibrarySelection::Single(name) => {
+            hasher.update([1]);
+            hasher.update(name.as_bytes());
+        }
     }
-    hasher.update(format!("{:?}", config.library).as_bytes());
-    let hash = hasher.finalize();
-    let mut hex = String::with_capacity(16);
-    for &b in &hash[..8] {
-        let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
-    }
-    hex
+    finalize_hash(hasher)
 }
 
 /// Subset of application config consumed by the download engine.
@@ -2031,6 +2108,85 @@ mod tests {
             compute_config_hash(&a),
             compute_config_hash(&b),
             "changing filename_exclude should change the config hash"
+        );
+    }
+
+    // ── Golden-hash stability tests ─────────────────────────────────
+    //
+    // These pin specific config values to specific hex outputs. If any
+    // test fails, it means the hash encoding changed -- which would
+    // trigger unnecessary full re-syncs for all users. Only update the
+    // expected values when the hash change is intentional.
+
+    #[test]
+    fn golden_hash_download_config_defaults() {
+        let config = test_config();
+        let hash = hash_download_config(&config);
+        assert_eq!(
+            hash, "557d246ae277e4aa",
+            "hash_download_config golden hash changed -- this will trigger full re-syncs"
+        );
+    }
+
+    #[test]
+    fn golden_hash_download_config_non_defaults() {
+        let mut config = test_config();
+        config.directory = PathBuf::from("/my/photos");
+        config.folder_structure = "{:%Y/%m}".to_string();
+        config.size = AssetVersionSize::Medium;
+        config.live_photo_size = AssetVersionSize::LiveMedium;
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        config.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Original;
+        config.align_raw = RawTreatmentPolicy::PreferAlternative;
+        config.keep_unicode_in_filenames = true;
+        config.skip_created_before = Some(
+            DateTime::parse_from_rfc3339("2020-06-15T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        config.skip_created_after = Some(
+            DateTime::parse_from_rfc3339("2024-12-31T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        config.recent = Some(500);
+        config.force_size = true;
+        config.skip_videos = true;
+        config.skip_photos = false;
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
+        config.filename_exclude = vec![
+            glob::Pattern::new("*.AAE").unwrap(),
+            glob::Pattern::new("*.THM").unwrap(),
+        ];
+        let hash = hash_download_config(&config);
+        assert_eq!(
+            hash, "e17212f54c74936b",
+            "hash_download_config golden hash changed -- this will trigger full re-syncs"
+        );
+    }
+
+    #[test]
+    fn golden_compute_config_hash_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let config = build_config_with(tmp.path(), "/photos", |_| {});
+        let hash = compute_config_hash(&config);
+        assert_eq!(
+            hash, "3854469db16cc4b3",
+            "compute_config_hash golden hash changed -- this will invalidate sync tokens"
+        );
+    }
+
+    #[test]
+    fn golden_compute_config_hash_with_albums() {
+        let tmp = TempDir::new().unwrap();
+        let config = build_config_with(tmp.path(), "/photos", |s| {
+            s.albums = vec!["Favorites".to_string(), "Travel".to_string()];
+            s.exclude_albums = vec!["Hidden".to_string()];
+        });
+        let hash = compute_config_hash(&config);
+        assert_eq!(
+            hash, "317609ad3f64f1b3",
+            "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
 }
