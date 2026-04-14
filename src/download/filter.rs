@@ -309,6 +309,167 @@ pub(super) async fn pre_ensure_asset_dir(
     dir_cache.ensure_dir_async(&parent).await;
 }
 
+/// How to resolve a path that collides with an existing file or in-flight download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollisionStrategy {
+    /// Compare sizes: same size = skip, different size = generate a dedup path.
+    /// When `skip_zero_size` is true, a version with size 0 is treated as
+    /// "size unknown" and never matches (always dedup).
+    SizeDedup { skip_zero_size: bool },
+    /// The file's identity is already encoded in the filename (name-id7).
+    /// Any existing file at the path means "already downloaded" -- skip.
+    SkipIfExists,
+}
+
+/// Shared context for `resolve_download_path` -- groups the mutable/config
+/// references that every call needs so the function stays under clippy's
+/// argument limit.
+struct ResolveContext<'a> {
+    config: &'a DownloadConfig,
+    created_local: &'a DateTime<Local>,
+    claimed_paths: &'a FxHashMap<NormalizedPath, u64>,
+    dir_cache: &'a mut paths::DirCache,
+}
+
+/// Resolve the final download path for a single version, handling on-disk
+/// files, AM/PM whitespace variants, and in-flight claimed paths.
+///
+/// Returns `Some(path)` when the file should be downloaded, or `None` to skip.
+///
+/// `check_ampm`: when true, also checks AM/PM whitespace variants on disk
+/// (relevant for primary photos whose timestamps contain AM/PM).
+///
+/// `make_dedup_filename`: called when a collision with a different-sized file
+/// is detected. Returns the deduplicated filename to try.
+fn resolve_download_path(
+    download_path: &Path,
+    version_size: u64,
+    asset_id: &str,
+    strategy: CollisionStrategy,
+    ctx: &mut ResolveContext<'_>,
+    check_ampm: bool,
+    make_dedup_filename: impl FnOnce() -> String,
+    label: &str,
+) -> Option<PathBuf> {
+    // Check for the file on disk. For primary photos, also check AM/PM
+    // whitespace variants (e.g., "1.40.01 PM.PNG" vs "1.40.01\u{202F}PM.PNG").
+    let on_disk_size = ctx.dir_cache.file_size(download_path).or_else(|| {
+        if !check_ampm {
+            return None;
+        }
+        let variant = ctx.dir_cache.find_ampm_variant(download_path)?;
+        Some(ctx.dir_cache.file_size(&variant).unwrap_or(0))
+    });
+
+    // Determine whether the existing size (on disk or in-flight) is a match.
+    // `source` is used only for log messages.
+    let (existing_size, source) = if let Some(size) = on_disk_size {
+        (Some(size), "on-disk")
+    } else {
+        let normalized = NormalizedPath::normalize(download_path);
+        if let Some(&size) = ctx.claimed_paths.get(normalized.as_ref()) {
+            (Some(size), "in-flight")
+        } else {
+            (None, "")
+        }
+    };
+
+    let Some(existing_size) = existing_size else {
+        // Path is unclaimed -- use it directly.
+        return Some(download_path.to_path_buf());
+    };
+
+    match strategy {
+        CollisionStrategy::SkipIfExists => {
+            if source == "on-disk" {
+                tracing::info!(
+                    asset_id,
+                    path = %download_path.display(),
+                    "Skipping {label}: file exists (name-id7)"
+                );
+            } else {
+                tracing::info!(
+                    asset_id,
+                    path = %download_path.display(),
+                    "Skipping {label}: path claimed in-flight (name-id7)"
+                );
+            }
+            None
+        }
+        CollisionStrategy::SizeDedup { skip_zero_size } => {
+            let sizes_match =
+                (!skip_zero_size || version_size > 0) && existing_size == version_size;
+
+            if sizes_match {
+                if source == "on-disk" {
+                    tracing::info!(
+                        asset_id,
+                        path = %download_path.display(),
+                        size = version_size,
+                        "Skipping {label}: file exists with same name and size"
+                    );
+                } else {
+                    tracing::info!(
+                        asset_id,
+                        path = %download_path.display(),
+                        size = version_size,
+                        "Skipping {label}: {source} download has same name and size"
+                    );
+                }
+                return None;
+            }
+
+            // Different size -- deduplicate.
+            let dedup_filename = make_dedup_filename();
+            let dedup_path = paths::local_download_path(
+                &ctx.config.directory,
+                &ctx.config.folder_structure,
+                ctx.created_local,
+                &dedup_filename,
+                ctx.config.album_name.as_deref(),
+            );
+            let dedup_key = NormalizedPath::normalize(&dedup_path);
+            if ctx.dir_cache.exists(&dedup_path)
+                || ctx.claimed_paths.contains_key(dedup_key.as_ref())
+            {
+                if source == "on-disk" {
+                    tracing::info!(
+                        asset_id,
+                        path = %dedup_path.display(),
+                        "Skipping {label}: dedup path already exists"
+                    );
+                } else {
+                    tracing::info!(
+                        asset_id,
+                        path = %dedup_path.display(),
+                        "Skipping {label}: dedup path already claimed in-flight"
+                    );
+                }
+                None
+            } else {
+                if source == "on-disk" {
+                    tracing::debug!(
+                        path = %download_path.display(),
+                        on_disk_size = existing_size,
+                        expected_size = version_size,
+                        dedup_path = %dedup_path.display(),
+                        "{label} collision: already exists with different size"
+                    );
+                } else {
+                    tracing::debug!(
+                        path = %download_path.display(),
+                        claimed_size = existing_size,
+                        expected_size = version_size,
+                        dedup_path = %dedup_path.display(),
+                        "{label} {source} collision: claimed with different size"
+                    );
+                }
+                Some(dedup_path)
+            }
+        }
+    }
+}
+
 /// Apply content filters (type, date range) and local existence check,
 /// producing download tasks for assets that need fetching.
 /// Returns up to two tasks: the primary photo/video and an optional live photo MOV.
@@ -422,137 +583,31 @@ pub(super) fn filter_asset_to_tasks(
             &filename,
             config.album_name.as_deref(),
         );
-        // Determine the final download path, applying size-based deduplication if needed.
-        // Check both on-disk files AND in-flight downloads (claimed_paths) to handle
-        // concurrent downloads of assets with the same filename.
-        // Check for the file on disk, including AM/PM whitespace variants
-        // (e.g., "1.40.01 PM.PNG" vs "1.40.01\u{202F}PM.PNG")
-        let existing_with_size = dir_cache
-            .file_size(&download_path)
-            .map(|size| (download_path.clone(), size))
-            .or_else(|| {
-                let variant = dir_cache.find_ampm_variant(&download_path)?;
-                let size = dir_cache.file_size(&variant).unwrap_or(0);
-                Some((variant, size))
-            });
-        let final_path = if let Some((_, on_disk_size)) = existing_with_size {
-            match config.file_match_policy {
-                FileMatchPolicy::NameSizeDedupWithSuffix => {
-                    if version.size > 0 && on_disk_size == version.size {
-                        // Same size — likely already downloaded, skip.
-                        tracing::info!(
-                            asset_id = asset.id(),
-                            path = %download_path.display(),
-                            size = version.size,
-                            "Skipping asset: file exists with same name and size"
-                        );
-                        None
-                    } else {
-                        // Different size — deduplicate by appending file size to filename.
-                        let dedup_filename = paths::add_dedup_suffix(&filename, version.size);
-                        let dedup_path = paths::local_download_path(
-                            &config.directory,
-                            &config.folder_structure,
-                            &created_local,
-                            &dedup_filename,
-                            config.album_name.as_deref(),
-                        );
-                        // Use normalize() for lookup to avoid PathBuf clone
-                        let dedup_key = NormalizedPath::normalize(&dedup_path);
-                        if dir_cache.exists(&dedup_path)
-                            || claimed_paths.contains_key(dedup_key.as_ref())
-                        {
-                            tracing::info!(
-                                asset_id = asset.id(),
-                                path = %dedup_path.display(),
-                                "Skipping asset: dedup path already exists"
-                            );
-                            None
-                        } else {
-                            tracing::debug!(
-                                path = %download_path.display(),
-                                on_disk_size,
-                                expected_size = version.size,
-                                dedup_path = %dedup_path.display(),
-                                "File collision: already exists with different size"
-                            );
-                            Some(dedup_path)
-                        }
-                    }
-                }
-                FileMatchPolicy::NameId7 => {
-                    // name-id7 policy adds asset ID to ALL filenames, not just collisions.
-                    // If the file exists, it's already downloaded, skip.
-                    tracing::info!(
-                        asset_id = asset.id(),
-                        path = %download_path.display(),
-                        "Skipping asset: file exists (name-id7)"
-                    );
-                    None
-                }
-            }
-        } else if let Some(&claimed_size) =
-            // Use normalize() for lookup to avoid PathBuf clone
-            claimed_paths.get(NormalizedPath::normalize(&download_path).as_ref())
-        {
-            // Path is claimed by an in-flight download — check for size collision.
-            // Use normalized paths for collision detection to handle case-insensitive
-            // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
-            match config.file_match_policy {
-                FileMatchPolicy::NameSizeDedupWithSuffix => {
-                    if version.size > 0 && claimed_size == version.size {
-                        // Same size — likely duplicate asset, skip.
-                        tracing::info!(
-                            asset_id = asset.id(),
-                            path = %download_path.display(),
-                            size = version.size,
-                            "Skipping asset: in-flight download has same name and size"
-                        );
-                        None
-                    } else {
-                        // Different size — deduplicate by appending file size to filename.
-                        let dedup_filename = paths::add_dedup_suffix(&filename, version.size);
-                        let dedup_path = paths::local_download_path(
-                            &config.directory,
-                            &config.folder_structure,
-                            &created_local,
-                            &dedup_filename,
-                            config.album_name.as_deref(),
-                        );
-                        // Use normalize() for lookup to avoid PathBuf clone
-                        let dedup_key = NormalizedPath::normalize(&dedup_path);
-                        if dir_cache.exists(&dedup_path)
-                            || claimed_paths.contains_key(dedup_key.as_ref())
-                        {
-                            tracing::info!(
-                                asset_id = asset.id(),
-                                path = %dedup_path.display(),
-                                "Skipping asset: dedup path already claimed in-flight"
-                            );
-                            None
-                        } else {
-                            tracing::debug!(
-                                path = %download_path.display(),
-                                claimed_size,
-                                expected_size = version.size,
-                                dedup_path = %dedup_path.display(),
-                                "In-flight collision: claimed with different size"
-                            );
-                            Some(dedup_path)
-                        }
-                    }
-                }
-                FileMatchPolicy::NameId7 => {
-                    tracing::info!(
-                        asset_id = asset.id(),
-                        path = %download_path.display(),
-                        "Skipping asset: path claimed in-flight (name-id7)"
-                    );
-                    None
-                }
-            }
-        } else {
-            Some(download_path.clone())
+
+        let strategy = match config.file_match_policy {
+            FileMatchPolicy::NameId7 => CollisionStrategy::SkipIfExists,
+            FileMatchPolicy::NameSizeDedupWithSuffix => CollisionStrategy::SizeDedup {
+                skip_zero_size: true,
+            },
+        };
+
+        let final_path = {
+            let mut ctx = ResolveContext {
+                config,
+                created_local: &created_local,
+                claimed_paths,
+                dir_cache,
+            };
+            resolve_download_path(
+                &download_path,
+                version.size,
+                asset.id(),
+                strategy,
+                &mut ctx,
+                true, // check AM/PM variants for primary photos
+                || paths::add_dedup_suffix(&filename, version.size),
+                "asset",
+            )
         };
 
         if let Some(path) = &final_path {
@@ -618,93 +673,29 @@ pub(super) fn filter_asset_to_tasks(
                 &mov_filename,
                 config.album_name.as_deref(),
             );
-            // If the path already exists (on disk or claimed), it may be a different
-            // file (e.g. a regular video) that collides with the live photo companion
-            // name. Detect this by comparing sizes; on mismatch, deduplicate using
-            // the asset ID.
-            //
-            // Use normalized paths for collision detection to handle case-insensitive
-            // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
-            let mov_key = NormalizedPath::normalize(&mov_path);
-            let final_mov_path = if let Some(on_disk_size) = dir_cache.file_size(&mov_path) {
-                if on_disk_size == live_version.size {
-                    // Same size — likely already downloaded, skip.
-                    tracing::info!(
-                        asset_id = asset.id(),
-                        path = %mov_path.display(),
-                        "Skipping live photo MOV: already exists with same size"
-                    );
-                    None
-                } else {
-                    // Collision with a different file — deduplicate.
-                    let dedup_filename = paths::insert_suffix(&mov_filename, asset.id());
-                    let dedup_path = paths::local_download_path(
-                        &config.directory,
-                        &config.folder_structure,
-                        &created_local,
-                        &dedup_filename,
-                        config.album_name.as_deref(),
-                    );
-                    let dedup_key = NormalizedPath::normalize(&dedup_path);
-                    if dir_cache.exists(&dedup_path)
-                        || claimed_paths.contains_key(dedup_key.as_ref())
-                    {
-                        tracing::info!(
-                            asset_id = asset.id(),
-                            path = %dedup_path.display(),
-                            "Skipping live photo MOV: dedup path already exists"
-                        );
-                        None
-                    } else {
-                        tracing::debug!(
-                            path = %mov_path.display(),
-                            dedup_path = %dedup_path.display(),
-                            "Live photo MOV collision: already exists with different size"
-                        );
-                        Some(dedup_path)
-                    }
-                }
-            } else if let Some(&claimed_size) = claimed_paths.get(mov_key.as_ref()) {
-                // Path is claimed by an in-flight download
-                if claimed_size == live_version.size {
-                    tracing::info!(
-                        asset_id = asset.id(),
-                        path = %mov_path.display(),
-                        "Skipping live photo MOV: in-flight with same size"
-                    );
-                    None
-                } else {
-                    // Collision with in-flight download — deduplicate.
-                    let dedup_filename = paths::insert_suffix(&mov_filename, asset.id());
-                    let dedup_path = paths::local_download_path(
-                        &config.directory,
-                        &config.folder_structure,
-                        &created_local,
-                        &dedup_filename,
-                        config.album_name.as_deref(),
-                    );
-                    let dedup_key = NormalizedPath::normalize(&dedup_path);
-                    if dir_cache.exists(&dedup_path)
-                        || claimed_paths.contains_key(dedup_key.as_ref())
-                    {
-                        tracing::info!(
-                            asset_id = asset.id(),
-                            path = %dedup_path.display(),
-                            "Skipping live photo MOV: dedup path already claimed in-flight"
-                        );
-                        None
-                    } else {
-                        tracing::debug!(
-                            path = %mov_path.display(),
-                            dedup_path = %dedup_path.display(),
-                            "Live photo MOV in-flight collision"
-                        );
-                        Some(dedup_path)
-                    }
-                }
-            } else {
-                Some(mov_path)
+
+            let asset_id = asset.id();
+            let final_mov_path = {
+                let mut ctx = ResolveContext {
+                    config,
+                    created_local: &created_local,
+                    claimed_paths,
+                    dir_cache,
+                };
+                resolve_download_path(
+                    &mov_path,
+                    live_version.size,
+                    asset_id,
+                    CollisionStrategy::SizeDedup {
+                        skip_zero_size: false,
+                    },
+                    &mut ctx,
+                    false, // no AM/PM variants for MOV companions
+                    || paths::insert_suffix(&mov_filename, asset_id),
+                    "live photo MOV",
+                )
             };
+
             if let Some(path) = final_mov_path {
                 // Clone for the normalized key, move original into DownloadTask
                 claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
