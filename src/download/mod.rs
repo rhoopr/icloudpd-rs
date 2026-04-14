@@ -1432,6 +1432,27 @@ pub async fn download_photos_with_sync(
 ) -> Result<SyncResult> {
     cleanup_orphan_part_files(&config).await;
 
+    // Transition any pending assets that already exceeded the retry limit to
+    // failed. This cleans up assets stuck from before the fix that marks them
+    // at skip time.
+    if config.max_download_attempts > 0 {
+        if let Some(db) = &config.state_db {
+            match db.fail_exceeded_pending(config.max_download_attempts).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(
+                        count = n,
+                        max = config.max_download_attempts,
+                        "Marked stuck pending assets as failed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to clean up stuck pending assets");
+                }
+                _ => {}
+            }
+        }
+    }
+
     match &config.sync_mode {
         SyncMode::Full => {
             download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
@@ -2187,7 +2208,7 @@ where
                         producer_pb.inc(1);
                     } else {
                         for task in tasks {
-                            // Mark assets that have exceeded the retry limit as failed.
+                            // Skip assets that have exceeded the retry limit.
                             if let Some(&attempts) =
                                 download_ctx.attempt_counts.get(task.asset_id.as_ref())
                             {
@@ -2198,28 +2219,8 @@ where
                                         asset_id = %task.asset_id,
                                         attempts,
                                         max = config.max_download_attempts,
-                                        "Asset exceeded max download attempts, marking as failed"
+                                        "Skipping asset: exceeded max download attempts"
                                     );
-                                    if let Some(db) = &producer_state_db {
-                                        let error = format!(
-                                            "Exceeded max download attempts ({attempts}/{})",
-                                            config.max_download_attempts
-                                        );
-                                        if let Err(e) = db
-                                            .mark_failed(
-                                                &task.asset_id,
-                                                task.version_size.as_str(),
-                                                &error,
-                                            )
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                asset_id = %task.asset_id,
-                                                error = %e,
-                                                "Failed to mark asset as failed"
-                                            );
-                                        }
-                                    }
                                     continue;
                                 }
                             }
@@ -5422,6 +5423,9 @@ mod tests {
         }
         async fn reset_failed(&self) -> Result<u64, StateError> {
             unimplemented!()
+        }
+        async fn fail_exceeded_pending(&self, _: u32) -> Result<u64, StateError> {
+            Ok(0)
         }
         async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
             unimplemented!()

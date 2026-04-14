@@ -90,6 +90,12 @@ pub trait StateDb: Send + Sync {
     /// Returns the number of assets reset.
     async fn reset_failed(&self) -> Result<u64, StateError>;
 
+    /// Mark pending assets that have exceeded `max_attempts` as failed.
+    ///
+    /// Cleans up assets stuck in pending from before this fix existed.
+    /// Returns the number of assets transitioned.
+    async fn fail_exceeded_pending(&self, max_attempts: u32) -> Result<u64, StateError>;
+
     // ── Bulk read operations ──
 
     /// Get all downloaded asset IDs as (id, `version_size`) pairs.
@@ -520,6 +526,21 @@ impl StateDb for SqliteStateDb {
             .map_err(|e| StateError::query(&e))?;
 
         Ok(rows as u64) // usize -> u64 is lossless on 64-bit
+    }
+
+    async fn fail_exceeded_pending(&self, max_attempts: u32) -> Result<u64, StateError> {
+        let conn = self.acquire_lock("fail_exceeded_pending")?;
+
+        let error = format!("Exceeded max download attempts (limit: {max_attempts})");
+        let rows = conn
+            .execute(
+                "UPDATE assets SET status = 'failed', last_error = ?1 \
+                 WHERE status = 'pending' AND download_attempts >= ?2",
+                rusqlite::params![error, max_attempts],
+            )
+            .map_err(|e| StateError::query(&e))?;
+
+        Ok(rows as u64)
     }
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
