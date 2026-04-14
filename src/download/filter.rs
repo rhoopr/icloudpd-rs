@@ -1,0 +1,2414 @@
+//! Asset filtering -- determines which iCloud assets need downloading by
+//! applying content/date/filename filters, resolving local paths, and
+//! detecting collisions with existing files or in-flight downloads.
+
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Local};
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
+
+use crate::icloud::photos::types::AssetVersion;
+use crate::icloud::photos::VersionsMap;
+use crate::state::{MediaType, VersionSizeKey};
+use crate::types::{
+    AssetItemType, AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
+    RawTreatmentPolicy,
+};
+
+use super::paths;
+use super::DownloadConfig;
+
+/// Case-insensitive glob matching options for filename exclusion patterns.
+const GLOB_CASE_INSENSITIVE: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: false,
+    require_literal_separator: false,
+    require_literal_leading_dot: false,
+};
+
+/// Determine the media type for an asset based on version size and item type.
+pub(crate) fn determine_media_type(
+    version_size: VersionSizeKey,
+    asset: &crate::icloud::photos::PhotoAsset,
+) -> MediaType {
+    match version_size {
+        VersionSizeKey::LiveOriginal
+        | VersionSizeKey::LiveMedium
+        | VersionSizeKey::LiveThumb
+        | VersionSizeKey::LiveAdjusted => {
+            if asset.item_type() == Some(AssetItemType::Image) {
+                MediaType::LivePhotoVideo
+            } else {
+                MediaType::Video
+            }
+        }
+        _ => {
+            if asset.item_type() == Some(AssetItemType::Movie) {
+                MediaType::Video
+            } else if asset.is_live_photo() {
+                MediaType::LivePhotoImage
+            } else {
+                MediaType::Photo
+            }
+        }
+    }
+}
+
+/// A normalized path string for case-insensitive collision detection.
+///
+/// On case-insensitive filesystems (macOS, Windows), we need to detect collisions between
+/// paths like `IMG_0996.mov` and `IMG_0996.MOV`. This stores the normalized (lowercased)
+/// form as a `Box<str>` and implements `Borrow<str>` to enable zero-copy lookups.
+///
+/// Use `NormalizedPath::normalize()` for temporary lookup keys to avoid `PathBuf` cloning.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct NormalizedPath(Box<str>);
+
+impl NormalizedPath {
+    /// Create a new normalized path from an owned `PathBuf`.
+    /// For lookup operations, prefer `normalize()` to avoid `PathBuf` cloning.
+    pub(super) fn new(path: PathBuf) -> Self {
+        Self(Self::normalize(&path).into_owned().into_boxed_str())
+    }
+
+    /// Normalize a path reference for map lookups.
+    ///
+    /// On case-insensitive systems (macOS, Windows), returns a lowercase copy.
+    /// On case-sensitive systems (Linux), returns a borrowed view when possible.
+    ///
+    /// Use with `claimed_paths.contains_key(NormalizedPath::normalize(&path).as_ref())`
+    /// to avoid allocating a `PathBuf` just for the lookup.
+    pub(super) fn normalize(path: &Path) -> Cow<'_, str> {
+        let s = path.to_string_lossy();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            Cow::Owned(s.to_ascii_lowercase())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            s
+        }
+    }
+}
+
+impl std::borrow::Borrow<str> for NormalizedPath {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A unit of work produced by the filter phase and consumed by the download phase.
+///
+/// Fields ordered for optimal memory layout:
+/// - Heap types first (`Box<str>`, `PathBuf`)
+/// - 8-byte primitives (u64)
+/// - `DateTime` (12-16 bytes)
+/// - 1-byte enum last
+#[derive(Debug, Clone)]
+pub(super) struct DownloadTask {
+    // Heap types first
+    pub(super) url: Box<str>,
+    pub(super) download_path: PathBuf,
+    pub(super) checksum: Box<str>,
+    /// iCloud asset ID for state tracking.
+    pub(super) asset_id: Box<str>,
+    // 8-byte primitives
+    pub(super) size: u64,
+    // DateTime
+    pub(super) created_local: DateTime<Local>,
+    // 1-byte enum
+    /// Version size key for state tracking.
+    pub(super) version_size: VersionSizeKey,
+}
+
+/// Apply the RAW alignment policy by swapping Original and Alternative versions
+/// when appropriate, matching Python's `apply_raw_policy()`.
+fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'_, VersionsMap> {
+    if policy == RawTreatmentPolicy::Unchanged {
+        return Cow::Borrowed(versions);
+    }
+
+    // Find indices for Original and Alternative in a single pass
+    let (orig_idx, alt_idx) =
+        versions
+            .iter()
+            .enumerate()
+            .fold((None, None), |(orig, alt), (idx, (k, _))| match k {
+                AssetVersionSize::Original => (Some(idx), alt),
+                AssetVersionSize::Alternative => (orig, Some(idx)),
+                _ => (orig, alt),
+            });
+
+    let Some(alt_idx) = alt_idx else {
+        return Cow::Borrowed(versions);
+    };
+
+    let should_swap = match policy {
+        RawTreatmentPolicy::PreferOriginal => versions[alt_idx].1.asset_type.contains("raw"),
+        RawTreatmentPolicy::PreferAlternative => {
+            orig_idx.is_some_and(|idx| versions[idx].1.asset_type.contains("raw"))
+        }
+        RawTreatmentPolicy::Unchanged => false,
+    };
+
+    if !should_swap {
+        return Cow::Borrowed(versions);
+    }
+
+    // Swap by cloning and modifying the keys
+    let mut swapped = versions.clone();
+    if let Some(orig_idx) = orig_idx {
+        swapped[orig_idx].0 = AssetVersionSize::Alternative;
+        swapped[alt_idx].0 = AssetVersionSize::Original;
+    }
+    Cow::Owned(swapped)
+}
+
+/// Lightweight pre-check: extract (`version_size`, checksum) pairs for an asset
+/// after applying content/date filters but WITHOUT path resolution or disk I/O.
+///
+/// Returns the candidate versions that would be downloaded. Used by the early
+/// skip gate to check the state DB before the expensive `filter_asset_to_tasks`.
+pub(super) fn extract_skip_candidates<'a>(
+    asset: &'a crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> SmallVec<[(VersionSizeKey, &'a str); 2]> {
+    // Excluded album assets -- same as filter_asset_to_tasks
+    if config.exclude_asset_ids.contains(asset.id()) {
+        return SmallVec::new();
+    }
+
+    // Content type filters -- same as filter_asset_to_tasks
+    if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
+        return SmallVec::new();
+    }
+    if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
+        return SmallVec::new();
+    }
+
+    let is_live_photo = asset.is_live_photo();
+    if config.live_photo_mode == LivePhotoMode::Skip && is_live_photo {
+        return SmallVec::new();
+    }
+
+    // Date filters
+    let created_utc = asset.created();
+    if let Some(before) = &config.skip_created_before {
+        if created_utc < *before {
+            return SmallVec::new();
+        }
+    }
+    if let Some(after) = &config.skip_created_after {
+        if created_utc > *after {
+            return SmallVec::new();
+        }
+    }
+
+    // Filename exclusion -- mirrors filter_asset_to_tasks
+    if !config.filename_exclude.is_empty() {
+        if let Some(filename) = asset.filename() {
+            if config
+                .filename_exclude
+                .iter()
+                .any(|p| p.matches_with(filename, GLOB_CASE_INSENSITIVE))
+            {
+                return SmallVec::new();
+            }
+        }
+    }
+
+    let versions = asset.versions();
+    let mut result = SmallVec::new();
+
+    // Primary version (with fallback to Original, same logic as filter_asset_to_tasks)
+    // VideoOnly: skip primary image for live photos.
+    let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
+    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
+        versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    };
+    if !skip_primary {
+        let primary = version_with_fallback(
+            &get_version,
+            config.size,
+            AssetVersionSize::Original,
+            config.force_size,
+        );
+        if let Some((v, effective_size)) = primary {
+            result.push((VersionSizeKey::from(effective_size), v.checksum.as_ref()));
+        }
+    }
+
+    // Live photo companion (with fallback to LiveOriginal, mirrors primary logic)
+    if matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Both | LivePhotoMode::VideoOnly
+    ) && asset.item_type() == Some(AssetItemType::Image)
+    {
+        let live = version_with_fallback(
+            &get_version,
+            config.live_photo_size,
+            AssetVersionSize::LiveOriginal,
+            config.force_size,
+        );
+        if let Some((v, effective_live_size)) = live {
+            result.push((
+                VersionSizeKey::from(effective_live_size),
+                v.checksum.as_ref(),
+            ));
+        }
+    }
+
+    result
+}
+
+/// Look up a version by key, falling back to `fallback_key` when the requested
+/// size is unavailable (unless `force_size` is set). Shared by both
+/// `extract_skip_candidates` and `filter_asset_to_tasks`.
+fn version_with_fallback<'a>(
+    get_version: &dyn Fn(&AssetVersionSize) -> Option<&'a AssetVersion>,
+    requested: AssetVersionSize,
+    fallback: AssetVersionSize,
+    force_size: bool,
+) -> Option<(&'a AssetVersion, AssetVersionSize)> {
+    match get_version(&requested) {
+        Some(v) => Some((v, requested)),
+        None if requested != fallback && !force_size => {
+            get_version(&fallback).map(|v| (v, fallback))
+        }
+        _ => None,
+    }
+}
+
+/// Pre-populate the `DirCache` for the asset's date-based parent directory
+/// on the blocking threadpool, so that subsequent sync `DirCache` lookups
+/// inside `filter_asset_to_tasks` are guaranteed cache-hits.
+pub(super) async fn pre_ensure_asset_dir(
+    dir_cache: &mut paths::DirCache,
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) {
+    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
+    let parent = paths::local_download_dir(
+        &config.directory,
+        &config.folder_structure,
+        &created_local,
+        config.album_name.as_deref(),
+    );
+    dir_cache.ensure_dir_async(&parent).await;
+}
+
+/// Apply content filters (type, date range) and local existence check,
+/// producing download tasks for assets that need fetching.
+/// Returns up to two tasks: the primary photo/video and an optional live photo MOV.
+///
+/// The `claimed_paths` map tracks paths that have been claimed by earlier tasks
+/// in the same download session, preventing race conditions where two assets
+/// with the same filename both see "file doesn't exist" during concurrent downloads.
+pub(super) fn filter_asset_to_tasks(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
+    dir_cache: &mut paths::DirCache,
+) -> SmallVec<[DownloadTask; 2]> {
+    if config.exclude_asset_ids.contains(asset.id()) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
+        return SmallVec::new();
+    }
+    if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping video (skip_videos enabled)");
+        return SmallVec::new();
+    }
+    if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping photo (skip_photos enabled)");
+        return SmallVec::new();
+    }
+
+    // LivePhotoMode::Skip: skip live photo assets entirely (both image and MOV)
+    let is_live_photo = asset.is_live_photo();
+    if config.live_photo_mode == LivePhotoMode::Skip && is_live_photo {
+        tracing::debug!(asset_id = %asset.id(), "Skipping live photo (live_photo_mode=skip)");
+        return SmallVec::new();
+    }
+
+    let created_utc = asset.created();
+    if let Some(before) = &config.skip_created_before {
+        if created_utc < *before {
+            tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (before date range)");
+            return SmallVec::new();
+        }
+    }
+    if let Some(after) = &config.skip_created_after {
+        if created_utc > *after {
+            tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (after date range)");
+            return SmallVec::new();
+        }
+    }
+
+    let fallback_filename;
+    let raw_filename = if let Some(f) = asset.filename() {
+        f
+    } else {
+        // Generate fallback from asset ID fingerprint, matching Python behavior.
+        let asset_type = asset
+            .versions()
+            .first()
+            .map_or("", |(_, v)| v.asset_type.as_ref());
+        fallback_filename = paths::generate_fingerprint_filename(asset.id(), asset_type);
+        tracing::info!(
+            asset_id = %asset.id(),
+            filename = %fallback_filename,
+            "Using fingerprint fallback filename"
+        );
+        &fallback_filename
+    };
+
+    // Filename exclusion: match raw filename against glob patterns before any
+    // cleaning or unicode stripping, so patterns match the original iCloud name.
+    if config
+        .filename_exclude
+        .iter()
+        .any(|p| p.matches_with(raw_filename, GLOB_CASE_INSENSITIVE))
+    {
+        tracing::debug!(asset_id = %asset.id(), filename = raw_filename, "Skipping (filename_exclude match)");
+        return SmallVec::new();
+    }
+
+    // Strip non-ASCII characters unless --keep-unicode-in-filenames is set.
+    // Matches Python's default behavior of calling remove_unicode_chars() on filenames.
+    let base_filename = if config.keep_unicode_in_filenames {
+        raw_filename.to_string()
+    } else {
+        paths::remove_unicode_chars(raw_filename)
+    };
+
+    let created_local: DateTime<Local> = created_utc.with_timezone(&Local);
+    let versions = apply_raw_policy(asset.versions(), config.align_raw);
+    let mut tasks = SmallVec::new();
+    // Track the effective primary filename (including any dedup suffix) so the
+    // live photo MOV companion is derived from the same name, keeping them paired.
+    let mut effective_primary_filename: Option<String> = None;
+
+    // Helper closure to find a version by key in the SmallVec
+    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
+        versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    };
+
+    // Select requested version, falling back to Original when the requested size is
+    // unavailable (unless --force-size is set). Matches Python's behavior.
+    // Track the effective size so we only add "-medium"/"-thumb" suffix when
+    // the asset actually has that version (not on fallback to Original).
+    let (version, effective_size) = match version_with_fallback(
+        &get_version,
+        config.size,
+        AssetVersionSize::Original,
+        config.force_size,
+    ) {
+        Some((v, s)) => (Some(v), s),
+        None => (None, config.size),
+    };
+    // VideoOnly mode: skip the primary image for live photos, only emit MOV.
+    let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
+
+    if let Some(version) = version.filter(|_| !skip_primary) {
+        // Map the file extension based on the version's UTI asset_type
+        let mapped_filename = paths::map_filename_extension(&base_filename, &version.asset_type);
+
+        // Add size suffix for non-Original sizes (e.g., "-medium", "-thumb").
+        // Only when actually using that size, not on fallback to Original.
+        // Matches Python's VERSION_FILENAME_SUFFIX_LOOKUP.
+        let sized_filename = match effective_size {
+            AssetVersionSize::Medium => paths::insert_suffix(&mapped_filename, "medium"),
+            AssetVersionSize::Thumb => paths::insert_suffix(&mapped_filename, "thumb"),
+            _ => mapped_filename,
+        };
+
+        // Apply name-id7 policy: bake asset ID suffix into ALL filenames upfront
+        let filename = match config.file_match_policy {
+            FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized_filename, asset.id()),
+            FileMatchPolicy::NameSizeDedupWithSuffix => sized_filename,
+        };
+
+        let download_path = paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &created_local,
+            &filename,
+            config.album_name.as_deref(),
+        );
+        // Determine the final download path, applying size-based deduplication if needed.
+        // Check both on-disk files AND in-flight downloads (claimed_paths) to handle
+        // concurrent downloads of assets with the same filename.
+        // Check for the file on disk, including AM/PM whitespace variants
+        // (e.g., "1.40.01 PM.PNG" vs "1.40.01\u{202F}PM.PNG")
+        let existing_with_size = dir_cache
+            .file_size(&download_path)
+            .map(|size| (download_path.clone(), size))
+            .or_else(|| {
+                let variant = dir_cache.find_ampm_variant(&download_path)?;
+                let size = dir_cache.file_size(&variant).unwrap_or(0);
+                Some((variant, size))
+            });
+        let final_path = if let Some((_, on_disk_size)) = existing_with_size {
+            match config.file_match_policy {
+                FileMatchPolicy::NameSizeDedupWithSuffix => {
+                    if version.size > 0 && on_disk_size == version.size {
+                        // Same size — likely already downloaded, skip.
+                        tracing::info!(
+                            asset_id = asset.id(),
+                            path = %download_path.display(),
+                            size = version.size,
+                            "Skipping asset: file exists with same name and size"
+                        );
+                        None
+                    } else {
+                        // Different size — deduplicate by appending file size to filename.
+                        let dedup_filename = paths::add_dedup_suffix(&filename, version.size);
+                        let dedup_path = paths::local_download_path(
+                            &config.directory,
+                            &config.folder_structure,
+                            &created_local,
+                            &dedup_filename,
+                            config.album_name.as_deref(),
+                        );
+                        // Use normalize() for lookup to avoid PathBuf clone
+                        let dedup_key = NormalizedPath::normalize(&dedup_path);
+                        if dir_cache.exists(&dedup_path)
+                            || claimed_paths.contains_key(dedup_key.as_ref())
+                        {
+                            tracing::info!(
+                                asset_id = asset.id(),
+                                path = %dedup_path.display(),
+                                "Skipping asset: dedup path already exists"
+                            );
+                            None
+                        } else {
+                            tracing::debug!(
+                                path = %download_path.display(),
+                                on_disk_size,
+                                expected_size = version.size,
+                                dedup_path = %dedup_path.display(),
+                                "File collision: already exists with different size"
+                            );
+                            Some(dedup_path)
+                        }
+                    }
+                }
+                FileMatchPolicy::NameId7 => {
+                    // name-id7 policy adds asset ID to ALL filenames, not just collisions.
+                    // If the file exists, it's already downloaded, skip.
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %download_path.display(),
+                        "Skipping asset: file exists (name-id7)"
+                    );
+                    None
+                }
+            }
+        } else if let Some(&claimed_size) =
+            // Use normalize() for lookup to avoid PathBuf clone
+            claimed_paths.get(NormalizedPath::normalize(&download_path).as_ref())
+        {
+            // Path is claimed by an in-flight download — check for size collision.
+            // Use normalized paths for collision detection to handle case-insensitive
+            // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
+            match config.file_match_policy {
+                FileMatchPolicy::NameSizeDedupWithSuffix => {
+                    if version.size > 0 && claimed_size == version.size {
+                        // Same size — likely duplicate asset, skip.
+                        tracing::info!(
+                            asset_id = asset.id(),
+                            path = %download_path.display(),
+                            size = version.size,
+                            "Skipping asset: in-flight download has same name and size"
+                        );
+                        None
+                    } else {
+                        // Different size — deduplicate by appending file size to filename.
+                        let dedup_filename = paths::add_dedup_suffix(&filename, version.size);
+                        let dedup_path = paths::local_download_path(
+                            &config.directory,
+                            &config.folder_structure,
+                            &created_local,
+                            &dedup_filename,
+                            config.album_name.as_deref(),
+                        );
+                        // Use normalize() for lookup to avoid PathBuf clone
+                        let dedup_key = NormalizedPath::normalize(&dedup_path);
+                        if dir_cache.exists(&dedup_path)
+                            || claimed_paths.contains_key(dedup_key.as_ref())
+                        {
+                            tracing::info!(
+                                asset_id = asset.id(),
+                                path = %dedup_path.display(),
+                                "Skipping asset: dedup path already claimed in-flight"
+                            );
+                            None
+                        } else {
+                            tracing::debug!(
+                                path = %download_path.display(),
+                                claimed_size,
+                                expected_size = version.size,
+                                dedup_path = %dedup_path.display(),
+                                "In-flight collision: claimed with different size"
+                            );
+                            Some(dedup_path)
+                        }
+                    }
+                }
+                FileMatchPolicy::NameId7 => {
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %download_path.display(),
+                        "Skipping asset: path claimed in-flight (name-id7)"
+                    );
+                    None
+                }
+            }
+        } else {
+            Some(download_path.clone())
+        };
+
+        if let Some(path) = &final_path {
+            // Record the effective filename used for the primary download so the
+            // MOV companion is derived from it, keeping HEIC/MOV paired after dedup.
+            if let Some(stem) = path.file_name().and_then(|f| f.to_str()) {
+                effective_primary_filename = Some(stem.to_string());
+            }
+        }
+        if let Some(path) = final_path {
+            // Clone for the normalized key, move original into DownloadTask
+            claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
+            tasks.push(DownloadTask {
+                url: version.url.clone(),
+                download_path: path,
+                checksum: version.checksum.clone(),
+                asset_id: asset.id().into(),
+                size: version.size,
+                created_local,
+                version_size: VersionSizeKey::from(effective_size),
+            });
+        }
+    }
+
+    // Live photo MOV companion -- only for images.
+    // Falls back from LiveAdjusted -> LiveOriginal when adjusted isn't available
+    // (mirrors the primary version fallback logic), unless --force-size is set.
+    if matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Both | LivePhotoMode::VideoOnly
+    ) && asset.item_type() == Some(AssetItemType::Image)
+    {
+        let (live_version_opt, effective_live_size) = match version_with_fallback(
+            &get_version,
+            config.live_photo_size,
+            AssetVersionSize::LiveOriginal,
+            config.force_size,
+        ) {
+            Some((v, s)) => (Some(v), s),
+            None => (None, config.live_photo_size),
+        };
+        if let Some(live_version) = live_version_opt {
+            // Derive the MOV filename from the effective primary filename (which
+            // includes any dedup suffix) so the HEIC and MOV remain visually paired.
+            // Fall back to the base filename when no primary was produced (e.g. skipped).
+            let live_base = match config.file_match_policy {
+                FileMatchPolicy::NameId7 => paths::apply_name_id7(&base_filename, asset.id()),
+                FileMatchPolicy::NameSizeDedupWithSuffix => effective_primary_filename
+                    .as_deref()
+                    .unwrap_or(&base_filename)
+                    .to_string(),
+            };
+            let mov_filename = match config.live_photo_mov_filename_policy {
+                LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
+                LivePhotoMovFilenamePolicy::Original => {
+                    paths::live_photo_mov_path_original(&live_base)
+                }
+            };
+            let mov_path = paths::local_download_path(
+                &config.directory,
+                &config.folder_structure,
+                &created_local,
+                &mov_filename,
+                config.album_name.as_deref(),
+            );
+            // If the path already exists (on disk or claimed), it may be a different
+            // file (e.g. a regular video) that collides with the live photo companion
+            // name. Detect this by comparing sizes; on mismatch, deduplicate using
+            // the asset ID.
+            //
+            // Use normalized paths for collision detection to handle case-insensitive
+            // filesystems (macOS, Windows) where IMG.mov and IMG.MOV are the same file.
+            let mov_key = NormalizedPath::normalize(&mov_path);
+            let final_mov_path = if let Some(on_disk_size) = dir_cache.file_size(&mov_path) {
+                if on_disk_size == live_version.size {
+                    // Same size — likely already downloaded, skip.
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %mov_path.display(),
+                        "Skipping live photo MOV: already exists with same size"
+                    );
+                    None
+                } else {
+                    // Collision with a different file — deduplicate.
+                    let dedup_filename = paths::insert_suffix(&mov_filename, asset.id());
+                    let dedup_path = paths::local_download_path(
+                        &config.directory,
+                        &config.folder_structure,
+                        &created_local,
+                        &dedup_filename,
+                        config.album_name.as_deref(),
+                    );
+                    let dedup_key = NormalizedPath::normalize(&dedup_path);
+                    if dir_cache.exists(&dedup_path)
+                        || claimed_paths.contains_key(dedup_key.as_ref())
+                    {
+                        tracing::info!(
+                            asset_id = asset.id(),
+                            path = %dedup_path.display(),
+                            "Skipping live photo MOV: dedup path already exists"
+                        );
+                        None
+                    } else {
+                        tracing::debug!(
+                            path = %mov_path.display(),
+                            dedup_path = %dedup_path.display(),
+                            "Live photo MOV collision: already exists with different size"
+                        );
+                        Some(dedup_path)
+                    }
+                }
+            } else if let Some(&claimed_size) = claimed_paths.get(mov_key.as_ref()) {
+                // Path is claimed by an in-flight download
+                if claimed_size == live_version.size {
+                    tracing::info!(
+                        asset_id = asset.id(),
+                        path = %mov_path.display(),
+                        "Skipping live photo MOV: in-flight with same size"
+                    );
+                    None
+                } else {
+                    // Collision with in-flight download — deduplicate.
+                    let dedup_filename = paths::insert_suffix(&mov_filename, asset.id());
+                    let dedup_path = paths::local_download_path(
+                        &config.directory,
+                        &config.folder_structure,
+                        &created_local,
+                        &dedup_filename,
+                        config.album_name.as_deref(),
+                    );
+                    let dedup_key = NormalizedPath::normalize(&dedup_path);
+                    if dir_cache.exists(&dedup_path)
+                        || claimed_paths.contains_key(dedup_key.as_ref())
+                    {
+                        tracing::info!(
+                            asset_id = asset.id(),
+                            path = %dedup_path.display(),
+                            "Skipping live photo MOV: dedup path already claimed in-flight"
+                        );
+                        None
+                    } else {
+                        tracing::debug!(
+                            path = %mov_path.display(),
+                            dedup_path = %dedup_path.display(),
+                            "Live photo MOV in-flight collision"
+                        );
+                        Some(dedup_path)
+                    }
+                }
+            } else {
+                Some(mov_path)
+            };
+            if let Some(path) = final_mov_path {
+                // Clone for the normalized key, move original into DownloadTask
+                claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
+                tasks.push(DownloadTask {
+                    url: live_version.url.clone(),
+                    download_path: path,
+                    checksum: live_version.checksum.clone(),
+                    asset_id: asset.id().into(),
+                    size: live_version.size,
+                    created_local,
+                    version_size: VersionSizeKey::from(effective_live_size),
+                });
+            }
+        }
+    }
+
+    tasks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use rustc_hash::FxHashSet;
+
+    use crate::icloud::photos::PhotoAsset;
+    use crate::retry::RetryConfig;
+    use crate::test_helpers::TestPhotoAsset;
+    use crate::types::LivePhotoMode;
+    use serde_json::json;
+    use std::fs;
+    use tempfile::TempDir;
+
+    use super::super::SyncMode;
+
+    fn test_config() -> DownloadConfig {
+        DownloadConfig {
+            directory: PathBuf::from("/nonexistent/download_filter_tests"),
+            folder_structure: "{:%Y/%m/%d}".to_string(),
+            size: AssetVersionSize::Original,
+            skip_videos: false,
+            skip_photos: false,
+            skip_created_before: None,
+            skip_created_after: None,
+            set_exif_datetime: false,
+            dry_run: false,
+            concurrent_downloads: 1,
+            recent: None,
+            retry: RetryConfig::default(),
+            live_photo_mode: LivePhotoMode::Both,
+            live_photo_size: AssetVersionSize::LiveOriginal,
+            live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
+            align_raw: RawTreatmentPolicy::Unchanged,
+            no_progress_bar: true,
+            only_print_filenames: false,
+            file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
+            force_size: false,
+            keep_unicode_in_filenames: false,
+            filename_exclude: Vec::new(),
+            temp_suffix: ".kei-tmp".to_string(),
+            state_db: None,
+            retry_only: false,
+            max_download_attempts: 10,
+            sync_mode: SyncMode::Full,
+            album_name: None,
+            exclude_asset_ids: Arc::new(FxHashSet::default()),
+        }
+    }
+
+    /// Helper that calls filter_asset_to_tasks with a fresh claimed_paths map.
+    /// Use this for simple tests that don't need to track paths across calls.
+    fn filter_asset_fresh(
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> SmallVec<[DownloadTask; 2]> {
+        let mut claimed_paths = FxHashMap::default();
+        let mut dir_cache = paths::DirCache::new();
+        filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache)
+    }
+
+    #[test]
+    fn test_filter_asset_produces_task() {
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(&*tasks[0].url, "https://example.com/orig");
+        assert_eq!(&*tasks[0].checksum, "abc123");
+        assert_eq!(tasks[0].size, 1000);
+    }
+
+    #[test]
+    fn test_filter_skips_videos_when_configured() {
+        let asset = TestPhotoAsset::new("VID_1")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .build();
+        let mut config = test_config();
+        config.skip_videos = true;
+        assert!(filter_asset_fresh(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_filter_video_task_carries_size() {
+        let asset = TestPhotoAsset::new("VID_2")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(500_000_000)
+            .orig_url("https://example.com/big_vid")
+            .orig_checksum("big_ck")
+            .build();
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].size, 500_000_000);
+    }
+
+    #[test]
+    fn test_filter_skips_photos_when_configured() {
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let mut config = test_config();
+        config.skip_photos = true;
+        assert!(filter_asset_fresh(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_filter_uses_fingerprint_fallback_without_filename() {
+        // Asset ID with special chars uses SHA-256 hash for collision resistance:
+        // SHA-256("AB/CD+EF==GH") → "c492ec6c51ec..."
+        let asset = PhotoAsset::new(
+            json!({"recordName": "AB/CD+EF==GH", "fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            tasks[0]
+                .download_path
+                .to_string_lossy()
+                .contains("c492ec6c51ec.JPG"),
+            "Expected fingerprint hash fallback filename, got: {:?}",
+            tasks[0].download_path
+        );
+    }
+
+    #[test]
+    fn test_filter_skips_asset_without_requested_version() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "SMALL_ONLY", "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 100,
+                    "downloadURL": "https://example.com/thumb",
+                    "fileChecksum": "th_ck"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config(); // requests Original, but only Thumb available
+        assert!(filter_asset_fresh(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_filter_skips_existing_file() {
+        let dir = TempDir::new().unwrap();
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+
+        // First call should produce a task (file doesn't exist yet)
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+
+        // Create the file with matching size (1000 bytes), second call should skip
+        fs::create_dir_all(tasks[0].download_path.parent().unwrap()).unwrap();
+        fs::write(&tasks[0].download_path, vec![0u8; 1000]).unwrap();
+        assert!(filter_asset_fresh(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_filter_deduplicates_file_with_different_size() {
+        let dir = TempDir::new().unwrap();
+
+        let asset = TestPhotoAsset::new("TEST_1").build(); // version.size = 1000
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+
+        // First call: file doesn't exist yet
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let original_path = tasks[0].download_path.clone();
+
+        // Create a file with DIFFERENT size (simulating a collision with different content)
+        fs::create_dir_all(original_path.parent().unwrap()).unwrap();
+        fs::write(&original_path, vec![0u8; 500]).unwrap(); // 500 bytes, not 1000
+
+        // Second call: should produce a task with deduped path (size suffix)
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let dedup_path = tasks[0].download_path.to_str().unwrap();
+        assert!(
+            dedup_path.contains("-1000."),
+            "Expected size suffix '-1000.' in deduped path, got: {}",
+            dedup_path,
+        );
+    }
+
+    fn test_live_photo_asset() -> PhotoAsset {
+        TestPhotoAsset::new("LIVE_1")
+            .filename("IMG_0001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(2000)
+            .orig_url("https://example.com/heic_orig")
+            .orig_checksum("heic_ck")
+            .live_photo("https://example.com/live_mov", "mov_ck", 3000)
+            .build()
+    }
+
+    #[test]
+    fn test_filter_produces_live_photo_mov_task() {
+        let asset = test_live_photo_asset();
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(tasks[0].size, 2000);
+        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
+        assert_eq!(tasks[1].size, 3000);
+        assert!(tasks[1]
+            .download_path
+            .to_str()
+            .unwrap()
+            .contains("IMG_0001_HEVC.MOV"));
+    }
+
+    #[test]
+    fn test_filter_skips_live_photo_mov_when_image_only() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
+    }
+
+    #[test]
+    fn test_filter_live_photo_original_policy() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Original;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks[1]
+            .download_path
+            .to_str()
+            .unwrap()
+            .contains("IMG_0001.MOV"));
+    }
+
+    #[test]
+    fn test_filter_skips_existing_live_photo_mov() {
+        let dir = TempDir::new().unwrap();
+
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+
+        // First call: both photo and MOV
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+
+        // Create the MOV file on disk with matching size (3000 bytes)
+        fs::create_dir_all(tasks[1].download_path.parent().unwrap()).unwrap();
+        fs::write(&tasks[1].download_path, vec![0u8; 3000]).unwrap();
+
+        // Second call: only the photo task (MOV already exists with matching size)
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
+    }
+
+    #[test]
+    fn test_filter_deduplicates_live_photo_mov_collision() {
+        let dir = TempDir::new().unwrap();
+
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+
+        // First call to get the expected MOV path
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        let mov_path = &tasks[1].download_path;
+
+        // Create a file at the MOV path with a DIFFERENT size (simulating a
+        // regular video that collides with the live photo companion name).
+        fs::create_dir_all(mov_path.parent().unwrap()).unwrap();
+        fs::write(mov_path, vec![0u8; 9999]).unwrap();
+
+        // Second call: should produce a deduped MOV path with asset ID suffix
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
+        let dedup_path = tasks[1].download_path.to_str().unwrap();
+        assert!(
+            dedup_path.contains("LIVE_1"),
+            "Expected asset ID 'LIVE_1' in deduped path, got: {}",
+            dedup_path,
+        );
+    }
+
+    #[test]
+    fn test_filter_live_photo_dedup_suffix_consistent_with_mov() {
+        // Regression test for #102: when two live photos share the same base
+        // filename but have different sizes (triggering dedup), the MOV companion
+        // must derive from the deduped HEIC name so they remain visually paired.
+        let dir = TempDir::new().unwrap();
+
+        let asset1 = TestPhotoAsset::new("LIVE_A")
+            .filename("IMG_0001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(2000)
+            .orig_url("https://example.com/heic_a")
+            .orig_checksum("ck_a")
+            .live_photo("https://example.com/mov_a", "mov_ck_a", 3000)
+            .build();
+
+        let asset2 = TestPhotoAsset::new("LIVE_B")
+            .filename("IMG_0001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(4000)
+            .orig_url("https://example.com/heic_b")
+            .orig_checksum("ck_b")
+            .live_photo("https://example.com/mov_b", "mov_ck_b", 5000)
+            .build();
+
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+
+        // Process asset1: creates IMG_0001.HEIC (2000 bytes) and its MOV
+        let mut claimed_paths = FxHashMap::default();
+        let mut dir_cache = paths::DirCache::new();
+        let tasks1 = filter_asset_to_tasks(&asset1, &config, &mut claimed_paths, &mut dir_cache);
+        assert_eq!(tasks1.len(), 2);
+        let heic1_path = &tasks1[0].download_path;
+
+        // Write asset1's HEIC to disk so asset2 sees a collision
+        fs::create_dir_all(heic1_path.parent().unwrap()).unwrap();
+        fs::write(heic1_path, vec![0u8; 2000]).unwrap();
+
+        // Process asset2: same filename, different size → should dedup HEIC
+        // Clear dir_cache since we just wrote a new file
+        dir_cache.clear();
+        let tasks2 = filter_asset_to_tasks(&asset2, &config, &mut claimed_paths, &mut dir_cache);
+        assert_eq!(tasks2.len(), 2, "Expected HEIC + MOV tasks for asset2");
+
+        let heic2_path = tasks2[0].download_path.to_str().unwrap();
+        let mov2_path = tasks2[1].download_path.to_str().unwrap();
+
+        // The deduped HEIC should have a size suffix
+        assert!(
+            heic2_path.contains("-4000."),
+            "Expected size suffix '-4000.' in deduped HEIC path, got: {}",
+            heic2_path,
+        );
+
+        // The MOV companion must also contain the size suffix from the HEIC,
+        // keeping them visually paired (this is the #102 fix).
+        assert!(
+            mov2_path.contains("-4000"),
+            "MOV companion should derive from deduped HEIC name (contain '-4000'), got: {}",
+            mov2_path,
+        );
+    }
+
+    #[test]
+    fn test_filter_live_photo_medium_size() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "LIVE_MED", "fields": {
+                "filenameEnc": {"value": "IMG_0002.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://example.com/heic_orig",
+                    "fileChecksum": "heic_ck"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resVidMedRes": {"value": {
+                    "size": 1500,
+                    "downloadURL": "https://example.com/live_med",
+                    "fileChecksum": "med_ck"
+                }},
+                "resVidMedFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveMedium;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(&*tasks[1].url, "https://example.com/live_med");
+    }
+
+    #[test]
+    fn test_filter_no_live_photo_for_videos() {
+        let asset = TestPhotoAsset::new("VID_1")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .live_photo("https://example.com/live_mov", "mov_ck", 3000)
+            .build();
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        // Videos should get 1 task (the video itself), not a live photo MOV
+        assert_eq!(tasks.len(), 1);
+    }
+
+    fn photo_asset_with_original_and_alternative(orig_type: &str, alt_type: &str) -> PhotoAsset {
+        TestPhotoAsset::new("RAW_TEST")
+            .orig_checksum("orig_ck")
+            .orig_file_type(orig_type)
+            .alt_version("https://example.com/alt", "alt_ck", 2000, alt_type)
+            .build()
+    }
+
+    /// Helper to get a version from a SmallVec by key
+    fn get_ver(versions: &VersionsMap, key: AssetVersionSize) -> Option<&AssetVersion> {
+        versions.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+
+    /// Helper to check if a version exists in a SmallVec
+    fn has_ver(versions: &VersionsMap, key: AssetVersionSize) -> bool {
+        versions.iter().any(|(k, _)| *k == key)
+    }
+
+    #[test]
+    fn test_raw_policy_as_is_no_swap() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::Unchanged);
+        assert_eq!(
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
+            "https://example.com/orig"
+        );
+        assert_eq!(
+            &*get_ver(&versions, AssetVersionSize::Alternative)
+                .unwrap()
+                .url,
+            "https://example.com/alt"
+        );
+    }
+
+    #[test]
+    fn test_raw_policy_as_original_swaps_when_alt_is_raw() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
+        // Alternative was RAW → swap: Original now has alt URL
+        assert_eq!(
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
+            "https://example.com/alt"
+        );
+        assert_eq!(
+            &*get_ver(&versions, AssetVersionSize::Alternative)
+                .unwrap()
+                .url,
+            "https://example.com/orig"
+        );
+    }
+
+    #[test]
+    fn test_raw_policy_as_alternative_swaps_when_orig_is_raw() {
+        let asset = photo_asset_with_original_and_alternative("com.adobe.raw-image", "public.jpeg");
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferAlternative);
+        // Original was RAW → swap: Alternative now has orig URL
+        assert_eq!(
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
+            "https://example.com/alt"
+        );
+        assert_eq!(
+            &*get_ver(&versions, AssetVersionSize::Alternative)
+                .unwrap()
+                .url,
+            "https://example.com/orig"
+        );
+    }
+
+    #[test]
+    fn test_raw_policy_as_original_no_swap_when_alt_not_raw() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
+        assert_eq!(
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
+            "https://example.com/orig"
+        );
+    }
+
+    #[test]
+    fn test_raw_policy_as_alternative_no_swap_when_orig_not_raw() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferAlternative);
+        assert_eq!(
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
+            "https://example.com/orig"
+        );
+    }
+
+    #[test]
+    fn test_raw_policy_no_alternative_no_swap() {
+        let asset = TestPhotoAsset::new("TEST_1").build(); // only has Original
+        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
+        assert_eq!(
+            &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
+            "https://example.com/orig"
+        );
+        assert!(!has_ver(&versions, AssetVersionSize::Alternative));
+    }
+
+    #[test]
+    fn test_filter_asset_uses_raw_policy_swap() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let mut config = test_config();
+        config.align_raw = RawTreatmentPolicy::PreferOriginal;
+        // With AsOriginal and RAW alternative, the swap makes Original point to alt URL
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(&*tasks[0].url, "https://example.com/alt");
+        assert_eq!(&*tasks[0].checksum, "alt_ck");
+    }
+
+    #[test]
+    fn test_filter_detects_case_insensitive_collision() {
+        // On case-insensitive filesystems (macOS, Windows), IMG_0996.mov and IMG_0996.MOV
+        // are the same file. Test that claimed_paths detects this collision.
+        let dir = TempDir::new().unwrap();
+
+        // First asset: regular video IMG_0996.mov
+        let video_asset = TestPhotoAsset::new("VID_0996")
+            .filename("IMG_0996.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(258592890)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .asset_date(1713657600000.0)
+            .build();
+
+        // Second asset: live photo IMG_0996.JPG whose MOV companion would be IMG_0996.MOV
+        let photo_asset = TestPhotoAsset::new("IMG_0996")
+            .filename("IMG_0996.JPG")
+            .orig_size(5000)
+            .orig_url("https://example.com/jpg")
+            .orig_checksum("jpg_ck")
+            .live_photo("https://example.com/live_mov", "mov_ck", 124037918)
+            .asset_date(1713657600000.0)
+            .build();
+
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+
+        // Process both assets through claimed_paths
+        let mut claimed_paths = FxHashMap::default();
+        let mut dir_cache = paths::DirCache::new();
+        let video_tasks =
+            filter_asset_to_tasks(&video_asset, &config, &mut claimed_paths, &mut dir_cache);
+        assert_eq!(video_tasks.len(), 1);
+        let video_path = &video_tasks[0].download_path;
+        eprintln!("Video path: {:?}", video_path);
+
+        let photo_tasks =
+            filter_asset_to_tasks(&photo_asset, &config, &mut claimed_paths, &mut dir_cache);
+        assert_eq!(photo_tasks.len(), 2, "Expected 2 tasks (photo + MOV)");
+
+        let mov_task = &photo_tasks[1];
+        let mov_path = &mov_task.download_path;
+        eprintln!("Live MOV path: {:?}", mov_path);
+        eprintln!(
+            "Claimed paths: {:?}",
+            claimed_paths.keys().collect::<Vec<_>>()
+        );
+
+        // Both the video (.mov) and the live-photo MOV get their extension
+        // mapped to uppercase .MOV via ITEM_TYPE_EXTENSIONS, so they collide
+        // on ALL platforms (not just case-insensitive ones).
+        let mov_filename = mov_path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            mov_filename.contains("-IMG_0996"),
+            "MOV should be deduped with asset ID suffix due to path collision. Got: {}",
+            mov_filename
+        );
+    }
+
+    #[test]
+    fn test_filter_asset_as_is_downloads_original() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let config = test_config(); // align_raw defaults to AsIs
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(&*tasks[0].url, "https://example.com/orig");
+        assert_eq!(&*tasks[0].checksum, "orig_ck");
+    }
+
+    #[test]
+    fn test_download_task_size() {
+        use std::mem::size_of;
+        // 144 bytes accommodates platform differences (Windows has larger PathBuf)
+        assert!(
+            size_of::<DownloadTask>() <= 144,
+            "DownloadTask size {} exceeds 144 bytes",
+            size_of::<DownloadTask>()
+        );
+    }
+
+    // ── extract_skip_candidates tests ──────────────────────────────
+
+    #[test]
+    fn test_extract_skip_candidates_photo() {
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let config = test_config();
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, VersionSizeKey::Original);
+        assert_eq!(candidates[0].1, "abc123");
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_live_photo() {
+        let asset = test_live_photo_asset();
+        let config = test_config();
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].0, VersionSizeKey::Original);
+        assert_eq!(candidates[0].1, "heic_ck");
+        assert_eq!(candidates[1].0, VersionSizeKey::LiveOriginal);
+        assert_eq!(candidates[1].1, "mov_ck");
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_skip_videos() {
+        let asset = TestPhotoAsset::new("VID_1")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .build();
+        let mut config = test_config();
+        config.skip_videos = true;
+        assert!(extract_skip_candidates(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_skip_photos() {
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let mut config = test_config();
+        config.skip_photos = true;
+        assert!(extract_skip_candidates(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_image_only_mode() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // Should still have the primary HEIC version, just not the MOV companion
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, VersionSizeKey::Original);
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_skip_mode() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert!(
+            candidates.is_empty(),
+            "Skip mode should exclude live photos entirely"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_skip_mode_non_live_passes() {
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "Skip mode should not affect non-live photos"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_video_only_mode() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // Should have only the MOV companion, no primary image
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, VersionSizeKey::LiveOriginal);
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_date_before_filter() {
+        let asset = TestPhotoAsset::new("TEST_1").build(); // assetDate = 1736899200000 = 2025-01-15
+        let mut config = test_config();
+        // Set skip_created_before to a date AFTER the asset's creation
+        config.skip_created_before = Some(
+            DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(extract_skip_candidates(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_date_after_filter() {
+        let asset = TestPhotoAsset::new("TEST_1").build(); // assetDate = 1736899200000 = 2025-01-15
+        let mut config = test_config();
+        // Set skip_created_after to a date BEFORE the asset's creation
+        config.skip_created_after = Some(
+            DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(extract_skip_candidates(&asset, &config).is_empty());
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_size_fallback_to_original() {
+        let asset = TestPhotoAsset::new("TEST_1").build(); // only has resOriginalRes
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium; // not available
+        config.force_size = false;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // Should fall back to Original
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, VersionSizeKey::Original);
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_force_size_no_fallback() {
+        let asset = TestPhotoAsset::new("TEST_1").build(); // only has resOriginalRes
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium; // not available
+        config.force_size = true;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // force_size prevents fallback — no primary version
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_live_adjusted_falls_back_to_live_original() {
+        let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.force_size = false;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // Primary + live companion (fallback to LiveOriginal)
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[1].0, VersionSizeKey::LiveOriginal);
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_live_adjusted_force_size_no_fallback() {
+        let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.force_size = true;
+        let candidates = extract_skip_candidates(&asset, &config);
+        // force_size prevents fallback — only primary, no live companion
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_live_adjusted_falls_back_to_live_original() {
+        let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.force_size = false;
+        let tasks = filter_asset_fresh(&asset, &config);
+        // Should produce 2 tasks: primary + live companion (fallback to LiveOriginal)
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].version_size, VersionSizeKey::LiveOriginal);
+        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
+    }
+
+    #[test]
+    fn test_filter_live_adjusted_force_size_no_fallback() {
+        let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.force_size = true;
+        let tasks = filter_asset_fresh(&asset, &config);
+        // force_size prevents fallback — only primary, no live companion
+        assert_eq!(tasks.len(), 1);
+    }
+
+    // ── determine_media_type tests ──────────────────────────────────────
+
+    #[test]
+    fn test_determine_media_type_image_no_live_is_photo() {
+        let asset = TestPhotoAsset::new("TEST_1").build(); // public.jpeg, no live versions
+        assert_eq!(
+            determine_media_type(VersionSizeKey::Original, &asset),
+            MediaType::Photo
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_image_with_live_is_live_photo_image() {
+        let asset = test_live_photo_asset(); // public.heic with live versions
+        assert_eq!(
+            determine_media_type(VersionSizeKey::Original, &asset),
+            MediaType::LivePhotoImage
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_movie_original_is_video() {
+        let asset = TestPhotoAsset::new("MOV_1")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .build();
+        assert_eq!(
+            determine_media_type(VersionSizeKey::Original, &asset),
+            MediaType::Video
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_live_original_on_image_is_live_photo_video() {
+        let asset = test_live_photo_asset();
+        assert_eq!(
+            determine_media_type(VersionSizeKey::LiveOriginal, &asset),
+            MediaType::LivePhotoVideo
+        );
+    }
+
+    #[test]
+    fn test_determine_media_type_live_original_on_movie_is_video() {
+        let asset = TestPhotoAsset::new("MOV_2")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://example.com/vid")
+            .orig_checksum("vid_ck")
+            .build();
+        assert_eq!(
+            determine_media_type(VersionSizeKey::LiveOriginal, &asset),
+            MediaType::Video
+        );
+    }
+
+    // ── NameId7 filter tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_name_id7_produces_task_with_id_suffix() {
+        let asset = TestPhotoAsset::new("TEST_1").build(); // recordName "TEST_1"
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // NameId7 uses underscore separator between stem and base64 ID suffix
+        assert!(
+            filename.contains('_'),
+            "NameId7 filename should contain underscore separator, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn test_name_id7_skips_existing_file() {
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let dir = TempDir::new().unwrap();
+        config.directory = dir.path().to_path_buf();
+
+        // First call to get the expected path
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let expected_path = &tasks[0].download_path;
+
+        // Create parent directories and write a file with the matching size
+        fs::create_dir_all(expected_path.parent().unwrap()).unwrap();
+        fs::write(expected_path, vec![0u8; 1000]).unwrap();
+
+        // Second call should skip since the file exists with matching size
+        let tasks2 = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks2.is_empty(),
+            "NameId7 should skip existing file, got {} tasks",
+            tasks2.len()
+        );
+    }
+
+    #[test]
+    fn test_name_id7_live_photo_produces_two_tasks_with_id_suffix() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(
+            tasks.len(),
+            2,
+            "Live photo should produce 2 tasks (HEIC + MOV)"
+        );
+
+        for task in &tasks {
+            let filename = task.download_path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                filename.contains('_'),
+                "NameId7 live photo filename should contain underscore separator, got: {filename}"
+            );
+        }
+    }
+
+    // ── keep_unicode_in_filenames tests ─────────────────────────────────
+
+    fn unicode_photo_asset() -> PhotoAsset {
+        TestPhotoAsset::new("UNI_1")
+            .filename("Caf\u{e9}_photo.jpg")
+            .build()
+    }
+
+    #[test]
+    fn test_keep_unicode_preserves_non_ascii() {
+        let asset = unicode_photo_asset();
+        let mut config = test_config();
+        config.keep_unicode_in_filenames = true;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("Caf\u{e9}"),
+            "keep_unicode=true should preserve unicode, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn test_default_strips_unicode_from_filename() {
+        let asset = unicode_photo_asset();
+        let config = test_config(); // keep_unicode_in_filenames = false
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("Caf_photo"),
+            "keep_unicode=false should strip non-ASCII, got: {filename}"
+        );
+        assert!(
+            !filename.contains("Caf\u{e9}"),
+            "keep_unicode=false should not contain unicode chars, got: {filename}"
+        );
+    }
+
+    // ── Medium/Thumb size suffix tests ──────────────────────────────────
+
+    fn multi_size_photo_asset() -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": "MED_1", "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "orig_ck"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resJPEGMedRes": {"value": {
+                    "size": 2000,
+                    "downloadURL": "https://example.com/med",
+                    "fileChecksum": "med_ck"
+                }},
+                "resJPEGMedFileType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 500,
+                    "downloadURL": "https://example.com/thumb",
+                    "fileChecksum": "thumb_ck"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        )
+    }
+
+    #[test]
+    fn test_medium_size_adds_suffix() {
+        let asset = multi_size_photo_asset();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("-medium"),
+            "Medium size should add '-medium' suffix, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn test_thumb_size_adds_suffix() {
+        let asset = multi_size_photo_asset();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Thumb;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            filename.contains("-thumb"),
+            "Thumb size should add '-thumb' suffix, got: {filename}"
+        );
+    }
+
+    // ── NormalizedPath direct tests ─────────────────────────────────────
+
+    #[test]
+    fn test_normalized_path_lowercases_on_case_insensitive() {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let np = NormalizedPath::new(PathBuf::from("Foo.JPG"));
+            assert_eq!(&*np.0, "foo.jpg");
+        }
+    }
+
+    #[test]
+    fn test_normalized_path_case_equality() {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let a = NormalizedPath::new(PathBuf::from("/photos/IMG.JPG"));
+            let b = NormalizedPath::new(PathBuf::from("/photos/img.jpg"));
+            assert_eq!(a, b);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            let a = NormalizedPath::new(PathBuf::from("/photos/IMG.JPG"));
+            let b = NormalizedPath::new(PathBuf::from("/photos/img.jpg"));
+            assert_ne!(a, b);
+        }
+    }
+
+    #[test]
+    fn test_normalized_path_borrow_for_hashmap_lookup() {
+        use std::collections::HashMap;
+        let mut map: HashMap<NormalizedPath, u64> = HashMap::new();
+        map.insert(NormalizedPath::new(PathBuf::from("test.jpg")), 42);
+        let key = NormalizedPath::normalize(std::path::Path::new("test.jpg"));
+        assert_eq!(map.get(key.as_ref()), Some(&42));
+    }
+
+    // ── NormalizedPath additional tests ──────────────────────────────────
+
+    #[test]
+    fn test_normalized_path_new_stores_normalized_form() {
+        let np = NormalizedPath::new(PathBuf::from("/photos/2025/01/IMG_0001.JPG"));
+        // On macOS/Windows the stored form should be lowercase
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(&*np.0, "/photos/2025/01/img_0001.jpg");
+        // On Linux the stored form preserves case
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(&*np.0, "/photos/2025/01/IMG_0001.JPG");
+    }
+
+    #[test]
+    fn test_normalized_path_normalize_returns_lowercase_on_macos() {
+        let path = Path::new("/Photos/IMG_0001.HEIC");
+        let normalized = NormalizedPath::normalize(path);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(normalized.as_ref(), "/photos/img_0001.heic");
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(normalized.as_ref(), "/Photos/IMG_0001.HEIC");
+    }
+
+    #[test]
+    fn test_normalized_path_hashmap_case_insensitive_lookup() {
+        // Insert with one case, look up with another — must find on macOS/Windows
+        use std::collections::HashMap;
+        let mut map: HashMap<NormalizedPath, u64> = HashMap::new();
+        map.insert(NormalizedPath::new(PathBuf::from("IMG_0001.JPG")), 100);
+        let lookup_key = NormalizedPath::normalize(Path::new("img_0001.jpg"));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(map.get(lookup_key.as_ref()), Some(&100));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(map.get(lookup_key.as_ref()), None);
+    }
+
+    #[test]
+    fn test_normalized_path_hash_consistency() {
+        // NormalizedPath::new and normalize must produce the same hash for HashMap
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let path = PathBuf::from("Test/Photo.JPG");
+        let np = NormalizedPath::new(path.clone());
+        let normalized_str = NormalizedPath::normalize(&path);
+
+        let mut h1 = DefaultHasher::new();
+        np.hash(&mut h1);
+        let hash1 = h1.finish();
+
+        // The str from normalize should hash the same as the NormalizedPath via Borrow<str>
+        let mut h2 = DefaultHasher::new();
+        let borrow_str: &str = std::borrow::Borrow::borrow(&np);
+        borrow_str.hash(&mut h2);
+        let hash2 = h2.finish();
+
+        assert_eq!(
+            hash1, hash2,
+            "NormalizedPath hash must match &str hash via Borrow"
+        );
+        assert_eq!(borrow_str, normalized_str.as_ref());
+    }
+
+    #[test]
+    fn test_normalized_path_case_different_paths_equal_on_case_insensitive() {
+        let upper = NormalizedPath::new(PathBuf::from("PHOTO.HEIC"));
+        let lower = NormalizedPath::new(PathBuf::from("photo.heic"));
+        let mixed = NormalizedPath::new(PathBuf::from("Photo.Heic"));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert_eq!(upper, lower);
+            assert_eq!(upper, mixed);
+            assert_eq!(lower, mixed);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            assert_ne!(upper, lower);
+            assert_ne!(upper, mixed);
+        }
+    }
+
+    // ── Gap coverage: empty versions, path traversal, empty filename ───
+
+    #[test]
+    fn filter_asset_empty_versions_map_produces_no_tasks() {
+        // Asset with no version fields at all — filter should produce zero tasks.
+        let asset = PhotoAsset::new(
+            json!({"recordName": "NO_VERS_1", "fields": {
+                "filenameEnc": {"value": "IMG_4502.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks.is_empty(),
+            "Asset with no versions should produce 0 tasks, got {}",
+            tasks.len()
+        );
+    }
+
+    #[test]
+    fn filter_asset_path_traversal_filename_is_sanitized() {
+        // A filename containing path traversal should NOT escape the download
+        // directory. The folder_structure + local_download_path should confine it.
+        let asset = TestPhotoAsset::new("TRAV_1")
+            .filename("../../../etc/passwd")
+            .orig_size(512)
+            .orig_url("https://cdn.icloud.com/photos/orig/abc")
+            .orig_checksum("a1b2c3d4e5f6")
+            .build();
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let path_str = tasks[0].download_path.to_string_lossy();
+        // The download path must stay inside the configured directory
+        assert!(
+            path_str.starts_with(config.directory.to_string_lossy().as_ref()),
+            "Path traversal filename should be confined to download dir, got: {path_str}"
+        );
+        assert!(
+            !path_str.contains("/etc/passwd"),
+            "Path traversal must not escape download directory, got: {path_str}"
+        );
+    }
+
+    #[test]
+    fn filter_asset_missing_filename_uses_fingerprint_fallback() {
+        // Asset whose filenameEnc field is absent (null) should trigger the
+        // fingerprint fallback path, generating a filename from the asset ID.
+        let asset = PhotoAsset::new(
+            json!({"recordName": "NOFN_ASSET1", "fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 2048,
+                    "downloadURL": "https://cdn.icloud.com/photos/orig/nofn",
+                    "fileChecksum": "deadbeef1234"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        assert!(
+            asset.filename().is_none(),
+            "Asset with no filenameEnc should have None filename"
+        );
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // Fingerprint path: SHA-256 hash of asset ID, first 12 hex chars
+        // SHA-256("NOFN_ASSET1") → "aab85e8020e4..."
+        assert!(
+            filename.contains("aab85e8020e4"),
+            "Missing filename should use fingerprint hash of asset ID, got: {filename}"
+        );
+        assert!(
+            filename.ends_with(".JPG"),
+            "Fingerprint filename for public.jpeg should have .JPG extension, got: {filename}"
+        );
+    }
+
+    // ── Gap coverage: skip_created_before AND skip_created_after ────────
+
+    #[test]
+    fn filter_asset_narrowing_date_window_includes_asset_inside() {
+        // Asset date: 2025-01-15 (epoch ms 1736899200000)
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let mut config = test_config();
+        // Window: 2025-01-01 .. 2025-02-01 — asset at Jan 15 is inside
+        config.skip_created_before = Some(
+            DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        config.skip_created_after = Some(
+            DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "Asset inside the date window should produce a task"
+        );
+    }
+
+    #[test]
+    fn filter_asset_narrowing_date_window_excludes_asset_before() {
+        // Asset date: 2025-01-15
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let mut config = test_config();
+        // Window: 2025-01-20 .. 2025-02-01 — asset at Jan 15 is before the window
+        config.skip_created_before = Some(
+            DateTime::parse_from_rfc3339("2025-01-20T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        config.skip_created_after = Some(
+            DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "Asset before the date window should be skipped"
+        );
+    }
+
+    #[test]
+    fn filter_asset_narrowing_date_window_excludes_asset_after() {
+        // Asset date: 2025-01-15
+        let asset = TestPhotoAsset::new("TEST_1").build();
+        let mut config = test_config();
+        // Window: 2024-12-01 .. 2025-01-10 — asset at Jan 15 is after the window
+        config.skip_created_before = Some(
+            DateTime::parse_from_rfc3339("2024-12-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        config.skip_created_after = Some(
+            DateTime::parse_from_rfc3339("2025-01-10T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "Asset after the date window should be skipped"
+        );
+    }
+
+    // ── Gap coverage: NameId7 produces task when file at original path ──
+
+    #[test]
+    fn filter_asset_name_id7_downloads_when_original_path_exists() {
+        // With NameId7 policy, the download path includes an ID suffix.
+        // Even if a file exists at the *non-suffixed* (original) path,
+        // NameId7 should produce a task because its path is different.
+        let dir = TempDir::new().unwrap();
+
+        let asset = TestPhotoAsset::new("TEST_1").build(); // recordName "TEST_1", "photo.jpg"
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+
+        // Get the NameId7 path
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let id7_path = &tasks[0].download_path;
+
+        // Create a file at the non-suffixed original path (without ID suffix)
+        // This simulates a file that was downloaded with NameSizeDedupWithSuffix
+        let original_path = paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &tasks[0].created_local,
+            "photo.JPG",
+            config.album_name.as_deref(),
+        );
+        fs::create_dir_all(original_path.parent().unwrap()).unwrap();
+        fs::write(&original_path, vec![0u8; 1000]).unwrap();
+
+        // The NameId7 path is different from the original path
+        assert_ne!(
+            id7_path, &original_path,
+            "NameId7 path should differ from non-suffixed path"
+        );
+
+        // NameId7 should still produce a task because the ID7 path doesn't exist
+        let tasks2 = filter_asset_fresh(&asset, &config);
+        assert_eq!(
+            tasks2.len(),
+            1,
+            "NameId7 should produce task when only the non-suffixed file exists"
+        );
+
+        // Now create the file at the NameId7 path — should skip
+        fs::create_dir_all(id7_path.parent().unwrap()).unwrap();
+        fs::write(id7_path, vec![0u8; 1000]).unwrap();
+        let tasks3 = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks3.is_empty(),
+            "NameId7 should skip when ID-suffixed file already exists"
+        );
+    }
+
+    // ── Gap coverage: retry_only known_ids filtering ────────────────────
+
+    #[test]
+    fn download_context_retry_only_skips_unknown_assets() {
+        // In retry-only mode, the producer checks known_ids before sending
+        // tasks. Simulate that filtering logic here.
+        let mut ctx = super::super::DownloadContext::default();
+        ctx.known_ids.insert("PREV_SYNCED_001".into());
+        ctx.known_ids.insert("PREV_SYNCED_002".into());
+
+        let known_asset = TestPhotoAsset::new("TEST_1").build(); // recordName "TEST_1"
+        let config = test_config();
+        let tasks = filter_asset_fresh(&known_asset, &config);
+
+        // Simulate the retry_only check from the producer loop
+        let retry_filtered: Vec<_> = tasks
+            .into_iter()
+            .filter(|task| ctx.known_ids.contains(task.asset_id.as_ref()))
+            .collect();
+
+        // "TEST_1" is NOT in known_ids, so retry_only would skip it
+        assert!(
+            retry_filtered.is_empty(),
+            "Unknown asset should be filtered out in retry_only mode"
+        );
+
+        // Now add "TEST_1" to known_ids and verify it passes
+        ctx.known_ids.insert("TEST_1".into());
+        let tasks2 = filter_asset_fresh(&known_asset, &config);
+        let retry_filtered2: Vec<_> = tasks2
+            .into_iter()
+            .filter(|task| ctx.known_ids.contains(task.asset_id.as_ref()))
+            .collect();
+        assert_eq!(
+            retry_filtered2.len(),
+            1,
+            "Known asset should pass retry_only filter"
+        );
+    }
+
+    // ── Gap coverage: incremental Modified events are downloadable ──────
+
+    #[test]
+    fn change_event_modified_asset_is_downloadable() {
+        use crate::icloud::photos::asset::ChangeEvent;
+        use crate::types::ChangeReason;
+
+        // In the iCloud changes API, both new and modified records arrive as
+        // ChangeReason::Created (the enum doc says "new or modified").
+        // Verify that a "modified" asset with a ChangeReason::Created is
+        // picked up by the download filter.
+        let modified_asset = TestPhotoAsset::new("MODIFIED_ASSET_1")
+            .filename("IMG_9876.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(4500000)
+            .orig_url("https://cdn.icloud.com/photos/orig/modified")
+            .orig_checksum("f0e1d2c3b4a5")
+            .build();
+
+        let event = ChangeEvent {
+            record_name: "MODIFIED_ASSET_1".to_string(),
+            record_type: Some("CPLAsset".to_string()),
+            reason: ChangeReason::Created,
+            asset: Some(modified_asset),
+        };
+
+        // Simulate the incremental filtering: Created reason + asset present
+        assert!(matches!(event.reason, ChangeReason::Created));
+        let asset = event.asset.unwrap();
+
+        // The extracted asset should produce a download task
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "Modified asset via Created reason should produce a download task"
+        );
+        assert_eq!(&*tasks[0].checksum, "f0e1d2c3b4a5");
+    }
+
+    // ── filter_asset_to_tasks edge-case tests ──────────────────────
+
+    #[test]
+    fn test_filter_asset_no_versions_produces_empty() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "NO_VERSIONS", "fields": {
+                "filenameEnc": {"value": "empty.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "Asset with no versions should produce no tasks"
+        );
+    }
+
+    #[test]
+    fn test_filter_skip_created_before_excludes_old_asset() {
+        // Asset created 2020-06-15 (epoch ms)
+        let asset = TestPhotoAsset::new("OLD_1")
+            .asset_date(1592179200000.0) // 2020-06-15T00:00:00Z
+            .build();
+        let mut config = test_config();
+        // skip_created_before = 2024-01-01
+        config.skip_created_before = Some(
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc(),
+        );
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "Asset created in 2020 should be excluded by skip_created_before=2024"
+        );
+    }
+
+    #[test]
+    fn test_filter_skip_created_after_excludes_new_asset() {
+        // Asset created 2025-06-15 (epoch ms)
+        let asset = TestPhotoAsset::new("NEW_1")
+            .asset_date(1750003200000.0) // 2025-06-15T00:00:00Z
+            .build();
+        let mut config = test_config();
+        // skip_created_after = 2023-01-01
+        config.skip_created_after = Some(
+            chrono::NaiveDate::from_ymd_opt(2023, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc(),
+        );
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "Asset created in 2025 should be excluded by skip_created_after=2023"
+        );
+    }
+
+    #[test]
+    fn test_filter_force_size_missing_version_no_fallback() {
+        // Asset only has Original; request Medium with force_size=true
+        let asset = TestPhotoAsset::new("FORCE_1").build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = true;
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "force_size=true with missing Medium version should not fall back to Original"
+        );
+    }
+
+    // ── LivePhotoMode + filename_exclude filter tests ─────────────
+
+    #[test]
+    fn test_filter_skip_mode_skips_live_photo_entirely() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks.is_empty(),
+            "Skip mode should produce no tasks for live photos"
+        );
+    }
+
+    #[test]
+    fn test_filter_video_only_mode_skips_primary_keeps_mov() {
+        let asset = test_live_photo_asset();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        // The task should be the MOV companion
+        assert!(tasks[0].download_path.to_str().unwrap().contains(".MOV"));
+    }
+
+    #[test]
+    fn test_filter_filename_exclude_matches() {
+        let asset = TestPhotoAsset::new("EXCL_1")
+            .filename("IMG_0001.AAE")
+            .build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(tasks.is_empty(), "*.AAE pattern should exclude AAE files");
+    }
+
+    #[test]
+    fn test_filter_filename_exclude_case_insensitive() {
+        let asset = TestPhotoAsset::new("EXCL_2").filename("Photo.aae").build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks.is_empty(),
+            "Pattern matching should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn test_filter_filename_exclude_no_match_passes() {
+        let asset = TestPhotoAsset::new("EXCL_3")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(!tasks.is_empty(), "Non-matching files should pass through");
+    }
+
+    // ── exclude_asset_ids filter tests ─────────────────────────────
+
+    #[test]
+    fn test_filter_exclude_asset_ids_blocks_matching() {
+        let asset = TestPhotoAsset::new("EXCLUDED_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        let mut ids = FxHashSet::default();
+        ids.insert("EXCLUDED_1".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(tasks.is_empty(), "Asset in exclude set should be filtered");
+    }
+
+    #[test]
+    fn test_filter_exclude_asset_ids_passes_non_matching() {
+        let asset = TestPhotoAsset::new("KEEP_1")
+            .filename("IMG_0002.JPG")
+            .build();
+        let mut config = test_config();
+        let mut ids = FxHashSet::default();
+        ids.insert("OTHER_ID".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert!(!tasks.is_empty(), "Asset not in exclude set should pass");
+    }
+
+    #[test]
+    fn test_skip_candidates_exclude_asset_ids() {
+        let asset = TestPhotoAsset::new("SKIP_EXCL_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        let mut ids = FxHashSet::default();
+        ids.insert("SKIP_EXCL_1".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
+        let candidates = extract_skip_candidates(&asset, &config);
+        assert!(
+            candidates.is_empty(),
+            "extract_skip_candidates should return empty for excluded assets"
+        );
+    }
+
+    // ── extract_skip_candidates: filename_exclude ─────────────────
+
+    #[test]
+    fn test_extract_skip_candidates_filename_exclude_matches() {
+        let asset = TestPhotoAsset::new("TEST_1").filename("photo.AAE").build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        assert!(
+            extract_skip_candidates(&asset, &config).is_empty(),
+            "filename_exclude should filter in extract_skip_candidates"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_filename_exclude_no_match_passes() {
+        let asset = TestPhotoAsset::new("TEST_1").build(); // filename = "test_photo.jpg"
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        assert!(
+            !extract_skip_candidates(&asset, &config).is_empty(),
+            "non-matching filename should pass through"
+        );
+    }
+
+    #[test]
+    fn test_extract_skip_candidates_filename_exclude_case_insensitive() {
+        let asset = TestPhotoAsset::new("TEST_1").filename("photo.aae").build();
+        let mut config = test_config();
+        config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
+        assert!(
+            extract_skip_candidates(&asset, &config).is_empty(),
+            "filename_exclude should be case-insensitive"
+        );
+    }
+}
