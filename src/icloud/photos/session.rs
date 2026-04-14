@@ -37,9 +37,11 @@ impl PhotosSession for reqwest::Client {
                     "CloudKit error response body"
                 );
             }
-            // Format matches reqwest's error_for_status() output so
-            // is_misdirected_request() and other string-based checks work.
-            anyhow::bail!("HTTP status client error ({status}) for url ({url})");
+            return Err(HttpStatusError {
+                status: status.as_u16(),
+                url,
+            }
+            .into());
         }
 
         let json: Value = resp.json().await?;
@@ -64,6 +66,15 @@ impl PhotosSession for crate::auth::SharedSession {
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
     }
+}
+
+/// HTTP error with structured status code for typed error handling.
+/// Wraps non-success HTTP responses from CloudKit endpoints.
+#[derive(Debug, thiserror::Error)]
+#[error("HTTP {status} for {url}")]
+pub(crate) struct HttpStatusError {
+    pub status: u16,
+    pub url: String,
 }
 
 /// `CloudKit` server error codes that indicate a transient condition.

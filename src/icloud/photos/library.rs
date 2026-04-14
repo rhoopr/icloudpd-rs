@@ -98,14 +98,15 @@ impl PhotoLibrary {
             // HTTP 403 on the CloudKit query endpoint after successful
             // authentication is the classic ADP signature: the account
             // authenticated fine but iCloud data access is blocked.
-            let msg = e.to_string();
-            if msg.contains("403 Forbidden") {
-                return ICloudError::ServiceNotActivated {
-                    code: "HTTP_403".into(),
-                    reason: "Forbidden — iCloud data access denied".into(),
-                };
+            if let Some(http_err) = e.downcast_ref::<super::session::HttpStatusError>() {
+                if http_err.status == 403 {
+                    return ICloudError::ServiceNotActivated {
+                        code: "HTTP_403".into(),
+                        reason: "Forbidden — iCloud data access denied".into(),
+                    };
+                }
             }
-            ICloudError::Connection(msg)
+            ICloudError::Connection(e.to_string())
         })?;
 
         let query: super::cloudkit::QueryResponse =
@@ -374,7 +375,7 @@ mod tests {
         assert_eq!(cloned.zone_name(), "PrimarySync");
     }
 
-    /// Stub that returns an HTTP 403 error (the format produced by `PhotosSession::post`).
+    /// Stub that returns an HTTP 403 error (the typed error produced by `PhotosSession::post`).
     struct Forbidden403Session;
 
     #[async_trait::async_trait]
@@ -385,9 +386,10 @@ mod tests {
             _body: &str,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
-            anyhow::bail!(
-                "HTTP status client error (403 Forbidden) for url (https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query)"
-            )
+            Err(crate::icloud::photos::session::HttpStatusError {
+                status: 403,
+                url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+            }.into())
         }
 
         fn clone_box(&self) -> Box<dyn PhotosSession> {
