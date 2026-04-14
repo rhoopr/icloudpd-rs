@@ -1432,24 +1432,28 @@ pub async fn download_photos_with_sync(
 ) -> Result<SyncResult> {
     cleanup_orphan_part_files(&config).await;
 
-    // Transition any pending assets that already exceeded the retry limit to
-    // failed. This cleans up assets stuck from before the fix that marks them
-    // at skip time.
-    if config.max_download_attempts > 0 {
-        if let Some(db) = &config.state_db {
-            match db.fail_exceeded_pending(config.max_download_attempts).await {
-                Ok(n) if n > 0 => {
-                    tracing::info!(
-                        count = n,
-                        max = config.max_download_attempts,
-                        "Marked stuck pending assets as failed"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to clean up stuck pending assets");
-                }
-                _ => {}
+    // Give every non-downloaded asset a fresh start this sync:
+    // 1. Failed -> pending (with attempts reset) so they re-enter the pipeline.
+    // 2. Pending with stale attempt counts -> attempts cleared, covering legacy
+    //    assets that were silently skipped before this fix.
+    if let Some(db) = &config.state_db {
+        match db.reset_failed().await {
+            Ok(n) if n > 0 => {
+                tracing::info!(count = n, "Reset failed assets for retry");
             }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to reset failed assets");
+            }
+            _ => {}
+        }
+        match db.reset_pending_attempts().await {
+            Ok(n) if n > 0 => {
+                tracing::info!(count = n, "Cleared stale attempt counts on pending assets");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to reset pending attempt counts");
+            }
+            _ => {}
         }
     }
 
@@ -5422,9 +5426,9 @@ mod tests {
             unimplemented!()
         }
         async fn reset_failed(&self) -> Result<u64, StateError> {
-            unimplemented!()
+            Ok(0)
         }
-        async fn fail_exceeded_pending(&self, _: u32) -> Result<u64, StateError> {
+        async fn reset_pending_attempts(&self) -> Result<u64, StateError> {
             Ok(0)
         }
         async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
