@@ -1454,8 +1454,33 @@ pub async fn download_photos_with_sync(
         }
     }
 
+    // Incremental sync only returns new changes — it won't re-enumerate
+    // pending assets from previous syncs. If any exist, fall back to full
+    // so they get retried. Once everything is downloaded, incremental resumes.
+    let force_full = if matches!(&config.sync_mode, SyncMode::Incremental { .. }) {
+        if let Some(db) = &config.state_db {
+            match db.get_summary().await {
+                Ok(summary) if summary.pending > 0 => {
+                    tracing::info!(
+                        pending = summary.pending,
+                        "Pending assets require full enumeration, skipping incremental sync"
+                    );
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     match &config.sync_mode {
         SyncMode::Full => {
+            download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
+        }
+        SyncMode::Incremental { .. } if force_full => {
             download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
         }
         SyncMode::Incremental { zone_sync_token } => {
