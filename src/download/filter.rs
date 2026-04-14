@@ -722,14 +722,11 @@ mod tests {
     use rustc_hash::FxHashSet;
 
     use crate::icloud::photos::PhotoAsset;
-    use crate::retry::RetryConfig;
     use crate::test_helpers::TestPhotoAsset;
     use crate::types::LivePhotoMode;
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
-
-    use super::super::SyncMode;
 
     fn test_config() -> DownloadConfig {
         DownloadConfig::test_default()
