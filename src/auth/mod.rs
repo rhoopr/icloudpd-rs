@@ -109,6 +109,14 @@ async fn authenticate_inner(
                 data = Some(d);
             }
             Err(e) => {
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_rate_limited())
+                {
+                    return Err(e.context(
+                        "Apple is rate limiting authentication requests. \
+                         Wait a few minutes before trying again",
+                    ));
+                }
                 tracing::debug!(
                     error = %e,
                     "Invalid authentication token, will log in from scratch"
@@ -132,6 +140,14 @@ async fn authenticate_inner(
                 data = Some(d);
             }
             Err(e) => {
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_rate_limited())
+                {
+                    return Err(e.context(
+                        "Apple is rate limiting authentication requests. \
+                         Wait a few minutes before trying again",
+                    ));
+                }
                 tracing::debug!(
                     error = %e,
                     "accountLogin failed, falling back to SRP"
@@ -275,8 +291,20 @@ pub async fn send_2fa_push(
 
     let mut data: Option<AccountLoginResponse> = None;
     if session.session_data.contains_key("session_token") {
-        if let Ok(d) = twofa::validate_token(&mut session, &endpoints).await {
-            data = Some(d);
+        match twofa::validate_token(&mut session, &endpoints).await {
+            Ok(d) => {
+                data = Some(d);
+            }
+            Err(e) => {
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_rate_limited())
+                {
+                    return Err(e.context(
+                        "Apple is rate limiting authentication requests. \
+                         Wait a few minutes before trying again",
+                    ));
+                }
+            }
         }
     }
 
