@@ -2187,7 +2187,7 @@ where
                         producer_pb.inc(1);
                     } else {
                         for task in tasks {
-                            // Skip assets that have exceeded the retry limit.
+                            // Mark assets that have exceeded the retry limit as failed.
                             if let Some(&attempts) =
                                 download_ctx.attempt_counts.get(task.asset_id.as_ref())
                             {
@@ -2198,8 +2198,28 @@ where
                                         asset_id = %task.asset_id,
                                         attempts,
                                         max = config.max_download_attempts,
-                                        "Skipping asset: exceeded max download attempts"
+                                        "Asset exceeded max download attempts, marking as failed"
                                     );
+                                    if let Some(db) = &producer_state_db {
+                                        let error = format!(
+                                            "Exceeded max download attempts ({attempts}/{})",
+                                            config.max_download_attempts
+                                        );
+                                        if let Err(e) = db
+                                            .mark_failed(
+                                                &task.asset_id,
+                                                task.version_size.as_str(),
+                                                &error,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                asset_id = %task.asset_id,
+                                                error = %e,
+                                                "Failed to mark asset as failed"
+                                            );
+                                        }
+                                    }
                                     continue;
                                 }
                             }
