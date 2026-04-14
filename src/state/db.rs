@@ -145,6 +145,11 @@ pub trait StateDb: Send + Sync {
     /// full metadata. Used by the early skip path to avoid path resolution.
     async fn touch_last_seen(&self, asset_id: &str) -> Result<(), StateError>;
 
+    /// Transition a pending asset to downloaded when its file already exists
+    /// on disk. Only affects rows with `status = 'pending'`; downloaded or
+    /// failed records are left unchanged. Returns `true` if a row was updated.
+    async fn mark_on_disk(&self, id: &str, version_size: &str) -> Result<bool, StateError>;
+
     /// Sample up to `limit` local paths of downloaded assets.
     /// Used to spot-check that "downloaded" files still exist on disk.
     async fn sample_downloaded_paths(&self, limit: usize) -> Result<Vec<PathBuf>, StateError>;
@@ -728,6 +733,21 @@ impl StateDb for SqliteStateDb {
         .map_err(|e| StateError::query(&e))?;
 
         Ok(())
+    }
+
+    async fn mark_on_disk(&self, id: &str, version_size: &str) -> Result<bool, StateError> {
+        let conn = self.acquire_lock("mark_on_disk")?;
+
+        let now = Utc::now().timestamp();
+        let updated = conn
+            .execute(
+                "UPDATE assets SET status = 'downloaded', downloaded_at = ?1 \
+                 WHERE id = ?2 AND version_size = ?3 AND status = 'pending'",
+                rusqlite::params![now, id, version_size],
+            )
+            .map_err(|e| StateError::query(&e))?;
+
+        Ok(updated > 0)
     }
 
     async fn sample_downloaded_paths(&self, limit: usize) -> Result<Vec<PathBuf>, StateError> {
@@ -2011,5 +2031,108 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let counts = db.get_attempt_counts().await.unwrap();
         assert!(counts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mark_on_disk_transitions_pending_to_downloaded() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Create a pending asset (simulates interrupted previous sync)
+        let record = TestAssetRecord::new("AOnDisk")
+            .checksum("aaaa")
+            .filename("IMG_0001.HEIC")
+            .size(5000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+
+        let before = db.get_summary().await.unwrap();
+        assert_eq!(before.pending, 1);
+        assert_eq!(before.downloaded, 0);
+
+        // mark_on_disk should transition pending -> downloaded
+        let updated = db.mark_on_disk("AOnDisk", "original").await.unwrap();
+        assert!(updated);
+
+        let after = db.get_summary().await.unwrap();
+        assert_eq!(after.pending, 0);
+        assert_eq!(after.downloaded, 1);
+    }
+
+    #[tokio::test]
+    async fn mark_on_disk_ignores_already_downloaded() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let dir = test_dir();
+
+        let record = TestAssetRecord::new("ADownloaded")
+            .checksum("bbbb")
+            .filename("IMG_0002.HEIC")
+            .size(6000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        let path = dir.path().join("IMG_0002.HEIC");
+        fs::write(&path, b"payload").unwrap();
+        db.mark_downloaded("ADownloaded", "original", &path, "localhash", None)
+            .await
+            .unwrap();
+
+        // mark_on_disk should return false (no row changed)
+        let updated = db.mark_on_disk("ADownloaded", "original").await.unwrap();
+        assert!(!updated);
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 1);
+    }
+
+    #[tokio::test]
+    async fn mark_on_disk_ignores_failed() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = TestAssetRecord::new("AFailed")
+            .checksum("cccc")
+            .filename("IMG_0003.MOV")
+            .size(7000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_failed("AFailed", "original", "HTTP 500")
+            .await
+            .unwrap();
+
+        let updated = db.mark_on_disk("AFailed", "original").await.unwrap();
+        assert!(!updated);
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.downloaded, 0);
+    }
+
+    #[tokio::test]
+    async fn mark_on_disk_prevents_promote_pending_to_failed() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Two pending assets: one exists on disk, one doesn't
+        for id in &["AExists", "AMissing"] {
+            let record = TestAssetRecord::new(id)
+                .checksum("dddd")
+                .filename("IMG.HEIC")
+                .size(1000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+        }
+
+        let before = db.get_summary().await.unwrap();
+        assert_eq!(before.pending, 2);
+
+        // Mark only AExists as on-disk
+        let updated = db.mark_on_disk("AExists", "original").await.unwrap();
+        assert!(updated);
+
+        // promote_pending_to_failed should only catch AMissing
+        let promoted = db.promote_pending_to_failed().await.unwrap();
+        assert_eq!(promoted, 1);
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.pending, 0);
     }
 }

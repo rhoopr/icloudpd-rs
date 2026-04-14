@@ -2252,7 +2252,28 @@ where
                     let tasks =
                         filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
                     if tasks.is_empty() {
-                        skipped_by_filter += 1;
+                        // Distinguish content-filtered assets (no eligible
+                        // versions) from on-disk skips (eligible versions but
+                        // files already exist). For the latter, transition any
+                        // stale pending DB records to downloaded so
+                        // promote_pending_to_failed won't mark them as failed.
+                        let candidates = extract_skip_candidates(&asset, config);
+                        if candidates.is_empty() {
+                            skipped_by_filter += 1;
+                        } else {
+                            skipped_on_disk += 1;
+                            if let Some(db) = &producer_state_db {
+                                for &(vs, _) in &candidates {
+                                    if let Err(e) = db.mark_on_disk(asset.id(), vs.as_str()).await {
+                                        tracing::debug!(
+                                            error = %e,
+                                            asset_id = %asset.id(),
+                                            "Failed to mark on-disk asset"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         producer_pb.inc(1);
                     } else {
                         for task in tasks {
@@ -2350,6 +2371,23 @@ where
                                         // are cache-hits — no blocking I/O.
                                         if dir_cache.exists(&task.download_path) {
                                             skipped_on_disk += 1;
+                                            // File exists on disk but DB has it as
+                                            // pending (e.g. interrupted previous sync).
+                                            // Transition to downloaded so
+                                            // promote_pending_to_failed won't catch it.
+                                            if let Err(e) = db
+                                                .mark_on_disk(
+                                                    &task.asset_id,
+                                                    task.version_size.as_str(),
+                                                )
+                                                .await
+                                            {
+                                                tracing::debug!(
+                                                    error = %e,
+                                                    asset_id = %task.asset_id,
+                                                    "Failed to mark on-disk asset"
+                                                );
+                                            }
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
                                                 path = %task.download_path.display(),
@@ -2360,6 +2398,19 @@ where
                                             .is_some()
                                         {
                                             skipped_ampm += 1;
+                                            if let Err(e) = db
+                                                .mark_on_disk(
+                                                    &task.asset_id,
+                                                    task.version_size.as_str(),
+                                                )
+                                                .await
+                                            {
+                                                tracing::debug!(
+                                                    error = %e,
+                                                    asset_id = %task.asset_id,
+                                                    "Failed to mark on-disk asset"
+                                                );
+                                            }
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
                                                 path = %task.download_path.display(),
@@ -5523,6 +5574,9 @@ mod tests {
         }
         async fn touch_last_seen(&self, _: &str) -> Result<(), StateError> {
             unimplemented!()
+        }
+        async fn mark_on_disk(&self, _: &str, _: &str) -> Result<bool, StateError> {
+            Ok(false)
         }
         async fn sample_downloaded_paths(
             &self,
