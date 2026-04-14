@@ -1458,10 +1458,15 @@ pub async fn download_photos_with_sync(
         0
     };
 
-    let was_interrupted = shutdown_token.clone();
     let result = match &config.sync_mode {
         SyncMode::Full => {
-            download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
+            download_photos_full_with_token(
+                download_client,
+                albums,
+                &config,
+                shutdown_token.clone(),
+            )
+            .await
         }
         // Incremental sync only returns new changes — it won't re-enumerate
         // pending assets from previous syncs. Fall back to full so they get
@@ -1471,7 +1476,13 @@ pub async fn download_photos_with_sync(
                 pending = total_pending,
                 "Pending assets require full enumeration, skipping incremental sync"
             );
-            download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
+            download_photos_full_with_token(
+                download_client,
+                albums,
+                &config,
+                shutdown_token.clone(),
+            )
+            .await
         }
         SyncMode::Incremental { zone_sync_token } => {
             let token = zone_sync_token.clone();
@@ -1512,7 +1523,7 @@ pub async fn download_photos_with_sync(
                             download_client,
                             albums,
                             &config,
-                            shutdown_token,
+                            shutdown_token.clone(),
                         )
                         .await
                     } else {
@@ -1523,12 +1534,10 @@ pub async fn download_photos_with_sync(
         }
     };
 
-    // Pending is a transient state that should only exist during a sync.
-    // Promote any remaining pending assets to failed so they're visible in
-    // `kei status --failed` and don't block incremental sync on next run.
-    // Skip on interrupted syncs where pending assets are expected.
+    // Pending is transient — anything still pending after a complete sync either
+    // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.
     if let Some(db) = &config.state_db {
-        if !was_interrupted.is_cancelled() {
+        if !shutdown_token.is_cancelled() {
             match db.promote_pending_to_failed().await {
                 Ok(promoted) if promoted > 0 => {
                     tracing::warn!(
