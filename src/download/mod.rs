@@ -606,6 +606,9 @@ async fn build_download_tasks(
         let assets = album_result?;
 
         for asset in &assets {
+            if filter::is_asset_filtered(asset, config) {
+                continue;
+            }
             pre_ensure_asset_dir(&mut dir_cache, asset, config).await;
             tasks.extend(filter_asset_to_tasks(
                 asset,
@@ -1061,6 +1064,10 @@ async fn download_photos_incremental(
         } else {
             config
         };
+
+        if filter::is_asset_filtered(asset, effective_config) {
+            continue;
+        }
 
         // Fast-skip: if state DB confirms all versions are already downloaded
         // with matching checksums, skip the filesystem check entirely.

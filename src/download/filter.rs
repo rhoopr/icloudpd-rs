@@ -165,10 +165,14 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'
     Cow::Owned(swapped)
 }
 
-/// Returns `true` if this asset should be skipped by all filter paths.
-/// Shared predicate used by both `extract_skip_candidates` (lightweight
-/// pre-check) and `filter_asset_to_tasks` (full path resolution).
-fn is_asset_filtered(asset: &crate::icloud::photos::PhotoAsset, config: &DownloadConfig) -> bool {
+/// Returns `true` if this asset should be skipped by content/metadata filters.
+///
+/// Callers must invoke this before `extract_skip_candidates` or
+/// `filter_asset_to_tasks` to avoid redundant evaluation.
+pub(super) fn is_asset_filtered(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> bool {
     if config.exclude_asset_ids.contains(asset.id()) {
         tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
         return true;
@@ -220,14 +224,11 @@ fn is_asset_filtered(asset: &crate::icloud::photos::PhotoAsset, config: &Downloa
 ///
 /// Returns the candidate versions that would be downloaded. Used by the early
 /// skip gate to check the state DB before the expensive `filter_asset_to_tasks`.
+/// Caller must check [`is_asset_filtered`] first.
 pub(super) fn extract_skip_candidates<'a>(
     asset: &'a crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> SmallVec<[(VersionSizeKey, &'a str); 2]> {
-    if is_asset_filtered(asset, config) {
-        return SmallVec::new();
-    }
-
     let is_live_photo = asset.is_live_photo();
     let versions = asset.versions();
     let mut result = SmallVec::new();
@@ -477,16 +478,13 @@ fn resolve_download_path(
 /// The `claimed_paths` map tracks paths that have been claimed by earlier tasks
 /// in the same download session, preventing race conditions where two assets
 /// with the same filename both see "file doesn't exist" during concurrent downloads.
+/// Caller must check [`is_asset_filtered`] first.
 pub(super) fn filter_asset_to_tasks(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
 ) -> SmallVec<[DownloadTask; 2]> {
-    if is_asset_filtered(asset, config) {
-        return SmallVec::new();
-    }
-
     let is_live_photo = asset.is_live_photo();
 
     let fallback_filename;
@@ -766,7 +764,7 @@ mod tests {
             .build();
         let mut config = test_config();
         config.skip_videos = true;
-        assert!(filter_asset_fresh(&asset, &config).is_empty());
+        assert!(is_asset_filtered(&asset, &config));
     }
 
     #[test]
@@ -790,7 +788,7 @@ mod tests {
         let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         config.skip_photos = true;
-        assert!(filter_asset_fresh(&asset, &config).is_empty());
+        assert!(is_asset_filtered(&asset, &config));
     }
 
     #[test]
@@ -1332,7 +1330,7 @@ mod tests {
             .build();
         let mut config = test_config();
         config.skip_videos = true;
-        assert!(extract_skip_candidates(&asset, &config).is_empty());
+        assert!(is_asset_filtered(&asset, &config));
     }
 
     #[test]
@@ -1340,7 +1338,7 @@ mod tests {
         let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
         config.skip_photos = true;
-        assert!(extract_skip_candidates(&asset, &config).is_empty());
+        assert!(is_asset_filtered(&asset, &config));
     }
 
     #[test]
@@ -1359,9 +1357,8 @@ mod tests {
         let asset = test_live_photo_asset();
         let mut config = test_config();
         config.live_photo_mode = LivePhotoMode::Skip;
-        let candidates = extract_skip_candidates(&asset, &config);
         assert!(
-            candidates.is_empty(),
+            is_asset_filtered(&asset, &config),
             "Skip mode should exclude live photos entirely"
         );
     }
@@ -1400,7 +1397,7 @@ mod tests {
                 .unwrap()
                 .into(),
         );
-        assert!(extract_skip_candidates(&asset, &config).is_empty());
+        assert!(is_asset_filtered(&asset, &config));
     }
 
     #[test]
@@ -1413,7 +1410,7 @@ mod tests {
                 .unwrap()
                 .into(),
         );
-        assert!(extract_skip_candidates(&asset, &config).is_empty());
+        assert!(is_asset_filtered(&asset, &config));
     }
 
     #[test]
@@ -1980,7 +1977,7 @@ mod tests {
                 .into(),
         );
         assert!(
-            filter_asset_fresh(&asset, &config).is_empty(),
+            is_asset_filtered(&asset, &config),
             "Asset before the date window should be skipped"
         );
     }
@@ -2002,7 +1999,7 @@ mod tests {
                 .into(),
         );
         assert!(
-            filter_asset_fresh(&asset, &config).is_empty(),
+            is_asset_filtered(&asset, &config),
             "Asset after the date window should be skipped"
         );
     }
@@ -2178,7 +2175,7 @@ mod tests {
                 .and_utc(),
         );
         assert!(
-            filter_asset_fresh(&asset, &config).is_empty(),
+            is_asset_filtered(&asset, &config),
             "Asset created in 2020 should be excluded by skip_created_before=2024"
         );
     }
@@ -2199,7 +2196,7 @@ mod tests {
                 .and_utc(),
         );
         assert!(
-            filter_asset_fresh(&asset, &config).is_empty(),
+            is_asset_filtered(&asset, &config),
             "Asset created in 2025 should be excluded by skip_created_after=2023"
         );
     }
@@ -2224,9 +2221,8 @@ mod tests {
         let asset = test_live_photo_asset();
         let mut config = test_config();
         config.live_photo_mode = LivePhotoMode::Skip;
-        let tasks = filter_asset_fresh(&asset, &config);
         assert!(
-            tasks.is_empty(),
+            is_asset_filtered(&asset, &config),
             "Skip mode should produce no tasks for live photos"
         );
     }
@@ -2249,8 +2245,10 @@ mod tests {
             .build();
         let mut config = test_config();
         config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
-        let tasks = filter_asset_fresh(&asset, &config);
-        assert!(tasks.is_empty(), "*.AAE pattern should exclude AAE files");
+        assert!(
+            is_asset_filtered(&asset, &config),
+            "*.AAE pattern should exclude AAE files"
+        );
     }
 
     #[test]
@@ -2258,9 +2256,8 @@ mod tests {
         let asset = TestPhotoAsset::new("EXCL_2").filename("Photo.aae").build();
         let mut config = test_config();
         config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
-        let tasks = filter_asset_fresh(&asset, &config);
         assert!(
-            tasks.is_empty(),
+            is_asset_filtered(&asset, &config),
             "Pattern matching should be case-insensitive"
         );
     }
@@ -2287,8 +2284,10 @@ mod tests {
         let mut ids = FxHashSet::default();
         ids.insert("EXCLUDED_1".to_string());
         config.exclude_asset_ids = Arc::new(ids);
-        let tasks = filter_asset_fresh(&asset, &config);
-        assert!(tasks.is_empty(), "Asset in exclude set should be filtered");
+        assert!(
+            is_asset_filtered(&asset, &config),
+            "Asset in exclude set should be filtered"
+        );
     }
 
     #[test]
@@ -2313,10 +2312,9 @@ mod tests {
         let mut ids = FxHashSet::default();
         ids.insert("SKIP_EXCL_1".to_string());
         config.exclude_asset_ids = Arc::new(ids);
-        let candidates = extract_skip_candidates(&asset, &config);
         assert!(
-            candidates.is_empty(),
-            "extract_skip_candidates should return empty for excluded assets"
+            is_asset_filtered(&asset, &config),
+            "is_asset_filtered should return true for excluded assets"
         );
     }
 
@@ -2328,8 +2326,8 @@ mod tests {
         let mut config = test_config();
         config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
         assert!(
-            extract_skip_candidates(&asset, &config).is_empty(),
-            "filename_exclude should filter in extract_skip_candidates"
+            is_asset_filtered(&asset, &config),
+            "filename_exclude should filter via is_asset_filtered"
         );
     }
 
@@ -2350,7 +2348,7 @@ mod tests {
         let mut config = test_config();
         config.filename_exclude = vec![glob::Pattern::new("*.AAE").unwrap()];
         assert!(
-            extract_skip_candidates(&asset, &config).is_empty(),
+            is_asset_filtered(&asset, &config),
             "filename_exclude should be case-insensitive"
         );
     }

@@ -23,8 +23,8 @@ use crate::state::{AssetRecord, StateDb, SyncRunStats};
 
 use super::error::DownloadError;
 use super::filter::{
-    determine_media_type, extract_skip_candidates, filter_asset_to_tasks, pre_ensure_asset_dir,
-    DownloadTask, NormalizedPath,
+    determine_media_type, extract_skip_candidates, filter_asset_to_tasks, is_asset_filtered,
+    pre_ensure_asset_dir, DownloadTask, NormalizedPath,
 };
 use super::{paths, DownloadConfig, DownloadContext, DownloadOutcome};
 
@@ -279,6 +279,9 @@ where
             }
             match result {
                 Ok(asset) => {
+                    if is_asset_filtered(&asset, config) {
+                        continue;
+                    }
                     let candidates = extract_skip_candidates(&asset, config);
                     if !candidates.is_empty()
                         && candidates.iter().all(|&(vs, cs)| {
@@ -317,6 +320,9 @@ where
                 break;
             }
             let asset = result?;
+            if is_asset_filtered(&asset, config) {
+                continue;
+            }
             pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
             let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
             for task in &tasks {
@@ -470,6 +476,12 @@ where
                     }
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    if is_asset_filtered(&asset, config) {
+                        skips.by_filter += 1;
+                        producer_pb.inc(1);
+                        continue;
+                    }
 
                     if trust_state {
                         let candidates = extract_skip_candidates(&asset, config);
