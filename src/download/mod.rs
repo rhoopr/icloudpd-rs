@@ -1458,7 +1458,8 @@ pub async fn download_photos_with_sync(
         0
     };
 
-    match &config.sync_mode {
+    let was_interrupted = shutdown_token.clone();
+    let result = match &config.sync_mode {
         SyncMode::Full => {
             download_photos_full_with_token(download_client, albums, &config, shutdown_token).await
         }
@@ -1520,7 +1521,30 @@ pub async fn download_photos_with_sync(
                 }
             }
         }
+    };
+
+    // Pending is a transient state that should only exist during a sync.
+    // Promote any remaining pending assets to failed so they're visible in
+    // `kei status --failed` and don't block incremental sync on next run.
+    // Skip on interrupted syncs where pending assets are expected.
+    if let Some(db) = &config.state_db {
+        if !was_interrupted.is_cancelled() {
+            match db.promote_pending_to_failed().await {
+                Ok(promoted) if promoted > 0 => {
+                    tracing::warn!(
+                        count = promoted,
+                        "Promoted unresolved pending assets to failed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to promote pending assets");
+                }
+                _ => {}
+            }
+        }
     }
+
+    result
 }
 
 /// Full enumeration with syncToken capture.
@@ -5461,6 +5485,9 @@ mod tests {
         }
         async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
             Ok((0, 0, 0))
+        }
+        async fn promote_pending_to_failed(&self) -> Result<u64, StateError> {
+            Ok(0)
         }
         async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
             unimplemented!()
