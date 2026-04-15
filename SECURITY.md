@@ -4,7 +4,7 @@
 
 If you find a security issue in kei, please report it through [GitHub's private security advisory](https://github.com/rhoopr/kei/security/advisories/new). This keeps the details private until a fix is ready.
 
-If you can't use GitHub advisories, email robhooper@gmail.com with "kei security" in the subject.
+If you can't use GitHub advisories, email github@robhooper.xyz with "kei security" in the subject.
 
 ## What counts
 
