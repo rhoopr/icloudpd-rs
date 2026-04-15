@@ -101,11 +101,30 @@ async fn authenticate_inner(
 
     let mut data: Option<AccountLoginResponse> = None;
     let has_session_token = session.session_data.contains_key("session_token");
+
+    // Fast path: if we validated recently, skip the Apple /validate call entirely.
+    // The cookies and session token are still in the session file; if they've
+    // actually gone stale, the first CloudKit call will 421 and trigger re-auth.
+    if has_session_token && code.is_none() {
+        if let Some(cached) = session
+            .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
+            .await
+        {
+            tracing::debug!("Session validated recently, skipping /validate call");
+            return Ok(AuthResult {
+                session,
+                data: cached,
+                requires_2fa: false,
+            });
+        }
+    }
+
     if has_session_token {
         tracing::debug!("Checking session token validity");
         match twofa::validate_token(&mut session, endpoints).await {
             Ok(d) => {
                 tracing::debug!("Existing session token is valid");
+                session.save_validation_cache(&d).await;
                 data = Some(d);
             }
             Err(e) => {
@@ -254,6 +273,7 @@ async fn authenticate_inner(
         let account_data = twofa::authenticate_with_token(&mut session, endpoints).await?;
 
         tracing::info!("Authentication completed successfully");
+        session.save_validation_cache(&account_data).await;
         return Ok(AuthResult {
             session,
             data: account_data,
@@ -262,6 +282,7 @@ async fn authenticate_inner(
     }
 
     tracing::info!("Authentication completed successfully");
+    session.save_validation_cache(&data).await;
     Ok(AuthResult {
         session,
         data,
@@ -290,9 +311,21 @@ pub async fn send_2fa_push(
     session.set_client_id(&client_id);
 
     let mut data: Option<AccountLoginResponse> = None;
-    if session.session_data.contains_key("session_token") {
+    let has_session_token = session.session_data.contains_key("session_token");
+
+    if has_session_token {
+        if let Some(cached) = session
+            .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
+            .await
+        {
+            data = Some(cached);
+        }
+    }
+
+    if data.is_none() && has_session_token {
         match twofa::validate_token(&mut session, &endpoints).await {
             Ok(d) => {
+                session.save_validation_cache(&d).await;
                 data = Some(d);
             }
             Err(e) => {
