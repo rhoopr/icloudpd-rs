@@ -456,7 +456,10 @@ fn validate_downloaded_content(
         .map_err(|e| DownloadError::Disk(Box::new(e)))?;
 
     if n == 0 {
-        return Ok(());
+        return Err(DownloadError::InvalidContent {
+            path: download_path.display().to_string().into(),
+            reason: "downloaded file is empty (zero bytes)".into(),
+        });
     }
 
     let header = &buf[..n];
@@ -854,9 +857,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_empty_file() {
+    fn validate_rejects_empty_file() {
         let (part, dest, _dir) = write_temp_file("empty.jpg", b"");
-        assert!(validate_downloaded_content(&part, &dest).is_ok());
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
 
     #[test]

@@ -355,20 +355,29 @@ impl StateDb for SqliteStateDb {
 
         let conn = self.acquire_lock("mark_downloaded")?;
 
-        conn.execute(
-            "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
-             local_checksum = ?3, download_checksum = ?4, last_error = NULL \
-             WHERE id = ?5 AND version_size = ?6",
-            rusqlite::params![
-                downloaded_at,
-                local_path.to_string_lossy(),
-                local_checksum,
-                download_checksum,
+        let rows = conn
+            .execute(
+                "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
+                 local_checksum = ?3, download_checksum = ?4, last_error = NULL \
+                 WHERE id = ?5 AND version_size = ?6",
+                rusqlite::params![
+                    downloaded_at,
+                    local_path.to_string_lossy(),
+                    local_checksum,
+                    download_checksum,
+                    id,
+                    version_size
+                ],
+            )
+            .map_err(|e| StateError::query("mark_downloaded", e))?;
+
+        if rows == 0 {
+            tracing::warn!(
                 id,
-                version_size
-            ],
-        )
-        .map_err(|e| StateError::query("mark_downloaded", e))?;
+                version_size,
+                "mark_downloaded matched 0 rows — asset may not have been recorded via upsert_seen"
+            );
+        }
 
         Ok(())
     }
@@ -381,11 +390,21 @@ impl StateDb for SqliteStateDb {
     ) -> Result<(), StateError> {
         let conn = self.acquire_lock("mark_failed")?;
 
-        conn.execute(
-            "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, last_error = ?1 WHERE id = ?2 AND version_size = ?3",
-            rusqlite::params![error, id, version_size],
-        )
-        .map_err(|e| StateError::query("mark_failed", e))?;
+        let rows = conn
+            .execute(
+                "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, \
+                 last_error = ?1 WHERE id = ?2 AND version_size = ?3",
+                rusqlite::params![error, id, version_size],
+            )
+            .map_err(|e| StateError::query("mark_failed", e))?;
+
+        if rows == 0 {
+            tracing::warn!(
+                id,
+                version_size,
+                "mark_failed matched 0 rows — asset may not have been recorded via upsert_seen"
+            );
+        }
 
         Ok(())
     }

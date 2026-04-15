@@ -928,26 +928,33 @@ async fn download_photos_full_with_token(
         (result, token_receivers)
     };
 
-    // Warn if enumeration saw significantly fewer assets than the API reported.
+    // Check if enumeration saw significantly fewer assets than the API reported.
     // This catches silent pagination truncation, dropped pages, or API hiccups
     // that would otherwise go unnoticed.
-    if total > 0 && !config.only_print_filenames && !config.dry_run {
+    let pagination_undercount = if total > 0 && !config.only_print_filenames && !config.dry_run {
         let seen = streaming_result.assets_seen;
         let threshold = total * 95 / 100; // 5% tolerance
         if seen < threshold {
             tracing::warn!(
                 expected = total,
                 seen,
-                "Enumeration saw fewer assets than expected — consider running a full re-sync"
+                "Enumeration saw fewer assets than expected — blocking sync token \
+                 advancement to force full re-enumeration on next run"
             );
+            true
+        } else {
+            false
         }
-    }
+    } else {
+        false
+    };
 
     // Collect the sync token from any album's token receiver.
     // In practice, all albums share the same zone so any token suffices.
-    // Don't advance the token for read-only operations like --only-print-filenames.
+    // Don't advance the token for read-only operations, or when pagination
+    // was incomplete (would permanently skip missed assets).
     let mut sync_token = None;
-    if !config.only_print_filenames {
+    if !config.only_print_filenames && !pagination_undercount {
         for rx in token_receivers {
             if let Ok(Some(token)) = rx.await {
                 sync_token = Some(token);

@@ -271,6 +271,7 @@ where
         };
 
         tokio::pin!(combined);
+        let mut enum_errors = 0usize;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
         while let Some(result) = combined.next().await {
@@ -302,16 +303,21 @@ where
                     }
                 }
                 Err(e) => {
+                    enum_errors += 1;
                     tracing::error!(error = %e, "Error fetching asset");
                 }
             }
         }
-        return Ok(StreamingResult::default());
+        return Ok(StreamingResult {
+            enumeration_errors: enum_errors,
+            ..StreamingResult::default()
+        });
     }
 
     if config.dry_run {
         tokio::pin!(combined);
         let mut count = 0usize;
+        let mut enum_errors = 0usize;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
         while let Some(result) = combined.next().await {
@@ -319,19 +325,28 @@ where
                 tracing::info!("Shutdown requested, stopping dry run");
                 break;
             }
-            let asset = result?;
-            if is_asset_filtered(&asset, config) {
-                continue;
+            match result {
+                Ok(asset) => {
+                    if is_asset_filtered(&asset, config) {
+                        continue;
+                    }
+                    pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
+                    let tasks =
+                        filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
+                    for task in &tasks {
+                        tracing::info!(path = %task.download_path.display(), "[DRY RUN] Would download");
+                    }
+                    count += tasks.len();
+                }
+                Err(e) => {
+                    enum_errors += 1;
+                    tracing::error!(error = %e, "Error fetching asset");
+                }
             }
-            pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
-            let tasks = filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
-            for task in &tasks {
-                tracing::info!(path = %task.download_path.display(), "[DRY RUN] Would download");
-            }
-            count += tasks.len();
         }
         return Ok(StreamingResult {
             downloaded: count,
+            enumeration_errors: enum_errors,
             ..StreamingResult::default()
         });
     }
@@ -1142,6 +1157,10 @@ pub(super) async fn run_download_pass(
                         auth_errors += 1;
                         pb.suspend(|| {
                             tracing::warn!(path = %task.download_path.display(), error = %e, "Auth error");
+                        });
+                    } else {
+                        pb.suspend(|| {
+                            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
                         });
                     }
                 } else {
