@@ -20,9 +20,9 @@ pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
 #[derive(Debug)]
 pub struct ChangeEvent {
     /// The record name (`CloudKit` record ID)
-    pub record_name: String,
+    pub record_name: Box<str>,
     /// The record type, if known (None for hard-deletes)
-    pub record_type: Option<String>,
+    pub record_type: Option<Box<str>>,
     /// Why this record changed
     pub reason: ChangeReason,
     /// The photo asset, if this is a CPLMaster+CPLAsset pair that was successfully paired.
@@ -33,15 +33,15 @@ pub struct ChangeEvent {
 /// A photo or video asset from iCloud.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - Heap types first (String, `Option<String>`)
+/// - Heap types first (`Box<str>`, `Option<Box<str>>`)
 /// - `VersionsMap` (`SmallVec` inline storage)
 /// - f64 primitives
 /// - Small enums last
 #[derive(Debug, Clone)]
 pub struct PhotoAsset {
     // Heap types first
-    record_name: String,
-    filename: Option<String>,
+    record_name: Box<str>,
+    filename: Option<Box<str>>,
     // SmallVec with inline storage
     versions: VersionsMap,
     // f64 primitives
@@ -203,13 +203,10 @@ impl PhotoAsset {
     /// Construct from raw JSON values (used by tests).
     #[cfg(test)]
     pub fn new(master_record: Value, asset_record: Value) -> Self {
-        let record_name = master_record["recordName"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let record_name: Box<str> = master_record["recordName"].as_str().unwrap_or("").into();
         let master_fields = master_record.get("fields").cloned().unwrap_or(Value::Null);
         let asset_fields = asset_record.get("fields").cloned().unwrap_or(Value::Null);
-        let filename = decode_filename(&master_fields);
+        let filename = decode_filename(&master_fields).map(String::into_boxed_str);
         let item_type_val = Some(resolve_item_type(&master_fields, filename.as_deref()));
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
@@ -226,7 +223,7 @@ impl PhotoAsset {
 
     /// Construct from typed `Record` structs (used by album pagination).
     pub fn from_records(master: super::cloudkit::Record, asset: super::cloudkit::Record) -> Self {
-        let filename = decode_filename(&master.fields);
+        let filename = decode_filename(&master.fields).map(String::into_boxed_str);
         let item_type_val = Some(resolve_item_type(&master.fields, filename.as_deref()));
         let asset_date_ms = asset.fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset.fields["addedDate"]["value"].as_f64();
@@ -237,7 +234,7 @@ impl PhotoAsset {
             &master.record_name,
         );
         Self {
-            record_name: master.record_name,
+            record_name: master.record_name.into_boxed_str(),
             filename,
             item_type_val,
             asset_date_ms,
@@ -396,7 +393,7 @@ impl DeltaRecordBuffer {
                     // Hard-deleted: no fields, can't tell if master or asset.
                     // Emit immediately as-is.
                     events.push(ChangeEvent {
-                        record_name: record.record_name,
+                        record_name: record.record_name.into_boxed_str(),
                         record_type: None,
                         reason,
                         asset: None,
@@ -426,8 +423,8 @@ impl DeltaRecordBuffer {
                         } else {
                             // CPLAsset with no masterRef -- metadata-only change
                             events.push(ChangeEvent {
-                                record_name: record.record_name,
-                                record_type: Some("CPLAsset".to_string()),
+                                record_name: record.record_name.into_boxed_str(),
+                                record_type: Some("CPLAsset".into()),
                                 reason,
                                 asset: None,
                             });
@@ -452,8 +449,8 @@ impl DeltaRecordBuffer {
         for (name, record) in self.pending_masters.drain() {
             let reason = classify_change_reason(&record);
             events.push(ChangeEvent {
-                record_name: name,
-                record_type: Some("CPLMaster".to_string()),
+                record_name: name.into_boxed_str(),
+                record_type: Some("CPLMaster".into()),
                 reason,
                 asset: None,
             });
@@ -462,8 +459,8 @@ impl DeltaRecordBuffer {
         for (_master_ref, record) in self.pending_assets.drain() {
             let reason = classify_change_reason(&record);
             events.push(ChangeEvent {
-                record_name: record.record_name,
-                record_type: Some("CPLAsset".to_string()),
+                record_name: record.record_name.into_boxed_str(),
+                record_type: Some("CPLAsset".into()),
                 reason,
                 asset: None,
             });
@@ -500,11 +497,11 @@ impl DeltaRecordBuffer {
         reason: ChangeReason,
         events: &mut Vec<ChangeEvent>,
     ) {
-        let master_name = master_record.record_name.clone();
+        let master_name: Box<str> = master_record.record_name.clone().into_boxed_str();
         let asset = PhotoAsset::from_records(master_record, asset_record);
         events.push(ChangeEvent {
             record_name: master_name,
-            record_type: Some("CPLMaster".to_string()),
+            record_type: Some("CPLMaster".into()),
             reason,
             asset: Some(asset),
         });
@@ -865,7 +862,7 @@ mod tests {
             "AssetVersion size {} exceeds 64 bytes",
             size_of::<AssetVersion>()
         );
-        // PhotoAsset with SmallVec<[...; 4]> inline storage is ~360 bytes.
+        // PhotoAsset with SmallVec<[...; 4]> inline storage and Box<str> fields is ~344 bytes.
         // This is larger than HashMap but avoids heap allocation for common case (<=4 versions).
         // The trade-off is acceptable since we process assets in streams, not all at once.
         assert!(
@@ -1037,7 +1034,7 @@ mod tests {
         // Page 2: asset arrives, referencing M1
         let events = buffer.process_records(vec![make_asset_record("A1", "M1")]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(&*events[0].record_name, "M1");
         assert_eq!(events[0].record_type.as_deref(), Some("CPLMaster"));
         assert_eq!(events[0].reason, ChangeReason::Created);
         assert!(events[0].asset.is_some());
@@ -1055,7 +1052,7 @@ mod tests {
         // Page 2: master arrives
         let events = buffer.process_records(vec![make_master_record("M1")]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(&*events[0].record_name, "M1");
         assert!(events[0].asset.is_some());
     }
 
@@ -1069,7 +1066,7 @@ mod tests {
             make_asset_record("A1", "M1"),
         ]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(&*events[0].record_name, "M1");
         assert!(events[0].asset.is_some());
     }
 
@@ -1083,7 +1080,7 @@ mod tests {
             make_master_record("M1"),
         ]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(&*events[0].record_name, "M1");
         assert!(events[0].asset.is_some());
     }
 
@@ -1100,7 +1097,7 @@ mod tests {
 
         let events = buffer.process_records(vec![hard_deleted]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "DELETED_1");
+        assert_eq!(&*events[0].record_name, "DELETED_1");
         assert_eq!(events[0].record_type, None);
         assert_eq!(events[0].reason, ChangeReason::HardDeleted);
         assert!(events[0].asset.is_none());
@@ -1146,14 +1143,14 @@ mod tests {
         assert_eq!(flushed.len(), 2);
 
         // Check that both orphans appear (order not guaranteed due to HashMap)
-        let names: Vec<&str> = flushed.iter().map(|e| e.record_name.as_str()).collect();
+        let names: Vec<&str> = flushed.iter().map(|e| &*e.record_name).collect();
         assert!(names.contains(&"M_ORPHAN"));
         assert!(names.contains(&"A_ORPHAN"));
 
         // Verify record types
         for event in &flushed {
             assert!(event.asset.is_none());
-            match event.record_name.as_str() {
+            match &*event.record_name {
                 "M_ORPHAN" => {
                     assert_eq!(event.record_type.as_deref(), Some("CPLMaster"));
                 }
@@ -1180,7 +1177,7 @@ mod tests {
             make_master_record("M3"),
         ]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M2");
+        assert_eq!(&*events[0].record_name, "M2");
 
         // Page 3: assets for M1 and M3
         let events = buffer.process_records(vec![
@@ -1188,7 +1185,7 @@ mod tests {
             make_asset_record("A3", "M3"),
         ]);
         assert_eq!(events.len(), 2);
-        let names: Vec<&str> = events.iter().map(|e| e.record_name.as_str()).collect();
+        let names: Vec<&str> = events.iter().map(|e| &*e.record_name).collect();
         assert!(names.contains(&"M1"));
         assert!(names.contains(&"M3"));
 
@@ -1211,7 +1208,7 @@ mod tests {
 
         let events = buffer.process_records(vec![asset_no_ref]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "A_NO_REF");
+        assert_eq!(&*events[0].record_name, "A_NO_REF");
         assert_eq!(events[0].record_type.as_deref(), Some("CPLAsset"));
         assert!(events[0].asset.is_none());
     }
@@ -1267,13 +1264,13 @@ mod tests {
             make_asset_record("A1", "M1"),
         ]);
         assert_eq!(events.len(), 1, "page 2 should pair M1+A1");
-        assert_eq!(events[0].record_name, "M1");
+        assert_eq!(&*events[0].record_name, "M1");
         assert!(events[0].asset.is_some());
 
         // Page 3: asset A2 referencing M2
         let events = buffer.process_records(vec![make_asset_record("A2", "M2")]);
         assert_eq!(events.len(), 1, "page 3 should pair M2+A2");
-        assert_eq!(events[0].record_name, "M2");
+        assert_eq!(&*events[0].record_name, "M2");
         assert!(events[0].asset.is_some());
 
         // Everything paired, flush empty
@@ -1304,7 +1301,7 @@ mod tests {
 
         let events = buffer.process_records(vec![master, soft_deleted_asset]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "M_DEL");
+        assert_eq!(&*events[0].record_name, "M_DEL");
         assert_eq!(events[0].reason, ChangeReason::SoftDeleted);
         assert!(events[0].asset.is_some());
     }
@@ -1415,7 +1412,7 @@ mod tests {
 
         let events = buffer.process_records(vec![asset_no_ref]);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].record_name, "A_STANDALONE");
+        assert_eq!(&*events[0].record_name, "A_STANDALONE");
         assert_eq!(events[0].record_type.as_deref(), Some("CPLAsset"));
         assert_eq!(events[0].reason, ChangeReason::Created);
         assert!(
@@ -1625,7 +1622,7 @@ mod tests {
             deleted: None,
         }]);
         assert_eq!(events.len(), 1, "page 2 should pair M_SPLIT + A_SPLIT");
-        assert_eq!(events[0].record_name, "M_SPLIT");
+        assert_eq!(&*events[0].record_name, "M_SPLIT");
         assert_eq!(events[0].reason, ChangeReason::Created);
 
         let asset = events[0]
@@ -1751,5 +1748,214 @@ mod tests {
             asset.versions().is_empty(),
             "Version with null asset type should be skipped"
         );
+    }
+
+    // ── Gap: asset with completely empty fields produces no versions ──
+
+    #[test]
+    fn extract_versions_empty_fields_produces_empty_map() {
+        let asset = make_asset(
+            json!({"recordName": "EMPTY_FIELDS", "fields": {}}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "asset with no version fields should have empty versions"
+        );
+    }
+
+    // ── Gap: asset with null resOriginalRes value ────────────────────
+
+    #[test]
+    fn extract_versions_null_res_value_produces_empty_map() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": null},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "null resOriginalRes value should produce empty versions"
+        );
+    }
+
+    // ── Gap: asset with missing size defaults to 0 ───────────────────
+
+    #[test]
+    fn extract_versions_missing_size_defaults_to_zero() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        // Missing size should default to 0, not skip the version entirely
+        assert_eq!(
+            asset.versions().len(),
+            1,
+            "version with missing size should still be extracted"
+        );
+        let orig = asset.get_version(AssetVersionSize::Original).unwrap();
+        assert_eq!(orig.size, 0, "missing size should default to 0");
+    }
+
+    // ── Gap: asset with empty string downloadURL ─────────────────────
+
+    #[test]
+    fn extract_versions_empty_download_url_is_preserved() {
+        // An empty-but-present URL is technically valid JSON -- verify it's
+        // not confused with null/missing.
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 100,
+                    "downloadURL": "",
+                    "fileChecksum": "ck_empty_url"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert_eq!(
+            asset.versions().len(),
+            1,
+            "empty string URL should not be treated as missing"
+        );
+        let orig = asset.get_version(AssetVersionSize::Original).unwrap();
+        assert_eq!(&*orig.url, "", "empty URL should be stored as empty");
+    }
+
+    // ── Gap: multiple versions with partial failures ─────────────────
+
+    #[test]
+    fn extract_versions_partial_valid_versions() {
+        // Original is valid, Thumb has missing checksum -- only Original
+        // should appear in versions.
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000,
+                    "downloadURL": "https://example.com/orig",
+                    "fileChecksum": "ck_orig"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 100,
+                    "downloadURL": "https://example.com/thumb"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert_eq!(
+            asset.versions().len(),
+            1,
+            "only the valid Original version should be extracted"
+        );
+        assert!(asset.contains_version(AssetVersionSize::Original));
+        assert!(
+            !asset.contains_version(AssetVersionSize::Thumb),
+            "Thumb with missing checksum should be skipped"
+        );
+    }
+
+    // ── Gap: is_live_photo false for video with LiveOriginal ─────────
+
+    #[test]
+    fn is_live_photo_false_for_video_with_live_version() {
+        // A Movie-type asset with LiveOriginal should NOT be considered a
+        // live photo (live photo = Image + companion video).
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalRes": {"value": {
+                    "size": 50000,
+                    "downloadURL": "https://example.com/vid",
+                    "fileChecksum": "vid_ck"
+                }},
+                "resOriginalFileType": {"value": "com.apple.quicktime-movie"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000,
+                    "downloadURL": "https://example.com/live",
+                    "fileChecksum": "live_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            !asset.is_live_photo(),
+            "Movie with LiveOriginal should NOT be is_live_photo"
+        );
+    }
+
+    // ── Gap: asset_date falls back to epoch for missing field ────────
+
+    #[test]
+    fn asset_date_missing_returns_epoch() {
+        let asset = make_asset(json!({"recordName": "NO_DATE"}), json!({"fields": {}}));
+        let dt = asset.asset_date();
+        assert_eq!(dt, DateTime::UNIX_EPOCH);
+    }
+
+    // ── Gap: classify_change_reason for various field combinations ───
+
+    #[test]
+    fn classify_change_reason_soft_deleted() {
+        use super::super::cloudkit::Record;
+        let record = Record {
+            record_name: "DEL".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({"isDeleted": {"value": 1}}),
+            deleted: None,
+        };
+        assert_eq!(classify_change_reason(&record), ChangeReason::SoftDeleted);
+    }
+
+    #[test]
+    fn classify_change_reason_hidden() {
+        use super::super::cloudkit::Record;
+        let record = Record {
+            record_name: "HID".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({"isHidden": {"value": 1}}),
+            deleted: None,
+        };
+        assert_eq!(classify_change_reason(&record), ChangeReason::Hidden);
+    }
+
+    #[test]
+    fn classify_change_reason_hard_deleted_overrides_fields() {
+        // record.deleted == true should take precedence over fields
+        use super::super::cloudkit::Record;
+        let record = Record {
+            record_name: "HARD".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({"isDeleted": {"value": 0}, "isHidden": {"value": 0}}),
+            deleted: Some(true),
+        };
+        assert_eq!(classify_change_reason(&record), ChangeReason::HardDeleted);
+    }
+
+    #[test]
+    fn classify_change_reason_default_is_created() {
+        use super::super::cloudkit::Record;
+        let record = Record {
+            record_name: "NEW".to_string(),
+            record_type: "CPLMaster".to_string(),
+            fields: json!({}),
+            deleted: None,
+        };
+        assert_eq!(classify_change_reason(&record), ChangeReason::Created);
     }
 }

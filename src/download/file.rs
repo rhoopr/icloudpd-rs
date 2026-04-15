@@ -203,7 +203,7 @@ async fn attempt_download<C: DownloadClient>(
         .await
         .map_err(|e| DownloadError::Http {
             source: e,
-            path: path_str.clone(),
+            path: path_str.clone().into(),
             status: 0,
             content_length: None,
             bytes_written: 0,
@@ -231,7 +231,7 @@ async fn attempt_download<C: DownloadClient>(
         _ => {
             return Err(DownloadError::HttpStatus {
                 status,
-                path: path_str,
+                path: path_str.into(),
             });
         }
     };
@@ -245,8 +245,8 @@ async fn attempt_download<C: DownloadClient>(
         if ct_lower.starts_with("text/html") {
             let _ = fs::remove_file(part_path).await;
             return Err(DownloadError::InvalidContent {
-                path: path_str,
-                reason: format!("server returned content-type: {ct}"),
+                path: path_str.into(),
+                reason: format!("server returned content-type: {ct}").into(),
             });
         }
     }
@@ -269,7 +269,7 @@ async fn attempt_download<C: DownloadClient>(
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| DownloadError::Http {
                 source: e,
-                path: path_str.clone(),
+                path: path_str.clone().into(),
                 status,
                 content_length,
                 bytes_written,
@@ -297,7 +297,7 @@ async fn attempt_download<C: DownloadClient>(
         if total_bytes != expected_len {
             let _ = fs::remove_file(&part_path).await;
             return Err(DownloadError::ContentLengthMismatch {
-                path: path_str,
+                path: path_str.into(),
                 expected: expected_len,
                 received: total_bytes,
             });
@@ -310,7 +310,7 @@ async fn attempt_download<C: DownloadClient>(
         if bytes_written != expected {
             let _ = fs::remove_file(&part_path).await;
             return Err(DownloadError::ContentLengthMismatch {
-                path: path_str,
+                path: path_str.into(),
                 expected,
                 received: bytes_written,
             });
@@ -456,7 +456,10 @@ fn validate_downloaded_content(
         .map_err(|e| DownloadError::Disk(Box::new(e)))?;
 
     if n == 0 {
-        return Ok(());
+        return Err(DownloadError::InvalidContent {
+            path: download_path.display().to_string().into(),
+            reason: "downloaded file is empty (zero bytes)".into(),
+        });
     }
 
     let header = &buf[..n];
@@ -472,7 +475,7 @@ fn validate_downloaded_content(
         || (trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case(b"<html"))
     {
         return Err(DownloadError::InvalidContent {
-            path: download_path.display().to_string(),
+            path: download_path.display().to_string().into(),
             reason: "file contains HTML (likely a CDN error page)".into(),
         });
     }
@@ -854,9 +857,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_empty_file() {
+    fn validate_rejects_empty_file() {
         let (part, dest, _dir) = write_temp_file("empty.jpg", b"");
-        assert!(validate_downloaded_content(&part, &dest).is_ok());
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
 
     #[test]
@@ -1891,5 +1895,174 @@ mod tests {
 
         let result = rename_part_to_final(&part, &final_path).await;
         assert!(result.is_err(), "should fail when .part doesn't exist");
+    }
+
+    // ── Gap: text/html content-type rejection before writing to disk ──
+
+    #[tokio::test]
+    async fn attempt_download_html_content_type_rejected_before_write() {
+        // CDN returns HTTP 200 with content-type text/html (rate-limit page).
+        // Should be rejected BEFORE writing to the .part file.
+        let client = StubDownloadClient::ok(b"<html>Rate Limited</html>")
+            .with_content_type("text/html; charset=utf-8");
+        let (download_path, part_path, _dir) = setup_download_dir("html_ct", "heic");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::InvalidContent { .. }),
+            "text/html content-type should be rejected, got: {err}"
+        );
+        assert!(err.is_retryable(), "HTML error page should be retryable");
+        assert!(
+            !part_path.exists(),
+            ".part should be deleted after HTML rejection"
+        );
+    }
+
+    // ── Gap: empty body (zero-byte download) rejected ────────────────
+
+    #[tokio::test]
+    async fn attempt_download_zero_byte_body_rejected() {
+        let client = StubDownloadClient {
+            status: 200,
+            content_length: Some(0),
+            content_type: None,
+            body: vec![],
+        };
+        let (download_path, part_path, _dir) = setup_download_dir("zero_body", "jpg");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::InvalidContent { .. }),
+            "zero-byte download should be rejected, got: {err}"
+        );
+        assert!(!download_path.exists(), "final file should not exist");
+    }
+
+    // ── Gap: stale .part file (>24h) triggers restart from zero ──────
+
+    #[tokio::test]
+    async fn attempt_download_stale_part_file_restarted() {
+        let (download_path, part_path, _dir) = setup_download_dir("stale_part", "jpg");
+
+        // Create a stale .part file and backdate its mtime by >24 hours
+        std::fs::write(&part_path, b"stale partial data from yesterday").unwrap();
+        let old_mtime = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(STALE_PART_FILE_SECS + 3600);
+        let times = std::fs::FileTimes::new()
+            .set_modified(old_mtime)
+            .set_accessed(old_mtime);
+        std::fs::File::options()
+            .write(true)
+            .open(&part_path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+
+        // Server returns full body (200, not 206)
+        let full_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        let client = StubDownloadClient::ok(&full_body);
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The stale data should be replaced with the fresh download
+        let content = std::fs::read(&download_path).unwrap();
+        assert_eq!(
+            content, full_body,
+            "stale .part should be overwritten with fresh data"
+        );
+    }
+
+    // ── Gap: expected_size check catches truncation with Content-Length ──
+
+    #[tokio::test]
+    async fn attempt_download_expected_size_catches_truncation() {
+        // Server sends 8 bytes with matching Content-Length, but API reported
+        // the file as 1024 bytes. The expected_size check should catch this.
+        let body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let client = StubDownloadClient::ok(&body); // CL = 8 bytes
+
+        let (download_path, part_path, _dir) = setup_download_dir("api_size", "jpg");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            Some(1024), // API says 1024 but download is 8
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                DownloadError::ContentLengthMismatch {
+                    expected: 1024,
+                    received: 8,
+                    ..
+                }
+            ),
+            "expected_size mismatch should produce ContentLengthMismatch, got: {err}"
+        );
+        assert!(
+            !part_path.exists(),
+            ".part should be removed on size mismatch"
+        );
+    }
+
+    // ── Gap: HTTP 4xx error (not 401/403) is not retryable ──────────
+
+    #[tokio::test]
+    async fn attempt_download_http_404_not_retryable() {
+        let client = StubDownloadClient::ok(b"Not Found").with_status(404);
+        let (download_path, part_path, _dir) = setup_download_dir("not_found", "jpg");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::HttpStatus { status: 404, .. }),
+            "expected HttpStatus 404, got: {err}"
+        );
+        assert!(!err.is_retryable(), "404 should not be retryable");
     }
 }

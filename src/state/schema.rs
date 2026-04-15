@@ -108,10 +108,10 @@ const SCHEMA_V4: &str = "ALTER TABLE assets ADD COLUMN download_checksum TEXT;";
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StateError> {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("column_exists", e))?;
     let exists = stmt
         .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|e| StateError::query(&e))?
+        .map_err(|e| StateError::query("column_exists", e))?
         .any(|name| name.is_ok_and(|n| n == column));
     Ok(exists)
 }
@@ -133,9 +133,10 @@ fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError>
             }
         }
         other => {
-            return Err(StateError::Query(format!(
-                "No migration defined for version {other}"
-            )));
+            return Err(StateError::UnsupportedSchemaVersion {
+                found: other,
+                expected: SCHEMA_VERSION,
+            });
         }
     }
     set_schema_version(conn, version)?;
@@ -326,6 +327,77 @@ mod tests {
             .prepare("SELECT local_checksum FROM assets LIMIT 0")
             .is_ok();
         assert!(has_column);
+    }
+
+    // ── Gap: v3 to v4 migration specifically ───────────────────────
+
+    #[test]
+    fn test_v3_to_v4_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Set up a v3 database
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        set_schema_version(&conn, 3).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 3);
+
+        // Verify local_checksum exists but download_checksum does not
+        assert!(conn
+            .prepare("SELECT local_checksum FROM assets LIMIT 0")
+            .is_ok());
+        assert!(conn
+            .prepare("SELECT download_checksum FROM assets LIMIT 0")
+            .is_err());
+
+        // Migrate should bring it to v4
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // download_checksum should now exist
+        assert!(conn
+            .prepare("SELECT download_checksum FROM assets LIMIT 0")
+            .is_ok());
+
+        // Verify data survives migration: insert a row using all columns
+        conn.execute(
+            "INSERT INTO assets (id, version_size, checksum, filename, created_at, size_bytes, \
+             media_type, last_seen_at, local_checksum, download_checksum) \
+             VALUES ('test', 'original', 'ck', 'photo.jpg', 0, 100, 'photo', 0, 'local', 'dl')",
+            [],
+        )
+        .unwrap();
+        let (lc, dc): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT local_checksum, download_checksum FROM assets WHERE id = 'test'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lc.as_deref(), Some("local"));
+        assert_eq!(dc.as_deref(), Some("dl"));
+    }
+
+    // ── Gap: v4 idempotent when download_checksum already exists ─────
+
+    #[test]
+    fn test_v4_migration_idempotent_when_column_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Set up v3 database, then manually add v4 column
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        set_schema_version(&conn, 3).unwrap();
+        conn.execute_batch("ALTER TABLE assets ADD COLUMN download_checksum TEXT")
+            .unwrap();
+
+        // Migration should succeed (idempotent) and advance to v4
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Column should be usable
+        assert!(conn
+            .prepare("SELECT download_checksum FROM assets LIMIT 0")
+            .is_ok());
     }
 
     /// T-9: Simulate crash after V3+V4 columns added but version left at V2.

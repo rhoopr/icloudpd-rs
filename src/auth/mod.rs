@@ -101,41 +101,96 @@ async fn authenticate_inner(
 
     let mut data: Option<AccountLoginResponse> = None;
     let has_session_token = session.session_data.contains_key("session_token");
+
+    // Fast path: if we validated recently, skip the Apple /validate call entirely.
+    // The cookies and session token are still in the session file; if they've
+    // actually gone stale, the first CloudKit call will 421 and trigger re-auth.
+    if has_session_token && code.is_none() {
+        if let Some(cached) = session
+            .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
+            .await
+        {
+            tracing::debug!("Session validated recently, skipping /validate call");
+            return Ok(AuthResult {
+                session,
+                data: cached,
+                requires_2fa: false,
+            });
+        }
+    }
+
     if has_session_token {
         tracing::debug!("Checking session token validity");
         match twofa::validate_token(&mut session, endpoints).await {
             Ok(d) => {
                 tracing::debug!("Existing session token is valid");
+                session.save_validation_cache(&d).await;
                 data = Some(d);
             }
             Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "Invalid authentication token, will log in from scratch"
-                );
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_rate_limited())
+                {
+                    return Err(e.context(
+                        "Apple is rate limiting authentication requests. \
+                         Wait a few minutes before trying again",
+                    ));
+                }
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_misdirected_request())
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "Misdirected request persists after connection pool reset, \
+                         falling back to SRP"
+                    );
+                } else {
+                    tracing::debug!(
+                        error = %e,
+                        "Invalid authentication token, will log in from scratch"
+                    );
+                }
             }
         }
     }
 
-    // When submit-code provides a code and a session_token already exists
-    // (from a prior SRP by --auth-only or get-code), try /accountLogin
-    // before falling back to SRP. The /validate endpoint above is stricter
-    // and rejects pre-2FA sessions, but /accountLogin works — it returns
-    // account data showing 2FA is required, letting us skip straight to
-    // code submission without re-initiating SRP (which triggers a new
-    // 2FA push from Apple, invalidating the code the user already has).
-    if data.is_none() && code.is_some() && has_session_token {
-        tracing::debug!("Session token exists with code provided, trying accountLogin before SRP");
+    // Try /accountLogin as a fallback before SRP. The /validate endpoint
+    // above is strict and often rejects sessions that /accountLogin accepts
+    // (e.g. post-2FA trusted sessions loaded from disk). /accountLogin
+    // sends dsWebAuthToken + trustToken and is more lenient -- it succeeds
+    // for most persisted sessions, avoiding unnecessary SRP handshakes.
+    // This is critical because Apple rate-limits SRP to ~10 auths per
+    // rolling window.
+    if data.is_none() && has_session_token {
+        tracing::debug!("Session token exists, trying accountLogin before SRP");
         match twofa::authenticate_with_token(&mut session, endpoints).await {
             Ok(d) => {
                 tracing::debug!("accountLogin succeeded, skipping SRP");
                 data = Some(d);
             }
             Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "accountLogin failed, falling back to SRP"
-                );
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_rate_limited())
+                {
+                    return Err(e.context(
+                        "Apple is rate limiting authentication requests. \
+                         Wait a few minutes before trying again",
+                    ));
+                }
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_misdirected_request())
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "accountLogin misdirected after connection pool reset, \
+                         falling back to SRP"
+                    );
+                } else {
+                    tracing::debug!(
+                        error = %e,
+                        "accountLogin failed, falling back to SRP"
+                    );
+                }
             }
         }
     }
@@ -238,6 +293,7 @@ async fn authenticate_inner(
         let account_data = twofa::authenticate_with_token(&mut session, endpoints).await?;
 
         tracing::info!("Authentication completed successfully");
+        session.save_validation_cache(&account_data).await;
         return Ok(AuthResult {
             session,
             data: account_data,
@@ -246,6 +302,7 @@ async fn authenticate_inner(
     }
 
     tracing::info!("Authentication completed successfully");
+    session.save_validation_cache(&data).await;
     Ok(AuthResult {
         session,
         data,
@@ -274,8 +331,49 @@ pub async fn send_2fa_push(
     session.set_client_id(&client_id);
 
     let mut data: Option<AccountLoginResponse> = None;
-    if session.session_data.contains_key("session_token") {
-        if let Ok(d) = twofa::validate_token(&mut session, &endpoints).await {
+    let has_session_token = session.session_data.contains_key("session_token");
+
+    if has_session_token {
+        if let Some(cached) = session
+            .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
+            .await
+        {
+            data = Some(cached);
+        }
+    }
+
+    if data.is_none() && has_session_token {
+        match twofa::validate_token(&mut session, &endpoints).await {
+            Ok(d) => {
+                session.save_validation_cache(&d).await;
+                data = Some(d);
+            }
+            Err(e) => {
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_rate_limited())
+                {
+                    return Err(e.context(
+                        "Apple is rate limiting authentication requests. \
+                         Wait a few minutes before trying again",
+                    ));
+                }
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_misdirected_request())
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "Misdirected request persists after connection pool reset, \
+                         falling back to SRP"
+                    );
+                }
+            }
+        }
+    }
+
+    // Try accountLogin before SRP (same rationale as authenticate_inner:
+    // validate_token is strict, accountLogin is lenient).
+    if data.is_none() && has_session_token {
+        if let Ok(d) = twofa::authenticate_with_token(&mut session, &endpoints).await {
             data = Some(d);
         }
     }
@@ -312,7 +410,40 @@ pub async fn validate_session(session: &mut Session, domain: &str) -> Result<boo
     let endpoints = Endpoints::for_domain(domain)?;
     match twofa::validate_token(session, &endpoints).await {
         Ok(_) => Ok(true),
-        Err(_) => Ok(false),
+        Err(_) => {
+            // /validate is strict; try /accountLogin as a lenient fallback.
+            // A session is valid if accountLogin succeeds and 2FA is not required
+            // (i.e. the trust token is still accepted).
+            match twofa::authenticate_with_token(session, &endpoints).await {
+                Ok(d) => {
+                    if check_requires_2fa(&d) {
+                        return Ok(false);
+                    }
+                    // If Apple rerouted the account to a different CloudKit
+                    // partition, the stored ckdatabasews URL is stale. Return
+                    // false to force full re-auth, which rebuilds PhotosService
+                    // with the new URL.
+                    let fresh_url = d
+                        .webservices
+                        .as_ref()
+                        .and_then(|ws| ws.ckdatabasews.as_ref())
+                        .map(|ep| ep.url.as_str());
+                    let stored_url = session.session_data.get("ckdatabasews_url");
+                    if let (Some(fresh), Some(stored)) = (fresh_url, stored_url) {
+                        if fresh != stored {
+                            tracing::info!(
+                                old_url = %stored,
+                                new_url = %fresh,
+                                "CloudKit partition changed, forcing full re-auth"
+                            );
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                Err(_) => Ok(false),
+            }
+        }
     }
 }
 

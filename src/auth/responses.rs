@@ -1,7 +1,23 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::error::AuthError;
+
+/// Default grace period for session validation cache (10 minutes).
+/// Within this window, `authenticate` skips the Apple `/validate` call
+/// and reuses cached account data from the previous validation.
+pub(crate) const VALIDATION_CACHE_GRACE_SECS: i64 = 600;
+
+/// Cached result from a successful `/validate` or `/accountLogin` call.
+/// Stored alongside the session file as `{username}.cache` so that
+/// rapid successive kei invocations don't hammer Apple's auth endpoints.
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ValidationCache {
+    /// Unix timestamp when the session was last validated.
+    pub validated_at: i64,
+    /// The account data returned by Apple.
+    pub account_data: AccountLoginResponse,
+}
 
 /// Server's half of the SRP handshake — contains the salt, public ephemeral B,
 /// iteration count, and protocol variant needed to compute the shared secret.
@@ -18,7 +34,7 @@ pub struct SrpInitResponse {
 /// An error entry from Apple's `service_errors` array.
 /// Apple auth APIs sometimes return HTTP 200 with error details in the body
 /// instead of using HTTP status codes.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct AppleServiceError {
     #[serde(default)]
     pub code: String,
@@ -34,7 +50,7 @@ pub(crate) struct AppleServiceError {
 /// Apple sometimes returns HTTP 200 with `hasError: true` and a
 /// `service_errors` array instead of a proper HTTP error status.
 /// Call [`check_errors()`](Self::check_errors) after deserializing to detect these.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountLoginResponse {
     #[serde(default)]
@@ -82,7 +98,7 @@ impl AccountLoginResponse {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DsInfo {
     #[serde(default)]
@@ -93,13 +109,13 @@ pub struct DsInfo {
     pub has_i_cloud_qualifying_device: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Webservices {
     #[serde(default)]
     pub ckdatabasews: Option<WebserviceEndpoint>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct WebserviceEndpoint {
     pub url: String,
 }

@@ -84,7 +84,8 @@ fn check_apple_service_errors(body: &Value) -> Result<(), AuthError> {
 
 /// Classify an HTTP error status from an auth endpoint into a typed `AuthError`.
 ///
-/// - 421/450 → `ServiceError` ("Authentication required")
+/// - 421 → `ServiceError` (Misdirected Request — HTTP/2 routing issue, not auth)
+/// - 450 → `ServiceError` (Authentication required)
 /// - 5xx → `ServiceError` (server error with context)
 /// - anything else → calls `fallback` to produce the default error
 fn classify_auth_http_error(
@@ -94,7 +95,14 @@ fn classify_auth_http_error(
     fallback: impl FnOnce() -> AuthError,
 ) -> AuthError {
     match status {
-        421 | 450 => AuthError::ServiceError {
+        421 => AuthError::ServiceError {
+            code: format!("http_{status}"),
+            message: format!(
+                "Misdirected Request during {context} (HTTP 421): \
+                 connection routed to wrong server. {text}"
+            ),
+        },
+        450 => AuthError::ServiceError {
             code: format!("http_{status}"),
             message: "Authentication required for this account. Please re-authenticate.".into(),
         },
@@ -260,7 +268,30 @@ pub async fn trust_session(
 ///
 /// POST `{setup_endpoint}/validate` with body "null".
 /// Returns the parsed JSON response body on success.
+///
+/// On 421 Misdirected Request, resets the HTTP connection pool and retries
+/// once. 421 is an HTTP/2 routing issue (connection went to the wrong
+/// partition server), not an authentication failure.
 pub async fn validate_token(
+    session: &mut Session,
+    endpoints: &Endpoints,
+) -> Result<AccountLoginResponse> {
+    match validate_token_once(session, endpoints).await {
+        Err(e)
+            if e.downcast_ref::<AuthError>()
+                .is_some_and(|ae| ae.is_misdirected_request()) =>
+        {
+            tracing::warn!(
+                "validate returned 421 Misdirected Request, retrying with fresh connection pool"
+            );
+            session.reset_http_clients()?;
+            validate_token_once(session, endpoints).await
+        }
+        other => other,
+    }
+}
+
+async fn validate_token_once(
     session: &mut Session,
     endpoints: &Endpoints,
 ) -> Result<AccountLoginResponse> {
@@ -304,7 +335,29 @@ pub async fn validate_token(
 ///
 /// POST `{setup_endpoint}/accountLogin` with the token and trust token.
 /// Returns the parsed JSON response containing account data.
+///
+/// On 421 Misdirected Request, resets the HTTP connection pool and retries
+/// once before returning the error.
 pub async fn authenticate_with_token(
+    session: &mut Session,
+    endpoints: &Endpoints,
+) -> Result<AccountLoginResponse> {
+    match authenticate_with_token_once(session, endpoints).await {
+        Err(e)
+            if e.downcast_ref::<AuthError>()
+                .is_some_and(|ae| ae.is_misdirected_request()) =>
+        {
+            tracing::warn!(
+                "accountLogin returned 421 Misdirected Request, retrying with fresh connection pool"
+            );
+            session.reset_http_clients()?;
+            authenticate_with_token_once(session, endpoints).await
+        }
+        other => other,
+    }
+}
+
+async fn authenticate_with_token_once(
     session: &mut Session,
     endpoints: &Endpoints,
 ) -> Result<AccountLoginResponse> {
@@ -593,5 +646,64 @@ mod tests {
             msg.contains("wait a few minutes"),
             "should suggest waiting: {msg}"
         );
+    }
+
+    #[test]
+    fn test_classify_421_is_misdirected_not_auth() {
+        let err = classify_auth_http_error(421, "body", "validation", || {
+            panic!("fallback should not be called for 421")
+        });
+        assert!(err.is_misdirected_request());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Misdirected Request"),
+            "421 should say misdirected, got: {msg}"
+        );
+        assert!(
+            !msg.contains("re-authenticate"),
+            "421 should not suggest re-auth, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_450_requires_auth() {
+        let err = classify_auth_http_error(450, "body", "login", || {
+            panic!("fallback should not be called for 450")
+        });
+        assert!(!err.is_misdirected_request());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("re-authenticate"),
+            "450 should suggest re-auth, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_421_produces_http_421_code() {
+        let err =
+            classify_auth_http_error(421, "", "validation", || panic!("should not be called"));
+        if let AuthError::ServiceError { code, .. } = &err {
+            assert_eq!(code, "http_421");
+        } else {
+            panic!("expected ServiceError, got: {err:?}");
+        }
+    }
+
+    #[test]
+    fn test_classify_5xx_server_error() {
+        let err = classify_auth_http_error(503, "Service Unavailable", "validation", || {
+            panic!("fallback should not be called for 5xx")
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("503"));
+        assert!(msg.contains("server error"));
+    }
+
+    #[test]
+    fn test_classify_other_uses_fallback() {
+        let err = classify_auth_http_error(401, "Unauthorized", "login", || {
+            AuthError::InvalidToken("custom fallback".into())
+        });
+        assert!(matches!(err, AuthError::InvalidToken(_)));
     }
 }

@@ -101,33 +101,36 @@ pub enum LogLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum FileMatchPolicy {
     #[value(name = "name-size-dedup-with-suffix")]
     #[serde(rename = "name-size-dedup-with-suffix")]
-    NameSizeDedupWithSuffix,
+    NameSizeDedupWithSuffix = 0,
     #[value(name = "name-id7")]
     #[serde(rename = "name-id7")]
-    NameId7,
+    NameId7 = 1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum RawTreatmentPolicy {
     #[value(name = "as-is")]
     #[serde(rename = "as-is")]
-    Unchanged,
+    Unchanged = 0,
     #[value(name = "original")]
     #[serde(rename = "original")]
-    PreferOriginal,
+    PreferOriginal = 1,
     #[value(name = "alternative")]
     #[serde(rename = "alternative")]
-    PreferAlternative,
+    PreferAlternative = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[repr(u8)]
 #[serde(rename_all = "lowercase")]
 pub enum LivePhotoMovFilenamePolicy {
-    Suffix,
-    Original,
+    Suffix = 0,
+    Original = 1,
 }
 
 /// Controls which components of live photos are downloaded.

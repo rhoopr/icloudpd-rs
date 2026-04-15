@@ -166,6 +166,10 @@ pub(crate) async fn strip_session_routing_state(session_file: &Path) {
             let _ = fs::remove_file(session_file).await;
         }
     }
+
+    // Invalidate validation cache since session is being reset
+    let cache_file = session_file.with_extension("cache");
+    let _ = fs::remove_file(&cache_file).await;
 }
 
 /// Build the API and download HTTP clients for a session.
@@ -399,6 +403,53 @@ impl Session {
     pub fn session_path(&self) -> PathBuf {
         self.cookie_dir
             .join(format!("{}.session", self.sanitized_username))
+    }
+
+    /// Path to the validation cache file.
+    fn cache_path(&self) -> PathBuf {
+        self.cookie_dir
+            .join(format!("{}.cache", self.sanitized_username))
+    }
+
+    /// Load cached validation data if it exists and is within the grace period.
+    pub(crate) async fn load_validation_cache(
+        &self,
+        grace_secs: i64,
+    ) -> Option<super::responses::AccountLoginResponse> {
+        let path = self.cache_path();
+        let contents = fs::read_to_string(&path).await.ok()?;
+        let cache: super::responses::ValidationCache = serde_json::from_str(&contents).ok()?;
+        let now = chrono::Utc::now().timestamp();
+        if now - cache.validated_at > grace_secs {
+            tracing::debug!(
+                age_secs = now - cache.validated_at,
+                grace_secs,
+                "Validation cache expired"
+            );
+            return None;
+        }
+        tracing::debug!(
+            age_secs = now - cache.validated_at,
+            "Using cached validation data"
+        );
+        Some(cache.account_data)
+    }
+
+    /// Save validation data to the cache file.
+    pub(crate) async fn save_validation_cache(
+        &self,
+        data: &super::responses::AccountLoginResponse,
+    ) {
+        let cache = super::responses::ValidationCache {
+            validated_at: chrono::Utc::now().timestamp(),
+            account_data: data.clone(),
+        };
+        let Ok(json) = serde_json::to_string_pretty(&cache) else {
+            return;
+        };
+        if let Err(e) = atomic_write(&self.cache_path(), json.as_bytes()).await {
+            tracing::debug!(error = %e, "Failed to write validation cache");
+        }
     }
 
     /// Replace both HTTP clients with fresh ones, dropping the old connection
@@ -636,6 +687,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::responses;
 
     /// Return a unique temp directory for a session test.
     ///
@@ -1148,5 +1200,117 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         let map: HashMap<String, String> = serde_json::from_str(&contents).unwrap();
         assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validation_cache_round_trip() {
+        let (_td, dir) = test_dir("cache_rt");
+        let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        let data = responses::AccountLoginResponse {
+            ds_info: None,
+            webservices: Some(responses::Webservices {
+                ckdatabasews: Some(responses::WebserviceEndpoint {
+                    url: "https://p60-ckdatabasews.icloud.com".into(),
+                }),
+            }),
+            hsa_challenge_required: false,
+            hsa_trusted_browser: true,
+            domain_to_use: None,
+            has_error: false,
+            service_errors: vec![],
+            i_cdp_enabled: false,
+        };
+
+        session.save_validation_cache(&data).await;
+        assert!(session.cache_path().exists());
+
+        let loaded = session.load_validation_cache(600).await;
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        let ws = loaded.webservices.unwrap();
+        assert_eq!(
+            ws.ckdatabasews.unwrap().url,
+            "https://p60-ckdatabasews.icloud.com"
+        );
+        assert!(loaded.hsa_trusted_browser);
+        assert!(!loaded.i_cdp_enabled);
+    }
+
+    #[tokio::test]
+    async fn validation_cache_expired() {
+        let (_td, dir) = test_dir("cache_exp");
+        let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        // Write a cache with an old timestamp
+        let cache = responses::ValidationCache {
+            validated_at: chrono::Utc::now().timestamp() - 3600,
+            account_data: responses::AccountLoginResponse {
+                ds_info: None,
+                webservices: None,
+                hsa_challenge_required: false,
+                hsa_trusted_browser: false,
+                domain_to_use: None,
+                has_error: false,
+                service_errors: vec![],
+                i_cdp_enabled: false,
+            },
+        };
+        let json = serde_json::to_string_pretty(&cache).unwrap();
+        std::fs::write(session.cache_path(), json).unwrap();
+
+        let loaded = session.load_validation_cache(600).await;
+        assert!(loaded.is_none(), "Expired cache should return None");
+    }
+
+    #[tokio::test]
+    async fn validation_cache_missing_file() {
+        let (_td, dir) = test_dir("cache_miss");
+        let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        let loaded = session.load_validation_cache(600).await;
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn validation_cache_corrupt_file() {
+        let (_td, dir) = test_dir("cache_corrupt");
+        let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        std::fs::write(session.cache_path(), "not valid json {{{").unwrap();
+
+        let loaded = session.load_validation_cache(600).await;
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn strip_session_invalidates_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_path = dir.path().join("test.session");
+        let cache_path = dir.path().join("test.cache");
+
+        let data = serde_json::json!({
+            "session_token": "tok_abc",
+            "trust_token": "trust_xyz",
+            "client_id": "auth-1234"
+        });
+        std::fs::write(&session_path, data.to_string()).unwrap();
+        std::fs::write(&cache_path, r#"{"validated_at":1,"account_data":{}}"#).unwrap();
+        assert!(cache_path.exists());
+
+        strip_session_routing_state(&session_path).await;
+
+        assert!(
+            !cache_path.exists(),
+            "Cache should be deleted on session strip"
+        );
     }
 }

@@ -97,13 +97,13 @@ pub trait StateDb: Send + Sync {
     /// (failed_reset, pending_reset, total_pending).
     async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError>;
 
-    /// Promote all remaining pending assets to failed.
+    /// Promote stale pending assets to failed.
     ///
-    /// Called at the end of a non-interrupted sync run. Pending is a transient
-    /// state that should only exist during a sync — anything still pending
-    /// when the run finishes either wasn't enumerated by the API or failed
-    /// silently. Returns the number of assets promoted.
-    async fn promote_pending_to_failed(&self) -> Result<u64, StateError>;
+    /// Called at the end of a non-interrupted sync run. Only promotes pending
+    /// assets whose `last_seen_at` is before `seen_since` - assets seen
+    /// during this sync (including on-disk skips) are left alone.
+    /// Returns the number of assets promoted.
+    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError>;
 
     // ── Bulk read operations ──
 
@@ -229,7 +229,7 @@ impl SqliteStateDb {
     ) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, StateError> {
         self.conn
             .lock()
-            .map_err(|e| StateError::Query(format!("{operation}: {e}")))
+            .map_err(|e| StateError::LockPoisoned(format!("{operation}: {e}")))
     }
 }
 
@@ -253,7 +253,7 @@ impl StateDb for SqliteStateDb {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("should_download", e))?
         };
 
         match result {
@@ -338,7 +338,7 @@ impl StateDb for SqliteStateDb {
                 last_seen_at,
             ],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("upsert_seen", e))?;
 
         Ok(())
     }
@@ -355,20 +355,29 @@ impl StateDb for SqliteStateDb {
 
         let conn = self.acquire_lock("mark_downloaded")?;
 
-        conn.execute(
-            "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
-             local_checksum = ?3, download_checksum = ?4, last_error = NULL \
-             WHERE id = ?5 AND version_size = ?6",
-            rusqlite::params![
-                downloaded_at,
-                local_path.to_string_lossy(),
-                local_checksum,
-                download_checksum,
+        let rows = conn
+            .execute(
+                "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
+                 local_checksum = ?3, download_checksum = ?4, last_error = NULL \
+                 WHERE id = ?5 AND version_size = ?6",
+                rusqlite::params![
+                    downloaded_at,
+                    local_path.to_string_lossy(),
+                    local_checksum,
+                    download_checksum,
+                    id,
+                    version_size
+                ],
+            )
+            .map_err(|e| StateError::query("mark_downloaded", e))?;
+
+        if rows == 0 {
+            tracing::warn!(
                 id,
-                version_size
-            ],
-        )
-        .map_err(|e| StateError::query(&e))?;
+                version_size,
+                "mark_downloaded matched 0 rows — asset may not have been recorded via upsert_seen"
+            );
+        }
 
         Ok(())
     }
@@ -381,11 +390,21 @@ impl StateDb for SqliteStateDb {
     ) -> Result<(), StateError> {
         let conn = self.acquire_lock("mark_failed")?;
 
-        conn.execute(
-            "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, last_error = ?1 WHERE id = ?2 AND version_size = ?3",
-            rusqlite::params![error, id, version_size],
-        )
-        .map_err(|e| StateError::query(&e))?;
+        let rows = conn
+            .execute(
+                "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, \
+                 last_error = ?1 WHERE id = ?2 AND version_size = ?3",
+                rusqlite::params![error, id, version_size],
+            )
+            .map_err(|e| StateError::query("mark_failed", e))?;
+
+        if rows == 0 {
+            tracing::warn!(
+                id,
+                version_size,
+                "mark_failed matched 0 rows — asset may not have been recorded via upsert_seen"
+            );
+        }
 
         Ok(())
     }
@@ -397,13 +416,13 @@ impl StateDb for SqliteStateDb {
             .prepare(
                 "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'failed'",
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_failed", e))?;
 
         let records = stmt
             .query_map([], row_to_asset_record)
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("get_failed", e))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_failed", e))?;
 
         Ok(records)
     }
@@ -437,7 +456,7 @@ impl StateDb for SqliteStateDb {
                     u64::try_from(f).unwrap_or(0),
                 )
             })
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_summary", e))?;
 
         let last_sync: Option<(Option<i64>, Option<i64>)> = conn
             .query_row(
@@ -446,7 +465,7 @@ impl StateDb for SqliteStateDb {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_summary", e))?;
 
         let (last_sync_started, last_sync_completed) = match last_sync {
             Some((started, completed)) => (
@@ -477,16 +496,16 @@ impl StateDb for SqliteStateDb {
             .prepare(
                 "SELECT id, version_size, checksum, filename, created_at, added_at, size_bytes, media_type, status, downloaded_at, local_path, last_seen_at, download_attempts, last_error, local_checksum FROM assets WHERE status = 'downloaded' ORDER BY rowid LIMIT ?1 OFFSET ?2",
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_page", e))?;
 
         let records = stmt
             .query_map(
                 rusqlite::params![i64::from(limit), offset as i64],
                 row_to_asset_record,
             )
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("get_downloaded_page", e))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_page", e))?;
 
         Ok(records)
     }
@@ -500,7 +519,7 @@ impl StateDb for SqliteStateDb {
             "INSERT INTO sync_runs (started_at) VALUES (?1)",
             [started_at],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("start_sync_run", e))?;
 
         let id = conn.last_insert_rowid();
         Ok(id)
@@ -519,7 +538,7 @@ impl StateDb for SqliteStateDb {
             "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, assets_failed = ?4, interrupted = ?5 WHERE id = ?6",
             rusqlite::params![completed_at, assets_seen, assets_downloaded, assets_failed, interrupted, run_id],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("complete_sync_run", e))?;
 
         Ok(())
     }
@@ -538,7 +557,7 @@ impl StateDb for SqliteStateDb {
                  WHERE status = 'failed'",
                 [],
             )
-            .map_err(|e| StateError::query(&e))? as u64;
+            .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
 
         let pending = conn
             .execute(
@@ -546,7 +565,7 @@ impl StateDb for SqliteStateDb {
                  WHERE status = 'pending' AND download_attempts > 0",
                 [],
             )
-            .map_err(|e| StateError::query(&e))? as u64;
+            .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
 
         let total_pending: i64 = conn
             .query_row(
@@ -554,22 +573,22 @@ impl StateDb for SqliteStateDb {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("prepare_for_retry", e))?;
         let total_pending = total_pending as u64;
 
         Ok((failed, pending, total_pending))
     }
 
-    async fn promote_pending_to_failed(&self) -> Result<u64, StateError> {
+    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
         let conn = self.acquire_lock("promote_pending_to_failed")?;
 
-        let promoted = conn
-            .execute(
+        let promoted =
+            conn.execute(
                 "UPDATE assets SET status = 'failed', last_error = 'Not resolved during sync' \
-                 WHERE status = 'pending'",
-                [],
+                 WHERE status = 'pending' AND (last_seen_at IS NULL OR last_seen_at < ?1)",
+                rusqlite::params![seen_since],
             )
-            .map_err(|e| StateError::query(&e))? as u64;
+            .map_err(|e| StateError::query("promote_pending_to_failed", e))? as u64;
 
         Ok(promoted)
     }
@@ -583,21 +602,21 @@ impl StateDb for SqliteStateDb {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_ids", e))?;
         let count = usize::try_from(count).unwrap_or(0);
 
         let mut stmt = conn
             .prepare_cached("SELECT id, version_size FROM assets WHERE status = 'downloaded'")
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_ids", e))?;
 
         let mut ids = HashSet::with_capacity(count);
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_ids", e))?;
         for row in rows {
-            ids.insert(row.map_err(|e| StateError::query(&e))?);
+            ids.insert(row.map_err(|e| StateError::query("get_downloaded_ids", e))?);
         }
 
         Ok(ids)
@@ -608,13 +627,13 @@ impl StateDb for SqliteStateDb {
 
         let mut stmt = conn
             .prepare_cached("SELECT DISTINCT id FROM assets")
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_all_known_ids", e))?;
 
         let ids = stmt
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("get_all_known_ids", e))?
             .collect::<Result<HashSet<_>, _>>()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_all_known_ids", e))?;
 
         Ok(ids)
     }
@@ -630,14 +649,14 @@ impl StateDb for SqliteStateDb {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
         let count = usize::try_from(count).unwrap_or(0);
 
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, version_size, checksum FROM assets WHERE status = 'downloaded'",
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
 
         let mut checksums = HashMap::with_capacity(count);
         let rows = stmt
@@ -647,9 +666,9 @@ impl StateDb for SqliteStateDb {
                     row.get::<_, String>(2)?,
                 ))
             })
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_downloaded_checksums", e))?;
         for row in rows {
-            let (key, val) = row.map_err(|e| StateError::query(&e))?;
+            let (key, val) = row.map_err(|e| StateError::query("get_downloaded_checksums", e))?;
             checksums.insert(key, val);
         }
 
@@ -664,7 +683,7 @@ impl StateDb for SqliteStateDb {
                 "SELECT id, MAX(download_attempts) FROM assets \
                  WHERE download_attempts > 0 GROUP BY id",
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_attempt_counts", e))?;
 
         let counts = stmt
             .query_map([], |row| {
@@ -672,9 +691,9 @@ impl StateDb for SqliteStateDb {
                 let count: i64 = row.get(1)?;
                 Ok((id, u32::try_from(count).unwrap_or(u32::MAX)))
             })
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("get_attempt_counts", e))?
             .collect::<Result<HashMap<_, _>, _>>()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_attempt_counts", e))?;
 
         Ok(counts)
     }
@@ -687,7 +706,7 @@ impl StateDb for SqliteStateDb {
                 row.get::<_, String>(0)
             })
             .optional()
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("get_metadata", e))?;
 
         Ok(value)
     }
@@ -699,7 +718,7 @@ impl StateDb for SqliteStateDb {
             "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             rusqlite::params![key, value],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("set_metadata", e))?;
 
         Ok(())
     }
@@ -712,7 +731,7 @@ impl StateDb for SqliteStateDb {
                 "DELETE FROM metadata WHERE key LIKE ?1",
                 [format!("{prefix}%")],
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("delete_metadata_by_prefix", e))?;
 
         Ok(deleted as u64)
     }
@@ -725,7 +744,7 @@ impl StateDb for SqliteStateDb {
             "UPDATE assets SET last_seen_at = ?1 WHERE id = ?2",
             rusqlite::params![now, asset_id],
         )
-        .map_err(|e| StateError::query(&e))?;
+        .map_err(|e| StateError::query("touch_last_seen", e))?;
 
         Ok(())
     }
@@ -738,14 +757,14 @@ impl StateDb for SqliteStateDb {
                 "SELECT local_path FROM assets WHERE status = 'downloaded' \
                  AND local_path IS NOT NULL ORDER BY RANDOM() LIMIT ?1",
             )
-            .map_err(|e| StateError::query(&e))?;
+            .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
 
         let paths = stmt
             .query_map(rusqlite::params![limit as i64], |row| {
                 let p: String = row.get(0)?;
                 Ok(PathBuf::from(p))
             })
-            .map_err(|e| StateError::query(&e))?
+            .map_err(|e| StateError::query("sample_downloaded_paths", e))?
             .filter_map(Result::ok)
             .collect();
 
@@ -1885,7 +1904,9 @@ mod tests {
         assert_eq!(before.pending, 2);
         assert_eq!(before.failed, 1);
 
-        let promoted = db.promote_pending_to_failed().await.unwrap();
+        // Use a future timestamp so all pending assets are considered stale
+        let future = chrono::Utc::now().timestamp() + 3600;
+        let promoted = db.promote_pending_to_failed(future).await.unwrap();
         assert_eq!(promoted, 2);
 
         let after = db.get_summary().await.unwrap();
@@ -2011,5 +2032,263 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let counts = db.get_attempt_counts().await.unwrap();
         assert!(counts.is_empty());
+    }
+
+    // ── Gap: mark_downloaded on non-existent record (no upsert_seen) ──
+
+    #[tokio::test]
+    async fn mark_downloaded_without_upsert_seen_succeeds_with_zero_rows() {
+        // mark_downloaded does an UPDATE, not an UPSERT. If the asset was
+        // never recorded via upsert_seen, it updates 0 rows and logs a
+        // warning. This should NOT return an error -- it's a graceful no-op.
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let result = db
+            .mark_downloaded(
+                "NEVER_SEEN",
+                "original",
+                Path::new("/tmp/never.jpg"),
+                "abc123",
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "mark_downloaded on unknown asset should succeed (0-row update)"
+        );
+
+        // Verify: the asset is NOT in the DB (it was never inserted)
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 0);
+        assert_eq!(summary.total_assets, 0);
+    }
+
+    // ── Gap: mark_failed increments download_attempts cumulatively ────
+
+    #[tokio::test]
+    async fn mark_failed_increments_attempts_cumulatively() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = TestAssetRecord::new("RETRY_ME")
+            .checksum("ck_retry")
+            .filename("photo.jpg")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+
+        // Fail three times
+        for i in 1..=3 {
+            db.mark_failed("RETRY_ME", "original", &format!("error {i}"))
+                .await
+                .unwrap();
+        }
+
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].download_attempts, 3,
+            "download_attempts should be 3 after three failures"
+        );
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some("error 3"),
+            "last_error should be the most recent failure"
+        );
+    }
+
+    // ── Gap: promote_pending_to_failed boundary -- seen assets preserved ──
+
+    #[tokio::test]
+    async fn promote_pending_to_failed_preserves_recently_seen() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Insert an "old" asset with last_seen_at far in the past
+        let old_record = TestAssetRecord::new("OLD_ASSET")
+            .checksum("ck_old")
+            .filename("old.jpg")
+            .size(1000)
+            .build();
+        db.upsert_seen(&old_record).await.unwrap();
+
+        // Manually backdate OLD_ASSET's last_seen_at to 1 hour ago
+        {
+            let conn = db.acquire_lock("test_setup").unwrap();
+            let old_ts = chrono::Utc::now().timestamp() - 3600;
+            conn.execute(
+                "UPDATE assets SET last_seen_at = ?1 WHERE id = 'OLD_ASSET'",
+                rusqlite::params![old_ts],
+            )
+            .unwrap();
+        }
+
+        // Insert a "new" asset -- its last_seen_at will be now()
+        let new_record = TestAssetRecord::new("NEW_ASSET")
+            .checksum("ck_new")
+            .filename("new.jpg")
+            .size(2000)
+            .build();
+        db.upsert_seen(&new_record).await.unwrap();
+
+        // Boundary: 30 minutes ago -- OLD_ASSET (1h ago) is before,
+        // NEW_ASSET (now) is after
+        let boundary = chrono::Utc::now().timestamp() - 1800;
+        let promoted = db.promote_pending_to_failed(boundary).await.unwrap();
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(
+            promoted, 1,
+            "only OLD_ASSET (seen before boundary) should be promoted"
+        );
+        assert_eq!(summary.pending, 1, "NEW_ASSET should remain pending");
+        assert_eq!(summary.failed, 1, "OLD_ASSET should be failed");
+    }
+
+    // ── Gap: promote_pending_to_failed with very old last_seen_at ────
+
+    #[tokio::test]
+    async fn promote_pending_to_failed_promotes_stale_last_seen() {
+        // Assets with last_seen_at from a previous sync cycle (e.g., epoch)
+        // should be promoted when the boundary is recent.
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = TestAssetRecord::new("STALE_ASSET")
+            .checksum("ck_stale")
+            .filename("stale.jpg")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+
+        // Backdate to epoch
+        {
+            let conn = db.acquire_lock("test_setup").unwrap();
+            conn.execute(
+                "UPDATE assets SET last_seen_at = 0 WHERE id = 'STALE_ASSET'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let promoted = db.promote_pending_to_failed(now).await.unwrap();
+        assert_eq!(
+            promoted, 1,
+            "asset with epoch last_seen_at should be promoted"
+        );
+    }
+
+    // ── Gap: upsert_seen preserves downloaded status across updates ───
+
+    #[tokio::test]
+    async fn upsert_seen_preserves_downloaded_status_and_path() {
+        let dir = test_dir();
+        let file_path = dir.path().join("keep_me.jpg");
+        fs::write(&file_path, b"content").unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // Insert and mark downloaded
+        let record = TestAssetRecord::new("PRESERVE")
+            .checksum("ck_v1")
+            .filename("keep_me.jpg")
+            .size(7)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("PRESERVE", "original", &file_path, "hash_v1", None)
+            .await
+            .unwrap();
+
+        // Re-upsert with updated metadata (e.g., checksum changed in iCloud)
+        let updated = TestAssetRecord::new("PRESERVE")
+            .checksum("ck_v2")
+            .filename("keep_me.jpg")
+            .size(7)
+            .build();
+        db.upsert_seen(&updated).await.unwrap();
+
+        // Status should still be "downloaded", not reset to "pending"
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(
+            summary.downloaded, 1,
+            "upsert_seen should preserve downloaded status"
+        );
+        assert_eq!(
+            summary.pending, 0,
+            "upsert_seen should NOT reset to pending"
+        );
+    }
+
+    // ── Gap: mark_downloaded with download_checksum ───────────────────
+
+    #[tokio::test]
+    async fn mark_downloaded_stores_download_checksum() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = TestAssetRecord::new("DL_CK")
+            .checksum("api_ck")
+            .filename("photo.jpg")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "DL_CK",
+            "original",
+            Path::new("/photos/photo.jpg"),
+            "local_sha256",
+            Some("pre_exif_sha256"),
+        )
+        .await
+        .unwrap();
+
+        // Verify via get_downloaded_page that the asset is downloaded
+        let page = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "DL_CK");
+        assert_eq!(
+            page[0].local_checksum.as_deref(),
+            Some("local_sha256"),
+            "local_checksum should be stored"
+        );
+    }
+
+    // ── Gap: sample_downloaded_paths returns actual paths ─────────────
+
+    #[tokio::test]
+    async fn sample_downloaded_paths_returns_stored_paths() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for i in 0..5 {
+            let record = TestAssetRecord::new(&format!("SAMPLE_{i}"))
+                .checksum(&format!("ck_{i}"))
+                .filename(&format!("photo_{i}.jpg"))
+                .size(1000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(
+                &format!("SAMPLE_{i}"),
+                "original",
+                Path::new(&format!("/photos/photo_{i}.jpg")),
+                &format!("hash_{i}"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let paths = db.sample_downloaded_paths(10).await.unwrap();
+        assert!(
+            !paths.is_empty(),
+            "should return at least some downloaded paths"
+        );
+        assert!(
+            paths.len() <= 5,
+            "should not return more than the number of downloaded assets"
+        );
+        for p in &paths {
+            assert!(
+                p.to_str().unwrap().starts_with("/photos/"),
+                "path should match what was stored: {:?}",
+                p
+            );
+        }
     }
 }
