@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.12] - 2026-04-15
+
+### Fixed
+
+- **On-disk assets falsely promoted to failed** - assets found on disk during sync were skipped without updating state, so `promote_pending_to_failed` marked them as failed at sync end. Fixed by tracking `last_seen_at` for on-disk assets. ([#206])
+- **Skip counters inflated by per-version counting** - reported skip numbers were per-version instead of per-asset, overstating actual skips. Now counted per-asset. ([#206])
+- **503 from Apple auth cascaded through all strategies** - a rate-limited response cascaded through validate, accountLogin, and SRP, each getting 503'd and extending the rate-limit window. Now bails on first 503. ([#206])
+- **421 Misdirected Request in auth endpoints** - now triggers connection pool reset before escalating to full re-auth. ([#206])
+- **Watch-mode reauth ignored CloudKit partition changes** - if the `ckdatabasews` URL changed between auth calls, kei continued with the stale endpoint. Now detects the change and forces full service re-init. ([#206])
+- **Duplicate error log in Phase 2 download pass** - collapsed to a single message. ([#206])
+- **rustls-webpki security update** - 0.103.10 to 0.103.12 (RUSTSEC-2026-0098, RUSTSEC-2026-0099). ([#206])
+
+### Changed
+
+- **Session reuse via accountLogin** - kei now tries `accountLogin` before falling through to SRP, cutting SRP handshakes from N-per-run to 1. Avoids Apple's SRP rate limit in watch mode and test suites. ([#206])
+- **Validation cache** - skips the `/validate` call when the session was validated recently. ([#206])
+- **AssetDisposition enum replaces boolean skip flags** - explicit state tracking (OnDisk, AmpmVariant, Filtered, RetryExhausted, Forwarded) with an invariant check at sync end: total = downloaded + failed + skipped. ([#206])
+- **Codebase restructured** - extracted `src/commands/`, `src/sync_loop.rs`, `download/pipeline.rs`, `download/filter.rs` from monolithic `main.rs` and `download/mod.rs`. ([#206])
+- **Typed auth errors** - string-based HTTP status detection replaced with `AuthError` variants (`is_rate_limited()`, `is_misdirected_request()`). ([#206])
+- **Config hashing stabilized** - deterministic cross-platform hashing. ([#206])
+
+### Added
+
+- 39 new tests covering sync decisions, API error handling, and state edge cases. ([#206])
+- SECURITY.md, CONTRIBUTING.md, PR template, and credential storage docs. ([#206])
+
+[#206]: https://github.com/rhoopr/kei/pull/206
+
 ## [0.7.11] - 2026-04-14
 
 ### Fixed
