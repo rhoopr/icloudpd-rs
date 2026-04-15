@@ -136,10 +136,20 @@ async fn authenticate_inner(
                          Wait a few minutes before trying again",
                     ));
                 }
-                tracing::debug!(
-                    error = %e,
-                    "Invalid authentication token, will log in from scratch"
-                );
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_misdirected_request())
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "Misdirected request persists after connection pool reset, \
+                         falling back to SRP"
+                    );
+                } else {
+                    tracing::debug!(
+                        error = %e,
+                        "Invalid authentication token, will log in from scratch"
+                    );
+                }
             }
         }
     }
@@ -167,10 +177,20 @@ async fn authenticate_inner(
                          Wait a few minutes before trying again",
                     ));
                 }
-                tracing::debug!(
-                    error = %e,
-                    "accountLogin failed, falling back to SRP"
-                );
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_misdirected_request())
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "accountLogin misdirected after connection pool reset, \
+                         falling back to SRP"
+                    );
+                } else {
+                    tracing::debug!(
+                        error = %e,
+                        "accountLogin failed, falling back to SRP"
+                    );
+                }
             }
         }
     }
@@ -336,6 +356,15 @@ pub async fn send_2fa_push(
                         "Apple is rate limiting authentication requests. \
                          Wait a few minutes before trying again",
                     ));
+                }
+                if e.downcast_ref::<AuthError>()
+                    .is_some_and(|ae| ae.is_misdirected_request())
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "Misdirected request persists after connection pool reset, \
+                         falling back to SRP"
+                    );
                 }
             }
         }

@@ -77,6 +77,20 @@ impl AuthError {
         }
     }
 
+    /// Check if this error indicates a 421 Misdirected Request.
+    ///
+    /// HTTP 421 is an HTTP/2 routing issue where the connection was routed to
+    /// the wrong partition server. The fix is to reset the connection pool and
+    /// retry, NOT to re-authenticate. Apple can return 421 as an HTTP status
+    /// or via the `X-Apple-I-Rscd` response header (rscd_421).
+    pub fn is_misdirected_request(&self) -> bool {
+        match self {
+            Self::ApiError { code, .. } => *code == 421,
+            Self::ServiceError { code, .. } => code == "http_421" || code == "rscd_421",
+            _ => false,
+        }
+    }
+
     /// Build a `ServiceError` with an enriched message for well-known Apple error codes.
     pub(crate) fn service_error(code: &str, raw_message: &str) -> Self {
         let upper = code.to_ascii_uppercase();
@@ -280,6 +294,91 @@ mod tests {
         assert!(!AuthError::TwoFactorFailed("test".into()).is_rate_limited());
         assert!(!AuthError::TwoFactorRequired.is_rate_limited());
         assert!(!AuthError::LockContention("test".into()).is_rate_limited());
+    }
+
+    #[test]
+    fn api_error_421_is_misdirected() {
+        let err = AuthError::ApiError {
+            code: 421,
+            message: "Misdirected Request".into(),
+        };
+        assert!(err.is_misdirected_request());
+    }
+
+    #[test]
+    fn service_error_http_421_is_misdirected() {
+        let err = AuthError::ServiceError {
+            code: "http_421".into(),
+            message: "Misdirected Request during validation".into(),
+        };
+        assert!(err.is_misdirected_request());
+    }
+
+    #[test]
+    fn service_error_rscd_421_is_misdirected() {
+        let err = AuthError::ServiceError {
+            code: "rscd_421".into(),
+            message: "Apple rejected the session (response code 421)".into(),
+        };
+        assert!(err.is_misdirected_request());
+    }
+
+    #[test]
+    fn api_error_other_codes_not_misdirected() {
+        for code in [401, 403, 450, 500, 502, 503, 504] {
+            let err = AuthError::ApiError {
+                code,
+                message: "test".into(),
+            };
+            assert!(
+                !err.is_misdirected_request(),
+                "code {code} should not be misdirected"
+            );
+        }
+    }
+
+    #[test]
+    fn service_error_other_codes_not_misdirected() {
+        for code in [
+            "http_450", "http_500", "http_503", "rscd_401", "rscd_403", "AUTH-421",
+        ] {
+            let err = AuthError::ServiceError {
+                code: code.into(),
+                message: "test".into(),
+            };
+            assert!(
+                !err.is_misdirected_request(),
+                "code {code} should not be misdirected"
+            );
+        }
+    }
+
+    #[test]
+    fn non_api_variants_not_misdirected() {
+        assert!(!AuthError::FailedLogin("test".into()).is_misdirected_request());
+        assert!(!AuthError::InvalidToken("test".into()).is_misdirected_request());
+        assert!(!AuthError::TwoFactorFailed("test".into()).is_misdirected_request());
+        assert!(!AuthError::TwoFactorRequired.is_misdirected_request());
+        assert!(!AuthError::LockContention("test".into()).is_misdirected_request());
+    }
+
+    #[test]
+    fn misdirected_and_rate_limited_are_exclusive() {
+        // 421 is misdirected, not rate limited
+        let err_421 = AuthError::ApiError {
+            code: 421,
+            message: "test".into(),
+        };
+        assert!(err_421.is_misdirected_request());
+        assert!(!err_421.is_rate_limited());
+
+        // 503 is rate limited, not misdirected
+        let err_503 = AuthError::ApiError {
+            code: 503,
+            message: "test".into(),
+        };
+        assert!(err_503.is_rate_limited());
+        assert!(!err_503.is_misdirected_request());
     }
 
     #[test]
