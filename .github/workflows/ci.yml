@@ -170,8 +170,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-audit
-      # Ignore unmaintained warnings (informational, not vulnerabilities)
-      - run: cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119
+      # Ignore unmaintained/inapplicable warnings:
+      # RUSTSEC-2024-0436: paste (unmaintained, transitive via little_exif)
+      # RUSTSEC-2025-0119: (previously ignored)
+      # RUSTSEC-2026-0097: rand unsound with custom logger — kei doesn't use rand::rng()
+      - run: cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2026-0097
 
   # Verifies the Dockerfile builds successfully
   # Catches build breakage before it hits the publish workflow on main

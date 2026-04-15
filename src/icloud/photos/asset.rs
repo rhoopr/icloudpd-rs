@@ -33,7 +33,7 @@ pub struct ChangeEvent {
 /// A photo or video asset from iCloud.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - Heap types first (Box<str>, `Option<Box<str>>`)
+/// - Heap types first (`Box<str>`, `Option<Box<str>>`)
 /// - `VersionsMap` (`SmallVec` inline storage)
 /// - f64 primitives
 /// - Small enums last
