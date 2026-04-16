@@ -478,7 +478,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 .await
                 {
                     Ok(()) => {
-                        tracing::debug!("Re-auth successful, resuming download...");
+                        tracing::info!("Re-auth successful, resuming download...");
                         continue; // Restart entire cycle
                     }
                     Err(e)
@@ -676,7 +676,7 @@ async fn run_cycle(
                 let stored_hash = db.get_metadata("enum_config_hash").await.unwrap_or(None);
                 if stored_hash.as_deref() != Some(&config_hash) {
                     if stored_hash.is_some() {
-                        tracing::debug!(
+                        tracing::info!(
                             "Download config changed since last sync, clearing sync tokens"
                         );
                         match db.delete_metadata_by_prefix("sync_token:").await {
@@ -750,7 +750,7 @@ async fn run_cycle(
                 }
             }
         } else if sync_result.sync_token.is_some() {
-            tracing::debug!(
+            tracing::info!(
                 zone = %lib_state.zone_name,
                 "Sync token NOT advanced (incomplete sync -- will replay changes next cycle)"
             );

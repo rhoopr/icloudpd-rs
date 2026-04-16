@@ -743,7 +743,7 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
     .unwrap_or(0);
 
     if cleaned > 0 {
-        tracing::debug!(count = cleaned, "Cleaned up orphaned .part files");
+        tracing::info!(count = cleaned, "Cleaned up orphaned .part files");
     }
 }
 
@@ -1268,7 +1268,7 @@ async fn download_photos_incremental(
     }
 
     let task_count = tasks.len();
-    tracing::debug!(
+    tracing::info!(
         count = task_count,
         "Downloading files from incremental sync"
     );

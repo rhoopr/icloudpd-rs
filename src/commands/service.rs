@@ -217,7 +217,7 @@ pub(crate) async fn init_photos_service(
     }
 
     if fresh_url != ckdatabasews_url {
-        tracing::debug!(
+        tracing::info!(
             old_url = %ckdatabasews_url,
             new_url = %fresh_url,
             "Re-authentication returned a different service URL"
@@ -312,7 +312,7 @@ where
         return Ok(());
     }
 
-    tracing::debug!("Session invalid, performing full re-authentication...");
+    tracing::info!("Session invalid, performing full re-authentication...");
     session.release_lock()?;
     drop(session);
 
@@ -329,7 +329,7 @@ where
 
     let mut session = shared_session.write().await;
     *session = new_auth.session;
-    tracing::debug!("Re-authentication successful");
+    tracing::info!("Re-authentication successful");
     Ok(())
 }
 

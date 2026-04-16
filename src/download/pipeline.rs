@@ -410,7 +410,7 @@ where
         let mut trust = stored_hash.as_deref() == Some(&config_hash);
         if !trust {
             if stored_hash.is_some() {
-                tracing::debug!("Download config changed since last sync, verifying all files");
+                tracing::info!("Download config changed since last sync, verifying all files");
                 // Clear stored sync tokens so the next cycle/run falls back to
                 // full enumeration, picking up assets that the old incremental
                 // token would have missed under the new filter settings.

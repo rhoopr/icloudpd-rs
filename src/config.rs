@@ -958,7 +958,7 @@ pub(crate) fn persist_first_run_config(
         std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))?;
     }
 
-    tracing::debug!(path = %config_path.display(), "Saved configuration for future runs");
+    tracing::info!(path = %config_path.display(), "Saved configuration for future runs");
     Ok(())
 }
 

@@ -140,7 +140,7 @@ fn migrate_to_version(conn: &Connection, version: i32) -> Result<(), StateError>
         }
     }
     set_schema_version(conn, version)?;
-    tracing::debug!(version, "Migrated database schema");
+    tracing::info!(version, "Migrated database schema");
     Ok(())
 }
 
