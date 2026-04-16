@@ -383,6 +383,19 @@ where
     loop {
         wait_for_2fa_submit(cookie_dir, username).await;
 
+        // Invalidate the validation cache so authenticate() actually checks
+        // with Apple instead of returning stale cached data from before 2FA.
+        let sanitized: String = username
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let cache_path = cookie_dir.join(format!("{sanitized}.cache"));
+        if cache_path.exists() {
+            if let Err(e) = tokio::fs::remove_file(&cache_path).await {
+                tracing::debug!(error = %e, "Could not remove validation cache");
+            }
+        }
+
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(TWO_FA_POLL_SECS)).await;
