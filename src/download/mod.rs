@@ -743,7 +743,7 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
     .unwrap_or(0);
 
     if cleaned > 0 {
-        tracing::info!(count = cleaned, "Cleaned up orphaned .part files");
+        tracing::debug!(count = cleaned, "Cleaned up orphaned .part files");
     }
 }
 
@@ -763,10 +763,10 @@ pub async fn download_photos_with_sync(
         match db.prepare_for_retry().await {
             Ok((failed, stale, total_pending)) => {
                 if failed > 0 {
-                    tracing::info!(count = failed, "Reset failed assets for retry");
+                    tracing::debug!(count = failed, "Reset failed assets for retry");
                 }
                 if stale > 0 {
-                    tracing::info!(
+                    tracing::debug!(
                         count = stale,
                         "Cleared stale attempt counts on pending assets"
                     );
@@ -796,7 +796,7 @@ pub async fn download_photos_with_sync(
         // pending assets from previous syncs. Fall back to full so they get
         // retried. Once everything is downloaded, incremental resumes.
         SyncMode::Incremental { .. } if total_pending > 0 => {
-            tracing::info!(
+            tracing::debug!(
                 pending = total_pending,
                 "Pending assets require full enumeration, skipping incremental sync"
             );
@@ -1094,7 +1094,7 @@ async fn download_photos_incremental(
         }
     }
 
-    tracing::info!(
+    tracing::debug!(
         created = created_count,
         soft_deleted = soft_deleted_count,
         hard_deleted = hard_deleted_count,
@@ -1120,7 +1120,7 @@ async fn download_photos_incremental(
     if let Some(recent) = config.recent {
         let limit = recent as usize;
         if downloadable_assets.len() > limit {
-            tracing::info!(
+            tracing::debug!(
                 total = downloadable_assets.len(),
                 limit,
                 "Capping incremental assets to --recent limit"
@@ -1129,7 +1129,7 @@ async fn download_photos_incremental(
         }
     }
 
-    tracing::info!(
+    tracing::debug!(
         count = downloadable_assets.len(),
         "Assets to download from incremental sync"
     );
@@ -1229,7 +1229,7 @@ async fn download_photos_incremental(
     }
 
     if skip_breakdown.by_state > 0 {
-        tracing::info!(
+        tracing::debug!(
             skipped = skip_breakdown.by_state,
             "Skipped already-downloaded assets (state DB)"
         );
@@ -1268,7 +1268,7 @@ async fn download_photos_incremental(
     }
 
     let task_count = tasks.len();
-    tracing::info!(
+    tracing::debug!(
         count = task_count,
         "Downloading files from incremental sync"
     );

@@ -158,7 +158,7 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
     if pending.is_empty() {
         return 0;
     }
-    tracing::info!(count = pending.len(), "Retrying deferred state writes");
+    tracing::debug!(count = pending.len(), "Retrying deferred state writes");
     let mut failures = 0;
     for write in pending {
         let mut succeeded = false;
@@ -213,7 +213,7 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
             "Some state writes could not be saved"
         );
     } else {
-        tracing::info!(count = pending.len(), "All deferred state writes recovered");
+        tracing::debug!(count = pending.len(), "All deferred state writes recovered");
     }
     failures
 }
@@ -410,13 +410,13 @@ where
         let mut trust = stored_hash.as_deref() == Some(&config_hash);
         if !trust {
             if stored_hash.is_some() {
-                tracing::info!("Download config changed since last sync, verifying all files");
+                tracing::debug!("Download config changed since last sync, verifying all files");
                 // Clear stored sync tokens so the next cycle/run falls back to
                 // full enumeration, picking up assets that the old incremental
                 // token would have missed under the new filter settings.
                 match db.delete_metadata_by_prefix("sync_token:").await {
                     Ok(n) if n > 0 => {
-                        tracing::info!(cleared = n, "Cleared stale sync tokens");
+                        tracing::debug!(cleared = n, "Cleared stale sync tokens");
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Failed to clear sync tokens");
@@ -743,7 +743,7 @@ where
         let total_skipped = skips.total();
         if total_skipped > 0 {
             producer_pb.suspend(|| {
-                tracing::info!(
+                tracing::debug!(
                     state = skips.by_state,
                     on_disk = skips.on_disk,
                     ampm_variant = skips.ampm_variant,
@@ -1079,7 +1079,7 @@ pub(super) async fn build_download_outcome(
     );
 
     let fresh_tasks = super::build_download_tasks(albums, config, shutdown_token.clone()).await?;
-    tracing::info!(
+    tracing::debug!(
         count = fresh_tasks.len(),
         "  Re-fetched tasks with fresh URLs"
     );

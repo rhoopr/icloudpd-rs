@@ -81,7 +81,7 @@ pub(crate) async fn init_photos_service(
         std::sync::Arc::new(tokio::sync::RwLock::new(auth_result.session));
     let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
 
-    tracing::info!("Initializing photos service...");
+    tracing::debug!("Initializing photos service...");
     match icloud::photos::PhotosService::new(
         ckdatabasews_url.clone(),
         session_box,
@@ -217,7 +217,7 @@ pub(crate) async fn init_photos_service(
     }
 
     if fresh_url != ckdatabasews_url {
-        tracing::info!(
+        tracing::debug!(
             old_url = %ckdatabasews_url,
             new_url = %fresh_url,
             "Re-authentication returned a different service URL"
@@ -312,7 +312,7 @@ where
         return Ok(());
     }
 
-    tracing::info!("Session invalid, performing full re-authentication...");
+    tracing::debug!("Session invalid, performing full re-authentication...");
     session.release_lock()?;
     drop(session);
 
@@ -329,7 +329,7 @@ where
 
     let mut session = shared_session.write().await;
     *session = new_auth.session;
-    tracing::info!("Re-authentication successful");
+    tracing::debug!("Re-authentication successful");
     Ok(())
 }
 
@@ -358,7 +358,7 @@ async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
             .and_then(|m| m.modified())
             .ok();
         if current_mtime != initial_mtime {
-            tracing::info!("Session file updated, retrying authentication");
+            tracing::debug!("Session file updated, retrying authentication");
             break;
         }
     }
@@ -406,7 +406,7 @@ where
                     if e.downcast_ref::<auth::error::AuthError>()
                         .is_some_and(auth::error::AuthError::is_two_factor_required) =>
                 {
-                    tracing::info!("Session not yet trusted, continuing to wait...");
+                    tracing::debug!("Session not yet trusted, continuing to wait...");
                     break; // Back to outer loop (wait_for_2fa_submit)
                 }
                 Err(e)
@@ -486,12 +486,12 @@ pub(crate) async fn resolve_libraries(
 ) -> anyhow::Result<Vec<icloud::photos::PhotoLibrary>> {
     match selection {
         config::LibrarySelection::All => {
-            tracing::info!("Using all available libraries");
+            tracing::debug!("Using all available libraries");
             photos_service.all_libraries().await
         }
         config::LibrarySelection::Single(name) => {
             if name != "PrimarySync" {
-                tracing::info!(library = %name, "Using non-default library");
+                tracing::debug!(library = %name, "Using non-default library");
             }
             Ok(vec![photos_service.get_library(name).await?.clone()])
         }
@@ -534,7 +534,7 @@ pub(crate) async fn resolve_albums(
         for name in exclude_albums {
             if let Some(album) = album_map.get(name.as_str()) {
                 let count = album.len().await.unwrap_or(0);
-                tracing::info!(album = name, count, "Pre-fetching excluded album asset IDs");
+                tracing::debug!(album = name, count, "Pre-fetching excluded album asset IDs");
                 let (stream, _token_rx) = album.photo_stream_with_token(None, Some(count), 1);
                 tokio::pin!(stream);
                 while let Some(Ok(asset)) = stream.next().await {
@@ -544,7 +544,7 @@ pub(crate) async fn resolve_albums(
                 tracing::warn!(album = name, "Excluded album not found, ignoring");
             }
         }
-        tracing::info!(count = exclude_ids.len(), "Collected excluded asset IDs");
+        tracing::debug!(count = exclude_ids.len(), "Collected excluded asset IDs");
         return Ok((vec![library.all()], exclude_ids));
     }
 
@@ -553,7 +553,7 @@ pub(crate) async fn resolve_albums(
     let mut matched = Vec::new();
     for name in album_names {
         if exclude_albums.iter().any(|e| e == name) {
-            tracing::info!(album = name, "Album excluded by --exclude-album");
+            tracing::debug!(album = name, "Album excluded by --exclude-album");
             continue;
         }
         if let Some(album) = album_map.remove(name.as_str()) {

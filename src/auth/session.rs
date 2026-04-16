@@ -395,17 +395,17 @@ impl Session {
                             .collect()
                     }
                     Err(e) => {
-                        tracing::info!(path = %session_path.display(), error = %e, "Session file corrupt, starting fresh");
+                        tracing::debug!(path = %session_path.display(), error = %e, "Session file corrupt, starting fresh");
                         HashMap::new()
                     }
                 },
                 Err(e) => {
-                    tracing::info!(path = %session_path.display(), error = %e, "Could not read session file, starting fresh");
+                    tracing::debug!(path = %session_path.display(), error = %e, "Could not read session file, starting fresh");
                     HashMap::new()
                 }
             }
         } else {
-            tracing::info!("Session file does not exist");
+            tracing::debug!("Session file does not exist");
             HashMap::new()
         };
 

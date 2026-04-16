@@ -653,7 +653,7 @@ fn reset_sync_token_forces_full_enumeration() {
 
         // Second sync should do full enumeration (no stored token)
         let output = sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 2)
-            .args(["--log-level", "info"])
+            .args(["--log-level", "debug"])
             .timeout(Duration::from_secs(TIMEOUT_SYNC))
             .output()
             .unwrap();

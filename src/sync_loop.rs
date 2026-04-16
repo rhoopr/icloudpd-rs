@@ -249,7 +249,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // Resolve the selected library/libraries
     let libraries = resolve_libraries(&config.library, &mut photos_service).await?;
-    tracing::info!(
+    tracing::debug!(
         count = libraries.len(),
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),
         "Resolved libraries"
@@ -275,11 +275,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 if is_retry_failed {
                     match db.reset_failed().await {
                         Ok(0) => {
-                            tracing::info!("No failed assets to retry");
+                            tracing::debug!("No failed assets to retry");
                             return Ok(());
                         }
                         Ok(count) => {
-                            tracing::info!(count, "Reset failed assets to pending");
+                            tracing::debug!(count, "Reset failed assets to pending");
                         }
                         Err(e) => {
                             tracing::warn!("Failed to reset failed assets: {e}");
@@ -311,7 +311,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
             }
             if cleared_ok {
-                tracing::info!("Cleared stored sync tokens");
+                tracing::debug!("Cleared stored sync tokens");
             }
         }
     }
@@ -478,7 +478,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 .await
                 {
                     Ok(()) => {
-                        tracing::info!("Re-auth successful, resuming download...");
+                        tracing::debug!("Re-auth successful, resuming download...");
                         continue; // Restart entire cycle
                     }
                     Err(e)
@@ -676,12 +676,12 @@ async fn run_cycle(
                 let stored_hash = db.get_metadata("enum_config_hash").await.unwrap_or(None);
                 if stored_hash.as_deref() != Some(&config_hash) {
                     if stored_hash.is_some() {
-                        tracing::info!(
+                        tracing::debug!(
                             "Download config changed since last sync, clearing sync tokens"
                         );
                         match db.delete_metadata_by_prefix("sync_token:").await {
                             Ok(n) if n > 0 => {
-                                tracing::info!(cleared = n, "Cleared stale sync tokens");
+                                tracing::debug!(cleared = n, "Cleared stale sync tokens");
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -745,12 +745,12 @@ async fn run_cycle(
                     if let Err(e) = db.set_metadata(&lib_state.sync_token_key, token).await {
                         tracing::warn!(error = %e, "Failed to store sync token");
                     } else {
-                        tracing::info!(zone = %lib_state.zone_name, "Stored sync token for next incremental sync");
+                        tracing::debug!(zone = %lib_state.zone_name, "Stored sync token for next incremental sync");
                     }
                 }
             }
         } else if sync_result.sync_token.is_some() {
-            tracing::info!(
+            tracing::debug!(
                 zone = %lib_state.zone_name,
                 "Sync token NOT advanced (incomplete sync -- will replay changes next cycle)"
             );
@@ -872,12 +872,12 @@ async fn determine_sync_mode(
 ) -> download::SyncMode {
     if is_retry_failed || no_incremental {
         if no_incremental && library_count == 1 {
-            tracing::info!(
+            tracing::debug!(
                 "Incremental sync disabled via --no-incremental, performing full enumeration"
             );
         }
         if is_retry_failed {
-            tracing::info!(
+            tracing::debug!(
                 "Retry-failed requires full enumeration to find previously-failed assets"
             );
         }
@@ -885,13 +885,13 @@ async fn determine_sync_mode(
     } else if let Some(db) = state_db {
         match db.get_metadata(sync_token_key).await {
             Ok(Some(ref token)) if !token.is_empty() => {
-                tracing::info!(zone = %zone_name, "Stored sync token found, using incremental sync");
+                tracing::debug!(zone = %zone_name, "Stored sync token found, using incremental sync");
                 download::SyncMode::Incremental {
                     zone_sync_token: token.clone(),
                 }
             }
             Ok(_) => {
-                tracing::info!(zone = %zone_name, "No sync token found, performing full enumeration");
+                tracing::debug!(zone = %zone_name, "No sync token found, performing full enumeration");
                 download::SyncMode::Full
             }
             Err(e) => {
