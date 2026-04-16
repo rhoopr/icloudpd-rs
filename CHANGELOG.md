@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.0] - 2026-04-16
+
+### Added
+
+- **`--report-json <path>`** - writes a JSON summary after each sync cycle with schema version, CLI options, stats, and per-reason skip breakdown. In watch mode, each cycle overwrites the file. ([#195])
+- **Bandwidth and disk usage tracking** - bytes downloaded and bytes written to disk are tracked through the download pipeline and shown in the sync summary. ([#196], [#197])
+- **Per-reason skip breakdown** - sync summary now shows why assets were skipped: already downloaded, on disk, filtered by media type / date range / live photo / filename, excluded by album, live photo variants, retries exhausted. ([#198])
+- **Extended notification env vars** - 21 new `KEI_*` variables passed to notification scripts: core counts (`KEI_DOWNLOADED`, `KEI_FAILED`, `KEI_SKIPPED`, ...), transfer stats (`KEI_BYTES_DOWNLOADED`, `KEI_DISK_BYTES`), error details, and the full skip breakdown. Absent for non-sync events, so existing scripts don't break. ([#212])
+
+### Changed
+
+- **Default log level restored to `info`** - was changed to `warn` in v0.7.11. Internal implementation messages (service init, token management, library resolution, schema migration) moved to `debug` so the default output is clean. ([#216])
+- **Sync summary in plain English** - replaces the old `downloaded=N skipped=N failed=N` structured format with readable output like `50 downloaded, 350 skipped, 0 failed (400 total)`. ([#216])
+- **`FilterReason` enum** - `is_asset_filtered` returns `Option<FilterReason>` instead of `bool`, enabling per-reason skip accounting in both full and incremental sync paths. ([#216])
+
+### Fixed
+
+- **Cookie domain loss on restart** - `reqwest::Jar::cookies()` strips `Domain=` attributes when persisting. On reload, cookies were host-scoped (e.g. `setup.icloud.com`) instead of broad domain (`.icloud.com`), so they weren't sent to `ckdatabasews.icloud.com` - causing 401 errors after container restarts. ([#217])
+- **421 recovery triggered unnecessary 2FA** - the recovery order was pool reset -> re-auth -> backoff. A transient routing issue would nuke a valid session and force SRP + 2FA. Reordered to pool reset -> backoff with fresh pools (10s/30s/60s) -> re-auth as last resort. ([#217])
+- **Auth 421 cache fallback** - when both `/validate` and `/accountLogin` return 421, cached auth data is now used instead of falling through to SRP. Prevents unnecessary 2FA prompts when Apple's auth CDN has a routing issue. ([#217])
+- **CloudKit `HttpStatusError` not retried** - HTTP 5xx and 429 responses wrapped in `HttpStatusError` fell through to `Abort` instead of `Retry` in `classify_api_error`. ([#217])
+- **Stale validation cache after 2FA** - the cache file is now deleted before retrying auth after a 2FA code submission, preventing `authenticate()` from returning pre-2FA cached data. ([#216])
+
+[#195]: https://github.com/rhoopr/kei/issues/195
+[#196]: https://github.com/rhoopr/kei/issues/196
+[#197]: https://github.com/rhoopr/kei/issues/197
+[#198]: https://github.com/rhoopr/kei/issues/198
+[#212]: https://github.com/rhoopr/kei/issues/212
+[#216]: https://github.com/rhoopr/kei/pull/216
+[#217]: https://github.com/rhoopr/kei/issues/217
+
 ## [0.7.12] - 2026-04-15
 
 ### Fixed
