@@ -161,14 +161,38 @@ fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
             .expect("failed to run login session validation");
 
         if output.status.success() {
-            eprintln!("Session OK.");
-            return;
+            // Verify the login actually established trust (not just SRP success
+            // without 2FA completion).
+            let has_token = std::fs::read_to_string(&cookie_file)
+                .ok()
+                .is_some_and(|c| c.contains("X-APPLE-WEBAUTH-TOKEN"));
+            if has_token {
+                eprintln!("Session OK.");
+                return;
+            }
+            eprintln!(
+                "Login succeeded but session is not trusted (missing X-APPLE-WEBAUTH-TOKEN).\n\
+                 Complete 2FA first: kei login get-code --username {username} --data-dir {}\n\
+                 Or set ICLOUD_TEST_COOKIE_DIR to a directory with a trusted session.",
+                cookie_dir.display()
+            );
+            std::process::exit(1);
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains(RATE_LIMIT_MARKER) {
             RATE_LIMITED.store(true, Ordering::SeqCst);
             eprintln!("\n*** ABORTING: Apple 503 rate limit during session validation ***");
+            std::process::exit(1);
+        }
+
+        if stderr.contains("2FA") || stderr.contains("Two-factor") {
+            eprintln!(
+                "\n*** ABORTING: 2FA required but not available in test mode ***\n\
+                 Complete 2FA first: kei login get-code --username {username} --data-dir {}\n\
+                 Or set ICLOUD_TEST_COOKIE_DIR to a directory with a trusted session.",
+                cookie_dir.display()
+            );
             std::process::exit(1);
         }
 
