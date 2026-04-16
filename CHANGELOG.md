@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Duplicate `--album` names no longer error** - `sync --album X --album X` previously failed with "Album 'X' not found" because the album map was drained on first match. Duplicate names are now deduplicated before resolution.
+
+---
+
 ## [0.8.0] - 2026-04-16
 
 ### Added
