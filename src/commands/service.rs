@@ -548,10 +548,15 @@ pub(crate) async fn resolve_albums(
         return Ok((vec![library.all()], exclude_ids));
     }
 
-    // Explicit --album list: resolve and exclude.
+    // Explicit --album list: resolve and exclude. Dedup names so callers
+    // passing the same album twice get one download pass, not an error.
     let mut album_map = library.albums().await?;
     let mut matched = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
     for name in album_names {
+        if !seen.insert(name.as_str()) {
+            continue;
+        }
         if exclude_albums.iter().any(|e| e == name) {
             tracing::debug!(album = name, "Album excluded by --exclude-album");
             continue;
@@ -735,6 +740,25 @@ mod tests {
         let result = resolve_albums(&library, &["DoesNotExist".to_string()], &[]).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_albums_dedups_duplicate_names() {
+        // `--album Vacation --album Vacation` should resolve to a single album,
+        // not error after the first instance drains the map.
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation")
+        ]}));
+        let library = stub_library(mock);
+
+        let (albums, _) = resolve_albums(
+            &library,
+            &["Vacation".to_string(), "Vacation".to_string()],
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(albums.len(), 1, "duplicate names dedup to 1");
     }
 
     #[tokio::test]

@@ -1071,6 +1071,147 @@ fn sync_incremental_second_run_skips_download() {
     });
 }
 
+// ── Watch mode, report JSON, multi-album ────────────────────────────────
+
+/// Verify `--watch-with-interval` drives multiple sync cycles within one run.
+///
+/// Runs at the minimum interval (60 s) long enough to observe two cycle starts,
+/// then kills the process and counts the `sync_loop: Starting kei` markers.
+#[test]
+#[ignore]
+fn sync_watch_runs_multiple_cycles() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let download_dir = tempdir().expect("tempdir");
+        let bin = env!("CARGO_BIN_EXE_kei");
+        let mut child = Command::new(bin)
+            .args([
+                "sync",
+                "--album",
+                ALBUM,
+                "--username",
+                &username,
+                "--password",
+                &password,
+                "--data-dir",
+                cookie_dir.to_str().unwrap(),
+                "--directory",
+                download_dir.path().to_str().unwrap(),
+                "--no-progress-bar",
+                "--watch-with-interval",
+                "60",
+                "--log-level",
+                "info",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn kei");
+
+        // First cycle runs at t=0, second at t=60, buffer for download time.
+        std::thread::sleep(Duration::from_secs(135));
+        let _ = child.kill();
+
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        let _ = child.wait();
+
+        // Each cycle logs "Waiting before next cycle" at the end; 2 cycles → 2 markers.
+        let clean = strip_ansi(&stderr);
+        let cycles = clean.matches("Waiting before next cycle").count();
+        assert!(
+            cycles >= 2,
+            "watch should drive at least 2 cycles, got {cycles}. stderr head: {}",
+            clean.chars().take(2000).collect::<String>()
+        );
+    });
+}
+
+/// Verify `--report-json` writes a parseable report with the documented schema.
+#[test]
+#[ignore]
+fn sync_report_json_writes_valid_schema() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+        let report_dir = tempdir().expect("tempdir");
+        let report_path = report_dir.path().join("report.json");
+
+        album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .args(["--report-json", report_path.to_str().unwrap()])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let body = std::fs::read_to_string(&report_path).expect("report file");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(json["version"], "1", "schema version");
+        assert!(json["kei_version"].is_string(), "kei_version present");
+        assert!(json["timestamp"].is_string(), "timestamp present");
+        let status = json["status"].as_str().expect("status string");
+        assert!(
+            matches!(status, "success" | "partial_failure" | "session_expired"),
+            "unexpected status: {status}"
+        );
+        assert!(json["options"].is_object(), "options object");
+        assert_eq!(json["options"]["username"], username.as_str());
+        assert!(json["stats"].is_object(), "stats object");
+    });
+}
+
+/// Verify passing the same album twice still downloads exactly once (dedup).
+///
+/// Exercises the multi-`--album` code path end-to-end. A richer test would
+/// use two distinct small albums, but only `icloudpd-test` exists in the
+/// test account, so we assert dedup as the minimal multi-filter invariant.
+#[test]
+#[ignore]
+fn sync_multi_album_dedups() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        common::cmd()
+            .args([
+                "sync",
+                "--album",
+                ALBUM,
+                "--album",
+                ALBUM,
+                "--username",
+                &username,
+                "--password",
+                &password,
+                "--data-dir",
+                cookie_dir.to_str().unwrap(),
+                "--directory",
+                download_dir.path().to_str().unwrap(),
+                "--no-progress-bar",
+                "--no-incremental",
+            ])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
+
+        let files = common::walkdir(download_dir.path());
+        assert_eq!(
+            files.len(),
+            3,
+            "duplicate album names should dedup to 3 files, got {}: {:?}",
+            files.len(),
+            files
+        );
+    });
+}
+
 // ── Bad credentials (LAST -- hits auth from scratch, burns rate limit) ──
 
 #[test]

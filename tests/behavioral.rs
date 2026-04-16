@@ -105,45 +105,56 @@ fn insert_asset(
 // Deprecation warnings: every legacy command prints to stderr
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Assert a legacy invocation prints a deprecation warning naming the new command.
+fn assert_deprecated(args: &[&str], should_succeed: bool, hint: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+    let with_data_dir: Vec<&str> = args
+        .iter()
+        .map(|a| if *a == "__DATA_DIR__" { data_dir } else { *a })
+        .collect();
+    let assert = clean_cmd().args(&with_data_dir).assert();
+    let assert = if should_succeed {
+        assert.success()
+    } else {
+        assert.failure()
+    };
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("deprecated") && stderr.contains(hint),
+        "args={args:?} hint={hint:?} stderr={stderr}"
+    );
+}
+
 #[test]
 fn deprecation_get_code() {
-    let out = clean_cmd()
-        .args(["get-code", "--username", "x@x.com", "--data-dir", "/tmp"])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("deprecated") && stderr.contains("login get-code"),
-        "stderr: {stderr}"
+    assert_deprecated(
+        &["get-code", "--username", "x@x.com", "--data-dir", "/tmp"],
+        false,
+        "login get-code",
     );
 }
 
 #[test]
 fn deprecation_submit_code() {
-    let out = clean_cmd()
-        .args([
+    assert_deprecated(
+        &[
             "submit-code",
             "123456",
             "--username",
             "x@x.com",
             "--data-dir",
             "/tmp",
-        ])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("deprecated") && stderr.contains("login submit-code"),
-        "stderr: {stderr}"
+        ],
+        false,
+        "login submit-code",
     );
 }
 
 #[test]
 fn deprecation_credential() {
+    // `credential` subcommand may exit success or failure depending on backend;
+    // only the deprecation warning matters here.
     let out = clean_cmd()
         .args([
             "credential",
@@ -165,140 +176,93 @@ fn deprecation_credential() {
 
 #[test]
 fn deprecation_retry_failed() {
-    let out = clean_cmd()
-        .args([
+    assert_deprecated(
+        &[
             "retry-failed",
             "--username",
             "x@x.com",
             "--data-dir",
             "/tmp",
-        ])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("deprecated") && stderr.contains("sync --retry-failed"),
-        "stderr: {stderr}"
+        ],
+        false,
+        "sync --retry-failed",
     );
 }
 
 #[test]
 fn deprecation_reset_state() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = clean_cmd()
-        .args([
+    assert_deprecated(
+        &[
             "reset-state",
             "--yes",
             "--username",
             "x@x.com",
             "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("deprecated") && stderr.contains("reset state"),
-        "stderr: {stderr}"
+            "__DATA_DIR__",
+        ],
+        true,
+        "reset state",
     );
 }
 
 #[test]
 fn deprecation_reset_sync_token() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = clean_cmd()
-        .args([
+    assert_deprecated(
+        &[
             "reset-sync-token",
             "--username",
             "x@x.com",
             "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("deprecated") && stderr.contains("reset sync-token"),
-        "stderr: {stderr}"
+            "__DATA_DIR__",
+        ],
+        true,
+        "reset sync-token",
     );
 }
 
 #[test]
 fn deprecation_setup() {
-    // setup is interactive, so just pass --help after the deprecation fires
-    // Actually, setup reads stdin, so we need to avoid it. Use a non-existent
-    // output path that will fail after the deprecation warning.
-    let out = clean_cmd()
-        .args(["setup", "--help"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    // --help short-circuits before effective_command(), so no deprecation.
-    // Instead, verify the subcommand still parses by checking exit 0.
-    assert!(out.status.success());
+    // --help short-circuits before effective_command(), so no deprecation warning.
+    // Just confirm the subcommand still parses.
+    clean_cmd().args(["setup", "--help"]).assert().success();
 }
 
 #[test]
 fn deprecation_auth_only_flag() {
-    let out = clean_cmd()
-        .args(["--auth-only", "--username", "x@x.com", "--data-dir", "/tmp"])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("deprecated") && stderr.contains("kei login"),
-        "stderr: {stderr}"
+    assert_deprecated(
+        &["--auth-only", "--username", "x@x.com", "--data-dir", "/tmp"],
+        false,
+        "kei login",
     );
 }
 
 #[test]
 fn deprecation_list_albums_flag() {
-    let out = clean_cmd()
-        .args([
+    assert_deprecated(
+        &[
             "--list-albums",
             "--username",
             "x@x.com",
             "--data-dir",
             "/tmp",
-        ])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("deprecated") && stderr.contains("list albums"),
-        "stderr: {stderr}"
+        ],
+        false,
+        "list albums",
     );
 }
 
 #[test]
 fn deprecation_list_libraries_flag() {
-    let out = clean_cmd()
-        .args([
+    assert_deprecated(
+        &[
             "--list-libraries",
             "--username",
             "x@x.com",
             "--data-dir",
             "/tmp",
-        ])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("deprecated") && stderr.contains("list libraries"),
-        "stderr: {stderr}"
+        ],
+        false,
+        "list libraries",
     );
 }
 
@@ -754,6 +718,49 @@ fn password_backend_shows_a_backend_name() {
                 .or(predicate::str::contains("keyring"))
                 .or(predicate::str::contains("none")),
         );
+}
+
+#[test]
+fn password_clear_without_stored_credential_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    clean_cmd()
+        .args([
+            "password",
+            "clear",
+            "--username",
+            "nobody@example.com",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No stored credential"));
+}
+
+#[test]
+fn password_backend_with_empty_data_dir_reports_none() {
+    // Fresh data dir with no keyring entry (keyring may still report for the
+    // username if it was set outside this test), so we use an unlikely
+    // username to minimize false positives.
+    let dir = tempfile::tempdir().unwrap();
+    let out = clean_cmd()
+        .args([
+            "password",
+            "backend",
+            "--username",
+            "kei-behavioral-test-nonexistent@example.invalid",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("none") || stdout.contains("keyring"),
+        "expected 'none' (or 'keyring' if system keyring returns stale entry), got: {stdout}"
+    );
 }
 
 // Legacy credential backend produces same output as new
