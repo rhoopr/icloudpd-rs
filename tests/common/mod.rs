@@ -101,7 +101,14 @@ fn require_creds() -> (String, String) {
 pub fn cookie_dir() -> PathBuf {
     init_env();
     let dir = if let Ok(dir) = std::env::var("ICLOUD_TEST_COOKIE_DIR") {
-        PathBuf::from(dir)
+        // Expand ~ since not all shells do it for env vars (e.g. fish)
+        if let Some(rest) = dir.strip_prefix("~/") {
+            dirs::home_dir()
+                .expect("could not determine home directory")
+                .join(rest)
+        } else {
+            PathBuf::from(dir)
+        }
     } else {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         manifest.join(".test-cookies")
