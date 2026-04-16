@@ -100,11 +100,14 @@ fn require_creds() -> (String, String) {
 #[allow(dead_code)]
 pub fn cookie_dir() -> PathBuf {
     init_env();
-    if let Ok(dir) = std::env::var("ICLOUD_TEST_COOKIE_DIR") {
-        return PathBuf::from(dir);
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.join(".test-cookies")
+    let dir = if let Ok(dir) = std::env::var("ICLOUD_TEST_COOKIE_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest.join(".test-cookies")
+    };
+    std::fs::create_dir_all(&dir).expect("create cookie dir");
+    dir
 }
 
 /// Run `--auth-only` once to ensure the session cookies are fresh.

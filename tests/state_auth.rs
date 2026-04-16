@@ -129,8 +129,10 @@ fn retry_failed_cmd(
 }
 
 fn db_file_count(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .expect("read dir")
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.path()
