@@ -119,23 +119,30 @@ pub fn cookie_dir() -> PathBuf {
 fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
     static ENSURED: OnceLock<()> = OnceLock::new();
     ENSURED.get_or_init(|| {
-        // Skip SRP if session file is fresh (< 1 hour old). This avoids
-        // burning rate-limit budget on every test run when cookies are valid.
+        // Skip SRP if session file is fresh AND the cookie file contains
+        // the WEBAUTH-TOKEN cookie (set only after 2FA trust is established).
+        // Without this check, a session that lost trust (e.g., after a 421
+        // storm) would be considered "fresh" but fail with 2FA required.
         let sanitized: String = username
             .chars()
             .filter(|c| c.is_ascii_alphanumeric())
             .collect();
         let session_file = cookie_dir.join(format!("{sanitized}.session"));
-        if let Ok(meta) = std::fs::metadata(&session_file) {
-            let is_fresh = meta
-                .modified()
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .is_some_and(|age| age < std::time::Duration::from_secs(48 * 3600));
-            if is_fresh {
-                eprintln!("Session file is fresh, skipping SRP validation.");
-                return;
-            }
+        let cookie_file = cookie_dir.join(&sanitized);
+        let session_fresh = std::fs::metadata(&session_file)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age < std::time::Duration::from_secs(48 * 3600));
+        let has_trust_cookie = std::fs::read_to_string(&cookie_file)
+            .ok()
+            .is_some_and(|c| c.contains("X-APPLE-WEBAUTH-TOKEN"));
+        if session_fresh && has_trust_cookie {
+            eprintln!("Session file is fresh and trusted, skipping SRP validation.");
+            return;
+        }
+        if session_fresh && !has_trust_cookie {
+            eprintln!("Session file is fresh but missing trust cookie, re-validating...");
         }
 
         eprintln!("Validating authentication session (login)...");
