@@ -1292,6 +1292,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_cache_no_time_limit_returns_stale_data() {
+        // When 421 fallback uses i64::MAX, even very old cached data should load
+        let (_td, dir) = test_dir("cache_no_limit");
+        let session = Session::new(&dir, "user@test.com", "https://www.icloud.com", None)
+            .await
+            .unwrap();
+
+        // Write a cache with a very old timestamp (1 week ago)
+        let cache = responses::ValidationCache {
+            validated_at: chrono::Utc::now().timestamp() - 604_800,
+            account_data: responses::AccountLoginResponse {
+                ds_info: None,
+                webservices: Some(responses::Webservices {
+                    ckdatabasews: Some(responses::WebserviceEndpoint {
+                        url: "https://p60-ckdatabasews.icloud.com".to_string(),
+                    }),
+                }),
+                hsa_challenge_required: false,
+                hsa_trusted_browser: true,
+                domain_to_use: None,
+                has_error: false,
+                service_errors: vec![],
+                i_cdp_enabled: false,
+            },
+        };
+        let json = serde_json::to_string_pretty(&cache).unwrap();
+        std::fs::write(session.cache_path(), json).unwrap();
+
+        // With normal grace (600s), should be expired
+        let loaded = session.load_validation_cache(600).await;
+        assert!(loaded.is_none(), "Should be expired with 600s grace");
+
+        // With i64::MAX grace (421 fallback), should load
+        let loaded = session.load_validation_cache(i64::MAX).await;
+        assert!(
+            loaded.is_some(),
+            "Should load with i64::MAX grace (421 fallback)"
+        );
+        let loaded = loaded.unwrap();
+        assert!(loaded.hsa_trusted_browser);
+        let ws = loaded.webservices.unwrap();
+        assert_eq!(
+            ws.ckdatabasews.unwrap().url,
+            "https://p60-ckdatabasews.icloud.com"
+        );
+    }
+
+    #[tokio::test]
     async fn strip_session_invalidates_cache() {
         let dir = tempfile::tempdir().unwrap();
         let session_path = dir.path().join("test.session");

@@ -141,8 +141,7 @@ async fn authenticate_inner(
                 {
                     tracing::warn!(
                         error = %e,
-                        "Misdirected request persists after connection pool reset, \
-                         falling back to SRP"
+                        "validate returned persistent 421 Misdirected Request"
                     );
                 } else {
                     tracing::debug!(

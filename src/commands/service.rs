@@ -782,6 +782,33 @@ mod tests {
         );
     }
 
+    // ── is_misdirected_request tests ──────────────────────────────────
+
+    #[test]
+    fn misdirected_request_detected_from_connection_error() {
+        let err = icloud::error::ICloudError::Connection(
+            "HTTP 421 for https://p60-ckdatabasews.icloud.com/...".to_string(),
+        );
+        assert!(is_misdirected_request(&err));
+    }
+
+    #[test]
+    fn non_421_connection_error_not_misdirected() {
+        let err = icloud::error::ICloudError::Connection(
+            "HTTP 500 for https://p60-ckdatabasews.icloud.com/...".to_string(),
+        );
+        assert!(!is_misdirected_request(&err));
+    }
+
+    #[test]
+    fn service_not_activated_not_misdirected() {
+        let err = icloud::error::ICloudError::ServiceNotActivated {
+            code: "ZONE_NOT_FOUND".to_string(),
+            reason: "zone not found".to_string(),
+        };
+        assert!(!is_misdirected_request(&err));
+    }
+
     #[tokio::test]
     async fn resolve_albums_same_album_in_both_yields_empty() {
         let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
