@@ -15,6 +15,11 @@ pub enum ICloudError {
             → Log into https://icloud.com/ and finish setting up your iCloud service."
     )]
     ServiceNotActivated { code: String, reason: String },
+    /// CloudKit rejected the request with HTTP 401. The caller should
+    /// invalidate any cached session/validation data and re-authenticate
+    /// with SRP before retrying.
+    #[error("Session expired (HTTP 401 from CloudKit)")]
+    SessionExpired,
     #[error(transparent)]
     Http(Box<reqwest::Error>),
     #[error(transparent)]
@@ -117,5 +122,16 @@ mod tests {
             !matches!(&err, ICloudError::Connection(msg) if msg.contains("421")),
             "503 should not match the misdirected request pattern"
         );
+    }
+
+    #[test]
+    fn session_expired_is_distinct_variant() {
+        let err = ICloudError::SessionExpired;
+        assert!(
+            matches!(err, ICloudError::SessionExpired),
+            "dedicated variant so callers can trigger SRP re-auth"
+        );
+        let display = err.to_string();
+        assert!(display.contains("401"), "display mentions 401: {display}");
     }
 }

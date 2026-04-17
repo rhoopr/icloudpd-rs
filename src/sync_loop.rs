@@ -237,18 +237,93 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         max_delay_secs: 60,
     };
 
-    let (shared_session, mut photos_service) = init_photos_service(
-        auth_result,
-        &config.cookie_directory,
-        &config.username,
-        config.domain.as_str(),
-        &password_provider,
-        api_retry_config,
-    )
-    .await?;
-
-    // Resolve the selected library/libraries
-    let libraries = resolve_libraries(&config.library, &mut photos_service).await?;
+    // CloudKit-401 recovery: when /validate and /accountLogin both return 421,
+    // auth::authenticate falls back to cached session data (to avoid an
+    // unnecessary 2FA prompt during transient auth-router routing issues).
+    // If the cached tokens are actually stale, CloudKit's first query returns
+    // 401. We catch that once, invalidate the validation cache, force SRP
+    // re-auth, and retry init. A second failure bails cleanly instead of
+    // looping under Docker's restart policy.
+    let mut pending_auth = Some(auth_result);
+    let mut retried_after_session_expired = false;
+    let (shared_session, mut photos_service, libraries) = loop {
+        let this_auth = pending_auth
+            .take()
+            .expect("auth_result present at start of attempt");
+        let (ss, mut ps) = init_photos_service(
+            this_auth,
+            &config.cookie_directory,
+            &config.username,
+            config.domain.as_str(),
+            &password_provider,
+            api_retry_config,
+        )
+        .await?;
+        match resolve_libraries(&config.library, &mut ps).await {
+            Ok(libs) => break (ss, ps, libs),
+            Err(e)
+                if !retried_after_session_expired
+                    && e.downcast_ref::<crate::icloud::error::ICloudError>()
+                        .is_some_and(|ic| {
+                            matches!(ic, crate::icloud::error::ICloudError::SessionExpired)
+                        }) =>
+            {
+                tracing::warn!(
+                    "CloudKit returned 401 after 421 auth-cache fallback; cached session \
+                     tokens are stale. Invalidating cache and forcing SRP re-authentication."
+                );
+                ss.read().await.invalidate_validation_cache().await;
+                drop(ps);
+                drop(ss);
+                retried_after_session_expired = true;
+                pending_auth = Some(
+                    match auth::authenticate(
+                        &config.cookie_directory,
+                        &config.username,
+                        &password_provider,
+                        config.domain.as_str(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(e)
+                            if e.downcast_ref::<auth::error::AuthError>()
+                                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
+                        {
+                            let msg = format!(
+                                "2FA required for {u}. Run: kei login get-code",
+                                u = config.username
+                            );
+                            tracing::warn!(message = %msg, "2FA required");
+                            notifier.notify(
+                                notifications::Event::TwoFaRequired,
+                                &msg,
+                                &config.username,
+                                None,
+                            );
+                            wait_and_retry_2fa(&config.cookie_directory, &config.username, || {
+                                auth::authenticate(
+                                    &config.cookie_directory,
+                                    &config.username,
+                                    &password_provider,
+                                    config.domain.as_str(),
+                                    None,
+                                    None,
+                                    None,
+                                )
+                            })
+                            .await?
+                        }
+                        Err(e) => return Err(e),
+                    },
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    };
     tracing::debug!(
         count = libraries.len(),
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),

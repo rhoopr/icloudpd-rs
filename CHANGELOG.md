@@ -11,7 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CloudKit 401 after 421 auth-cache fallback no longer loops under Docker restart.** When `/validate` and `/accountLogin` both return 421, kei falls back to cached session data (0.8.0 behavior). If those cached tokens were actually stale, the first CloudKit query returned 401, the process exited, and Docker restarted with the same stale cache forever. CloudKit 401 now maps to a typed `ICloudError::SessionExpired`; the sync loop catches it once, invalidates the validation cache, forces SRP re-authentication, and retries initialization. A second failure surfaces cleanly instead of looping. ([#217])
+- **Final error output carries a timestamp.** The top-level `anyhow::Error` is now routed through `tracing::error!` in addition to stderr, so crash messages in `docker logs` / `journalctl` carry the same `YYYY-MM-DDTHH:MM:SS INFO kei::...` prefix as the rest of the output. Makes the log timeline correlate cleanly instead of jumping from "kei::sync_loop: ..." lines to an unprefixed "Error: ..." line.
 - **Duplicate `--album` names no longer error** - `sync --album X --album X` previously failed with "Album 'X' not found" because the album map was drained on first match. Duplicate names are now deduplicated before resolution.
+
+[#217]: https://github.com/rhoopr/kei/issues/217
 
 ---
 

@@ -95,10 +95,15 @@ impl PhotoLibrary {
                     };
                 }
             }
-            // HTTP 403 on the CloudKit query endpoint after successful
-            // authentication is the classic ADP signature: the account
-            // authenticated fine but iCloud data access is blocked.
             if let Some(http_err) = e.downcast_ref::<super::session::HttpStatusError>() {
+                // HTTP 401: cached session tokens are stale (typically after
+                // the auth/mod.rs:201 421 cache-fallback). Caller invalidates
+                // the validation cache and retries with fresh SRP.
+                if http_err.status == 401 {
+                    return ICloudError::SessionExpired;
+                }
+                // HTTP 403 is the classic ADP signature: account authenticated
+                // fine but iCloud data access is blocked.
                 if http_err.status == 403 {
                     return ICloudError::ServiceNotActivated {
                         code: "HTTP_403".into(),
@@ -421,6 +426,52 @@ mod tests {
         assert!(
             display.contains("Advanced Data Protection"),
             "expected ADP guidance in message, got: {display}"
+        );
+    }
+
+    /// Stub that returns HTTP 401, the signature of a stale cached session
+    /// surviving the 421 auth-cache fallback.
+    struct Unauthorized401Session;
+
+    #[async_trait::async_trait]
+    impl PhotosSession for Unauthorized401Session {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            Err(crate::icloud::photos::session::HttpStatusError {
+                status: 401,
+                url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+            }.into())
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(Unauthorized401Session)
+        }
+    }
+
+    #[tokio::test]
+    async fn http_401_maps_to_session_expired() {
+        let err = PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(Unauthorized401Session),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ICloudError::SessionExpired),
+            "expected SessionExpired so sync_loop can invalidate cache and \
+             re-authenticate, got: {err:?}"
         );
     }
 }
