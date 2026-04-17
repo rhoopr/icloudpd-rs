@@ -96,29 +96,22 @@ impl PhotoLibrary {
                 }
             }
             if let Some(http_err) = e.downcast_ref::<super::session::HttpStatusError>() {
-                // HTTP 401: stale cached session tokens. Caller invalidates
-                // the validation cache and retries with fresh SRP.
-                if http_err.status == 401 {
-                    return ICloudError::SessionExpired { status: 401 };
-                }
                 // HTTP 421: HTTP/2 connection routed to the wrong CloudKit
                 // partition. Caller resets the pool and retries.
                 if http_err.status == 421 {
                     return ICloudError::MisdirectedRequest;
                 }
-                // HTTP 403 has many causes: rate limits, stale sessions, rotated
-                // routing cookies, and - in some cases - ADP. Genuine ADP is
-                // already surfaced earlier via (a) `i_cdp_enabled` in the auth
-                // response, which bails before we ever reach CloudKit, and
-                // (b) CloudKit body errors ZONE_NOT_FOUND / ACCESS_DENIED /
-                // AUTHENTICATION_FAILED, which classify_api_error maps to
-                // ServiceNotActivated above. Anything left is most often a
-                // session-state problem, so route it to SessionExpired and let
-                // the sync loop re-auth. If the 403 truly is ADP and persists,
-                // the AUTH_ERROR_THRESHOLD break in the download pipeline stops
-                // the sync instead of spamming retries.
-                if http_err.status == 403 {
-                    return ICloudError::SessionExpired { status: 403 };
+                // HTTP 401 / 403 both route through SessionExpired so the sync
+                // loop re-auths. 401 is the classic stale-session signal; 403
+                // has many causes (rate limits, rotated routing cookies, and
+                // ADP edge cases not caught by `i_cdp_enabled` or by the
+                // CloudKit body errors handled above). If the 403 truly is
+                // persistent ADP, AUTH_ERROR_THRESHOLD in the download
+                // pipeline stops the sync rather than spamming retries.
+                if http_err.status == 401 || http_err.status == 403 {
+                    return ICloudError::SessionExpired {
+                        status: http_err.status,
+                    };
                 }
             }
             ICloudError::Connection(e.to_string())
