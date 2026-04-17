@@ -118,19 +118,31 @@ jobs:
       - name: Generate release notes
         id: release_notes
         run: |
-          # Get previous tag
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          VERSION="${GITHUB_REF_NAME#v}"
 
-          if [ -z "$PREV_TAG" ]; then
+          # Extract the current version's section from CHANGELOG.md
+          # Captures everything between ## [VERSION] and the next ## [ or ---
+          NOTES=$(awk "/^## \[${VERSION}\]/{found=1; next} /^## \[|^---/{if(found) exit} found" CHANGELOG.md)
+
+          if [ -z "$NOTES" ]; then
+            # Fall back to git log if CHANGELOG section not found
+            PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
             echo "notes<<EOF" >> $GITHUB_OUTPUT
-            echo "Initial release" >> $GITHUB_OUTPUT
+            if [ -z "$PREV_TAG" ]; then
+              echo "Initial release" >> $GITHUB_OUTPUT
+            else
+              echo "## Changes since $PREV_TAG" >> $GITHUB_OUTPUT
+              echo "" >> $GITHUB_OUTPUT
+              git log --pretty=format:"- %s" $PREV_TAG..HEAD >> $GITHUB_OUTPUT
+              echo "" >> $GITHUB_OUTPUT
+            fi
             echo "EOF" >> $GITHUB_OUTPUT
           else
             echo "notes<<EOF" >> $GITHUB_OUTPUT
-            echo "## Changes since $PREV_TAG" >> $GITHUB_OUTPUT
+            echo "$NOTES" >> $GITHUB_OUTPUT
             echo "" >> $GITHUB_OUTPUT
-            git log --pretty=format:"- %s" $PREV_TAG..HEAD >> $GITHUB_OUTPUT
-            echo "" >> $GITHUB_OUTPUT
+            echo "---" >> $GITHUB_OUTPUT
+            echo "**Full changelog:** [CHANGELOG.md](https://github.com/rhoopr/kei/blob/${{ github.ref_name }}/CHANGELOG.md)" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
           fi
 
