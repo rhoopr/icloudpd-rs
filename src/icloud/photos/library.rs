@@ -99,7 +99,7 @@ impl PhotoLibrary {
                 // HTTP 401: stale cached session tokens. Caller invalidates
                 // the validation cache and retries with fresh SRP.
                 if http_err.status == 401 {
-                    return ICloudError::SessionExpired;
+                    return ICloudError::SessionExpired { status: 401 };
                 }
                 // HTTP 421: HTTP/2 connection routed to the wrong CloudKit
                 // partition. Caller resets the pool and retries.
@@ -118,7 +118,7 @@ impl PhotoLibrary {
                 // the AUTH_ERROR_THRESHOLD break in the download pipeline stops
                 // the sync instead of spamming retries.
                 if http_err.status == 403 {
-                    return ICloudError::SessionExpired;
+                    return ICloudError::SessionExpired { status: 403 };
                 }
             }
             ICloudError::Connection(e.to_string())
@@ -435,8 +435,12 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, ICloudError::SessionExpired),
-            "expected SessionExpired so sync_loop can re-auth, got: {err:?}"
+            matches!(err, ICloudError::SessionExpired { status: 403 }),
+            "expected SessionExpired {{ 403 }} so the message tracks the actual status, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("HTTP 403"),
+            "display must mention HTTP 403, got: {err}"
         );
     }
 
@@ -532,8 +536,8 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, ICloudError::SessionExpired),
-            "expected SessionExpired so sync_loop can invalidate cache and \
+            matches!(err, ICloudError::SessionExpired { status: 401 }),
+            "expected SessionExpired {{ 401 }} so sync_loop can invalidate cache and \
              re-authenticate, got: {err:?}"
         );
     }

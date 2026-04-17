@@ -144,11 +144,11 @@ async fn authenticate_inner(
             }
             Err(e) => {
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_rate_limited)
+                    .is_some_and(AuthError::is_transient_apple_failure)
                 {
                     return Err(e.context(
-                        "Apple is rate limiting authentication requests. \
-                         Wait a few minutes before trying again",
+                        "Apple's auth service is returning transient errors (HTTP 429/5xx). \
+                         Wait a few minutes and retry",
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
@@ -187,11 +187,11 @@ async fn authenticate_inner(
             }
             Err(e) => {
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_rate_limited)
+                    .is_some_and(AuthError::is_transient_apple_failure)
                 {
                     return Err(e.context(
-                        "Apple is rate limiting authentication requests. \
-                         Wait a few minutes before trying again",
+                        "Apple's auth service is returning transient errors (HTTP 429/5xx). \
+                         Wait a few minutes and retry",
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
@@ -399,11 +399,11 @@ pub async fn send_2fa_push(
             }
             Err(e) => {
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_rate_limited)
+                    .is_some_and(AuthError::is_transient_apple_failure)
                 {
                     return Err(e.context(
-                        "Apple is rate limiting authentication requests. \
-                         Wait a few minutes before trying again",
+                        "Apple's auth service is returning transient errors (HTTP 429/5xx). \
+                         Wait a few minutes and retry",
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
