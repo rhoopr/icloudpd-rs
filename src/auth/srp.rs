@@ -500,12 +500,21 @@ pub async fn authenticate_srp(
         tracing::debug!("SRP complete returned 412: attempting repair");
         // Session_data was already refreshed via extract_and_save on the
         // preceding complete response, so the headers here pick up any
-        // rotated scnt/session_id.
+        // rotated scnt/session_id. Route through `srp_post` so transient
+        // 5xx/429 on the repair endpoint get the same retry policy as init
+        // and complete.
         let repair_headers = get_auth_headers(domain, client_id, transport.session_data(), None)?;
         let repair_url = format!("{}/repair/complete", endpoints.auth);
-        let repair_response = transport
-            .post(&repair_url, Some("{}"), Some(repair_headers))
-            .await?;
+        let mut repair_prebuilt = Some(repair_headers);
+        let repair_response = srp_post(
+            transport,
+            "repair",
+            &repair_url,
+            "{}",
+            &mut repair_prebuilt,
+            |sd| get_auth_headers(domain, client_id, sd, None),
+        )
+        .await?;
         if !repair_response.is_success() {
             return Err(AuthError::ApiError {
                 code: 412,
@@ -879,6 +888,25 @@ mod tests {
         .unwrap();
     }
 
+    /// `srp_post` must honor a `Retry-After` header on a transient 429
+    /// response. With paused time, a finite header delay proves the parse
+    /// path is wired up (a broken parse would fall through to the much
+    /// larger exponential backoff, but both succeed here — the test still
+    /// documents the contract and would surface as a compile-time regression
+    /// if `parse_retry_after_header` were dropped from srp_post).
+    #[tokio::test(start_paused = true)]
+    async fn srp_init_429_with_retry_after_retries_then_succeeds() {
+        let mut retry_after = HeaderMap::new();
+        retry_after.insert("Retry-After", HeaderValue::from_static("1"));
+        run_srp(vec![
+            response_with_headers(429, b"too many".to_vec(), retry_after),
+            valid_init_response(),
+            response(200, vec![]),
+        ])
+        .await
+        .unwrap();
+    }
+
     /// Apple's `X-Apple-I-Rscd: 401/403` header means "session rejected" even
     /// when the HTTP status is 200. SRP must detect this so a hidden rejection
     /// surfaces as a ServiceError rather than being treated as a valid handshake.
@@ -958,19 +986,37 @@ mod tests {
         .unwrap();
     }
 
+    /// Persistent 5xx on /repair/complete exhausts the retry budget and
+    /// surfaces as `ApiError { code: 412 }` with the repair-failed message.
+    /// Three responses needed: init (200), complete (412), then the repair
+    /// call consumes AUTH_RETRY_CONFIG.max_retries+1 retries.
     #[tokio::test(start_paused = true)]
     async fn srp_complete_412_repair_fails() {
-        // Repair itself gets the retry budget (3 attempts) since it goes
-        // through srp_post-style transport.post; here all three return 500.
         let err = run_srp(vec![
             valid_init_response(),
             response(412, vec![]),
+            response(500, b"repair broken".to_vec()),
+            response(500, b"repair broken".to_vec()),
             response(500, b"repair broken".to_vec()),
         ])
         .await
         .unwrap_err();
         let auth_err = err.downcast_ref::<AuthError>().unwrap();
         assert!(matches!(auth_err, AuthError::ApiError { code: 412, .. }));
+    }
+
+    /// A transient 5xx on /repair/complete is retried by srp_post; on a
+    /// later 2xx the overall SRP flow succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn srp_complete_412_repair_retries_transient_5xx() {
+        run_srp(vec![
+            valid_init_response(),
+            response(412, vec![]),
+            response(503, b"unavailable".to_vec()),
+            response(200, vec![]),
+        ])
+        .await
+        .unwrap();
     }
 
     /// 401 at /signin/complete IS a password rejection (SRP's M1 verification

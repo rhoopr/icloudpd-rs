@@ -144,7 +144,7 @@ async fn authenticate_inner(
             }
             Err(e) => {
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_rate_limited())
+                    .is_some_and(AuthError::is_rate_limited)
                 {
                     return Err(e.context(
                         "Apple is rate limiting authentication requests. \
@@ -152,7 +152,7 @@ async fn authenticate_inner(
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_misdirected_request())
+                    .is_some_and(AuthError::is_misdirected_request)
                 {
                     tracing::warn!(
                         error = %e,
@@ -187,7 +187,7 @@ async fn authenticate_inner(
             }
             Err(e) => {
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_rate_limited())
+                    .is_some_and(AuthError::is_rate_limited)
                 {
                     return Err(e.context(
                         "Apple is rate limiting authentication requests. \
@@ -195,7 +195,7 @@ async fn authenticate_inner(
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_misdirected_request())
+                    .is_some_and(AuthError::is_misdirected_request)
                 {
                     if pool_reset {
                         tracing::warn!(
@@ -250,7 +250,7 @@ async fn authenticate_inner(
             Ok(d) => d,
             Err(e)
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_misdirected_request()) =>
+                    .is_some_and(AuthError::is_misdirected_request) =>
             {
                 tracing::warn!(
                     error = %e,
@@ -399,7 +399,7 @@ pub async fn send_2fa_push(
             }
             Err(e) => {
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_rate_limited())
+                    .is_some_and(AuthError::is_rate_limited)
                 {
                     return Err(e.context(
                         "Apple is rate limiting authentication requests. \
@@ -407,7 +407,7 @@ pub async fn send_2fa_push(
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_misdirected_request())
+                    .is_some_and(AuthError::is_misdirected_request)
                 {
                     tracing::warn!(
                         error = %e,
@@ -431,7 +431,7 @@ pub async fn send_2fa_push(
             Err(e)
                 if !pool_reset
                     && e.downcast_ref::<AuthError>()
-                        .is_some_and(|ae| ae.is_misdirected_request()) =>
+                        .is_some_and(AuthError::is_misdirected_request) =>
             {
                 tracing::warn!(
                     error = %e,
@@ -440,7 +440,12 @@ pub async fn send_2fa_push(
                 );
                 session.reset_http_clients()?;
             }
-            Err(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "accountLogin failed during send_2fa_push, falling back to SRP"
+                );
+            }
         }
     }
 
@@ -461,7 +466,7 @@ pub async fn send_2fa_push(
             Ok(d) => d,
             Err(e)
                 if e.downcast_ref::<AuthError>()
-                    .is_some_and(|ae| ae.is_misdirected_request()) =>
+                    .is_some_and(AuthError::is_misdirected_request) =>
             {
                 tracing::warn!(
                     error = %e,

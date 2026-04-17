@@ -836,16 +836,26 @@ mod tests {
     /// Scrub auth-related env vars for the duration of the returned guard so
     /// tests that exercise clap's flag parsing don't get contaminated when the
     /// developer has `ICLOUD_USERNAME` / `ICLOUD_PASSWORD` exported (via
-    /// `.env` sourcing for live tests). The process-wide mutex serializes
-    /// mutations so parallel test threads don't race.
+    /// `.env` sourcing for live tests). A process-wide mutex serializes
+    /// concurrent calls to this helper.
+    ///
+    /// Note that this only protects against other callers of `scrub_auth_env`.
+    /// `setenv`/`getenv` on POSIX aren't thread-safe against each other, so an
+    /// unrelated test reading an env var while the guard is mutating could
+    /// theoretically race. The CLI unit tests only touch these two vars via
+    /// clap's `env = "..."` attributes during `try_parse_from`, which happens
+    /// synchronously on one thread per test — so in practice the guard is
+    /// sufficient for this suite. If a future test reads env from another
+    /// thread, it needs to coordinate through the same mutex.
     fn scrub_auth_env() -> AuthEnvGuard {
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
         let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_user = std::env::var("ICLOUD_USERNAME").ok();
         let prev_pw = std::env::var("ICLOUD_PASSWORD").ok();
-        // SAFETY: mutations happen only inside the static mutex, so no other
-        // thread in this process observes env state mid-swap.
+        // SAFETY: the enclosing MutexGuard serializes every other caller of
+        // scrub_auth_env, and the test suite does not read these env vars
+        // from separate threads.
         unsafe {
             std::env::remove_var("ICLOUD_USERNAME");
             std::env::remove_var("ICLOUD_PASSWORD");
@@ -865,7 +875,9 @@ mod tests {
 
     impl Drop for AuthEnvGuard {
         fn drop(&mut self) {
-            // SAFETY: still holding the static mutex, so restoration is exclusive.
+            // SAFETY: still holding the static mutex, so restoration is
+            // exclusive under the same "no cross-thread readers" condition
+            // described on scrub_auth_env.
             unsafe {
                 if let Some(v) = self.prev_user.take() {
                     std::env::set_var("ICLOUD_USERNAME", v);
