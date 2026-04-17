@@ -198,7 +198,7 @@ async fn retry_auth_request(
 /// POST endpoint no longer reliably triggers pushes. The PUT endpoint
 /// works across both old and new Apple auth flows.
 ///
-/// Retries transient 5xx/429 up to [`TWOFA_RETRY_CONFIG`]; honors
+/// Retries transient 5xx/429 up to [`AUTH_RETRY_CONFIG`]; honors
 /// `Retry-After` when Apple provides one.
 ///
 /// See: icloud-photos-downloader/icloud_photos_downloader#1322
