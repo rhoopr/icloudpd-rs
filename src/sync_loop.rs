@@ -237,45 +237,81 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         max_delay_secs: 60,
     };
 
-    // CloudKit-401 recovery: when /validate and /accountLogin both return 421,
-    // auth::authenticate falls back to cached session data (to avoid an
-    // unnecessary 2FA prompt during transient auth-router routing issues).
-    // If the cached tokens are actually stale, CloudKit's first query returns
-    // 401. We catch that once, invalidate the validation cache, force SRP
-    // re-auth, and retry init. A second failure bails cleanly instead of
-    // looping under Docker's restart policy.
+    // CloudKit session/routing recovery: if the first CloudKit query returns
+    // 401 (stale session) or 421 after a pool reset (persistent misdirected
+    // request, typically from stale session routing headers), invalidate the
+    // validation cache and force SRP re-auth. A second failure bails cleanly
+    // instead of looping under Docker's restart policy.
     let mut pending_auth = Some(auth_result);
-    let mut retried_after_session_expired = false;
+    let mut retried_after_session_error = false;
     let (shared_session, mut photos_service, libraries) = loop {
         let this_auth = pending_auth
             .take()
             .expect("auth_result present at start of attempt");
-        let (ss, mut ps) = init_photos_service(
-            this_auth,
-            &config.cookie_directory,
-            &config.username,
-            config.domain.as_str(),
-            &password_provider,
-            api_retry_config,
-        )
-        .await?;
-        match resolve_libraries(&config.library, &mut ps).await {
-            Ok(libs) => break (ss, ps, libs),
+        let init_result = init_photos_service(this_auth, api_retry_config).await;
+        let (ss, mut ps) = match init_result {
+            Ok(pair) => pair,
             Err(e)
-                if !retried_after_session_expired
+                if !retried_after_session_error
                     && e.downcast_ref::<crate::icloud::error::ICloudError>()
                         .is_some_and(|ic| {
-                            matches!(ic, crate::icloud::error::ICloudError::SessionExpired)
+                            matches!(
+                                ic,
+                                crate::icloud::error::ICloudError::SessionExpired
+                                    | crate::icloud::error::ICloudError::MisdirectedRequest
+                            )
                         }) =>
             {
                 tracing::warn!(
-                    "CloudKit returned 401 after 421 auth-cache fallback; cached session \
-                     tokens are stale. Invalidating cache and forcing SRP re-authentication."
+                    error = %e,
+                    "CloudKit init failed with stale-session signature; forcing SRP re-authentication"
+                );
+                let session_file =
+                    auth::session_file_path(&config.cookie_directory, &config.username);
+                auth::strip_session_routing_state(&session_file).await;
+                retried_after_session_error = true;
+                pending_auth = Some(
+                    match auth::authenticate(
+                        &config.cookie_directory,
+                        &config.username,
+                        &password_provider,
+                        config.domain.as_str(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => return Err(e),
+                    },
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        match resolve_libraries(&config.library, &mut ps).await {
+            Ok(libs) => break (ss, ps, libs),
+            Err(e)
+                if !retried_after_session_error
+                    && e.downcast_ref::<crate::icloud::error::ICloudError>()
+                        .is_some_and(|ic| {
+                            matches!(
+                                ic,
+                                crate::icloud::error::ICloudError::SessionExpired
+                                    | crate::icloud::error::ICloudError::MisdirectedRequest
+                            )
+                        }) =>
+            {
+                tracing::warn!(
+                    error = %e,
+                    "CloudKit returned stale-session signature; invalidating cache and \
+                     forcing SRP re-authentication"
                 );
                 ss.read().await.invalidate_validation_cache().await;
                 drop(ps);
                 drop(ss);
-                retried_after_session_expired = true;
+                retried_after_session_error = true;
                 pending_auth = Some(
                     match auth::authenticate(
                         &config.cookie_directory,

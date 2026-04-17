@@ -96,11 +96,15 @@ impl PhotoLibrary {
                 }
             }
             if let Some(http_err) = e.downcast_ref::<super::session::HttpStatusError>() {
-                // HTTP 401: cached session tokens are stale (typically after
-                // the auth/mod.rs:201 421 cache-fallback). Caller invalidates
+                // HTTP 401: stale cached session tokens. Caller invalidates
                 // the validation cache and retries with fresh SRP.
                 if http_err.status == 401 {
                     return ICloudError::SessionExpired;
+                }
+                // HTTP 421: HTTP/2 connection routed to the wrong CloudKit
+                // partition. Caller resets the pool and retries.
+                if http_err.status == 421 {
+                    return ICloudError::MisdirectedRequest;
                 }
                 // HTTP 403 is the classic ADP signature: account authenticated
                 // fine but iCloud data access is blocked.
@@ -472,6 +476,52 @@ mod tests {
             matches!(err, ICloudError::SessionExpired),
             "expected SessionExpired so sync_loop can invalidate cache and \
              re-authenticate, got: {err:?}"
+        );
+    }
+
+    /// Stub that returns HTTP 421, the signature of a misdirected CloudKit
+    /// connection that survived the `init_photos_service` pool-reset retry.
+    struct Misdirected421Session;
+
+    #[async_trait::async_trait]
+    impl PhotosSession for Misdirected421Session {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            Err(crate::icloud::photos::session::HttpStatusError {
+                status: 421,
+                url: "https://p60-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query".into(),
+            }.into())
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(Misdirected421Session)
+        }
+    }
+
+    #[tokio::test]
+    async fn http_421_maps_to_misdirected_request() {
+        let err = PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(Misdirected421Session),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ICloudError::MisdirectedRequest),
+            "expected MisdirectedRequest so sync_loop can invalidate cache and \
+             force SRP re-auth, got: {err:?}"
         );
     }
 }
