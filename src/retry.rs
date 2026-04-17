@@ -1,6 +1,27 @@
 use std::future::Future;
+use std::time::Duration;
 
 use rand::RngExt;
+
+/// Parse the `Retry-After` response header as delta-seconds, capped at `max`.
+/// Returns `None` for absent, zero, or unparseable values. The HTTP-date form
+/// is not accepted (Apple/CloudKit always emit delta-seconds).
+pub fn parse_retry_after_header(
+    headers: &reqwest::header::HeaderMap,
+    max: Duration,
+) -> Option<Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if secs == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(secs).min(max))
+}
 
 /// Retry decision returned by the error classifier callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +337,62 @@ mod tests {
         .await;
         // Abort returns immediately without logging retry
         assert!(!logs_contain("Retryable error"));
+    }
+
+    fn headers_with_retry_after(value: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn parse_retry_after_delta_seconds() {
+        let h = headers_with_retry_after("5");
+        assert_eq!(
+            parse_retry_after_header(&h, Duration::from_secs(60)),
+            Some(Duration::from_secs(5))
+        );
+        let h = headers_with_retry_after(" 12 ");
+        assert_eq!(
+            parse_retry_after_header(&h, Duration::from_secs(60)),
+            Some(Duration::from_secs(12))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_zero_treated_as_absent() {
+        let h = headers_with_retry_after("0");
+        assert_eq!(parse_retry_after_header(&h, Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn parse_retry_after_caps_at_max() {
+        let h = headers_with_retry_after("999999");
+        assert_eq!(
+            parse_retry_after_header(&h, Duration::from_secs(120)),
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_http_date() {
+        let h = headers_with_retry_after("Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(parse_retry_after_header(&h, Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_junk() {
+        let h = headers_with_retry_after("not-a-number");
+        assert_eq!(parse_retry_after_header(&h, Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn parse_retry_after_missing_header() {
+        let h = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after_header(&h, Duration::from_secs(60)), None);
     }
 
     #[tokio::test]

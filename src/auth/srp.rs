@@ -12,17 +12,9 @@ use std::time::Duration;
 use super::endpoints::Endpoints;
 use super::session::Session;
 use super::twofa::{check_rscd_from_headers, rscd_service_error};
+use super::AUTH_RETRY_CONFIG;
 use crate::auth::error::AuthError;
-use crate::retry::{RetryAction, RetryConfig};
-
-/// Bounded retry budget for transient failures on Apple's auth endpoints
-/// (5xx, 429, network flaps). The auth flow is user-blocking, so we keep
-/// this short: three tries with short-ish backoffs, capped by Retry-After.
-const SRP_RETRY_CONFIG: RetryConfig = RetryConfig {
-    max_retries: 2,
-    base_delay_secs: 2,
-    max_delay_secs: 30,
-};
+use crate::retry::parse_retry_after_header;
 
 /// Buffered HTTP response for SRP authentication steps.
 /// Decouples the SRP flow from `reqwest::Response` for testability.
@@ -52,42 +44,6 @@ impl SrpResponse {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
-
-    /// Parse `Retry-After` (delta-seconds only) from the response headers.
-    fn retry_after(&self) -> Option<Duration> {
-        self.headers
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .map(Duration::from_secs)
-    }
-}
-
-/// Typed error for transient SRP HTTP failures that should retry.
-/// Distinct from `AuthError` so the retry classifier can match on it.
-#[derive(Debug, thiserror::Error)]
-#[error("SRP transport error ({status}) at {step}")]
-struct SrpTransientError {
-    status: u16,
-    step: &'static str,
-    retry_after: Option<Duration>,
-}
-
-fn classify_srp_error(e: &anyhow::Error) -> RetryAction {
-    if let Some(t) = e.downcast_ref::<SrpTransientError>() {
-        return match t.retry_after {
-            Some(d) => RetryAction::RetryAfter(d),
-            None => RetryAction::Retry,
-        };
-    }
-    // reqwest network failures (no status) are transient; retry.
-    if let Some(rq) = e.downcast_ref::<reqwest::Error>() {
-        if rq.status().is_none() {
-            return RetryAction::Retry;
-        }
-    }
-    RetryAction::Abort
 }
 
 /// Abstracts the HTTP transport used by SRP authentication.
@@ -538,14 +494,13 @@ pub async fn authenticate_srp(
     }
 
     if response.status == 409 {
-        // 409 is Apple's signal that credentials are valid but 2FA is needed
         tracing::debug!("SRP complete returned 409: two-factor authentication required");
         return Ok(());
     } else if response.status == 412 {
-        // /repair/complete uses the same session context; `transport.post`
-        // calls `extract_and_save` on every response, so session_data here
-        // reflects any scnt/session_id rotated by the failing complete call.
         tracing::debug!("SRP complete returned 412: attempting repair");
+        // Session_data was already refreshed via extract_and_save on the
+        // preceding complete response, so the headers here pick up any
+        // rotated scnt/session_id.
         let repair_headers = get_auth_headers(domain, client_id, transport.session_data(), None)?;
         let repair_url = format!("{}/repair/complete", endpoints.auth);
         let repair_response = transport
@@ -559,11 +514,9 @@ pub async fn authenticate_srp(
             .into());
         }
     } else if response.is_server_error() {
-        // Retries already exhausted by srp_post; this is a persistent 5xx.
         let status = response.status;
         let body = response.text();
         let detail = if body.contains('<') {
-            // HTML error page — show just the status code
             String::new()
         } else {
             format!(": {body}")
@@ -577,9 +530,9 @@ pub async fn authenticate_srp(
         }
         .into());
     } else if response.status == 400 {
-        // 400 means Apple rejected the SRP payload as malformed. That is
-        // either a kei bug or a protocol change on Apple's side — never a
-        // wrong password. Surface verbatim so we don't mislead the user.
+        // 400 from SRP complete means Apple rejected the payload shape, not
+        // the password. Treat as a kei bug or protocol change; never blame
+        // credentials.
         let body = response.text();
         let detail = if body.contains('<') {
             String::new()
@@ -595,9 +548,8 @@ pub async fn authenticate_srp(
         }
         .into());
     } else if response.status == 401 {
-        // 401 at /signin/complete means Apple's SRP M1 verification failed —
-        // the password does not match. This is the one branch that can
-        // confidently blame the credentials.
+        // 401 at /signin/complete is the only status that reliably means the
+        // password is wrong: Apple's SRP M1 verification rejected the proof.
         let body = response.text();
         let detail = if body.contains('<') {
             String::new()
@@ -608,10 +560,6 @@ pub async fn authenticate_srp(
             AuthError::FailedLogin(format!("Invalid email/password combination{detail}")).into(),
         );
     } else if response.status == 429 {
-        // srp_post only retries up to max_retries; after that, 429 lands
-        // here. Map to ApiError so `is_rate_limited()` detects it via the
-        // HTTP-503 path? No -- 429 is rate-limited too but the existing
-        // helper keys on 503. Surface with an actionable message.
         return Err(AuthError::ApiError {
             code: 429,
             message:
@@ -620,11 +568,9 @@ pub async fn authenticate_srp(
         }
         .into());
     } else if response.is_client_error() {
-        // Any other 4xx (403, 412 already handled, etc) — surface the raw
-        // status rather than attributing it to bad credentials. Apple's
-        // auth surface has historically returned 403 for rate limits,
-        // rotated routing cookies, and rarely even bad passwords; without
-        // a discriminating body we cannot tell which.
+        // Any other 4xx — Apple has historically returned 403 for rate
+        // limits and rotated routing cookies, so surface the raw status
+        // rather than attributing it to bad credentials.
         let status = response.status;
         let body = response.text();
         let detail = if body.contains('<') {
@@ -664,7 +610,8 @@ async fn srp_post<F>(
 where
     F: Fn(&HashMap<String, String>) -> Result<HeaderMap>,
 {
-    let total_attempts = SRP_RETRY_CONFIG.max_retries.saturating_add(1);
+    let max_delay = Duration::from_secs(AUTH_RETRY_CONFIG.max_delay_secs);
+    let total_attempts = AUTH_RETRY_CONFIG.max_retries.saturating_add(1);
     let mut last_transient: Option<SrpResponse> = None;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..total_attempts {
@@ -677,19 +624,11 @@ where
             Ok(resp) => {
                 let status = resp.status;
                 let is_transient = status == 429 || resp.is_server_error();
-                if !is_transient {
+                if !is_transient || attempt + 1 >= total_attempts {
                     return Ok(resp);
                 }
-                let is_last = attempt + 1 >= total_attempts;
-                if is_last {
-                    // Surface the actual response so the caller's existing
-                    // status-match produces the end-user error message.
-                    return Ok(resp);
-                }
-                let delay = match resp.retry_after() {
-                    Some(d) => d.min(Duration::from_secs(SRP_RETRY_CONFIG.max_delay_secs)),
-                    None => SRP_RETRY_CONFIG.delay_for_retry(attempt),
-                };
+                let delay = parse_retry_after_header(&resp.headers, max_delay)
+                    .unwrap_or_else(|| AUTH_RETRY_CONFIG.delay_for_retry(attempt));
                 tracing::warn!(
                     attempt = attempt + 1,
                     total_attempts,
@@ -702,10 +641,13 @@ where
             }
             Err(e) => {
                 let is_last = attempt + 1 >= total_attempts;
-                if is_last || classify_srp_error(&e) == RetryAction::Abort {
+                let is_network_error = e
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(|r| r.status().is_none());
+                if is_last || !is_network_error {
                     return Err(e);
                 }
-                let delay = SRP_RETRY_CONFIG.delay_for_retry(attempt);
+                let delay = AUTH_RETRY_CONFIG.delay_for_retry(attempt);
                 tracing::warn!(
                     attempt = attempt + 1,
                     total_attempts,

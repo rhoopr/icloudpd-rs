@@ -10,6 +10,17 @@ pub mod session;
 pub mod srp;
 pub mod twofa;
 
+use crate::retry::RetryConfig;
+
+/// Retry budget for Apple's auth endpoints (SRP init/complete, 2FA push,
+/// 2FA submit). The flow is user-blocking, so we keep this short: three
+/// tries total, short backoffs, capped by `Retry-After`.
+pub(crate) const AUTH_RETRY_CONFIG: RetryConfig = RetryConfig {
+    max_retries: 2,
+    base_delay_secs: 2,
+    max_delay_secs: 30,
+};
+
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 

@@ -9,20 +9,12 @@ use serde_json::Value;
 use super::endpoints::Endpoints;
 use super::session::Session;
 use super::srp::get_auth_headers;
+use super::AUTH_RETRY_CONFIG;
 use crate::auth::error::AuthError;
 use crate::auth::responses::AccountLoginResponse;
-use crate::retry::RetryConfig;
+use crate::retry::{parse_retry_after_header, RetryConfig};
 
 const TWO_FA_CODE_LENGTH: usize = 6;
-
-/// Retry budget for 2FA push/submit against Apple's auth service. The flow is
-/// user-blocking, so we only absorb short blips: three tries, short backoffs,
-/// capped by `Retry-After`.
-const TWOFA_RETRY_CONFIG: RetryConfig = RetryConfig {
-    max_retries: 2,
-    base_delay_secs: 2,
-    max_delay_secs: 30,
-};
 
 /// Check if the `X-Apple-I-Rscd` header indicates an authentication failure.
 /// Apple sometimes returns HTTP 200 but sets this header to the "real"
@@ -138,27 +130,63 @@ fn classify_auth_http_error(
     }
 }
 
-/// Parse `Retry-After` (delta-seconds only) from response headers, capping at
-/// the supplied `max_delay` so a pathological server value cannot stall the
-/// retry loop for arbitrarily long.
-fn parse_retry_after_header(
-    headers: &reqwest::header::HeaderMap,
-    max_delay: Duration,
-) -> Option<Duration> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .map(Duration::from_secs)
-        .map(|d| d.min(max_delay))
-}
-
-/// True for status codes where retrying is likely to change the outcome
-/// (rate limits, transient 5xx). Apple's auth endpoints occasionally emit
-/// these during high-load windows.
+/// True for statuses where retrying is likely to change the outcome (Apple
+/// rate limits and transient 5xx).
 fn is_transient_auth_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
+}
+
+/// HTTP verb for the auth-layer retry helper; picks between `session.put`
+/// and `session.post` without forcing callers to write two near-identical
+/// retry loops.
+enum AuthMethod<'a> {
+    Put,
+    Post { body: &'a str },
+}
+
+/// POST/PUT against an Apple auth endpoint, retrying transient 5xx/429 up to
+/// `retry_config` and honoring `Retry-After`. On non-transient or
+/// budget-exhausted 4xx/5xx the response body is read and returned to the
+/// caller as `(status, text)` so it can build a typed error; transport errors
+/// propagate as-is (they are rare and non-retryable at this layer).
+async fn retry_auth_request(
+    session: &mut Session,
+    url: &str,
+    method: AuthMethod<'_>,
+    headers_fn: impl Fn(&Session) -> Result<HeaderMap>,
+    retry_config: &RetryConfig,
+    log_label: &str,
+) -> Result<(reqwest::StatusCode, String)> {
+    let max_delay = Duration::from_secs(retry_config.max_delay_secs);
+    let total_attempts = retry_config.max_retries.saturating_add(1);
+    for attempt in 0..total_attempts {
+        let headers = headers_fn(session)?;
+        let response = match method {
+            AuthMethod::Put => session.put(url, Some(headers)).await?,
+            AuthMethod::Post { body } => session.post(url, Some(body), Some(headers)).await?,
+        };
+        let status = response.status();
+        let is_last = attempt + 1 >= total_attempts;
+        if status.is_success() || !is_transient_auth_status(status.as_u16()) || is_last {
+            let text = response.text().await.unwrap_or_default();
+            return Ok((status, text));
+        }
+
+        let delay = parse_retry_after_header(response.headers(), max_delay)
+            .unwrap_or_else(|| retry_config.delay_for_retry(attempt));
+        let _ = response.text().await;
+        tracing::warn!(
+            attempt = attempt + 1,
+            total_attempts,
+            status = status.as_u16(),
+            retry_delay_secs = delay.as_secs(),
+            "{log_label}: transient failure, retrying"
+        );
+        tokio::time::sleep(delay).await;
+    }
+    Err(anyhow::anyhow!(
+        "{log_label}: retry loop exhausted without a decisive response"
+    ))
 }
 
 /// Trigger a push notification to trusted devices for 2FA code entry.
@@ -180,8 +208,7 @@ pub async fn trigger_push_notification(
     client_id: &str,
     domain: &str,
 ) -> Result<()> {
-    trigger_push_notification_inner(session, endpoints, client_id, domain, &TWOFA_RETRY_CONFIG)
-        .await
+    trigger_push_notification_inner(session, endpoints, client_id, domain, &AUTH_RETRY_CONFIG).await
 }
 
 async fn trigger_push_notification_inner(
@@ -191,58 +218,34 @@ async fn trigger_push_notification_inner(
     domain: &str,
     retry_config: &RetryConfig,
 ) -> Result<()> {
-    let accept_override: [(&str, &str); 1] = [("Accept", "application/json")];
     let url = format!("{}/verify/trusteddevice/securitycode", endpoints.auth);
-    let max_delay = Duration::from_secs(retry_config.max_delay_secs);
     tracing::debug!(url = %url, "Requesting 2FA code via PUT");
 
-    let total_attempts = retry_config.max_retries.saturating_add(1);
-    for attempt in 0..total_attempts {
-        // Rebuild headers each attempt: session_data may have rotated
-        // scnt/session_id between tries via extract_and_save.
-        let headers = get_auth_headers(
-            domain,
-            client_id,
-            &session.session_data,
-            Some(&accept_override),
-        )?;
-        let response = session.put(&url, Some(headers)).await?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
+    let (status, text) = retry_auth_request(
+        session,
+        &url,
+        AuthMethod::Put,
+        |s| {
+            get_auth_headers(
+                domain,
+                client_id,
+                &s.session_data,
+                Some(&[("Accept", "application/json")]),
+            )
+        },
+        retry_config,
+        "2FA push notification",
+    )
+    .await?;
 
-        let is_last = attempt + 1 >= total_attempts;
-        if !is_transient_auth_status(status.as_u16()) || is_last {
-            let retry_after = parse_retry_after_header(response.headers(), max_delay);
-            let text = response.text().await.unwrap_or_default();
-            return Err(AuthError::ApiError {
-                code: status.as_u16(),
-                message: format!(
-                    "2FA push notification rejected (HTTP {status}){}: {text}",
-                    retry_after
-                        .map(|d| format!(", Retry-After={}s", d.as_secs()))
-                        .unwrap_or_default()
-                ),
-            }
-            .into());
-        }
-
-        let delay = parse_retry_after_header(response.headers(), max_delay)
-            .unwrap_or_else(|| retry_config.delay_for_retry(attempt));
-        let _ = response.text().await; // drain body so the connection can reuse
-        tracing::warn!(
-            attempt = attempt + 1,
-            total_attempts,
-            status = status.as_u16(),
-            retry_delay_secs = delay.as_secs(),
-            "2FA push notification: transient failure, retrying"
-        );
-        tokio::time::sleep(delay).await;
+    if status.is_success() {
+        return Ok(());
     }
-    Err(anyhow::anyhow!(
-        "2FA push notification: retry loop exhausted without a decisive response"
-    ))
+    Err(AuthError::ApiError {
+        code: status.as_u16(),
+        message: format!("2FA push notification rejected (HTTP {status}): {text}"),
+    }
+    .into())
 }
 
 /// Strip non-digit characters and check whether the result is a valid 6-digit 2FA code.
@@ -273,7 +276,7 @@ pub async fn submit_2fa_code(
         client_id,
         domain,
         code,
-        &TWOFA_RETRY_CONFIG,
+        &AUTH_RETRY_CONFIG,
     )
     .await
 }
@@ -294,73 +297,29 @@ async fn submit_2fa_code_inner(
         return Ok(false);
     };
 
-    let data = serde_json::json!({
-        "securityCode": {
-            "code": code,
-        }
-    });
-
-    let accept_override: [(&str, &str); 1] = [("Accept", "application/json")];
-
-    let headers = get_auth_headers(
-        domain,
-        client_id,
-        &session.session_data,
-        Some(&accept_override),
-    )?;
-
+    let data = serde_json::json!({ "securityCode": { "code": code } });
     let url = format!("{}/verify/trusteddevice/securitycode", endpoints.auth);
     let body = data.to_string();
-    let max_delay = Duration::from_secs(retry_config.max_delay_secs);
-    // The first attempt reuses the pre-computed `headers`; retries (rare,
-    // only on 429/5xx) rebuild them so any rotated scnt/session_id is picked
-    // up. A "wrong code" response (-21669) short-circuits without a retry.
-    let mut attempt_headers = Some(headers);
-    let total_attempts = retry_config.max_retries.saturating_add(1);
-    let (status, text) = 'outer: {
-        for attempt in 0..total_attempts {
-            let headers = if let Some(h) = attempt_headers.take() {
-                h
-            } else {
-                get_auth_headers(
-                    domain,
-                    client_id,
-                    &session.session_data,
-                    Some(&accept_override),
-                )?
-            };
-            let response = session.post(&url, Some(&body), Some(headers)).await?;
-            let status = response.status();
-            if status.is_success() {
-                let text = response.text().await.unwrap_or_default();
-                break 'outer (status, text);
-            }
 
-            let is_last = attempt + 1 >= total_attempts;
-            if !is_transient_auth_status(status.as_u16()) || is_last {
-                let text = response.text().await.unwrap_or_default();
-                break 'outer (status, text);
-            }
-
-            let delay = parse_retry_after_header(response.headers(), max_delay)
-                .unwrap_or_else(|| retry_config.delay_for_retry(attempt));
-            let _ = response.text().await;
-            tracing::warn!(
-                attempt = attempt + 1,
-                total_attempts,
-                status = status.as_u16(),
-                retry_delay_secs = delay.as_secs(),
-                "2FA code submit: transient failure, retrying"
-            );
-            tokio::time::sleep(delay).await;
-        }
-        return Err(anyhow::anyhow!(
-            "2FA code submit: retry loop exhausted without a decisive response"
-        ));
-    };
+    let (status, text) = retry_auth_request(
+        session,
+        &url,
+        AuthMethod::Post { body: &body },
+        |s| {
+            get_auth_headers(
+                domain,
+                client_id,
+                &s.session_data,
+                Some(&[("Accept", "application/json")]),
+            )
+        },
+        retry_config,
+        "2FA code submit",
+    )
+    .await?;
 
     if !status.is_success() {
-        // Apple error code -21669 = incorrect verification code
+        // -21669 = incorrect verification code
         if text.contains("-21669") {
             tracing::error!("Code verification failed: wrong code");
             return Ok(false);

@@ -2,25 +2,11 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::retry::{self, RetryAction, RetryConfig};
+use crate::retry::{self, parse_retry_after_header, RetryAction, RetryConfig};
 
-/// Cap on `Retry-After` values to bound the worst-case pause. A pathological
-/// or stale HTTP-date could otherwise stall the retry loop.
+/// Upper bound on any `Retry-After` hint from CloudKit, chosen so a
+/// pathological server value can't stall the retry loop.
 const RETRY_AFTER_MAX: Duration = Duration::from_secs(120);
-
-/// Parse a `Retry-After` header as delta-seconds. Returns `None` for absent
-/// or unparseable values, or zero. Values over [`RETRY_AFTER_MAX`] are capped.
-///
-/// The HTTP-date form is accepted by the spec but rarely used in practice
-/// (Apple/CloudKit always emit delta-seconds); we skip it to avoid pulling
-/// in an extra chrono/httpdate dependency for a fallback path.
-pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
-    let secs: u64 = value.trim().parse().ok()?;
-    if secs == 0 {
-        return None;
-    }
-    Some(Duration::from_secs(secs).min(RETRY_AFTER_MAX))
-}
 
 /// Async HTTP session trait for the photos service.
 ///
@@ -58,11 +44,7 @@ impl PhotosSession for reqwest::Client {
 
         if status.is_client_error() || status.is_server_error() {
             let url = resp.url().to_string();
-            let retry_after = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(parse_retry_after);
+            let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
             let resp_body = resp.text().await.unwrap_or_default();
             if !resp_body.is_empty() {
                 // 421 bodies are the most diagnostic signal for distinguishing
@@ -938,35 +920,5 @@ mod tests {
             retry_after: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Abort));
-    }
-
-    #[test]
-    fn parse_retry_after_delta_seconds() {
-        assert_eq!(parse_retry_after("5"), Some(Duration::from_secs(5)));
-        assert_eq!(parse_retry_after(" 12 "), Some(Duration::from_secs(12)));
-    }
-
-    #[test]
-    fn parse_retry_after_zero_treated_as_absent() {
-        assert_eq!(parse_retry_after("0"), None);
-    }
-
-    #[test]
-    fn parse_retry_after_caps_at_max() {
-        let out = parse_retry_after("999999").unwrap();
-        assert_eq!(out, RETRY_AFTER_MAX);
-    }
-
-    #[test]
-    fn parse_retry_after_rejects_http_date() {
-        // We intentionally do not decode HTTP-date form; callers fall back to
-        // exponential backoff when this returns None.
-        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"), None);
-    }
-
-    #[test]
-    fn parse_retry_after_rejects_junk() {
-        assert_eq!(parse_retry_after("not-a-number"), None);
-        assert_eq!(parse_retry_after(""), None);
     }
 }
