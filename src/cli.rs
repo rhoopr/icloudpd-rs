@@ -238,6 +238,16 @@ pub struct StatusArgs {
     /// Show failed assets with error messages
     #[arg(long)]
     pub failed: bool,
+
+    /// Show pending assets (known to the DB, not yet finalized this sync).
+    /// Includes assets the current sync scope excludes via filters or album
+    /// selection.
+    #[arg(long)]
+    pub pending: bool,
+
+    /// Show downloaded assets
+    #[arg(long)]
+    pub downloaded: bool,
 }
 
 /// Arguments for the import-existing command.

@@ -2689,6 +2689,122 @@ fn dry_run_creates_no_state_db() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Status: --pending and --downloaded (issue #211)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn status_pending_shows_pending_assets() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    insert_asset(&conn, "a1", "pending", "photo1.jpg", None, None, None);
+    insert_asset(&conn, "a2", "pending", "photo2.jpg", None, None, None);
+    insert_asset(
+        &conn,
+        "a3",
+        "downloaded",
+        "photo3.jpg",
+        Some("/p/photo3.jpg"),
+        None,
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--pending",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Pending assets:"), "stdout: {stdout}");
+    assert!(stdout.contains("photo1.jpg"), "stdout: {stdout}");
+    assert!(stdout.contains("photo2.jpg"), "stdout: {stdout}");
+    // Downloaded asset must not appear in the pending listing
+    assert!(!stdout.contains("photo3.jpg"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_downloaded_shows_downloaded_assets() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    insert_asset(
+        &conn,
+        "a1",
+        "downloaded",
+        "photo1.jpg",
+        Some("/p/photo1.jpg"),
+        None,
+        None,
+    );
+    insert_asset(&conn, "a2", "pending", "photo2.jpg", None, None, None);
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--downloaded",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Downloaded assets:"), "stdout: {stdout}");
+    assert!(stdout.contains("photo1.jpg"), "stdout: {stdout}");
+    assert!(stdout.contains("/p/photo1.jpg"), "stdout: {stdout}");
+    // Pending asset must not appear in the downloaded listing
+    assert!(!stdout.contains("photo2.jpg"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_pending_empty_when_none_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "a1",
+        "downloaded",
+        "photo1.jpg",
+        Some("/p/photo1.jpg"),
+        None,
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--pending",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("Pending assets:"), "stdout: {stdout}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Config env vars in TOML (KEI_CONFIG, KEI_DATA_DIR)
 // ═══════════════════════════════════════════════════════════════════════
 

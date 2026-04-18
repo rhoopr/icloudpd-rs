@@ -1979,6 +1979,9 @@ mod tests {
         async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()
         }
+        async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
         async fn get_summary(&self) -> Result<SyncSummary, StateError> {
             unimplemented!()
         }
