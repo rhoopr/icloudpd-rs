@@ -484,7 +484,7 @@ impl StateDb for SqliteStateDb {
 
         let (total_assets, downloaded, pending, failed, downloaded_bytes) = conn
             .query_row(
-                 "SELECT \
+                "SELECT \
                      COUNT(*), \
                      COUNT(CASE WHEN status = 'downloaded' THEN 1 END), \
                      COUNT(CASE WHEN status = 'pending' THEN 1 END), \

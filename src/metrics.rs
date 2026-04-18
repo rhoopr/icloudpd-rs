@@ -295,7 +295,9 @@ impl MetricsHandle {
     /// call site, so no extra DB query is needed for that gauge.
     pub(crate) fn update_db_stats(&self, summary: &SyncSummary, assets_seen: u64) {
         self.db_assets_total
-            .get_or_create(&StatusLabels { status: "downloaded" })
+            .get_or_create(&StatusLabels {
+                status: "downloaded",
+            })
             .set(summary.downloaded as i64);
         self.db_assets_total
             .get_or_create(&StatusLabels { status: "pending" })
@@ -304,7 +306,9 @@ impl MetricsHandle {
             .get_or_create(&StatusLabels { status: "failed" })
             .set(summary.failed as i64);
         self.db_assets_size_bytes
-            .get_or_create(&StatusLabels { status: "downloaded" })
+            .get_or_create(&StatusLabels {
+                status: "downloaded",
+            })
             .set(summary.downloaded_bytes as i64);
         self.db_last_sync_assets_seen.set(assets_seen as i64);
     }
@@ -816,7 +820,12 @@ mod tests {
 
     // ── DB-backed gauges ──────────────────────────────────────────────────────
 
-    fn make_summary(downloaded: u64, pending: u64, failed: u64, downloaded_bytes: u64) -> SyncSummary {
+    fn make_summary(
+        downloaded: u64,
+        pending: u64,
+        failed: u64,
+        downloaded_bytes: u64,
+    ) -> SyncSummary {
         SyncSummary {
             total_assets: downloaded + pending + failed,
             downloaded,
