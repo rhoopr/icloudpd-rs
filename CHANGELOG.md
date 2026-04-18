@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.0] - 2026-04-18
+
+### Added
+
+- **Prometheus metrics and `/healthz` HTTP endpoint.** New `--metrics-port <PORT>` flag (also `KEI_METRICS_PORT` env var and `[metrics] port` TOML key) opts in to an HTTP server that exposes `/metrics` in Prometheus text format and `/healthz` as a JSON health snapshot matching `health.json`. Metrics include cumulative counters (assets seen, downloaded, failed, per-reason skipped, bytes downloaded, bytes written, EXIF/state-write/enumeration failures, session expirations, interrupted cycles) and gauges (cycle duration, consecutive failures, last-success timestamp). When the flag is unset, no server starts and behavior is unchanged. ([#225])
+
+[#225]: https://github.com/rhoopr/kei/pull/225
+
+---
+
 ## [0.8.2] - 2026-04-17
 
 ### Fixed
