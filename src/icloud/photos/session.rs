@@ -992,4 +992,143 @@ mod tests {
         // Must be valid UTF-8 (the format! call would panic otherwise).
         assert!(out.is_char_boundary(out.len() - '…'.len_utf8()));
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // wiremock-based tests: exercise the real reqwest path through
+    // `PhotosSession::post` to prove that CloudKit error bodies
+    // actually end up on `HttpStatusError.body`. The unit-level tests
+    // above only cover `truncate_body`; these tests close the loop
+    // between "server returned a body" and "caller can read it".
+    // ────────────────────────────────────────────────────────────────
+
+    use wiremock::matchers::method as wm_method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The FIDO failure mode from issue #221: CloudKit returns 401 with
+    /// `"no auth method found"` in the JSON body. A real reqwest client
+    /// posting to a wiremock endpoint must surface that body on the
+    /// resulting `HttpStatusError` so the library.rs mapping can log
+    /// the security-key hint.
+    #[tokio::test]
+    async fn wiremock_401_preserves_body_in_http_status_error() {
+        let server = MockServer::start().await;
+        let body = r#"{"serverErrorCode":"AUTHENTICATION_FAILED","reason":"no auth method found"}"#;
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = PhotosSession::post(
+            &client,
+            &format!("{}/records/query", server.uri()),
+            "{}".to_string(),
+            &[],
+        )
+        .await
+        .expect_err("401 must propagate as an error");
+        let http_err = err
+            .downcast_ref::<HttpStatusError>()
+            .expect("expected HttpStatusError");
+        assert_eq!(http_err.status, 401);
+        let preserved = http_err
+            .body
+            .as_deref()
+            .expect("401 body must be preserved for downstream FIDO/auth diagnostics");
+        assert!(
+            preserved.contains("no auth method found"),
+            "preserved body must include the FIDO-indicating signal, got: {preserved}"
+        );
+    }
+
+    /// A 503 body (transient error) is preserved too, so the retry
+    /// path's warnings can include server-provided detail. Guards
+    /// against a refactor that accidentally scopes body preservation
+    /// to 401 only.
+    #[tokio::test]
+    async fn wiremock_5xx_preserves_body_in_http_status_error() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("service unavailable"))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = PhotosSession::post(
+            &client,
+            &format!("{}/records/query", server.uri()),
+            "{}".to_string(),
+            &[],
+        )
+        .await
+        .expect_err("503 must propagate as an error");
+        let http_err = err.downcast_ref::<HttpStatusError>().unwrap();
+        assert_eq!(http_err.status, 503);
+        assert_eq!(http_err.body.as_deref(), Some("service unavailable"));
+    }
+
+    /// An empty error body yields `body: None`, not `Some("")`. Guards
+    /// the downstream check `http_err.body.as_deref()` from having to
+    /// special-case "" vs absent.
+    #[tokio::test]
+    async fn wiremock_empty_body_stays_none() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(403)) // no body
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = PhotosSession::post(
+            &client,
+            &format!("{}/records/query", server.uri()),
+            "{}".to_string(),
+            &[],
+        )
+        .await
+        .expect_err("403 must propagate");
+        let http_err = err.downcast_ref::<HttpStatusError>().unwrap();
+        assert_eq!(http_err.status, 403);
+        assert!(
+            http_err.body.is_none(),
+            "empty response body must be None, not Some(\"\"), got: {:?}",
+            http_err.body
+        );
+    }
+
+    /// An oversized body is truncated with the `…` marker so a
+    /// pathological CloudKit response (HTML error page, stack trace)
+    /// can't blow up the error path.
+    #[tokio::test]
+    async fn wiremock_oversized_body_is_truncated() {
+        let server = MockServer::start().await;
+        let huge = "x".repeat(MAX_PRESERVED_BODY * 3);
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = PhotosSession::post(
+            &client,
+            &format!("{}/records/query", server.uri()),
+            "{}".to_string(),
+            &[],
+        )
+        .await
+        .expect_err("500 must propagate");
+        let http_err = err.downcast_ref::<HttpStatusError>().unwrap();
+        let preserved = http_err.body.as_deref().unwrap();
+        assert!(
+            preserved.ends_with('…'),
+            "oversized body must be clipped with the truncation marker, got (len {}): {}",
+            preserved.len(),
+            preserved
+        );
+        assert!(
+            preserved.len() <= MAX_PRESERVED_BODY + '…'.len_utf8(),
+            "truncated body must stay under the cap plus the marker, got len {}",
+            preserved.len()
+        );
+    }
 }

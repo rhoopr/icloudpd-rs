@@ -618,6 +618,75 @@ mod tests {
         );
     }
 
+    /// When the 401 body contains "no auth method found", the mapping must
+    /// emit a WARN naming security keys as the likely cause and pointing
+    /// at issue #221. This is the defense-in-depth hint that fires if a
+    /// future Apple flow change bypasses the SRP-level FIDO detection.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn http_401_no_auth_method_found_logs_security_key_hint() {
+        let _err = PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(NoAuthMethodFoundSession),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            logs_contain("no auth method found"),
+            "WARN must quote the CloudKit signal so reporters can grep for it"
+        );
+        assert!(
+            logs_contain("FIDO/WebAuthn security keys"),
+            "WARN must name FIDO/WebAuthn as the likely cause"
+        );
+        assert!(
+            logs_contain("#221"),
+            "WARN must link to the tracking issue so the user can find context"
+        );
+        assert!(
+            logs_contain("Sign-In & Security"),
+            "WARN must include the settings path to remove the keys"
+        );
+    }
+
+    /// A plain 401 without the "no auth method found" signal must NOT
+    /// emit the FIDO hint — that would confuse users whose session is
+    /// stale for ordinary reasons (expired trust token, rotated cookies).
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn http_401_without_fido_body_does_not_log_security_key_hint() {
+        let _err = PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(Unauthorized401Session),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            !logs_contain("FIDO/WebAuthn security keys"),
+            "ordinary stale-session 401 must not trigger the FIDO hint"
+        );
+        assert!(
+            !logs_contain("Sign-In & Security"),
+            "only 'no auth method found' bodies should produce the settings hint"
+        );
+    }
+
     /// Stub that returns HTTP 421, the signature of a misdirected CloudKit
     /// connection that survived the `init_photos_service` pool-reset retry.
     struct Misdirected421Session;
