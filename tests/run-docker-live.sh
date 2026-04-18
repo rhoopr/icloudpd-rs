@@ -235,6 +235,34 @@ check "password-file auth works in container" "$?"
 rm -rf "$SECRETS_DIR" "$PWFILE_PHOTOS"
 
 echo ""
+echo "--- Test 13: kei status --downloaded inside container ---"
+# Test 1's sync wrote downloaded rows into $DOCKER_CONFIG. The --downloaded
+# flag should list them.
+STATUS_OUT=$(docker run --rm \
+    -v "$DOCKER_CONFIG:/config" \
+    "$IMAGE" status \
+        --username "$ICLOUD_USERNAME" \
+        --data-dir /config \
+        --downloaded \
+    2>&1)
+echo "$STATUS_OUT" | tail -5
+echo "$STATUS_OUT" | grep -q "Downloaded assets:"
+check "--downloaded listing renders inside container" "$?"
+
+echo ""
+echo "--- Test 14: kei status --pending --failed --downloaded combined ---"
+# All three flags should render (or be silently absent if that status has
+# zero rows). Exit code must be 0 regardless.
+docker run --rm \
+    -v "$DOCKER_CONFIG:/config" \
+    "$IMAGE" status \
+        --username "$ICLOUD_USERNAME" \
+        --data-dir /config \
+        --pending --failed --downloaded \
+    >/dev/null 2>&1
+check "--pending --failed --downloaded combined exits 0" "$?"
+
+echo ""
 echo "==========================================="
 echo "  DOCKER LIVE TEST RESULTS: $PASS pass, $FAIL fail"
 echo "==========================================="

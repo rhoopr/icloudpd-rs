@@ -2333,4 +2333,118 @@ mod tests {
             "Expected producer panic error, got: {err}"
         );
     }
+
+    /// End-to-end regression for issue #211. A pending row carried over from
+    /// a prior sync, combined with a filter that excludes the asset in the
+    /// current sync, must not have its `last_seen_at` bumped by the producer.
+    /// Combined with the flipped `promote_pending_to_failed` gate, this
+    /// guarantees the ghost loop (pending -> failed -> pending) can't recur.
+    #[tokio::test]
+    async fn ghost_loop_regression_filtered_pending_asset_survives_sync() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::{AssetStatus, MediaType, SqliteStateDb, StateDb};
+        use chrono::TimeZone;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        // File-backed DB so we can reach in with a raw rusqlite connection
+        // to backdate last_seen_at without exposing `acquire_lock`.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+
+        // ── Prior sync: pending video row, backdated last_seen_at ───────
+        let prior_seen_at = chrono::Utc::now().timestamp() - 86400;
+        let record = AssetRecord::new_pending(
+            "GHOST".into(),
+            VersionSizeKey::Original,
+            "ck_ghost".into(),
+            "ghost.mov".into(),
+            chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            None,
+            4096,
+            MediaType::Video,
+        );
+        db.upsert_seen(&record).await.unwrap();
+        {
+            // Backdate to simulate a sync that happened yesterday.
+            let raw = rusqlite::Connection::open(&db_path).unwrap();
+            raw.execute(
+                "UPDATE assets SET last_seen_at = ?1 WHERE id = 'GHOST'",
+                rusqlite::params![prior_seen_at],
+            )
+            .unwrap();
+        }
+
+        // ── Current sync: --skip-videos excludes the asset ──────────────
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = dir.path().to_path_buf();
+        config.skip_videos = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        // Stream yields the same video asset the producer filtered last time.
+        let asset = TestPhotoAsset::new("GHOST")
+            .filename("ghost.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(4096)
+            .orig_url("http://127.0.0.1:1/ghost.mov")
+            .orig_checksum("ck_ghost")
+            .build();
+        let asset_stream = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]);
+
+        let client = reqwest::Client::new();
+        let shutdown_token = CancellationToken::new();
+        let sync_started_at = chrono::Utc::now().timestamp();
+
+        stream_and_download_from_stream(&client, asset_stream, &config, 1, shutdown_token)
+            .await
+            .expect("sync must complete");
+
+        // The producer must not have touched last_seen_at. The row is still
+        // pending, last_seen_at still stamped at the prior sync.
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1, "asset must remain the only pending row");
+        assert_eq!(pending[0].id, "GHOST");
+        assert_eq!(
+            pending[0].status,
+            AssetStatus::Pending,
+            "status must remain pending"
+        );
+        assert_eq!(
+            pending[0].last_seen_at.timestamp(),
+            prior_seen_at,
+            "producer must NOT bump last_seen_at on a filtered asset"
+        );
+
+        // And promote_pending_to_failed at sync end leaves it alone.
+        let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
+        assert_eq!(promoted, 0, "filtered asset must not be promoted");
+
+        // Second sync cycle with the same filter: state stays stable
+        // (locks in "no ghost loop across repeated syncs").
+        let asset2 = TestPhotoAsset::new("GHOST")
+            .filename("ghost.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(4096)
+            .orig_url("http://127.0.0.1:1/ghost.mov")
+            .orig_checksum("ck_ghost")
+            .build();
+        let stream2 = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset2)]);
+        let shutdown_token2 = CancellationToken::new();
+        let sync_2_start = chrono::Utc::now().timestamp();
+        stream_and_download_from_stream(&client, stream2, &config, 1, shutdown_token2)
+            .await
+            .expect("second sync must complete");
+        let promoted2 = db.promote_pending_to_failed(sync_2_start).await.unwrap();
+        assert_eq!(promoted2, 0, "second sync must also leave row untouched");
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.failed, 0);
+    }
 }

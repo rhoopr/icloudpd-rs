@@ -2815,6 +2815,146 @@ fn status_pending_empty_when_none_pending() {
     assert!(!stdout.contains("Pending assets:"), "stdout: {stdout}");
 }
 
+#[test]
+fn status_downloaded_with_null_local_path_surfaces_missing_marker() {
+    // Covers the `<MISSING local_path>` display path in print_downloaded.
+    // A downloaded row without a local_path is a state-DB invariant
+    // violation; status must not silently hide it.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    // Directly insert a downloaded row with NULL local_path. insert_asset
+    // helper would still pass None through, so we use it with explicit
+    // Option::None for local_path.
+    insert_asset(&conn, "a1", "downloaded", "broken.jpg", None, None, None);
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--downloaded",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("<MISSING local_path>"),
+        "missing-path marker not surfaced: {stdout}"
+    );
+    assert!(stdout.contains("broken.jpg"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_all_three_flags_render_all_sections() {
+    // End-to-end coverage for --failed --pending --downloaded combined.
+    // Locks in the three-section rendering and proves the flags are
+    // orthogonal in the actual binary (not just clap parsing).
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    insert_asset(
+        &conn,
+        "dl1",
+        "downloaded",
+        "dl.jpg",
+        Some("/p/dl.jpg"),
+        None,
+        None,
+    );
+    insert_asset(&conn, "pend1", "pending", "pend.jpg", None, None, None);
+    insert_asset(
+        &conn,
+        "fail1",
+        "failed",
+        "fail.jpg",
+        None,
+        Some("timeout"),
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--failed",
+            "--pending",
+            "--downloaded",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Failed assets:"), "stdout: {stdout}");
+    assert!(stdout.contains("fail.jpg"), "stdout: {stdout}");
+    assert!(stdout.contains("Pending assets:"), "stdout: {stdout}");
+    assert!(stdout.contains("pend.jpg"), "stdout: {stdout}");
+    assert!(stdout.contains("Downloaded assets:"), "stdout: {stdout}");
+    assert!(stdout.contains("dl.jpg"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_downloaded_paginates_past_500_records() {
+    // Covers the pagination loop in run_status for --downloaded when the
+    // result set exceeds page_size (500). Uses 600 rows to require at
+    // least two page fetches.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    for i in 0..600 {
+        let id = format!("dl{i:04}");
+        let filename = format!("photo_{i:04}.jpg");
+        let local = format!("/p/photo_{i:04}.jpg");
+        insert_asset(
+            &conn,
+            &id,
+            "downloaded",
+            &filename,
+            Some(&local),
+            None,
+            None,
+        );
+    }
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "status",
+            "--downloaded",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Downloaded: 600"), "stdout: {stdout}");
+    // First and last rows across the page boundary must both appear.
+    assert!(stdout.contains("photo_0000.jpg"), "first row missing");
+    assert!(stdout.contains("photo_0499.jpg"), "boundary row missing");
+    assert!(
+        stdout.contains("photo_0500.jpg"),
+        "post-boundary row missing"
+    );
+    assert!(stdout.contains("photo_0599.jpg"), "last row missing");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Config env vars in TOML (KEI_CONFIG, KEI_DATA_DIR)
 // ═══════════════════════════════════════════════════════════════════════

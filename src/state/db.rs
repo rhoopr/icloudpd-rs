@@ -1041,6 +1041,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_failed_orders_by_last_seen_desc() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for id in &["OLDEST", "MIDDLE", "NEWEST"] {
+            let record = TestAssetRecord::new(id)
+                .checksum(&format!("ck_{id}"))
+                .filename(&format!("{}.jpg", id.to_lowercase()))
+                .size(100)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_failed(id, "original", "boom").await.unwrap();
+        }
+
+        // Force a deterministic order by backdating.
+        backdate_last_seen(&db, "OLDEST", 1_000);
+        backdate_last_seen(&db, "MIDDLE", 2_000);
+        backdate_last_seen(&db, "NEWEST", 3_000);
+
+        let failed = db.get_failed().await.unwrap();
+        let ids: Vec<&str> = failed.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["NEWEST", "MIDDLE", "OLDEST"],
+            "get_failed must sort last_seen_at DESC"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_pending_orders_by_last_seen_desc() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for id in &["OLD", "MID", "NEW"] {
+            let record = TestAssetRecord::new(id)
+                .checksum(&format!("ck_{id}"))
+                .filename(&format!("{}.jpg", id.to_lowercase()))
+                .size(100)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+        }
+
+        backdate_last_seen(&db, "OLD", 1_000);
+        backdate_last_seen(&db, "MID", 2_000);
+        backdate_last_seen(&db, "NEW", 3_000);
+
+        let pending = db.get_pending().await.unwrap();
+        let ids: Vec<&str> = pending.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["NEW", "MID", "OLD"],
+            "get_pending must sort last_seen_at DESC"
+        );
+    }
+
+    #[tokio::test]
     async fn test_reset_failed() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
@@ -2262,6 +2316,46 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.pending, 1);
         assert_eq!(summary.failed, 0);
+    }
+
+    // Canary for the touch_last_seen contract: if a caller bumps
+    // last_seen_at on a pending row, promote_pending_to_failed WILL promote
+    // it. The touch_last_seen trait docs warn against this. This test locks
+    // in that behavior so a silent regression (e.g. an unsafe touch added
+    // to a skip path) is caught.
+
+    #[tokio::test]
+    async fn touch_last_seen_on_pending_row_causes_promotion_at_sync_end() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // A pending row carried over from a prior sync (backdated).
+        let record = TestAssetRecord::new("PENDING_CARRYOVER")
+            .checksum("ck_p")
+            .filename("pending.jpg")
+            .size(1000)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        backdate_last_seen(
+            &db,
+            "PENDING_CARRYOVER",
+            chrono::Utc::now().timestamp() - 86400,
+        );
+
+        // Capture sync_started_at BEFORE touch_last_seen runs.
+        let sync_started_at = chrono::Utc::now().timestamp();
+
+        // Caller violates the contract: bumps last_seen_at on a pending row.
+        db.touch_last_seen("PENDING_CARRYOVER").await.unwrap();
+
+        let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
+        assert_eq!(
+            promoted, 1,
+            "touch_last_seen on a pending row must cause promotion at sync end"
+        );
+
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, "PENDING_CARRYOVER");
     }
 
     // ── Gap: upsert_seen preserves downloaded status across updates ───
