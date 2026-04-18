@@ -830,6 +830,23 @@ impl StateDb for SqliteStateDb {
     }
 }
 
+#[cfg(test)]
+impl SqliteStateDb {
+    /// Overwrite `last_seen_at` for a specific asset. Used by tests that need
+    /// to simulate a pending row carried over from a prior sync. Callable
+    /// from any test module in the crate so cross-module state tests (e.g.
+    /// pipeline-level ghost-loop regression) don't have to reach for raw
+    /// `rusqlite::Connection` plumbing.
+    pub(crate) fn backdate_last_seen(&self, asset_id: &str, ts: i64) {
+        let conn = self.acquire_lock("test_backdate_last_seen").unwrap();
+        conn.execute(
+            "UPDATE assets SET last_seen_at = ?1 WHERE id = ?2",
+            rusqlite::params![ts, asset_id],
+        )
+        .unwrap();
+    }
+}
+
 /// Column list for every `SELECT ... FROM assets` that feeds `row_to_asset_record`.
 /// Keep this in sync with the indices read in `row_to_asset_record`.
 const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
@@ -891,17 +908,6 @@ mod tests {
 
     fn test_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
-    }
-
-    /// Overwrite `last_seen_at` for a specific asset row. Used by tests that
-    /// need to simulate a pending row carried over from a prior sync.
-    fn backdate_last_seen(db: &SqliteStateDb, asset_id: &str, ts: i64) {
-        let conn = db.acquire_lock("test_setup").unwrap();
-        conn.execute(
-            "UPDATE assets SET last_seen_at = ?1 WHERE id = ?2",
-            rusqlite::params![ts, asset_id],
-        )
-        .unwrap();
     }
 
     #[tokio::test]
@@ -1055,9 +1061,9 @@ mod tests {
         }
 
         // Force a deterministic order by backdating.
-        backdate_last_seen(&db, "OLDEST", 1_000);
-        backdate_last_seen(&db, "MIDDLE", 2_000);
-        backdate_last_seen(&db, "NEWEST", 3_000);
+        db.backdate_last_seen("OLDEST", 1_000);
+        db.backdate_last_seen("MIDDLE", 2_000);
+        db.backdate_last_seen("NEWEST", 3_000);
 
         let failed = db.get_failed().await.unwrap();
         let ids: Vec<&str> = failed.iter().map(|r| r.id.as_str()).collect();
@@ -1081,9 +1087,9 @@ mod tests {
             db.upsert_seen(&record).await.unwrap();
         }
 
-        backdate_last_seen(&db, "OLD", 1_000);
-        backdate_last_seen(&db, "MID", 2_000);
-        backdate_last_seen(&db, "NEW", 3_000);
+        db.backdate_last_seen("OLD", 1_000);
+        db.backdate_last_seen("MID", 2_000);
+        db.backdate_last_seen("NEW", 3_000);
 
         let pending = db.get_pending().await.unwrap();
         let ids: Vec<&str> = pending.iter().map(|r| r.id.as_str()).collect();
@@ -2244,7 +2250,7 @@ mod tests {
             .size(1000)
             .build();
         db.upsert_seen(&old_record).await.unwrap();
-        backdate_last_seen(&db, "OLD_ASSET", chrono::Utc::now().timestamp() - 3600);
+        db.backdate_last_seen("OLD_ASSET", chrono::Utc::now().timestamp() - 3600);
 
         // NEW_ASSET: producer called upsert_seen this sync, consumer never
         // finalized. This is the stuck-pipeline case the function exists
@@ -2294,7 +2300,7 @@ mod tests {
             .size(4096)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        backdate_last_seen(&db, "GHOST", chrono::Utc::now().timestamp() - 86400);
+        db.backdate_last_seen("GHOST", chrono::Utc::now().timestamp() - 86400);
 
         // Sync 2 begins now. The asset is filtered out - no upsert_seen, no
         // touch_last_seen. last_seen_at stays at one_day_ago.
@@ -2335,11 +2341,7 @@ mod tests {
             .size(1000)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        backdate_last_seen(
-            &db,
-            "PENDING_CARRYOVER",
-            chrono::Utc::now().timestamp() - 86400,
-        );
+        db.backdate_last_seen("PENDING_CARRYOVER", chrono::Utc::now().timestamp() - 86400);
 
         // Capture sync_started_at BEFORE touch_last_seen runs.
         let sync_started_at = chrono::Utc::now().timestamp();

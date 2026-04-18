@@ -251,16 +251,22 @@ check "--downloaded listing renders inside container" "$?"
 
 echo ""
 echo "--- Test 14: kei status --pending --failed --downloaded combined ---"
-# All three flags should render (or be silently absent if that status has
-# zero rows). Exit code must be 0 regardless.
-docker run --rm \
+# Test 1's sync produced downloaded rows, so the downloaded section must
+# render. Pending/failed sections are only emitted when their counts are > 0,
+# so we don't require them here - the downloaded header is the load-bearing
+# check, and the full invocation must exit 0.
+COMBINED_OUT=$(docker run --rm \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" status \
         --username "$ICLOUD_USERNAME" \
         --data-dir /config \
         --pending --failed --downloaded \
-    >/dev/null 2>&1
-check "--pending --failed --downloaded combined exits 0" "$?"
+    2>&1)
+COMBINED_EC=$?
+echo "$COMBINED_OUT" | grep -q "Downloaded assets:"
+HAS_DOWNLOADED=$?
+check "--pending --failed --downloaded combined exits 0" "$COMBINED_EC"
+check "combined flags render Downloaded section" "$HAS_DOWNLOADED"
 
 echo ""
 echo "==========================================="

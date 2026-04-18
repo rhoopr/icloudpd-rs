@@ -2343,18 +2343,24 @@ mod tests {
     async fn ghost_loop_regression_filtered_pending_asset_survives_sync() {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
-        use crate::state::{AssetStatus, MediaType, SqliteStateDb, StateDb};
+        use crate::state::{MediaType, SqliteStateDb, StateDb};
         use chrono::TimeZone;
         use futures_util::stream;
         use std::sync::Arc;
 
-        // File-backed DB so we can reach in with a raw rusqlite connection
-        // to backdate last_seen_at without exposing `acquire_lock`.
-        let tmp = TempDir::new().unwrap();
-        let db_path = tmp.path().join("state.db");
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        fn ghost_asset() -> PhotoAsset {
+            TestPhotoAsset::new("GHOST")
+                .filename("ghost.mov")
+                .item_type("com.apple.quicktime-movie")
+                .orig_file_type("com.apple.quicktime-movie")
+                .orig_size(4096)
+                .orig_url("http://127.0.0.1:1/ghost.mov")
+                .orig_checksum("ck_ghost")
+                .build()
+        }
 
-        // ── Prior sync: pending video row, backdated last_seen_at ───────
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+
         let prior_seen_at = chrono::Utc::now().timestamp() - 86400;
         let record = AssetRecord::new_pending(
             "GHOST".into(),
@@ -2367,17 +2373,8 @@ mod tests {
             MediaType::Video,
         );
         db.upsert_seen(&record).await.unwrap();
-        {
-            // Backdate to simulate a sync that happened yesterday.
-            let raw = rusqlite::Connection::open(&db_path).unwrap();
-            raw.execute(
-                "UPDATE assets SET last_seen_at = ?1 WHERE id = 'GHOST'",
-                rusqlite::params![prior_seen_at],
-            )
-            .unwrap();
-        }
+        db.backdate_last_seen("GHOST", prior_seen_at);
 
-        // ── Current sync: --skip-videos excludes the asset ──────────────
         let dir = TempDir::new().unwrap();
         let mut config = DownloadConfig::test_default();
         config.directory = dir.path().to_path_buf();
@@ -2385,59 +2382,29 @@ mod tests {
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
 
-        // Stream yields the same video asset the producer filtered last time.
-        let asset = TestPhotoAsset::new("GHOST")
-            .filename("ghost.mov")
-            .item_type("com.apple.quicktime-movie")
-            .orig_file_type("com.apple.quicktime-movie")
-            .orig_size(4096)
-            .orig_url("http://127.0.0.1:1/ghost.mov")
-            .orig_checksum("ck_ghost")
-            .build();
-        let asset_stream = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]);
-
         let client = reqwest::Client::new();
-        let shutdown_token = CancellationToken::new();
         let sync_started_at = chrono::Utc::now().timestamp();
-
-        stream_and_download_from_stream(&client, asset_stream, &config, 1, shutdown_token)
+        let stream1 = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(ghost_asset())]);
+        stream_and_download_from_stream(&client, stream1, &config, 1, CancellationToken::new())
             .await
             .expect("sync must complete");
 
-        // The producer must not have touched last_seen_at. The row is still
-        // pending, last_seen_at still stamped at the prior sync.
         let pending = db.get_pending().await.unwrap();
         assert_eq!(pending.len(), 1, "asset must remain the only pending row");
         assert_eq!(pending[0].id, "GHOST");
-        assert_eq!(
-            pending[0].status,
-            AssetStatus::Pending,
-            "status must remain pending"
-        );
         assert_eq!(
             pending[0].last_seen_at.timestamp(),
             prior_seen_at,
             "producer must NOT bump last_seen_at on a filtered asset"
         );
 
-        // And promote_pending_to_failed at sync end leaves it alone.
         let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
         assert_eq!(promoted, 0, "filtered asset must not be promoted");
 
-        // Second sync cycle with the same filter: state stays stable
-        // (locks in "no ghost loop across repeated syncs").
-        let asset2 = TestPhotoAsset::new("GHOST")
-            .filename("ghost.mov")
-            .item_type("com.apple.quicktime-movie")
-            .orig_file_type("com.apple.quicktime-movie")
-            .orig_size(4096)
-            .orig_url("http://127.0.0.1:1/ghost.mov")
-            .orig_checksum("ck_ghost")
-            .build();
-        let stream2 = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset2)]);
-        let shutdown_token2 = CancellationToken::new();
+        // Second cycle locks in stability across repeated syncs.
         let sync_2_start = chrono::Utc::now().timestamp();
-        stream_and_download_from_stream(&client, stream2, &config, 1, shutdown_token2)
+        let stream2 = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(ghost_asset())]);
+        stream_and_download_from_stream(&client, stream2, &config, 1, CancellationToken::new())
             .await
             .expect("second sync must complete");
         let promoted2 = db.promote_pending_to_failed(sync_2_start).await.unwrap();
