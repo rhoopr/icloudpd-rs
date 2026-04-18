@@ -67,10 +67,16 @@ impl PhotosSession for reqwest::Client {
                     );
                 }
             }
+            let preserved = if resp_body.is_empty() {
+                None
+            } else {
+                Some(truncate_body(&resp_body))
+            };
             return Err(HttpStatusError {
                 status: status.as_u16(),
                 url,
                 retry_after,
+                body: preserved,
             }
             .into());
         }
@@ -110,12 +116,38 @@ impl PhotosSession for crate::auth::SharedSession {
 /// `retry_after` is populated from the `Retry-After` response header when
 /// present, so callers can honor the server-provided delay on 429/503
 /// instead of falling back to exponential backoff alone.
+///
+/// `body` carries a truncated copy of the response body so downstream
+/// error mapping (e.g. detecting "no auth method found" in a CloudKit 401
+/// that typically indicates FIDO/security keys on the account) can read
+/// the payload without re-requesting. Truncated to keep memory bounded
+/// when CloudKit occasionally returns large HTML error pages.
 #[derive(Debug, thiserror::Error)]
 #[error("HTTP {status} for {url}")]
 pub(crate) struct HttpStatusError {
     pub status: u16,
     pub url: String,
     pub retry_after: Option<Duration>,
+    pub body: Option<String>,
+}
+
+/// Maximum number of bytes preserved from an HTTP error body. Apple's
+/// CloudKit error JSON is typically a few hundred bytes; HTML error pages
+/// and stack traces are occasionally much larger. Cap it so a degenerate
+/// response can't bloat the error path.
+const MAX_PRESERVED_BODY: usize = 1024;
+
+/// Shorten `body` to at most `MAX_PRESERVED_BODY` bytes without splitting
+/// a multi-byte UTF-8 character.
+fn truncate_body(body: &str) -> String {
+    if body.len() <= MAX_PRESERVED_BODY {
+        return body.to_string();
+    }
+    let mut end = MAX_PRESERVED_BODY;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &body[..end])
 }
 
 /// `CloudKit` server error codes that indicate a transient condition.
@@ -862,6 +894,7 @@ mod tests {
             status: 503,
             url: "https://example.com".to_string(),
             retry_after: None,
+            body: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Retry));
     }
@@ -872,6 +905,7 @@ mod tests {
             status: 429,
             url: "https://example.com".to_string(),
             retry_after: None,
+            body: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Retry));
     }
@@ -882,6 +916,7 @@ mod tests {
             status: 429,
             url: "https://example.com".to_string(),
             retry_after: Some(Duration::from_secs(7)),
+            body: None,
         });
         match classify_api_error(&err) {
             RetryAction::RetryAfter(d) => assert_eq!(d, Duration::from_secs(7)),
@@ -895,6 +930,7 @@ mod tests {
             status: 503,
             url: "https://example.com".to_string(),
             retry_after: Some(Duration::from_secs(2)),
+            body: None,
         });
         match classify_api_error(&err) {
             RetryAction::RetryAfter(d) => assert_eq!(d, Duration::from_secs(2)),
@@ -908,6 +944,7 @@ mod tests {
             status: 401,
             url: "https://example.com".to_string(),
             retry_after: None,
+            body: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Abort));
     }
@@ -918,7 +955,41 @@ mod tests {
             status: 403,
             url: "https://example.com".to_string(),
             retry_after: None,
+            body: None,
         });
         assert!(matches!(classify_api_error(&err), RetryAction::Abort));
+    }
+
+    #[test]
+    fn truncate_body_leaves_short_bodies_unchanged() {
+        let body = r#"{"serverErrorCode":"AUTHENTICATION_FAILED","reason":"no auth method found"}"#;
+        assert_eq!(truncate_body(body), body);
+    }
+
+    #[test]
+    fn truncate_body_clips_oversized_bodies() {
+        let body = "x".repeat(MAX_PRESERVED_BODY * 2);
+        let out = truncate_body(&body);
+        assert!(
+            out.len() <= MAX_PRESERVED_BODY + 4,
+            "truncated body must stay under the cap plus the marker, got len {}",
+            out.len()
+        );
+        assert!(
+            out.ends_with('…'),
+            "truncation marker must be appended to signal the clip"
+        );
+    }
+
+    #[test]
+    fn truncate_body_respects_utf8_boundaries() {
+        // Multi-byte chars must not be split — pad with a 3-byte char so
+        // the naive byte-slice would land in the middle.
+        let mut body = "a".repeat(MAX_PRESERVED_BODY - 1);
+        body.push('€'); // 3 bytes: 0xE2 0x82 0xAC
+        body.push_str(&"b".repeat(MAX_PRESERVED_BODY));
+        let out = truncate_body(&body);
+        // Must be valid UTF-8 (the format! call would panic otherwise).
+        assert!(out.is_char_boundary(out.len() - '…'.len_utf8()));
     }
 }

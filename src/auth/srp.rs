@@ -494,6 +494,23 @@ pub async fn authenticate_srp(
     }
 
     if response.status == 409 {
+        // The 409 body carries the 2FA challenge metadata. When the account
+        // has FIDO/WebAuthn security keys registered, Apple includes an
+        // `fsaChallenge` object (and usually a `keyNames` array). CloudKit
+        // rejects sessions minted through this flow with "no auth method
+        // found" (issue #221), so bail before prompting for a 2FA code the
+        // user can't complete headless.
+        let challenge: super::responses::TwoFactorChallenge = response.json().unwrap_or_default();
+        if challenge.requires_fido() {
+            tracing::debug!(
+                key_count = challenge.key_names.len(),
+                "SRP complete returned 409 with FIDO/WebAuthn challenge; unsupported"
+            );
+            return Err(AuthError::FidoNotSupported {
+                key_names: challenge.key_names,
+            }
+            .into());
+        }
         tracing::debug!("SRP complete returned 409: two-factor authentication required");
         return Ok(());
     } else if response.status == 412 {
@@ -973,6 +990,76 @@ mod tests {
         run_srp(vec![valid_init_response(), response(409, vec![])])
             .await
             .unwrap();
+    }
+
+    /// 409 with an `fsaChallenge` field means the account has a FIDO/WebAuthn
+    /// security key registered. kei can't complete that challenge, so the
+    /// caller must see a typed `FidoNotSupported` error rather than
+    /// proceeding to prompt for a 2FA code (which would hang or fail
+    /// silently downstream at the CloudKit handshake).
+    #[tokio::test]
+    async fn srp_complete_409_with_fsa_challenge_returns_fido_not_supported() {
+        let body = br#"{
+            "fsaChallenge": {"challenge": "abc", "keyHandles": ["h1"], "rpId": "apple.com"},
+            "keyNames": ["YubiKey 5C"],
+            "authType": "hsa2"
+        }"#;
+        let err = run_srp(vec![valid_init_response(), response(409, body.to_vec())])
+            .await
+            .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        match auth_err {
+            AuthError::FidoNotSupported { key_names } => {
+                assert_eq!(key_names, &vec!["YubiKey 5C".to_string()]);
+            }
+            other => panic!("expected FidoNotSupported, got: {other:?}"),
+        }
+    }
+
+    /// Defensive: Apple could send `keyNames` without `fsaChallenge` in a
+    /// flow we haven't observed. Treat the presence of any named security
+    /// keys as a FIDO signal.
+    #[tokio::test]
+    async fn srp_complete_409_with_only_key_names_returns_fido_not_supported() {
+        let body = br#"{"keyNames": ["Passkey-Home"]}"#;
+        let err = run_srp(vec![valid_init_response(), response(409, body.to_vec())])
+            .await
+            .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        assert!(
+            matches!(auth_err, AuthError::FidoNotSupported { .. }),
+            "expected FidoNotSupported, got: {auth_err:?}"
+        );
+    }
+
+    /// A normal HSA2 challenge (push to trusted device, SMS to trusted
+    /// phone) must continue through the existing 2FA flow — the FIDO
+    /// detection must not false-positive on the usual 409 shape.
+    #[tokio::test]
+    async fn srp_complete_409_without_fido_fields_passes_through() {
+        let body = br#"{
+            "trustedDevices": [{"id": "d1"}],
+            "trustedPhoneNumbers": [{"id": 1}],
+            "authType": "hsa2",
+            "securityCode": {"length": 6}
+        }"#;
+        run_srp(vec![valid_init_response(), response(409, body.to_vec())])
+            .await
+            .unwrap();
+    }
+
+    /// If Apple returns a 409 with an unparsable body (rare but possible on
+    /// upstream errors or protocol drift), the default-derived
+    /// `TwoFactorChallenge` reports no FIDO, and SRP falls through to the
+    /// normal 2FA path rather than incorrectly bailing.
+    #[tokio::test]
+    async fn srp_complete_409_with_unparsable_body_falls_through_to_2fa() {
+        run_srp(vec![
+            valid_init_response(),
+            response(409, b"not json".to_vec()),
+        ])
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
