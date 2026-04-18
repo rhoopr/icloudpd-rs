@@ -101,10 +101,13 @@ fn print_pending(asset: &AssetRecord) {
 }
 
 fn print_downloaded(asset: &AssetRecord) {
-    let local = asset
-        .local_path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<no path>".into());
+    // status='downloaded' rows are written with local_path by mark_downloaded,
+    // so a missing path here means a state-DB invariant violation (manual
+    // edit, partial migration, upsert after mark_downloaded without path).
+    // Surface it clearly rather than hiding it.
+    let local = asset.local_path.as_ref().map_or_else(
+        || "<MISSING local_path>".to_string(),
+        |p| p.display().to_string(),
+    );
     println!("  {} ({}) -> {}", asset.filename, asset.id, local);
 }

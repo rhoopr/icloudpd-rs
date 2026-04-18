@@ -1895,6 +1895,45 @@ mod tests {
         let cli = Cli::try_parse_from(["kei", "status", "--failed"]).unwrap();
         if let Some(Command::Status(args)) = cli.command {
             assert!(args.failed);
+            assert!(!args.pending);
+            assert!(!args.downloaded);
+        } else {
+            panic!("Expected Status command");
+        }
+    }
+
+    #[test]
+    fn test_status_with_pending_flag() {
+        let cli = Cli::try_parse_from(["kei", "status", "--pending"]).unwrap();
+        if let Some(Command::Status(args)) = cli.command {
+            assert!(!args.failed);
+            assert!(args.pending);
+            assert!(!args.downloaded);
+        } else {
+            panic!("Expected Status command");
+        }
+    }
+
+    #[test]
+    fn test_status_with_downloaded_flag() {
+        let cli = Cli::try_parse_from(["kei", "status", "--downloaded"]).unwrap();
+        if let Some(Command::Status(args)) = cli.command {
+            assert!(!args.failed);
+            assert!(!args.pending);
+            assert!(args.downloaded);
+        } else {
+            panic!("Expected Status command");
+        }
+    }
+
+    #[test]
+    fn test_status_flags_combine() {
+        let cli = Cli::try_parse_from(["kei", "status", "--failed", "--pending", "--downloaded"])
+            .unwrap();
+        if let Some(Command::Status(args)) = cli.command {
+            assert!(args.failed);
+            assert!(args.pending);
+            assert!(args.downloaded);
         } else {
             panic!("Expected Status command");
         }

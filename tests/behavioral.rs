@@ -36,8 +36,14 @@ fn sanitize_username(username: &str) -> String {
         .collect()
 }
 
-/// Create a state DB at the expected path for the given username inside `data_dir`.
+/// Create a state DB at the expected path for the given username inside
+/// `data_dir`. Mirrors the latest schema from `src/state/schema.rs` so
+/// callers don't rely on the binary's migration path to fill in columns
+/// added after v1. Bump `SCHEMA_VERSION` and the DDL below together whenever
+/// schema.rs changes.
 fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Connection {
+    const SCHEMA_VERSION: i32 = 4;
+
     let db_name = format!("{}.db", sanitize_username(username));
     let db_path = data_dir.join(db_name);
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -59,8 +65,12 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             download_attempts INTEGER DEFAULT 0,
             last_error TEXT,
             local_checksum TEXT,
+            download_checksum TEXT,
             PRIMARY KEY (id, version_size)
         );
+        CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
+        CREATE INDEX IF NOT EXISTS idx_assets_local_path ON assets(local_path);
+        CREATE INDEX IF NOT EXISTS idx_assets_checksum ON assets(checksum);
         CREATE TABLE IF NOT EXISTS sync_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             started_at INTEGER NOT NULL,
@@ -77,7 +87,8 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
         ",
     )
     .unwrap();
-    conn.pragma_update(None, "user_version", 3).unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .unwrap();
     conn
 }
 
