@@ -12,10 +12,63 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
+  # Detects which categories of files changed in the PR. Downstream jobs
+  # gate on these outputs to skip when irrelevant. Workflow or script
+  # changes flip every flag on - those touch CI itself, so re-run everything
+  # to validate the change doesn't break unrelated jobs.
+  detect:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      cargo: ${{ steps.filter.outputs.cargo }}
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          files=$(git diff --name-only "${BASE_SHA}"...HEAD)
+          echo "Changed files:"
+          printf '  %s\n' $files
+          echo
+
+          if printf '%s\n' "$files" | grep -qE '^\.github/(workflows/|scripts/)'; then
+            echo "Workflow / scripts change detected -> running all jobs"
+            {
+              echo "code=true"
+              echo "cargo=true"
+              echo "docker=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          code=false; cargo=false; docker=false
+          if printf '%s\n' "$files" | grep -qE '^(src/|tests/|build\.rs$|Cargo\.toml$|Cargo\.lock$)'; then
+            code=true
+          fi
+          if printf '%s\n' "$files" | grep -qE '^(Cargo\.toml$|Cargo\.lock$)'; then
+            cargo=true
+          fi
+          if printf '%s\n' "$files" | grep -qE '^(src/|Cargo\.toml$|Cargo\.lock$|Dockerfile$|\.dockerignore$)'; then
+            docker=true
+          fi
+          {
+            echo "code=$code"
+            echo "cargo=$cargo"
+            echo "docker=$docker"
+          } >> "$GITHUB_OUTPUT"
+
   # Enforces consistent code style across the project
   # Fails if any code isn't formatted with rustfmt
   fmt:
     name: Format
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +81,8 @@ jobs:
   # Acts as an additional layer of static analysis beyond the compiler
   clippy:
     name: Clippy
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +98,8 @@ jobs:
   # fail-fast: false ensures all platforms run even if one fails
   test:
     name: Test (${{ matrix.os }})
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -61,6 +118,8 @@ jobs:
   # Important for maintaining quality docs, especially for published crates
   docs:
     name: Docs
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: "-Dwarnings"
@@ -76,6 +135,8 @@ jobs:
   # Requires nightly because cargo-udeps uses unstable features
   unused-deps:
     name: Unused Dependencies
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,6 +149,8 @@ jobs:
   # Ensures reproducible builds and prevents "works on my machine" issues
   lockfile:
     name: Lockfile
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,6 +161,8 @@ jobs:
   # Output artifact feeds into the Coverage aggregator job.
   coverage-head:
     name: Coverage (head)
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -132,6 +197,8 @@ jobs:
   # the delta - it doesn't block the PR.
   coverage-base:
     name: Coverage (base)
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -150,10 +217,13 @@ jobs:
         run: |
           cargo llvm-cov --all-features --no-report
           cargo llvm-cov report --json --output-path base_coverage.json
+          cargo llvm-cov report --lcov --output-path base_coverage.lcov
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-base
-          path: base_coverage.json
+          path: |
+            base_coverage.json
+            base_coverage.lcov
           retention-days: 1
 
   # Aggregates head + base, computes patch coverage, posts the PR comment.
@@ -183,11 +253,11 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          python3 .github/scripts/patch_coverage.py \
-            --base "$BASE_SHA" \
-            --lcov coverage.lcov \
-            --workspace . \
-            > patch_coverage.json
+          args=(--base "$BASE_SHA" --lcov coverage.lcov --workspace .)
+          if [ -f base_coverage.lcov ]; then
+            args+=(--base-lcov base_coverage.lcov)
+          fi
+          python3 .github/scripts/patch_coverage.py "${args[@]}" > patch_coverage.json
           cat patch_coverage.json
       - name: Post coverage comment
         continue-on-error: true
@@ -231,12 +301,21 @@ jobs:
             echo ""
 
             # Per-file patch coverage, if the PR touched any covered .rs lines.
+            # Patch column = % of changed lines covered.
+            # File column = whole-file coverage on PR head.
+            # Δ column = whole-file delta vs base (blank for new files).
             if [ "$PATCH_TOTAL" -gt 0 ]; then
-              echo "| File | Patch Coverage | Covered / Changed |"
-              echo "|------|----------------|-------------------|"
+              echo "| File | Patch | File Coverage | Δ from main |"
+              echo "|------|-------|---------------|-------------|"
               jq -r "${PCT_DEF}"'
-                .files | sort_by(.percent) | .[]
-                | "| \(.file) | \(.percent | pct)% | \(.covered) / \(.total) |"
+                # Format a signed delta as +X.YY / -X.YY.
+                def signed: if . >= 0 then "+\(. | pct)" else "-\(-1 * . | pct)" end;
+                .files | sort_by(.percent) | .[] |
+                "| \(.file) | \(.percent | pct)% (\(.covered) / \(.total)) | " +
+                (if .file_percent_head == null then "—" else "\(.file_percent_head | pct)%" end) +
+                " | " +
+                (if .file_delta == null then (if .file_percent_head != null then "new" else "—" end) else "\(.file_delta | signed)%" end) +
+                " |"
               ' patch_coverage.json
               echo ""
             fi
@@ -318,6 +397,8 @@ jobs:
   # Release mode can surface different issues than debug mode (e.g., optimization bugs)
   build:
     name: Build (${{ matrix.os }})
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -336,6 +417,8 @@ jobs:
   # Catches known security vulnerabilities in your dependency tree
   security:
     name: Security Audit
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -350,6 +433,8 @@ jobs:
   # Catches build breakage before it hits the publish workflow on main
   docker:
     name: Docker Build
+    needs: detect
+    if: needs.detect.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -362,10 +447,45 @@ jobs:
           cache-to: type=gha,mode=max
 
   # Catches spelling mistakes in code, comments, and documentation
-  # Small thing but helps maintain a professional codebase
+  # Small thing but helps maintain a professional codebase. Always runs
+  # since typos can land in any kind of file.
   typos:
     name: Typos
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: crate-ci/typos@master
+
+  # Single required check that gates merging. Skipped jobs (path-filtered
+  # out) count as success; only real failures or cancellations block.
+  # The branch ruleset should require this name and nothing else.
+  ci:
+    name: CI
+    if: always()
+    needs:
+      - detect
+      - fmt
+      - clippy
+      - test
+      - docs
+      - unused-deps
+      - lockfile
+      - coverage
+      - build
+      - security
+      - docker
+      - typos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs passed or were skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq .
+          if echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null; then
+            echo "All required jobs passed or were skipped."
+          else
+            echo "One or more required jobs failed or were cancelled." >&2
+            exit 1
+          fi

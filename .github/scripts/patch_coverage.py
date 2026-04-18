@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-"""Compute patch coverage from a git diff and an LCOV report.
-
-Patch coverage = of the source lines this PR adds or modifies, the fraction
-that the test suite actually executed.
+"""Compute patch coverage and per-file file-level deltas.
 
 Outputs JSON to stdout:
   {
-    "total_covered": int,
-    "total_eligible": int,
-    "percent": float | null,
-    "files": [{"file": str, "covered": int, "total": int, "percent": float}, ...]
+    "total_covered": int,        # patch lines hit by tests
+    "total_eligible": int,       # patch lines that have coverage data
+    "percent": float | null,     # patch coverage %
+    "files": [
+      {
+        "file": str,
+        "covered": int,          # patch lines covered in this file
+        "total": int,            # patch lines eligible in this file
+        "percent": float,        # patch coverage % for this file
+        "file_percent_head": float | null,  # full-file line coverage on head
+        "file_percent_base": float | null,  # full-file line coverage on base
+        "file_delta": float | null,         # head - base
+      },
+      ...
+    ]
   }
 
-A line is "eligible" if it appears in the LCOV report (i.e. the compiler
-emitted coverage instrumentation for it). Lines that are pure whitespace,
-comments, or non-executable declarations have no DA: entry and are excluded
-from the denominator -- they're not testable.
+A line is "eligible" if it has a DA: entry in the LCOV report (i.e. the
+compiler emitted coverage instrumentation for it). Lines that are pure
+whitespace, comments, or non-executable declarations have no DA: entry and
+are excluded from the denominator -- they're not testable.
 """
 
 import argparse
@@ -77,15 +85,28 @@ def normalize_paths(coverage: dict[str, dict[int, int]], workspace: Path) -> dic
     return out
 
 
+def file_pct(line_hits: dict[int, int]) -> float | None:
+    """Whole-file line coverage % from a {line: hits} map."""
+    if not line_hits:
+        return None
+    covered = sum(1 for hits in line_hits.values() if hits > 0)
+    return covered / len(line_hits) * 100
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base", required=True, help="base ref or SHA to diff against")
-    ap.add_argument("--lcov", required=True, type=Path, help="path to LCOV report")
+    ap.add_argument("--lcov", required=True, type=Path, help="path to head LCOV report")
+    ap.add_argument("--base-lcov", type=Path, default=None, help="optional base LCOV for delta")
     ap.add_argument("--workspace", default=".", type=Path, help="repo root for path normalization")
     args = ap.parse_args()
 
     workspace = args.workspace.resolve()
-    coverage = normalize_paths(parse_lcov(args.lcov), workspace)
+    head_cov = normalize_paths(parse_lcov(args.lcov), workspace)
+    base_cov: dict[str, dict[int, int]] = {}
+    if args.base_lcov is not None and args.base_lcov.exists():
+        base_cov = normalize_paths(parse_lcov(args.base_lcov), workspace)
+
     diff = parse_diff_added_lines(args.base)
 
     files = []
@@ -93,16 +114,24 @@ def main() -> None:
     total_eligible = 0
     for path in sorted(diff):
         added_lines = diff[path]
-        file_cov = coverage.get(path, {})
-        eligible = sorted(line for line in added_lines if line in file_cov)
+        head_file = head_cov.get(path, {})
+        eligible = sorted(line for line in added_lines if line in head_file)
         if not eligible:
             continue
-        covered = sum(1 for line in eligible if file_cov[line] > 0)
+        covered = sum(1 for line in eligible if head_file[line] > 0)
+
+        head_pct = file_pct(head_file)
+        base_pct = file_pct(base_cov.get(path, {})) if path in base_cov else None
+        delta = (head_pct - base_pct) if (head_pct is not None and base_pct is not None) else None
+
         files.append({
             "file": path,
             "covered": covered,
             "total": len(eligible),
             "percent": covered / len(eligible) * 100,
+            "file_percent_head": head_pct,
+            "file_percent_base": base_pct,
+            "file_delta": delta,
         })
         total_covered += covered
         total_eligible += len(eligible)
