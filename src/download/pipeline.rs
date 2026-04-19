@@ -855,7 +855,7 @@ where
         skips
     });
 
-    let temp_suffix: Arc<str> = config.temp_suffix.clone().into();
+    let temp_suffix: Arc<str> = Arc::from(config.temp_suffix.as_str());
     let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
             let client = download_client.clone();
@@ -885,9 +885,8 @@ where
             .download_path
             .file_name()
             .and_then(|f| f.to_str())
-            .unwrap_or("")
-            .to_string();
-        pb.set_message(filename);
+            .unwrap_or("");
+        pb.set_message(filename.to_owned());
         match result {
             Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
                 downloaded += 1;

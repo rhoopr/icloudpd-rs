@@ -148,7 +148,7 @@ impl MetadataPayload {
     /// `description` is unset. Keywords are parsed from the JSON array blob
     /// leniently — a malformed blob yields an empty list rather than an error.
     pub(super) fn from_metadata(meta: &crate::state::AssetMetadata) -> Self {
-        let description = meta.description.clone().or_else(|| meta.title.clone());
+        let description = meta.description.as_ref().or(meta.title.as_ref()).cloned();
         let keywords = meta
             .keywords
             .as_deref()
@@ -186,7 +186,11 @@ impl MetadataPayload {
                 self.keywords.push(album.clone());
             }
         }
-        self.people = people.to_vec();
+        // Skip the allocation when people is empty (common: libraries
+        // without face tagging never populate this side of the groupings).
+        if !people.is_empty() {
+            self.people = people.to_vec();
+        }
         self
     }
 }

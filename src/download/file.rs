@@ -383,15 +383,19 @@ pub(super) async fn rename_part_to_final(
 /// Used for `local_checksum` / `download_checksum` in the state DB and
 /// by `verify --checksums` for integrity checks.
 pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
+    use anyhow::Context;
     use sha2::{Digest, Sha256};
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(&path)?;
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("opening {} for SHA-256", path.display()))?;
         let mut sha256 = Sha256::new();
         let mut buf = [0u8; 8192];
         loop {
             use std::io::Read;
-            let n = file.read(&mut buf)?;
+            let n = file
+                .read(&mut buf)
+                .with_context(|| format!("reading {} for SHA-256", path.display()))?;
             if n == 0 {
                 break;
             }
