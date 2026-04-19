@@ -876,10 +876,16 @@ where
 
     tokio::pin!(download_stream);
 
+    // On cancellation we keep consuming results so in-flight downloads
+    // still get their state rows written; new downloads are gated off by
+    // the producer's own cancellation (which closes task_tx, naturally
+    // ending this stream). The 30s watchdog in shutdown.rs is the backstop
+    // if a hung download blocks the drain.
+    let mut drain_logged = false;
     while let Some((task, result)) = download_stream.next().await {
-        if shutdown_token.is_cancelled() {
-            pb.suspend(|| tracing::info!("Shutdown requested, stopping new downloads"));
-            break;
+        if shutdown_token.is_cancelled() && !drain_logged {
+            pb.suspend(|| tracing::info!("Shutdown requested, draining in-flight downloads..."));
+            drain_logged = true;
         }
         let filename = task
             .download_path
