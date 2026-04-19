@@ -144,15 +144,17 @@ pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
 }
 
 /// Write `write` as a `.xmp` sidecar next to the media file, atomically.
+///
+/// If a sidecar already exists (e.g., from Darktable / Lightroom / digiKam),
+/// its existing XMP properties are read and kei's fields are layered on top
+/// rather than overwriting the whole packet. A malformed existing sidecar
+/// falls back to a fresh packet — kei's enriched view wins over a file we
+/// can't parse.
 pub(crate) fn write_sidecar(media_path: &Path, write: &MetadataWrite) -> Result<()> {
     if write.is_empty() {
         return Ok(());
     }
     ensure_initialized();
-
-    let mut meta = XmpMeta::new().context("creating XmpMeta")?;
-    apply_to_xmp(&mut meta, write)?;
-    let bytes = meta.to_string().into_bytes();
 
     let Some(name) = media_path.file_name() else {
         anyhow::bail!("sidecar target has no filename: {}", media_path.display());
@@ -163,6 +165,33 @@ pub(crate) fn write_sidecar(media_path: &Path, write: &MetadataWrite) -> Result<
     let mut tmp_name = sidecar_name;
     tmp_name.push(".meta-tmp");
     let tmp_path = sidecar_path.with_file_name(&tmp_name);
+
+    // Seed the packet with any existing sidecar content so user-authored
+    // ratings / keywords / develop settings from another tool survive.
+    let mut meta = match std::fs::read(&sidecar_path) {
+        Ok(existing_bytes) => match std::str::from_utf8(&existing_bytes)
+            .ok()
+            .and_then(|s| s.parse::<XmpMeta>().ok())
+        {
+            Some(parsed) => parsed,
+            None => {
+                tracing::warn!(
+                    path = %sidecar_path.display(),
+                    "Existing XMP sidecar could not be parsed; overwriting with a fresh packet"
+                );
+                XmpMeta::new().context("creating XmpMeta")?
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            XmpMeta::new().context("creating XmpMeta")?
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Reading existing sidecar {}", sidecar_path.display()));
+        }
+    };
+    apply_to_xmp(&mut meta, write)?;
+    let bytes = meta.to_string().into_bytes();
 
     std::fs::write(&tmp_path, &bytes)
         .with_context(|| format!("Writing XMP sidecar {}", tmp_path.display()))?;
@@ -1096,6 +1125,73 @@ mod tests {
         assert!(!tmp.exists(), "temp sidecar file must be cleaned up");
 
         fs::remove_file(&sidecar).ok();
+        fs::remove_file(&media_path).ok();
+    }
+
+    #[test]
+    fn write_sidecar_preserves_existing_user_fields() {
+        // A third-party tool (Darktable, digiKam) wrote a sidecar with
+        // dc:creator before kei ever ran. On our write, the creator must
+        // survive; kei's rating / keywords layer on top.
+        let dir = test_tmp_dir("sidecar_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("merge.jpg");
+        let sidecar_path = dir.join("merge.jpg.xmp");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+
+        // Seed an existing sidecar that carries a dc:creator we must keep.
+        ensure_initialized();
+        let mut seed = XmpMeta::new().unwrap();
+        seed.set_property(
+            xmp_toolkit::xmp_ns::DC,
+            "creator",
+            &xmp_toolkit::XmpValue::new("User-Photographer".to_string()),
+        )
+        .unwrap();
+        std::fs::write(&sidecar_path, seed.to_string().into_bytes()).unwrap();
+
+        // kei writes its own rating on top.
+        let write = MetadataWrite {
+            rating: Some(4),
+            ..MetadataWrite::default()
+        };
+        write_sidecar(&media_path, &write).expect("sidecar merge");
+
+        let merged = fs::read_to_string(&sidecar_path).unwrap();
+        assert!(
+            merged.contains("User-Photographer"),
+            "existing user-authored dc:creator must survive kei's write: {merged}"
+        );
+        assert!(
+            merged.contains("Rating") || merged.contains("rating"),
+            "kei's rating must be applied on top: {merged}"
+        );
+
+        fs::remove_file(&sidecar_path).ok();
+        fs::remove_file(&media_path).ok();
+    }
+
+    #[test]
+    fn write_sidecar_recovers_from_unparseable_existing() {
+        // A garbage existing sidecar should not block kei's write; we log
+        // and fall back to a fresh packet rather than erroring.
+        let dir = test_tmp_dir("sidecar_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("garbage.jpg");
+        let sidecar_path = dir.join("garbage.jpg.xmp");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+        std::fs::write(&sidecar_path, b"<<< this is not XMP >>>").unwrap();
+
+        let write = MetadataWrite {
+            title: Some("Clean".into()),
+            ..MetadataWrite::default()
+        };
+        write_sidecar(&media_path, &write).expect("fallback to fresh packet");
+
+        let out = fs::read_to_string(&sidecar_path).unwrap();
+        assert!(out.contains("Clean"), "fallback write must land: {out}");
+
+        fs::remove_file(&sidecar_path).ok();
         fs::remove_file(&media_path).ok();
     }
 
