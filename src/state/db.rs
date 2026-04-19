@@ -201,6 +201,14 @@ pub trait StateDb: Send + Sync {
         source: &str,
     ) -> Result<(), StateError>;
 
+    /// Bulk-load every `(asset_id, album_name)` from `asset_albums`. Used at
+    /// sync start to populate the in-memory groupings index — downstream
+    /// writers look up album memberships without a per-asset DB hit.
+    async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError>;
+
+    /// Bulk-load every `(asset_id, person_name)` from `asset_people`.
+    async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError>;
+
     /// Mark an asset as soft-deleted (all versions under `asset_id`).
     ///
     /// Updates `is_deleted` and optional `deleted_at` timestamp. Does not
@@ -955,6 +963,36 @@ impl StateDb for SqliteStateDb {
         )
         .map_err(|e| StateError::query("add_asset_album", e))?;
         Ok(())
+    }
+
+    async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError> {
+        let conn = self.acquire_lock("get_all_asset_albums")?;
+        let mut stmt = conn
+            .prepare_cached("SELECT asset_id, album_name FROM asset_albums")
+            .map_err(|e| StateError::query("get_all_asset_albums", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| StateError::query("get_all_asset_albums", e))?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
+    async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
+        let conn = self.acquire_lock("get_all_asset_people")?;
+        let mut stmt = conn
+            .prepare_cached("SELECT asset_id, person_name FROM asset_people")
+            .map_err(|e| StateError::query("get_all_asset_people", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| StateError::query("get_all_asset_people", e))?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
     }
 
     async fn mark_soft_deleted(
@@ -2858,6 +2896,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn get_all_asset_people_returns_every_pair() {
+        // asset_people has no production writer yet (reserved for future
+        // provider adapters); insert test rows via raw SQL so this covers
+        // the read path without adding a trait method that would sit unused
+        // in production builds.
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        {
+            let conn = db.acquire_lock("seed").unwrap();
+            for (aid, person) in [("A1", "Alice"), ("A1", "Bob"), ("A2", "Alice")] {
+                conn.execute(
+                    "INSERT INTO asset_people (asset_id, person_name) VALUES (?1, ?2)",
+                    rusqlite::params![aid, person],
+                )
+                .unwrap();
+            }
+        }
+        let rows = db.get_all_asset_people().await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&("A1".into(), "Alice".into())));
+        assert!(rows.contains(&("A1".into(), "Bob".into())));
+        assert!(rows.contains(&("A2".into(), "Alice".into())));
+    }
+
+    #[tokio::test]
+    async fn get_all_asset_albums_returns_every_pair() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.add_asset_album("A1", "Favorites", "icloud")
+            .await
+            .unwrap();
+        db.add_asset_album("A1", "Trip", "icloud").await.unwrap();
+        db.add_asset_album("A2", "Favorites", "icloud")
+            .await
+            .unwrap();
+        let rows = db.get_all_asset_albums().await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&("A1".into(), "Favorites".into())));
+        assert!(rows.contains(&("A1".into(), "Trip".into())));
+        assert!(rows.contains(&("A2".into(), "Favorites".into())));
     }
 
     #[tokio::test]

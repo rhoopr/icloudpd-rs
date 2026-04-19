@@ -128,6 +128,64 @@ pub(crate) fn apply_metadata(path: &Path, write: &MetadataWrite) -> Result<()> {
     }
 }
 
+/// Whether this path's extension is one the in-place embedded-metadata writer
+/// can patch. JPEG / PNG / TIFF / MP4 / MOV go through XMP Toolkit;
+/// HEIC / HEIF / AVIF go through [`super::heif`].
+pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
+    if heif::is_heif_path(path) {
+        return true;
+    }
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "jpg" | "jpeg" | "png" | "tif" | "tiff" | "mp4" | "mov"
+        )
+    })
+}
+
+/// Write `write` as a `.xmp` sidecar next to the media file, atomically.
+pub(crate) fn write_sidecar(media_path: &Path, write: &MetadataWrite) -> Result<()> {
+    if write.is_empty() {
+        return Ok(());
+    }
+    ensure_initialized();
+
+    let mut meta = XmpMeta::new().context("creating XmpMeta")?;
+    apply_to_xmp(&mut meta, write)?;
+    let bytes = meta.to_string().into_bytes();
+
+    let mut sidecar_name = media_path.file_name().unwrap_or_default().to_os_string();
+    sidecar_name.push(".xmp");
+    let sidecar_path = media_path.with_file_name(&sidecar_name);
+    let mut tmp_name = sidecar_path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".meta-tmp");
+    let tmp_path = sidecar_path.with_file_name(&tmp_name);
+
+    std::fs::write(&tmp_path, &bytes)
+        .with_context(|| format!("Writing XMP sidecar {}", tmp_path.display()))?;
+    // Prefer rename (atomic); on EXDEV (cross-device) fall back to copy + unlink.
+    if let Err(rename_err) = std::fs::rename(&tmp_path, &sidecar_path) {
+        match std::fs::copy(&tmp_path, &sidecar_path) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            Err(copy_err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(rename_err).with_context(|| {
+                    format!(
+                        "Renaming {} -> {} (cross-device copy also failed: {})",
+                        tmp_path.display(),
+                        sidecar_path.display(),
+                        copy_err
+                    )
+                });
+            }
+        }
+    }
+    tracing::debug!(path = %sidecar_path.display(), "Wrote XMP sidecar");
+    Ok(())
+}
+
 fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite) -> Result<()> {
     ensure_initialized();
 
@@ -932,5 +990,131 @@ mod tests {
             }
         }
         None
+    }
+
+    // ── Sidecar + format-dispatch tests ────────────────────────────────
+
+    #[test]
+    fn is_embed_writable_path_recognises_supported_formats() {
+        for ext in [
+            "jpg", "jpeg", "JPG", "png", "PNG", "tif", "tiff", "mp4", "MOV", "heic", "HEIF", "avif",
+        ] {
+            let p = PathBuf::from(format!("/a/b.{ext}"));
+            assert!(is_embed_writable_path(&p), "{ext} should be writable");
+        }
+    }
+
+    #[test]
+    fn is_embed_writable_path_rejects_unsupported_formats() {
+        for ext in ["dng", "raf", "aae", "gif", "webp", ""] {
+            let p = PathBuf::from(format!("/a/b.{ext}"));
+            assert!(!is_embed_writable_path(&p), "{ext} should NOT be writable");
+        }
+        assert!(!is_embed_writable_path(Path::new("/a/b")));
+    }
+
+    #[test]
+    fn write_sidecar_is_noop_on_empty_write() {
+        let dir = test_tmp_dir("sidecar_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("empty.jpg");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+        write_sidecar(&media_path, &MetadataWrite::default()).unwrap();
+        let sidecar = dir.join("empty.jpg.xmp");
+        assert!(
+            !sidecar.exists(),
+            "empty metadata write must not create a sidecar"
+        );
+        fs::remove_file(&media_path).ok();
+    }
+
+    #[test]
+    fn write_sidecar_creates_xmp_file_next_to_media() {
+        let dir = test_tmp_dir("sidecar_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("photo.jpg");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+
+        let write = MetadataWrite {
+            rating: Some(5),
+            title: Some("Vacation".to_string()),
+            keywords: vec!["beach".into(), "sun".into()],
+            people: vec!["Alice".into()],
+            ..MetadataWrite::default()
+        };
+        write_sidecar(&media_path, &write).expect("sidecar write");
+        let sidecar = dir.join("photo.jpg.xmp");
+        assert!(sidecar.exists(), "sidecar should be written next to media");
+
+        let bytes = fs::read(&sidecar).unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.contains("rdf:RDF"));
+        assert!(s.contains("xmp:Rating"));
+        assert!(s.contains("Vacation"));
+        assert!(s.contains("beach"));
+        assert!(s.contains("Alice"));
+
+        fs::remove_file(&sidecar).ok();
+        fs::remove_file(&media_path).ok();
+    }
+
+    #[test]
+    fn write_sidecar_is_atomic_rewrite() {
+        let dir = test_tmp_dir("sidecar_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("rewrite.jpg");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+
+        let first = MetadataWrite {
+            title: Some("Before".into()),
+            ..MetadataWrite::default()
+        };
+        write_sidecar(&media_path, &first).unwrap();
+
+        let second = MetadataWrite {
+            title: Some("After".into()),
+            ..MetadataWrite::default()
+        };
+        write_sidecar(&media_path, &second).unwrap();
+
+        let sidecar = dir.join("rewrite.jpg.xmp");
+        let s = fs::read_to_string(&sidecar).unwrap();
+        assert!(s.contains("After"), "second write should replace first");
+        assert!(
+            !s.contains("Before"),
+            "previous title must not leak through"
+        );
+
+        let tmp = dir.join("rewrite.jpg.xmp.meta-tmp");
+        assert!(!tmp.exists(), "temp sidecar file must be cleaned up");
+
+        fs::remove_file(&sidecar).ok();
+        fs::remove_file(&media_path).ok();
+    }
+
+    #[test]
+    fn write_sidecar_does_not_touch_media_file() {
+        let dir = test_tmp_dir("sidecar_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("untouched.jpg");
+        let original_bytes = b"opaque-bytes-dont-care-about-format";
+        std::fs::write(&media_path, original_bytes).unwrap();
+
+        let write = MetadataWrite {
+            rating: Some(3),
+            ..MetadataWrite::default()
+        };
+        write_sidecar(&media_path, &write).unwrap();
+
+        let after = fs::read(&media_path).unwrap();
+        assert_eq!(
+            after,
+            original_bytes.to_vec(),
+            "sidecar write must never alter the media file"
+        );
+
+        let sidecar = dir.join("untouched.jpg.xmp");
+        fs::remove_file(&sidecar).ok();
+        fs::remove_file(&media_path).ok();
     }
 }

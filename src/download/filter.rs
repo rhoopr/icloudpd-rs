@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Local};
 use rustc_hash::FxHashMap;
@@ -108,13 +109,14 @@ impl std::borrow::Borrow<str> for NormalizedPath {
     }
 }
 
-/// Metadata values surfaced on a `DownloadTask` for EXIF enrichment.
+/// Metadata values surfaced on a `DownloadTask` for write-out to embedded XMP
+/// / native EXIF / XMP sidecars.
 ///
 /// Carried separately from the rest of `AssetMetadata` so the download layer
-/// only sees the fields it can actually write to EXIF tags. Fields are owned
-/// (not borrowed) because the task moves across async boundaries.
+/// only sees fields a writer can actually use. Fields are owned (not borrowed)
+/// because the task moves across async boundaries.
 #[derive(Debug, Clone, Default)]
-pub(super) struct ExifPayload {
+pub(super) struct MetadataPayload {
     /// 1-5 star rating (mapped from `AssetMetadata::rating` or `is_favorite`).
     pub(super) rating: Option<u8>,
     /// GPS latitude in decimal degrees, WGS84.
@@ -123,31 +125,96 @@ pub(super) struct ExifPayload {
     pub(super) longitude: Option<f64>,
     /// GPS altitude in meters above sea level.
     pub(super) altitude: Option<f64>,
+    /// Short title / caption.
+    pub(super) title: Option<String>,
     /// Image description text (prefers `description`, falls back to `title`).
     pub(super) description: Option<String>,
+    /// `dc:subject` tags — provider keywords plus album memberships merge here.
+    pub(super) keywords: Vec<String>,
+    /// MWG-RS person names for `iptcExt:PersonInImage`.
+    pub(super) people: Vec<String>,
+    /// Hidden from the timeline at the source.
+    pub(super) is_hidden: bool,
+    /// Archived at the source.
+    pub(super) is_archived: bool,
+    /// Media subtype (panorama, screenshot, burst, slo_mo, …).
+    pub(super) media_subtype: Option<String>,
+    /// Opaque provider burst grouping id.
+    pub(super) burst_id: Option<String>,
 }
 
-impl ExifPayload {
-    /// Build from `AssetMetadata`, preserving precedence rules from the spec:
-    /// rating falls back to `is_favorite -> 5`; description falls back to title.
+impl MetadataPayload {
+    /// Build from `AssetMetadata`. Description falls back to title when
+    /// `description` is unset. Keywords are parsed from the JSON array blob
+    /// leniently — a malformed blob yields an empty list rather than an error.
     pub(super) fn from_metadata(meta: &crate::state::AssetMetadata) -> Self {
-        // rating comes straight from meta — provider adapters (e.g. the iCloud
-        // extractor) already map `is_favorite` to 5 at ingest time.
         let description = meta.description.clone().or_else(|| meta.title.clone());
+        let keywords = meta
+            .keywords
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .unwrap_or_default();
         Self {
             rating: meta.rating,
             latitude: meta.latitude,
             longitude: meta.longitude,
             altitude: meta.altitude,
+            title: meta.title.clone(),
             description,
+            keywords,
+            people: Vec::new(),
+            is_hidden: meta.is_hidden,
+            is_archived: meta.is_archived,
+            media_subtype: meta.media_subtype.clone(),
+            burst_id: meta.burst_id.clone(),
         }
     }
+
+    /// Merge album names into `keywords` (as `dc:subject` tags — the standard
+    /// XMP slot photo managers scan for groupings) and set `people`.
+    pub(super) fn with_asset_groupings(mut self, albums: &[String], people: &[String]) -> Self {
+        for album in albums {
+            if !self.keywords.iter().any(|k| k == album) {
+                self.keywords.push(album.clone());
+            }
+        }
+        self.people = people.to_vec();
+        self
+    }
+}
+
+/// Index of per-asset album memberships and face-tag names, preloaded from
+/// the state DB at sync start so `filter_asset_to_tasks` can enrich each
+/// task's [`MetadataPayload`] without per-asset DB hits.
+#[derive(Debug, Default)]
+pub(crate) struct AssetGroupings {
+    pub(crate) albums: FxHashMap<String, Vec<String>>,
+    pub(crate) people: FxHashMap<String, Vec<String>>,
+}
+
+fn build_payload(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> Arc<MetadataPayload> {
+    let albums = config
+        .asset_groupings
+        .albums
+        .get(asset.id())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let people = config
+        .asset_groupings
+        .people
+        .get(asset.id())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    Arc::new(MetadataPayload::from_metadata(asset.metadata()).with_asset_groupings(albums, people))
 }
 
 /// A unit of work produced by the filter phase and consumed by the download phase.
 ///
 /// Fields ordered for optimal memory layout:
-/// - Heap types first (`Box<str>`, `PathBuf`, `ExifPayload`)
+/// - Heap types first (`Box<str>`, `PathBuf`, `MetadataPayload`)
 /// - 8-byte primitives (u64)
 /// - `DateTime` (12-16 bytes)
 /// - 1-byte enum last
@@ -159,8 +226,10 @@ pub(super) struct DownloadTask {
     pub(super) checksum: Box<str>,
     /// iCloud asset ID for state tracking.
     pub(super) asset_id: Box<str>,
-    /// EXIF-writable metadata surfaced from `AssetMetadata`.
-    pub(super) exif: ExifPayload,
+    /// Metadata fields surfaced from `AssetMetadata` for writer consumption.
+    /// Behind `Arc` so `task.metadata.clone()` in the download hot path is a
+    /// refcount bump instead of a deep clone of every `Vec<String>` inside.
+    pub(super) metadata: Arc<MetadataPayload>,
     // 8-byte primitives
     pub(super) size: u64,
     // DateTime
@@ -671,7 +740,7 @@ pub(super) fn filter_asset_to_tasks(
                 download_path: path,
                 checksum: version.checksum.clone(),
                 asset_id: asset.id().into(),
-                exif: ExifPayload::from_metadata(asset.metadata()),
+                metadata: build_payload(asset, config),
                 size: version.size,
                 created_local,
                 version_size: VersionSizeKey::from(effective_size),
@@ -750,7 +819,7 @@ pub(super) fn filter_asset_to_tasks(
                     download_path: path,
                     checksum: live_version.checksum.clone(),
                     asset_id: asset.id().into(),
-                    exif: ExifPayload::from_metadata(asset.metadata()),
+                    metadata: build_payload(asset, config),
                     size: live_version.size,
                     created_local,
                     version_size: VersionSizeKey::from(effective_live_size),
@@ -2615,5 +2684,116 @@ mod tests {
             Some(FilterReason::ExcludedAlbum),
             "asset in exclude_asset_ids should be filtered"
         );
+    }
+
+    // ── MetadataPayload + AssetGroupings tests ─────────────────────────
+
+    fn asset_metadata_with_keywords(keywords_json: &str) -> crate::state::AssetMetadata {
+        crate::state::AssetMetadata {
+            title: Some("Beach day".to_string()),
+            description: Some("Sunny afternoon".to_string()),
+            keywords: Some(keywords_json.to_string()),
+            rating: Some(4),
+            latitude: Some(37.7),
+            longitude: Some(-122.4),
+            altitude: Some(10.0),
+            is_hidden: true,
+            is_archived: false,
+            media_subtype: Some("portrait".to_string()),
+            burst_id: Some("burst-1".to_string()),
+            ..crate::state::AssetMetadata::default()
+        }
+    }
+
+    #[test]
+    fn metadata_payload_parses_keywords_json() {
+        let meta = asset_metadata_with_keywords(r#"["vacation","beach","sun"]"#);
+        let p = MetadataPayload::from_metadata(&meta);
+        assert_eq!(
+            p.keywords,
+            vec!["vacation".to_string(), "beach".into(), "sun".into()]
+        );
+    }
+
+    #[test]
+    fn metadata_payload_keywords_are_empty_on_bad_json() {
+        let meta = asset_metadata_with_keywords("not json");
+        let p = MetadataPayload::from_metadata(&meta);
+        assert!(
+            p.keywords.is_empty(),
+            "malformed keywords JSON must not poison payload"
+        );
+    }
+
+    #[test]
+    fn metadata_payload_description_falls_back_to_title() {
+        let mut meta = asset_metadata_with_keywords("[]");
+        meta.description = None;
+        let p = MetadataPayload::from_metadata(&meta);
+        assert_eq!(p.description, Some("Beach day".to_string()));
+    }
+
+    #[test]
+    fn metadata_payload_carries_all_new_fields() {
+        let meta = asset_metadata_with_keywords("[]");
+        let p = MetadataPayload::from_metadata(&meta);
+        assert_eq!(p.title, Some("Beach day".into()));
+        assert!(p.is_hidden);
+        assert!(!p.is_archived);
+        assert_eq!(p.media_subtype, Some("portrait".into()));
+        assert_eq!(p.burst_id, Some("burst-1".into()));
+    }
+
+    #[test]
+    fn with_asset_groupings_merges_albums_into_keywords() {
+        let meta = asset_metadata_with_keywords(r#"["sun"]"#);
+        let p = MetadataPayload::from_metadata(&meta)
+            .with_asset_groupings(&["Favorites".into(), "Trip".into()], &[]);
+        assert_eq!(p.keywords, vec!["sun", "Favorites", "Trip"]);
+    }
+
+    #[test]
+    fn with_asset_groupings_dedupes_existing_album_keywords() {
+        let meta = asset_metadata_with_keywords(r#"["Favorites"]"#);
+        let p = MetadataPayload::from_metadata(&meta)
+            .with_asset_groupings(&["Favorites".into(), "Trip".into()], &[]);
+        assert_eq!(
+            p.keywords,
+            vec!["Favorites", "Trip"],
+            "album already in keywords must not appear twice"
+        );
+    }
+
+    #[test]
+    fn with_asset_groupings_populates_people() {
+        let meta = asset_metadata_with_keywords("[]");
+        let p = MetadataPayload::from_metadata(&meta)
+            .with_asset_groupings(&[], &["Alice".into(), "Bob".into()]);
+        assert_eq!(p.people, vec!["Alice", "Bob"]);
+    }
+
+    #[test]
+    fn build_payload_reads_grouping_index_from_config() {
+        let asset = TestPhotoAsset::new("GROUP_1").build();
+        let mut groupings = AssetGroupings::default();
+        groupings
+            .albums
+            .insert("GROUP_1".into(), vec!["Favorites".into()]);
+        groupings
+            .people
+            .insert("GROUP_1".into(), vec!["Alice".into()]);
+        let mut config = test_config();
+        config.asset_groupings = Arc::new(groupings);
+        let payload = build_payload(&asset, &config);
+        assert!(payload.keywords.contains(&"Favorites".to_string()));
+        assert_eq!(payload.people, vec!["Alice".to_string()]);
+    }
+
+    #[test]
+    fn build_payload_is_empty_grouping_safe() {
+        let asset = TestPhotoAsset::new("EMPTY_1").build();
+        let config = test_config();
+        let payload = build_payload(&asset, &config);
+        assert!(payload.people.is_empty());
     }
 }

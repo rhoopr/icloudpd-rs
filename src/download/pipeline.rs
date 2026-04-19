@@ -24,7 +24,7 @@ use crate::state::{AssetRecord, StateDb, SyncRunStats};
 use super::error::DownloadError;
 use super::filter::{
     determine_media_type, extract_skip_candidates, filter_asset_to_tasks, is_asset_filtered,
-    pre_ensure_asset_dir, DownloadTask, ExifPayload, FilterReason, NormalizedPath,
+    pre_ensure_asset_dir, DownloadTask, FilterReason, MetadataPayload, NormalizedPath,
 };
 use super::{paths, DownloadConfig, DownloadContext, DownloadOutcome};
 
@@ -241,29 +241,41 @@ fn create_progress_bar(
     pb
 }
 
-/// Per-tag EXIF write toggles. `any()` drives the `.part`-and-modify-before-rename
-/// flow; individual flags gate which tags get written in `apply_exif`.
+/// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
+/// flow; individual flags gate which fields get written in the XMP packet.
+///
+/// `embed_xmp` enables the XMP-only fields that have no native EXIF equivalent
+/// (title, keywords, people, hidden/archived, media subtype, burst id).
+/// `xmp_sidecar` is orthogonal — it writes a `.xmp` file next to the photo
+/// without touching the photo bytes.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct ExifFlags {
+pub(super) struct MetadataFlags {
     pub(super) datetime: bool,
     pub(super) rating: bool,
     pub(super) gps: bool,
     pub(super) description: bool,
+    pub(super) embed_xmp: bool,
+    pub(super) xmp_sidecar: bool,
 }
 
-impl ExifFlags {
-    pub(super) fn any(&self) -> bool {
-        self.datetime || self.rating || self.gps || self.description
+impl MetadataFlags {
+    /// Whether any flag needs the downloaded bytes to stay as a `.part` file
+    /// for in-place XMP editing before the atomic rename. Sidecar writes
+    /// happen after the rename and don't need this, so they're excluded.
+    pub(super) fn any_embed(&self) -> bool {
+        self.datetime || self.rating || self.gps || self.description || self.embed_xmp
     }
 }
 
-impl From<&DownloadConfig> for ExifFlags {
+impl From<&DownloadConfig> for MetadataFlags {
     fn from(config: &DownloadConfig) -> Self {
         Self {
             datetime: config.set_exif_datetime,
             rating: config.set_exif_rating,
             gps: config.set_exif_gps,
             description: config.set_exif_description,
+            embed_xmp: config.embed_xmp,
+            xmp_sidecar: config.xmp_sidecar,
         }
     }
 }
@@ -272,7 +284,7 @@ impl From<&DownloadConfig> for ExifFlags {
 pub(super) struct PassConfig<'a> {
     pub(super) client: &'a Client,
     pub(super) retry_config: &'a RetryConfig,
-    pub(super) exif: ExifFlags,
+    pub(super) metadata: MetadataFlags,
     pub(super) concurrency: usize,
     pub(super) no_progress_bar: bool,
     pub(super) temp_suffix: String,
@@ -283,7 +295,7 @@ pub(super) struct PassConfig<'a> {
 impl std::fmt::Debug for PassConfig<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PassConfig")
-            .field("exif", &self.exif)
+            .field("metadata", &self.metadata)
             .field("concurrency", &self.concurrency)
             .field("no_progress_bar", &self.no_progress_bar)
             .field("temp_suffix", &self.temp_suffix)
@@ -414,7 +426,7 @@ where
 
     let download_client = download_client.clone();
     let retry_config = config.retry;
-    let exif_flags = ExifFlags::from(config.as_ref());
+    let metadata_flags = MetadataFlags::from(config.as_ref());
     let concurrency = config.concurrent_downloads;
     let state_db = config.state_db.clone();
 
@@ -853,7 +865,7 @@ where
                     &client,
                     &task,
                     &retry_config,
-                    exif_flags,
+                    metadata_flags,
                     &temp_suffix,
                 ))
                 .await;
@@ -1149,7 +1161,7 @@ pub(super) async fn build_download_outcome(
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
-        exif: ExifFlags::from(config.as_ref()),
+        metadata: MetadataFlags::from(config.as_ref()),
         concurrency: cleanup_concurrency,
         no_progress_bar: config.no_progress_bar,
         temp_suffix: config.temp_suffix.clone(),
@@ -1234,7 +1246,7 @@ pub(super) async fn run_download_pass(
     let pb = create_progress_bar(config.no_progress_bar, false, tasks.len() as u64);
     let client = config.client.clone();
     let retry_config = config.retry_config;
-    let exif_flags = config.exif;
+    let metadata_flags = config.metadata;
     let state_db = config.state_db.clone();
     let shutdown_token = config.shutdown_token.clone();
     let concurrency = config.concurrency;
@@ -1254,7 +1266,7 @@ pub(super) async fn run_download_pass(
                     &client,
                     &task,
                     retry_config,
-                    exif_flags,
+                    metadata_flags,
                     &temp_suffix,
                 ))
                 .await;
@@ -1358,46 +1370,71 @@ pub(super) async fn run_download_pass(
     }
 }
 
-/// Decide which metadata fields to apply, honouring the spec's per-tag gates:
-///
-/// - **Datetime**: only when the file has no `DateTimeOriginal` (preserves
-///   camera-supplied timestamps).
-/// - **Rating / description / title**: always overwrite when the flag is set —
-///   iCloud is the source of truth.
-/// - **GPS**: only when the file has no existing GPS data.
-/// - **Keywords / people / kei-namespace fields**: always overwrite when
-///   present in the task payload.
-///
-/// Pure function of a pre-read `ExifProbe` plus the task's payload, so the
-/// caller controls where the file I/O happens (blocking pool, not runtime).
-fn plan_metadata_write(
-    flags: ExifFlags,
-    payload: &ExifPayload,
+/// Comprehensive snapshot of every field a payload can contribute. Used as
+/// the sidecar plan directly and as the base that [`plan_metadata_write`]
+/// filters for the embed path.
+fn plan_sidecar_write(
+    payload: &MetadataPayload,
     created_local: &chrono::DateTime<chrono::Local>,
-    probe: &super::metadata::ExifProbe,
 ) -> super::metadata::MetadataWrite {
-    let mut write = super::metadata::MetadataWrite::default();
-
-    if flags.datetime && probe.datetime_original.is_none() {
-        write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
-    }
-
-    if flags.rating {
-        write.rating = payload.rating;
-    }
-
-    if flags.gps && !probe.has_gps {
-        if let (Some(lat), Some(lng)) = (payload.latitude, payload.longitude) {
-            write.gps = Some(super::metadata::GpsCoords {
+    super::metadata::MetadataWrite {
+        datetime: Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string()),
+        rating: payload.rating,
+        gps: match (payload.latitude, payload.longitude) {
+            (Some(lat), Some(lng)) => Some(super::metadata::GpsCoords {
                 latitude: lat,
                 longitude: lng,
                 altitude: payload.altitude,
-            });
-        }
+            }),
+            _ => None,
+        },
+        title: payload.title.clone(),
+        description: payload.description.clone(),
+        keywords: payload.keywords.clone(),
+        people: payload.people.clone(),
+        is_hidden: payload.is_hidden,
+        is_archived: payload.is_archived,
+        media_subtype: payload.media_subtype.clone(),
+        burst_id: payload.burst_id.clone(),
     }
+}
 
-    if flags.description {
-        write.description = payload.description.clone();
+/// Filter the comprehensive write down to what the embed path should actually
+/// touch, honouring per-tag gates:
+///
+/// - **datetime / GPS**: only when the flag is on AND the file has no
+///   existing value (probe gate preserves camera-supplied data).
+/// - **rating / description**: flag gate only — iCloud is the source of truth.
+/// - **XMP-only fields** (title, keywords, people, hidden/archived,
+///   media_subtype, burst_id): gated on `embed_xmp`.
+fn plan_metadata_write(
+    flags: MetadataFlags,
+    payload: &MetadataPayload,
+    created_local: &chrono::DateTime<chrono::Local>,
+    probe: &super::metadata::ExifProbe,
+) -> super::metadata::MetadataWrite {
+    let mut write = plan_sidecar_write(payload, created_local);
+
+    if !flags.datetime || probe.datetime_original.is_some() {
+        write.datetime = None;
+    }
+    if !flags.rating {
+        write.rating = None;
+    }
+    if !flags.gps || probe.has_gps {
+        write.gps = None;
+    }
+    if !flags.description {
+        write.description = None;
+    }
+    if !flags.embed_xmp {
+        write.title = None;
+        write.keywords.clear();
+        write.people.clear();
+        write.is_hidden = false;
+        write.is_archived = false;
+        write.media_subtype = None;
+        write.burst_id = None;
     }
 
     write
@@ -1411,7 +1448,7 @@ async fn download_single_task(
     client: &Client,
     task: &DownloadTask,
     retry_config: &RetryConfig,
-    exif_flags: ExifFlags,
+    metadata_flags: MetadataFlags,
     temp_suffix: &str,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
     if let Some(parent) = task.download_path.parent() {
@@ -1426,17 +1463,10 @@ async fn download_single_task(
         "downloading",
     );
 
-    // Determine if EXIF modification is needed so we can keep the .part file
-    // around for modification before the atomic rename to the final path.
-    // Any EXIF flag enabled + JPEG extension -> rewrite before rename.
-    let needs_exif = exif_flags.any() && {
-        let ext = task
-            .download_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg")
-    };
+    // Embed writes happen on the .part file before the atomic rename; sidecar
+    // writes happen after, on the final path.
+    let needs_exif =
+        metadata_flags.any_embed() && super::metadata::is_embed_writable_path(&task.download_path);
 
     let bytes_downloaded = Box::pin(super::file::download_file(
         client,
@@ -1474,7 +1504,7 @@ async fn download_single_task(
     let mut exif_ok = true;
     if let Some(part) = &part_path {
         let exif_path = part.clone();
-        let payload = task.exif.clone();
+        let payload = task.metadata.clone();
         let created_local = task.created_local;
         // Probe + plan + apply all run on the blocking pool so no file I/O
         // happens on the async runtime's poll thread.
@@ -1486,7 +1516,7 @@ async fn download_single_task(
                     super::metadata::ExifProbe::default()
                 }
             };
-            let write = plan_metadata_write(exif_flags, &payload, &created_local, &probe);
+            let write = plan_metadata_write(metadata_flags, &payload, &created_local, &probe);
             if write.is_empty() {
                 return true;
             }
@@ -1525,6 +1555,29 @@ async fn download_single_task(
     // Atomic rename: .part → final (only when EXIF path was used)
     if let Some(part) = &part_path {
         super::file::rename_part_to_final(part, &task.download_path).await?;
+    }
+
+    if metadata_flags.xmp_sidecar {
+        let sidecar_path = task.download_path.clone();
+        let payload = task.metadata.clone();
+        let created_local = task.created_local;
+        let sidecar_result = tokio::task::spawn_blocking(move || {
+            let write = plan_sidecar_write(&payload, &created_local);
+            if write.is_empty() {
+                return true;
+            }
+            if let Err(e) = super::metadata::write_sidecar(&sidecar_path, &write) {
+                tracing::warn!(path = %sidecar_path.display(), error = %e, "Failed to write XMP sidecar");
+                false
+            } else {
+                true
+            }
+        })
+        .await;
+        if let Err(e) = sidecar_result {
+            tracing::warn!(error = %e, "XMP sidecar task panicked");
+            exif_ok = false;
+        }
     }
 
     let disk_bytes = match tokio::fs::metadata(&task.download_path).await {
@@ -1730,6 +1783,128 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
+    fn now_local() -> chrono::DateTime<chrono::Local> {
+        chrono::Local::now()
+    }
+
+    fn rich_payload() -> MetadataPayload {
+        MetadataPayload {
+            rating: Some(4),
+            latitude: Some(37.7),
+            longitude: Some(-122.4),
+            altitude: Some(10.0),
+            title: Some("T".into()),
+            description: Some("D".into()),
+            keywords: vec!["vacation".into(), "beach".into()],
+            people: vec!["Alice".into()],
+            is_hidden: true,
+            is_archived: true,
+            media_subtype: Some("portrait".into()),
+            burst_id: Some("b1".into()),
+        }
+    }
+
+    #[test]
+    fn plan_metadata_write_gates_xmp_fields_on_embed_xmp() {
+        let payload = rich_payload();
+        let flags_no_embed = MetadataFlags::default();
+        let w = plan_metadata_write(
+            flags_no_embed,
+            &payload,
+            &now_local(),
+            &crate::download::metadata::ExifProbe::default(),
+        );
+        assert!(
+            w.title.is_none(),
+            "title must not write when embed_xmp is off"
+        );
+        assert!(w.keywords.is_empty());
+        assert!(w.people.is_empty());
+        assert!(!w.is_hidden);
+
+        let flags_embed = MetadataFlags {
+            embed_xmp: true,
+            ..MetadataFlags::default()
+        };
+        let w = plan_metadata_write(
+            flags_embed,
+            &payload,
+            &now_local(),
+            &crate::download::metadata::ExifProbe::default(),
+        );
+        assert_eq!(w.title.as_deref(), Some("T"));
+        assert_eq!(w.keywords, vec!["vacation", "beach"]);
+        assert_eq!(w.people, vec!["Alice"]);
+        assert!(w.is_hidden);
+        assert!(w.is_archived);
+        assert_eq!(w.media_subtype.as_deref(), Some("portrait"));
+        assert_eq!(w.burst_id.as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn plan_metadata_write_respects_probe_skip_for_datetime_and_gps() {
+        let payload = rich_payload();
+        let flags = MetadataFlags {
+            datetime: true,
+            gps: true,
+            ..MetadataFlags::default()
+        };
+        let probe = crate::download::metadata::ExifProbe {
+            datetime_original: Some("2020:01:01 00:00:00".into()),
+            has_gps: true,
+        };
+        let w = plan_metadata_write(flags, &payload, &now_local(), &probe);
+        assert!(
+            w.datetime.is_none(),
+            "must skip datetime when file already has one"
+        );
+        assert!(w.gps.is_none(), "must skip gps when file already has one");
+    }
+
+    #[test]
+    fn plan_sidecar_write_is_comprehensive_regardless_of_flags() {
+        let payload = rich_payload();
+        let w = plan_sidecar_write(&payload, &now_local());
+        // Every payload field should land in the sidecar write, no flag gating.
+        assert!(w.datetime.is_some());
+        assert_eq!(w.rating, Some(4));
+        assert!(w.gps.is_some());
+        assert_eq!(w.title.as_deref(), Some("T"));
+        assert_eq!(w.description.as_deref(), Some("D"));
+        assert_eq!(w.keywords.len(), 2);
+        assert_eq!(w.people, vec!["Alice"]);
+        assert!(w.is_hidden);
+        assert!(w.is_archived);
+        assert_eq!(w.media_subtype.as_deref(), Some("portrait"));
+        assert_eq!(w.burst_id.as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn plan_sidecar_write_empty_payload_yields_datetime_only() {
+        // datetime comes from the local clock; the rest stays empty.
+        let w = plan_sidecar_write(&MetadataPayload::default(), &now_local());
+        assert!(w.datetime.is_some());
+        assert!(w.rating.is_none());
+        assert!(w.gps.is_none());
+        assert!(w.title.is_none());
+        assert!(w.keywords.is_empty());
+        assert!(!w.is_hidden);
+    }
+
+    #[test]
+    fn metadata_flags_any_embed_captures_embed_only() {
+        let mut flags = MetadataFlags::default();
+        assert!(!flags.any_embed());
+        flags.xmp_sidecar = true;
+        assert!(
+            !flags.any_embed(),
+            "sidecar-only must not trigger the .part-edit flow"
+        );
+        flags.xmp_sidecar = false;
+        flags.embed_xmp = true;
+        assert!(flags.any_embed());
+    }
+
     #[test]
     fn test_set_file_mtime_positive_timestamp() {
         let dir = TempDir::new().unwrap();
@@ -1842,7 +2017,7 @@ mod tests {
                                 created_local: chrono::Local::now(),
                                 size: 1000,
                                 asset_id: "ASSET_A".into(),
-                                exif: ExifPayload::default(),
+                                metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
                             },
                             DownloadTask {
@@ -1852,7 +2027,7 @@ mod tests {
                                 created_local: chrono::Local::now(),
                                 size: 2000,
                                 asset_id: "ASSET_B".into(),
-                                exif: ExifPayload::default(),
+                                metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
                             },
                         ];
@@ -1863,7 +2038,7 @@ mod tests {
                         let pass_config = PassConfig {
                             client: &client,
                             retry_config: &retry,
-                            exif: ExifFlags::default(),
+                            metadata: MetadataFlags::default(),
                             concurrency: 1,
                             no_progress_bar: true,
                             temp_suffix: ".kei-tmp".to_string(),
@@ -1899,7 +2074,7 @@ mod tests {
                             created_local: chrono::Local::now(),
                             size: 500,
                             asset_id: "ASSET_C".into(),
-                            exif: ExifPayload::default(),
+                            metadata: Arc::new(MetadataPayload::default()),
                             version_size: VersionSizeKey::Original,
                         }];
 
@@ -1913,7 +2088,7 @@ mod tests {
                         let pass_config = PassConfig {
                             client: &client,
                             retry_config: &retry,
-                            exif: ExifFlags::default(),
+                            metadata: MetadataFlags::default(),
                             concurrency: 1,
                             no_progress_bar: true,
                             temp_suffix: ".kei-tmp".to_string(),
@@ -2158,6 +2333,12 @@ mod tests {
         async fn add_asset_album(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
             Ok(())
         }
+        async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
+            Ok(Vec::new())
+        }
         async fn mark_soft_deleted(
             &self,
             _: &str,
@@ -2352,6 +2533,8 @@ mod tests {
             set_exif_rating: false,
             set_exif_gps: false,
             set_exif_description: false,
+            embed_xmp: false,
+            xmp_sidecar: false,
             dry_run: false,
             concurrent_downloads: 10,
             recent: None,
@@ -2377,6 +2560,7 @@ mod tests {
             sync_mode: SyncMode::Full,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
+            asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
         });
 
         let client = reqwest::Client::builder()
@@ -2429,6 +2613,8 @@ mod tests {
             set_exif_rating: false,
             set_exif_gps: false,
             set_exif_description: false,
+            embed_xmp: false,
+            xmp_sidecar: false,
             dry_run: false,
             concurrent_downloads: 1,
             recent: None,
@@ -2450,6 +2636,7 @@ mod tests {
             sync_mode: SyncMode::Full,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
+            asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
         });
         let client = reqwest::Client::new();
         let shutdown_token = CancellationToken::new();

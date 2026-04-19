@@ -13,10 +13,12 @@ pub(crate) mod pipeline;
 
 use pipeline::{
     build_download_outcome, format_duration, log_sync_summary, run_download_pass,
-    stream_and_download_from_stream, ExifFlags, PassConfig, StreamingResult, AUTH_ERROR_THRESHOLD,
+    stream_and_download_from_stream, MetadataFlags, PassConfig, StreamingResult,
+    AUTH_ERROR_THRESHOLD,
 };
 
 pub(crate) use filter::determine_media_type;
+pub(crate) use filter::AssetGroupings;
 use filter::{
     extract_skip_candidates, filter_asset_to_tasks, pre_ensure_asset_dir, DownloadTask,
     NormalizedPath,
@@ -364,6 +366,12 @@ pub(crate) struct DownloadConfig {
     pub(crate) set_exif_rating: bool,
     pub(crate) set_exif_gps: bool,
     pub(crate) set_exif_description: bool,
+    /// Embed the full XMP packet (title, keywords, people, hidden/archived,
+    /// media subtype, burst id) into the file bytes on supported formats.
+    pub(crate) embed_xmp: bool,
+    /// Write a `.xmp` sidecar file next to each downloaded media file with
+    /// the same composed XMP packet.
+    pub(crate) xmp_sidecar: bool,
     pub(crate) dry_run: bool,
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
@@ -395,6 +403,8 @@ pub(crate) struct DownloadConfig {
     pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
     /// Maximum download attempts per asset before giving up (0 = unlimited).
     pub(crate) max_download_attempts: u32,
+    /// Preloaded asset→album and asset→person indices, shared across clones.
+    pub(crate) asset_groupings: Arc<AssetGroupings>,
 }
 
 impl DownloadConfig {
@@ -414,6 +424,7 @@ impl DownloadConfig {
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
             exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
+            asset_groupings: Arc::clone(&self.asset_groupings),
             ..*self
         }
     }
@@ -433,6 +444,8 @@ impl std::fmt::Debug for DownloadConfig {
             .field("set_exif_rating", &self.set_exif_rating)
             .field("set_exif_gps", &self.set_exif_gps)
             .field("set_exif_description", &self.set_exif_description)
+            .field("embed_xmp", &self.embed_xmp)
+            .field("xmp_sidecar", &self.xmp_sidecar)
             .field("dry_run", &self.dry_run)
             .field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
@@ -478,6 +491,8 @@ impl DownloadConfig {
             set_exif_rating: false,
             set_exif_gps: false,
             set_exif_description: false,
+            embed_xmp: false,
+            xmp_sidecar: false,
             dry_run: false,
             concurrent_downloads: 1,
             recent: None,
@@ -499,6 +514,7 @@ impl DownloadConfig {
             sync_mode: SyncMode::Full,
             album_name: None,
             exclude_asset_ids: std::sync::Arc::new(FxHashSet::default()),
+            asset_groupings: Arc::new(AssetGroupings::default()),
         }
     }
 }
@@ -1333,7 +1349,7 @@ async fn download_photos_incremental(
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
-        exif: ExifFlags::from(config.as_ref()),
+        metadata: MetadataFlags::from(config.as_ref()),
         concurrency: config.concurrent_downloads,
         no_progress_bar: config.no_progress_bar,
         temp_suffix: config.temp_suffix.clone(),
@@ -1872,6 +1888,8 @@ mod tests {
             set_exif_rating: false,
             set_exif_gps: false,
             set_exif_description: false,
+            embed_xmp: false,
+            xmp_sidecar: false,
             dry_run: false,
             no_progress_bar: true,
             keep_unicode_in_filenames: false,

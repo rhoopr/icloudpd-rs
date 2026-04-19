@@ -359,7 +359,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let retry_config = api_retry_config;
     let live_photo_size = config.live_photo_size.to_asset_version_size();
     let build_download_config = |sync_mode: download::SyncMode,
-                                 exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>|
+                                 exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
+                                 asset_groupings: Arc<download::AssetGroupings>|
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
             directory: config.directory.clone(),
@@ -373,6 +374,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             set_exif_rating: config.set_exif_rating,
             set_exif_gps: config.set_exif_gps,
             set_exif_description: config.set_exif_description,
+            embed_xmp: config.embed_xmp,
+            xmp_sidecar: config.xmp_sidecar,
             dry_run: config.dry_run,
             concurrent_downloads: config.threads_num as usize,
             recent: config.recent,
@@ -394,6 +397,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             sync_mode,
             album_name: None,
             exclude_asset_ids,
+            asset_groupings,
         })
     };
 
@@ -764,6 +768,7 @@ async fn run_cycle(
     build_download_config: &dyn Fn(
         download::SyncMode,
         Arc<rustc_hash::FxHashSet<String>>,
+        Arc<download::AssetGroupings>,
     ) -> Arc<download::DownloadConfig>,
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
@@ -837,8 +842,17 @@ async fn run_cycle(
         };
         tracing::debug!(sync_mode = sync_mode_label, zone = %lib_state.zone_name, "Starting sync cycle");
 
-        let download_config =
-            build_download_config(sync_mode, Arc::clone(&lib_state.exclude_asset_ids));
+        // Skip the DB scan entirely when nothing downstream will read it.
+        let asset_groupings = if config.embed_xmp || config.xmp_sidecar {
+            preload_asset_groupings(state_db).await
+        } else {
+            Arc::new(download::AssetGroupings::default())
+        };
+        let download_config = build_download_config(
+            sync_mode,
+            Arc::clone(&lib_state.exclude_asset_ids),
+            asset_groupings,
+        );
         let download_client = shared_session.read().await.download_client();
         let sync_result = download::download_photos_with_sync(
             &download_client,
@@ -924,6 +938,35 @@ async fn run_cycle(
 /// Check `changes/database` to determine if this watch cycle can be skipped.
 ///
 /// Returns `true` when no zones report changes and `moreComing` is false.
+/// Bulk-load `asset_albums` + `asset_people` into an in-memory index so the
+/// filter phase can enrich payloads without per-asset DB hits.
+async fn preload_asset_groupings(
+    state_db: &Option<Arc<dyn state::StateDb>>,
+) -> Arc<download::AssetGroupings> {
+    let Some(db) = state_db else {
+        return Arc::new(download::AssetGroupings::default());
+    };
+    let (albums, people) = tokio::join!(db.get_all_asset_albums(), db.get_all_asset_people());
+    let mut groupings = download::AssetGroupings::default();
+    match albums {
+        Ok(rows) => {
+            for (asset_id, album) in rows {
+                groupings.albums.entry(asset_id).or_default().push(album);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to preload asset_albums"),
+    }
+    match people {
+        Ok(rows) => {
+            for (asset_id, person) in rows {
+                groupings.people.entry(asset_id).or_default().push(person);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to preload asset_people"),
+    }
+    Arc::new(groupings)
+}
+
 async fn check_changes_database(
     state_db: &Option<Arc<dyn state::StateDb>>,
     lib_state: &LibraryState,

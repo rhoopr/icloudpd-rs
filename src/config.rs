@@ -51,6 +51,8 @@ pub(crate) struct TomlDownload {
     pub set_exif_rating: Option<bool>,
     pub set_exif_gps: Option<bool>,
     pub set_exif_description: Option<bool>,
+    pub embed_xmp: Option<bool>,
+    pub xmp_sidecar: Option<bool>,
     pub no_progress_bar: Option<bool>,
     pub retry: Option<TomlRetry>,
 }
@@ -235,6 +237,8 @@ pub struct Config {
     pub set_exif_rating: bool,
     pub set_exif_gps: bool,
     pub set_exif_description: bool,
+    pub embed_xmp: bool,
+    pub xmp_sidecar: bool,
     pub dry_run: bool,
     pub no_progress_bar: bool,
     pub keep_unicode_in_filenames: bool,
@@ -534,6 +538,8 @@ impl Config {
             sync.set_exif_description,
             toml_dl.and_then(|d| d.set_exif_description),
         );
+        let embed_xmp = resolve_flag(sync.embed_xmp, toml_dl.and_then(|d| d.embed_xmp));
+        let xmp_sidecar = resolve_flag(sync.xmp_sidecar, toml_dl.and_then(|d| d.xmp_sidecar));
         let no_progress_bar = resolve_flag(
             sync.no_progress_bar,
             toml_dl.and_then(|d| d.no_progress_bar),
@@ -740,6 +746,8 @@ impl Config {
             set_exif_rating,
             set_exif_gps,
             set_exif_description,
+            embed_xmp,
+            xmp_sidecar,
             dry_run: sync.dry_run,
             no_progress_bar,
             keep_unicode_in_filenames,
@@ -809,6 +817,8 @@ impl Config {
                 } else {
                     None
                 },
+                embed_xmp: if self.embed_xmp { Some(true) } else { None },
+                xmp_sidecar: if self.xmp_sidecar { Some(true) } else { None },
                 no_progress_bar: if self.no_progress_bar {
                     Some(true)
                 } else {
@@ -979,6 +989,8 @@ pub(crate) fn persist_first_run_config(
             set_exif_rating: None,
             set_exif_gps: None,
             set_exif_description: None,
+            embed_xmp: None,
+            xmp_sidecar: None,
             no_progress_bar: None,
             retry: None,
         }),
@@ -1413,6 +1425,49 @@ mod tests {
         .unwrap();
         assert!(cfg.set_exif_datetime);
         assert!(cfg.skip_videos);
+    }
+
+    #[test]
+    fn test_build_embed_xmp_and_sidecar_from_toml() {
+        let toml_str = r#"
+            [download]
+            embed_xmp = true
+            xmp_sidecar = true
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert!(cfg.embed_xmp);
+        assert!(cfg.xmp_sidecar);
+    }
+
+    #[test]
+    fn test_cli_embed_xmp_overrides_toml() {
+        let toml_str = r#"
+            [download]
+            embed_xmp = true
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.embed_xmp = Some(false);
+        let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
+        assert!(
+            !cfg.embed_xmp,
+            "--embed-xmp=false must override TOML embed_xmp = true"
+        );
+    }
+
+    #[test]
+    fn test_embed_xmp_default_false_when_unset() {
+        let cfg =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        assert!(!cfg.embed_xmp);
+        assert!(!cfg.xmp_sidecar);
     }
 
     #[test]
