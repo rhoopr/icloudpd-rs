@@ -108,10 +108,47 @@ impl std::borrow::Borrow<str> for NormalizedPath {
     }
 }
 
+/// Metadata values surfaced on a `DownloadTask` for EXIF enrichment.
+///
+/// Carried separately from the rest of `AssetMetadata` so the download layer
+/// only sees the fields it can actually write to EXIF tags. Fields are owned
+/// (not borrowed) because the task moves across async boundaries.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ExifPayload {
+    /// 1-5 star rating (mapped from `AssetMetadata::rating` or `is_favorite`).
+    pub(super) rating: Option<u8>,
+    /// GPS latitude in decimal degrees, WGS84.
+    pub(super) latitude: Option<f64>,
+    /// GPS longitude in decimal degrees, WGS84.
+    pub(super) longitude: Option<f64>,
+    /// GPS altitude in meters above sea level.
+    pub(super) altitude: Option<f64>,
+    /// Image description text (prefers `description`, falls back to `title`).
+    pub(super) description: Option<String>,
+}
+
+impl ExifPayload {
+    /// Build from `AssetMetadata`, preserving precedence rules from the spec:
+    /// rating falls back to `is_favorite -> 5`; description falls back to title.
+    pub(super) fn from_metadata(meta: &crate::state::AssetMetadata) -> Self {
+        let rating = meta
+            .rating
+            .or(if meta.is_favorite { Some(5) } else { None });
+        let description = meta.description.clone().or_else(|| meta.title.clone());
+        Self {
+            rating,
+            latitude: meta.latitude,
+            longitude: meta.longitude,
+            altitude: meta.altitude,
+            description,
+        }
+    }
+}
+
 /// A unit of work produced by the filter phase and consumed by the download phase.
 ///
 /// Fields ordered for optimal memory layout:
-/// - Heap types first (`Box<str>`, `PathBuf`)
+/// - Heap types first (`Box<str>`, `PathBuf`, `ExifPayload`)
 /// - 8-byte primitives (u64)
 /// - `DateTime` (12-16 bytes)
 /// - 1-byte enum last
@@ -123,6 +160,8 @@ pub(super) struct DownloadTask {
     pub(super) checksum: Box<str>,
     /// iCloud asset ID for state tracking.
     pub(super) asset_id: Box<str>,
+    /// EXIF-writable metadata surfaced from `AssetMetadata`.
+    pub(super) exif: ExifPayload,
     // 8-byte primitives
     pub(super) size: u64,
     // DateTime
@@ -633,6 +672,7 @@ pub(super) fn filter_asset_to_tasks(
                 download_path: path,
                 checksum: version.checksum.clone(),
                 asset_id: asset.id().into(),
+                exif: ExifPayload::from_metadata(asset.metadata()),
                 size: version.size,
                 created_local,
                 version_size: VersionSizeKey::from(effective_size),
@@ -711,6 +751,7 @@ pub(super) fn filter_asset_to_tasks(
                     download_path: path,
                     checksum: live_version.checksum.clone(),
                     asset_id: asset.id().into(),
+                    exif: ExifPayload::from_metadata(asset.metadata()),
                     size: live_version.size,
                     created_local,
                     version_size: VersionSizeKey::from(effective_live_size),
@@ -1302,10 +1343,11 @@ mod tests {
     #[test]
     fn test_download_task_size() {
         use std::mem::size_of;
-        // 144 bytes accommodates platform differences (Windows has larger PathBuf)
+        // Feature 2 added ExifPayload (rating/GPS/description) so each task
+        // carries its write-ready metadata into the download phase.
         assert!(
-            size_of::<DownloadTask>() <= 144,
-            "DownloadTask size {} exceeds 144 bytes",
+            size_of::<DownloadTask>() <= 200,
+            "DownloadTask size {} exceeds 200 bytes",
             size_of::<DownloadTask>()
         );
     }

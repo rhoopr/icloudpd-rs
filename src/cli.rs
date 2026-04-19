@@ -120,6 +120,18 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_SET_EXIF_DATETIME", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub set_exif_datetime: Option<bool>,
 
+    /// Write EXIF `Rating` tag (0x4746) for favorited photos (1-5 scale)
+    #[arg(long, env = "KEI_SET_EXIF_RATING", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub set_exif_rating: Option<bool>,
+
+    /// Write EXIF GPS tags from iCloud location metadata (only when the file lacks GPS)
+    #[arg(long, env = "KEI_SET_EXIF_GPS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub set_exif_gps: Option<bool>,
+
+    /// Write EXIF `ImageDescription` tag from iCloud description / title
+    #[arg(long, env = "KEI_SET_EXIF_DESCRIPTION", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub set_exif_description: Option<bool>,
+
     /// Do not modify local system or iCloud
     #[arg(long, conflicts_with = "watch_with_interval")]
     pub dry_run: bool,
@@ -574,6 +586,15 @@ impl SyncArgs {
         }
         if self.set_exif_datetime.is_none() {
             self.set_exif_datetime = fallback.set_exif_datetime;
+        }
+        if self.set_exif_rating.is_none() {
+            self.set_exif_rating = fallback.set_exif_rating;
+        }
+        if self.set_exif_gps.is_none() {
+            self.set_exif_gps = fallback.set_exif_gps;
+        }
+        if self.set_exif_description.is_none() {
+            self.set_exif_description = fallback.set_exif_description;
         }
         self.dry_run = self.dry_run || fallback.dry_run;
         if self.watch_with_interval.is_none() {

@@ -2,28 +2,83 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+/// EXIF tag 0x4746 (`xmp:Rating` mapping, short in IFD0, 0-5 scale).
+const EXIF_TAG_RATING: u16 = 0x4746;
+
+/// Bundle of EXIF fields to apply in a single read-modify-write cycle.
+///
+/// Any field left `None` is not written. `None` values also mean the caller
+/// chose not to enrich the corresponding tag — they are distinct from the tag
+/// being explicitly cleared, which kei never does.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ExifWrite {
+    /// `"YYYY:MM:DD HH:MM:SS"` string applied to DateTime/DateTimeOriginal/
+    /// DateTimeDigitized. Only written when the file has no DateTimeOriginal.
+    pub(crate) datetime: Option<String>,
+    /// 1-5 star rating. Writes EXIF tag 0x4746.
+    pub(crate) rating: Option<u8>,
+    /// GPS triple (decimal degrees WGS84 for lat/lng; meters for alt). Written
+    /// as EXIF GPS IFD tags only when the file has no existing GPS data.
+    pub(crate) gps: Option<GpsCoords>,
+    /// ImageDescription (EXIF tag 0x010E). Always overwrites.
+    pub(crate) description: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GpsCoords {
+    pub(crate) latitude: f64,
+    pub(crate) longitude: f64,
+    pub(crate) altitude: Option<f64>,
+}
+
+impl ExifWrite {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.datetime.is_none()
+            && self.rating.is_none()
+            && self.gps.is_none()
+            && self.description.is_none()
+    }
+}
+
 /// Read the `DateTimeOriginal` EXIF tag from an image file.
 ///
 /// Uses `kamadak-exif` (read-only EXIF crate). A separate crate (`little_exif`)
 /// handles writing because no single Rust EXIF library supports both reliable
-/// reading and writing. See [`set_photo_exif`] for the write side.
+/// reading and writing. See [`apply_exif`] for the write side.
 ///
 /// Returns `Ok(Some(value))` if the tag is present, `Ok(None)` if the file
 /// has no EXIF data or the tag is missing, and `Err` only on I/O failure.
 pub(crate) fn get_photo_exif(path: &Path) -> Result<Option<String>> {
+    read_exif_tag(path, exif::Tag::DateTimeOriginal)
+}
+
+/// Whether the file already has any of the primary GPS tags populated.
+/// Returns `false` if the file has no EXIF data.
+pub(crate) fn has_gps_data(path: &Path) -> bool {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut bufreader = std::io::BufReader::new(&file);
+    let reader = exif::Reader::new();
+    let Ok(data) = reader.read_from_container(&mut bufreader) else {
+        return false;
+    };
+    data.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)
+        .is_some()
+        || data
+            .get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)
+            .is_some()
+}
+
+fn read_exif_tag(path: &Path, tag: exif::Tag) -> Result<Option<String>> {
     let file = std::fs::File::open(path).with_context(|| format!("Opening {}", path.display()))?;
     let mut bufreader = std::io::BufReader::new(&file);
-    let exif_reader = exif::Reader::new();
-
-    match exif_reader.read_from_container(&mut bufreader) {
-        Ok(exif_data) => {
-            if let Some(field) = exif_data.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
-            {
-                Ok(Some(field.display_value().to_string()))
-            } else {
-                Ok(None)
-            }
-        }
+    let reader = exif::Reader::new();
+    match reader.read_from_container(&mut bufreader) {
+        Ok(data) => Ok(data
+            .get_field(tag, exif::In::PRIMARY)
+            .map(|f| f.display_value().to_string())),
         Err(e) => {
             tracing::debug!(path = %path.display(), error = %e, "No EXIF data");
             Ok(None)
@@ -31,23 +86,40 @@ pub(crate) fn get_photo_exif(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Write the EXIF date tags to a JPEG file.
+/// Write the EXIF date tags to a JPEG file — thin test-only wrapper.
+///
+/// Equivalent to `apply_exif(path, ExifWrite { datetime: Some(..), .. })`.
+/// Production call sites go through `apply_exif` directly.
+#[cfg(test)]
+pub(crate) fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
+    apply_exif(
+        path,
+        &ExifWrite {
+            datetime: Some(datetime_str.to_string()),
+            ..ExifWrite::default()
+        },
+    )
+}
+
+/// Apply the requested EXIF fields to a JPEG file in a single read-modify-write.
 ///
 /// Uses `little_exif` (write-capable EXIF crate). A separate crate (`kamadak-exif`)
 /// handles reading because `little_exif` doesn't support fine-grained tag reads.
-/// See [`get_photo_exif`] for the read side.
 ///
-/// Writes `DateTime`, `DateTimeOriginal`, and `DateTimeDigitized` to match
-/// the behavior of `icloudpd`. The `datetime_str` should be in
-/// `"YYYY:MM:DD HH:MM:SS"` format.
-pub(crate) fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
+/// The write is atomic: metadata is serialized to a sibling `.exif-tmp` file
+/// and renamed over the target. A crash mid-write leaves the original intact.
+pub(crate) fn apply_exif(path: &Path, write: &ExifWrite) -> Result<()> {
     use little_exif::exif_tag::ExifTag;
     use little_exif::filetype::FileExtension;
+    use little_exif::ifd::ExifTagGroup;
     use little_exif::metadata::Metadata;
 
-    // Read the file into memory and use write_to_vec with an explicit
-    // FileExtension::JPEG.  write_to_file derives the type from the file
-    // extension, which fails for .kei-tmp / .part temp files.
+    if write.is_empty() {
+        return Ok(());
+    }
+
+    // Read into memory with explicit FileExtension::JPEG — the download path is
+    // a .part-style temp file whose extension can't be auto-detected.
     let mut buf =
         std::fs::read(path).with_context(|| format!("Reading {} for EXIF", path.display()))?;
 
@@ -55,15 +127,47 @@ pub(crate) fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
         Ok(m) => m,
         Err(_) => Metadata::new(),
     };
-    metadata.set_tag(ExifTag::ModifyDate(datetime_str.to_string()));
-    metadata.set_tag(ExifTag::DateTimeOriginal(datetime_str.to_string()));
-    metadata.set_tag(ExifTag::CreateDate(datetime_str.to_string()));
+
+    if let Some(dt) = &write.datetime {
+        metadata.set_tag(ExifTag::ModifyDate(dt.clone()));
+        metadata.set_tag(ExifTag::DateTimeOriginal(dt.clone()));
+        metadata.set_tag(ExifTag::CreateDate(dt.clone()));
+    }
+
+    if let Some(rating) = write.rating {
+        // EXIF Rating (0x4746) is an INT16U in IFD0. little_exif doesn't have a
+        // named variant, so we use the UnknownINT16U escape hatch.
+        metadata.set_tag(ExifTag::UnknownINT16U(
+            vec![u16::from(rating.min(5))],
+            EXIF_TAG_RATING,
+            ExifTagGroup::GENERIC,
+        ));
+    }
+
+    if let Some(gps) = write.gps {
+        let (lat_ref, lat_triple) = to_gps_ref_and_dms(gps.latitude, "N", "S");
+        let (lng_ref, lng_triple) = to_gps_ref_and_dms(gps.longitude, "E", "W");
+        metadata.set_tag(ExifTag::GPSLatitudeRef(lat_ref));
+        metadata.set_tag(ExifTag::GPSLatitude(lat_triple));
+        metadata.set_tag(ExifTag::GPSLongitudeRef(lng_ref));
+        metadata.set_tag(ExifTag::GPSLongitude(lng_triple));
+        if let Some(alt) = gps.altitude {
+            let alt_ref: u8 = if alt < 0.0 { 1 } else { 0 };
+            metadata.set_tag(ExifTag::GPSAltitudeRef(vec![alt_ref]));
+            metadata.set_tag(ExifTag::GPSAltitude(vec![
+                little_exif::rational::uR64::from(alt.abs()),
+            ]));
+        }
+    }
+
+    if let Some(desc) = &write.description {
+        metadata.set_tag(ExifTag::ImageDescription(desc.clone()));
+    }
+
     metadata
         .write_to_vec(&mut buf, FileExtension::JPEG)
         .with_context(|| format!("Writing EXIF metadata for {}", path.display()))?;
 
-    // Write to a sibling temp file and atomically rename to avoid leaving a
-    // truncated file if the process is killed mid-write.
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".exif-tmp");
     let tmp_path = path.with_file_name(&tmp_name);
@@ -73,11 +177,52 @@ pub(crate) fn set_photo_exif(path: &Path, datetime_str: &str) -> Result<()> {
         .with_context(|| format!("Renaming {} -> {}", tmp_path.display(), path.display()))?;
 
     tracing::debug!(
-        datetime = %datetime_str,
         path = %path.display(),
-        "Set EXIF DateTime/DateTimeOriginal/DateTimeDigitized"
+        datetime = ?write.datetime.as_deref(),
+        rating = ?write.rating,
+        has_gps = write.gps.is_some(),
+        has_description = write.description.is_some(),
+        "Applied EXIF metadata"
     );
     Ok(())
+}
+
+/// Decompose a decimal degree value into an EXIF GPS `[deg, min, sec]` rational
+/// triple plus its hemisphere reference.
+fn to_gps_ref_and_dms(
+    deg: f64,
+    positive_ref: &str,
+    negative_ref: &str,
+) -> (String, Vec<little_exif::rational::uR64>) {
+    use little_exif::rational::uR64;
+    let hemisphere = if deg >= 0.0 {
+        positive_ref
+    } else {
+        negative_ref
+    };
+    let abs = deg.abs();
+    let d = abs.floor();
+    let m_frac = (abs - d) * 60.0;
+    let m = m_frac.floor();
+    let s = (m_frac - m) * 60.0;
+    // Store seconds with 4-decimal precision, which is enough to round-trip
+    // Apple's f64 lat/lng to ~1 cm accuracy.
+    let s_scaled = (s * 10_000.0).round();
+    let triple = vec![
+        uR64 {
+            nominator: d as u32,
+            denominator: 1,
+        },
+        uR64 {
+            nominator: m as u32,
+            denominator: 1,
+        },
+        uR64 {
+            nominator: s_scaled as u32,
+            denominator: 10_000,
+        },
+    ];
+    (hemisphere.to_string(), triple)
 }
 
 #[cfg(test)]
@@ -256,5 +401,261 @@ mod tests {
         assert_eq!(result, Some("2025-01-01 00:00:00".to_string()));
 
         fs::remove_file(&path).ok();
+    }
+
+    // ── Feature 2: rating / GPS / description writers ───────────────────
+
+    fn read_field(path: &Path, tag: exif::Tag) -> Option<String> {
+        let file = std::fs::File::open(path).ok()?;
+        let mut r = std::io::BufReader::new(&file);
+        let data = exif::Reader::new().read_from_container(&mut r).ok()?;
+        data.get_field(tag, exif::In::PRIMARY)
+            .map(|f| f.display_value().to_string())
+    }
+
+    fn read_u32_field(path: &Path, tag: exif::Tag) -> Option<u32> {
+        let file = std::fs::File::open(path).ok()?;
+        let mut r = std::io::BufReader::new(&file);
+        let data = exif::Reader::new().read_from_container(&mut r).ok()?;
+        data.get_field(tag, exif::In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0))
+    }
+
+    #[test]
+    fn apply_exif_is_noop_when_empty() {
+        let dir = test_tmp_dir("exif_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("noop.jpg");
+        fs::write(&path, minimal_jpeg()).unwrap();
+        let before = fs::read(&path).unwrap();
+        apply_exif(&path, &ExifWrite::default()).unwrap();
+        let after = fs::read(&path).unwrap();
+        assert_eq!(before, after, "empty write must not touch the file");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_exif_rating_roundtrips() {
+        let dir = test_tmp_dir("exif_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rating.jpg");
+        fs::write(&path, minimal_jpeg()).unwrap();
+
+        apply_exif(
+            &path,
+            &ExifWrite {
+                rating: Some(4),
+                ..ExifWrite::default()
+            },
+        )
+        .unwrap();
+
+        // Tag 0x4746 is Rating (no named constant in kamadak-exif).
+        let rating = read_u32_field(&path, exif::Tag(exif::Context::Tiff, 0x4746))
+            .expect("Rating tag missing");
+        assert_eq!(rating, 4);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_exif_rating_clamps_above_5() {
+        let dir = test_tmp_dir("exif_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rating_clamp.jpg");
+        fs::write(&path, minimal_jpeg()).unwrap();
+
+        apply_exif(
+            &path,
+            &ExifWrite {
+                rating: Some(99),
+                ..ExifWrite::default()
+            },
+        )
+        .unwrap();
+
+        let rating = read_u32_field(&path, exif::Tag(exif::Context::Tiff, 0x4746)).unwrap();
+        assert_eq!(rating, 5, "rating must clamp to 5");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_exif_gps_writes_ref_and_dms_triple() {
+        let dir = test_tmp_dir("exif_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gps.jpg");
+        fs::write(&path, minimal_jpeg()).unwrap();
+
+        apply_exif(
+            &path,
+            &ExifWrite {
+                gps: Some(GpsCoords {
+                    latitude: 37.7749,
+                    longitude: -122.4194,
+                    altitude: Some(17.0),
+                }),
+                ..ExifWrite::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_field(&path, exif::Tag::GPSLatitudeRef).as_deref(),
+            Some("N")
+        );
+        assert_eq!(
+            read_field(&path, exif::Tag::GPSLongitudeRef).as_deref(),
+            Some("W")
+        );
+        // GPSLatitude / GPSLongitude are displayed as "deg/1, min/1, sec/10000"
+        // in kamadak-exif. Just verify they're present — decomposition is
+        // covered by the unit test on to_gps_ref_and_dms.
+        assert!(read_field(&path, exif::Tag::GPSLatitude).is_some());
+        assert!(read_field(&path, exif::Tag::GPSLongitude).is_some());
+        // Altitude is RATIONAL64U meters; ref=0 means above sea level.
+        assert!(read_field(&path, exif::Tag::GPSAltitude).is_some());
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_exif_gps_negative_altitude_sets_alt_ref_1() {
+        let dir = test_tmp_dir("exif_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gps_neg_alt.jpg");
+        fs::write(&path, minimal_jpeg()).unwrap();
+
+        apply_exif(
+            &path,
+            &ExifWrite {
+                gps: Some(GpsCoords {
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    altitude: Some(-50.0),
+                }),
+                ..ExifWrite::default()
+            },
+        )
+        .unwrap();
+
+        let alt_ref = read_u32_field(&path, exif::Tag::GPSAltitudeRef).unwrap();
+        assert_eq!(alt_ref, 1, "below-sea-level altitude must set ref = 1");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_exif_description_roundtrips() {
+        let dir = test_tmp_dir("exif_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("desc.jpg");
+        fs::write(&path, minimal_jpeg()).unwrap();
+
+        apply_exif(
+            &path,
+            &ExifWrite {
+                description: Some("Beach sunset".to_string()),
+                ..ExifWrite::default()
+            },
+        )
+        .unwrap();
+
+        let desc = read_field(&path, exif::Tag::ImageDescription).unwrap();
+        assert!(
+            desc.contains("Beach sunset"),
+            "expected description to contain 'Beach sunset', got {desc}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_exif_all_fields_single_pass() {
+        let dir = test_tmp_dir("exif_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("all.jpg");
+        fs::write(&path, minimal_jpeg()).unwrap();
+
+        apply_exif(
+            &path,
+            &ExifWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                rating: Some(3),
+                gps: Some(GpsCoords {
+                    latitude: 1.0,
+                    longitude: 2.0,
+                    altitude: None,
+                }),
+                description: Some("caption".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_field(&path, exif::Tag::DateTimeOriginal).as_deref(),
+            Some("2024-06-15 10:00:00")
+        );
+        assert_eq!(
+            read_u32_field(&path, exif::Tag(exif::Context::Tiff, 0x4746)),
+            Some(3)
+        );
+        assert_eq!(
+            read_field(&path, exif::Tag::GPSLatitudeRef).as_deref(),
+            Some("N")
+        );
+        assert!(read_field(&path, exif::Tag::ImageDescription)
+            .unwrap()
+            .contains("caption"));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn has_gps_data_false_on_blank_jpeg() {
+        let dir = test_tmp_dir("exif_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("no_gps.jpg");
+        fs::write(&path, minimal_jpeg()).unwrap();
+        assert!(!has_gps_data(&path));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn has_gps_data_true_after_write() {
+        let dir = test_tmp_dir("exif_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("with_gps.jpg");
+        fs::write(&path, minimal_jpeg()).unwrap();
+        apply_exif(
+            &path,
+            &ExifWrite {
+                gps: Some(GpsCoords {
+                    latitude: 10.0,
+                    longitude: 20.0,
+                    altitude: None,
+                }),
+                ..ExifWrite::default()
+            },
+        )
+        .unwrap();
+        assert!(has_gps_data(&path));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn to_gps_ref_and_dms_positive_latitude() {
+        let (refstr, triple) = to_gps_ref_and_dms(37.7749, "N", "S");
+        assert_eq!(refstr, "N");
+        assert_eq!(triple.len(), 3);
+        assert_eq!(triple[0].nominator, 37);
+        assert_eq!(triple[1].nominator, 46); // 0.7749 * 60 = 46.494
+                                             // seconds with 4-decimal scaling: (0.494 * 60) * 10000 ≈ 296400
+        assert!(
+            triple[2].nominator > 290_000 && triple[2].nominator < 300_000,
+            "seconds nominator was {}",
+            triple[2].nominator
+        );
+    }
+
+    #[test]
+    fn to_gps_ref_and_dms_negative_longitude() {
+        let (refstr, triple) = to_gps_ref_and_dms(-122.4194, "E", "W");
+        assert_eq!(refstr, "W");
+        assert_eq!(triple[0].nominator, 122);
     }
 }

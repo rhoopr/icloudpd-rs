@@ -708,6 +708,9 @@ fn generate_toml(answers: &SetupAnswers) -> String {
     } else {
         writeln!(out, "# set_exif_datetime = false").ok();
     }
+    writeln!(out, "# set_exif_rating = false").ok();
+    writeln!(out, "# set_exif_gps = false").ok();
+    writeln!(out, "# set_exif_description = false").ok();
     writeln!(out, "# temp_suffix = \".kei-tmp\"").ok();
     writeln!(out, "# no_progress_bar = false").ok();
 

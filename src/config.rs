@@ -48,6 +48,9 @@ pub(crate) struct TomlDownload {
     pub threads_num: Option<u16>,
     pub temp_suffix: Option<String>,
     pub set_exif_datetime: Option<bool>,
+    pub set_exif_rating: Option<bool>,
+    pub set_exif_gps: Option<bool>,
+    pub set_exif_description: Option<bool>,
     pub no_progress_bar: Option<bool>,
     pub retry: Option<TomlRetry>,
 }
@@ -229,6 +232,9 @@ pub struct Config {
     pub skip_photos: bool,
     pub force_size: bool,
     pub set_exif_datetime: bool,
+    pub set_exif_rating: bool,
+    pub set_exif_gps: bool,
+    pub set_exif_description: bool,
     pub dry_run: bool,
     pub no_progress_bar: bool,
     pub keep_unicode_in_filenames: bool,
@@ -519,6 +525,15 @@ impl Config {
             sync.set_exif_datetime,
             toml_dl.and_then(|d| d.set_exif_datetime),
         );
+        let set_exif_rating = resolve_flag(
+            sync.set_exif_rating,
+            toml_dl.and_then(|d| d.set_exif_rating),
+        );
+        let set_exif_gps = resolve_flag(sync.set_exif_gps, toml_dl.and_then(|d| d.set_exif_gps));
+        let set_exif_description = resolve_flag(
+            sync.set_exif_description,
+            toml_dl.and_then(|d| d.set_exif_description),
+        );
         let no_progress_bar = resolve_flag(
             sync.no_progress_bar,
             toml_dl.and_then(|d| d.no_progress_bar),
@@ -722,6 +737,9 @@ impl Config {
             skip_photos,
             force_size,
             set_exif_datetime,
+            set_exif_rating,
+            set_exif_gps,
+            set_exif_description,
             dry_run: sync.dry_run,
             no_progress_bar,
             keep_unicode_in_filenames,
@@ -776,6 +794,17 @@ impl Config {
                     Some(self.temp_suffix.clone())
                 },
                 set_exif_datetime: if self.set_exif_datetime {
+                    Some(true)
+                } else {
+                    None
+                },
+                set_exif_rating: if self.set_exif_rating {
+                    Some(true)
+                } else {
+                    None
+                },
+                set_exif_gps: if self.set_exif_gps { Some(true) } else { None },
+                set_exif_description: if self.set_exif_description {
                     Some(true)
                 } else {
                     None
@@ -947,6 +976,9 @@ pub(crate) fn persist_first_run_config(
             threads_num: None,
             temp_suffix: None,
             set_exif_datetime: None,
+            set_exif_rating: None,
+            set_exif_gps: None,
+            set_exif_description: None,
             no_progress_bar: None,
             retry: None,
         }),

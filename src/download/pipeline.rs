@@ -24,7 +24,7 @@ use crate::state::{AssetRecord, StateDb, SyncRunStats};
 use super::error::DownloadError;
 use super::filter::{
     determine_media_type, extract_skip_candidates, filter_asset_to_tasks, is_asset_filtered,
-    pre_ensure_asset_dir, DownloadTask, FilterReason, NormalizedPath,
+    pre_ensure_asset_dir, DownloadTask, ExifPayload, FilterReason, NormalizedPath,
 };
 use super::{paths, DownloadConfig, DownloadContext, DownloadOutcome};
 
@@ -241,11 +241,27 @@ fn create_progress_bar(
     pb
 }
 
+/// Per-tag EXIF write toggles. `any()` drives the `.part`-and-modify-before-rename
+/// flow; individual flags gate which tags get written in `apply_exif`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ExifFlags {
+    pub(super) datetime: bool,
+    pub(super) rating: bool,
+    pub(super) gps: bool,
+    pub(super) description: bool,
+}
+
+impl ExifFlags {
+    pub(super) fn any(&self) -> bool {
+        self.datetime || self.rating || self.gps || self.description
+    }
+}
+
 /// Configuration for a download pass.
 pub(super) struct PassConfig<'a> {
     pub(super) client: &'a Client,
     pub(super) retry_config: &'a RetryConfig,
-    pub(super) set_exif: bool,
+    pub(super) exif: ExifFlags,
     pub(super) concurrency: usize,
     pub(super) no_progress_bar: bool,
     pub(super) temp_suffix: String,
@@ -256,7 +272,7 @@ pub(super) struct PassConfig<'a> {
 impl std::fmt::Debug for PassConfig<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PassConfig")
-            .field("set_exif", &self.set_exif)
+            .field("exif", &self.exif)
             .field("concurrency", &self.concurrency)
             .field("no_progress_bar", &self.no_progress_bar)
             .field("temp_suffix", &self.temp_suffix)
@@ -387,7 +403,12 @@ where
 
     let download_client = download_client.clone();
     let retry_config = config.retry;
-    let set_exif = config.set_exif_datetime;
+    let exif_flags = ExifFlags {
+        datetime: config.set_exif_datetime,
+        rating: config.set_exif_rating,
+        gps: config.set_exif_gps,
+        description: config.set_exif_description,
+    };
     let concurrency = config.concurrent_downloads;
     let state_db = config.state_db.clone();
 
@@ -826,7 +847,7 @@ where
                     &client,
                     &task,
                     &retry_config,
-                    set_exif,
+                    exif_flags,
                     &temp_suffix,
                 ))
                 .await;
@@ -1122,7 +1143,12 @@ pub(super) async fn build_download_outcome(
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
-        set_exif: config.set_exif_datetime,
+        exif: ExifFlags {
+            datetime: config.set_exif_datetime,
+            rating: config.set_exif_rating,
+            gps: config.set_exif_gps,
+            description: config.set_exif_description,
+        },
         concurrency: cleanup_concurrency,
         no_progress_bar: config.no_progress_bar,
         temp_suffix: config.temp_suffix.clone(),
@@ -1207,7 +1233,7 @@ pub(super) async fn run_download_pass(
     let pb = create_progress_bar(config.no_progress_bar, false, tasks.len() as u64);
     let client = config.client.clone();
     let retry_config = config.retry_config;
-    let set_exif = config.set_exif;
+    let exif_flags = config.exif;
     let state_db = config.state_db.clone();
     let shutdown_token = config.shutdown_token.clone();
     let concurrency = config.concurrency;
@@ -1227,7 +1253,7 @@ pub(super) async fn run_download_pass(
                     &client,
                     &task,
                     retry_config,
-                    set_exif,
+                    exif_flags,
                     &temp_suffix,
                 ))
                 .await;
@@ -1331,6 +1357,56 @@ pub(super) async fn run_download_pass(
     }
 }
 
+/// Decide which EXIF fields to apply, honouring the spec's per-tag gates:
+///
+/// - **Datetime**: only when the file has no `DateTimeOriginal` (preserves
+///   camera-supplied timestamps).
+/// - **Rating / description**: always overwrite when the flag is set — iCloud
+///   is the source of truth for these.
+/// - **GPS**: only when the file has no existing GPS IFD.
+fn plan_exif_write(
+    flags: ExifFlags,
+    payload: &ExifPayload,
+    created_local: &chrono::DateTime<chrono::Local>,
+    path: &std::path::Path,
+) -> super::exif::ExifWrite {
+    let mut write = super::exif::ExifWrite::default();
+
+    if flags.datetime {
+        match super::exif::get_photo_exif(path) {
+            Ok(None) => {
+                write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
+            }
+            Ok(Some(_)) => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "Failed to read EXIF");
+            }
+        }
+    }
+
+    if flags.rating {
+        write.rating = payload.rating;
+    }
+
+    if flags.gps {
+        if let (Some(lat), Some(lng)) = (payload.latitude, payload.longitude) {
+            if !super::exif::has_gps_data(path) {
+                write.gps = Some(super::exif::GpsCoords {
+                    latitude: lat,
+                    longitude: lng,
+                    altitude: payload.altitude,
+                });
+            }
+        }
+    }
+
+    if flags.description {
+        write.description = payload.description.clone();
+    }
+
+    write
+}
+
 /// Download a single task, handling mtime and EXIF stamping on success.
 ///
 /// Returns `Ok(true)` on full success, `Ok(false)` if the download succeeded
@@ -1339,7 +1415,7 @@ async fn download_single_task(
     client: &Client,
     task: &DownloadTask,
     retry_config: &RetryConfig,
-    set_exif: bool,
+    exif_flags: ExifFlags,
     temp_suffix: &str,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
     if let Some(parent) = task.download_path.parent() {
@@ -1356,7 +1432,8 @@ async fn download_single_task(
 
     // Determine if EXIF modification is needed so we can keep the .part file
     // around for modification before the atomic rename to the final path.
-    let needs_exif = set_exif && {
+    // Any EXIF flag enabled + JPEG extension -> rewrite before rename.
+    let needs_exif = exif_flags.any() && {
         let ext = task
             .download_path
             .extension()
@@ -1401,24 +1478,19 @@ async fn download_single_task(
     let mut exif_ok = true;
     if let Some(part) = &part_path {
         let exif_path = part.clone();
-        let date_str = task.created_local.format("%Y:%m:%d %H:%M:%S").to_string();
-        let exif_result =
-            tokio::task::spawn_blocking(move || match super::exif::get_photo_exif(&exif_path) {
-                Ok(None) => {
-                    if let Err(e) = super::exif::set_photo_exif(&exif_path, &date_str) {
-                        tracing::warn!(path = %exif_path.display(), error = %e, "Failed to set EXIF");
-                        false
-                    } else {
-                        true
-                    }
-                }
-                Ok(Some(_)) => true,
-                Err(e) => {
-                    tracing::warn!(path = %exif_path.display(), error = %e, "Failed to read EXIF");
-                    false
-                }
-            })
-            .await;
+        let write = plan_exif_write(exif_flags, &task.exif, &task.created_local, &exif_path);
+        let exif_result = tokio::task::spawn_blocking(move || {
+            if write.is_empty() {
+                return true;
+            }
+            if let Err(e) = super::exif::apply_exif(&exif_path, &write) {
+                tracing::warn!(path = %exif_path.display(), error = %e, "Failed to write EXIF");
+                false
+            } else {
+                true
+            }
+        })
+        .await;
         match exif_result {
             Ok(ok) => exif_ok = ok,
             Err(e) => {
@@ -1763,6 +1835,7 @@ mod tests {
                                 created_local: chrono::Local::now(),
                                 size: 1000,
                                 asset_id: "ASSET_A".into(),
+                                exif: ExifPayload::default(),
                                 version_size: VersionSizeKey::Original,
                             },
                             DownloadTask {
@@ -1772,6 +1845,7 @@ mod tests {
                                 created_local: chrono::Local::now(),
                                 size: 2000,
                                 asset_id: "ASSET_B".into(),
+                                exif: ExifPayload::default(),
                                 version_size: VersionSizeKey::Original,
                             },
                         ];
@@ -1782,7 +1856,7 @@ mod tests {
                         let pass_config = PassConfig {
                             client: &client,
                             retry_config: &retry,
-                            set_exif: false,
+                            exif: ExifFlags::default(),
                             concurrency: 1,
                             no_progress_bar: true,
                             temp_suffix: ".kei-tmp".to_string(),
@@ -1818,6 +1892,7 @@ mod tests {
                             created_local: chrono::Local::now(),
                             size: 500,
                             asset_id: "ASSET_C".into(),
+                            exif: ExifPayload::default(),
                             version_size: VersionSizeKey::Original,
                         }];
 
@@ -1831,7 +1906,7 @@ mod tests {
                         let pass_config = PassConfig {
                             client: &client,
                             retry_config: &retry,
-                            set_exif: false,
+                            exif: ExifFlags::default(),
                             concurrency: 1,
                             no_progress_bar: true,
                             temp_suffix: ".kei-tmp".to_string(),
@@ -2267,6 +2342,9 @@ mod tests {
             skip_created_before: None,
             skip_created_after: None,
             set_exif_datetime: false,
+            set_exif_rating: false,
+            set_exif_gps: false,
+            set_exif_description: false,
             dry_run: false,
             concurrent_downloads: 10,
             recent: None,
@@ -2341,6 +2419,9 @@ mod tests {
             skip_created_before: None,
             skip_created_after: None,
             set_exif_datetime: false,
+            set_exif_rating: false,
+            set_exif_gps: false,
+            set_exif_description: false,
             dry_run: false,
             concurrent_downloads: 1,
             recent: None,

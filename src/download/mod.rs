@@ -12,7 +12,7 @@ pub(crate) mod pipeline;
 
 use pipeline::{
     build_download_outcome, format_duration, log_sync_summary, run_download_pass,
-    stream_and_download_from_stream, PassConfig, StreamingResult, AUTH_ERROR_THRESHOLD,
+    stream_and_download_from_stream, ExifFlags, PassConfig, StreamingResult, AUTH_ERROR_THRESHOLD,
 };
 
 pub(crate) use filter::determine_media_type;
@@ -360,6 +360,9 @@ pub(crate) struct DownloadConfig {
     pub(crate) skip_created_before: Option<DateTime<Utc>>,
     pub(crate) skip_created_after: Option<DateTime<Utc>>,
     pub(crate) set_exif_datetime: bool,
+    pub(crate) set_exif_rating: bool,
+    pub(crate) set_exif_gps: bool,
+    pub(crate) set_exif_description: bool,
     pub(crate) dry_run: bool,
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
@@ -426,6 +429,9 @@ impl std::fmt::Debug for DownloadConfig {
             .field("skip_created_before", &self.skip_created_before)
             .field("skip_created_after", &self.skip_created_after)
             .field("set_exif_datetime", &self.set_exif_datetime)
+            .field("set_exif_rating", &self.set_exif_rating)
+            .field("set_exif_gps", &self.set_exif_gps)
+            .field("set_exif_description", &self.set_exif_description)
             .field("dry_run", &self.dry_run)
             .field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
@@ -468,6 +474,9 @@ impl DownloadConfig {
             skip_created_before: None,
             skip_created_after: None,
             set_exif_datetime: false,
+            set_exif_rating: false,
+            set_exif_gps: false,
+            set_exif_description: false,
             dry_run: false,
             concurrent_downloads: 1,
             recent: None,
@@ -1323,7 +1332,12 @@ async fn download_photos_incremental(
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
-        set_exif: config.set_exif_datetime,
+        exif: ExifFlags {
+            datetime: config.set_exif_datetime,
+            rating: config.set_exif_rating,
+            gps: config.set_exif_gps,
+            description: config.set_exif_description,
+        },
         concurrency: config.concurrent_downloads,
         no_progress_bar: config.no_progress_bar,
         temp_suffix: config.temp_suffix.clone(),
@@ -1859,6 +1873,9 @@ mod tests {
             skip_photos: false,
             force_size: false,
             set_exif_datetime: false,
+            set_exif_rating: false,
+            set_exif_gps: false,
+            set_exif_description: false,
             dry_run: false,
             no_progress_bar: true,
             keep_unicode_in_filenames: false,
