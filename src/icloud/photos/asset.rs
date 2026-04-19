@@ -140,9 +140,9 @@ fn extract_versions(
             tracing::warn!(
                 asset = %record_name,
                 field = format_args!("{res_field}.size"),
-                "Missing size, defaulting to 0"
+                "Missing size, skipping version"
             );
-            0
+            continue;
         };
 
         let url: Box<str> = if let Some(u) = res_entry["downloadURL"].as_str() {
@@ -1792,10 +1792,10 @@ mod tests {
         );
     }
 
-    // ── Gap: asset with missing size defaults to 0 ───────────────────
+    // ── Gap: asset with missing size skips the version ───────────────
 
     #[test]
-    fn extract_versions_missing_size_defaults_to_zero() {
+    fn extract_versions_missing_size_skips_version() {
         let asset = make_asset(
             json!({"fields": {
                 "itemType": {"value": "public.jpeg"},
@@ -1807,14 +1807,12 @@ mod tests {
             }}),
             json!({"fields": {}}),
         );
-        // Missing size should default to 0, not skip the version entirely
-        assert_eq!(
-            asset.versions().len(),
-            1,
-            "version with missing size should still be extracted"
+        // A size-less version cannot be reliably downloaded or verified.
+        // Skip it so a 0-byte placeholder doesn't poison downstream decisions.
+        assert!(
+            asset.versions().is_empty(),
+            "version with missing size should be skipped"
         );
-        let orig = asset.get_version(AssetVersionSize::Original).unwrap();
-        assert_eq!(orig.size, 0, "missing size should default to 0");
     }
 
     // ── Gap: asset with empty string downloadURL ─────────────────────
