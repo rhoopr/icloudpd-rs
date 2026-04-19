@@ -162,95 +162,7 @@ fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite) -> Result<()> 
         let mut meta = file
             .xmp()
             .unwrap_or_else(|| XmpMeta::new().unwrap_or_default());
-
-        if let Some(dt) = &write.datetime {
-            // XMP uses ISO 8601 datetimes; our stored form is the EXIF-style
-            // "YYYY:MM:DD HH:MM:SS". Convert for XMP, keep a local EXIF copy
-            // so XMP Toolkit's reconciler writes the native block too.
-            let iso = exif_datetime_to_iso(dt);
-            meta.set_property(xmp_ns::XMP, "CreateDate", &XmpValue::new(iso.clone()))?;
-            meta.set_property(xmp_ns::XMP, "ModifyDate", &XmpValue::new(iso.clone()))?;
-            meta.set_property(
-                xmp_ns::EXIF,
-                "DateTimeOriginal",
-                &XmpValue::new(iso.clone()),
-            )?;
-            meta.set_property(xmp_ns::PHOTOSHOP, "DateCreated", &XmpValue::new(iso))?;
-        }
-
-        if let Some(r) = write.rating {
-            meta.set_property_i32(xmp_ns::XMP, "Rating", &XmpValue::new(i32::from(r.min(5))))?;
-        }
-
-        if let Some(gps) = write.gps {
-            meta.set_property(
-                xmp_ns::EXIF,
-                "GPSLatitude",
-                &XmpValue::new(encode_gps(gps.latitude, 'N', 'S')),
-            )?;
-            meta.set_property(
-                xmp_ns::EXIF,
-                "GPSLongitude",
-                &XmpValue::new(encode_gps(gps.longitude, 'E', 'W')),
-            )?;
-            if let Some(alt) = gps.altitude {
-                meta.set_property(
-                    xmp_ns::EXIF,
-                    "GPSAltitude",
-                    &XmpValue::new(encode_altitude(alt)),
-                )?;
-                meta.set_property(
-                    xmp_ns::EXIF,
-                    "GPSAltitudeRef",
-                    &XmpValue::new(if alt < 0.0 { "1" } else { "0" }.to_string()),
-                )?;
-            }
-        }
-
-        if let Some(title) = &write.title {
-            meta.set_localized_text(xmp_ns::DC, "title", None, "x-default", title)?;
-        }
-
-        if let Some(desc) = &write.description {
-            meta.set_localized_text(xmp_ns::DC, "description", None, "x-default", desc)?;
-        }
-
-        if !write.keywords.is_empty() {
-            // Clear existing dc:subject so we don't accumulate stale entries on
-            // re-writes. XMP Toolkit has no bulk set for bags.
-            let _ = meta.delete_property(xmp_ns::DC, "subject");
-            for kw in &write.keywords {
-                meta.append_array_item(
-                    xmp_ns::DC,
-                    &XmpValue::new("subject".to_string()).set_is_array(true),
-                    &XmpValue::new(kw.clone()),
-                )?;
-            }
-        }
-
-        if !write.people.is_empty() {
-            let _ = meta.delete_property(xmp_ns::IPTC_EXT, "PersonInImage");
-            for name in &write.people {
-                meta.append_array_item(
-                    xmp_ns::IPTC_EXT,
-                    &XmpValue::new("PersonInImage".to_string()).set_is_array(true),
-                    &XmpValue::new(name.clone()),
-                )?;
-            }
-        }
-
-        if write.is_hidden {
-            meta.set_property_bool(KEI_XMP_NS, "hidden", &XmpValue::new(true))?;
-        }
-        if write.is_archived {
-            meta.set_property_bool(KEI_XMP_NS, "archived", &XmpValue::new(true))?;
-        }
-        if let Some(subtype) = &write.media_subtype {
-            meta.set_property(KEI_XMP_NS, "mediaSubtype", &XmpValue::new(subtype.clone()))?;
-        }
-        if let Some(burst) = &write.burst_id {
-            meta.set_property(KEI_XMP_NS, "burstId", &XmpValue::new(burst.clone()))?;
-        }
+        apply_to_xmp(&mut meta, write)?;
 
         if !file.can_put_xmp(&meta) {
             anyhow::bail!(
@@ -280,17 +192,124 @@ fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite) -> Result<()> 
     }
 }
 
-/// HEIC write path: serialize the requested fields into an XMP packet, then
-/// insert it as a MIME item inside the HEIC's `meta` box using an ISO-BMFF
-/// atom editor. Operates on file bytes directly so the encoded image data in
-/// `mdat` stays byte-for-byte identical — honouring invariant 2 (never modify
-/// user data without explicit instruction).
+/// Apply the requested metadata fields to an `XmpMeta`. Single source of
+/// truth — both the xmp_toolkit-backed and ISO-BMFF-backed writers route
+/// through here so the two paths produce identical XMP content.
+fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpResult<()> {
+    if let Some(dt) = &write.datetime {
+        // XMP uses ISO 8601; our stored form is EXIF-style "YYYY:MM:DD HH:MM:SS".
+        // Convert for XMP, keep a local EXIF copy so XMP Toolkit's reconciler
+        // writes the native block too on formats that have one.
+        let iso = exif_datetime_to_iso(dt);
+        meta.set_property(xmp_ns::XMP, "CreateDate", &XmpValue::new(iso.clone()))?;
+        meta.set_property(xmp_ns::XMP, "ModifyDate", &XmpValue::new(iso.clone()))?;
+        meta.set_property(
+            xmp_ns::EXIF,
+            "DateTimeOriginal",
+            &XmpValue::new(iso.clone()),
+        )?;
+        meta.set_property(xmp_ns::PHOTOSHOP, "DateCreated", &XmpValue::new(iso))?;
+    }
+
+    if let Some(r) = write.rating {
+        meta.set_property_i32(xmp_ns::XMP, "Rating", &XmpValue::new(i32::from(r.min(5))))?;
+    }
+
+    if let Some(gps) = write.gps {
+        meta.set_property(
+            xmp_ns::EXIF,
+            "GPSLatitude",
+            &XmpValue::new(encode_gps(gps.latitude, 'N', 'S')),
+        )?;
+        meta.set_property(
+            xmp_ns::EXIF,
+            "GPSLongitude",
+            &XmpValue::new(encode_gps(gps.longitude, 'E', 'W')),
+        )?;
+        if let Some(alt) = gps.altitude {
+            meta.set_property(
+                xmp_ns::EXIF,
+                "GPSAltitude",
+                &XmpValue::new(encode_altitude(alt)),
+            )?;
+            meta.set_property(
+                xmp_ns::EXIF,
+                "GPSAltitudeRef",
+                &XmpValue::new(if alt < 0.0 { "1" } else { "0" }.to_string()),
+            )?;
+        }
+    }
+
+    if let Some(title) = &write.title {
+        meta.set_localized_text(xmp_ns::DC, "title", None, "x-default", title)?;
+    }
+
+    if let Some(desc) = &write.description {
+        meta.set_localized_text(xmp_ns::DC, "description", None, "x-default", desc)?;
+    }
+
+    if !write.keywords.is_empty() {
+        // Clear existing dc:subject so we don't accumulate stale entries on
+        // re-writes. XMP Toolkit has no bulk set for bags.
+        let _ = meta.delete_property(xmp_ns::DC, "subject");
+        for kw in &write.keywords {
+            meta.append_array_item(
+                xmp_ns::DC,
+                &XmpValue::new("subject".to_string()).set_is_array(true),
+                &XmpValue::new(kw.clone()),
+            )?;
+        }
+    }
+
+    if !write.people.is_empty() {
+        let _ = meta.delete_property(xmp_ns::IPTC_EXT, "PersonInImage");
+        for name in &write.people {
+            meta.append_array_item(
+                xmp_ns::IPTC_EXT,
+                &XmpValue::new("PersonInImage".to_string()).set_is_array(true),
+                &XmpValue::new(name.clone()),
+            )?;
+        }
+    }
+
+    if write.is_hidden {
+        meta.set_property_bool(KEI_XMP_NS, "hidden", &XmpValue::new(true))?;
+    }
+    if write.is_archived {
+        meta.set_property_bool(KEI_XMP_NS, "archived", &XmpValue::new(true))?;
+    }
+    if let Some(subtype) = &write.media_subtype {
+        meta.set_property(KEI_XMP_NS, "mediaSubtype", &XmpValue::new(subtype.clone()))?;
+    }
+    if let Some(burst) = &write.burst_id {
+        meta.set_property(KEI_XMP_NS, "burstId", &XmpValue::new(burst.clone()))?;
+    }
+
+    Ok(())
+}
+
+/// HEIC write path: read any existing XMP, apply our fields on top, and
+/// insert the resulting packet as a MIME item inside the HEIC's `meta` box.
+/// Operates on file bytes directly via ISO-BMFF atom editing so the encoded
+/// image data in `mdat` stays byte-for-byte identical — invariant 2.
 fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
     ensure_initialized();
 
     let input = std::fs::read(path)
         .with_context(|| format!("Reading {} for HEIC update", path.display()))?;
-    let xmp_bytes = build_xmp_packet(write)?;
+
+    // Preserve any XMP the file already carries (e.g. Apple Live Photo or
+    // depth markers) by parsing it into the XmpMeta we mutate. If parsing
+    // fails or there's no existing XMP, start from an empty packet.
+    let existing_xmp_bytes = extract_xmp_bytes_from_heif(&input);
+    let mut meta = existing_xmp_bytes
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|s| s.parse::<XmpMeta>().ok())
+        .unwrap_or_else(|| XmpMeta::new().unwrap_or_default());
+    apply_to_xmp(&mut meta, write)?;
+    let xmp_bytes = meta.to_string().into_bytes();
+
     let new_bytes = insert_xmp_into_heif(&input, &xmp_bytes)
         .with_context(|| format!("Inserting XMP into HEIC {}", path.display()))?;
 
@@ -303,6 +322,39 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
         .with_context(|| format!("Renaming {} -> {}", tmp_path.display(), path.display()))?;
     tracing::debug!(path = %path.display(), "Applied HEIC metadata");
     Ok(())
+}
+
+/// Locate the XMP packet bytes embedded in a HEIC file, if any. Returns the
+/// raw RDF/XML payload referenced by the first `mime`-type item with
+/// content_type `"application/rdf+xml"`. Used by the write path to preserve
+/// existing XMP on rewrite (symmetric with xmp_toolkit's `file.xmp()`).
+fn extract_xmp_bytes_from_heif(bytes: &[u8]) -> Option<Vec<u8>> {
+    use mp4_atom::{Any, DecodeMaybe, FourCC, Iinf, Iloc};
+    let mut cursor: &[u8] = bytes;
+    while let Ok(Some(atom)) = Any::decode_maybe(&mut cursor) {
+        let Any::Meta(meta) = atom else { continue };
+        let iinf = meta.get::<Iinf>()?;
+        let iloc = meta.get::<Iloc>()?;
+        let xmp_entry = iinf.item_infos.iter().find(|e| {
+            e.item_type == Some(FourCC::new(b"mime"))
+                && e.content_type.as_deref() == Some("application/rdf+xml")
+        })?;
+        let loc = iloc
+            .item_locations
+            .iter()
+            .find(|l| l.item_id == xmp_entry.item_id)?;
+        if loc.construction_method != 0 {
+            return None;
+        }
+        let extent = loc.extents.first()?;
+        let start = loc.base_offset.saturating_add(extent.offset) as usize;
+        let end = start + extent.length as usize;
+        if end > bytes.len() {
+            return None;
+        }
+        return Some(bytes[start..end].to_vec());
+    }
+    None
 }
 
 /// Surgically insert (or replace) the XMP `mime` item inside a HEIC file.
@@ -651,93 +703,13 @@ fn push_iloc_entry(meta: &mut mp4_atom::Meta, loc: mp4_atom::ItemLocation) {
     meta.get_mut::<Iloc>().unwrap().item_locations.push(loc);
 }
 
-/// Build a standalone XMP packet from the metadata write bundle.
-///
-/// Reuses the same field mapping as the xmp_toolkit-backed writer so HEIC
-/// and JPEG end up with identical XMP content. Output is the serialized
-/// packet bytes (with the `<?xpacket begin=?>` wrapper), ready to hand to
-/// libheif's `add_xmp_metadata`.
+/// Build a standalone XMP packet from a bundle of fields. Thin convenience
+/// over [`apply_to_xmp`] for callers (mostly tests) that want the serialized
+/// packet bytes directly.
+#[cfg(test)]
 fn build_xmp_packet(write: &MetadataWrite) -> Result<Vec<u8>> {
     let mut meta = XmpMeta::new().context("creating XmpMeta")?;
-
-    if let Some(dt) = &write.datetime {
-        let iso = exif_datetime_to_iso(dt);
-        meta.set_property(xmp_ns::XMP, "CreateDate", &XmpValue::new(iso.clone()))?;
-        meta.set_property(xmp_ns::XMP, "ModifyDate", &XmpValue::new(iso.clone()))?;
-        meta.set_property(
-            xmp_ns::EXIF,
-            "DateTimeOriginal",
-            &XmpValue::new(iso.clone()),
-        )?;
-        meta.set_property(xmp_ns::PHOTOSHOP, "DateCreated", &XmpValue::new(iso))?;
-    }
-
-    if let Some(r) = write.rating {
-        meta.set_property_i32(xmp_ns::XMP, "Rating", &XmpValue::new(i32::from(r.min(5))))?;
-    }
-
-    if let Some(gps) = write.gps {
-        meta.set_property(
-            xmp_ns::EXIF,
-            "GPSLatitude",
-            &XmpValue::new(encode_gps(gps.latitude, 'N', 'S')),
-        )?;
-        meta.set_property(
-            xmp_ns::EXIF,
-            "GPSLongitude",
-            &XmpValue::new(encode_gps(gps.longitude, 'E', 'W')),
-        )?;
-        if let Some(alt) = gps.altitude {
-            meta.set_property(
-                xmp_ns::EXIF,
-                "GPSAltitude",
-                &XmpValue::new(encode_altitude(alt)),
-            )?;
-            meta.set_property(
-                xmp_ns::EXIF,
-                "GPSAltitudeRef",
-                &XmpValue::new(if alt < 0.0 { "1" } else { "0" }.to_string()),
-            )?;
-        }
-    }
-
-    if let Some(title) = &write.title {
-        meta.set_localized_text(xmp_ns::DC, "title", None, "x-default", title)?;
-    }
-
-    if let Some(desc) = &write.description {
-        meta.set_localized_text(xmp_ns::DC, "description", None, "x-default", desc)?;
-    }
-
-    for kw in &write.keywords {
-        meta.append_array_item(
-            xmp_ns::DC,
-            &XmpValue::new("subject".to_string()).set_is_array(true),
-            &XmpValue::new(kw.clone()),
-        )?;
-    }
-
-    for name in &write.people {
-        meta.append_array_item(
-            xmp_ns::IPTC_EXT,
-            &XmpValue::new("PersonInImage".to_string()).set_is_array(true),
-            &XmpValue::new(name.clone()),
-        )?;
-    }
-
-    if write.is_hidden {
-        meta.set_property_bool(KEI_XMP_NS, "hidden", &XmpValue::new(true))?;
-    }
-    if write.is_archived {
-        meta.set_property_bool(KEI_XMP_NS, "archived", &XmpValue::new(true))?;
-    }
-    if let Some(subtype) = &write.media_subtype {
-        meta.set_property(KEI_XMP_NS, "mediaSubtype", &XmpValue::new(subtype.clone()))?;
-    }
-    if let Some(burst) = &write.burst_id {
-        meta.set_property(KEI_XMP_NS, "burstId", &XmpValue::new(burst.clone()))?;
-    }
-
+    apply_to_xmp(&mut meta, write)?;
     Ok(meta.to_string().into_bytes())
 }
 
@@ -1231,6 +1203,43 @@ mod tests {
             "mdat image data must not change across metadata writes"
         );
 
+        fs::remove_file(&path).ok();
+    }
+
+    /// Second write should preserve fields written by the first — confirms
+    /// the HEIC path reads existing XMP before mutating, so we don't drop
+    /// e.g. Apple's existing XMP markers when adding kei-specific fields.
+    #[test]
+    fn apply_metadata_heic_preserves_existing_xmp_on_rewrite() {
+        let dir = test_tmp_dir("meta_heic_tests");
+        let path = fresh_heic(&dir, "preserve_xmp.heic");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                title: Some("First".into()),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                rating: Some(4),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+
+        let xmp = extract_xmp_from_heic(&fs::read(&path).unwrap()).expect("XMP missing");
+        let s = std::str::from_utf8(&xmp).unwrap();
+        assert!(
+            s.contains("First"),
+            "first-write title should survive rewrite"
+        );
+        assert!(
+            s.contains("xmp:Rating"),
+            "second-write rating should be present"
+        );
         fs::remove_file(&path).ok();
     }
 
