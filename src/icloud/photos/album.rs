@@ -909,7 +909,7 @@ mod tests {
                         "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
                         "resOriginalRes": {
                             "value": {
-                                "downloadURL": "https://example.com/photo.jpg",
+                                "downloadURL": "https://p01.icloud-content.com/photo.jpg",
                                 "size": 1024,
                                 "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
                             }
@@ -1155,7 +1155,7 @@ mod tests {
                 "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
                 "resOriginalRes": {
                     "value": {
-                        "downloadURL": "https://example.com/photo.jpg",
+                        "downloadURL": "https://p01.icloud-content.com/photo.jpg",
                         "size": 1024,
                         "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
                     }

@@ -3065,7 +3065,7 @@ mod tests {
             "fields": {
                 "itemType": {"value": "public.jpeg"},
                 "filenameEnc": {"value": "img.jpg", "type": "STRING"},
-                "resOriginalRes": {"value": {"size": 10, "downloadURL": "https://x", "fileChecksum": "ck"}},
+                "resOriginalRes": {"value": {"size": 10, "downloadURL": "https://p01.icloud-content.com/x", "fileChecksum": "ck"}},
                 "resOriginalFileType": {"value": "public.jpeg"},
             },
         });

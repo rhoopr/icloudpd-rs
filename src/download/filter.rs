@@ -879,7 +879,7 @@ mod tests {
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://example.com/orig");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "abc123");
         assert_eq!(tasks[0].size, 1000);
     }
@@ -891,7 +891,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(50000)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
             .build();
         let mut config = test_config();
@@ -909,7 +909,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(500_000_000)
-            .orig_url("https://example.com/big_vid")
+            .orig_url("https://p01.icloud-content.com/big_vid")
             .orig_checksum("big_ck")
             .build();
         let config = test_config();
@@ -938,7 +938,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 1000,
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "abc123"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
@@ -966,7 +966,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resJPEGThumbRes": {"value": {
                     "size": 100,
-                    "downloadURL": "https://example.com/thumb",
+                    "downloadURL": "https://p01.icloud-content.com/thumb",
                     "fileChecksum": "th_ck"
                 }},
                 "resJPEGThumbFileType": {"value": "public.jpeg"}
@@ -1028,9 +1028,9 @@ mod tests {
             .item_type("public.heic")
             .orig_file_type("public.heic")
             .orig_size(2000)
-            .orig_url("https://example.com/heic_orig")
+            .orig_url("https://p01.icloud-content.com/heic_orig")
             .orig_checksum("heic_ck")
-            .live_photo("https://example.com/live_mov", "mov_ck", 3000)
+            .live_photo("https://p01.icloud-content.com/live_mov", "mov_ck", 3000)
             .build()
     }
 
@@ -1040,9 +1040,9 @@ mod tests {
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/heic_orig");
         assert_eq!(tasks[0].size, 2000);
-        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_mov");
         assert_eq!(tasks[1].size, 3000);
         assert!(tasks[1]
             .download_path
@@ -1058,7 +1058,7 @@ mod tests {
         config.live_photo_mode = LivePhotoMode::ImageOnly;
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/heic_orig");
     }
 
     #[test]
@@ -1094,7 +1094,7 @@ mod tests {
         // Second call: only the photo task (MOV already exists with matching size)
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://example.com/heic_orig");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/heic_orig");
     }
 
     #[test]
@@ -1118,7 +1118,7 @@ mod tests {
         // Second call: should produce a deduped MOV path with asset ID suffix
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_mov");
         let dedup_path = tasks[1].download_path.to_str().unwrap();
         assert!(
             dedup_path.contains("LIVE_1"),
@@ -1139,9 +1139,9 @@ mod tests {
             .item_type("public.heic")
             .orig_file_type("public.heic")
             .orig_size(2000)
-            .orig_url("https://example.com/heic_a")
+            .orig_url("https://p01.icloud-content.com/heic_a")
             .orig_checksum("ck_a")
-            .live_photo("https://example.com/mov_a", "mov_ck_a", 3000)
+            .live_photo("https://p01.icloud-content.com/mov_a", "mov_ck_a", 3000)
             .build();
 
         let asset2 = TestPhotoAsset::new("LIVE_B")
@@ -1149,9 +1149,9 @@ mod tests {
             .item_type("public.heic")
             .orig_file_type("public.heic")
             .orig_size(4000)
-            .orig_url("https://example.com/heic_b")
+            .orig_url("https://p01.icloud-content.com/heic_b")
             .orig_checksum("ck_b")
-            .live_photo("https://example.com/mov_b", "mov_ck_b", 5000)
+            .live_photo("https://p01.icloud-content.com/mov_b", "mov_ck_b", 5000)
             .build();
 
         let mut config = test_config();
@@ -1201,13 +1201,13 @@ mod tests {
                 "itemType": {"value": "public.heic"},
                 "resOriginalRes": {"value": {
                     "size": 2000,
-                    "downloadURL": "https://example.com/heic_orig",
+                    "downloadURL": "https://p01.icloud-content.com/heic_orig",
                     "fileChecksum": "heic_ck"
                 }},
                 "resOriginalFileType": {"value": "public.heic"},
                 "resVidMedRes": {"value": {
                     "size": 1500,
-                    "downloadURL": "https://example.com/live_med",
+                    "downloadURL": "https://p01.icloud-content.com/live_med",
                     "fileChecksum": "med_ck"
                 }},
                 "resVidMedFileType": {"value": "com.apple.quicktime-movie"}
@@ -1218,7 +1218,7 @@ mod tests {
         config.live_photo_size = AssetVersionSize::LiveMedium;
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
-        assert_eq!(&*tasks[1].url, "https://example.com/live_med");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_med");
     }
 
     #[test]
@@ -1228,9 +1228,9 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(50000)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
-            .live_photo("https://example.com/live_mov", "mov_ck", 3000)
+            .live_photo("https://p01.icloud-content.com/live_mov", "mov_ck", 3000)
             .build();
         let config = test_config();
         let tasks = filter_asset_fresh(&asset, &config);
@@ -1242,7 +1242,12 @@ mod tests {
         TestPhotoAsset::new("RAW_TEST")
             .orig_checksum("orig_ck")
             .orig_file_type(orig_type)
-            .alt_version("https://example.com/alt", "alt_ck", 2000, alt_type)
+            .alt_version(
+                "https://p01.icloud-content.com/alt",
+                "alt_ck",
+                2000,
+                alt_type,
+            )
             .build()
     }
 
@@ -1262,13 +1267,13 @@ mod tests {
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::Unchanged);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Alternative)
                 .unwrap()
                 .url,
-            "https://example.com/alt"
+            "https://p01.icloud-content.com/alt"
         );
     }
 
@@ -1279,13 +1284,13 @@ mod tests {
         // Alternative was RAW → swap: Original now has alt URL
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/alt"
+            "https://p01.icloud-content.com/alt"
         );
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Alternative)
                 .unwrap()
                 .url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
     }
 
@@ -1296,13 +1301,13 @@ mod tests {
         // Original was RAW → swap: Alternative now has orig URL
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/alt"
+            "https://p01.icloud-content.com/alt"
         );
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Alternative)
                 .unwrap()
                 .url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
     }
 
@@ -1312,7 +1317,7 @@ mod tests {
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
     }
 
@@ -1322,7 +1327,7 @@ mod tests {
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferAlternative);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
     }
 
@@ -1332,7 +1337,7 @@ mod tests {
         let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
-            "https://example.com/orig"
+            "https://p01.icloud-content.com/orig"
         );
         assert!(!has_ver(&versions, AssetVersionSize::Alternative));
     }
@@ -1345,7 +1350,7 @@ mod tests {
         // With AsOriginal and RAW alternative, the swap makes Original point to alt URL
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://example.com/alt");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/alt");
         assert_eq!(&*tasks[0].checksum, "alt_ck");
     }
 
@@ -1361,7 +1366,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(258592890)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
             .asset_date(1713657600000.0)
             .build();
@@ -1370,9 +1375,13 @@ mod tests {
         let photo_asset = TestPhotoAsset::new("IMG_0996")
             .filename("IMG_0996.JPG")
             .orig_size(5000)
-            .orig_url("https://example.com/jpg")
+            .orig_url("https://p01.icloud-content.com/jpg")
             .orig_checksum("jpg_ck")
-            .live_photo("https://example.com/live_mov", "mov_ck", 124037918)
+            .live_photo(
+                "https://p01.icloud-content.com/live_mov",
+                "mov_ck",
+                124037918,
+            )
             .asset_date(1713657600000.0)
             .build();
 
@@ -1417,7 +1426,7 @@ mod tests {
         let config = test_config(); // align_raw defaults to AsIs
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
-        assert_eq!(&*tasks[0].url, "https://example.com/orig");
+        assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "orig_ck");
     }
 
@@ -1462,7 +1471,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(50000)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
             .build();
         let mut config = test_config();
@@ -1619,7 +1628,7 @@ mod tests {
         // Should produce 2 tasks: primary + live companion (fallback to LiveOriginal)
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[1].version_size, VersionSizeKey::LiveOriginal);
-        assert_eq!(&*tasks[1].url, "https://example.com/live_mov");
+        assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_mov");
     }
 
     #[test]
@@ -1660,7 +1669,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(50000)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
             .build();
         assert_eq!(
@@ -1685,7 +1694,7 @@ mod tests {
             .item_type("com.apple.quicktime-movie")
             .orig_file_type("com.apple.quicktime-movie")
             .orig_size(50000)
-            .orig_url("https://example.com/vid")
+            .orig_url("https://p01.icloud-content.com/vid")
             .orig_checksum("vid_ck")
             .build();
         assert_eq!(
@@ -1821,19 +1830,19 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 5000,
-                    "downloadURL": "https://example.com/orig",
+                    "downloadURL": "https://p01.icloud-content.com/orig",
                     "fileChecksum": "orig_ck"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"},
                 "resJPEGMedRes": {"value": {
                     "size": 2000,
-                    "downloadURL": "https://example.com/med",
+                    "downloadURL": "https://p01.icloud-content.com/med",
                     "fileChecksum": "med_ck"
                 }},
                 "resJPEGMedFileType": {"value": "public.jpeg"},
                 "resJPEGThumbRes": {"value": {
                     "size": 500,
-                    "downloadURL": "https://example.com/thumb",
+                    "downloadURL": "https://p01.icloud-content.com/thumb",
                     "fileChecksum": "thumb_ck"
                 }},
                 "resJPEGThumbFileType": {"value": "public.jpeg"}
@@ -2025,7 +2034,7 @@ mod tests {
         let asset = TestPhotoAsset::new("TRAV_1")
             .filename("../../../etc/passwd")
             .orig_size(512)
-            .orig_url("https://cdn.icloud.com/photos/orig/abc")
+            .orig_url("https://p01.icloud-content.com/photos/orig/abc")
             .orig_checksum("a1b2c3d4e5f6")
             .build();
         let config = test_config();
@@ -2052,7 +2061,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"},
                 "resOriginalRes": {"value": {
                     "size": 2048,
-                    "downloadURL": "https://cdn.icloud.com/photos/orig/nofn",
+                    "downloadURL": "https://p01.icloud-content.com/photos/orig/nofn",
                     "fileChecksum": "deadbeef1234"
                 }},
                 "resOriginalFileType": {"value": "public.jpeg"}
@@ -2267,7 +2276,7 @@ mod tests {
             .item_type("public.heic")
             .orig_file_type("public.heic")
             .orig_size(4500000)
-            .orig_url("https://cdn.icloud.com/photos/orig/modified")
+            .orig_url("https://p01.icloud-content.com/photos/orig/modified")
             .orig_checksum("f0e1d2c3b4a5")
             .build();
 
@@ -2528,13 +2537,13 @@ mod tests {
         let asset_a = TestPhotoAsset::new("ASSET_A")
             .filename("IMG_0001.JPG")
             .orig_size(5000)
-            .orig_url("https://example.com/a")
+            .orig_url("https://p01.icloud-content.com/a")
             .orig_checksum("ck_a")
             .build();
         let asset_b = TestPhotoAsset::new("ASSET_B")
             .filename("IMG_0001.JPG")
             .orig_size(5000)
-            .orig_url("https://example.com/b")
+            .orig_url("https://p01.icloud-content.com/b")
             .orig_checksum("ck_b")
             .build();
 
@@ -2562,13 +2571,13 @@ mod tests {
         let asset_a = TestPhotoAsset::new("ASSET_A")
             .filename("IMG_0001.JPG")
             .orig_size(5000)
-            .orig_url("https://example.com/a")
+            .orig_url("https://p01.icloud-content.com/a")
             .orig_checksum("ck_a")
             .build();
         let asset_b = TestPhotoAsset::new("ASSET_B")
             .filename("IMG_0001.JPG")
             .orig_size(7000)
-            .orig_url("https://example.com/b")
+            .orig_url("https://p01.icloud-content.com/b")
             .orig_checksum("ck_b")
             .build();
 
@@ -2603,7 +2612,7 @@ mod tests {
         let asset = TestPhotoAsset::new("ZERO_SIZE")
             .filename("IMG_0001.JPG")
             .orig_size(0) // size unknown/zero
-            .orig_url("https://example.com/zero")
+            .orig_url("https://p01.icloud-content.com/zero")
             .orig_checksum("zero_ck")
             .build();
 
@@ -2641,7 +2650,7 @@ mod tests {
         let asset = TestPhotoAsset::new("ASSET_X")
             .filename("IMG_0001.JPG")
             .orig_size(5000)
-            .orig_url("https://example.com/x")
+            .orig_url("https://p01.icloud-content.com/x")
             .orig_checksum("ck_x")
             .build();
 

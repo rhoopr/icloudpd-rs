@@ -117,7 +117,7 @@ impl TestAssetRecord {
 ///     .filename("IMG_0001.HEIC")
 ///     .item_type("public.heic")
 ///     .orig_file_type("public.heic")
-///     .live_photo("https://example.com/mov", "mov_ck", 3000)
+///     .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
 ///     .build();
 /// ```
 pub struct TestPhotoAsset {
@@ -153,7 +153,7 @@ impl TestPhotoAsset {
             filename: "photo.jpg".to_string(),
             item_type: "public.jpeg".to_string(),
             orig_size: 1000,
-            orig_url: "https://example.com/orig".to_string(),
+            orig_url: "https://p01.icloud-content.com/orig".to_string(),
             orig_checksum: "abc123".to_string(),
             orig_file_type: "public.jpeg".to_string(),
             asset_date: 1736899200000.0,

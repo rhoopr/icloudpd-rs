@@ -2021,7 +2021,7 @@ mod tests {
 
                         let tasks = vec![
                             DownloadTask {
-                                url: "https://example.com/a".into(),
+                                url: "https://p01.icloud-content.com/a".into(),
                                 download_path: dir.path().join("a.jpg"),
                                 checksum: "aaa".into(),
                                 created_local: chrono::Local::now(),
@@ -2031,7 +2031,7 @@ mod tests {
                                 version_size: VersionSizeKey::Original,
                             },
                             DownloadTask {
-                                url: "https://example.com/b".into(),
+                                url: "https://p01.icloud-content.com/b".into(),
                                 download_path: dir.path().join("b.jpg"),
                                 checksum: "bbb".into(),
                                 created_local: chrono::Local::now(),
