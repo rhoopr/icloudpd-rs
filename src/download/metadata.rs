@@ -388,6 +388,10 @@ fn exif_datetime_to_iso(s: &str) -> String {
     let bytes = s.as_bytes();
     if bytes.len() == 19 && bytes[4] == b':' && bytes[7] == b':' && bytes[10] == b' ' {
         let mut out = s.to_owned();
+        // SAFETY: `out` is a freshly-owned String with no aliases. The length
+        // check above proves indices 4, 7, 10 are in-bounds, and the
+        // replacement bytes are all valid 7-bit ASCII, so UTF-8
+        // well-formedness is preserved.
         unsafe {
             let b = out.as_bytes_mut();
             b[4] = b'-';
