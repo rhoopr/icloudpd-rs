@@ -35,7 +35,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use futures_util::stream::{self, StreamExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::icloud::photos::{PhotoAlbum, PhotoAsset, SyncTokenError};
+use crate::icloud::photos::{PhotoAsset, SyncTokenError};
 use crate::retry::RetryConfig;
 use crate::state::{AssetRecord, StateDb, VersionSizeKey};
 use crate::types::{
@@ -326,9 +326,19 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     // Enumeration-filter fields: changing these affects WHICH assets are
     // fetched from iCloud, so sync tokens must be invalidated to avoid
     // missing assets that are newly eligible under the changed filters.
-    for album in &config.albums {
-        hasher.update(album.as_bytes());
-        hasher.update(b"\0");
+    // Tag byte distinguishes the three selection modes so switching between
+    // them (e.g. `-a A` -> `-a all`) invalidates the sync token even if no
+    // explicit album name changed.
+    match &config.albums {
+        crate::config::AlbumSelection::LibraryOnly => hasher.update([0]),
+        crate::config::AlbumSelection::All => hasher.update([1]),
+        crate::config::AlbumSelection::Named(names) => {
+            hasher.update([2]);
+            for album in names {
+                hasher.update(album.as_bytes());
+                hasher.update(b"\0");
+            }
+        }
     }
     let mut sorted_excludes: Vec<&str> = config
         .exclude_albums
@@ -400,10 +410,26 @@ pub(crate) struct DownloadConfig {
 }
 
 impl DownloadConfig {
+    /// True when `--folder-structure` contains the `{album}` token.
+    ///
+    /// Only meaningful on the *base* config. A per-pass config produced by
+    /// `with_album_name` / `with_pass` has already had the token expanded
+    /// out of `folder_structure`, so this would always return false there.
+    /// Per-pass code paths should check `album_name.is_some()` instead.
+    pub(crate) fn uses_album_expansion(&self) -> bool {
+        self.folder_structure.contains("{album}")
+    }
+
     /// Clone this config with a different `album_name`, for per-album processing
     /// when `{album}` is in `folder_structure`. Pre-expands the `{album}` token
     /// in `folder_structure` so `local_download_dir` avoids per-asset
     /// sanitize/escape/replace allocations.
+    ///
+    /// Setting `album_name` on the derived config is load-bearing: the
+    /// fast-skip bypass in the streaming pipeline uses `album_name.is_some()`
+    /// as the "this asset may legitimately land at multiple paths, don't
+    /// trust the DB" signal. An empty name still sets `Some("")`, so the
+    /// unfiled `library.all()` pass inherits the bypass too.
     fn with_album_name(&self, name: Arc<str>) -> Self {
         let album_ref = Some(name.as_ref()).filter(|n: &&str| !n.is_empty());
         let folder_structure = paths::expand_album_token(&self.folder_structure, album_ref);
@@ -416,6 +442,35 @@ impl DownloadConfig {
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
             exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
+            bandwidth_limiter: self.bandwidth_limiter.clone(),
+            ..*self
+        }
+    }
+
+    /// Clone this config for a single download pass: pre-expand `{album}`
+    /// and pin the pass's exclude-ids set in one clone. Equivalent to
+    /// `with_album_name(...).with_exclude_ids(...)` but avoids the second
+    /// allocation.
+    fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
+        Self {
+            exclude_asset_ids: Arc::clone(&pass.exclude_ids),
+            ..self.with_album_name(Arc::clone(&pass.album.name))
+        }
+    }
+
+    /// Clone this config with a different `exclude_asset_ids` set. Used
+    /// for the merged (non-`{album}`) full-sync path, where all passes
+    /// share a single config but the exclude set is lifted off the plan.
+    fn with_exclude_ids(&self, exclude_ids: Arc<FxHashSet<String>>) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            folder_structure: self.folder_structure.clone(),
+            filename_exclude: self.filename_exclude.clone(),
+            temp_suffix: self.temp_suffix.clone(),
+            state_db: self.state_db.clone(),
+            sync_mode: self.sync_mode.clone(),
+            album_name: self.album_name.clone(),
+            exclude_asset_ids: exclude_ids,
             bandwidth_limiter: self.bandwidth_limiter.clone(),
             ..*self
         }
@@ -642,18 +697,34 @@ impl DownloadContext {
     }
 }
 
+/// Pre-compute one `Arc<DownloadConfig>` per pass. Each pass_index maps to
+/// a derived config that pre-expands `{album}` and pins the pass's
+/// exclude-asset-ids set. In `{album}` mode passes may legitimately differ
+/// per entry; outside of it, passes share identical excludes but the per-
+/// pass wrapper is harmless and keeps call sites uniform.
+fn build_pass_configs(
+    passes: &[crate::commands::AlbumPass],
+    base: &DownloadConfig,
+) -> Vec<Arc<DownloadConfig>> {
+    passes
+        .iter()
+        .map(|pass| Arc::new(base.with_pass(pass)))
+        .collect()
+}
+
 /// Eagerly enumerate all albums and build a complete task list.
 ///
 /// Used only by the Phase 2 cleanup pass — re-contacts the API so each call
 /// yields fresh CDN URLs that haven't expired during a long download session.
 async fn build_download_tasks(
-    albums: &[PhotoAlbum],
+    passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
     shutdown_token: CancellationToken,
 ) -> Result<Vec<DownloadTask>> {
-    let album_results: Vec<Result<Vec<_>>> = stream::iter(albums)
+    let pass_configs = build_pass_configs(passes, config);
+    let pass_results: Vec<Result<(usize, Vec<_>)>> = stream::iter(passes.iter().enumerate())
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
-        .map(|album| async move { album.photos(config.recent).await })
+        .map(|(i, pass)| async move { pass.album.photos(config.recent).await.map(|a| (i, a)) })
         .buffer_unordered(config.concurrent_downloads)
         .collect()
         .await;
@@ -661,17 +732,18 @@ async fn build_download_tasks(
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
     let mut dir_cache = paths::DirCache::new();
-    for album_result in album_results {
-        let assets = album_result?;
+    for pass_result in pass_results {
+        let (pass_index, assets) = pass_result?;
+        let pass_config = &pass_configs[pass_index];
 
         for asset in &assets {
-            if filter::is_asset_filtered(asset, config).is_some() {
+            if filter::is_asset_filtered(asset, pass_config).is_some() {
                 continue;
             }
-            pre_ensure_asset_dir(&mut dir_cache, asset, config).await;
+            pre_ensure_asset_dir(&mut dir_cache, asset, pass_config).await;
             tasks.extend(filter_asset_to_tasks(
                 asset,
-                config,
+                pass_config,
                 &mut claimed_paths,
                 &mut dir_cache,
             ));
@@ -758,7 +830,7 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
 
 pub async fn download_photos_with_sync(
     download_client: &Client,
-    albums: &[PhotoAlbum],
+    passes: &[crate::commands::AlbumPass],
     config: Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
@@ -795,7 +867,26 @@ pub async fn download_photos_with_sync(
         SyncMode::Full => {
             download_photos_full_with_token(
                 download_client,
-                albums,
+                passes,
+                &config,
+                shutdown_token.clone(),
+            )
+            .await
+        }
+        // In `{album}` mode we have to fall back to full enumeration:
+        // `changes_stream` uses the zone-level `/changes/zone` endpoint, so
+        // it returns the same delta for every album in a zone. Without
+        // per-asset album-membership info on the change events, we can't
+        // route assets to the correct album folder — full enumeration uses
+        // the album-scoped `photo_stream_with_token` and stays correct.
+        SyncMode::Incremental { .. } if config.uses_album_expansion() => {
+            tracing::debug!(
+                "`{{album}}` folder template requires full enumeration for correct \
+                 per-album routing, skipping incremental"
+            );
+            download_photos_full_with_token(
+                download_client,
+                passes,
                 &config,
                 shutdown_token.clone(),
             )
@@ -811,7 +902,7 @@ pub async fn download_photos_with_sync(
             );
             download_photos_full_with_token(
                 download_client,
-                albums,
+                passes,
                 &config,
                 shutdown_token.clone(),
             )
@@ -821,7 +912,7 @@ pub async fn download_photos_with_sync(
             let token = zone_sync_token.clone();
             match download_photos_incremental(
                 download_client,
-                albums,
+                passes,
                 &config,
                 &token,
                 shutdown_token.clone(),
@@ -854,7 +945,7 @@ pub async fn download_photos_with_sync(
                         );
                         download_photos_full_with_token(
                             download_client,
-                            albums,
+                            passes,
                             &config,
                             shutdown_token.clone(),
                         )
@@ -896,42 +987,44 @@ pub async fn download_photos_with_sync(
 /// is returned alongside the download outcome.
 async fn download_photos_full_with_token(
     download_client: &Client,
-    albums: &[PhotoAlbum],
+    passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let uses_album_token = config.folder_structure.contains("{album}");
+    let uses_album_token = config.uses_album_expansion();
 
-    // Build token-aware streams for each album
-    let mut album_counts: Vec<u64> = Vec::with_capacity(albums.len());
-    for album in albums {
-        album_counts.push(album.len().await.unwrap_or(0));
-    }
-    let mut total: u64 = album_counts.iter().sum();
+    // `album.len()` is one HTTP call per pass. Serialising it scaled fine
+    // when users typed out a few `-a` flags by hand; with `-a all` it's
+    // routinely 20+ round-trips before the first byte of the first
+    // download. `buffered` (not `buffer_unordered`) preserves pass order
+    // so the `zip(&pass_counts)` below stays aligned.
+    let pass_counts: Vec<u64> = stream::iter(passes)
+        .map(|pass| async move { pass.album.len().await.unwrap_or(0) })
+        .buffered(config.concurrent_downloads)
+        .collect()
+        .await;
+    let mut total: u64 = pass_counts.iter().sum();
     if let Some(recent) = config.recent {
         total = total.min(u64::from(recent));
     }
 
-    // When {album} is in folder_structure, process each album separately so that
-    // the album name can be threaded into path expansion. Otherwise, merge all
-    // album streams for maximum download concurrency across albums.
+    // {album} mode processes passes sequentially: each needs its own
+    // album-specific path expansion, so cross-pass download concurrency is
+    // traded off for correct placement. Assets in multiple albums get one
+    // copy per album folder. Non-{album} plans have a uniform exclude set
+    // across passes (LibraryOnly: 1 pass; Named/All-without-{album}: every
+    // pass has empty excludes) so streams merge for maximum concurrency.
     let (streaming_result, token_receivers) = if uses_album_token {
+        let pass_configs = build_pass_configs(passes, config);
         let mut combined_result = StreamingResult::default();
-        let mut token_receivers = Vec::with_capacity(albums.len());
+        let mut token_receivers = Vec::with_capacity(passes.len());
 
-        // When {album} is in folder_structure, albums are processed sequentially
-        // so each gets its own per-album path expansion. Cross-album download
-        // concurrency is intentionally sacrificed for correct path placement.
-        // Assets appearing in multiple albums are downloaded once per album,
-        // each to its respective album directory.
-        for (album, &count) in albums.iter().zip(&album_counts) {
+        for ((pass, &count), pass_config) in passes.iter().zip(&pass_counts).zip(&pass_configs) {
             if shutdown_token.is_cancelled() {
                 break;
             }
-            let album_config = Arc::new(config.with_album_name(album.name.clone()));
-
-            let (stream, token_rx) = album.photo_stream_with_token(
+            let (stream, token_rx) = pass.album.photo_stream_with_token(
                 config.recent,
                 Some(count),
                 config.concurrent_downloads,
@@ -941,7 +1034,7 @@ async fn download_photos_full_with_token(
             let result = stream_and_download_from_stream(
                 download_client,
                 stream,
-                &album_config,
+                pass_config,
                 total,
                 shutdown_token.clone(),
             )
@@ -959,12 +1052,21 @@ async fn download_photos_full_with_token(
 
         (combined_result, token_receivers)
     } else {
-        let mut token_receivers = Vec::with_capacity(albums.len());
-        let streams: Vec<_> = albums
+        let merged_exclude_ids = passes
+            .first()
+            .map(|p| Arc::clone(&p.exclude_ids))
+            .unwrap_or_else(|| Arc::new(FxHashSet::default()));
+        let merged_config = if Arc::ptr_eq(&merged_exclude_ids, &config.exclude_asset_ids) {
+            Arc::clone(config)
+        } else {
+            Arc::new(config.with_exclude_ids(merged_exclude_ids))
+        };
+        let mut token_receivers = Vec::with_capacity(passes.len());
+        let streams: Vec<_> = passes
             .iter()
-            .zip(&album_counts)
-            .map(|(album, &count)| {
-                let (stream, token_rx) = album.photo_stream_with_token(
+            .zip(&pass_counts)
+            .map(|(pass, &count)| {
+                let (stream, token_rx) = pass.album.photo_stream_with_token(
                     config.recent,
                     Some(count),
                     config.concurrent_downloads,
@@ -978,7 +1080,7 @@ async fn download_photos_full_with_token(
         let result = stream_and_download_from_stream(
             download_client,
             combined,
-            config,
+            &merged_config,
             total,
             shutdown_token.clone(),
         )
@@ -1025,7 +1127,7 @@ async fn download_photos_full_with_token(
     // Build the outcome using the same logic as download_photos
     let (outcome, stats) = build_download_outcome(
         download_client,
-        albums,
+        passes,
         config,
         streaming_result,
         started,
@@ -1046,18 +1148,19 @@ async fn download_photos_full_with_token(
 /// downloadable assets, and feeds them through the download pipeline.
 async fn download_photos_incremental(
     download_client: &Client,
-    albums: &[PhotoAlbum],
+    passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
     zone_sync_token: &str,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let uses_album_token = config.folder_structure.contains("{album}");
+    let uses_album_token = config.uses_album_expansion();
 
-    // Collect change events from all albums, counting and filtering in a single pass.
-    // Each asset is paired with its source album name so that {album} token
-    // expansion works correctly in the incremental path.
-    let mut downloadable_assets: Vec<(PhotoAsset, Arc<str>)> = Vec::new();
+    // Each asset is paired with its source pass index so both `{album}`
+    // expansion and per-pass exclusion (notably, the unfiled pass's set
+    // that prevents assets already in some user album from downloading
+    // twice) can be applied downstream.
+    let mut downloadable_assets: Vec<(PhotoAsset, usize)> = Vec::new();
     let mut sync_token: Option<String> = None;
     let mut created_count = 0u64;
     let mut soft_deleted_count = 0u64;
@@ -1065,8 +1168,8 @@ async fn download_photos_incremental(
     let mut hidden_count = 0u64;
     let mut total_events = 0u64;
 
-    for album in albums {
-        let (change_stream, token_rx) = album.changes_stream(zone_sync_token);
+    for (pass_index, pass) in passes.iter().enumerate() {
+        let (change_stream, token_rx) = pass.album.changes_stream(zone_sync_token);
         tokio::pin!(change_stream);
 
         while let Some(result) = change_stream.next().await {
@@ -1079,7 +1182,7 @@ async fn download_photos_incremental(
                 ChangeReason::Created => {
                     created_count += 1;
                     if let Some(asset) = event.asset {
-                        downloadable_assets.push((asset, Arc::clone(&album.name)));
+                        downloadable_assets.push((asset, pass_index));
                     }
                 }
                 ChangeReason::SoftDeleted => {
@@ -1097,7 +1200,7 @@ async fn download_photos_incremental(
             }
         }
 
-        // Capture the sync token from this album
+        // Capture the sync token from this pass
         if let Ok(token) = token_rx.await {
             sync_token = Some(token);
         }
@@ -1151,25 +1254,18 @@ async fn download_photos_incremental(
     };
 
     // Convert assets to download tasks, using state DB fast-skip where possible.
-    // When {album} is in folder_structure, create per-album configs so the album
-    // name is threaded into path expansion (mirrors full sync behaviour).
+    // Each pass (concrete album or unfiled) gets its own derived config so
+    // that both album-specific path expansion and per-pass exclude sets are
+    // applied. Configs are cached per pass index to avoid redundant
+    // allocations when many assets flow through the same pass.
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
     let mut dir_cache = paths::DirCache::new();
     let mut skip_breakdown = SkipBreakdown::default();
-    let mut album_configs: FxHashMap<Arc<str>, Arc<DownloadConfig>> = FxHashMap::default();
+    let pass_configs = build_pass_configs(passes, config);
 
-    // In {album} mode, assets in multiple albums are processed once per album,
-    // each downloading to the album-specific directory. Configs are cached per
-    // album name to avoid redundant allocations.
-    for (asset, album_name) in &downloadable_assets {
-        let effective_config: &Arc<DownloadConfig> = if uses_album_token {
-            album_configs
-                .entry(Arc::clone(album_name))
-                .or_insert_with(|| Arc::new(config.with_album_name(Arc::clone(album_name))))
-        } else {
-            config
-        };
+    for (asset, pass_index) in &downloadable_assets {
+        let effective_config = &pass_configs[*pass_index];
 
         if let Some(reason) = filter::is_asset_filtered(asset, effective_config) {
             match reason {
@@ -1182,19 +1278,24 @@ async fn download_photos_incremental(
             continue;
         }
 
-        // Fast-skip: if state DB confirms all versions are already downloaded
-        // with matching checksums, skip the filesystem check entirely.
-        let candidates = extract_skip_candidates(asset, effective_config);
-        if !candidates.is_empty()
-            && candidates.iter().all(|&(vs, cs)| {
-                matches!(
-                    download_ctx.should_download_fast(asset.id(), vs, cs, true),
-                    Some(false)
-                )
-            })
-        {
-            skip_breakdown.by_state += 1;
-            continue;
+        // `should_download_fast` keys on (asset_id, version_size, checksum)
+        // and is path-blind. In `{album}` mode the same asset may target
+        // multiple album folders; a DB-only skip would leave later copies
+        // missing from disk. Fall through to the path-aware filesystem
+        // check in that case.
+        if !uses_album_token {
+            let candidates = extract_skip_candidates(asset, effective_config);
+            if !candidates.is_empty()
+                && candidates.iter().all(|&(vs, cs)| {
+                    matches!(
+                        download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                        Some(false)
+                    )
+                })
+            {
+                skip_breakdown.by_state += 1;
+                continue;
+            }
         }
 
         pre_ensure_asset_dir(&mut dir_cache, asset, effective_config).await;
@@ -1796,7 +1897,7 @@ mod tests {
             directory: dl_config.directory.clone(),
             cookie_directory: std::path::PathBuf::from("/tmp"),
             folder_structure: dl_config.folder_structure.clone(),
-            albums: vec![],
+            albums: crate::config::AlbumSelection::LibraryOnly,
             exclude_albums: vec![],
             filename_exclude: vec![],
             library: crate::config::LibrarySelection::Single("PrimarySync".into()),
@@ -1843,7 +1944,8 @@ mod tests {
 
         // Verify album changes produce a different hash
         let mut config_with_album = app_config;
-        config_with_album.albums = vec!["Favorites".to_string()];
+        config_with_album.albums =
+            crate::config::AlbumSelection::Named(vec!["Favorites".to_string()]);
         let hash3 = compute_config_hash(&config_with_album);
         assert_ne!(hash1, hash3, "adding an album must change the hash");
     }
@@ -2408,7 +2510,7 @@ mod tests {
         let config = build_config_with(tmp.path(), "/photos", |_| {});
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "3854469db16cc4b3",
+            hash, "3ca58f7e3c69834f",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -2422,7 +2524,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "317609ad3f64f1b3",
+            hash, "907facf5394e2fa4",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
