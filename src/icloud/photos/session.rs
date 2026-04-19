@@ -233,19 +233,40 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
         if has_errors {
             // Log each errored record and capture the last error
             let mut last_ck_err = None;
+            let mut permanent_errors = 0usize;
+            let mut retryable_errors = 0usize;
             for record in records {
                 if let Some(code) = record["serverErrorCode"].as_str() {
                     let reason = record["reason"].as_str().unwrap_or("unknown");
+                    let record_name = record["recordName"].as_str().unwrap_or("(unknown)");
                     let retryable = RETRYABLE_SERVER_ERRORS
                         .iter()
                         .any(|&s| s.eq_ignore_ascii_case(code));
                     let service_not_activated = is_service_not_activated(code, reason);
-                    tracing::warn!(
-                        error_code = code,
-                        retryable,
-                        service_not_activated,
-                        "CloudKit per-record error: {reason}"
-                    );
+                    // Permanent errors (e.g. ACCESS_DENIED on a revoked
+                    // shared asset) silently drop records from the
+                    // enumeration; log at error! so operators can audit
+                    // which assets were skipped and why. Retryable errors
+                    // are a matter of the retry loop and stay at warn!.
+                    if retryable {
+                        retryable_errors += 1;
+                        tracing::warn!(
+                            record_name,
+                            error_code = code,
+                            retryable,
+                            service_not_activated,
+                            "CloudKit per-record error (retryable): {reason}"
+                        );
+                    } else {
+                        permanent_errors += 1;
+                        tracing::error!(
+                            record_name,
+                            error_code = code,
+                            retryable,
+                            service_not_activated,
+                            "CloudKit per-record error (permanent, record skipped): {reason}"
+                        );
+                    }
                     last_ck_err = Some(CloudKitServerError {
                         code: code.into(),
                         reason: reason.into(),
@@ -270,6 +291,8 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                 }
                 tracing::warn!(
                     errored = total - valid_count,
+                    permanent = permanent_errors,
+                    retryable = retryable_errors,
                     valid = valid_count,
                     total,
                     "Filtered errored records from CloudKit response"
