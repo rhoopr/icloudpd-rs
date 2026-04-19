@@ -16,6 +16,17 @@ use super::queries::{build_changes_zone_request, encode_params, DESIRED_KEYS_VAL
 use super::session::{check_changes_zone_error, PhotosSession};
 use crate::retry::RetryConfig;
 
+/// How many consecutive empty /records/query pages trigger true EOF.
+///
+/// CloudKit's /records/query does not expose a `moreComing` flag; an empty
+/// page can be either real end-of-list or a transient gap at this rank
+/// range (e.g., a block of fully-deleted records aligning with a page
+/// boundary). We probe forward by one `page_size` on each empty page and
+/// only terminate after this many consecutive empty probes — two gives
+/// us defense against a single-page gap at the cost of one extra request
+/// on true EOF.
+const MAX_EMPTY_PAGE_PROBES: u32 = 2;
+
 /// A boxed, pinned stream of photo asset results.
 type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
 
@@ -476,6 +487,7 @@ impl PhotoAlbum {
             let mut total_sent: u64 = 0;
             let mut pending_masters: FxHashMap<String, super::cloudkit::Record> =
                 FxHashMap::default();
+            let mut consecutive_empty_pages: u32 = 0;
             let url = format!(
                 "{}/records/query?{}",
                 service_endpoint,
@@ -553,10 +565,34 @@ impl PhotoAlbum {
                     "Got records"
                 );
 
-                // No records at all means the API has no more data.
+                // An empty page can mean either true end-of-list or a transient
+                // gap at this rank range (e.g., a run of fully-deleted records
+                // aligning with a page boundary). The API has no `moreComing`
+                // flag on /records/query, so we probe forward by one
+                // page_size before committing to EOF. The guard terminates
+                // after MAX_EMPTY_PAGE_PROBES consecutive empty pages to avoid
+                // unbounded scanning on genuinely empty tails.
                 if record_count == 0 {
-                    break;
+                    consecutive_empty_pages += 1;
+                    if consecutive_empty_pages >= MAX_EMPTY_PAGE_PROBES {
+                        tracing::debug!(
+                            album = %name,
+                            offset,
+                            probes = consecutive_empty_pages,
+                            "End of album (consecutive empty pages)"
+                        );
+                        break;
+                    }
+                    tracing::debug!(
+                        album = %name,
+                        offset,
+                        probes = consecutive_empty_pages,
+                        "Empty page, probing forward one page_size"
+                    );
+                    offset += page_size as u64;
+                    continue;
                 }
+                consecutive_empty_pages = 0;
 
                 // Collect current page's records, trying to pair with
                 // buffered unpaired records from previous pages.
@@ -1128,6 +1164,39 @@ mod tests {
         assert_eq!(
             count, 1,
             "page 2's paired asset should be yielded despite page 1 having no masters"
+        );
+    }
+
+    /// CF-1: a single empty /records/query page is not sufficient to
+    /// conclude EOF. The fetcher must probe forward by one `page_size`
+    /// before terminating, so a transient gap doesn't silently cut
+    /// enumeration short.
+    #[tokio::test]
+    async fn test_photo_stream_probes_past_single_empty_page() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosSession::new()
+            .ok(canned_page("master-1", None))
+            // Page 2 is empty (simulated gap); must not terminate.
+            .ok(json!({"records": []}))
+            // Page 3 contains records past the gap.
+            .ok(canned_page("master-2", None));
+        // MockPhotosSession then returns the default {"records": []} on
+        // every subsequent call; the fetcher requires MAX_EMPTY_PAGE_PROBES
+        // consecutive empties to commit to EOF.
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+        tokio::pin!(stream);
+
+        let mut count = 0u32;
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+            count += 1;
+        }
+        assert_eq!(
+            count, 2,
+            "both master-1 and master-2 should be yielded; the single empty page in between must not terminate enumeration"
         );
     }
 
