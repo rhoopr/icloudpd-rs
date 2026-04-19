@@ -315,6 +315,30 @@ impl SqliteStateDb {
     }
 }
 
+/// Drain a rusqlite row iterator into `Vec<T>`, dropping parse failures but
+/// logging each at `debug!` and summarising the drop count at `warn!` so a
+/// corrupted row never silently disappears from a bulk loader.
+fn collect_rows_with_warn<T, I>(rows: I, label: &'static str) -> Result<Vec<T>, StateError>
+where
+    I: Iterator<Item = rusqlite::Result<T>>,
+{
+    let mut out = Vec::new();
+    let mut dropped = 0usize;
+    for r in rows {
+        match r {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                dropped += 1;
+                tracing::debug!(error = %e, "{label}: row parse error");
+            }
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(dropped, "{label}: dropped rows with parse errors");
+    }
+    Ok(out)
+}
+
 #[async_trait]
 impl StateDb for SqliteStateDb {
     #[cfg(test)]
@@ -937,16 +961,13 @@ impl StateDb for SqliteStateDb {
             )
             .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
 
-        let paths = stmt
+        let rows = stmt
             .query_map(rusqlite::params![limit as i64], |row| {
                 let p: String = row.get(0)?;
                 Ok(PathBuf::from(p))
             })
-            .map_err(|e| StateError::query("sample_downloaded_paths", e))?
-            .filter_map(Result::ok)
-            .collect();
-
-        Ok(paths)
+            .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
+        collect_rows_with_warn(rows, "sample_downloaded_paths")
     }
 
     async fn add_asset_album(
@@ -974,10 +995,8 @@ impl StateDb for SqliteStateDb {
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|e| StateError::query("get_all_asset_albums", e))?
-            .filter_map(Result::ok)
-            .collect();
-        Ok(rows)
+            .map_err(|e| StateError::query("get_all_asset_albums", e))?;
+        collect_rows_with_warn(rows, "get_all_asset_albums")
     }
 
     async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
@@ -989,10 +1008,8 @@ impl StateDb for SqliteStateDb {
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|e| StateError::query("get_all_asset_people", e))?
-            .filter_map(Result::ok)
-            .collect();
-        Ok(rows)
+            .map_err(|e| StateError::query("get_all_asset_people", e))?;
+        collect_rows_with_warn(rows, "get_all_asset_people")
     }
 
     async fn mark_soft_deleted(
