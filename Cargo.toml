@@ -71,7 +71,7 @@ anyhow = "1"
 thiserror = "2"
 
 # Random
-rand = "0.10"
+rand = "0.10.1"
 
 # File locking
 fs4 = "0.13"
