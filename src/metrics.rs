@@ -80,6 +80,7 @@ pub(crate) struct MetricsHandle {
     db_assets_total: Family<StatusLabels, Gauge>,
     db_assets_size_bytes: Family<StatusLabels, Gauge>,
     db_last_sync_assets_seen: Gauge,
+    db_summary_read_failures: Counter,
 }
 
 impl MetricsHandle {
@@ -206,6 +207,13 @@ impl MetricsHandle {
             db_last_sync_assets_seen.clone(),
         );
 
+        let db_summary_read_failures = Counter::default();
+        registry.register(
+            "kei_db_summary_read_failures",
+            "Total number of failed attempts to read the DB summary for metrics",
+            db_summary_read_failures.clone(),
+        );
+
         Self {
             registry: Arc::new(registry),
             inner: Arc::new(Mutex::new(Inner {
@@ -228,6 +236,7 @@ impl MetricsHandle {
             db_assets_total,
             db_assets_size_bytes,
             db_last_sync_assets_seen,
+            db_summary_read_failures,
         }
     }
 
@@ -298,19 +307,29 @@ impl MetricsHandle {
             .get_or_create(&StatusLabels {
                 status: "downloaded",
             })
-            .set(summary.downloaded as i64);
+            .set(i64::try_from(summary.downloaded).unwrap_or(i64::MAX));
         self.db_assets_total
             .get_or_create(&StatusLabels { status: "pending" })
-            .set(summary.pending as i64);
+            .set(i64::try_from(summary.pending).unwrap_or(i64::MAX));
         self.db_assets_total
             .get_or_create(&StatusLabels { status: "failed" })
-            .set(summary.failed as i64);
+            .set(i64::try_from(summary.failed).unwrap_or(i64::MAX));
         self.db_assets_size_bytes
             .get_or_create(&StatusLabels {
                 status: "downloaded",
             })
-            .set(summary.downloaded_bytes as i64);
-        self.db_last_sync_assets_seen.set(assets_seen as i64);
+            .set(i64::try_from(summary.downloaded_bytes).unwrap_or(i64::MAX));
+        self.db_last_sync_assets_seen
+            .set(i64::try_from(assets_seen).unwrap_or(i64::MAX));
+    }
+
+    /// Increment the counter for failed DB summary reads.
+    ///
+    /// Call this whenever [`get_summary`](crate::state::StateDb::get_summary)
+    /// returns an error during a metrics update so the failure is visible in
+    /// the `/metrics` output rather than only in the log.
+    pub(crate) fn record_db_summary_failure(&self) {
+        self.db_summary_read_failures.inc();
     }
 
     async fn update_health_gauges(&self, health: &HealthStatus) {
@@ -845,16 +864,16 @@ mod tests {
 
         let output = render_metrics(&handle).await;
         assert!(
-            output.contains(r#"status="downloaded""#) && output.contains("100"),
-            "downloaded count missing:\n{output}"
+            output.contains(r#"kei_db_assets_total{status="downloaded"} 100"#),
+            "downloaded count missing or wrong:\n{output}"
         );
         assert!(
-            output.contains(r#"status="pending""#) && output.contains("5"),
-            "pending count missing:\n{output}"
+            output.contains(r#"kei_db_assets_total{status="pending"} 5"#),
+            "pending count missing or wrong:\n{output}"
         );
         assert!(
-            output.contains(r#"status="failed""#) && output.contains("2"),
-            "failed count missing:\n{output}"
+            output.contains(r#"kei_db_assets_total{status="failed"} 2"#),
+            "failed count missing or wrong:\n{output}"
         );
     }
 
@@ -866,7 +885,7 @@ mod tests {
 
         let output = render_metrics(&handle).await;
         assert!(
-            output.contains("kei_db_assets_size_bytes") && output.contains("2048000"),
+            output.contains(r#"kei_db_assets_size_bytes{status="downloaded"} 2048000"#),
             "downloaded_bytes gauge missing or wrong:\n{output}"
         );
     }
@@ -919,6 +938,19 @@ mod tests {
         assert!(
             output.contains("kei_db_last_sync_assets_seen"),
             "kei_db_last_sync_assets_seen missing from /metrics output:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_summary_failure_counter_increments() {
+        let handle = MetricsHandle::new();
+        handle.record_db_summary_failure();
+        handle.record_db_summary_failure();
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains("kei_db_summary_read_failures_total 2"),
+            "db_summary_read_failures counter missing or wrong:\n{output}"
         );
     }
 }

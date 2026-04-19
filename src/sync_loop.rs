@@ -490,6 +490,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             handle.update_db_stats(&summary, cycle_result.stats.assets_seen);
                         }
                         Err(e) => {
+                            handle.record_db_summary_failure();
                             tracing::warn!(error = %e, "Failed to fetch DB summary for metrics; skipping DB gauge update");
                         }
                     }
