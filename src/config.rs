@@ -292,6 +292,14 @@ fn resolve<T>(cli: Option<T>, toml: Option<T>, default: T) -> T {
     cli.or(toml).unwrap_or(default)
 }
 
+/// Same as `resolve`, but takes references so callers don't clone both
+/// sources before choosing the winner. Only the chosen value is cloned.
+/// Prefer this for owned types (`String`, `Vec<_>`) where the `resolve`
+/// version would double-allocate; for `Copy` types the two are equivalent.
+fn resolve_ref<T: Clone>(cli: Option<&T>, toml: Option<&T>, default: T) -> T {
+    cli.or(toml).cloned().unwrap_or(default)
+}
+
 /// For boolean flags: CLI explicit value wins, then TOML, then false.
 /// `Option<bool>` allows the CLI to explicitly pass `--flag false` to
 /// override a TOML `true`.
@@ -330,9 +338,9 @@ pub(crate) fn resolve_auth(
 ) -> (String, Option<String>, Domain, PathBuf) {
     let toml_auth = toml.and_then(|t| t.auth.as_ref());
 
-    let username = resolve(
-        globals.username.clone(),
-        toml_auth.and_then(|a| a.username.clone()),
+    let username = resolve_ref(
+        globals.username.as_ref(),
+        toml_auth.and_then(|a| a.username.as_ref()),
         String::new(),
     );
 

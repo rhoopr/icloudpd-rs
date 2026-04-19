@@ -236,6 +236,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         base_delay_secs: config.retry_delay_secs,
         max_delay_secs: 60,
     };
+    api_retry_config.validate()?;
 
     // CloudKit session/routing recovery: if init or the first CloudKit query
     // surfaces a session-error signature (401 stale session, or 421 persisting

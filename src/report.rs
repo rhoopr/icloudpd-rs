@@ -27,6 +27,14 @@ pub(crate) struct SyncReport {
 }
 
 /// User-facing options captured from the resolved Config. No secrets.
+///
+/// `size`, `live_photo_mode`, `live_photo_size`, `file_match_policy`, and
+/// `library` are serialized as lowercased `{:?}` of the underlying enum
+/// (e.g. `VersionSize::Original` → `"original"`). Those enum variant names
+/// are therefore part of the `sync_report.json` wire format — renaming a
+/// variant will silently change the emitted JSON. When a variant rename
+/// is needed, either keep the old lowercase string here explicitly or
+/// bump the report schema version.
 #[derive(Debug, Serialize)]
 pub(crate) struct RunOptions {
     pub username: String,

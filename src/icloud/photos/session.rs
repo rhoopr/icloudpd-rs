@@ -45,7 +45,17 @@ impl PhotosSession for reqwest::Client {
         if status.is_client_error() || status.is_server_error() {
             let url = resp.url().to_string();
             let retry_after = parse_retry_after_header(resp.headers(), RETRY_AFTER_MAX);
-            let resp_body = resp.text().await.unwrap_or_default();
+            let resp_body = match resp.text().await {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        url = %url,
+                        "CloudKit error-response body read failed; proceeding with empty body"
+                    );
+                    String::new()
+                }
+            };
             if !resp_body.is_empty() {
                 // 421 bodies are the most diagnostic signal for distinguishing
                 // ADP-class from session-class misdirected requests (e.g. the
@@ -252,6 +262,10 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                 records.retain(|r| r["serverErrorCode"].as_str().is_none());
                 let valid_count = records.len();
                 if valid_count == 0 {
+                    // Control only reaches here because the loop above walked
+                    // at least one record with `serverErrorCode` set, which
+                    // always assigns `last_ck_err`. The expect encodes that
+                    // invariant — it cannot fire at runtime.
                     return Err(last_ck_err.expect("errored is non-empty").into());
                 }
                 tracing::warn!(
