@@ -403,19 +403,19 @@ async fn collect_album_asset_ids(
 /// The returned [`AlbumPlan`] contains one or more passes, each paired with
 /// its own exclude-asset-ids set:
 ///
-/// - [`AlbumSelection::LibraryOnly`] returns a single library-wide pass.
+/// - [`config::AlbumSelection::LibraryOnly`] returns a single library-wide pass.
 ///   `--exclude-album X` without `--album` populates the pass's exclude set
 ///   with X's members so they don't leak through the library-wide stream.
-/// - [`AlbumSelection::Named`] returns one pass per matched album, minus
+/// - [`config::AlbumSelection::Named`] returns one pass per matched album, minus
 ///   anything in `exclude_albums`. Missing names are a hard error.
-/// - [`AlbumSelection::All`] returns one pass per discovered album (minus
+/// - [`config::AlbumSelection::All`] returns one pass per discovered album (minus
 ///   `exclude_albums`). When `{album}` is in `folder_structure`, an extra
 ///   library-wide "unfiled" pass is appended; its exclude set is the union
 ///   of every discovered album's members (including excluded ones — users
 ///   explicitly asked to skip those, so they must not fall through to the
 ///   unfiled pass either).
 ///
-/// `folder_structure` is consulted only for `AlbumSelection::All`, to decide
+/// `folder_structure` is consulted only for `config::AlbumSelection::All`, to decide
 /// whether to add the unfiled pass.
 pub(crate) async fn resolve_albums(
     library: &icloud::photos::PhotoLibrary,
