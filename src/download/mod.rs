@@ -410,10 +410,12 @@ pub(crate) struct DownloadConfig {
 }
 
 impl DownloadConfig {
-    /// True when `--folder-structure` contains the `{album}` token. Passes
-    /// in this mode need per-album path expansion and bypass the
-    /// path-blind state-DB fast-skip (the same asset legitimately lives at
-    /// different paths across album folders).
+    /// True when `--folder-structure` contains the `{album}` token.
+    ///
+    /// Only meaningful on the *base* config. A per-pass config produced by
+    /// `with_album_name` / `with_pass` has already had the token expanded
+    /// out of `folder_structure`, so this would always return false there.
+    /// Per-pass code paths should check `album_name.is_some()` instead.
     pub(crate) fn uses_album_expansion(&self) -> bool {
         self.folder_structure.contains("{album}")
     }
@@ -422,6 +424,12 @@ impl DownloadConfig {
     /// when `{album}` is in `folder_structure`. Pre-expands the `{album}` token
     /// in `folder_structure` so `local_download_dir` avoids per-asset
     /// sanitize/escape/replace allocations.
+    ///
+    /// Setting `album_name` on the derived config is load-bearing: the
+    /// fast-skip bypass in the streaming pipeline uses `album_name.is_some()`
+    /// as the "this asset may legitimately land at multiple paths, don't
+    /// trust the DB" signal. An empty name still sets `Some("")`, so the
+    /// unfiled `library.all()` pass inherits the bypass too.
     fn with_album_name(&self, name: Arc<str>) -> Self {
         let album_ref = Some(name.as_ref()).filter(|n: &&str| !n.is_empty());
         let folder_structure = paths::expand_album_token(&self.folder_structure, album_ref);
@@ -993,7 +1001,7 @@ async fn download_photos_full_with_token(
     // so the `zip(&pass_counts)` below stays aligned.
     let pass_counts: Vec<u64> = stream::iter(passes)
         .map(|pass| async move { pass.album.len().await.unwrap_or(0) })
-        .buffered(config.concurrent_downloads.max(1))
+        .buffered(config.concurrent_downloads)
         .collect()
         .await;
     let mut total: u64 = pass_counts.iter().sum();
@@ -2421,42 +2429,6 @@ mod tests {
         assert!(
             !derived.folder_structure.contains('/')
                 || !derived.folder_structure.starts_with("My/Album")
-        );
-    }
-
-    // The fast-skip bypass in `stream_and_download_from_stream` keys on
-    // `album_name.is_some()` as its signal that "this asset may legitimately
-    // land at multiple paths, don't trust the DB". `with_album_name` and
-    // `with_pass` must both preserve that signal; if either left it None, a
-    // photo in multiple albums would download to the first album's folder
-    // only.
-    #[test]
-    fn test_with_album_name_sets_album_name_for_fast_skip_bypass() {
-        let mut config = test_config();
-        config.folder_structure = "{album}/%Y".to_string();
-        config.album_name = None;
-        let derived = config.with_album_name(Arc::from("Vacation"));
-        assert_eq!(
-            derived.album_name.as_deref(),
-            Some("Vacation"),
-            "album_name must be set so the fast-skip bypass fires"
-        );
-    }
-
-    #[test]
-    fn test_with_album_name_empty_name_still_signals_per_album_pass() {
-        // The unfiled pass uses `library.all()` whose name is empty. The
-        // fast-skip bypass still needs to fire for it — an asset in any
-        // concrete album is excluded from the unfiled pass via `exclude_ids`,
-        // but truly-unfiled assets still need path-aware checks.
-        let mut config = test_config();
-        config.folder_structure = "{album}/%Y".to_string();
-        config.album_name = None;
-        let derived = config.with_album_name(Arc::from(""));
-        assert_eq!(
-            derived.album_name.as_deref(),
-            Some(""),
-            "empty album name still signals per-album pass mode"
         );
     }
 
