@@ -152,7 +152,13 @@ impl MetadataPayload {
         let keywords = meta
             .keywords
             .as_deref()
-            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .and_then(|s| match serde_json::from_str::<Vec<String>>(s) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(error = %e, raw = %s, "Failed to parse keywords JSON");
+                    None
+                }
+            })
             .unwrap_or_default();
         Self {
             rating: meta.rating,
@@ -173,9 +179,12 @@ impl MetadataPayload {
     /// Merge album names into `keywords` (as `dc:subject` tags — the standard
     /// XMP slot photo managers scan for groupings) and set `people`.
     pub(super) fn with_asset_groupings(mut self, albums: &[String], people: &[String]) -> Self {
-        for album in albums {
-            if !self.keywords.iter().any(|k| k == album) {
-                self.keywords.push(album.clone());
+        if !albums.is_empty() {
+            let mut seen: rustc_hash::FxHashSet<String> = self.keywords.iter().cloned().collect();
+            for album in albums {
+                if seen.insert(album.clone()) {
+                    self.keywords.push(album.clone());
+                }
             }
         }
         self.people = people.to_vec();

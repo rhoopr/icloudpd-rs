@@ -1370,9 +1370,21 @@ pub(super) async fn run_download_pass(
     }
 }
 
+/// Pack `(latitude, longitude, altitude)` from a payload into `GpsCoords`,
+/// or `None` when either lat or lng is missing.
+fn gps_from_payload(payload: &MetadataPayload) -> Option<super::metadata::GpsCoords> {
+    match (payload.latitude, payload.longitude) {
+        (Some(lat), Some(lng)) => Some(super::metadata::GpsCoords {
+            latitude: lat,
+            longitude: lng,
+            altitude: payload.altitude,
+        }),
+        _ => None,
+    }
+}
+
 /// Comprehensive snapshot of every field a payload can contribute. Used as
-/// the sidecar plan directly and as the base that [`plan_metadata_write`]
-/// filters for the embed path.
+/// the sidecar plan (sidecars are fresh files; no probe gating applies).
 fn plan_sidecar_write(
     payload: &MetadataPayload,
     created_local: &chrono::DateTime<chrono::Local>,
@@ -1380,14 +1392,7 @@ fn plan_sidecar_write(
     super::metadata::MetadataWrite {
         datetime: Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string()),
         rating: payload.rating,
-        gps: match (payload.latitude, payload.longitude) {
-            (Some(lat), Some(lng)) => Some(super::metadata::GpsCoords {
-                latitude: lat,
-                longitude: lng,
-                altitude: payload.altitude,
-            }),
-            _ => None,
-        },
+        gps: gps_from_payload(payload),
         title: payload.title.clone(),
         description: payload.description.clone(),
         keywords: payload.keywords.clone(),
@@ -1399,42 +1404,44 @@ fn plan_sidecar_write(
     }
 }
 
-/// Filter the comprehensive write down to what the embed path should actually
-/// touch, honouring per-tag gates:
+/// Plan the embed-path write. Per-tag gates:
 ///
 /// - **datetime / GPS**: only when the flag is on AND the file has no
 ///   existing value (probe gate preserves camera-supplied data).
 /// - **rating / description**: flag gate only — iCloud is the source of truth.
 /// - **XMP-only fields** (title, keywords, people, hidden/archived,
 ///   media_subtype, burst_id): gated on `embed_xmp`.
+///
+/// Populates conditionally (not populate-then-clear) so the common
+/// `embed_xmp=false` config doesn't pay for keyword/people clones it discards.
 fn plan_metadata_write(
     flags: MetadataFlags,
     payload: &MetadataPayload,
     created_local: &chrono::DateTime<chrono::Local>,
     probe: &super::metadata::ExifProbe,
 ) -> super::metadata::MetadataWrite {
-    let mut write = plan_sidecar_write(payload, created_local);
+    let mut write = super::metadata::MetadataWrite::default();
 
-    if !flags.datetime || probe.datetime_original.is_some() {
-        write.datetime = None;
+    if flags.datetime && probe.datetime_original.is_none() {
+        write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
     }
-    if !flags.rating {
-        write.rating = None;
+    if flags.rating {
+        write.rating = payload.rating;
     }
-    if !flags.gps || probe.has_gps {
-        write.gps = None;
+    if flags.gps && !probe.has_gps {
+        write.gps = gps_from_payload(payload);
     }
-    if !flags.description {
-        write.description = None;
+    if flags.description {
+        write.description = payload.description.clone();
     }
-    if !flags.embed_xmp {
-        write.title = None;
-        write.keywords.clear();
-        write.people.clear();
-        write.is_hidden = false;
-        write.is_archived = false;
-        write.media_subtype = None;
-        write.burst_id = None;
+    if flags.embed_xmp {
+        write.title = payload.title.clone();
+        write.keywords = payload.keywords.clone();
+        write.people = payload.people.clone();
+        write.is_hidden = payload.is_hidden;
+        write.is_archived = payload.is_archived;
+        write.media_subtype = payload.media_subtype.clone();
+        write.burst_id = payload.burst_id.clone();
     }
 
     write
@@ -1574,9 +1581,12 @@ async fn download_single_task(
             }
         })
         .await;
-        if let Err(e) = sidecar_result {
-            tracing::warn!(error = %e, "XMP sidecar task panicked");
-            exif_ok = false;
+        match sidecar_result {
+            Ok(ok) => exif_ok = exif_ok && ok,
+            Err(e) => {
+                tracing::warn!(error = %e, "XMP sidecar task panicked");
+                exif_ok = false;
+            }
         }
     }
 

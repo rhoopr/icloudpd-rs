@@ -154,10 +154,13 @@ pub(crate) fn write_sidecar(media_path: &Path, write: &MetadataWrite) -> Result<
     apply_to_xmp(&mut meta, write)?;
     let bytes = meta.to_string().into_bytes();
 
-    let mut sidecar_name = media_path.file_name().unwrap_or_default().to_os_string();
+    let Some(name) = media_path.file_name() else {
+        anyhow::bail!("sidecar target has no filename: {}", media_path.display());
+    };
+    let mut sidecar_name = name.to_os_string();
     sidecar_name.push(".xmp");
     let sidecar_path = media_path.with_file_name(&sidecar_name);
-    let mut tmp_name = sidecar_path.file_name().unwrap_or_default().to_os_string();
+    let mut tmp_name = sidecar_name;
     tmp_name.push(".meta-tmp");
     let tmp_path = sidecar_path.with_file_name(&tmp_name);
 
