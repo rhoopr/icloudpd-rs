@@ -3290,6 +3290,40 @@ mod tests {
         assert!(toml.photos.as_ref().unwrap().live_photo_mode.is_none());
     }
 
+    #[test]
+    fn test_to_toml_roundtrip_bandwidth_limit() {
+        let mut sync = default_sync();
+        sync.bandwidth_limit = Some(5_000_000);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        let serialized = cfg.to_toml();
+        assert_eq!(
+            serialized
+                .download
+                .as_ref()
+                .unwrap()
+                .bandwidth_limit
+                .as_deref(),
+            Some("5000000")
+        );
+
+        let reparsed = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(serialized),
+        )
+        .unwrap();
+        assert_eq!(reparsed.bandwidth_limit, Some(5_000_000));
+    }
+
+    #[test]
+    fn test_to_toml_bandwidth_limit_none_omitted() {
+        let cfg =
+            Config::build(&default_globals(), default_password(), default_sync(), None).unwrap();
+        let toml = cfg.to_toml();
+        assert!(toml.download.as_ref().unwrap().bandwidth_limit.is_none());
+    }
+
     // ── TOML-only skip_live_photos legacy path ──────────────────────
 
     #[test]

@@ -13,12 +13,12 @@
 use async_speed_limit::{clock::StandardClock, Limiter};
 
 #[derive(Clone)]
-pub struct BandwidthLimiter {
+pub(crate) struct BandwidthLimiter {
     inner: Limiter<StandardClock>,
 }
 
 impl BandwidthLimiter {
-    pub fn new(bytes_per_sec: u64) -> Self {
+    pub(crate) fn new(bytes_per_sec: u64) -> Self {
         Self {
             inner: <Limiter>::builder(bytes_per_sec as f64).build(),
         }
@@ -28,11 +28,11 @@ impl BandwidthLimiter {
     ///
     /// The underlying limiter handles oversized requests correctly: a chunk
     /// larger than one bucket refill simply waits longer.
-    pub async fn consume(&self, n: usize) {
+    pub(crate) async fn consume(&self, n: usize) {
         self.inner.consume(n).await;
     }
 
-    pub fn bytes_per_sec(&self) -> u64 {
+    pub(crate) fn bytes_per_sec(&self) -> u64 {
         self.inner.speed_limit() as u64
     }
 }

@@ -359,8 +359,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let retry_config = api_retry_config;
     let live_photo_size = config.live_photo_size.to_asset_version_size();
     // One shared limiter per sync run so the configured cap applies to
-    // aggregate throughput across every concurrent download. The inner
-    // token bucket is already shared across clones, so no Arc is needed.
+    // aggregate throughput across every concurrent download.
     let bandwidth_limiter = config
         .bandwidth_limit
         .map(download::limiter::BandwidthLimiter::new);
