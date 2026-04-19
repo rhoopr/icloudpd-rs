@@ -907,6 +907,13 @@ where
                 disk_bytes_total += disk_bytes;
                 if !exif_ok {
                     exif_failures += 1;
+                    pb.suspend(|| {
+                        tracing::error!(
+                            asset_id = %task.asset_id,
+                            path = %task.download_path.display(),
+                            "Metadata write failed after download; marker set for retry on next sync"
+                        );
+                    });
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) = db
@@ -933,6 +940,32 @@ where
                             local_checksum,
                             download_checksum,
                         });
+                    } else if !exif_ok {
+                        // Bytes landed, state row reflects that, but the
+                        // EXIF/XMP writer failed. CF-5's metadata-only
+                        // rewrite path reads this marker on the next sync.
+                        if let Err(e) = db
+                            .record_metadata_write_failure(
+                                &task.asset_id,
+                                task.version_size.as_str(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                asset_id = %task.asset_id,
+                                error = %e,
+                                "Could not set metadata-write-failed marker"
+                            );
+                        }
+                    } else {
+                        // Success path: clear any stale marker from a
+                        // prior sync that had failed.
+                        let _ = db
+                            .clear_metadata_write_failure(
+                                &task.asset_id,
+                                task.version_size.as_str(),
+                            )
+                            .await;
                     }
                 }
             }
@@ -1344,6 +1377,13 @@ pub(super) async fn run_download_pass(
                 disk_bytes_total += disk_bytes;
                 if !*exif_ok {
                     exif_failures += 1;
+                    pb.suspend(|| {
+                        tracing::error!(
+                            asset_id = %task.asset_id,
+                            path = %task.download_path.display(),
+                            "Metadata write failed after download; marker set for retry on next sync"
+                        );
+                    });
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) = db
@@ -1370,6 +1410,27 @@ pub(super) async fn run_download_pass(
                             local_checksum: local_checksum.clone(),
                             download_checksum: download_checksum.clone(),
                         });
+                    } else if !*exif_ok {
+                        if let Err(e) = db
+                            .record_metadata_write_failure(
+                                &task.asset_id,
+                                task.version_size.as_str(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                asset_id = %task.asset_id,
+                                error = %e,
+                                "Could not set metadata-write-failed marker"
+                            );
+                        }
+                    } else {
+                        let _ = db
+                            .clear_metadata_write_failure(
+                                &task.asset_id,
+                                task.version_size.as_str(),
+                            )
+                            .await;
                     }
                 }
             }
@@ -2405,6 +2466,12 @@ mod tests {
             Ok(())
         }
         async fn mark_hidden_at_source(&self, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn record_metadata_write_failure(&self, _: &str, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn clear_metadata_write_failure(&self, _: &str, _: &str) -> Result<(), StateError> {
             Ok(())
         }
         async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {

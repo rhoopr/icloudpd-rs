@@ -223,6 +223,25 @@ pub trait StateDb: Send + Sync {
     /// Mark an asset as hidden at source.
     async fn mark_hidden_at_source(&self, asset_id: &str) -> Result<(), StateError>;
 
+    /// Record that a metadata write (EXIF embed or sidecar) failed for this
+    /// asset-version pair after the bytes landed on disk. Sets
+    /// `metadata_write_failed_at` to the current timestamp. CF-5's
+    /// metadata-only rewrite path consumes this to retry on subsequent syncs
+    /// even when the file checksum matches.
+    async fn record_metadata_write_failure(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError>;
+
+    /// Clear the metadata-write-failed marker for an asset-version pair
+    /// after a successful rewrite.
+    async fn clear_metadata_write_failure(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError>;
+
     /// Whether any downloaded asset still has `metadata_hash IS NULL`.
     ///
     /// Used at sync start to log a one-time backfill notice after the v5
@@ -1034,6 +1053,37 @@ impl StateDb for SqliteStateDb {
             rusqlite::params![asset_id],
         )
         .map_err(|e| StateError::query("mark_hidden_at_source", e))?;
+        Ok(())
+    }
+
+    async fn record_metadata_write_failure(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        let ts = Utc::now().timestamp();
+        let conn = self.acquire_lock("record_metadata_write_failure")?;
+        conn.execute(
+            "UPDATE assets SET metadata_write_failed_at = ?1 \
+             WHERE id = ?2 AND version_size = ?3",
+            rusqlite::params![ts, asset_id, version_size],
+        )
+        .map_err(|e| StateError::query("record_metadata_write_failure", e))?;
+        Ok(())
+    }
+
+    async fn clear_metadata_write_failure(
+        &self,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        let conn = self.acquire_lock("clear_metadata_write_failure")?;
+        conn.execute(
+            "UPDATE assets SET metadata_write_failed_at = NULL \
+             WHERE id = ?1 AND version_size = ?2",
+            rusqlite::params![asset_id, version_size],
+        )
+        .map_err(|e| StateError::query("clear_metadata_write_failure", e))?;
         Ok(())
     }
 
@@ -2988,6 +3038,61 @@ mod tests {
         db.mark_hidden_at_source("HID_1").await.unwrap();
         let pending = db.get_pending().await.unwrap();
         assert!(pending[0].metadata.is_hidden);
+    }
+
+    #[tokio::test]
+    async fn record_and_clear_metadata_write_failure_roundtrip() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("MWF_1").build();
+        db.upsert_seen(&rec).await.unwrap();
+
+        // Initially, the marker column is NULL.
+        let ts_initial: Option<i64> = {
+            let conn = db.acquire_lock("test").unwrap();
+            conn.query_row(
+                "SELECT metadata_write_failed_at FROM assets WHERE id = 'MWF_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(ts_initial.is_none());
+
+        // Set the marker.
+        db.record_metadata_write_failure("MWF_1", "original")
+            .await
+            .unwrap();
+        let ts_after_set: Option<i64> = {
+            let conn = db.acquire_lock("test").unwrap();
+            conn.query_row(
+                "SELECT metadata_write_failed_at FROM assets WHERE id = 'MWF_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            ts_after_set.is_some(),
+            "marker should be set after record_metadata_write_failure"
+        );
+
+        // Clear the marker after a successful retry.
+        db.clear_metadata_write_failure("MWF_1", "original")
+            .await
+            .unwrap();
+        let ts_after_clear: Option<i64> = {
+            let conn = db.acquire_lock("test").unwrap();
+            conn.query_row(
+                "SELECT metadata_write_failed_at FROM assets WHERE id = 'MWF_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            ts_after_clear.is_none(),
+            "marker should be cleared after clear_metadata_write_failure"
+        );
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 5;
+pub(crate) const SCHEMA_VERSION: i32 = 6;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -206,6 +206,19 @@ fn migrate_to_version(
             // metadata populated.
             if start_version < 5 {
                 conn.execute("DELETE FROM metadata WHERE key LIKE 'sync_token:%'", [])?;
+            }
+        }
+        6 => {
+            // metadata_write_failed_at: epoch timestamp of the most recent
+            // metadata write (EXIF/XMP embed or sidecar) that failed after
+            // the media bytes landed. NULL means no pending retry. CF-5's
+            // metadata-only rewrite path consumes this to re-drive the
+            // writer on subsequent syncs, since checksum-based skip logic
+            // otherwise hides the asset forever.
+            if !column_exists(conn, "assets", "metadata_write_failed_at")? {
+                conn.execute_batch(
+                    "ALTER TABLE assets ADD COLUMN metadata_write_failed_at INTEGER;",
+                )?;
             }
         }
         other => {
