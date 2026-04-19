@@ -33,7 +33,7 @@ use crate::health::HealthStatus;
 // ── Label types ──────────────────────────────────────────────────────────────
 
 /// Label set for the `kei_sync_skipped_total` counter family.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
 struct SkipLabels {
     reason: &'static str,
 }
