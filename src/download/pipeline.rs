@@ -135,7 +135,7 @@ pub(super) const AUTH_ERROR_THRESHOLD: usize = 3;
 /// Accumulated during the download loop and retried in a final flush.
 #[derive(Debug)]
 struct PendingStateWrite {
-    asset_id: Box<str>,
+    asset_id: Arc<str>,
     version_size: crate::state::VersionSizeKey,
     download_path: PathBuf,
     local_checksum: String,
@@ -560,7 +560,7 @@ where
         let config = &producer_config;
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
-        let mut seen_ids: FxHashSet<Box<str>> = FxHashSet::default();
+        let mut seen_ids: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
         tokio::pin!(combined);
@@ -570,7 +570,7 @@ where
             }
             match result {
                 Ok(asset) => {
-                    if !seen_ids.insert(asset.id().into()) {
+                    if !seen_ids.insert(asset.id_arc()) {
                         tracing::warn!(
                             asset_id = %asset.id(),
                             "Duplicate asset ID from API, skipping"

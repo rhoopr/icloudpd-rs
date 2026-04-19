@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, TimeZone, Utc};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
@@ -35,14 +37,19 @@ pub struct ChangeEvent {
 /// A photo or video asset from iCloud.
 ///
 /// Fields are ordered for optimal memory layout:
-/// - Heap types first (`Box<str>`, `Option<Box<str>>`)
+/// - Heap types first (`Arc<str>`, `Option<Box<str>>`)
 /// - `VersionsMap` (`SmallVec` inline storage)
 /// - f64 primitives
 /// - Small enums last
+///
+/// `record_name` is `Arc<str>` so downstream consumers (producer
+/// dedup set, `DownloadTask`, deferred state writes) can share the
+/// same allocation via refcount bumps instead of re-cloning the
+/// record ID at every stage boundary.
 #[derive(Debug, Clone)]
 pub struct PhotoAsset {
     // Heap types first
-    record_name: Box<str>,
+    record_name: Arc<str>,
     filename: Option<Box<str>>,
     // Metadata boxed to keep PhotoAsset compact when metadata is large
     // (keywords, provider_data JSON can be several hundred bytes).
@@ -190,7 +197,7 @@ impl PhotoAsset {
     /// Construct from raw JSON values (used by tests).
     #[cfg(test)]
     pub fn new(master_record: Value, asset_record: Value) -> Self {
-        let record_name: Box<str> = master_record["recordName"].as_str().unwrap_or("").into();
+        let record_name: Arc<str> = master_record["recordName"].as_str().unwrap_or("").into();
         let master_fields = master_record.get("fields").cloned().unwrap_or(Value::Null);
         let asset_fields = asset_record.get("fields").cloned().unwrap_or(Value::Null);
         let filename = decode_filename(&master_fields).map(String::into_boxed_str);
@@ -224,7 +231,7 @@ impl PhotoAsset {
         );
         let asset_metadata = Box::new(metadata::extract(&master.fields, &asset.fields));
         Self {
-            record_name: master.record_name.into_boxed_str(),
+            record_name: Arc::from(master.record_name),
             filename,
             asset_metadata,
             item_type_val,
@@ -241,6 +248,14 @@ impl PhotoAsset {
 
     pub fn id(&self) -> &str {
         &self.record_name
+    }
+
+    /// Shared handle on the record ID. Consumers that want to store the ID
+    /// (producer dedup set, `DownloadTask`, deferred state writes) clone the
+    /// `Arc<str>` instead of allocating a fresh owned copy.
+    #[must_use]
+    pub fn id_arc(&self) -> Arc<str> {
+        Arc::clone(&self.record_name)
     }
 
     pub fn filename(&self) -> Option<&str> {

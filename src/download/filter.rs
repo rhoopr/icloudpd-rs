@@ -236,8 +236,9 @@ pub(super) struct DownloadTask {
     pub(super) url: Box<str>,
     pub(super) download_path: PathBuf,
     pub(super) checksum: Box<str>,
-    /// iCloud asset ID for state tracking.
-    pub(super) asset_id: Box<str>,
+    /// iCloud asset ID for state tracking. Shared with the producer's
+    /// dedup set and any deferred state writes via refcount bump.
+    pub(super) asset_id: Arc<str>,
     /// Metadata fields surfaced from `AssetMetadata` for writer consumption.
     /// Behind `Arc` so `task.metadata.clone()` in the download hot path is a
     /// refcount bump instead of a deep clone of every `Vec<String>` inside.
@@ -751,7 +752,7 @@ pub(super) fn filter_asset_to_tasks(
                 url: version.url.clone(),
                 download_path: path,
                 checksum: version.checksum.clone(),
-                asset_id: asset.id().into(),
+                asset_id: asset.id_arc(),
                 metadata: build_payload(asset, config),
                 size: version.size,
                 created_local,
@@ -830,7 +831,7 @@ pub(super) fn filter_asset_to_tasks(
                     url: live_version.url.clone(),
                     download_path: path,
                     checksum: live_version.checksum.clone(),
-                    asset_id: asset.id().into(),
+                    asset_id: asset.id_arc(),
                     metadata: build_payload(asset, config),
                     size: live_version.size,
                     created_local,
