@@ -1167,10 +1167,10 @@ mod tests {
         );
     }
 
-    /// CF-1: a single empty /records/query page is not sufficient to
-    /// conclude EOF. The fetcher must probe forward by one `page_size`
-    /// before terminating, so a transient gap doesn't silently cut
-    /// enumeration short.
+    /// A single empty /records/query page is not sufficient to conclude
+    /// EOF. The fetcher must probe forward by one `page_size` before
+    /// terminating so a transient gap doesn't silently cut enumeration
+    /// short.
     #[tokio::test]
     async fn test_photo_stream_probes_past_single_empty_page() {
         use tokio_stream::StreamExt;

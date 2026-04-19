@@ -540,10 +540,11 @@ struct DownloadContext {
     /// Used to detect metadata-only changes (favorite toggle, keywords, GPS edit,
     /// etc.) when file bytes are unchanged but the provider has newer metadata.
     downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>>,
-    /// Set of `(asset_id, version_size)` pairs with a non-null
+    /// Nested map: `asset_id` -> set of `version_sizes` with a non-null
     /// `metadata_write_failed_at` from a prior sync. These always route to
     /// the metadata-rewrite path regardless of whether the hash changed.
-    metadata_retry_markers: FxHashSet<(Box<str>, Box<str>)>,
+    /// Two-level shape matches `downloaded_ids` for zero-allocation lookups.
+    metadata_retry_markers: FxHashMap<Box<str>, FxHashSet<Box<str>>>,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced.
     known_ids: FxHashSet<Box<str>>,
@@ -553,14 +554,58 @@ struct DownloadContext {
 }
 
 impl DownloadContext {
-    /// Load the download context from the state database.
+    /// Load the download context from the state database. All six queries
+    /// are independent and run concurrently so sync start doesn't serialize
+    /// on round-trip latency across them.
     async fn load(db: &dyn StateDb, retry_only: bool) -> Self {
-        // Build nested map structure for zero-allocation lookups
+        let known_ids_fut = async {
+            if retry_only {
+                db.get_all_known_ids().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load known IDs from state DB");
+                    Default::default()
+                })
+            } else {
+                Default::default()
+            }
+        };
+        let (ids, checksums, hashes, markers, attempts, known_ids) = tokio::join!(
+            async {
+                db.get_downloaded_ids().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
+                    Default::default()
+                })
+            },
+            async {
+                db.get_downloaded_checksums().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load checksums from state DB");
+                    Default::default()
+                })
+            },
+            async {
+                db.get_downloaded_metadata_hashes()
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Failed to load metadata hashes from state DB");
+                        Default::default()
+                    })
+            },
+            async {
+                db.get_metadata_retry_markers().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
+                    Default::default()
+                })
+            },
+            async {
+                db.get_attempt_counts().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load attempt counts from state DB");
+                    Default::default()
+                })
+            },
+            known_ids_fut,
+        );
+
         let mut downloaded_ids: FxHashMap<Box<str>, FxHashSet<Box<str>>> = FxHashMap::default();
-        for (asset_id, version_size) in db.get_downloaded_ids().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
-            Default::default()
-        }) {
+        for (asset_id, version_size) in ids {
             downloaded_ids
                 .entry(asset_id.into_boxed_str())
                 .or_default()
@@ -569,12 +614,7 @@ impl DownloadContext {
 
         let mut downloaded_checksums: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
             FxHashMap::default();
-        for ((asset_id, version_size), checksum) in
-            db.get_downloaded_checksums().await.unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to load checksums from state DB");
-                Default::default()
-            })
-        {
+        for ((asset_id, version_size), checksum) in checksums {
             downloaded_checksums
                 .entry(asset_id.into_boxed_str())
                 .or_default()
@@ -583,14 +623,7 @@ impl DownloadContext {
 
         let mut downloaded_metadata_hashes: FxHashMap<Box<str>, FxHashMap<Box<str>, Box<str>>> =
             FxHashMap::default();
-        for ((asset_id, version_size), metadata_hash) in db
-            .get_downloaded_metadata_hashes()
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to load metadata hashes from state DB");
-                Default::default()
-            })
-        {
+        for ((asset_id, version_size), metadata_hash) in hashes {
             downloaded_metadata_hashes
                 .entry(asset_id.into_boxed_str())
                 .or_default()
@@ -600,40 +633,21 @@ impl DownloadContext {
                 );
         }
 
-        let metadata_retry_markers: FxHashSet<(Box<str>, Box<str>)> = db
-            .get_metadata_retry_markers()
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
-                Default::default()
-            })
-            .into_iter()
-            .map(|(id, vs)| (id.into_boxed_str(), vs.into_boxed_str()))
-            .collect();
+        // Two-level shape matches downloaded_ids so lookups are O(1) with
+        // borrowed keys instead of allocating a tuple per probe.
+        let mut metadata_retry_markers: FxHashMap<Box<str>, FxHashSet<Box<str>>> =
+            FxHashMap::default();
+        for (id, vs) in markers {
+            metadata_retry_markers
+                .entry(id.into_boxed_str())
+                .or_default()
+                .insert(vs.into_boxed_str());
+        }
 
-        // In retry-only mode, load all known asset IDs so we can skip new
-        // assets that were never synced before.
-        let known_ids = if retry_only {
-            db.get_all_known_ids()
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load known IDs from state DB");
-                    Default::default()
-                })
-                .into_iter()
-                .map(String::into_boxed_str)
-                .collect()
-        } else {
-            FxHashSet::default()
-        };
+        let known_ids: FxHashSet<Box<str>> =
+            known_ids.into_iter().map(String::into_boxed_str).collect();
 
-        let attempt_counts: FxHashMap<Box<str>, u32> = db
-            .get_attempt_counts()
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to load attempt counts from state DB");
-                Default::default()
-            })
+        let attempt_counts: FxHashMap<Box<str>, u32> = attempts
             .into_iter()
             .map(|(id, count)| (id.into_boxed_str(), count))
             .collect();
@@ -660,11 +674,11 @@ impl DownloadContext {
         new_metadata_hash: Option<&str>,
     ) -> bool {
         let vs_str = version_size.as_str();
-        if self
+        let has_retry_marker = self
             .metadata_retry_markers
-            .iter()
-            .any(|(id, vs)| id.as_ref() == asset_id && vs.as_ref() == vs_str)
-        {
+            .get(asset_id)
+            .is_some_and(|vsset| vsset.contains(vs_str));
+        if has_retry_marker {
             return true;
         }
         let Some(new_hash) = new_metadata_hash else {
@@ -676,7 +690,7 @@ impl DownloadContext {
             .and_then(|map| map.get(vs_str))
         {
             Some(stored) => stored.as_ref() != new_hash,
-            None => true, // downloaded row has no stored hash yet → refresh
+            None => true, // downloaded row has no stored hash yet -- refresh
         }
     }
 
@@ -2025,7 +2039,9 @@ mod tests {
     fn needs_metadata_rewrite_honors_retry_marker() {
         let mut ctx = DownloadContext::default();
         ctx.metadata_retry_markers
-            .insert(("asset_retry".into(), "original".into()));
+            .entry("asset_retry".into())
+            .or_default()
+            .insert("original".into());
         // No stored hash at all, but marker is set -> rewrite needed.
         assert!(ctx.needs_metadata_rewrite("asset_retry", VersionSizeKey::Original, None));
         // Marker set -> rewrite even if hashes match.

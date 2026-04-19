@@ -211,7 +211,7 @@ fn migrate_to_version(
         6 => {
             // metadata_write_failed_at: epoch timestamp of the most recent
             // metadata write (EXIF/XMP embed or sidecar) that failed after
-            // the media bytes landed. NULL means no pending retry. CF-5's
+            // the media bytes landed. NULL means no pending retry. The
             // metadata-only rewrite path consumes this to re-drive the
             // writer on subsequent syncs, since checksum-based skip logic
             // otherwise hides the asset forever.
@@ -616,10 +616,10 @@ mod tests {
         assert_eq!(kept, 1);
     }
 
-    /// CF-10: if the v5 migration arm is re-entered on an already-v5 DB
-    /// (e.g., someone ran `PRAGMA user_version = 0` to re-run migrations),
-    /// sync tokens must NOT be wiped again. The invalidation is a
-    /// one-shot upgrade side effect, not a recurring v5 behaviour.
+    /// If the v5 migration arm is re-entered on an already-v5 DB (e.g.,
+    /// someone ran `PRAGMA user_version = 0` to re-run migrations), sync
+    /// tokens must NOT be wiped again: the invalidation is a one-shot
+    /// upgrade side effect, not a recurring v5 behaviour.
     #[test]
     fn test_v5_does_not_reinvalidate_on_reentry() {
         let conn = Connection::open_in_memory().unwrap();
