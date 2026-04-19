@@ -447,8 +447,9 @@ pub(crate) async fn resolve_albums(
             })
         }
         config::AlbumSelection::Named(names) => {
-            // Dedup names so callers passing the same album twice get a
-            // single download pass, not an error.
+            // Dedup names: passing the same album twice should collapse to
+            // a single pass, not error out after the first remove()
+            // drained the map.
             let mut album_map = library.albums().await?;
             let mut passes = Vec::new();
             let mut seen = rustc_hash::FxHashSet::default();
@@ -473,12 +474,11 @@ pub(crate) async fn resolve_albums(
             Ok(AlbumPlan { passes })
         }
         config::AlbumSelection::All => {
-            // Filter smart folders (Favorites, Screenshots, Videos, etc.)
-            // out of the expansion. The issue requester wanted "my albums",
-            // meaning user-created folders — surfacing Apple's smart folders
-            // as download targets would be surprising and create confusing
-            // directories like "Recently Deleted" or "Hidden". Users who
-            // explicitly want a smart folder can still name it: `-a Favorites`.
+            // Smart folders (Favorites, Recently Deleted, Hidden, etc.) are
+            // skipped: the feature request asked for user-created albums,
+            // and surfacing Apple's system folders as download targets
+            // creates confusing trees. Users who want one can still name
+            // it explicitly via `-a Favorites`.
             let smart_folder_names: rustc_hash::FxHashSet<&'static str> =
                 icloud::photos::smart_folders::smart_folders()
                     .into_iter()
@@ -492,25 +492,20 @@ pub(crate) async fn resolve_albums(
                 .collect();
             let has_album_token = folder_structure.contains("{album}");
 
-            // Pre-compute the "in any user album" set BEFORE consuming the
-            // map, so the unfiled pass (if any) can skip anything that
-            // already belongs to a concrete user album — including albums
-            // excluded via --exclude-album (the user explicitly asked to
-            // skip those photos, so they must not fall through to unfiled).
+            // Collect every user album's members (including --exclude-album
+            // ones) into the unfiled exclusion set before consuming the
+            // map. Excluded albums must contribute too, otherwise their
+            // photos would leak out through the library-wide unfiled pass.
             let mut in_any_album: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
             if has_album_token {
                 for (name, album) in &album_map {
-                    tracing::debug!(
-                        album = name,
-                        "Pre-fetching album asset IDs for unfiled exclusion set"
-                    );
+                    tracing::debug!(album = name, "Pre-fetching IDs for unfiled exclusion set");
                     collect_album_asset_ids(album, &mut in_any_album).await?;
                 }
             }
 
-            // Sort by name for deterministic ordering — HashMap iteration
-            // order is not stable and users inspecting logs or dry-run
-            // output want consistency across runs.
+            // Sort by name — HashMap iteration is non-deterministic and
+            // logs/dry-run output should be stable across runs.
             let mut named_albums: Vec<(String, icloud::photos::PhotoAlbum)> =
                 album_map.into_iter().collect();
             named_albums.sort_by(|a, b| a.0.cmp(&b.0));

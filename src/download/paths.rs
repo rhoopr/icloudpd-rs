@@ -8,7 +8,7 @@ use rustc_hash::FxHashMap;
 
 /// Strip the legacy Python-style `{:%Y/%m/%d}` wrapper, returning the inner
 /// format string. Returns the input unchanged if the wrapper is absent.
-fn strip_python_wrapper(folder_structure: &str) -> &str {
+pub(crate) fn strip_python_wrapper(folder_structure: &str) -> &str {
     if folder_structure.starts_with("{:") && folder_structure.ends_with('}') {
         &folder_structure[2..folder_structure.len() - 1]
     } else {

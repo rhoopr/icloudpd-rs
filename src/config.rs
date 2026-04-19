@@ -210,23 +210,12 @@ impl std::fmt::Display for AlbumSelection {
     }
 }
 
-/// Strip the Python-style `{:...}` wrapper used in legacy folder-structure
-/// values so validation runs against the same form `expand_album_token`
-/// expands at runtime.
-fn strip_python_wrapper(folder_structure: &str) -> &str {
-    if folder_structure.starts_with("{:") && folder_structure.ends_with('}') {
-        &folder_structure[2..folder_structure.len() - 1]
-    } else {
-        folder_structure
-    }
-}
-
 /// Reject `--folder-structure` values that place `{album}` somewhere other
 /// than the first path segment, or use it more than once. Both cases would
 /// make the "unfiled photos" fallback path shift other segments around
 /// unpredictably when `{album}` collapses to an empty string.
 fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
-    let stripped = strip_python_wrapper(folder_structure);
+    let stripped = crate::download::paths::strip_python_wrapper(folder_structure);
     let count = stripped.matches("{album}").count();
     if count == 0 {
         return Ok(());
@@ -267,7 +256,7 @@ fn resolve_album_selection(
         // Smart default: bare `{album}` in the folder template implies
         // "every album, plus an unfiled pass" without the user having to
         // also pass `-a all`.
-        if strip_python_wrapper(folder_structure).contains("{album}") {
+        if crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}") {
             return Ok(AlbumSelection::All);
         }
         return Ok(AlbumSelection::LibraryOnly);
