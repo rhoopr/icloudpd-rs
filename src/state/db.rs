@@ -109,6 +109,13 @@ pub trait StateDb: Send + Sync {
     /// Complete a sync run with statistics.
     async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError>;
 
+    /// Promote any `sync_runs` rows left in `status='running'` to
+    /// `status='interrupted'` (with `interrupted=1`). These are rows from a
+    /// prior process that was SIGKILL'd or crashed without calling
+    /// `complete_sync_run`. Called once at process startup, immediately
+    /// after migrations. Returns the number of rows promoted.
+    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError>;
+
     /// Reset all failed assets to pending status.
     ///
     /// Returns the number of assets reset.
@@ -765,7 +772,7 @@ impl StateDb for SqliteStateDb {
         let conn = self.acquire_lock("start_sync_run")?;
 
         conn.execute(
-            "INSERT INTO sync_runs (started_at) VALUES (?1)",
+            "INSERT INTO sync_runs (started_at, status) VALUES (?1, 'running')",
             [started_at],
         )
         .map_err(|e| StateError::query("start_sync_run", e))?;
@@ -779,17 +786,43 @@ impl StateDb for SqliteStateDb {
         let assets_seen = i64::try_from(stats.assets_seen).unwrap_or(i64::MAX);
         let assets_downloaded = i64::try_from(stats.assets_downloaded).unwrap_or(i64::MAX);
         let assets_failed = i64::try_from(stats.assets_failed).unwrap_or(i64::MAX);
-        let interrupted = i32::from(stats.interrupted);
+        let interrupted_i32 = i32::from(stats.interrupted);
+        let status = if stats.interrupted {
+            "interrupted"
+        } else {
+            "complete"
+        };
 
         let conn = self.acquire_lock("complete_sync_run")?;
 
         conn.execute(
-            "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, assets_failed = ?4, interrupted = ?5 WHERE id = ?6",
-            rusqlite::params![completed_at, assets_seen, assets_downloaded, assets_failed, interrupted, run_id],
+            "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, \
+             assets_failed = ?4, interrupted = ?5, status = ?6 WHERE id = ?7",
+            rusqlite::params![
+                completed_at,
+                assets_seen,
+                assets_downloaded,
+                assets_failed,
+                interrupted_i32,
+                status,
+                run_id
+            ],
         )
         .map_err(|e| StateError::query("complete_sync_run", e))?;
 
         Ok(())
+    }
+
+    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+        let conn = self.acquire_lock("promote_orphaned_sync_runs")?;
+        let rows = conn
+            .execute(
+                "UPDATE sync_runs SET status = 'interrupted', interrupted = 1 \
+                 WHERE status = 'running'",
+                [],
+            )
+            .map_err(|e| StateError::query("promote_orphaned_sync_runs", e))?;
+        Ok(rows as u64)
     }
 
     async fn reset_failed(&self) -> Result<u64, StateError> {
@@ -1641,6 +1674,109 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert!(summary.last_sync_started.is_some());
         assert!(summary.last_sync_completed.is_some());
+    }
+
+    // ── sync_runs status lifecycle (MS-5) ──────────────────────────────────
+
+    async fn status_of(db: &SqliteStateDb, run_id: i64) -> String {
+        let conn = db.acquire_lock("test_status_of").unwrap();
+        conn.query_row(
+            "SELECT status FROM sync_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_run_status_is_running_after_start() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        assert_eq!(status_of(&db, run_id).await, "running");
+    }
+
+    #[tokio::test]
+    async fn sync_run_status_is_complete_after_clean_complete() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let stats = SyncRunStats {
+            assets_seen: 1,
+            assets_downloaded: 1,
+            assets_failed: 0,
+            interrupted: false,
+        };
+        db.complete_sync_run(run_id, &stats).await.unwrap();
+        assert_eq!(status_of(&db, run_id).await, "complete");
+    }
+
+    #[tokio::test]
+    async fn sync_run_status_is_interrupted_when_flagged() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let stats = SyncRunStats {
+            assets_seen: 1,
+            assets_downloaded: 0,
+            assets_failed: 0,
+            interrupted: true,
+        };
+        db.complete_sync_run(run_id, &stats).await.unwrap();
+        assert_eq!(status_of(&db, run_id).await, "interrupted");
+    }
+
+    #[tokio::test]
+    async fn promote_orphaned_sync_runs_flips_running_rows() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        // Simulate two crashed runs plus one clean one
+        let a = db.start_sync_run().await.unwrap();
+        let b = db.start_sync_run().await.unwrap();
+        let c = db.start_sync_run().await.unwrap();
+        let clean = SyncRunStats {
+            assets_seen: 0,
+            assets_downloaded: 0,
+            assets_failed: 0,
+            interrupted: false,
+        };
+        db.complete_sync_run(c, &clean).await.unwrap();
+
+        let promoted = db.promote_orphaned_sync_runs().await.unwrap();
+        assert_eq!(promoted, 2);
+        assert_eq!(status_of(&db, a).await, "interrupted");
+        assert_eq!(status_of(&db, b).await, "interrupted");
+        // The cleanly completed row must be untouched
+        assert_eq!(status_of(&db, c).await, "complete");
+    }
+
+    #[tokio::test]
+    async fn promote_orphaned_sync_runs_noop_when_none_pending() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let stats = SyncRunStats {
+            assets_seen: 0,
+            assets_downloaded: 0,
+            assets_failed: 0,
+            interrupted: false,
+        };
+        db.complete_sync_run(run_id, &stats).await.unwrap();
+
+        let promoted = db.promote_orphaned_sync_runs().await.unwrap();
+        assert_eq!(promoted, 0);
+    }
+
+    #[tokio::test]
+    async fn promote_orphaned_sync_runs_sets_interrupted_flag_too() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let _ = db.promote_orphaned_sync_runs().await.unwrap();
+
+        let conn = db.acquire_lock("verify_interrupted").unwrap();
+        let interrupted: i32 = conn
+            .query_row(
+                "SELECT interrupted FROM sync_runs WHERE id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(interrupted, 1);
     }
 
     #[tokio::test]

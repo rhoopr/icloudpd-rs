@@ -304,6 +304,23 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 tracing::debug!(path = %db_path.display(), "State database opened");
                 let db = Arc::new(db);
 
+                // Promote any sync_runs rows left in status='running' from a
+                // prior SIGKILL'd or crashed process. Runs once per process,
+                // before any new sync starts.
+                match db.promote_orphaned_sync_runs().await {
+                    Ok(0) => {}
+                    Ok(count) => {
+                        tracing::warn!(
+                            count,
+                            "Promoted orphaned sync_runs rows to 'interrupted' \
+                             (prior process exited uncleanly)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to promote orphaned sync_runs rows");
+                    }
+                }
+
                 // For retry-failed, reset failed assets to pending
                 if is_retry_failed {
                     match db.reset_failed().await {

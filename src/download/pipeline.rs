@@ -2833,6 +2833,9 @@ mod tests {
         async fn complete_sync_run(&self, _: i64, _: &SyncRunStats) -> Result<(), StateError> {
             unimplemented!()
         }
+        async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+            Ok(0)
+        }
         async fn reset_failed(&self) -> Result<u64, StateError> {
             unimplemented!()
         }

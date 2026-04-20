@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 6;
+pub(crate) const SCHEMA_VERSION: i32 = 7;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -218,6 +218,25 @@ fn migrate_to_version(
             if !column_exists(conn, "assets", "metadata_write_failed_at")? {
                 conn.execute_batch(
                     "ALTER TABLE assets ADD COLUMN metadata_write_failed_at INTEGER;",
+                )?;
+            }
+        }
+        7 => {
+            // sync_runs.status lifecycle: explicit string column so a
+            // SIGKILL'd process leaves a detectable "running" row that the
+            // next startup can promote to "interrupted". Backfill existing
+            // rows from the (completed_at, interrupted) pair.
+            if !column_exists(conn, "sync_runs", "status")? {
+                conn.execute_batch(
+                    "ALTER TABLE sync_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'running';",
+                )?;
+                conn.execute(
+                    "UPDATE sync_runs SET status = CASE \
+                        WHEN completed_at IS NULL THEN 'interrupted' \
+                        WHEN interrupted = 1      THEN 'interrupted' \
+                        ELSE 'complete' \
+                     END",
+                    [],
                 )?;
             }
         }
@@ -691,5 +710,65 @@ mod tests {
             )
             .unwrap_or(false);
         assert!(has_index);
+    }
+
+    // ── v7 sync_runs.status migration (MS-5) ───────────────────────────────
+
+    #[test]
+    fn test_v7_adds_status_column_and_backfills() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a v6 DB with a mix of runs
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        for (col, decl) in V5_ASSET_COLUMNS {
+            conn.execute_batch(&format!("ALTER TABLE assets ADD COLUMN {col} {decl};"))
+                .unwrap();
+        }
+        conn.execute_batch(SCHEMA_V5_TABLES).unwrap();
+        conn.execute_batch("ALTER TABLE assets ADD COLUMN metadata_write_failed_at INTEGER;")
+            .unwrap();
+        set_schema_version(&conn, 6).unwrap();
+
+        // Insert three historical sync_runs:
+        //   1: clean (completed_at set, interrupted=0)      -> 'complete'
+        //   2: flagged interrupted (completed_at set, =1)   -> 'interrupted'
+        //   3: crashed (completed_at IS NULL)               -> 'interrupted'
+        conn.execute(
+            "INSERT INTO sync_runs (id, started_at, completed_at, interrupted) \
+             VALUES (1, 100, 200, 0), (2, 300, 400, 1), (3, 500, NULL, 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let status = |id: i64| -> String {
+            conn.query_row("SELECT status FROM sync_runs WHERE id = ?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(status(1), "complete");
+        assert_eq!(status(2), "interrupted");
+        assert_eq!(status(3), "interrupted");
+    }
+
+    #[test]
+    fn test_v7_idempotent_when_column_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Second call must be a no-op — status column already exists
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_v7_fresh_db_has_status_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(conn.prepare("SELECT status FROM sync_runs LIMIT 0").is_ok());
     }
 }
