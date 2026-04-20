@@ -61,10 +61,20 @@ test MODE="":
             ;;
     esac
 
-# Coverage: (none) | html | patch [BASE] - patch reproduces the sticky PR comment locally.
+# Coverage: (none) | html | live | patch [BASE]. `live` merges the live
+# sync + state_auth runs into the offline baseline - the only way to see
+# the real coverage of orchestration code that offline tests can't reach.
 cov MODE="" BASE="main":
     #!/usr/bin/env bash
     set -euo pipefail
+    _live_env() {
+        if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f .env ]; then
+            set -a; source .env; set +a
+        fi
+        : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
+        export ICLOUD_TEST_COOKIE_DIR="${ICLOUD_TEST_COOKIE_DIR:-$HOME/.config/kei}"
+        export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
+    }
     case "{{MODE}}" in
         "")
             cargo llvm-cov --all-features
@@ -72,6 +82,20 @@ cov MODE="" BASE="main":
         html)
             cargo llvm-cov --all-features --html
             echo "Report: target/llvm-cov/html/index.html"
+            ;;
+        live)
+            _live_env
+            # --no-report accumulates coverage across multiple test
+            # binary invocations so we can run the live suites under the
+            # same profile data as the offline ones. The final `report`
+            # call prints the merged summary.
+            cargo llvm-cov clean --workspace
+            cargo llvm-cov --no-report --bin kei
+            cargo llvm-cov --no-report --test cli
+            cargo llvm-cov --no-report --test behavioral
+            cargo llvm-cov --no-report --test sync -- --include-ignored --test-threads=1
+            cargo llvm-cov --no-report --test state_auth -- --include-ignored --test-threads=1
+            cargo llvm-cov report --summary-only
             ;;
         patch)
             cargo llvm-cov --all-features --lcov --output-path head.lcov
@@ -87,7 +111,7 @@ cov MODE="" BASE="main":
             ;;
         *)
             echo "Unknown mode: {{MODE}}" >&2
-            echo "Modes: (none) | html | patch [BASE]" >&2
+            echo "Modes: (none) | html | live | patch [BASE]" >&2
             exit 1
             ;;
     esac
