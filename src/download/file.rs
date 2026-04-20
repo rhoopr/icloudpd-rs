@@ -495,13 +495,49 @@ fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum>
     Ok(DecodedChecksum { hex, is_sha1 })
 }
 
+/// Inspect the first bytes of a downloaded file for known-bad sentinels that
+/// unambiguously identify a non-media error body (HTML error page, JSON error,
+/// etc.). Returns a human-readable reason string when a sentinel is present.
+///
+/// Checks run case-insensitively against ASCII-whitespace-trimmed content so
+/// that e.g. a leading `\n<html>` still fails. These sentinels are never valid
+/// image/video starts — unlike the magic-byte checks further down, which are
+/// only warnings because exotic variants exist.
+fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
+    let trimmed = header
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map_or(header, |pos| &header[pos..]);
+
+    // Note: `<?xml` is deliberately NOT a sentinel because legitimate AAE
+    // sidecar files start with an XML declaration.
+    const HTML_PREFIXES: &[&[u8]] = &[b"<!doctype", b"<html"];
+    for prefix in HTML_PREFIXES {
+        if trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return Some("file starts with HTML markup (likely a CDN error page)");
+        }
+    }
+
+    // JSON error envelopes: `{"error"`, `{"errors"`, `{"message"`, `{"code"`.
+    // Match only the quoted-key form so we don't reject arbitrary JSON bodies
+    // that legitimately start with `{` (images never do, but we stay narrow).
+    const JSON_PREFIXES: &[&[u8]] = &[b"{\"error\"", b"{\"errors\"", b"{\"message\"", b"{\"code\""];
+    for prefix in JSON_PREFIXES {
+        if trimmed.len() >= prefix.len() && trimmed[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return Some("file starts with a JSON error envelope (likely a CDN error body)");
+        }
+    }
+
+    None
+}
+
 /// Validate that downloaded content matches expected format for the file extension.
 ///
 /// For known media types (JPEG, PNG, HEIC, MOV, etc.), checks magic bytes in the
 /// file header. Magic byte mismatches are logged as warnings but allowed through,
 /// since format variants exist (e.g. classic QuickTime MOV without `ftyp` box).
-/// HTML content is always rejected as a hard error — Apple's CDN occasionally
-/// returns error pages with HTTP 200.
+/// HTML and JSON error-page sentinels are always rejected as hard errors —
+/// Apple's CDN occasionally returns them with HTTP 200.
 fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,
@@ -523,19 +559,13 @@ fn validate_downloaded_content(
 
     let header = &buf[..n];
 
-    // Reject HTML content regardless of extension. Apple's CDN sometimes returns
-    // error/rate-limit pages as HTTP 200 with text/html bodies.
-    let trimmed = header
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .map_or(header, |pos| &header[pos..]);
-
-    if trimmed.starts_with(b"<!")
-        || (trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case(b"<html"))
-    {
+    // Reject known-bad error-page sentinels regardless of extension. Apple's
+    // CDN occasionally returns rate-limit / 4xx / 5xx bodies as HTTP 200 with
+    // HTML or JSON content that no valid image file would ever start with.
+    if let Some(reason) = detect_error_sentinel(header) {
         return Err(DownloadError::InvalidContent {
             path: download_path.display().to_string().into(),
-            reason: "file contains HTML (likely a CDN error page)".into(),
+            reason: reason.into(),
         });
     }
 
@@ -913,6 +943,58 @@ mod tests {
         // AAE files are XML plists — should not be rejected
         let (part, dest, _dir) = write_temp_file("photo.aae", b"<?xml version=\"1.0\"?>");
         assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_json_error_envelope_as_jpeg() {
+        let body = b"{\"error\": \"Forbidden\", \"code\": 403}";
+        let (part, dest, _dir) = write_temp_file("photo.jpg", body);
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        match err {
+            DownloadError::InvalidContent { reason, .. } => {
+                assert!(
+                    reason.contains("JSON error envelope"),
+                    "expected JSON-sentinel reason, got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_json_error_envelope_with_leading_whitespace() {
+        let body = b"\n  {\"errors\": [\"x\"]}";
+        let (part, dest, _dir) = write_temp_file("clip.heic", body);
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_json_error_envelope_case_insensitive_key() {
+        // Sentinel should match the quoted key regardless of case
+        let body = b"{\"ERROR\": \"nope\"}";
+        let (part, dest, _dir) = write_temp_file("photo.png", body);
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    #[test]
+    fn detect_error_sentinel_unit() {
+        assert!(detect_error_sentinel(b"<!doctype html>").is_some());
+        assert!(detect_error_sentinel(b"<!DOCTYPE HTML>").is_some());
+        assert!(detect_error_sentinel(b"<html><body>x</body></html>").is_some());
+        assert!(detect_error_sentinel(b"  \n<HTML>").is_some());
+        assert!(detect_error_sentinel(b"{\"error\": 1}").is_some());
+        assert!(detect_error_sentinel(b"{\"errors\":[]}").is_some());
+        assert!(detect_error_sentinel(b"{\"message\":\"foo\"}").is_some());
+        assert!(detect_error_sentinel(b"{\"code\":403}").is_some());
+
+        // Valid starts that must NOT be flagged
+        assert!(detect_error_sentinel(b"<?xml version=\"1.0\"?>").is_none());
+        assert!(detect_error_sentinel(&[0xFF, 0xD8, 0xFF, 0xE0]).is_none());
+        assert!(detect_error_sentinel(b"").is_none());
+        // A JSON-looking body that isn't an error envelope should pass through
+        assert!(detect_error_sentinel(b"{\"width\":1024}").is_none());
     }
 
     #[test]
