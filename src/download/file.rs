@@ -1379,6 +1379,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attempt_download_resume_rejects_version_rotation_via_content_length() {
+        // CF-3 regression: if the .part carries K bytes from version A and the
+        // server's Range response's Content-Length (+ resume_offset) totals a
+        // different size than expected_size, the resume is rejected to avoid
+        // producing a Frankenfile of {A-prefix || B-suffix} bytes.
+        let (download_path, part_path, _dir) = setup_download_dir("rotation", "jpg");
+        // .part carries 100 bytes from version A (expected size 150)
+        std::fs::write(&part_path, vec![0xAA; 100]).unwrap();
+
+        // Server returns 206 claiming the remaining 80 bytes of a 180-byte file
+        // (version B rotation: total 180, not the expected 150).
+        let client = StubDownloadClient {
+            status: 206,
+            content_length: Some(80),
+            content_type: None,
+            body: vec![0xBB; 80],
+        };
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            Some(150), // expected_size signals version A
+        )
+        .await
+        .expect_err("resume across version rotation must be rejected");
+
+        match err {
+            DownloadError::ContentLengthMismatch {
+                expected, received, ..
+            } => {
+                assert_eq!(expected, 150);
+                assert_eq!(received, 180); // resume_offset + reported remaining
+            }
+            other => panic!("expected ContentLengthMismatch, got: {other:?}"),
+        }
+        // The stale .part must be removed so the next attempt starts clean.
+        assert!(
+            !part_path.exists(),
+            ".part should be removed after rotation detection"
+        );
+    }
+
+    #[tokio::test]
     async fn attempt_download_resume_fallback_truncates_and_rewrites() {
         let (download_path, part_path, _dir) = setup_download_dir("resume_fallback", "jpg");
 
