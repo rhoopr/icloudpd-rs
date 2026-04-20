@@ -1606,7 +1606,11 @@ mod tests {
             json!({"fields": {"assetDate": {"value": f64::NAN}}}),
         );
         let dt = asset.asset_date();
-        assert_eq!(dt, DateTime::UNIX_EPOCH);
+        assert_eq!(
+            dt,
+            DateTime::UNIX_EPOCH,
+            "NaN assetDate must fall back to epoch — (i64::MIN..=i64::MAX).contains(&NaN) is false"
+        );
     }
 
     #[test]

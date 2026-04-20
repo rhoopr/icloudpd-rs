@@ -3711,9 +3711,9 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch("BEGIN; UPDATE assets SET status = 'failed', last_error = 'would be set by crashed tx' WHERE id = 'WAL_KEEPER'; ").unwrap();
-            // Verify the UPDATE is visible within this transaction so the
-            // test isn't accidentally a no-op (e.g. if the row weren't
-            // there or the UPDATE matched 0 rows).
+            // Confirm the UPDATE actually landed inside the open tx, so the
+            // final assertion is proving rollback rather than a silent no-op
+            // (e.g. row missing, UPDATE matching zero rows).
             let mid_tx_status: String = conn
                 .query_row(
                     "SELECT status FROM assets WHERE id = 'WAL_KEEPER'",
@@ -3721,11 +3721,7 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(
-                mid_tx_status, "failed",
-                "UPDATE must land within the open transaction; otherwise the \
-                 test isn't exercising rollback"
-            );
+            assert_eq!(mid_tx_status, "failed");
             // Drop without commit → rollback.
             drop(conn);
         }
