@@ -638,7 +638,7 @@ fn sync_set_exif_datetime_embeds_date() {
 
 /// --set-exif-rating should add a Rating property (value depends on the
 /// source photo; we assert the sync succeeds and the resulting JPEG has
-/// a writeable XMP packet).
+/// a writable XMP packet).
 #[test]
 #[ignore]
 fn sync_set_exif_rating_embeds_rating() {
