@@ -10,7 +10,7 @@ mod library;
 pub(crate) mod metadata;
 pub mod queries;
 pub mod session;
-mod smart_folders;
+pub(crate) mod smart_folders;
 pub mod types;
 
 pub use album::PhotoAlbum;

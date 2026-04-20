@@ -27,15 +27,14 @@ use crate::state::{self, StateDb};
 use crate::systemd::SystemdNotifier;
 use crate::{available_disk_space, make_password_provider, PartialSyncError, PidFileGuard};
 
-/// Per-library state: zone name, sync token key, and resolved albums.
+/// Per-library state: zone name, sync token key, and resolved album plan.
 struct LibraryState {
     library: crate::icloud::photos::PhotoLibrary,
     zone_name: String,
     sync_token_key: String,
-    albums: Vec<crate::icloud::photos::PhotoAlbum>,
-    /// Asset IDs from excluded albums, used to filter out assets when
-    /// `--exclude-album` is set without explicit `--album`.
-    exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
+    /// Ordered list of download passes. Each pass carries its own
+    /// exclude-asset-ids set. See [`crate::commands::AlbumPlan`].
+    plan: crate::commands::AlbumPlan,
 }
 
 /// Arguments that [`run_sync`] needs from the CLI dispatch layer.
@@ -396,6 +395,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .map(|d| d.with_timezone(&chrono::Utc));
     let retry_config = api_retry_config;
     let live_photo_size = config.live_photo_size.to_asset_version_size();
+    // One shared limiter per sync run so the configured cap applies to
+    // aggregate throughput across every concurrent download.
+    let bandwidth_limiter = config
+        .bandwidth_limit
+        .map(download::limiter::BandwidthLimiter::new);
+    if let Some(limiter) = &bandwidth_limiter {
+        tracing::info!(
+            bytes_per_sec = limiter.bytes_per_sec(),
+            "Bandwidth limit enabled"
+        );
+    }
     let build_download_config = |sync_mode: download::SyncMode,
                                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
                                  asset_groupings: Arc<download::AssetGroupings>|
@@ -436,6 +446,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             album_name: None,
             exclude_asset_ids,
             asset_groupings,
+            bandwidth_limiter: bandwidth_limiter.clone(),
         })
     };
 
@@ -452,14 +463,18 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     for library in &libraries {
         let zone_name = library.zone_name().to_string();
         let sync_token_key = format!("sync_token:{zone_name}");
-        let (albums, exclude_ids) =
-            resolve_albums(library, &config.albums, &config.exclude_albums).await?;
+        let plan = resolve_albums(
+            library,
+            &config.albums,
+            &config.exclude_albums,
+            &config.folder_structure,
+        )
+        .await?;
         library_states.push(LibraryState {
             library: library.clone(),
             zone_name,
             sync_token_key,
-            albums,
-            exclude_asset_ids: Arc::new(exclude_ids),
+            plan,
         });
     }
     sd_notifier.notify_ready();
@@ -537,6 +552,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     handle.record_session_expiration();
                 }
                 handle.update(&cycle_result.stats, &health).await;
+
+                // Update DB-backed gauges from the state database.
+                if let Some(ref db) = state_db {
+                    match db.get_summary().await {
+                        Ok(summary) => {
+                            handle.update_db_stats(&summary, cycle_result.stats.assets_seen);
+                        }
+                        Err(e) => {
+                            handle.record_db_summary_failure();
+                            tracing::warn!(error = %e, "Failed to fetch DB summary for metrics; skipping DB gauge update");
+                        }
+                    }
+                }
             }
 
             // Write JSON report if configured
@@ -725,12 +753,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             // this is expensive -- consider caching exclude_asset_ids across watch
             // cycles and only refreshing when the album's sync token changes.
             for lib_state in &mut library_states {
-                match resolve_albums(&lib_state.library, &config.albums, &config.exclude_albums)
-                    .await
+                match resolve_albums(
+                    &lib_state.library,
+                    &config.albums,
+                    &config.exclude_albums,
+                    &config.folder_structure,
+                )
+                .await
                 {
-                    Ok((refreshed, exclude_ids)) => {
-                        lib_state.albums = refreshed;
-                        lib_state.exclude_asset_ids = Arc::new(exclude_ids);
+                    Ok(refreshed) => {
+                        lib_state.plan = refreshed;
                         consecutive_album_refresh_failures = 0;
                     }
                     Err(e) => {
@@ -937,15 +969,18 @@ async fn run_cycle(
         } else {
             Arc::new(download::AssetGroupings::default())
         };
+        // Each pass carries its own exclude-asset-ids, so the config built
+        // here starts with an empty set; download_photos_with_sync derives
+        // per-pass configs internally via `with_exclude_ids`.
         let download_config = build_download_config(
             sync_mode,
-            Arc::clone(&lib_state.exclude_asset_ids),
+            Arc::new(rustc_hash::FxHashSet::default()),
             asset_groupings,
         );
         let download_client = shared_session.read().await.download_client();
         let sync_result = download::download_photos_with_sync(
             &download_client,
-            &lib_state.albums,
+            &lib_state.plan.passes,
             download_config,
             shutdown_token.clone(),
         )

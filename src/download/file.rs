@@ -10,6 +10,7 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
 use super::error::DownloadError;
+use super::limiter::BandwidthLimiter;
 use crate::retry::{self, RetryAction, RetryConfig};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -100,12 +101,22 @@ pub(super) struct DownloadOpts {
     pub expected_size: Option<u64>,
 }
 
-/// Download a file with retry support and optional expected-size verification.
+/// Side-channel observers / throttles that ride along with a download call
+/// without bloating the direct argument list.
 ///
-/// `rate_limit_counter`, when provided, is incremented by 1 for every
-/// observed HTTP 429 / 503 error (each retry attempt that hits rate-limiting
-/// counts once). The total is aggregated at the sync level so operators see
-/// when Apple is back-pressuring the run.
+/// `rate_limit_counter`, when set, is incremented by 1 for every observed
+/// HTTP 429 / 503 error (each retry attempt that hits rate-limiting counts
+/// once). The total is aggregated at the sync level so operators see when
+/// Apple is back-pressuring the run.
+///
+/// `bandwidth_limiter`, when set, caps throughput on the response body read.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct DownloadLimits<'a> {
+    pub rate_limit_counter: Option<&'a std::sync::atomic::AtomicUsize>,
+    pub bandwidth_limiter: Option<&'a BandwidthLimiter>,
+}
+
+/// Download a file with retry support and optional expected-size verification.
 pub(super) async fn download_file<C: DownloadClient>(
     client: &C,
     url: &str,
@@ -114,7 +125,7 @@ pub(super) async fn download_file<C: DownloadClient>(
     retry_config: &RetryConfig,
     temp_suffix: &str,
     opts: DownloadOpts,
-    rate_limit_counter: Option<&std::sync::atomic::AtomicUsize>,
+    limits: DownloadLimits<'_>,
 ) -> Result<u64, DownloadError> {
     let part_path =
         temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
@@ -123,7 +134,7 @@ pub(super) async fn download_file<C: DownloadClient>(
         retry_config,
         |e: &DownloadError| {
             if e.is_rate_limited() {
-                if let Some(counter) = rate_limit_counter {
+                if let Some(counter) = limits.rate_limit_counter {
                     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -141,6 +152,7 @@ pub(super) async fn download_file<C: DownloadClient>(
                 &part_path,
                 opts.skip_rename,
                 opts.expected_size,
+                limits.bandwidth_limiter,
             ))
             .await
         },
@@ -169,6 +181,7 @@ async fn attempt_download<C: DownloadClient>(
     part_path: &Path,
     skip_rename: bool,
     expected_size: Option<u64>,
+    bandwidth_limiter: Option<&BandwidthLimiter>,
 ) -> Result<u64, DownloadError> {
     let path_str = download_path.display().to_string();
 
@@ -340,6 +353,9 @@ async fn attempt_download<C: DownloadClient>(
                 content_length,
                 bytes_written,
             })?;
+            if let Some(limiter) = bandwidth_limiter {
+                limiter.consume(chunk.len()).await;
+            }
             file.write_all(&chunk).await?;
             bytes_written += chunk.len() as u64;
         }
@@ -1204,6 +1220,7 @@ mod tests {
             &part_path,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1228,6 +1245,7 @@ mod tests {
             &download_path,
             &part_path,
             true,
+            None,
             None,
         )
         .await
@@ -1257,6 +1275,7 @@ mod tests {
             &part_path,
             false,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1283,6 +1302,7 @@ mod tests {
             &part_path,
             false,
             Some(1024),
+            None,
         )
         .await
         .unwrap_err();
@@ -1307,6 +1327,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
         )
         .await
@@ -1334,6 +1355,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
         )
         .await
@@ -1368,6 +1390,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
         )
         .await
@@ -1404,6 +1427,7 @@ mod tests {
             &part_path,
             false,
             Some(150), // expected_size signals version A
+            None,
         )
         .await
         .expect_err("resume across version rotation must be rejected");
@@ -1442,6 +1466,7 @@ mod tests {
             &part_path,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1466,6 +1491,7 @@ mod tests {
             &part_path,
             false,
             Some(body.len() as u64),
+            None,
         )
         .await
         .unwrap();
@@ -1519,6 +1545,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
         )
         .await
@@ -1614,7 +1641,7 @@ mod tests {
                 skip_rename: false,
                 expected_size: None,
             },
-            None,
+            DownloadLimits::default(),
         )
         .await;
 
@@ -1675,6 +1702,7 @@ mod tests {
             &part_path,
             false,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1706,6 +1734,7 @@ mod tests {
             &part_path,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1726,6 +1755,7 @@ mod tests {
             &part_path,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1745,6 +1775,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
         )
         .await
@@ -1787,7 +1818,7 @@ mod tests {
                     skip_rename: false,
                     expected_size: None,
                 },
-                None,
+                DownloadLimits::default(),
             )
             .await;
             (result, download_path, dir)
@@ -1942,12 +1973,74 @@ mod tests {
                     skip_rename: false,
                     expected_size: None,
                 },
-                None,
+                DownloadLimits::default(),
             )
             .await
             .unwrap();
 
             assert_eq!(std::fs::read(&download_path).unwrap(), full_body);
+        }
+
+        /// End-to-end throttle test: pull a fixed payload through `download_file`
+        /// with a real HTTP server and assert wall-clock elapsed time at least
+        /// approaches what the cap predicts.
+        #[tokio::test]
+        async fn bandwidth_limiter_throttles_download() {
+            use std::time::Instant;
+
+            // 64 KiB at 64 KiB/s -> expect ~1s. Lenient lower bound
+            // (>= expected * 0.6) so CI jitter doesn't flake; overshoot is
+            // fine because it only means the limiter is stricter than required.
+            let body_size = 64 * 1024usize;
+            let body = vec![0xAAu8; body_size];
+            let limit = 64 * 1024u64;
+            let expected_secs = body_size as f64 / limit as f64;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/throttle.bin"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                .mount(&server)
+                .await;
+
+            let checksum = base64::engine::general_purpose::STANDARD.encode([0xAAu8; 32]);
+            let dir = TempDir::new().unwrap();
+            let download_path = dir.path().join("throttle.bin");
+            let config = RetryConfig {
+                max_retries: 0,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+            let limiter = BandwidthLimiter::new(limit);
+
+            let start = Instant::now();
+            let bytes = download_file(
+                &reqwest::Client::new(),
+                &format!("{}/throttle.bin", server.uri()),
+                &download_path,
+                &checksum,
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: Some(body_size as u64),
+                },
+                DownloadLimits {
+                    bandwidth_limiter: Some(&limiter),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("throttled download succeeds");
+            let elapsed = start.elapsed().as_secs_f64();
+
+            assert_eq!(bytes, body_size as u64);
+            assert!(
+                elapsed >= expected_secs * 0.6,
+                "elapsed {elapsed:.2}s under {limit} B/s cap for {body_size} B \
+                 should be close to expected {expected_secs:.2}s",
+            );
+            assert_eq!(std::fs::read(&download_path).unwrap().len(), body_size);
         }
     }
 
@@ -2115,6 +2208,7 @@ mod tests {
             &part_path,
             false,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2148,6 +2242,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
         )
         .await
@@ -2191,6 +2286,7 @@ mod tests {
             &part_path,
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2221,6 +2317,7 @@ mod tests {
             &part_path,
             false,
             Some(1024), // API says 1024 but download is 8
+            None,
         )
         .await
         .unwrap_err();
@@ -2301,12 +2398,12 @@ mod tests {
             let dp_a = download_path.clone();
             let pp_a = part_path.clone();
             let task_a = tokio::spawn(async move {
-                attempt_download(&client_a, "http://stub", &dp_a, &pp_a, false, None).await
+                attempt_download(&client_a, "http://stub", &dp_a, &pp_a, false, None, None).await
             });
             let dp_b = download_path.clone();
             let pp_b = part_path.clone();
             let task_b = tokio::spawn(async move {
-                attempt_download(&client_b, "http://stub", &dp_b, &pp_b, false, None).await
+                attempt_download(&client_b, "http://stub", &dp_b, &pp_b, false, None, None).await
             });
 
             let a = task_a.await.unwrap();
@@ -2354,6 +2451,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
         )
         .await

@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::icloud::photos::{PhotoAlbum, PhotoAsset};
+use crate::icloud::photos::PhotoAsset;
 use crate::retry::RetryConfig;
 use crate::state::{AssetRecord, StateDb, SyncRunStats, VersionSizeKey};
 
@@ -587,6 +587,7 @@ pub(super) struct PassConfig<'a> {
     /// retry attempt, not per unique task. Aggregated into SyncStats for
     /// the rate-limit pressure warning.
     pub(super) rate_limit_counter: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) bandwidth_limiter: Option<super::BandwidthLimiter>,
 }
 
 impl std::fmt::Debug for PassConfig<'_> {
@@ -654,16 +655,24 @@ where
                     if is_asset_filtered(&asset, config).is_some() {
                         continue;
                     }
-                    let candidates = extract_skip_candidates(&asset, config);
-                    if !candidates.is_empty()
-                        && candidates.iter().all(|&(vs, cs)| {
-                            matches!(
-                                download_ctx.should_download_fast(asset.id(), vs, cs, true),
-                                Some(false)
-                            )
-                        })
-                    {
-                        continue;
+                    // Fast-skip is path-blind; in `{album}` mode the same
+                    // asset legitimately lives at multiple paths, so we'd
+                    // under-report the listing if we trusted the DB here.
+                    // `album_name.is_some()` is the right signal because by
+                    // the time this runs, `with_album_name` has expanded
+                    // `{album}` out of `folder_structure` entirely.
+                    if config.album_name.is_none() {
+                        let candidates = extract_skip_candidates(&asset, config);
+                        if !candidates.is_empty()
+                            && candidates.iter().all(|&(vs, cs)| {
+                                matches!(
+                                    download_ctx.should_download_fast(asset.id(), vs, cs, true),
+                                    Some(false)
+                                )
+                            })
+                        {
+                            continue;
+                        }
                     }
 
                     pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
@@ -933,7 +942,16 @@ where
                         continue;
                     }
 
-                    if trust_state {
+                    // Fast-skip is path-blind; in `{album}` mode the same
+                    // asset may target multiple album folders, so skipping
+                    // after the first download would leave later folders
+                    // missing their copy. Fall through to the path-aware
+                    // filesystem/dir_cache check below. `album_name.is_some`
+                    // is the right signal here: `with_album_name` has
+                    // already expanded `{album}` out of folder_structure
+                    // by the time this runs, so checking the template
+                    // would always be false.
+                    if trust_state && config.album_name.is_none() {
                         let candidates = extract_skip_candidates(&asset, config);
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {
@@ -1231,11 +1249,13 @@ where
 
     let temp_suffix: Arc<str> = Arc::from(config.temp_suffix.as_str());
     let rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bandwidth_limiter = config.bandwidth_limiter.clone();
     let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
             let client = download_client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
+            let bandwidth_limiter = bandwidth_limiter.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -1244,6 +1264,7 @@ where
                     metadata_flags,
                     &temp_suffix,
                     Some(rate_limit_counter.as_ref()),
+                    bandwidth_limiter.as_ref(),
                 ))
                 .await;
                 (task, result)
@@ -1474,7 +1495,7 @@ where
 /// `download_photos_full_with_token`.
 pub(super) async fn build_download_outcome(
     download_client: &Client,
-    albums: &[PhotoAlbum],
+    passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
     streaming_result: StreamingResult,
     started: Instant,
@@ -1602,7 +1623,7 @@ pub(super) async fn build_download_outcome(
         "── Cleanup pass: re-fetching URLs and retrying failed downloads ──"
     );
 
-    let fresh_tasks = super::build_download_tasks(albums, config, shutdown_token.clone()).await?;
+    let fresh_tasks = super::build_download_tasks(passes, config, shutdown_token.clone()).await?;
     tracing::debug!(
         count = fresh_tasks.len(),
         "  Re-fetched tasks with fresh URLs"
@@ -1620,6 +1641,7 @@ pub(super) async fn build_download_outcome(
         shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
         rate_limit_counter: Arc::clone(&phase2_rate_counter),
+        bandwidth_limiter: config.bandwidth_limiter.clone(),
     };
     let pass_result = run_download_pass(pass_config, fresh_tasks).await;
 
@@ -1714,6 +1736,7 @@ pub(super) async fn run_download_pass(
     let concurrency = config.concurrency;
     let temp_suffix: Arc<str> = config.temp_suffix.into();
     let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
+    let bandwidth_limiter = config.bandwidth_limiter.clone();
 
     type DownloadResult = (
         DownloadTask,
@@ -1725,6 +1748,7 @@ pub(super) async fn run_download_pass(
             let client = client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
+            let bandwidth_limiter = bandwidth_limiter.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -1733,6 +1757,7 @@ pub(super) async fn run_download_pass(
                     metadata_flags,
                     &temp_suffix,
                     Some(rate_limit_counter.as_ref()),
+                    bandwidth_limiter.as_ref(),
                 ))
                 .await;
                 (task, result)
@@ -1965,6 +1990,7 @@ async fn download_single_task(
     metadata_flags: MetadataFlags,
     temp_suffix: &str,
     rate_limit_counter: Option<&std::sync::atomic::AtomicUsize>,
+    bandwidth_limiter: Option<&super::BandwidthLimiter>,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -1994,7 +2020,10 @@ async fn download_single_task(
             skip_rename: needs_exif,
             expected_size: if task.size > 0 { Some(task.size) } else { None },
         },
-        rate_limit_counter,
+        super::file::DownloadLimits {
+            rate_limit_counter,
+            bandwidth_limiter,
+        },
     ))
     .await?;
 
@@ -2694,6 +2723,7 @@ mod tests {
                             shutdown_token: token,
                             state_db: None,
                             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                            bandwidth_limiter: None,
                         };
                         let result = run_download_pass(pass_config, tasks).await;
                         assert!(result.failed.is_empty());
@@ -2745,6 +2775,7 @@ mod tests {
                             shutdown_token: token,
                             state_db: None,
                             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                            bandwidth_limiter: None,
                         };
                         let result = run_download_pass(pass_config, tasks).await;
                         assert_eq!(result.failed.len(), 1);
@@ -3255,6 +3286,7 @@ mod tests {
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
+            bandwidth_limiter: None,
         });
 
         let client = reqwest::Client::builder()
@@ -3331,6 +3363,7 @@ mod tests {
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(crate::download::AssetGroupings::default()),
+            bandwidth_limiter: None,
         });
         let client = reqwest::Client::new();
         let shutdown_token = CancellationToken::new();

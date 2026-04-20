@@ -13,6 +13,51 @@ fn non_empty_string(s: &str) -> Result<String, String> {
     }
 }
 
+/// Parse a human-readable byte-rate into bytes per second.
+///
+/// Accepts a leading positive integer followed by an optional unit suffix:
+/// decimal `K`/`M`/`G` (×1000) or binary `Ki`/`Mi`/`Gi` (×1024). Suffix is
+/// case-insensitive. No suffix means bytes/sec. Zero is rejected.
+pub(crate) fn parse_bandwidth_limit(s: &str) -> Result<u64, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("value must not be empty".to_string());
+    }
+    let digit_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    if digit_end == 0 {
+        return Err(format!(
+            "invalid bandwidth value `{s}`: must start with a number"
+        ));
+    }
+    let (num_str, suffix) = trimmed.split_at(digit_end);
+    let n: u64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid bandwidth number `{num_str}`"))?;
+    let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "ki" | "kib" => 1_024,
+        "mi" | "mib" => 1_024 * 1_024,
+        "gi" | "gib" => 1_024 * 1_024 * 1_024,
+        other => {
+            return Err(format!(
+                "invalid bandwidth unit `{other}`: expected one of K, M, G, Ki, Mi, Gi"
+            ));
+        }
+    };
+    let bytes_per_sec = n
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("bandwidth value `{s}` overflows u64 bytes/sec"))?;
+    if bytes_per_sec == 0 {
+        return Err("bandwidth limit must be greater than zero".to_string());
+    }
+    Ok(bytes_per_sec)
+}
+
 /// Strip non-digit characters and validate that the result is exactly 6 digits.
 /// Accepts "123456", "123 456", "123-456", etc.
 fn parse_2fa_code(s: &str) -> Result<String, String> {
@@ -60,7 +105,10 @@ pub struct SyncArgs {
     #[arg(short = 'd', long, env = "KEI_DIRECTORY", value_parser = non_empty_string)]
     pub directory: Option<String>,
 
-    /// Album(s) to download
+    /// Album(s) to download. Use `-a all` to sync every user-created album
+    /// in one run (Apple's smart folders like "Favorites" are skipped —
+    /// name them explicitly if you want them). `-a all` cannot be combined
+    /// with specific album names.
     #[arg(short = 'a', long = "album", env = "KEI_ALBUM", value_parser = non_empty_string)]
     pub albums: Vec<String>,
 
@@ -92,6 +140,14 @@ pub struct SyncArgs {
     #[arg(long = "threads-num", env = "KEI_THREADS_NUM", value_parser = clap::value_parser!(u16).range(1..=64))]
     pub threads_num: Option<u16>,
 
+    /// Cap total download throughput across all concurrent downloads.
+    /// Accepts human-readable values: `10M` (10 MB/s), `500K` (500 KB/s),
+    /// `1Mi` (1 MiB/s), bare integer = bytes/s. When set without an explicit
+    /// `--threads-num`, concurrency defaults to 1 to avoid fragmenting the
+    /// capped pipe across many starved connections.
+    #[arg(long = "bandwidth-limit", env = "KEI_BANDWIDTH_LIMIT", value_parser = parse_bandwidth_limit)]
+    pub bandwidth_limit: Option<u64>,
+
     /// Don't download videos (pass `false` to override config file)
     #[arg(long, env = "KEI_SKIP_VIDEOS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub skip_videos: Option<bool>,
@@ -112,7 +168,11 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_FORCE_SIZE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub force_size: Option<bool>,
 
-    /// Folder structure for organizing downloads (e.g., "%Y/%m/%d", "{album}/%Y/%B", "none")
+    /// Folder structure for organizing downloads (e.g., "%Y/%m/%d",
+    /// "{album}/%Y/%B", "none"). `{album}` must be the first segment and
+    /// may only appear once. When `{album}` is used without `-a`, kei
+    /// auto-syncs every user-created album plus a library-wide pass for
+    /// unfiled photos (where `{album}` collapses to empty).
     #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
 
@@ -594,6 +654,9 @@ impl SyncArgs {
         }
         if self.threads_num.is_none() {
             self.threads_num = fallback.threads_num;
+        }
+        if self.bandwidth_limit.is_none() {
+            self.bandwidth_limit = fallback.bandwidth_limit;
         }
         if self.skip_videos.is_none() {
             self.skip_videos = fallback.skip_videos;
@@ -1500,6 +1563,54 @@ mod tests {
     }
 
     #[test]
+    fn test_bandwidth_limit_bare_bytes() {
+        let mut args = base_args();
+        args.extend(["--bandwidth-limit", "1500000"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.bandwidth_limit, Some(1_500_000));
+    }
+
+    #[test]
+    fn test_bandwidth_limit_decimal_suffixes() {
+        let mut args = base_args();
+        args.extend(["--bandwidth-limit", "10M"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.bandwidth_limit, Some(10_000_000));
+    }
+
+    #[test]
+    fn test_bandwidth_limit_binary_suffix() {
+        let mut args = base_args();
+        args.extend(["--bandwidth-limit", "2Mi"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.bandwidth_limit, Some(2 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_bandwidth_limit_case_insensitive() {
+        assert_eq!(parse_bandwidth_limit("500k"), Ok(500_000));
+        assert_eq!(parse_bandwidth_limit("500K"), Ok(500_000));
+        assert_eq!(parse_bandwidth_limit("1gib"), Ok(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_bandwidth_limit_rejects_zero() {
+        let mut args = base_args();
+        args.extend(["--bandwidth-limit", "0"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+        assert!(parse_bandwidth_limit("0K").is_err());
+    }
+
+    #[test]
+    fn test_bandwidth_limit_rejects_invalid() {
+        assert!(parse_bandwidth_limit("").is_err());
+        assert!(parse_bandwidth_limit("abc").is_err());
+        assert!(parse_bandwidth_limit("10X").is_err());
+        assert!(parse_bandwidth_limit("-5M").is_err());
+        assert!(parse_bandwidth_limit("1.5M").is_err());
+    }
+
+    #[test]
     fn test_max_retries_custom() {
         let mut args = base_args();
         args.extend(["--max-retries", "10"]);
@@ -1854,6 +1965,15 @@ mod tests {
     fn test_albums_empty_by_default() {
         let cli = parse(&base_args());
         assert!(cli.sync.albums.is_empty());
+    }
+
+    #[test]
+    fn test_album_all_accepted() {
+        let mut args = base_args();
+        args.extend(["-a", "all"]);
+        let cli = parse(&args);
+        // CLI layer stays dumb: Config::build interprets "all".
+        assert_eq!(cli.sync.albums, vec!["all"]);
     }
 
     // ── Input validation ───────────────────────────────────────────
