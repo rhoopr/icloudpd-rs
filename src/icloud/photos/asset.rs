@@ -214,18 +214,17 @@ fn extract_versions(
     versions
 }
 
-/// Host suffixes kei will download from. Apple CloudKit returns CDN URLs on
-/// `*.icloud-content.com`; china-region uses `*.apple.com.cn`. Keeping this
-/// narrow prevents a compromised/malformed response from pointing kei at an
-/// attacker-controlled origin. Add new suffixes explicitly when Apple
-/// introduces one; a loud skip is preferable to a silent cross-origin fetch.
+/// Host suffixes kei will download from. Apple CloudKit returns photo/video
+/// bytes on `*.icloud-content.com` (and `*.icloud-content.com.cn` in the
+/// china region); other static assets occasionally come from `*.cdn-apple.com`.
+/// The allowlist is deliberately narrow to content-delivery hosts so a
+/// compromised or malformed CloudKit response can't point kei at an
+/// auth/gateway/marketing subdomain of `icloud.com` / `apple.com`. Add
+/// new suffixes explicitly when Apple introduces one; a loud skip is
+/// preferable to a silent cross-origin fetch.
 const ALLOWED_DOWNLOAD_HOST_SUFFIXES: &[&str] = &[
     ".icloud-content.com",
     ".icloud-content.com.cn",
-    ".icloud.com",
-    ".icloud.com.cn",
-    ".apple.com",
-    ".apple.com.cn",
     ".cdn-apple.com",
 ];
 
@@ -2004,6 +2003,30 @@ mod tests {
             assert!(
                 super::validate_download_url(u).is_err(),
                 "expected err: {u}"
+            );
+        }
+    }
+
+    /// Regression: the URL allowlist is narrow to content-delivery hosts.
+    /// Auth, gateway, and marketing subdomains of `icloud.com` / `apple.com`
+    /// must not be accepted as download origins even over HTTPS — a
+    /// compromised CloudKit response pointing at one is a silent-redirect
+    /// risk that the narrowed allowlist now rejects at the validation step.
+    #[test]
+    fn validate_download_url_rejects_icloud_and_apple_subdomains() {
+        for u in [
+            "https://www.icloud.com/photos/asset",
+            "https://gateway.icloud.com/foo",
+            "https://appleid.icloud.com/token",
+            "https://www.apple.com/resource",
+            "https://configuration.apple.com/cfg",
+            "https://developer.apple.com/sdk",
+            "https://www.icloud.com.cn/x",
+            "https://www.apple.com.cn/x",
+        ] {
+            assert!(
+                super::validate_download_url(u).is_err(),
+                "expected err (not a CDN host): {u}"
             );
         }
     }
