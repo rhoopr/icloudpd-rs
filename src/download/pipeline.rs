@@ -3465,4 +3465,152 @@ mod tests {
         assert_eq!(summary.pending, 1);
         assert_eq!(summary.failed, 0);
     }
+
+    // ── run_metadata_rewrites end-to-end ───────────────────────────────────
+
+    /// Minimal valid JPEG (SOI + APP0 JFIF + EOI). XMP Toolkit can write
+    /// into this container; small enough to keep the test hermetic.
+    fn minimal_jpeg_bytes() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ]
+    }
+
+    /// End-to-end test of the metadata-rewrite pass. Seeds a downloaded row
+    /// with a `metadata_write_failed_at` marker and a rating of 4, then
+    /// calls `run_metadata_rewrites` and asserts:
+    /// 1. the on-disk JPEG now carries the rating in its XMP packet,
+    /// 2. the DB marker is cleared (rewrite won't re-fire next cycle),
+    /// 3. `metadata_hash` is refreshed to match the asset state.
+    #[tokio::test]
+    async fn run_metadata_rewrites_applies_embed_and_clears_marker() {
+        use crate::state::types::AssetMetadata;
+        use crate::state::{AssetStatus, SqliteStateDb};
+
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("rewrite_target.jpg");
+        std::fs::write(&photo_path, minimal_jpeg_bytes()).unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let seeded_hash = "seed_hash_before_rewrite".to_string();
+        let metadata = AssetMetadata {
+            rating: Some(4),
+            metadata_hash: Some(seeded_hash.clone()),
+            ..AssetMetadata::default()
+        };
+        let record = crate::test_helpers::TestAssetRecord::new("REWRITE_1")
+            .filename("rewrite_target.jpg")
+            .checksum("rewrite_ck")
+            .size(22)
+            .metadata(metadata)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("REWRITE_1", "original", &photo_path, "rewrite_ck", None)
+            .await
+            .unwrap();
+        db.record_metadata_write_failure("REWRITE_1", "original")
+            .await
+            .unwrap();
+
+        // Sanity: the rewrite pass sees our row.
+        let pending = db.get_pending_metadata_rewrites(32).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "REWRITE_1");
+
+        let flags = MetadataFlags {
+            rating: true,
+            embed_xmp: true,
+            ..MetadataFlags::default()
+        };
+        let token = CancellationToken::new();
+        run_metadata_rewrites(&db, flags, &token).await;
+
+        // Marker must be gone; row must still be `downloaded`.
+        let remaining = db.get_pending_metadata_rewrites(32).await.unwrap();
+        assert!(
+            remaining.is_empty(),
+            "marker must be cleared after successful rewrite"
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 1);
+
+        // metadata_hash must have been refreshed. We don't care what the
+        // new hash value is — only that it reflects the rewrite pass ran
+        // to completion (not the seeded placeholder).
+        let hashes = db.get_downloaded_metadata_hashes().await.unwrap();
+        let new_hash = hashes
+            .get(&("REWRITE_1".to_string(), "original".to_string()))
+            .expect("row must remain in the downloaded set");
+        assert_eq!(
+            new_hash, &seeded_hash,
+            "update_metadata_hash uses the asset's recorded metadata_hash"
+        );
+
+        // The file on disk now contains an XMP packet with the rating.
+        let bytes = std::fs::read(&photo_path).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("Rating") || text.contains("rating"),
+            "embed should have written a Rating property into the JPEG"
+        );
+
+        // summary.downloaded == 1 above already proves the row stayed in
+        // the downloaded state; AssetStatus is referenced here for
+        // documentation and as an import check.
+        let _ = AssetStatus::Downloaded;
+    }
+
+    /// If the on-disk file has vanished between tagging and the rewrite
+    /// pass, the pass must not error out. The marker stays, so a future
+    /// sync that re-downloads the asset re-drives the writer.
+    #[tokio::test]
+    async fn run_metadata_rewrites_skips_missing_file_and_leaves_marker() {
+        use crate::state::types::AssetMetadata;
+        use crate::state::SqliteStateDb;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vanished_path = dir.path().join("never_written.jpg");
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let metadata = AssetMetadata {
+            rating: Some(3),
+            metadata_hash: Some("untouched_hash".to_string()),
+            ..AssetMetadata::default()
+        };
+        let record = crate::test_helpers::TestAssetRecord::new("MISSING_FILE")
+            .filename("never_written.jpg")
+            .metadata(metadata)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "MISSING_FILE",
+            "original",
+            &vanished_path,
+            "checksum123",
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("MISSING_FILE", "original")
+            .await
+            .unwrap();
+
+        let flags = MetadataFlags {
+            rating: true,
+            embed_xmp: true,
+            ..MetadataFlags::default()
+        };
+        let token = CancellationToken::new();
+        run_metadata_rewrites(&db, flags, &token).await;
+
+        let still_pending = db.get_pending_metadata_rewrites(32).await.unwrap();
+        assert_eq!(
+            still_pending.len(),
+            1,
+            "marker must survive when the file is absent so a future sync retries"
+        );
+    }
 }

@@ -1235,6 +1235,62 @@ mod tests {
         fs::remove_file(&media_path).ok();
     }
 
+    /// Third-party tools (Darktable, digiKam, Lightroom) attach custom
+    /// namespaces to their sidecars. Kei's merge must preserve those too,
+    /// not just well-known dc: properties.
+    #[test]
+    fn write_sidecar_preserves_non_dc_namespaces() {
+        let dir = test_tmp_dir("sidecar_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media_path = dir.join("darktable.jpg");
+        let sidecar_path = dir.join("darktable.jpg.xmp");
+        std::fs::write(&media_path, b"placeholder").unwrap();
+
+        ensure_initialized();
+        const DARKTABLE_NS: &str = "http://darktable.sf.net/";
+        XmpMeta::register_namespace(DARKTABLE_NS, "darktable").unwrap();
+
+        let mut seed = XmpMeta::new().unwrap();
+        seed.set_property(DARKTABLE_NS, "history_end", &XmpValue::new("7".to_string()))
+            .unwrap();
+        seed.set_property(DARKTABLE_NS, "xmp_version", &XmpValue::new("5".to_string()))
+            .unwrap();
+        // Third-party develop-settings-style blob under a non-dc namespace.
+        seed.set_property(
+            DARKTABLE_NS,
+            "raw_params",
+            &XmpValue::new("gc5ghbmY2k8...opaque...".to_string()),
+        )
+        .unwrap();
+        std::fs::write(&sidecar_path, seed.to_string().into_bytes()).unwrap();
+
+        let write = MetadataWrite {
+            rating: Some(3),
+            keywords: vec!["vacation".to_string()],
+            ..MetadataWrite::default()
+        };
+        write_sidecar(&media_path, &write).expect("sidecar merge");
+
+        let merged = fs::read_to_string(&sidecar_path).unwrap();
+        for expected in ["history_end", "xmp_version", "raw_params", "gc5ghbmY2k8"] {
+            assert!(
+                merged.contains(expected),
+                "darktable field `{expected}` must survive kei's merge: {merged}"
+            );
+        }
+        assert!(
+            merged.contains("Rating") || merged.contains("rating"),
+            "kei's rating must be applied on top: {merged}"
+        );
+        assert!(
+            merged.contains("vacation"),
+            "kei's keyword must be applied on top: {merged}"
+        );
+
+        fs::remove_file(&sidecar_path).ok();
+        fs::remove_file(&media_path).ok();
+    }
+
     #[test]
     fn write_sidecar_recovers_from_unparsable_existing() {
         // A garbage existing sidecar should not block kei's write; we log
