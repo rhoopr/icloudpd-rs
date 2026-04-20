@@ -87,7 +87,7 @@ pub(crate) fn insert_xmp(input: &[u8], xmp: &[u8]) -> Result<Vec<u8>> {
                 original_offsets.push(offset_before_atom);
             }
             None => anyhow::bail!(
-                "unparseable tail at offset {} of {}",
+                "unparsable tail at offset {} of {}",
                 offset_before_atom,
                 input.len()
             ),

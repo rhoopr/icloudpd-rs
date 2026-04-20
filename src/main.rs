@@ -237,32 +237,28 @@ struct PidFileGuard {
 impl PidFileGuard {
     fn new(path: PathBuf) -> std::io::Result<Self> {
         // If a prior PID file exists, validate whether the recorded process
-        // is still alive. Alive → bail; dead/unparseable → treat as stale
+        // is still alive. Alive → bail; dead/unparsable → treat as stale
         // and overwrite.
         if let Ok(contents) = std::fs::read_to_string(&path) {
             if let Some(existing) = contents.trim().parse::<i32>().ok().filter(|p| *p > 0) {
-                match pid_is_alive(existing) {
-                    PidStatus::Alive => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!(
-                                "PID file {} refers to running process {existing}; refusing to start a second instance",
-                                path.display()
-                            ),
-                        ));
-                    }
-                    PidStatus::Dead => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            stale_pid = existing,
-                            "PID file references a non-running process; overwriting as stale"
-                        );
-                    }
+                if pid_is_alive(existing) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "PID file {} refers to running process {existing}; refusing to start a second instance",
+                            path.display()
+                        ),
+                    ));
                 }
+                tracing::warn!(
+                    path = %path.display(),
+                    stale_pid = existing,
+                    "PID file references a non-running process; overwriting as stale"
+                );
             } else {
                 tracing::warn!(
                     path = %path.display(),
-                    "PID file contents unparseable; overwriting as stale"
+                    "PID file contents unparsable; overwriting as stale"
                 );
             }
         }
@@ -272,40 +268,32 @@ impl PidFileGuard {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PidStatus {
-    Alive,
-    Dead,
-}
-
 /// Return whether the PID corresponds to a running process.
 ///
 /// Uses `kill(pid, 0)` on Unix: 0 = alive; ESRCH = dead; EPERM = alive
 /// (exists but outside our signalling permissions — still a live process).
 #[cfg(unix)]
-fn pid_is_alive(pid: i32) -> PidStatus {
+fn pid_is_alive(pid: i32) -> bool {
     // SAFETY: kill with signal 0 performs permission / existence checks only
     // and never delivers a signal.
     let rc = unsafe { libc::kill(pid, 0) };
     if rc == 0 {
-        return PidStatus::Alive;
+        return true;
     }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::ESRCH) => PidStatus::Dead,
-        Some(libc::EPERM) => PidStatus::Alive,
-        _ => PidStatus::Dead,
-    }
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    )
 }
 
 #[cfg(not(unix))]
-fn pid_is_alive(_pid: i32) -> PidStatus {
+fn pid_is_alive(_pid: i32) -> bool {
     // Windows PID reuse happens fast enough that a cheap "is PID alive" check
     // without a process-handle lookup can return false-alives for totally
-    // unrelated processes. Report Dead so stale PID files are overwritten,
+    // unrelated processes. Report dead so stale PID files are overwritten,
     // trading duplicate-run protection (which the OS filesystem lock in
     // PidFileGuard::new still backstops) for avoiding spurious refusals.
-    PidStatus::Dead
+    false
 }
 
 impl Drop for PidFileGuard {
@@ -610,7 +598,7 @@ mod tests {
         // PID 2^31-2 is not allocatable on Linux (max_pid is much smaller),
         // so kill(pid, 0) returns ESRCH deterministically.
         let dead_pid = i32::MAX - 1;
-        assert_eq!(pid_is_alive(dead_pid), PidStatus::Dead);
+        assert!(!pid_is_alive(dead_pid));
 
         let path = std::env::temp_dir().join("icloudpd_test_pid_guard_dead.pid");
         let _ = std::fs::remove_file(&path);
@@ -639,7 +627,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn pid_is_alive_self() {
-        assert_eq!(pid_is_alive(std::process::id() as i32), PidStatus::Alive);
+        assert!(pid_is_alive(std::process::id() as i32));
     }
 
     #[test]

@@ -18,7 +18,7 @@ use super::types::{
 ///
 /// The `assets.source` column is NOT NULL (v5 migration defaults pre-existing
 /// rows to "icloud"). Test fixtures and legacy call sites that don't populate
-/// metadata get the same value written here so that INSERTs always succeed.
+/// metadata get the same value written here so that inserts always succeed.
 /// Real provider adapters (iCloud, Takeout, etc.) set `source` explicitly;
 /// this fallback is a safety net, not the intended write path.
 const DEFAULT_SOURCE: &str = "icloud";

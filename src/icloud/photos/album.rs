@@ -112,7 +112,7 @@ impl PhotoAlbum {
     }
 
     /// Return the CloudKit zone name this album belongs to
-    /// (e.g. "PrimarySync", "SharedSync-<uuid>"). Falls back to an empty
+    /// (e.g. `PrimarySync`, `SharedSync-<uuid>`). Falls back to an empty
     /// string if the zone_id JSON lacks a `zoneName` field, which should
     /// only happen in hand-constructed test fixtures.
     pub fn zone_name(&self) -> &str {

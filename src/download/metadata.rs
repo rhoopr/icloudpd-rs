@@ -1172,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn write_sidecar_recovers_from_unparseable_existing() {
+    fn write_sidecar_recovers_from_unparsable_existing() {
         // A garbage existing sidecar should not block kei's write; we log
         // and fall back to a fresh packet rather than erroring.
         let dir = test_tmp_dir("sidecar_tests");
