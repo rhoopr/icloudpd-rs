@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use xmp_toolkit::{xmp_ns, OpenFileOptions, XmpFile, XmpMeta, XmpValue};
 
 use super::heif;
+use crate::fs_util::atomic_install;
 
 /// Custom XMP namespace for kei-specific fields that don't fit standard
 /// schemas (`hidden`, `archived`, `mediaSubtype`, `burstId`). Consumers that
@@ -206,43 +207,9 @@ pub(crate) fn write_sidecar(media_path: &Path, write: &MetadataWrite) -> Result<
     Ok(())
 }
 
-/// Install `src` at `dst` atomically. Prefers `rename` (truly atomic on the
-/// same device). On EXDEV, copies `src` to a sibling on the destination
-/// device, then renames that sibling into place. A crash mid-copy leaves
-/// a sidecar tmp on disk but never exposes a half-written `dst`. Matches
-/// the invariant used by `report::atomic_install` so the codebase has a
-/// single shape for cross-device atomicity.
-fn atomic_install(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if let Err(rename_err) = std::fs::rename(src, dst) {
-        let ext = dst.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
-        let dst_sibling = dst.with_extension(format!("{ext}.kei-xdev-tmp-{}", std::process::id()));
-        if let Err(copy_err) = std::fs::copy(src, &dst_sibling) {
-            let _ = std::fs::remove_file(src);
-            tracing::warn!(
-                src = %src.display(),
-                dst = %dst.display(),
-                rename_err = %rename_err,
-                copy_err = %copy_err,
-                "rename failed and cross-device copy also failed"
-            );
-            return Err(rename_err);
-        }
-        if let Err(final_err) = std::fs::rename(&dst_sibling, dst) {
-            let _ = std::fs::remove_file(&dst_sibling);
-            let _ = std::fs::remove_file(src);
-            return Err(final_err);
-        }
-        let _ = std::fs::remove_file(src);
-    }
-    Ok(())
-}
-
-/// RAII cleanup for a sibling `.meta-tmp` file. Ensures the tmp is deleted
-/// whether the work succeeds, errors, *or panics* — the last case matters
-/// because the xmp_toolkit path crosses an FFI boundary into vendored C++
-/// code; if that panics (or the runtime aborts the task), a plain
-/// early-return cleanup won't fire. Call `disarm` after a successful
-/// rename so `Drop` leaves the now-renamed file alone.
+/// Remove the tmp file on drop unless disarmed. Protects `.meta-tmp` against
+/// a panic across the xmp_toolkit FFI boundary; no orphan sweep matches this
+/// suffix.
 struct TmpGuard<'a> {
     path: &'a Path,
     armed: bool,
@@ -275,9 +242,6 @@ fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite) -> Result<()> 
     std::fs::copy(path, &tmp_path)
         .with_context(|| format!("Copying {} -> {}", path.display(), tmp_path.display()))?;
 
-    // Guard cleans up `.meta-tmp` on any exit path — including a panic
-    // inside the xmp_toolkit FFI — so we never leave orphan tmp files on
-    // disk. The orphan sweep on sync start does not match `.meta-tmp`.
     let guard = TmpGuard::new(&tmp_path);
 
     let result: Result<()> = (|| {
@@ -311,16 +275,11 @@ fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite) -> Result<()> 
             std::fs::rename(&tmp_path, path).with_context(|| {
                 format!("Renaming {} -> {}", tmp_path.display(), path.display())
             })?;
-            // Rename consumed the tmp; suppress Drop so it doesn't try to
-            // unlink the (now renamed) destination file.
             guard.disarm();
             tracing::debug!(path = %path.display(), "Applied metadata");
             Ok(())
         }
-        Err(e) => {
-            // guard's Drop removes the tmp on the way out.
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -450,9 +409,6 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
     let tmp_path = path.with_file_name(&tmp_name);
     std::fs::write(&tmp_path, &new_bytes)
         .with_context(|| format!("Writing patched HEIC to {}", tmp_path.display()))?;
-    // Same RAII discipline as the XMP Toolkit path: the HEIC writer is pure
-    // Rust, but keeping the guard here is cheap insurance against future
-    // changes (e.g. a panic in a parser helper) orphaning `.meta-tmp`.
     let guard = TmpGuard::new(&tmp_path);
     std::fs::rename(&tmp_path, path)
         .with_context(|| format!("Renaming {} -> {}", tmp_path.display(), path.display()))?;
@@ -520,7 +476,6 @@ mod tests {
         std::env::temp_dir().join("claude").join(subdir)
     }
 
-    /// `TmpGuard` removes the file when dropped.
     #[test]
     fn tmp_guard_cleans_up_on_drop() {
         let dir = test_tmp_dir("tmp_guard");
@@ -537,7 +492,6 @@ mod tests {
         );
     }
 
-    /// After `disarm`, `Drop` is a no-op.
     #[test]
     fn tmp_guard_disarm_keeps_file() {
         let dir = test_tmp_dir("tmp_guard");
@@ -552,10 +506,8 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    /// Regression: if the XMP-writer closure panics, the `.meta-tmp` file
-    /// must still be cleaned up. We simulate the shape without invoking
-    /// xmp_toolkit so the test is fast and hermetic — the same RAII guard
-    /// protects the real xmp_toolkit path in `apply_metadata_xmp_toolkit`.
+    /// The xmp_toolkit writer runs closures across an FFI boundary, so a
+    /// panic out of that FFI must still clean up `.meta-tmp`.
     #[test]
     fn tmp_guard_cleans_up_even_on_panic() {
         let dir = test_tmp_dir("tmp_guard");

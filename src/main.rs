@@ -13,6 +13,7 @@ mod commands;
 mod config;
 mod credential;
 mod download;
+mod fs_util;
 mod health;
 mod icloud;
 mod metrics;
