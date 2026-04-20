@@ -677,7 +677,7 @@ impl Config {
             toml_dl.and_then(|d| d.no_progress_bar),
         );
 
-        // Retry upper bounds are re-validated here so TOML can't bypass clap's clamps.
+        // Re-validate; clap range attrs run on CLI only.
         let max_retries = resolve(sync.max_retries, toml_retry.and_then(|r| r.max_retries), 3);
         anyhow::ensure!(
             max_retries <= 100,

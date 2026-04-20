@@ -28,23 +28,22 @@ const FILE_MISSING_REASON: &str = "FILE_MISSING_AT_STARTUP";
 
 const SCAN_PAGE_SIZE: u32 = 1000;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct MissingAsset {
     id: String,
     version_size: VersionSizeKey,
     local_path: PathBuf,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy)]
 struct ScanCounts {
     present: u64,
     missing: u64,
     no_path: u64,
 }
 
-/// Collect every `downloaded` row whose `local_path` no longer exists. The
-/// scan is read-only so later `mark_failed` calls can't cause OFFSET
-/// pagination to skip rows that haven't been examined yet.
+/// Reads every page before any mutation so later `mark_failed` calls can't
+/// shift OFFSET pagination and skip rows.
 async fn scan_missing(
     db: &dyn StateDb,
     mut report_missing: impl FnMut(&MissingAsset),
@@ -61,9 +60,16 @@ async fn scan_missing(
         }
         offset += page.len() as u64;
 
-        for mut asset in page {
-            let Some(local_path) = asset.local_path.take() else {
-                report_no_path(&asset.id);
+        for asset in page {
+            let crate::state::AssetRecord {
+                id,
+                version_size,
+                local_path,
+                ..
+            } = asset;
+
+            let Some(local_path) = local_path else {
+                report_no_path(&id);
                 counts.no_path += 1;
                 continue;
             };
@@ -74,8 +80,8 @@ async fn scan_missing(
             }
 
             let record = MissingAsset {
-                id: std::mem::take(&mut asset.id),
-                version_size: asset.version_size,
+                id,
+                version_size,
                 local_path,
             };
             report_missing(&record);
@@ -186,8 +192,10 @@ mod tests {
     use crate::state::{AssetStatus, SqliteStateDb};
     use crate::test_helpers::TestAssetRecord;
 
-    /// Build a downloaded asset whose `local_path` does not exist on disk.
-    async fn seed_missing(db: &SqliteStateDb, id: &str, path: &std::path::Path) {
+    /// Seed a `downloaded` row whose `local_path` points at `path`; the path
+    /// itself is not touched on disk, so the scan treats it as missing
+    /// unless the caller also writes a file there.
+    async fn seed_downloaded(db: &SqliteStateDb, id: &str, path: &std::path::Path) {
         let record = TestAssetRecord::new(id)
             .checksum(&format!("ck_{id}"))
             .filename(&format!("{id}.jpg"))
@@ -199,24 +207,22 @@ mod tests {
             .unwrap();
     }
 
+    async fn seed_missing(db: &SqliteStateDb, id: &str, path: &std::path::Path) {
+        seed_downloaded(db, id, path).await;
+    }
+
+    async fn seed_present(db: &SqliteStateDb, id: &str, path: &std::path::Path) {
+        std::fs::write(path, b"x").unwrap();
+        seed_downloaded(db, id, path).await;
+    }
+
     #[tokio::test]
     async fn reconcile_marks_missing_file_as_failed() {
         let dir = tempfile::tempdir().unwrap();
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         seed_missing(&db, "MISSING_1", &dir.path().join("does_not_exist.jpg")).await;
-
-        let record2 = TestAssetRecord::new("PRESENT_1")
-            .checksum("cksum_2")
-            .filename("present.jpg")
-            .size(100)
-            .build();
-        db.upsert_seen(&record2).await.unwrap();
-        let present_path = dir.path().join("present.jpg");
-        std::fs::write(&present_path, b"data").unwrap();
-        db.mark_downloaded("PRESENT_1", "original", &present_path, "cksum_2", None)
-            .await
-            .unwrap();
+        seed_present(&db, "PRESENT_1", &dir.path().join("present.jpg")).await;
 
         let (counts, missing) = scan_missing(&db, |_: &MissingAsset| {}, |_: &str| {})
             .await
@@ -265,8 +271,6 @@ mod tests {
         assert_eq!(summary.failed, 0);
     }
 
-    /// Every missing row must be collected even when mutation would shift the
-    /// `downloaded` result set under OFFSET pagination.
     #[tokio::test]
     async fn reconcile_handles_pagination_with_many_missing_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -313,16 +317,7 @@ mod tests {
             let id = format!("MIX_{i:05}");
             let path = dir.path().join(format!("{id}.jpg"));
             if i % 3 == 0 {
-                std::fs::write(&path, b"x").unwrap();
-                let rec = TestAssetRecord::new(&id)
-                    .checksum(&format!("ck_{id}"))
-                    .filename(&format!("{id}.jpg"))
-                    .size(1)
-                    .build();
-                db.upsert_seen(&rec).await.unwrap();
-                db.mark_downloaded(&id, "original", &path, &format!("ck_{id}"), None)
-                    .await
-                    .unwrap();
+                seed_present(&db, &id, &path).await;
                 expected_present += 1;
             } else {
                 seed_missing(&db, &id, &path).await;

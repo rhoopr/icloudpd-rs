@@ -210,6 +210,7 @@ pub(crate) fn write_sidecar(media_path: &Path, write: &MetadataWrite) -> Result<
 /// Remove the tmp file on drop unless disarmed. Protects `.meta-tmp` against
 /// a panic across the xmp_toolkit FFI boundary; no orphan sweep matches this
 /// suffix.
+#[derive(Debug)]
 struct TmpGuard<'a> {
     path: &'a Path,
     armed: bool,
@@ -270,17 +271,12 @@ fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite) -> Result<()> 
         Ok(())
     })();
 
-    match result {
-        Ok(()) => {
-            std::fs::rename(&tmp_path, path).with_context(|| {
-                format!("Renaming {} -> {}", tmp_path.display(), path.display())
-            })?;
-            guard.disarm();
-            tracing::debug!(path = %path.display(), "Applied metadata");
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
+    result?;
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("Renaming {} -> {}", tmp_path.display(), path.display()))?;
+    guard.disarm();
+    tracing::debug!(path = %path.display(), "Applied metadata");
+    Ok(())
 }
 
 /// Apply the requested metadata fields to an `XmpMeta`. Single source of
