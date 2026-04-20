@@ -160,6 +160,9 @@ pub(super) struct StreamingResult {
     pub(super) skip_summary: ProducerSkipSummary,
     pub(super) bytes_downloaded: u64,
     pub(super) disk_bytes_written: u64,
+    /// Count of 429/503 observations during Phase 1 downloads (per retry
+    /// attempt, not per unique task). Feeds SyncStats.rate_limited.
+    pub(super) rate_limit_observations: usize,
 }
 
 /// Threshold of auth errors before aborting the download pass for re-authentication.
@@ -580,6 +583,10 @@ pub(super) struct PassConfig<'a> {
     pub(super) temp_suffix: String,
     pub(super) shutdown_token: CancellationToken,
     pub(super) state_db: Option<Arc<dyn StateDb>>,
+    /// Accumulator for 429/503 observations during this pass. Counted per
+    /// retry attempt, not per unique task. Aggregated into SyncStats for
+    /// the rate-limit pressure warning.
+    pub(super) rate_limit_counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for PassConfig<'_> {
@@ -603,6 +610,7 @@ pub(super) struct PassResult {
     pub(super) state_write_failures: usize,
     pub(super) bytes_downloaded: u64,
     pub(super) disk_bytes_written: u64,
+    pub(super) rate_limit_observations: usize,
 }
 
 /// Streaming download pipeline that consumes a pre-built combined stream.
@@ -1222,10 +1230,12 @@ where
     });
 
     let temp_suffix: Arc<str> = Arc::from(config.temp_suffix.as_str());
+    let rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
             let client = download_client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
+            let rate_limit_counter = Arc::clone(&rate_limit_counter);
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -1233,6 +1243,7 @@ where
                     &retry_config,
                     metadata_flags,
                     &temp_suffix,
+                    Some(rate_limit_counter.as_ref()),
                 ))
                 .await;
                 (task, result)
@@ -1454,6 +1465,7 @@ where
         skip_summary: producer_skips,
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
+        rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -1489,6 +1501,7 @@ pub(super) async fn build_download_outcome(
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: true,
+            rate_limited: streaming_result.rate_limit_observations,
         };
         return Ok((
             DownloadOutcome::SessionExpired {
@@ -1559,6 +1572,7 @@ pub(super) async fn build_download_outcome(
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
+            rate_limited: streaming_result.rate_limit_observations,
         };
         log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
         if state_write_failures > 0
@@ -1595,6 +1609,7 @@ pub(super) async fn build_download_outcome(
     );
 
     let phase2_task_count = fresh_tasks.len();
+    let phase2_rate_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
@@ -1604,6 +1619,7 @@ pub(super) async fn build_download_outcome(
         temp_suffix: config.temp_suffix.clone(),
         shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
+        rate_limit_counter: Arc::clone(&phase2_rate_counter),
     };
     let pass_result = run_download_pass(pass_config, fresh_tasks).await;
 
@@ -1627,6 +1643,8 @@ pub(super) async fn build_download_outcome(
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: true,
+            rate_limited: streaming_result.rate_limit_observations
+                + pass_result.rate_limit_observations,
         };
         return Ok((
             DownloadOutcome::SessionExpired {
@@ -1664,7 +1682,10 @@ pub(super) async fn build_download_outcome(
         enumeration_errors,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: shutdown_token.is_cancelled(),
+        rate_limited: streaming_result.rate_limit_observations
+            + pass_result.rate_limit_observations,
     };
+    maybe_warn_rate_limit_pressure(&stats);
     log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
 
     if total_failures > 0 {
@@ -1692,6 +1713,7 @@ pub(super) async fn run_download_pass(
     let shutdown_token = config.shutdown_token.clone();
     let concurrency = config.concurrency;
     let temp_suffix: Arc<str> = config.temp_suffix.into();
+    let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
 
     type DownloadResult = (
         DownloadTask,
@@ -1702,6 +1724,7 @@ pub(super) async fn run_download_pass(
         .map(|task| {
             let client = client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
+            let rate_limit_counter = Arc::clone(&rate_limit_counter);
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -1709,6 +1732,7 @@ pub(super) async fn run_download_pass(
                     retry_config,
                     metadata_flags,
                     &temp_suffix,
+                    Some(rate_limit_counter.as_ref()),
                 ))
                 .await;
                 (task, result)
@@ -1823,6 +1847,30 @@ pub(super) async fn run_download_pass(
         state_write_failures,
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
+        rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// Emit a warn! if rate_limit_observations exceeded 10% of attempts. Heuristic
+/// threshold: below 10% the retry layer likely absorbed the pressure silently;
+/// at/above it, the operator should adjust cadence to avoid prolonged
+/// back-off behavior and possible hard lockouts.
+fn maybe_warn_rate_limit_pressure(stats: &super::SyncStats) {
+    if stats.rate_limited == 0 {
+        return;
+    }
+    // Use assets_seen as the denominator; if zero, count total attempts instead.
+    let denom = stats.assets_seen.max(1);
+    let pct = stats.rate_limited as u64 * 100 / denom;
+    if pct >= 10 {
+        tracing::warn!(
+            rate_limit_observations = stats.rate_limited,
+            assets_seen = stats.assets_seen,
+            percent = pct,
+            "Observed HTTP 429/503 rate-limiting on >=10% of sync attempts — \
+             consider raising --watch-with-interval or lowering --threads-num \
+             to reduce sustained pressure on iCloud"
+        );
     }
 }
 
@@ -1908,6 +1956,7 @@ async fn download_single_task(
     retry_config: &RetryConfig,
     metadata_flags: MetadataFlags,
     temp_suffix: &str,
+    rate_limit_counter: Option<&std::sync::atomic::AtomicUsize>,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -1937,6 +1986,7 @@ async fn download_single_task(
             skip_rename: needs_exif,
             expected_size: if task.size > 0 { Some(task.size) } else { None },
         },
+        rate_limit_counter,
     ))
     .await?;
 
@@ -2317,6 +2367,51 @@ mod tests {
         assert_eq!(total, 500);
     }
 
+    // ── maybe_warn_rate_limit_pressure (MS-3) ───────────────────────────────
+    //
+    // The helper itself is side-effect-only (emits tracing::warn!); we assert
+    // the pure-math decision via the percentage threshold. A full log-capture
+    // test would need tracing-subscriber machinery that the rest of this
+    // module doesn't set up.
+
+    fn stats_with_rl(assets_seen: u64, rate_limited: usize) -> super::super::SyncStats {
+        super::super::SyncStats {
+            assets_seen,
+            rate_limited,
+            ..super::super::SyncStats::default()
+        }
+    }
+
+    #[test]
+    fn rate_limit_pressure_triggers_at_exactly_10_percent() {
+        // 10/100 = 10% → triggers
+        let stats = stats_with_rl(100, 10);
+        let pct = stats.rate_limited as u64 * 100 / stats.assets_seen.max(1);
+        assert_eq!(pct, 10);
+        assert!(pct >= 10);
+    }
+
+    #[test]
+    fn rate_limit_pressure_below_10_percent_does_not_trigger() {
+        let stats = stats_with_rl(100, 9);
+        let pct = stats.rate_limited as u64 * 100 / stats.assets_seen.max(1);
+        assert_eq!(pct, 9);
+        assert!(pct < 10);
+    }
+
+    #[test]
+    fn rate_limit_pressure_zero_assets_seen_does_not_panic() {
+        // The helper uses .max(1) on the denominator to avoid div-by-zero.
+        let stats = stats_with_rl(0, 3);
+        maybe_warn_rate_limit_pressure(&stats);
+    }
+
+    #[test]
+    fn rate_limit_pressure_zero_observations_skips_quickly() {
+        let stats = stats_with_rl(100, 0);
+        maybe_warn_rate_limit_pressure(&stats); // no panic, no denom needed
+    }
+
     #[test]
     fn batch_forecast_decision_saturating_mul_never_overflows_warn_threshold() {
         // Near-u64::MAX free values must compute warn_threshold without
@@ -2588,6 +2683,7 @@ mod tests {
                             temp_suffix: ".kei-tmp".to_string(),
                             shutdown_token: token,
                             state_db: None,
+                            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         };
                         let result = run_download_pass(pass_config, tasks).await;
                         assert!(result.failed.is_empty());
@@ -2638,6 +2734,7 @@ mod tests {
                             temp_suffix: ".kei-tmp".to_string(),
                             shutdown_token: token,
                             state_db: None,
+                            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         };
                         let result = run_download_pass(pass_config, tasks).await;
                         assert_eq!(result.failed.len(), 1);

@@ -94,6 +94,11 @@ pub struct SyncStats {
     pub enumeration_errors: usize,
     pub elapsed_secs: f64,
     pub interrupted: bool,
+    /// Number of tasks that observed at least one HTTP 429 / 503 response
+    /// during retry. A high ratio of rate_limited / assets_seen signals the
+    /// sync is running against a back-pressured account; operators should
+    /// either raise --watch-with-interval or lower --threads-num.
+    pub rate_limited: usize,
 }
 
 /// Per-reason breakdown of skipped assets.
@@ -1451,6 +1456,7 @@ async fn download_photos_incremental(
         temp_suffix: config.temp_suffix.clone(),
         shutdown_token,
         state_db: config.state_db.clone(),
+        rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
     let pass_result = run_download_pass(pass_config, tasks).await;
 
@@ -1476,6 +1482,7 @@ async fn download_photos_incremental(
         enumeration_errors: 0,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
+        rate_limited: pass_result.rate_limit_observations,
     };
     log_sync_summary(
         "\u{2500}\u{2500} Incremental Sync Summary \u{2500}\u{2500}",

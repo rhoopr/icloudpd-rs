@@ -101,6 +101,11 @@ pub(super) struct DownloadOpts {
 }
 
 /// Download a file with retry support and optional expected-size verification.
+///
+/// `rate_limit_counter`, when provided, is incremented by 1 for every
+/// observed HTTP 429 / 503 error (each retry attempt that hits rate-limiting
+/// counts once). The total is aggregated at the sync level so operators see
+/// when Apple is back-pressuring the run.
 pub(super) async fn download_file<C: DownloadClient>(
     client: &C,
     url: &str,
@@ -109,6 +114,7 @@ pub(super) async fn download_file<C: DownloadClient>(
     retry_config: &RetryConfig,
     temp_suffix: &str,
     opts: DownloadOpts,
+    rate_limit_counter: Option<&std::sync::atomic::AtomicUsize>,
 ) -> Result<u64, DownloadError> {
     let part_path =
         temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
@@ -116,6 +122,11 @@ pub(super) async fn download_file<C: DownloadClient>(
     Box::pin(retry::retry_with_backoff(
         retry_config,
         |e: &DownloadError| {
+            if e.is_rate_limited() {
+                if let Some(counter) = rate_limit_counter {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             if e.is_retryable() {
                 RetryAction::Retry
             } else {
@@ -1557,6 +1568,7 @@ mod tests {
                 skip_rename: false,
                 expected_size: None,
             },
+            None,
         )
         .await;
 
@@ -1729,6 +1741,7 @@ mod tests {
                     skip_rename: false,
                     expected_size: None,
                 },
+                None,
             )
             .await;
             (result, download_path, dir)
@@ -1883,6 +1896,7 @@ mod tests {
                     skip_rename: false,
                     expected_size: None,
                 },
+                None,
             )
             .await
             .unwrap();
