@@ -580,8 +580,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn pid_file_guard_refuses_when_existing_pid_alive() {
-        // Current process is alive by definition — write its PID into the file.
+        // Windows' pid_is_alive stub deliberately always returns false to
+        // avoid PID-reuse false positives, so this guard behavior is
+        // Unix-only.
         let path = std::env::temp_dir().join("icloudpd_test_pid_guard_alive.pid");
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, std::process::id().to_string()).unwrap();
