@@ -97,14 +97,16 @@ cov MODE="" BASE="main":
             ;;
         patch)
             cargo llvm-cov --all-features --lcov --output-path head.lcov
-            git worktree add ../.kei-cov-base "{{BASE}}" >/dev/null
+            # --detach so the base worktree doesn't collide with any
+            # existing checkout of the base branch (e.g. the main repo
+            # already sitting on main).
+            git worktree add --detach ../.kei-cov-base "{{BASE}}" >/dev/null
             (cd ../.kei-cov-base && cargo llvm-cov --all-features --lcov --output-path "$OLDPWD/base.lcov")
             git worktree remove ../.kei-cov-base >/dev/null
             python3 .github/scripts/patch_coverage.py \
-                --head head.lcov \
-                --base base.lcov \
-                --base-ref "{{BASE}}" \
-                --head-ref HEAD
+                --lcov head.lcov \
+                --base-lcov base.lcov \
+                --base "{{BASE}}"
             rm -f head.lcov base.lcov
             ;;
         *)
@@ -135,7 +137,15 @@ docker MODE:
             docker build -t kei:dev .
             ;;
         multiarch)
-            docker buildx build --platform linux/amd64,linux/arm64 -t kei:dev .
+            # The default `docker` driver can't build multiple platforms;
+            # bootstrap (or reuse) a `docker-container` driver builder
+            # named `kei-multiarch` for this invocation only.
+            if ! docker buildx inspect kei-multiarch >/dev/null 2>&1; then
+                docker buildx create --name kei-multiarch --driver docker-container >/dev/null
+            fi
+            docker buildx build --builder kei-multiarch \
+                --platform linux/amd64,linux/arm64 \
+                -t kei:dev .
             ;;
         run)
             docker compose up
