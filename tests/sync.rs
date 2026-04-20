@@ -982,6 +982,50 @@ fn sync_threads_num_reflected_in_log() {
     });
 }
 
+/// --only-print-filenames emits at least one filename to stdout and
+/// writes nothing to disk.
+#[test]
+#[ignore]
+fn sync_only_print_filenames_emits_names_without_downloading() {
+    let (username, password, cookie_dir) = common::require_preauth();
+
+    common::with_auth_retry(|| {
+        let download_dir = tempdir().expect("tempdir");
+
+        // --dry-run makes the test state-independent: kei emits a
+        // filename for every album member regardless of what the state
+        // DB already considers downloaded.
+        let out = album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .args(["--only-print-filenames", "--dry-run"])
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let non_log_lines: Vec<&str> = stdout
+            .lines()
+            .filter(|l| {
+                !l.is_empty()
+                    && !l.contains("INFO ")
+                    && !l.contains("WARN ")
+                    && !l.contains("ERROR ")
+            })
+            .collect();
+        assert!(
+            !non_log_lines.is_empty(),
+            "--only-print-filenames must emit at least one filename, stdout was:\n{stdout}"
+        );
+
+        let files = common::walkdir(download_dir.path());
+        assert!(
+            files.is_empty(),
+            "--only-print-filenames must not write files, found: {files:?}"
+        );
+    });
+}
+
 /// --notification-script should be called with ICLOUDPD_EVENT set.
 #[test]
 #[ignore]

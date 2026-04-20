@@ -636,4 +636,29 @@ mod tests {
         let resp = make_response(2, true, true, true);
         assert!(check_requires_2fa(&resp));
     }
+
+    #[test]
+    fn test_session_file_path_sanitizes_username() {
+        let dir = Path::new("/tmp/cookies");
+        let path = session_file_path(dir, "user@icloud.com");
+        // sanitize_username strips non-alphanumerics.
+        assert_eq!(path, Path::new("/tmp/cookies/usericloudcom.session"));
+    }
+
+    #[test]
+    fn test_session_file_path_handles_unicode_and_symbols() {
+        let dir = Path::new("/data");
+        // Non-alphanumerics (including unicode) are dropped; alphanumerics kept.
+        let path = session_file_path(dir, "user+tag@example.co.uk");
+        assert_eq!(path, Path::new("/data/usertagexamplecouk.session"));
+    }
+
+    #[test]
+    fn test_session_file_path_empty_username_leaves_bare_extension() {
+        // Edge case: an empty username produces `.session` alone in the
+        // cookie dir. Not a useful path but the function shouldn't panic.
+        let dir = Path::new("/var/cookies");
+        let path = session_file_path(dir, "");
+        assert_eq!(path, Path::new("/var/cookies/.session"));
+    }
 }
