@@ -585,6 +585,72 @@ fn password_set_requires_username() {
 }
 
 #[test]
+fn password_clear_requires_username() {
+    clean_cmd()
+        .args(["password", "clear", "--data-dir", "/tmp"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--username is required"));
+}
+
+#[test]
+fn password_backend_requires_username() {
+    clean_cmd()
+        .args(["password", "backend", "--data-dir", "/tmp"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--username is required"));
+}
+
+/// `password backend` against a fresh cookie dir prints the credential
+/// backend name. The backend choice is platform-dependent (OS keyring
+/// when available, encrypted file fallback), so we only assert the
+/// output is non-empty and exit is clean.
+#[test]
+fn password_backend_prints_backend_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = clean_cmd()
+        .args([
+            "password",
+            "backend",
+            "--username",
+            "test@example.com",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.trim().is_empty(),
+        "password backend must print the backend name, got empty stdout"
+    );
+}
+
+/// `password clear` against a cookie dir with no stored credential
+/// surfaces a clear error rather than silently succeeding. Locks in the
+/// "not idempotent" contract so nobody changes the behaviour without
+/// noticing the operator-visible impact.
+#[test]
+fn password_clear_on_empty_store_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    clean_cmd()
+        .args([
+            "password",
+            "clear",
+            "--username",
+            "test@example.com",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No stored credential"));
+}
+
+#[test]
 fn sync_requires_username() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
@@ -614,6 +680,42 @@ fn sync_requires_directory() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("--directory is required"));
+}
+
+#[test]
+fn import_existing_requires_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    clean_cmd()
+        .args([
+            "import-existing",
+            "--username",
+            "x@x.com",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--directory is required for import-existing",
+        ));
+}
+
+#[test]
+fn import_existing_rejects_nonexistent_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    clean_cmd()
+        .args([
+            "import-existing",
+            "--username",
+            "x@x.com",
+            "--directory",
+            "/does/not/exist/anywhere",
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Directory does not exist"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
