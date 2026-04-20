@@ -3668,6 +3668,88 @@ mod tests {
         assert_eq!(provider["assetSubtypeV2"], json!(16));
     }
 
+    // WAL mid-transaction rollback invariant: a second connection that
+    // begins a transaction modifying committed rows, then is dropped
+    // without calling commit(), must not leave those modifications
+    // visible to any subsequent SqliteStateDb::open(). This stands in
+    // for the crash-between-BEGIN-and-COMMIT scenario (OOM kill, power
+    // loss, SIGKILL) that WAL mode is supposed to make safe.
+    //
+    // If kei ever flipped journal_mode away from WAL (or mis-used
+    // autocommit so every write lands without tx grouping), a single
+    // interrupted mark_downloaded batch could leave half-complete state
+    // that the next sync would read as truth, silently drifting the DB
+    // from the file system.
+    #[tokio::test]
+    async fn wal_uncommitted_transaction_is_invisible_on_reopen() {
+        use rusqlite::Connection;
+
+        let dir = test_dir();
+        let path = dir.path().join("wal_rollback.db");
+        let file_path = dir.path().join("keeper.jpg");
+        fs::write(&file_path, b"bytes").unwrap();
+
+        // Step 1: open, commit a downloaded row, close.
+        {
+            let db = SqliteStateDb::open(&path).await.unwrap();
+            let record = TestAssetRecord::new("WAL_KEEPER")
+                .checksum("ck_w")
+                .filename("keeper.jpg")
+                .size(5)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded("WAL_KEEPER", "original", &file_path, "localhash", None)
+                .await
+                .unwrap();
+        }
+
+        // Step 2: open a raw rusqlite connection, begin an explicit
+        // transaction that would corrupt the downloaded row, then drop
+        // the connection WITHOUT committing. rusqlite's Connection Drop
+        // rolls back any open transaction — which is exactly the
+        // observable state SQLite exposes after a hard crash mid-tx.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("BEGIN; UPDATE assets SET status = 'failed', last_error = 'would be set by crashed tx' WHERE id = 'WAL_KEEPER'; ").unwrap();
+            // Verify the UPDATE is visible within this transaction so the
+            // test isn't accidentally a no-op (e.g. if the row weren't
+            // there or the UPDATE matched 0 rows).
+            let mid_tx_status: String = conn
+                .query_row(
+                    "SELECT status FROM assets WHERE id = 'WAL_KEEPER'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                mid_tx_status, "failed",
+                "UPDATE must land within the open transaction; otherwise the \
+                 test isn't exercising rollback"
+            );
+            // Drop without commit → rollback.
+            drop(conn);
+        }
+
+        // Step 3: reopen. The rolled-back UPDATE must not be visible.
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        let ids = db.get_downloaded_ids().await.unwrap();
+        assert!(
+            ids.contains(&("WAL_KEEPER".into(), "original".into())),
+            "committed downloaded row must survive an adjacent uncommitted \
+             transaction's rollback; got downloaded set: {ids:?}"
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(
+            summary.downloaded, 1,
+            "rolled-back UPDATE must not alter the committed status"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "WAL_KEEPER must not have been promoted to failed by the \
+             rolled-back transaction"
+        );
+    }
+
     // Full-sync conservatism invariant: an asset downloaded in a prior sync
     // that is absent from every page of the current full enumeration must
     // remain in the state DB as status='downloaded', untouched. Full sync
