@@ -528,6 +528,30 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 } else {
                     "success"
                 };
+                // Populate failed_assets from the state DB so the report
+                // reflects the final committed set, not mid-sync churn.
+                let (failed_assets, failed_assets_truncated) = match state_db.as_ref() {
+                    Some(db) => match db.get_failed().await {
+                        Ok(records) => {
+                            let total = records.len();
+                            let truncated = total.saturating_sub(crate::report::FAILED_ASSETS_CAP);
+                            let entries: Vec<_> = records
+                                .iter()
+                                .take(crate::report::FAILED_ASSETS_CAP)
+                                .map(crate::report::FailedAssetEntry::from_record)
+                                .collect();
+                            (entries, truncated)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to load failed_assets for sync_report.json"
+                            );
+                            (Vec::new(), 0)
+                        }
+                    },
+                    None => (Vec::new(), 0),
+                };
                 let report = crate::report::SyncReport {
                     version: "1",
                     kei_version: env!("CARGO_PKG_VERSION"),
@@ -535,6 +559,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     status: status.to_string(),
                     options: crate::report::RunOptions::from_config(&config),
                     stats: cycle_result.stats.clone(),
+                    failed_assets,
+                    failed_assets_truncated,
                 };
                 if let Err(e) = crate::report::write_report(report_path, &report) {
                     tracing::warn!(error = %e, path = %report_path.display(), "Failed to write JSON report");
