@@ -550,14 +550,18 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 };
                 // Populate failed_assets from the state DB so the report
                 // reflects the final committed set, not mid-sync churn.
+                // get_failed_sample pushes the LIMIT into SQL so an account
+                // with thousands of failures doesn't load every row here.
                 let (failed_assets, failed_assets_truncated) = match state_db.as_ref() {
-                    Some(db) => match db.get_failed().await {
-                        Ok(records) => {
-                            let total = records.len();
-                            let truncated = total.saturating_sub(crate::report::FAILED_ASSETS_CAP);
+                    Some(db) => match db
+                        .get_failed_sample(crate::report::FAILED_ASSETS_CAP as u32)
+                        .await
+                    {
+                        Ok((records, total)) => {
+                            let truncated =
+                                (total as usize).saturating_sub(crate::report::FAILED_ASSETS_CAP);
                             let entries: Vec<_> = records
                                 .iter()
-                                .take(crate::report::FAILED_ASSETS_CAP)
                                 .map(crate::report::FailedAssetEntry::from_record)
                                 .collect();
                             (entries, truncated)

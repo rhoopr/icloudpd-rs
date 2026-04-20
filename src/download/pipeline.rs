@@ -1859,9 +1859,17 @@ fn maybe_warn_rate_limit_pressure(stats: &super::SyncStats) {
     if stats.rate_limited == 0 {
         return;
     }
-    // Use assets_seen as the denominator; if zero, count total attempts instead.
-    let denom = stats.assets_seen.max(1);
-    let pct = stats.rate_limited as u64 * 100 / denom;
+    if stats.assets_seen == 0 {
+        // No enumeration anchor — surface the raw count so operators still
+        // see the signal, but skip the (meaningless) percentage.
+        tracing::warn!(
+            rate_limit_observations = stats.rate_limited,
+            "Observed HTTP 429/503 rate-limiting before any assets were enumerated — \
+             consider raising --watch-with-interval or lowering --threads-num"
+        );
+        return;
+    }
+    let pct = stats.rate_limited as u64 * 100 / stats.assets_seen;
     if pct >= 10 {
         tracing::warn!(
             rate_limit_observations = stats.rate_limited,
@@ -2294,7 +2302,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use tempfile::TempDir;
 
-    // ── batch_forecast_decision unit tests (NB-10) ──────────────────────────
+    // ── batch_forecast_decision unit tests ─────────────────────────────────
 
     #[test]
     fn batch_forecast_decision_none_free_always_continues() {
@@ -2367,7 +2375,7 @@ mod tests {
         assert_eq!(total, 500);
     }
 
-    // ── maybe_warn_rate_limit_pressure (MS-3) ───────────────────────────────
+    // ── maybe_warn_rate_limit_pressure ─────────────────────────────────────
     //
     // The helper itself is side-effect-only (emits tracing::warn!); we assert
     // the pure-math decision via the percentage threshold. A full log-capture
@@ -2401,7 +2409,9 @@ mod tests {
 
     #[test]
     fn rate_limit_pressure_zero_assets_seen_does_not_panic() {
-        // The helper uses .max(1) on the denominator to avoid div-by-zero.
+        // With zero assets_seen, the helper must skip percentage math (which
+        // would produce a misleading "300%" for 3 observations) and emit a
+        // separate no-anchor warn path.
         let stats = stats_with_rl(0, 3);
         maybe_warn_rate_limit_pressure(&stats);
     }
@@ -2910,6 +2920,12 @@ mod tests {
         }
         async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()
+        }
+        async fn get_failed_sample(
+            &self,
+            _limit: u32,
+        ) -> Result<(Vec<AssetRecord>, u64), StateError> {
+            Ok((Vec::new(), 0))
         }
         async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()

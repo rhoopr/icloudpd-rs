@@ -712,7 +712,7 @@ mod tests {
         assert!(has_index);
     }
 
-    // ── v7 sync_runs.status migration (MS-5) ───────────────────────────────
+    // ── v7 sync_runs.status migration ──────────────────────────────────────
 
     #[test]
     fn test_v7_adds_status_column_and_backfills() {

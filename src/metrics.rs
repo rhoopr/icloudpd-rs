@@ -779,7 +779,7 @@ mod tests {
         );
     }
 
-    // ── /healthz staleness threshold (NB-8) ────────────────────────────────
+    // ── /healthz staleness threshold ───────────────────────────────────────
 
     async fn set_threshold(handle: &MetricsHandle, max_age: Option<chrono::Duration>) {
         handle.inner.lock().await.staleness_threshold = max_age;

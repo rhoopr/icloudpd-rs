@@ -300,8 +300,11 @@ fn pid_is_alive(pid: i32) -> PidStatus {
 
 #[cfg(not(unix))]
 fn pid_is_alive(_pid: i32) -> PidStatus {
-    // On non-Unix platforms we can't cheaply check; be conservative and
-    // treat any existing PID file as stale.
+    // Windows PID reuse happens fast enough that a cheap "is PID alive" check
+    // without a process-handle lookup can return false-alives for totally
+    // unrelated processes. Report Dead so stale PID files are overwritten,
+    // trading duplicate-run protection (which the OS filesystem lock in
+    // PidFileGuard::new still backstops) for avoiding spurious refusals.
     PidStatus::Dead
 }
 

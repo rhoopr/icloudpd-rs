@@ -87,6 +87,11 @@ pub trait StateDb: Send + Sync {
     /// Get all failed assets.
     async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError>;
 
+    /// Most-recently-seen failed rows up to `limit`, alongside the total
+    /// failed count. Used by the sync-report writer to avoid loading every
+    /// failed row into memory on an account with thousands of failures.
+    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError>;
+
     /// Get all pending assets.
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
 
@@ -127,7 +132,7 @@ pub trait StateDb: Send + Sync {
 
     /// Return the zone names of any enumerations that started but never
     /// ended. Read once at process startup so the operator is warned that
-    /// the next full sync will re-enumerate from scratch until MS-4 resume
+    /// the next full sync will re-enumerate from scratch until resume
     /// support lands.
     async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError>;
 
@@ -674,6 +679,34 @@ impl StateDb for SqliteStateDb {
             .map_err(|e| StateError::query("get_failed", e))?;
 
         Ok(records)
+    }
+
+    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
+        let conn = self.acquire_lock("get_failed_sample")?;
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM assets WHERE status = 'failed'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| StateError::query("get_failed_sample", e))?;
+
+        let sql = format!(
+            "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
+             ORDER BY last_seen_at DESC LIMIT ?1",
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| StateError::query("get_failed_sample", e))?;
+
+        let records = stmt
+            .query_map([i64::from(limit)], row_to_asset_record)
+            .map_err(|e| StateError::query("get_failed_sample", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StateError::query("get_failed_sample", e))?;
+
+        Ok((records, total.max(0) as u64))
     }
 
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
@@ -1615,6 +1648,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_failed_sample_respects_limit_and_returns_total() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for i in 0..5 {
+            let id = format!("FAIL_{i}");
+            let record = TestAssetRecord::new(&id)
+                .checksum(&format!("ck_{i}"))
+                .filename(&format!("{i}.jpg"))
+                .size(100)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_failed(&id, "original", "boom").await.unwrap();
+        }
+        // Newest first: FAIL_4 > FAIL_3 > FAIL_2 ...
+        for i in 0..5 {
+            db.backdate_last_seen(&format!("FAIL_{i}"), 1_000 + i as i64);
+        }
+
+        let (sample, total) = db.get_failed_sample(2).await.unwrap();
+        assert_eq!(total, 5, "total should reflect full failed count");
+        assert_eq!(sample.len(), 2, "limit should cap returned rows");
+        assert_eq!(sample[0].id, "FAIL_4");
+        assert_eq!(sample[1].id, "FAIL_3");
+
+        // limit > total returns all and the correct total
+        let (sample, total) = db.get_failed_sample(100).await.unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(sample.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn get_failed_sample_empty_returns_zero_total() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let (sample, total) = db.get_failed_sample(10).await.unwrap();
+        assert!(sample.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
     async fn get_pending_orders_by_last_seen_desc() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
@@ -1729,7 +1801,7 @@ mod tests {
         assert!(summary.last_sync_completed.is_some());
     }
 
-    // ── sync_runs status lifecycle (MS-5) ──────────────────────────────────
+    // ── sync_runs status lifecycle ─────────────────────────────────────────
 
     async fn status_of(db: &SqliteStateDb, run_id: i64) -> String {
         let conn = db.acquire_lock("test_status_of").unwrap();
@@ -1815,7 +1887,7 @@ mod tests {
         assert_eq!(promoted, 0);
     }
 
-    // ── enum_in_progress markers (MS-4) ────────────────────────────────────
+    // ── enum_in_progress markers ───────────────────────────────────────────
 
     #[tokio::test]
     async fn begin_enum_progress_inserts_marker() {

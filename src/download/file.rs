@@ -1380,10 +1380,10 @@ mod tests {
 
     #[tokio::test]
     async fn attempt_download_resume_rejects_version_rotation_via_content_length() {
-        // CF-3 regression: if the .part carries K bytes from version A and the
-        // server's Range response's Content-Length (+ resume_offset) totals a
-        // different size than expected_size, the resume is rejected to avoid
-        // producing a Frankenfile of {A-prefix || B-suffix} bytes.
+        // If the .part carries K bytes from version A and the server's Range
+        // response's Content-Length (+ resume_offset) totals a different size
+        // than expected_size, the resume must be rejected to avoid producing
+        // a Frankenfile of {A-prefix || B-suffix} bytes.
         let (download_path, part_path, _dir) = setup_download_dir("rotation", "jpg");
         // .part carries 100 bytes from version A (expected size 150)
         std::fs::write(&part_path, vec![0xAA; 100]).unwrap();

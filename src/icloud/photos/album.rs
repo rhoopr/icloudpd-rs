@@ -1402,8 +1402,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_changes_stream_transient_zone_error_preserves_initial_token() {
-        // NB-2 regression: a transient zone code (RETRY_LATER, SERVER_INTERNAL_ERROR,
-        // etc.) on the very first page must not lose the caller's initial sync_token.
+        // A transient zone code (RETRY_LATER, SERVER_INTERNAL_ERROR, etc.)
+        // on the very first page must not lose the caller's initial sync_token.
         use tokio_stream::StreamExt;
 
         let mock = MockPhotosSession::new().ok(json!({
