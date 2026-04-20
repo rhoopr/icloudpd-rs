@@ -229,16 +229,80 @@ fn get_db_path(globals: &config::GlobalArgs, toml: Option<&TomlConfig>) -> anyho
 
 /// RAII guard that writes the current PID to a file on creation and removes
 /// it when dropped.
+#[derive(Debug)]
 struct PidFileGuard {
     path: PathBuf,
 }
 
 impl PidFileGuard {
     fn new(path: PathBuf) -> std::io::Result<Self> {
+        // If a prior PID file exists, validate whether the recorded process
+        // is still alive. Alive → bail; dead/unparseable → treat as stale
+        // and overwrite.
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Some(existing) = contents.trim().parse::<i32>().ok().filter(|p| *p > 0) {
+                match pid_is_alive(existing) {
+                    PidStatus::Alive => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "PID file {} refers to running process {existing}; refusing to start a second instance",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    PidStatus::Dead => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            stale_pid = existing,
+                            "PID file references a non-running process; overwriting as stale"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    path = %path.display(),
+                    "PID file contents unparseable; overwriting as stale"
+                );
+            }
+        }
         std::fs::write(&path, std::process::id().to_string())?;
         tracing::debug!(path = %path.display(), "PID file created");
         Ok(Self { path })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidStatus {
+    Alive,
+    Dead,
+}
+
+/// Return whether the PID corresponds to a running process.
+///
+/// Uses `kill(pid, 0)` on Unix: 0 = alive; ESRCH = dead; EPERM = alive
+/// (exists but outside our signalling permissions — still a live process).
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> PidStatus {
+    // SAFETY: kill with signal 0 performs permission / existence checks only
+    // and never delivers a signal.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return PidStatus::Alive;
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ESRCH) => PidStatus::Dead,
+        Some(libc::EPERM) => PidStatus::Alive,
+        _ => PidStatus::Dead,
+    }
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: i32) -> PidStatus {
+    // On non-Unix platforms we can't cheaply check; be conservative and
+    // treat any existing PID file as stale.
+    PidStatus::Dead
 }
 
 impl Drop for PidFileGuard {
@@ -519,6 +583,57 @@ mod tests {
     fn pid_file_guard_handles_missing_parent() {
         let path = std::env::temp_dir().join("nonexistent_dir_abc123/test.pid");
         assert!(PidFileGuard::new(path).is_err());
+    }
+
+    #[test]
+    fn pid_file_guard_refuses_when_existing_pid_alive() {
+        // Current process is alive by definition — write its PID into the file.
+        let path = std::env::temp_dir().join("icloudpd_test_pid_guard_alive.pid");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+
+        let err = PidFileGuard::new(path.clone()).expect_err("should refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_file_guard_overwrites_when_existing_pid_dead() {
+        // PID 2^31-2 is not allocatable on Linux (max_pid is much smaller),
+        // so kill(pid, 0) returns ESRCH deterministically.
+        let dead_pid = i32::MAX - 1;
+        assert_eq!(pid_is_alive(dead_pid), PidStatus::Dead);
+
+        let path = std::env::temp_dir().join("icloudpd_test_pid_guard_dead.pid");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, dead_pid.to_string()).unwrap();
+
+        let guard = PidFileGuard::new(path.clone()).expect("should overwrite stale PID file");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, std::process::id().to_string());
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn pid_file_guard_overwrites_when_existing_contents_garbage() {
+        let path = std::env::temp_dir().join("icloudpd_test_pid_guard_garbage.pid");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "not a pid").unwrap();
+
+        let guard = PidFileGuard::new(path.clone()).expect("should overwrite garbage PID file");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, std::process::id().to_string());
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_is_alive_self() {
+        assert_eq!(pid_is_alive(std::process::id() as i32), PidStatus::Alive);
     }
 
     #[test]

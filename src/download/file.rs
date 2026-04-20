@@ -285,16 +285,39 @@ async fn attempt_download<C: DownloadClient>(
         }
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(truncate)
-        .append(!truncate)
-        .open(&part_path)
-        .await
-        .map_err(|e| {
-            DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {e}"))
-        })?;
+    // When starting fresh (no resume), unlink any existing .part and use
+    // create_new so a concurrent kei instance writing the same .part is
+    // detected as a hard error (AlreadyExists) rather than silently racing.
+    // When resuming, open append-only without create (the file must exist —
+    // we read its length at the top of this function).
+    let mut file = if truncate {
+        let _ = fs::remove_file(&part_path).await;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part_path)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => DownloadError::Other(anyhow::anyhow!(
+                    "Concurrent writer detected on {}: another kei instance appears to be \
+                     downloading the same file. Only one kei instance may target a given \
+                     directory at a time",
+                    part_path.display()
+                )),
+                _ => {
+                    DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {e}"))
+                }
+            })?
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&part_path)
+            .await
+            .map_err(|e| {
+                DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {e}"))
+            })?
+    };
 
     let mut stream = response.stream;
     let stream_result: Result<(), DownloadError> = async {
