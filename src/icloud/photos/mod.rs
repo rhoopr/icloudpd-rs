@@ -453,4 +453,214 @@ mod tests {
             "https://p00-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private"
         );
     }
+
+    #[test]
+    fn test_build_service_endpoint_shared_library_type() {
+        assert_eq!(
+            PhotosService::build_service_endpoint("https://example.test", "shared"),
+            "https://example.test/database/1/com.apple.photos.cloud/production/shared"
+        );
+    }
+
+    #[test]
+    fn test_get_service_endpoint_uses_service_root_and_type() {
+        let svc = make_service(Box::new(PanicSession), HashMap::new());
+        assert_eq!(
+            svc.get_service_endpoint("private"),
+            "https://p00-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private"
+        );
+        assert_eq!(
+            svc.get_service_endpoint("shared"),
+            "https://p00-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/shared"
+        );
+    }
+
+    /// `get_library("PrimarySync")` short-circuits and returns the
+    /// pre-built primary library without hitting the network.
+    #[tokio::test]
+    async fn test_get_library_primary_sync_short_circuits() {
+        // A session that panics on clone confirms we never spin up a
+        // new PhotoLibrary for PrimarySync.
+        let mut svc = make_service(Box::new(PanicSession), HashMap::new());
+        let lib = svc.get_library("PrimarySync").await.unwrap();
+        assert_eq!(lib.zone_name(), "PrimarySync");
+    }
+
+    /// Cloneable capturing session - unlike CapturingSession above,
+    /// clone_box produces a working clone so fetch_libraries can hand
+    /// sessions to each constructed PhotoLibrary.
+    struct CloneableSession {
+        response: Value,
+    }
+
+    #[async_trait::async_trait]
+    impl session::PhotosSession for CloneableSession {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            Ok(self.response.clone())
+        }
+
+        fn clone_box(&self) -> Box<dyn session::PhotosSession> {
+            Box::new(CloneableSession {
+                response: self.response.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_private_libraries_parses_zone_list() {
+        let session = CloneableSession {
+            response: json!({
+                "zones": [
+                    {
+                        "zoneID": {"zoneName": "PrimarySync"},
+                        "syncToken": "tok",
+                    },
+                    {
+                        "zoneID": {"zoneName": "CMMLibrary-ABC"},
+                        "syncToken": "tok2",
+                    }
+                ]
+            }),
+        };
+        let mut svc = make_service(Box::new(session), HashMap::new());
+        let libs = svc.fetch_private_libraries().await.unwrap();
+        assert_eq!(libs.len(), 2);
+        assert!(libs.contains_key("PrimarySync"));
+        assert!(libs.contains_key("CMMLibrary-ABC"));
+    }
+
+    /// Deleted zones are filtered out.
+    #[tokio::test]
+    async fn test_fetch_libraries_skips_deleted_zones() {
+        let session = CloneableSession {
+            response: json!({
+                "zones": [
+                    {
+                        "zoneID": {"zoneName": "LiveZone"},
+                        "syncToken": "tok",
+                    },
+                    {
+                        "zoneID": {"zoneName": "GoneZone"},
+                        "syncToken": "tok2",
+                        "deleted": true,
+                    }
+                ]
+            }),
+        };
+        let mut svc = make_service(Box::new(session), HashMap::new());
+        let libs = svc.fetch_private_libraries().await.unwrap();
+        assert_eq!(libs.len(), 1);
+        assert!(libs.contains_key("LiveZone"));
+        assert!(!libs.contains_key("GoneZone"));
+    }
+
+    /// Second call to fetch_private_libraries reuses the cached map
+    /// rather than re-issuing the HTTP request. A session that only
+    /// responds correctly once would fail on the second call if caching
+    /// were broken.
+    #[tokio::test]
+    async fn test_fetch_private_libraries_is_lazy_and_cached() {
+        let session = CloneableSession {
+            response: json!({
+                "zones": [{"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "t"}]
+            }),
+        };
+        let mut svc = make_service(Box::new(session), HashMap::new());
+        // First call hits the stub.
+        let libs1 = svc.fetch_private_libraries().await.unwrap();
+        let first_len = libs1.len();
+        // Second call returns the cached map.
+        let libs2 = svc.fetch_private_libraries().await.unwrap();
+        assert_eq!(libs2.len(), first_len);
+    }
+
+    #[tokio::test]
+    async fn test_get_library_unknown_returns_error() {
+        let session = CloneableSession {
+            response: json!({"zones": []}),
+        };
+        let mut svc = make_service(Box::new(session), HashMap::new());
+        let err = svc.get_library("DoesNotExist").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unknown library") && msg.contains("DoesNotExist"),
+            "error should name the unknown library: {msg}"
+        );
+    }
+
+    /// Session that returns different zones depending on whether the
+    /// URL path contains `/private/` or `/shared/`. Needed to test
+    /// `all_libraries` which calls both.
+    struct RoutingSession {
+        private_response: Value,
+        shared_response: Value,
+    }
+
+    #[async_trait::async_trait]
+    impl session::PhotosSession for RoutingSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/private/") {
+                Ok(self.private_response.clone())
+            } else if url.contains("/shared/") {
+                Ok(self.shared_response.clone())
+            } else {
+                anyhow::bail!("unexpected URL: {url}")
+            }
+        }
+
+        fn clone_box(&self) -> Box<dyn session::PhotosSession> {
+            Box::new(RoutingSession {
+                private_response: self.private_response.clone(),
+                shared_response: self.shared_response.clone(),
+            })
+        }
+    }
+
+    /// `all_libraries` returns the primary library plus the non-primary
+    /// entries from the private zone list plus every shared zone.
+    #[tokio::test]
+    async fn test_all_libraries_combines_primary_private_and_shared() {
+        let session = RoutingSession {
+            private_response: json!({
+                "zones": [
+                    {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "t"},
+                    {"zoneID": {"zoneName": "ExtraPrivate"}, "syncToken": "t2"}
+                ]
+            }),
+            shared_response: json!({
+                "zones": [
+                    {"zoneID": {"zoneName": "SharedOne"}, "syncToken": "t3"}
+                ]
+            }),
+        };
+        let mut svc = make_service(Box::new(session), HashMap::new());
+        let all = svc.all_libraries().await.unwrap();
+        let names: Vec<_> = all.iter().map(|l| l.zone_name().to_string()).collect();
+
+        // Primary appears exactly once (from the primary_library slot;
+        // the private-list copy is filtered out).
+        let primary_count = names.iter().filter(|n| *n == "PrimarySync").count();
+        assert_eq!(
+            primary_count, 1,
+            "PrimarySync must appear once, got {names:?}"
+        );
+        assert!(
+            names.contains(&"ExtraPrivate".to_string()),
+            "non-primary private zone must be included: {names:?}"
+        );
+        assert!(
+            names.contains(&"SharedOne".to_string()),
+            "shared zone must be included: {names:?}"
+        );
+    }
 }
