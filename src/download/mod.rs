@@ -724,22 +724,32 @@ impl DownloadContext {
             return Some(true);
         }
 
-        // Check if checksum changed (also zero-allocation lookup)
-        if let Some(versions) = self.downloaded_checksums.get(asset_id) {
-            if let Some(stored_checksum) = versions.get(version_size_str) {
-                if stored_checksum.as_ref() != checksum {
-                    // Checksum changed — needs re-download
-                    return Some(true);
-                }
+        // Check if checksum changed (also zero-allocation lookup). Track
+        // whether a stored checksum is present at all so we can audit the
+        // "no stored checksum" path, which pre-v3 rows fall into.
+        let stored_checksum = self
+            .downloaded_checksums
+            .get(asset_id)
+            .and_then(|versions| versions.get(version_size_str));
+        if let Some(stored) = stored_checksum {
+            if stored.as_ref() != checksum {
+                return Some(true);
             }
+        } else {
+            // Pre-v3 row with no stored local_checksum. Audit so operators can
+            // correlate unexpected "skipped" counts with missing checksum
+            // history (the row will gain a checksum on next download).
+            tracing::debug!(
+                asset_id = asset_id,
+                version_size = %version_size_str,
+                trust_state = trust_state,
+                "no stored checksum for downloaded asset-version; skip decision uses trust_state only"
+            );
         }
 
-        // Downloaded with matching checksum
         if trust_state {
-            // Trust the DB — hard skip without filesystem check
             Some(false)
         } else {
-            // Need filesystem check to confirm file is still on disk
             None
         }
     }

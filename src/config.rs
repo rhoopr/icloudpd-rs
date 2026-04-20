@@ -525,8 +525,8 @@ impl Config {
         );
         let threads_num = resolve(sync.threads_num, toml_dl.and_then(|d| d.threads_num), 10);
         anyhow::ensure!(
-            threads_num >= 1,
-            "threads_num must be >= 1, got {threads_num}"
+            (1..=64).contains(&threads_num),
+            "threads_num must be in 1..=64, got {threads_num}"
         );
         let temp_suffix = resolve(
             sync.temp_suffix,
@@ -680,9 +680,10 @@ impl Config {
             .watch_with_interval
             .or_else(|| toml_watch.and_then(|w| w.interval));
         if let Some(n) = watch_with_interval {
-            if n < 60 {
-                anyhow::bail!("watch interval must be >= 60 seconds, got {n}");
-            }
+            anyhow::ensure!(
+                (60..=86400).contains(&n),
+                "watch interval must be in 60..=86400 seconds, got {n}"
+            );
         }
         let notify_systemd = resolve_flag(
             sync.notify_systemd,
@@ -1524,6 +1525,46 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("threads_num"),
             "Error should mention threads_num"
+        );
+    }
+
+    #[test]
+    fn test_build_threads_num_above_upper_bound_from_toml_rejected() {
+        let toml_str = r#"
+            [download]
+            threads_num = 128
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("threads_num"),
+            "Error should mention threads_num"
+        );
+    }
+
+    #[test]
+    fn test_build_watch_interval_above_upper_bound_from_toml_rejected() {
+        let toml_str = r#"
+            [watch]
+            interval = 100000
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let result = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("watch interval"),
+            "Error should mention watch interval"
         );
     }
 

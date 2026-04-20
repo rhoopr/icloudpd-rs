@@ -89,7 +89,7 @@ pub struct SyncArgs {
     pub recent: Option<u32>,
 
     /// Number of concurrent download threads (default: 10)
-    #[arg(long = "threads-num", env = "KEI_THREADS_NUM", value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long = "threads-num", env = "KEI_THREADS_NUM", value_parser = clap::value_parser!(u16).range(1..=64))]
     pub threads_num: Option<u16>,
 
     /// Don't download videos (pass `false` to override config file)
@@ -147,8 +147,8 @@ pub struct SyncArgs {
     #[arg(long, conflicts_with = "watch_with_interval")]
     pub dry_run: bool,
 
-    /// Run continuously, waiting N seconds between runs (minimum: 60)
-    #[arg(long, env = "KEI_WATCH_WITH_INTERVAL", value_parser = clap::value_parser!(u64).range(60..))]
+    /// Run continuously, waiting N seconds between runs (60..=86400)
+    #[arg(long, env = "KEI_WATCH_WITH_INTERVAL", value_parser = clap::value_parser!(u64).range(60..=86400))]
     pub watch_with_interval: Option<u64>,
 
     /// Disable progress bar
@@ -211,6 +211,8 @@ pub struct SyncArgs {
 
     /// Script to run on events (2FA required, sync complete, etc.).
     /// Called with `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars.
+    /// Fire-and-forget: script failures are logged at warn! but never block
+    /// the sync or affect the exit code.
     #[arg(long, env = "KEI_NOTIFICATION_SCRIPT")]
     pub notification_script: Option<String>,
 
@@ -1465,6 +1467,25 @@ mod tests {
     }
 
     #[test]
+    fn test_threads_num_accepts_upper_bound() {
+        let mut args = base_args();
+        args.extend(["--threads-num", "64"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.threads_num, Some(64));
+    }
+
+    #[test]
+    fn test_threads_num_rejects_above_upper_bound() {
+        let mut args = base_args();
+        args.extend(["--threads-num", "65"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+
+        let mut args = base_args();
+        args.extend(["--threads-num", "5000"]);
+        assert!(Cli::try_parse_from(&args).is_err());
+    }
+
+    #[test]
     fn test_max_retries_custom() {
         let mut args = base_args();
         args.extend(["--max-retries", "10"]);
@@ -1777,6 +1798,18 @@ mod tests {
         let mut args = base_args();
         args.extend(["--watch-with-interval", "60"]);
         assert!(Cli::try_parse_from(&args).is_ok());
+    }
+
+    #[test]
+    fn test_watch_with_interval_rejects_above_maximum() {
+        // 86400s = 24h ceiling
+        let mut args = base_args();
+        args.extend(["--watch-with-interval", "86400"]);
+        assert!(Cli::try_parse_from(&args).is_ok());
+
+        let mut args = base_args();
+        args.extend(["--watch-with-interval", "86401"]);
+        assert!(Cli::try_parse_from(&args).is_err());
     }
 
     #[test]
