@@ -28,6 +28,41 @@ use super::filter::{
 };
 use super::{paths, DownloadConfig, DownloadContext, DownloadOutcome};
 
+/// Outcome of `batch_forecast_decision` — either keep queueing, emit a
+/// one-shot warn, or stop enqueuing so the caller cancels the sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchForecast {
+    Continue,
+    Warn,
+    Bail,
+}
+
+/// Classify the impact of adding `size` bytes to the running queued total
+/// against the free-space snapshot captured at enumeration start.
+///
+/// Side-effects: `fetch_add`s `size` into `queued_bytes` so concurrent
+/// callers see a consistent total. The caller is responsible for emitting
+/// the log line and/or cancelling.
+fn batch_forecast_decision(
+    size: u64,
+    initial_free: Option<u64>,
+    queued_bytes: &std::sync::atomic::AtomicU64,
+    warn_emitted: &std::sync::atomic::AtomicBool,
+) -> (BatchForecast, u64) {
+    let total = queued_bytes.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
+    let Some(free) = initial_free else {
+        return (BatchForecast::Continue, total);
+    };
+    if total >= free {
+        return (BatchForecast::Bail, total);
+    }
+    let warn_threshold = free.saturating_mul(9) / 10;
+    if total >= warn_threshold && !warn_emitted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return (BatchForecast::Warn, total);
+    }
+    (BatchForecast::Continue, total)
+}
+
 /// Per-asset outcome in the producer's task loop. Ordered by ascending
 /// priority so `.max()` picks the winner when an asset has tasks with
 /// mixed outcomes (e.g. one version on disk, another sent for download).
@@ -807,6 +842,17 @@ where
     let enum_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let enum_errors_producer = Arc::clone(&enum_errors);
 
+    // Batch-size forecast: snapshot free space once at the start of
+    // enumeration and track bytes queued to consumers. Emit a one-time warn
+    // at 90% and cancel the sync at 100%. This catches the "batch much
+    // larger than free space" case early, before downloads run the disk dry
+    // mid-stream. We snapshot free space once so the threshold reflects
+    // "headroom at start" — per-task rechecks against a shrinking denominator
+    // would fire noisy false-positives as downloads consume the disk normally.
+    let initial_free = crate::available_disk_space(&config.directory);
+    let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let producer_config = Arc::clone(config);
     let producer_state_db = state_db.clone();
     let producer_shutdown = shutdown_token.clone();
@@ -818,6 +864,37 @@ where
         let mut seen_ids: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
+        let forecast_check = |size: u64| -> bool {
+            let (decision, total) = batch_forecast_decision(
+                size,
+                initial_free,
+                &queued_bytes_producer,
+                &space_warn_emitted_producer,
+            );
+            match decision {
+                BatchForecast::Continue => false,
+                BatchForecast::Warn => {
+                    if let Some(free) = initial_free {
+                        tracing::warn!(
+                            queued_bytes = total,
+                            initial_free_bytes = free,
+                            percent_of_free = (total as f64 * 100.0 / free as f64) as u64,
+                            "Queued download batch approaching 90% of initial free disk space"
+                        );
+                    }
+                    false
+                }
+                BatchForecast::Bail => {
+                    tracing::error!(
+                        queued_bytes = total,
+                        initial_free_bytes = initial_free.unwrap_or(0),
+                        "Queued download batch would exceed initial free disk space; cancelling sync"
+                    );
+                    producer_shutdown.cancel();
+                    true
+                }
+            }
+        };
         tokio::pin!(combined);
         while let Some(result) = combined.next().await {
             if producer_shutdown.is_cancelled() {
@@ -1011,7 +1088,11 @@ where
                                 ) {
                                     Some(true) => {
                                         disposition = disposition.max(AssetDisposition::Forwarded);
+                                        let size = task.size;
                                         if task_tx.send(task).await.is_err() {
+                                            return skips;
+                                        }
+                                        if forecast_check(size) {
                                             return skips;
                                         }
                                     }
@@ -1051,7 +1132,11 @@ where
                                             );
                                             disposition =
                                                 disposition.max(AssetDisposition::Forwarded);
+                                            let size = task.size;
                                             if task_tx.send(task).await.is_err() {
+                                                return skips;
+                                            }
+                                            if forecast_check(size) {
                                                 return skips;
                                             }
                                         }
@@ -1059,7 +1144,11 @@ where
                                 }
                             } else {
                                 disposition = disposition.max(AssetDisposition::Forwarded);
+                                let size = task.size;
                                 if task_tx.send(task).await.is_err() {
+                                    return skips;
+                                }
+                                if forecast_check(size) {
                                     return skips;
                                 }
                             }
@@ -2152,8 +2241,91 @@ mod tests {
     use crate::test_helpers::TestPhotoAsset;
     use std::collections::{HashMap, HashSet};
     use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    // ── batch_forecast_decision unit tests (NB-10) ──────────────────────────
+
+    #[test]
+    fn batch_forecast_decision_none_free_always_continues() {
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+        let (decision, total) = batch_forecast_decision(10_000, None, &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+        assert_eq!(total, 10_000);
+        // Even huge sizes must not emit warn/bail when free-space probe failed
+        let (decision, _) = batch_forecast_decision(u64::MAX - 10_000, None, &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+    }
+
+    #[test]
+    fn batch_forecast_decision_below_warn_threshold_continues() {
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+        // free = 1000, 50% of free queued → below 90% threshold
+        let (decision, total) = batch_forecast_decision(500, Some(1000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+        assert_eq!(total, 500);
+        assert!(!warn.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn batch_forecast_decision_crossing_90pct_warns_once() {
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+        // First call crosses 90% threshold
+        let (decision, total) = batch_forecast_decision(900, Some(1000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Warn);
+        assert_eq!(total, 900);
+        assert!(warn.load(Ordering::Relaxed));
+        // Subsequent calls that stay below 100% must NOT re-warn
+        let (decision, total) = batch_forecast_decision(50, Some(1000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+        assert_eq!(total, 950);
+    }
+
+    #[test]
+    fn batch_forecast_decision_crossing_100pct_bails() {
+        let queued = AtomicU64::new(800);
+        let warn = AtomicBool::new(true); // already warned at 800
+                                          // 800 + 250 = 1050 ≥ 1000 → bail
+        let (decision, total) = batch_forecast_decision(250, Some(1000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Bail);
+        assert_eq!(total, 1050);
+    }
+
+    #[test]
+    fn batch_forecast_decision_prefers_bail_over_warn_at_100pct_first_call() {
+        // If the very first queued task already exceeds free space, we should
+        // bail (not warn). This is the 2TB-into-300GB-disk scenario.
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+        let (decision, total) =
+            batch_forecast_decision(2_000_000_000, Some(300_000_000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Bail);
+        assert_eq!(total, 2_000_000_000);
+        // warn flag should NOT have been set — bail short-circuits
+        assert!(!warn.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn batch_forecast_decision_zero_size_is_a_noop() {
+        let queued = AtomicU64::new(500);
+        let warn = AtomicBool::new(false);
+        let (decision, total) = batch_forecast_decision(0, Some(1000), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+        assert_eq!(total, 500);
+    }
+
+    #[test]
+    fn batch_forecast_decision_saturating_mul_never_overflows_warn_threshold() {
+        // Near-u64::MAX free values must compute warn_threshold without
+        // overflowing and without spuriously warning at tiny totals.
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+        let (decision, _total) = batch_forecast_decision(1_000, Some(u64::MAX), &queued, &warn);
+        assert_eq!(decision, BatchForecast::Continue);
+    }
 
     fn now_local() -> chrono::DateTime<chrono::Local> {
         chrono::Local::now()

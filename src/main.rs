@@ -137,7 +137,7 @@ struct PartialSyncError(usize);
 ///
 /// Returns `None` if the statvfs call fails (e.g. path doesn't exist yet).
 #[cfg(unix)]
-fn available_disk_space(path: &Path) -> Option<u64> {
+pub(crate) fn available_disk_space(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -163,7 +163,7 @@ fn available_disk_space(path: &Path) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn available_disk_space(_path: &Path) -> Option<u64> {
+pub(crate) fn available_disk_space(_path: &Path) -> Option<u64> {
     None
 }
 
