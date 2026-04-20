@@ -2052,6 +2052,60 @@ mod tests {
         );
     }
 
+    /// Cross-batch case-insensitive collision: prior sync wrote an asset to
+    /// `IMG_0500.JPG`; the current sync's claimed_paths was pre-seeded with
+    /// that path's normalized form (as the pipeline would do when loading
+    /// prior downloads from the state DB). A new asset whose filter output
+    /// lands at `img_0500.jpg` must case-insensitively collide with the
+    /// seeded entry and route through the same dedup logic that intra-sync
+    /// collisions use — not be silently dispatched and overwrite the prior
+    /// file on case-insensitive filesystems (macOS, Windows).
+    ///
+    /// This locks in the case-insensitive primitive (NormalizedPath +
+    /// claimed_paths keyed on it). On Linux the primitive is exercised
+    /// directly; macOS/Windows additionally rely on FS case-folding in
+    /// dir_cache.file_size(), which is covered by the existing
+    /// `test_filter_skips_existing_file`.
+    #[test]
+    fn filter_cross_batch_case_insensitive_collision_is_deduped() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.directory = dir.path().to_path_buf();
+
+        // Asset whose filename resolves to `IMG_0500.JPG` in the folder tree.
+        let asset = TestPhotoAsset::new("CROSS_BATCH_1")
+            .filename("IMG_0500.JPG")
+            .orig_size(1000)
+            .orig_url("https://p01.icloud-content.com/img")
+            .orig_checksum("ck_cb")
+            .build();
+
+        // First filter call: derive the target path the pipeline would
+        // normally hand to the downloader.
+        let first_tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(first_tasks.len(), 1);
+        let downloaded_path = first_tasks[0].download_path.clone();
+
+        // Simulate the prior-sync download having produced that file on
+        // disk with a case-inverted basename (e.g. the case came from
+        // Apple metadata or a rename tool). On case-insensitive FS the
+        // dir_cache would find it; on case-sensitive FS, simulate the
+        // equivalent by pre-seeding claimed_paths with the normalized
+        // form — which is what a startup load from state DB would do.
+        let claimed_key = NormalizedPath::new(downloaded_path.clone());
+        let mut claimed_paths = FxHashMap::default();
+        claimed_paths.insert(claimed_key, 1000); // same size as the asset
+
+        let mut dir_cache = paths::DirCache::new();
+        let second_tasks =
+            filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        assert!(
+            second_tasks.is_empty(),
+            "asset whose target path case-insensitively matches a claimed \
+             path of the same size must be skipped, not dispatched; got tasks: {second_tasks:?}"
+        );
+    }
+
     #[test]
     fn filter_asset_empty_filename_string_uses_fingerprint_fallback() {
         // Distinct from the missing-field case: the STRING field is PRESENT
