@@ -881,8 +881,14 @@ impl StateDb for SqliteStateDb {
         let key = format!("enum_in_progress:{zone}");
         let now = Utc::now().timestamp().to_string();
         let conn = self.acquire_lock("begin_enum_progress")?;
+        // INSERT OR IGNORE preserves the original start timestamp across
+        // re-entry. If a prior enumeration was interrupted and never cleared
+        // the marker, a new call on the same zone must not erase the age of
+        // the original interruption — operators rely on that age to decide
+        // whether to intervene. `end_enum_progress` is the only path that
+        // clears the marker.
         conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO metadata (key, value) VALUES (?1, ?2)",
             rusqlite::params![key, now],
         )
         .map_err(|e| StateError::query("begin_enum_progress", e))?;
@@ -1932,9 +1938,62 @@ mod tests {
     async fn begin_enum_progress_is_idempotent_for_same_zone() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         db.begin_enum_progress("PrimarySync").await.unwrap();
-        db.begin_enum_progress("PrimarySync").await.unwrap(); // overwrite timestamp
+        db.begin_enum_progress("PrimarySync").await.unwrap();
         let zones = db.list_interrupted_enumerations().await.unwrap();
         assert_eq!(zones, vec!["PrimarySync".to_string()]);
+    }
+
+    /// Regression: if a prior enumeration was interrupted and the marker
+    /// survives, a later `begin_enum_progress` on the same zone must not
+    /// reset the stored timestamp — operators rely on the marker age to
+    /// judge whether to intervene on a long-stuck enumeration.
+    ///
+    /// Each read of the marker runs inside its own lock scope: the DB uses a
+    /// plain std::sync::Mutex guarding the Connection, so holding a guard
+    /// across a later async `db.*_enum_progress` call would deadlock on
+    /// re-acquisition.
+    #[tokio::test]
+    async fn begin_enum_progress_preserves_original_timestamp_on_reentry() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let original_ts = "1700000000";
+
+        fn read_marker(db: &SqliteStateDb) -> Option<String> {
+            let conn = db.acquire_lock("read_marker").unwrap();
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key = 'enum_in_progress:PrimarySync'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        }
+
+        // Seed an older marker timestamp directly.
+        {
+            let conn = db.acquire_lock("seed_marker").unwrap();
+            conn.execute(
+                "INSERT INTO metadata (key, value) VALUES ('enum_in_progress:PrimarySync', ?1)",
+                [original_ts],
+            )
+            .unwrap();
+        }
+
+        // Re-entering begin_enum_progress on a live marker must not overwrite it.
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        assert_eq!(
+            read_marker(&db).as_deref(),
+            Some(original_ts),
+            "re-entering begin_enum_progress must not rewrite the original timestamp"
+        );
+
+        // After end_enum_progress, the marker clears; a subsequent begin
+        // should install a fresh timestamp.
+        db.end_enum_progress("PrimarySync").await.unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+        let fresh = read_marker(&db).expect("marker must exist after begin");
+        assert_ne!(
+            fresh, original_ts,
+            "after end_enum_progress, a new begin should install a fresh timestamp"
+        );
     }
 
     #[tokio::test]
