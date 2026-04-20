@@ -20,26 +20,21 @@ use std::path::PathBuf;
 use crate::cli;
 use crate::config;
 use crate::state;
-use crate::state::StateDb;
+use crate::state::{StateDb, VersionSizeKey};
 
-/// Error message written to `assets.last_error` when reconcile detects a
-/// missing file. Stable across versions so monitoring tools can key on it.
+/// Stable sentinel written to `assets.last_error` so monitoring tools can
+/// key on the reason a row flipped from downloaded back to failed.
 const FILE_MISSING_REASON: &str = "FILE_MISSING_AT_STARTUP";
 
-/// Page size for the scan pass. `get_downloaded_page` is paginated to cap
-/// DB memory; the scan does not mutate the `downloaded` result set, so
-/// OFFSET pagination is safe here.
 const SCAN_PAGE_SIZE: u32 = 1000;
 
-/// One missing-file record collected during the scan pass.
 #[derive(Debug, Clone)]
 struct MissingAsset {
     id: String,
-    version_size: String,
+    version_size: VersionSizeKey,
     local_path: PathBuf,
 }
 
-/// Aggregate counts from a reconcile scan.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ScanCounts {
     present: u64,
@@ -47,10 +42,9 @@ struct ScanCounts {
     no_path: u64,
 }
 
-/// Scan all `downloaded` assets and return the subset whose recorded
-/// `local_path` no longer exists on disk. Pure read: mutates neither the
-/// DB nor any files. Decoupled from `run_reconcile` so tests can drive it
-/// against arbitrary state without reimplementing the loop.
+/// Collect every `downloaded` row whose `local_path` no longer exists. The
+/// scan is read-only so later `mark_failed` calls can't cause OFFSET
+/// pagination to skip rows that haven't been examined yet.
 async fn scan_missing(
     db: &dyn StateDb,
     mut report_missing: impl FnMut(&MissingAsset),
@@ -67,23 +61,22 @@ async fn scan_missing(
         }
         offset += page.len() as u64;
 
-        for asset in &page {
-            let Some(local_path) = &asset.local_path else {
+        for mut asset in page {
+            let Some(local_path) = asset.local_path.take() else {
                 report_no_path(&asset.id);
                 counts.no_path += 1;
                 continue;
             };
 
-            let exists = tokio::fs::try_exists(local_path).await.unwrap_or(false);
-            if exists {
+            if tokio::fs::try_exists(&local_path).await.unwrap_or(false) {
                 counts.present += 1;
                 continue;
             }
 
             let record = MissingAsset {
-                id: asset.id.clone(),
-                version_size: asset.version_size.as_str().to_string(),
-                local_path: local_path.clone(),
+                id: std::mem::take(&mut asset.id),
+                version_size: asset.version_size,
+                local_path,
             };
             report_missing(&record);
             counts.missing += 1;
@@ -120,8 +113,6 @@ pub(crate) async fn run_reconcile(
     }
     println!();
 
-    // Scan pass: collect every missing row. This is read-only, so OFFSET
-    // pagination on `WHERE status='downloaded'` is safe.
     let (counts, missing) = scan_missing(
         &db,
         |m| {
@@ -129,7 +120,7 @@ pub(crate) async fn run_reconcile(
                 "MISSING: {} ({}, {})",
                 m.local_path.display(),
                 m.id,
-                m.version_size,
+                m.version_size.as_str(),
             );
         },
         |id| {
@@ -138,22 +129,20 @@ pub(crate) async fn run_reconcile(
     )
     .await?;
 
-    // Mutation pass: mark each missing row as failed. Executed after the
-    // scan completes so flipping rows out of the `downloaded` set can't
-    // cause pagination to skip still-downloaded rows.
     let mut marked_failed = 0u64;
     let mut mark_errors = 0u64;
     if !args.dry_run {
         for m in &missing {
             match db
-                .mark_failed(&m.id, &m.version_size, FILE_MISSING_REASON)
+                .mark_failed(&m.id, m.version_size.as_str(), FILE_MISSING_REASON)
                 .await
             {
                 Ok(()) => marked_failed += 1,
                 Err(e) => {
                     eprintln!(
                         "  failed to mark {}:{} as failed: {e}",
-                        m.id, m.version_size
+                        m.id,
+                        m.version_size.as_str()
                     );
                     mark_errors += 1;
                 }
@@ -163,8 +152,8 @@ pub(crate) async fn run_reconcile(
 
     println!();
     if mark_errors > 0 {
-        // Surface the failure before the summary so scripts reading
-        // stdout don't see a "Results:" block and assume success.
+        // Print before "Results:" so stdout-scraping scripts don't see a
+        // success-looking summary right before the non-zero exit.
         println!("FAILED: {mark_errors} state updates errored — see stderr above for details.");
         println!();
     }
@@ -215,10 +204,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        // Missing file
         seed_missing(&db, "MISSING_1", &dir.path().join("does_not_exist.jpg")).await;
 
-        // Present file
         let record2 = TestAssetRecord::new("PRESENT_1")
             .checksum("cksum_2")
             .filename("present.jpg")
@@ -239,9 +226,8 @@ mod tests {
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].id, "MISSING_1");
 
-        // Apply the mutation pass.
         for m in &missing {
-            db.mark_failed(&m.id, &m.version_size, FILE_MISSING_REASON)
+            db.mark_failed(&m.id, m.version_size.as_str(), FILE_MISSING_REASON)
                 .await
                 .unwrap();
         }
@@ -268,40 +254,30 @@ mod tests {
 
         seed_missing(&db, "MISSING_DRY", &dir.path().join("x.jpg")).await;
 
-        // scan_missing is always read-only. A dry-run in run_reconcile just
-        // skips the mutation loop that follows.
         let (counts, missing) = scan_missing(&db, |_: &MissingAsset| {}, |_: &str| {})
             .await
             .unwrap();
         assert_eq!(counts.missing, 1);
         assert_eq!(missing.len(), 1);
 
-        // Nothing mutated the DB.
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.downloaded, 1);
         assert_eq!(summary.failed, 0);
     }
 
-    /// Regression for the offset-vs-mutation bug: with > SCAN_PAGE_SIZE rows
-    /// and a high miss ratio, the original implementation paginated the
-    /// `downloaded` result set while simultaneously flipping rows out of it,
-    /// causing later pages to skip rows that were still downloaded. The
-    /// two-phase (scan, then mutate) design keeps the scan read-only so
-    /// every missing row is collected before any mark_failed fires.
+    /// Every missing row must be collected even when mutation would shift the
+    /// `downloaded` result set under OFFSET pagination.
     #[tokio::test]
     async fn reconcile_handles_pagination_with_many_missing_files() {
         let dir = tempfile::tempdir().unwrap();
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        // Seed >SCAN_PAGE_SIZE rows, all with non-existent local_paths.
-        let total = (SCAN_PAGE_SIZE as usize) + 500; // 1500 rows
+        let total = (SCAN_PAGE_SIZE as usize) + 500;
         for i in 0..total {
             let id = format!("ROW_{i:05}");
             seed_missing(&db, &id, &dir.path().join(format!("{id}.jpg"))).await;
         }
 
-        // Scan pass should find every missing row, regardless of page
-        // boundary interactions.
         let (counts, missing) = scan_missing(&db, |_: &MissingAsset| {}, |_: &str| {})
             .await
             .unwrap();
@@ -309,10 +285,8 @@ mod tests {
         assert_eq!(counts.present, 0);
         assert_eq!(missing.len(), total);
 
-        // Mutation pass: mark them all failed, then verify every original
-        // row ended up in the failed state — no silent skips.
         for m in &missing {
-            db.mark_failed(&m.id, &m.version_size, FILE_MISSING_REASON)
+            db.mark_failed(&m.id, m.version_size.as_str(), FILE_MISSING_REASON)
                 .await
                 .unwrap();
         }
@@ -320,8 +294,6 @@ mod tests {
         assert_eq!(summary.downloaded, 0);
         assert_eq!(summary.failed as usize, total);
 
-        // Second reconcile pass against the resulting DB must see zero
-        // downloaded rows and therefore zero missing files.
         let (counts2, missing2) = scan_missing(&db, |_: &MissingAsset| {}, |_: &str| {})
             .await
             .unwrap();
@@ -329,20 +301,17 @@ mod tests {
         assert!(missing2.is_empty());
     }
 
-    /// Even with a mix of present and missing files across page
-    /// boundaries, the scan classifies each row correctly.
     #[tokio::test]
     async fn reconcile_classifies_mixed_present_and_missing_across_pages() {
         let dir = tempfile::tempdir().unwrap();
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let total = (SCAN_PAGE_SIZE as usize) + 250; // 1250 rows
+        let total = (SCAN_PAGE_SIZE as usize) + 250;
         let mut expected_missing = 0u64;
         let mut expected_present = 0u64;
         for i in 0..total {
             let id = format!("MIX_{i:05}");
             let path = dir.path().join(format!("{id}.jpg"));
-            // Every third row is "present" on disk; the rest are missing.
             if i % 3 == 0 {
                 std::fs::write(&path, b"x").unwrap();
                 let rec = TestAssetRecord::new(&id)
