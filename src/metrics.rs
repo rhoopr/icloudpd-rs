@@ -1101,8 +1101,12 @@ mod tests {
             .build()
             .unwrap();
 
+        // spawn_server binds to 0.0.0.0; dial via 127.0.0.1 because Windows
+        // treats 0.0.0.0 as AddrNotAvailable on connect.
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
         let metrics_resp = client
-            .get(format!("http://{addr}/metrics"))
+            .get(format!("{base}/metrics"))
             .send()
             .await
             .expect("GET /metrics should succeed");
@@ -1124,7 +1128,7 @@ mod tests {
         );
 
         let healthz_resp = client
-            .get(format!("http://{addr}/healthz"))
+            .get(format!("{base}/healthz"))
             .send()
             .await
             .expect("GET /healthz should succeed");
