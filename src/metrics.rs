@@ -93,7 +93,7 @@ pub(crate) struct MetricsHandle {
 
 impl MetricsHandle {
     /// Build the registry and register all metrics.
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(staleness_threshold: Option<chrono::Duration>) -> Self {
         let mut registry = Registry::default();
 
         let assets_seen = Counter::default();
@@ -226,7 +226,7 @@ impl MetricsHandle {
             registry: Arc::new(registry),
             inner: Arc::new(Mutex::new(Inner {
                 health_snapshot: None,
-                staleness_threshold: None,
+                staleness_threshold,
             })),
             assets_seen,
             downloaded,
@@ -450,13 +450,7 @@ pub(crate) fn spawn_server(
     shutdown_token: CancellationToken,
     staleness_threshold: Option<chrono::Duration>,
 ) -> anyhow::Result<(MetricsHandle, tokio::task::JoinHandle<()>)> {
-    let handle = MetricsHandle::new();
-    if let Some(max_age) = staleness_threshold {
-        let inner = Arc::clone(&handle.inner);
-        // Lock is uncontended at this point (no readers exist yet), so
-        // blocking_lock is safe and avoids making the function async.
-        inner.blocking_lock().staleness_threshold = Some(max_age);
-    }
+    let handle = MetricsHandle::new(staleness_threshold);
     let app = Router::new()
         .route("/metrics", get(handle_metrics))
         .route("/healthz", get(handle_healthz))
@@ -535,7 +529,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_response_has_openmetrics_content_type() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let response =
             axum::response::IntoResponse::into_response(handle_metrics(State(handle)).await);
         let content_type = response
@@ -553,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn counters_reflect_single_cycle() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let stats = stats_with(5, 2, 1024);
         handle.update(&stats, &healthy_status(0)).await;
 
@@ -574,7 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn counters_accumulate_across_cycles() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&stats_with(3, 1, 500), &healthy_status(0))
             .await;
@@ -599,7 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn gauges_reflect_only_the_latest_cycle() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let stats1 = SyncStats {
             elapsed_secs: 10.0,
             ..Default::default()
@@ -627,7 +621,7 @@ mod tests {
 
     #[tokio::test]
     async fn cycle_duration_not_clobbered_by_health_only_update() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let stats = SyncStats {
             elapsed_secs: 25.0,
             ..Default::default()
@@ -646,7 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_only_update_still_refreshes_health_gauges() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         // First real cycle with 3 failures.
         handle
             .update(&SyncStats::default(), &healthy_status(3))
@@ -663,7 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_only_update_refreshes_healthz_snapshot() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle.update_health_only(&healthy_status(0)).await;
 
         let (status, _body) = render_healthz(&handle).await;
@@ -678,7 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_flag_increments_counter() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let stats = SyncStats {
             interrupted: true,
             ..Default::default()
@@ -694,7 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_interrupted_cycle_does_not_increment_counter() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(0))
             .await;
@@ -710,7 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_expiration_counter_increments() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle.record_session_expiration();
         handle.record_session_expiration();
 
@@ -725,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn skip_breakdown_emits_labelled_counters() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let mut stats = SyncStats::default();
         stats.skipped.by_state = 10;
         stats.skipped.on_disk = 3;
@@ -749,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_skips_do_not_create_label_series() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(0))
             .await;
@@ -765,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn consecutive_failures_gauge_tracks_health() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(3))
             .await;
@@ -779,7 +773,7 @@ mod tests {
 
     #[tokio::test]
     async fn consecutive_failures_gauge_resets_on_success() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(3))
             .await;
@@ -798,14 +792,14 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_503_before_first_cycle() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let (status, _body) = render_healthz(&handle).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn healthz_returns_200_after_successful_cycle() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(0))
             .await;
@@ -818,7 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_503_when_consecutive_failures_reaches_threshold() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(5))
             .await;
@@ -829,7 +823,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_200_when_consecutive_failures_below_threshold() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(4))
             .await;
@@ -840,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_body_contains_expected_fields() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(0))
             .await;
@@ -876,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_503_when_last_success_is_stale() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(0))
             .await;
@@ -890,7 +884,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_200_when_last_success_is_fresh() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(0))
             .await;
@@ -903,7 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_staleness_disabled_when_threshold_is_none() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(0))
             .await;
@@ -917,7 +911,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_staleness_tripped_also_when_failures_high() {
         // Both conditions at once -> 503
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle
             .update(&SyncStats::default(), &healthy_status(5))
             .await;
@@ -932,7 +926,7 @@ mod tests {
     async fn healthz_staleness_ignored_when_last_success_never_set() {
         // First cycle failed -> no last_success_at. Staleness must not trip
         // because we have no anchor timestamp yet; failures alone drive 503.
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let mut h = HealthStatus::new();
         h.record_failure("first ever");
         handle.update(&SyncStats::default(), &h).await;
@@ -964,7 +958,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_db_stats_sets_asset_count_gauges() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let summary = make_summary(100, 5, 2, 1_000_000);
         handle.update_db_stats(&summary, 107);
 
@@ -985,7 +979,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_db_stats_sets_size_bytes_gauge() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let summary = make_summary(50, 0, 0, 2_048_000);
         handle.update_db_stats(&summary, 50);
 
@@ -998,7 +992,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_db_stats_sets_last_sync_assets_seen_gauge() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         let summary = make_summary(28_000, 3_000, 71, 0);
         handle.update_db_stats(&summary, 31_071);
 
@@ -1011,7 +1005,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_db_stats_gauges_reflect_latest_call() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle.update_db_stats(&make_summary(100, 10, 0, 500_000), 110);
         // Second call should overwrite (gauges, not counters).
         handle.update_db_stats(&make_summary(105, 5, 0, 525_000), 110);
@@ -1029,7 +1023,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_metric_names_present_in_output() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle.update_db_stats(&make_summary(1, 0, 0, 1024), 1);
 
         let output = render_metrics(&handle).await;
@@ -1049,7 +1043,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_summary_failure_counter_increments() {
-        let handle = MetricsHandle::new();
+        let handle = MetricsHandle::new(None);
         handle.record_db_summary_failure();
         handle.record_db_summary_failure();
 
@@ -1058,5 +1052,24 @@ mod tests {
             output.contains("kei_db_summary_read_failures_total 2"),
             "db_summary_read_failures counter missing or wrong:\n{output}"
         );
+    }
+
+    /// Regression test for https://github.com/rhoopr/kei/issues/248
+    ///
+    /// `spawn_server()` must not panic when called from within a tokio runtime
+    /// with a `staleness_threshold` set. Before the fix, `blocking_lock()` was
+    /// used inside the tokio runtime, which panics unconditionally regardless
+    /// of lock contention.
+    #[tokio::test]
+    async fn spawn_server_with_staleness_threshold_does_not_panic_inside_runtime() {
+        let token = CancellationToken::new();
+        // Port 0 lets the OS pick a free ephemeral port.
+        let result = spawn_server(0, token.clone(), Some(chrono::Duration::seconds(3600)));
+        assert!(
+            result.is_ok(),
+            "spawn_server panicked or errored inside tokio runtime: {:?}",
+            result.err()
+        );
+        token.cancel();
     }
 }
