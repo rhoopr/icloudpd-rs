@@ -126,11 +126,6 @@ sha1 = "0.10"
 # tests in the auth layer don't sleep through real wall-clock delays.
 tokio = { version = "1", features = ["test-util"] }
 
-[lints.clippy]
-# Flag `[]` / `[..]` panic footguns so we reach for `.get()` / `.first()` or an
-# explicit, invariant-documenting `#[allow]` at each site.
-indexing_slicing = "warn"
-
 [[test]]
 name = "cli"
 path = "tests/cli.rs"

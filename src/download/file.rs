@@ -578,6 +578,9 @@ fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
 /// Photos pipeline commonly serves live-photo and HEVC videos in classic
 /// QuickTime format, whose first atom is padding (`wide`) or media data
 /// (`mdat`) rather than `ftyp`.
+// Each match arm slices `header` only after an `n >= N` length guard, where
+// `n == header.len()`. Clippy can't see the proof but every slice is bounded.
+#[allow(clippy::indexing_slicing)]
 fn classify_magic(ext: &str, header: &[u8]) -> Option<bool> {
     let n = header.len();
     match ext {
@@ -616,9 +619,6 @@ fn is_mov_top_atom(atom: &[u8]) -> bool {
 /// since format variants exist (e.g. classic QuickTime MOV without `ftyp` box).
 /// HTML and JSON error-page sentinels are always rejected as hard errors —
 /// Apple's CDN occasionally returns them with HTTP 200.
-// Every slice of `header` below is guarded by an `n >= N` check earlier in
-// the same match arm; the `header = &buf[..n]` narrowing bounds `n <= 16`.
-#[allow(clippy::indexing_slicing)]
 fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,
@@ -638,6 +638,8 @@ fn validate_downloaded_content(
         });
     }
 
+    // `n` is bytes read from `buf` so `n <= buf.len() == 16`.
+    #[allow(clippy::indexing_slicing)]
     let header = &buf[..n];
 
     // Reject known-bad error-page sentinels regardless of extension. Apple's
@@ -657,9 +659,12 @@ fn validate_downloaded_content(
         .to_ascii_lowercase();
 
     if classify_magic(&ext, header) == Some(false) {
+        // `n.min(8)` caps the slice at `header.len()`.
+        #[allow(clippy::indexing_slicing)]
+        let preview = &header[..n.min(8)];
         tracing::warn!(
             path = %download_path.display(),
-            header = %format_args!("{:02x?}", &header[..n.min(8)]),
+            header = %format_args!("{preview:02x?}"),
             "File header does not match expected format for .{ext}, saving anyway",
         );
     }
