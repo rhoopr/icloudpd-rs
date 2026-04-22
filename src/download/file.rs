@@ -481,6 +481,8 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
             if n == 0 {
                 break;
             }
+            // `n` is bounded by buf.len() because read() returns bytes written.
+            #[allow(clippy::indexing_slicing)]
             sha256.update(&buf[..n]);
         }
         Ok(format!("{:x}", sha256.finalize()))
@@ -530,6 +532,9 @@ fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum>
 /// that e.g. a leading `\n<html>` still fails. These sentinels are never valid
 /// image/video starts — unlike the magic-byte checks further down, which are
 /// only warnings because exotic variants exist.
+// `pos` comes from `header.iter().position(...)` so `header[pos..]` is
+// in-bounds; the prefix slices below are guarded by explicit length checks.
+#[allow(clippy::indexing_slicing)]
 fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
     let trimmed = header
         .iter()
@@ -573,6 +578,9 @@ fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
 /// Photos pipeline commonly serves live-photo and HEVC videos in classic
 /// QuickTime format, whose first atom is padding (`wide`) or media data
 /// (`mdat`) rather than `ftyp`.
+// Each match arm slices `header` only after an `n >= N` length guard, where
+// `n == header.len()`. Clippy can't see the proof but every slice is bounded.
+#[allow(clippy::indexing_slicing)]
 fn classify_magic(ext: &str, header: &[u8]) -> Option<bool> {
     let n = header.len();
     match ext {
@@ -630,6 +638,8 @@ fn validate_downloaded_content(
         });
     }
 
+    // `n` is bytes read from `buf` so `n <= buf.len() == 16`.
+    #[allow(clippy::indexing_slicing)]
     let header = &buf[..n];
 
     // Reject known-bad error-page sentinels regardless of extension. Apple's
@@ -649,9 +659,12 @@ fn validate_downloaded_content(
         .to_ascii_lowercase();
 
     if classify_magic(&ext, header) == Some(false) {
+        // `n.min(8)` caps the slice at `header.len()`.
+        #[allow(clippy::indexing_slicing)]
+        let preview = &header[..n.min(8)];
         tracing::warn!(
             path = %download_path.display(),
-            header = %format_args!("{:02x?}", &header[..n.min(8)]),
+            header = %format_args!("{preview:02x?}"),
             "File header does not match expected format for .{ext}, saving anyway",
         );
     }

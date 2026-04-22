@@ -164,3 +164,7 @@ dbg_macro = "warn"
 cast_possible_truncation = "warn"
 cast_precision_loss = "warn"
 cast_sign_loss = "warn"
+
+# `[]` / `[..]` panic footguns. Refactor to `.get()` / `.first()` / pattern
+# match, or scope an `#[allow]` with a comment naming the invariant.
+indexing_slicing = "warn"
