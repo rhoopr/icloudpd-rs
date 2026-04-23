@@ -6,7 +6,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/built_with-Rust-dea584?logo=rust" alt="Built with Rust">
-  <a href="LICENSE.md"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
   <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/v/release/rhoopr/kei?color=blue&label=version" alt="Version"></a>
   <a href="https://github.com/rhoopr/kei/actions/workflows/docker.yml"><img src="https://img.shields.io/github/actions/workflow/status/rhoopr/kei/docker.yml?branch=main&label=build&logo=github" alt="Build"></a>
   <br>
@@ -82,7 +82,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [tests/README.md](tests/README.md) fo
 
 ## License
 
-MIT - see [LICENSE.md](LICENSE.md)
+MIT - see [LICENSE](LICENSE)
 
 ## Acknowledgments
 
