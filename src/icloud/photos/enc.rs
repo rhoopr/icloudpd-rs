@@ -36,13 +36,32 @@ fn decoded_bytes(entry: &Value) -> Option<Vec<u8>> {
 }
 
 /// Decode a UTF-8 `*Enc` string field (e.g. `captionEnc`, `extendedDescEnc`).
+///
+/// On the common `type: "STRING"` branch this avoids the
+/// `Vec<u8>` round-trip that `decoded_bytes()` performs.
 pub fn decode_string(fields: &Value, key: &str) -> Option<String> {
     let entry = fields.get(key)?;
     if entry.is_null() {
         return None;
     }
-    let bytes = decoded_bytes(entry)?;
-    String::from_utf8(bytes).ok()
+    let value = entry.get("value")?.as_str()?;
+    match entry
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("ENCRYPTED_BYTES")
+    {
+        "STRING" => Some(value.to_owned()),
+        "ENCRYPTED_BYTES" => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .ok()?;
+            String::from_utf8(bytes).ok()
+        }
+        other => {
+            tracing::warn!(enc_type = %other, "Unsupported Enc field type");
+            None
+        }
+    }
 }
 
 /// Decode `keywordsEnc`: base64 -> binary plist containing an array of strings.
