@@ -1771,7 +1771,7 @@ pub(super) async fn run_download_pass(
     let state_db = config.state_db.clone();
     let shutdown_token = config.shutdown_token.clone();
     let concurrency = config.concurrency;
-    let temp_suffix: Arc<str> = config.temp_suffix.into();
+    let temp_suffix: Arc<str> = config.temp_suffix;
     let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
 
