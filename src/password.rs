@@ -745,10 +745,10 @@ mod tests {
 
     // ── invoke_password_provider ────────────────────────────────────
     //
-    // Regression for CF-8: a provider whose resolve() does blocking I/O
-    // (subprocess wait, file read) must NOT run on the async worker. The
-    // canary here is that the async caller remains responsive while the
-    // sync closure is in flight, which spawn_blocking guarantees.
+    // A provider whose resolve() does blocking I/O (subprocess wait,
+    // file read) must not run on the async worker. The canary here
+    // is that the async caller stays responsive while the sync
+    // closure is in flight, which spawn_blocking guarantees.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn invoke_password_provider_yields_runtime_for_blocking_closure() {

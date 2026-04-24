@@ -613,6 +613,21 @@ impl DownloadConfig {
     }
 }
 
+/// Look up an owned `String` id in a shared `Arc<str>` interner,
+/// inserting a fresh `Arc` if absent. Returns the shared handle.
+///
+/// `Arc::from(String)` transfers the string's buffer into the `Arc<str>`
+/// without copying the bytes, so the miss path allocates no more than
+/// the baseline cost of a fresh handle.
+fn intern_id(interner: &mut FxHashSet<Arc<str>>, s: String) -> Arc<str> {
+    if let Some(existing) = interner.get(s.as_str()) {
+        return Arc::clone(existing);
+    }
+    let a: Arc<str> = Arc::from(s);
+    interner.insert(Arc::clone(&a));
+    a
+}
+
 /// Pre-loaded download state for O(1) skip decisions.
 ///
 /// Loaded once at sync start from the state database, this enables fast
@@ -705,19 +720,16 @@ impl DownloadContext {
         // `Arc<str>` across every map below (and is cheaply cloneable
         // into each via Arc::clone). This collapses the former 4-6
         // independent `String -> Box<str>` conversions per id into one.
-        let mut interner: FxHashMap<String, Arc<str>> = FxHashMap::default();
-        let intern = |interner: &mut FxHashMap<String, Arc<str>>, s: String| -> Arc<str> {
-            if let Some(existing) = interner.get(&s) {
-                return Arc::clone(existing);
-            }
-            let a: Arc<str> = Arc::from(s.as_str());
-            interner.insert(s, Arc::clone(&a));
-            a
-        };
+        //
+        // FxHashSet<Arc<str>> over FxHashMap<String, Arc<str>> so the
+        // interner doesn't keep a duplicate `String` alive for every
+        // id; `Arc::from(String)` transfers the String's buffer into
+        // the Arc without an extra copy.
+        let mut interner: FxHashSet<Arc<str>> = FxHashSet::default();
 
         let mut downloaded_ids: FxHashMap<Arc<str>, FxHashSet<Box<str>>> = FxHashMap::default();
         for (asset_id, version_size) in ids {
-            let id = intern(&mut interner, asset_id);
+            let id = intern_id(&mut interner, asset_id);
             downloaded_ids
                 .entry(id)
                 .or_default()
@@ -727,7 +739,7 @@ impl DownloadContext {
         let mut downloaded_checksums: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>> =
             FxHashMap::default();
         for ((asset_id, version_size), checksum) in checksums {
-            let id = intern(&mut interner, asset_id);
+            let id = intern_id(&mut interner, asset_id);
             downloaded_checksums
                 .entry(id)
                 .or_default()
@@ -737,7 +749,7 @@ impl DownloadContext {
         let mut downloaded_metadata_hashes: FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>> =
             FxHashMap::default();
         for ((asset_id, version_size), metadata_hash) in hashes {
-            let id = intern(&mut interner, asset_id);
+            let id = intern_id(&mut interner, asset_id);
             downloaded_metadata_hashes.entry(id).or_default().insert(
                 version_size.into_boxed_str(),
                 metadata_hash.into_boxed_str(),
@@ -749,7 +761,7 @@ impl DownloadContext {
         let mut metadata_retry_markers: FxHashMap<Arc<str>, FxHashSet<Box<str>>> =
             FxHashMap::default();
         for (id, vs) in markers {
-            let id = intern(&mut interner, id);
+            let id = intern_id(&mut interner, id);
             metadata_retry_markers
                 .entry(id)
                 .or_default()
@@ -758,18 +770,13 @@ impl DownloadContext {
 
         let known_ids: FxHashSet<Arc<str>> = known_ids
             .into_iter()
-            .map(|id| intern(&mut interner, id))
+            .map(|id| intern_id(&mut interner, id))
             .collect();
 
         let attempt_counts: FxHashMap<Arc<str>, u32> = attempts
             .into_iter()
-            .map(|(id, count)| (intern(&mut interner, id), count))
+            .map(|(id, count)| (intern_id(&mut interner, id), count))
             .collect();
-
-        // Drop the interner: every `Arc<str>` it minted is now owned by
-        // one of the maps above, so the temporary `String` keys can be
-        // freed without breaking the `Arc` reference graph.
-        drop(interner);
 
         Self {
             downloaded_ids,

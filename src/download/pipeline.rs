@@ -913,7 +913,11 @@ where
         // collapses N UPDATE statements (one per fast-skip / on-disk
         // skip) into one batched UPDATE so the producer loop doesn't
         // serialize behind an fsync-per-asset under WAL mode.
-        let mut touched_ids: FxHashSet<Arc<str>> = FxHashSet::default();
+        //
+        // Vec is sufficient: every push is inside a branch predicated on
+        // `seen_ids.insert(asset.id_arc())` returning true, so IDs are
+        // already unique at this point.
+        let mut touched_ids: Vec<Arc<str>> = Vec::new();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
         let forecast_check = |size: u64| -> bool {
@@ -1017,7 +1021,7 @@ where
                             )
                             .await;
                             if producer_state_db.is_some() {
-                                touched_ids.insert(asset.id_arc());
+                                touched_ids.push(asset.id_arc());
                             }
                             skips.by_state += 1;
                             producer_pb.inc(1);
@@ -1044,7 +1048,7 @@ where
                         )
                         .await;
                         if producer_state_db.is_some() {
-                            touched_ids.insert(asset.id_arc());
+                            touched_ids.push(asset.id_arc());
                         }
                         skips.on_disk += 1;
                         producer_pb.inc(1);

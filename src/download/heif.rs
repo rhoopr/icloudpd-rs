@@ -233,11 +233,9 @@ pub(crate) fn insert_xmp<W: Write>(input: &[u8], xmp: &[u8], mut writer: W) -> R
         }
     }
 
-    // mp4-atom's Encode requires BufMut (bytes crate); it can't stream
-    // directly into a Write. Encode each atom into a reusable Vec, then
-    // flush it to `writer`. This caps in-memory output at one atom
-    // (the biggest, typically the image mdat) rather than the whole
-    // serialized file.
+    // mp4-atom's Encode requires BufMut (bytes), not Write; a reusable
+    // per-atom Vec caps in-memory output at one atom (the image mdat
+    // is typically the largest) rather than the full serialized file.
     let mut atom_buf: Vec<u8> = Vec::new();
     for atom in &atoms {
         atom_buf.clear();

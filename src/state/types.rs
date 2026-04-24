@@ -373,13 +373,11 @@ impl AssetRecord {
     /// Wraps the passed `AssetMetadata` in a fresh `Arc`. Prod code
     /// uses [`Self::with_metadata_arc`] directly to reuse the
     /// allocation that `PhotoAsset` already owns; this convenience
-    /// is only referenced from tests.
+    /// is only referenced from tests. Hash refresh happens inside
+    /// `with_metadata_arc` when the hash is absent.
     #[cfg(test)]
     #[must_use]
-    pub fn with_metadata(self, mut metadata: AssetMetadata) -> Self {
-        if metadata.metadata_hash.is_none() {
-            metadata.refresh_hash();
-        }
+    pub fn with_metadata(self, metadata: AssetMetadata) -> Self {
         self.with_metadata_arc(Arc::new(metadata))
     }
 
