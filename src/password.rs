@@ -284,12 +284,17 @@ fn run_password_command_with_timeout(
             .spawn()
             .with_context(|| format!("Failed to execute password command: {cmd}"))?;
 
+        // Poll with 5ms → 50ms backoff; clamp each sleep to the remaining
+        // deadline so we never overshoot the timeout budget.
         let start = std::time::Instant::now();
+        let mut poll = std::time::Duration::from_millis(5);
+        let cap = std::time::Duration::from_millis(50);
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
-                    if start.elapsed() >= timeout {
+                    let remaining = timeout.saturating_sub(start.elapsed());
+                    if remaining.is_zero() {
                         let _ = child.kill();
                         let _ = child.wait();
                         anyhow::bail!(
@@ -297,7 +302,8 @@ fn run_password_command_with_timeout(
                             timeout.as_secs()
                         );
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    std::thread::sleep(poll.min(remaining));
+                    poll = (poll * 2).min(cap);
                 }
                 Err(e) => {
                     return Err(anyhow::Error::from(e)

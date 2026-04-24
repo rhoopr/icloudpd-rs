@@ -76,19 +76,17 @@ fn should_notify_shared_libraries(
     ))
 }
 
-/// One-shot probe + warning for users on the `PrimarySync` default who also
-/// have shared libraries. Fires at most once per data dir; the marker lives
-/// in the state DB's `metadata` table under [`SHARED_LIBRARY_NOTICE_KEY`].
-///
-/// The network probe and the marker write are both best-effort: failures
+/// Probe + warning for users on the `PrimarySync` default who also have
+/// shared libraries. The marker (stored in the state DB's `metadata` table
+/// under [`SHARED_LIBRARY_NOTICE_KEY`]) is only set after the notice fires,
+/// so accounts with no shared libraries re-probe on every sync and catch a
+/// later-added library. The probe and marker write are best-effort: failures
 /// degrade to `tracing::debug!` and skip without breaking the sync.
 async fn maybe_notify_shared_libraries(
     selection: &config::LibrarySelection,
     photos_service: &mut crate::icloud::photos::PhotosService,
     state_db: Option<&Arc<dyn state::StateDb>>,
 ) {
-    // Read the marker first; if we've already notified on this data dir,
-    // skip the network probe entirely.
     let already_notified = match state_db {
         Some(db) => match db.get_metadata(SHARED_LIBRARY_NOTICE_KEY).await {
             Ok(Some(_)) => true,
@@ -107,8 +105,9 @@ async fn maybe_notify_shared_libraries(
         return;
     }
 
-    // Short-circuit before the API call for users who aren't on the default.
-    // Saves one request per sync once we persist the marker on next sync.
+    // Skip the probe when the user explicitly picked a non-default library;
+    // they've already opted in or out. `should_notify_shared_libraries`
+    // repeats this check defensively.
     if !matches!(selection, config::LibrarySelection::Single(s) if s == "PrimarySync") {
         return;
     }
@@ -124,13 +123,12 @@ async fn maybe_notify_shared_libraries(
         }
     };
 
-    if let Some(msg) = should_notify_shared_libraries(selection, shared_count, already_notified) {
-        tracing::warn!("{msg}");
-    }
+    let Some(msg) = should_notify_shared_libraries(selection, shared_count, already_notified)
+    else {
+        return;
+    };
+    tracing::warn!("{msg}");
 
-    // Persist the marker regardless of whether a notice fired, so the next
-    // sync doesn't re-probe. A user who adds a shared library later can
-    // clear the marker via `kei reset state`.
     if let Some(db) = state_db {
         if let Err(e) = db.set_metadata(SHARED_LIBRARY_NOTICE_KEY, "1").await {
             tracing::debug!(

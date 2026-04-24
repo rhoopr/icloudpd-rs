@@ -172,96 +172,73 @@ pub(crate) async fn run_import_existing(
             // Get the created date in local time for path computation
             let created_local = asset.created().with_timezone(&Local);
 
-            // Check each version (we only check "original" for import since that's
-            // what the normal sync would download)
-            if let Some(version) = asset.get_version(AssetVersionSize::Original) {
-                // Map extension from UTI type, matching sync pipeline
-                let filename =
-                    download::paths::map_filename_extension(&base_filename, &version.asset_type);
-                let expected_path = download::paths::local_download_path(
-                    &directory,
-                    &folder_structure,
-                    &created_local,
-                    &filename,
-                    None, // import-existing doesn't have album context
+            let Some(version) = asset.get_version(AssetVersionSize::Original) else {
+                continue;
+            };
+            let filename =
+                download::paths::map_filename_extension(&base_filename, &version.asset_type);
+            let expected_path = download::paths::local_download_path(
+                &directory,
+                &folder_structure,
+                &created_local,
+                &filename,
+                None,
+            );
+
+            let Ok(metadata) = std::fs::metadata(&expected_path) else {
+                unmatched += 1;
+                continue;
+            };
+            if metadata.len() != version.size {
+                unmatched += 1;
+                continue;
+            }
+
+            let version_size = state::VersionSizeKey::Original;
+
+            if !args.dry_run {
+                let media_type = download::determine_media_type(version_size, &asset);
+                let record = state::AssetRecord::new_pending(
+                    asset.id().to_string(),
+                    version_size,
+                    version.checksum.to_string(),
+                    filename.clone(),
+                    asset.created(),
+                    Some(asset.added_date()),
+                    version.size,
+                    media_type,
                 );
-
-                if expected_path.exists() {
-                    // Check size matches
-                    if let Ok(metadata) = std::fs::metadata(&expected_path) {
-                        if metadata.len() == version.size {
-                            // File exists with matching size - mark as downloaded
-                            let version_size = state::VersionSizeKey::Original;
-                            let media_type = download::determine_media_type(version_size, &asset);
-                            let record = state::AssetRecord::new_pending(
-                                asset.id().to_string(),
-                                version_size,
-                                version.checksum.to_string(),
-                                filename.clone(),
-                                asset.created(),
-                                Some(asset.added_date()),
-                                version.size,
-                                media_type,
-                            );
-
-                            // Under --dry-run, skip the two DB writes entirely
-                            // but still count the match. Checksums still run
-                            // so "would have imported" matches "did import"
-                            // as closely as possible - catches hash/IO issues
-                            // the user would hit on a real run.
-                            if !args.dry_run {
-                                if let Err(e) = db.upsert_seen(&record).await {
-                                    tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to record asset");
-                                    continue;
-                                }
-                            }
-
-                            let local_checksum = match download::file::compute_sha256(
-                                &expected_path,
-                            )
-                            .await
-                            {
-                                Ok(hash) => hash,
-                                Err(e) => {
-                                    tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
-                                    continue;
-                                }
-                            };
-
-                            if !args.dry_run {
-                                if let Err(e) = db
-                                    .mark_downloaded(
-                                        asset.id(),
-                                        version_size.as_str(),
-                                        &expected_path,
-                                        &local_checksum,
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to mark as downloaded");
-                                    continue;
-                                }
-                            } else {
-                                // Touch the computed checksum so clippy doesn't
-                                // flag it as unused when --dry-run skips the
-                                // mark_downloaded call.
-                                let _ = &local_checksum;
-                            }
-
-                            matched += 1;
-                            if !args.no_progress_bar && matched.is_multiple_of(100) {
-                                println!("  Matched {matched} files so far...");
-                            }
-                        } else {
-                            unmatched += 1;
-                        }
-                    } else {
-                        unmatched += 1;
-                    }
-                } else {
-                    unmatched += 1;
+                if let Err(e) = db.upsert_seen(&record).await {
+                    tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to record asset");
+                    continue;
                 }
+
+                let local_checksum = match download::file::compute_sha256(&expected_path).await {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
+                        continue;
+                    }
+                };
+
+                if let Err(e) = db
+                    .mark_downloaded(
+                        asset.id(),
+                        version_size.as_str(),
+                        &expected_path,
+                        &local_checksum,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to mark as downloaded");
+                    continue;
+                }
+            }
+
+            matched += 1;
+            if !args.no_progress_bar && matched.is_multiple_of(100) {
+                println!("  Matched {matched} files so far...");
             }
         }
     }

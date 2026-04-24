@@ -65,7 +65,6 @@ struct SetupAnswers {
     notification_script: Option<String>,
     threads_num: Option<u16>,
     max_retries: Option<u32>,
-    retry_delay: Option<u64>,
     keep_unicode_in_filenames: bool,
     #[cfg(feature = "xmp")]
     set_exif_datetime: bool,
@@ -99,7 +98,6 @@ impl Default for SetupAnswers {
             notification_script: None,
             threads_num: None,
             max_retries: None,
-            retry_delay: None,
             keep_unicode_in_filenames: false,
             #[cfg(feature = "xmp")]
             set_exif_datetime: false,
@@ -592,12 +590,6 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     if retries != 3 {
         answers.max_retries = Some(retries);
     }
-    // Initial retry delay is now derived from `--max-retries` via a smart
-    // default, so the wizard no longer prompts for it. The deprecated
-    // `retry_delay` field on `Answers` is left untouched; if a user is
-    // migrating a config that already has `[download.retry] delay = N`,
-    // `Config::build` warns and keeps using the explicit value until
-    // v0.20.0.
 
     // Filenames
     println!();
@@ -732,12 +724,6 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         Some(n) => writeln!(out, "max_retries = {n}").ok(),
         None => writeln!(out, "# max_retries = 3").ok(),
     };
-    // `delay` is deprecated; the wizard doesn't emit it. Users migrating an
-    // older config that sets it will see a warning at startup directing them
-    // to remove it before v0.20.0. See `smart_retry_delay`.
-    if let Some(n) = answers.retry_delay {
-        writeln!(out, "# delay = {n}  # deprecated, remove before v0.20.0").ok();
-    }
 
     // [filters]
     writeln!(out).ok();
@@ -969,7 +955,6 @@ mod tests {
             notification_script: Some("/usr/local/bin/notify.sh".to_string()),
             threads_num: Some(4),
             max_retries: Some(5),
-            retry_delay: Some(10),
             keep_unicode_in_filenames: true,
             #[cfg(feature = "xmp")]
             set_exif_datetime: true,
@@ -1029,7 +1014,6 @@ mod tests {
             notification_script: Some("/bin/notify".to_string()),
             threads_num: Some(2),
             max_retries: Some(0),
-            retry_delay: Some(1),
             keep_unicode_in_filenames: true,
             #[cfg(feature = "xmp")]
             set_exif_datetime: true,
@@ -1055,10 +1039,6 @@ mod tests {
         assert_eq!(dl.set_exif_datetime, Some(true));
         let retry = dl.retry.unwrap();
         assert_eq!(retry.max_retries, Some(0));
-        // `retry_delay` is deprecated; the wizard emits it as a commented-out
-        // line so migration-in-place is visible but the key is inert. That
-        // means the parsed TOML back doesn't carry the value as an active
-        // field.
         assert_eq!(retry.delay, None);
 
         let filters = parsed.filters.unwrap();
