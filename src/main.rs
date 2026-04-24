@@ -767,6 +767,10 @@ mod tests {
         assert_eq!(result2.expose_secret(), "mypass");
     }
 
+    // `PasswordSource::Command::resolve()` shells out via `sh -c`, which
+    // is unix-only. Windows coverage lives in
+    // `password::tests::run_password_command_errors_on_non_unix`.
+    #[cfg(unix)]
     #[test]
     fn make_password_provider_with_command_source() {
         let source = password::PasswordSource::Command("echo cmd_test".to_string());

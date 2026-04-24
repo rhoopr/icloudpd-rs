@@ -435,7 +435,11 @@ mod tests {
     }
 
     // ── run_password_command ────────────────────────────────────────
+    //
+    // All happy-path tests here shell out via `sh -c`, which is unix-only.
+    // Windows coverage is `run_password_command_errors_on_non_unix` below.
 
+    #[cfg(unix)]
     #[test]
     fn run_password_command_echo() {
         assert_eq!(
@@ -446,18 +450,21 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_password_command_failure() {
         let err = run_password_command("false").unwrap_err();
         assert!(err.to_string().contains("exited with status"), "{err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_password_command_empty() {
         let err = run_password_command("printf ''").unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_password_command_strips_newline() {
         assert_eq!(
@@ -519,6 +526,8 @@ mod tests {
         );
     }
 
+    // Same reasoning as run_password_command_echo: `sh -c` is unix-only.
+    #[cfg(unix)]
     #[test]
     fn password_source_command_resolve() {
         let source = PasswordSource::Command("echo cmd_pw".to_string());
