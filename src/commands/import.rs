@@ -132,7 +132,7 @@ pub(crate) async fn run_import_existing(
     for library in &libraries {
         tracing::debug!(zone = %library.zone_name(), "Scanning library");
         let all_album = library.all();
-        let stream = all_album.photo_stream(recent_count, None, 1);
+        let (stream, panic_rx) = all_album.photo_stream(recent_count, None, 1);
         tokio::pin!(stream);
 
         while let Some(result) = stream.next().await {
@@ -240,6 +240,17 @@ pub(crate) async fn run_import_existing(
             if !args.no_progress_bar && matched.is_multiple_of(100) {
                 println!("  Matched {matched} files so far...");
             }
+        }
+
+        // Enumeration is complete — but if a fetcher panicked the stream
+        // just closed short, leaving `total` understated. Bail so the
+        // scan is obviously aborted (not a silently partial report).
+        if panic_rx.await.unwrap_or(false) {
+            anyhow::bail!(
+                "import scan aborted for library '{}': a fetcher task panicked; \
+                 results are incomplete, see earlier error log",
+                library.zone_name()
+            );
         }
     }
 
