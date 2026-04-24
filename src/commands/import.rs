@@ -35,12 +35,27 @@ pub(crate) async fn run_import_existing(
     // Resolve directory and path settings from CLI > TOML > default, matching
     // the sync command's resolution so import-existing looks for files at the
     // same paths sync would have created.
-    let directory_str = args
-        .directory
+    anyhow::ensure!(
+        !(args.download_dir.is_some() && args.directory.is_some()),
+        "both `--download-dir` and `--directory` are set; `--directory` is \
+         deprecated and will be removed in v0.20.0 — pick one"
+    );
+    let directory_cli = if let Some(d) = args.download_dir {
+        Some(d)
+    } else if let Some(d) = args.directory {
+        tracing::warn!(
+            "`--directory` / `KEI_DIRECTORY` is deprecated and will be removed in v0.20.0, \
+             use `--download-dir` / `KEI_DOWNLOAD_DIR` instead"
+        );
+        Some(d)
+    } else {
+        None
+    };
+    let directory_str = directory_cli
         .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
         .unwrap_or_default();
     if directory_str.is_empty() {
-        anyhow::bail!("--directory is required for import-existing");
+        anyhow::bail!("--download-dir is required for import-existing");
     }
     let directory = config::expand_tilde(&directory_str);
     let folder_structure = args
@@ -51,6 +66,20 @@ pub(crate) async fn run_import_existing(
         .keep_unicode_in_filenames
         .or_else(|| toml_photos.and_then(|p| p.keep_unicode_in_filenames))
         .unwrap_or(false);
+
+    // import-existing walks files on disk, not iCloud creation dates, so the
+    // `--recent Nd` form has no meaning here. Count form only.
+    let recent_count: Option<u32> = match args.recent {
+        None => None,
+        Some(crate::cli::RecentLimit::Count(n)) => Some(n),
+        Some(crate::cli::RecentLimit::Days(n)) => {
+            anyhow::bail!(
+                "`--recent {n}d` isn't supported for import-existing (which scans \
+                 existing files rather than filtering by iCloud date). Use a plain \
+                 count like `--recent 1000` instead."
+            );
+        }
+    };
 
     if !directory.exists() {
         anyhow::bail!("Directory does not exist: {}", directory.display());
@@ -103,7 +132,7 @@ pub(crate) async fn run_import_existing(
     for library in &libraries {
         tracing::debug!(zone = %library.zone_name(), "Scanning library");
         let all_album = library.all();
-        let stream = all_album.photo_stream(args.recent, None, 1);
+        let stream = all_album.photo_stream(recent_count, None, 1);
         tokio::pin!(stream);
 
         while let Some(result) = stream.next().await {
@@ -143,88 +172,83 @@ pub(crate) async fn run_import_existing(
             // Get the created date in local time for path computation
             let created_local = asset.created().with_timezone(&Local);
 
-            // Check each version (we only check "original" for import since that's
-            // what the normal sync would download)
-            if let Some(version) = asset.get_version(AssetVersionSize::Original) {
-                // Map extension from UTI type, matching sync pipeline
-                let filename =
-                    download::paths::map_filename_extension(&base_filename, &version.asset_type);
-                let expected_path = download::paths::local_download_path(
-                    &directory,
-                    &folder_structure,
-                    &created_local,
-                    &filename,
-                    None, // import-existing doesn't have album context
+            let Some(version) = asset.get_version(AssetVersionSize::Original) else {
+                continue;
+            };
+            let filename =
+                download::paths::map_filename_extension(&base_filename, &version.asset_type);
+            let expected_path = download::paths::local_download_path(
+                &directory,
+                &folder_structure,
+                &created_local,
+                &filename,
+                None,
+            );
+
+            let Ok(metadata) = std::fs::metadata(&expected_path) else {
+                unmatched += 1;
+                continue;
+            };
+            if metadata.len() != version.size {
+                unmatched += 1;
+                continue;
+            }
+
+            let version_size = state::VersionSizeKey::Original;
+
+            if !args.dry_run {
+                let media_type = download::determine_media_type(version_size, &asset);
+                let record = state::AssetRecord::new_pending(
+                    asset.id().to_string(),
+                    version_size,
+                    version.checksum.to_string(),
+                    filename.clone(),
+                    asset.created(),
+                    Some(asset.added_date()),
+                    version.size,
+                    media_type,
                 );
-
-                if expected_path.exists() {
-                    // Check size matches
-                    if let Ok(metadata) = std::fs::metadata(&expected_path) {
-                        if metadata.len() == version.size {
-                            // File exists with matching size - mark as downloaded
-                            let version_size = state::VersionSizeKey::Original;
-                            let media_type = download::determine_media_type(version_size, &asset);
-                            let record = state::AssetRecord::new_pending(
-                                asset.id().to_string(),
-                                version_size,
-                                version.checksum.to_string(),
-                                filename.clone(),
-                                asset.created(),
-                                Some(asset.added_date()),
-                                version.size,
-                                media_type,
-                            );
-
-                            if let Err(e) = db.upsert_seen(&record).await {
-                                tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to record asset");
-                                continue;
-                            }
-
-                            let local_checksum = match download::file::compute_sha256(
-                                &expected_path,
-                            )
-                            .await
-                            {
-                                Ok(hash) => hash,
-                                Err(e) => {
-                                    tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
-                                    continue;
-                                }
-                            };
-
-                            if let Err(e) = db
-                                .mark_downloaded(
-                                    asset.id(),
-                                    version_size.as_str(),
-                                    &expected_path,
-                                    &local_checksum,
-                                    None,
-                                )
-                                .await
-                            {
-                                tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to mark as downloaded");
-                                continue;
-                            }
-
-                            matched += 1;
-                            if !args.no_progress_bar && matched.is_multiple_of(100) {
-                                println!("  Matched {matched} files so far...");
-                            }
-                        } else {
-                            unmatched += 1;
-                        }
-                    } else {
-                        unmatched += 1;
-                    }
-                } else {
-                    unmatched += 1;
+                if let Err(e) = db.upsert_seen(&record).await {
+                    tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to record asset");
+                    continue;
                 }
+
+                let local_checksum = match download::file::compute_sha256(&expected_path).await {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
+                        continue;
+                    }
+                };
+
+                if let Err(e) = db
+                    .mark_downloaded(
+                        asset.id(),
+                        version_size.as_str(),
+                        &expected_path,
+                        &local_checksum,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(asset_id = %asset.id(), error = %e, "Failed to mark as downloaded");
+                    continue;
+                }
+            }
+
+            matched += 1;
+            if !args.no_progress_bar && matched.is_multiple_of(100) {
+                println!("  Matched {matched} files so far...");
             }
         }
     }
 
     println!();
-    println!("Import complete:");
+    if args.dry_run {
+        println!("Import complete (DRY RUN - no changes written to state DB):");
+    } else {
+        println!("Import complete:");
+    }
     println!("  Total assets scanned: {total}");
     println!("  Files matched:        {matched}");
     println!("  Unmatched versions:   {unmatched}");

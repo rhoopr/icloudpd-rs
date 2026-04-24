@@ -65,7 +65,6 @@ struct SetupAnswers {
     notification_script: Option<String>,
     threads_num: Option<u16>,
     max_retries: Option<u32>,
-    retry_delay: Option<u64>,
     keep_unicode_in_filenames: bool,
     #[cfg(feature = "xmp")]
     set_exif_datetime: bool,
@@ -99,7 +98,6 @@ impl Default for SetupAnswers {
             notification_script: None,
             threads_num: None,
             max_retries: None,
-            retry_delay: None,
             keep_unicode_in_filenames: false,
             #[cfg(feature = "xmp")]
             set_exif_datetime: false,
@@ -593,14 +591,6 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         answers.max_retries = Some(retries);
     }
 
-    let delay: u64 = Input::new()
-        .with_prompt("Retry delay in seconds")
-        .default(5u64)
-        .interact_text()?;
-    if delay != 5 {
-        answers.retry_delay = Some(delay);
-    }
-
     // Filenames
     println!();
     answers.keep_unicode_in_filenames = Confirm::new()
@@ -710,8 +700,8 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         None => writeln!(out, "# folder_structure = \"%Y/%m/%d\"").ok(),
     };
     match answers.threads_num {
-        Some(n) => writeln!(out, "threads_num = {n}").ok(),
-        None => writeln!(out, "# threads_num = 10").ok(),
+        Some(n) => writeln!(out, "threads = {n}").ok(),
+        None => writeln!(out, "# threads = 10").ok(),
     };
     #[cfg(feature = "xmp")]
     {
@@ -733,10 +723,6 @@ fn generate_toml(answers: &SetupAnswers) -> String {
     match answers.max_retries {
         Some(n) => writeln!(out, "max_retries = {n}").ok(),
         None => writeln!(out, "# max_retries = 3").ok(),
-    };
-    match answers.retry_delay {
-        Some(n) => writeln!(out, "delay = {n}").ok(),
-        None => writeln!(out, "# delay = 5").ok(),
     };
 
     // [filters]
@@ -914,7 +900,7 @@ mod tests {
         assert!(!toml.contains("secret"));
         // Defaults should be commented out
         assert!(toml.contains("# size = \"original\""));
-        assert!(toml.contains("# threads_num = 10"));
+        assert!(toml.contains("# threads = 10"));
         assert!(toml.contains("# log_level = \"warn\""));
     }
 
@@ -969,7 +955,6 @@ mod tests {
             notification_script: Some("/usr/local/bin/notify.sh".to_string()),
             threads_num: Some(4),
             max_retries: Some(5),
-            retry_delay: Some(10),
             keep_unicode_in_filenames: true,
             #[cfg(feature = "xmp")]
             set_exif_datetime: true,
@@ -990,7 +975,7 @@ mod tests {
         assert!(toml_str.contains("recent = 100"));
         assert!(toml_str.contains("interval = 1800"));
         assert!(toml_str.contains("notify_systemd = true"));
-        assert!(toml_str.contains("threads_num = 4"));
+        assert!(toml_str.contains("threads = 4"));
         assert!(toml_str.contains("file_match_policy = \"name-id7\""));
         assert!(toml_str.contains("log_level = \"debug\""));
         #[cfg(feature = "xmp")]
@@ -1029,7 +1014,6 @@ mod tests {
             notification_script: Some("/bin/notify".to_string()),
             threads_num: Some(2),
             max_retries: Some(0),
-            retry_delay: Some(1),
             keep_unicode_in_filenames: true,
             #[cfg(feature = "xmp")]
             set_exif_datetime: true,
@@ -1049,18 +1033,19 @@ mod tests {
         let dl = parsed.download.unwrap();
         assert_eq!(dl.directory.as_deref(), Some("/data/photos"));
         assert_eq!(dl.folder_structure.as_deref(), Some("%Y-%m"));
-        assert_eq!(dl.threads_num, Some(2));
+        assert_eq!(dl.threads, Some(2));
+        assert_eq!(dl.threads_num, None);
         #[cfg(feature = "xmp")]
         assert_eq!(dl.set_exif_datetime, Some(true));
         let retry = dl.retry.unwrap();
         assert_eq!(retry.max_retries, Some(0));
-        assert_eq!(retry.delay, Some(1));
+        assert_eq!(retry.delay, None);
 
         let filters = parsed.filters.unwrap();
         assert_eq!(filters.albums.as_deref(), Some(&["A".to_string()][..]));
         assert_eq!(filters.skip_videos, Some(true));
         assert_eq!(filters.skip_live_photos, Some(true));
-        assert_eq!(filters.recent, Some(50));
+        assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(50)));
         assert_eq!(filters.skip_created_before.as_deref(), Some("30d"));
         assert_eq!(filters.skip_created_after.as_deref(), Some("2025-06-01"));
 
