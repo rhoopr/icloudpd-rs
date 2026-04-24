@@ -1,6 +1,7 @@
 //! Types for the state tracking module.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
@@ -328,7 +329,11 @@ pub struct AssetRecord {
     pub status: AssetStatus,
 
     /// Provider-agnostic metadata captured from the source (v5+).
-    pub metadata: AssetMetadata,
+    ///
+    /// Behind `Arc` so `PhotoAsset` → `AssetRecord` (the producer hot
+    /// loop) shares the same allocation instead of deep-cloning every
+    /// `Option<String>` field per asset.
+    pub metadata: Arc<AssetMetadata>,
 }
 
 impl AssetRecord {
@@ -359,17 +364,40 @@ impl AssetRecord {
             version_size,
             media_type,
             status: AssetStatus::Pending,
-            metadata: AssetMetadata::default(),
+            metadata: Arc::new(AssetMetadata::default()),
         }
     }
 
     /// Attach metadata, populating `metadata_hash` if unset.
+    ///
+    /// Wraps the passed `AssetMetadata` in a fresh `Arc`. Prod code
+    /// uses [`Self::with_metadata_arc`] directly to reuse the
+    /// allocation that `PhotoAsset` already owns; this convenience
+    /// is only referenced from tests.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_metadata(mut self, mut metadata: AssetMetadata) -> Self {
+    pub fn with_metadata(self, mut metadata: AssetMetadata) -> Self {
         if metadata.metadata_hash.is_none() {
             metadata.refresh_hash();
         }
-        self.metadata = metadata;
+        self.with_metadata_arc(Arc::new(metadata))
+    }
+
+    /// Attach shared metadata, populating `metadata_hash` if unset.
+    ///
+    /// If the passed `Arc` has its hash already populated (the normal
+    /// case — `metadata::extract()` refreshes before returning), this
+    /// is a refcount bump. Missing hash triggers a single deep clone
+    /// via `Arc::unwrap_or_clone` + `refresh_hash`.
+    #[must_use]
+    pub fn with_metadata_arc(mut self, metadata: Arc<AssetMetadata>) -> Self {
+        self.metadata = if metadata.metadata_hash.is_some() {
+            metadata
+        } else {
+            let mut m = Arc::unwrap_or_clone(metadata);
+            m.refresh_hash();
+            Arc::new(m)
+        };
         self
     }
 }

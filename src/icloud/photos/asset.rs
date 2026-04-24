@@ -50,9 +50,10 @@ pub struct PhotoAsset {
     // Heap types first
     record_name: Arc<str>,
     filename: Option<Box<str>>,
-    // Metadata boxed to keep PhotoAsset compact when metadata is large
-    // (keywords, provider_data JSON can be several hundred bytes).
-    asset_metadata: Box<AssetMetadata>,
+    // Metadata behind Arc so downstream consumers (AssetRecord, the
+    // pipeline's metadata-hash comparisons) can share the same
+    // allocation via refcount bumps. Immutable after construction.
+    asset_metadata: Arc<AssetMetadata>,
     // SmallVec with inline storage
     versions: VersionsMap,
     // f64 primitives
@@ -283,7 +284,7 @@ impl PhotoAsset {
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
         let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
-        let asset_metadata = Box::new(metadata::extract(&master_fields, &asset_fields));
+        let asset_metadata = Arc::new(metadata::extract(&master_fields, &asset_fields));
         Self {
             record_name,
             filename,
@@ -315,7 +316,7 @@ impl PhotoAsset {
             &asset.fields,
             &master.record_name,
         );
-        let asset_metadata = Box::new(metadata::extract(&master.fields, &asset.fields));
+        let asset_metadata = Arc::new(metadata::extract(&master.fields, &asset.fields));
         Self {
             record_name: Arc::from(master.record_name),
             filename,
@@ -330,6 +331,14 @@ impl PhotoAsset {
     /// Provider-agnostic metadata extracted at construction time.
     pub fn metadata(&self) -> &AssetMetadata {
         &self.asset_metadata
+    }
+
+    /// Shared handle on the metadata. Consumers that persist the
+    /// metadata (state DB writes via [`AssetRecord::with_metadata_arc`])
+    /// clone the `Arc` instead of deep-cloning every owned string.
+    #[must_use]
+    pub fn metadata_arc(&self) -> Arc<AssetMetadata> {
+        Arc::clone(&self.asset_metadata)
     }
 
     pub fn id(&self) -> &str {

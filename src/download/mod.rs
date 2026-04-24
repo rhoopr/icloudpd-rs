@@ -1538,7 +1538,7 @@ async fn download_photos_incremental(
                     task.size,
                     media_type,
                 )
-                .with_metadata(asset.metadata().clone());
+                .with_metadata_arc(asset.metadata_arc());
                 if let Err(e) = db.upsert_seen(&record).await {
                     tracing::warn!(
                         asset_id = %task.asset_id,

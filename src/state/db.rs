@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -1485,7 +1485,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
             .unwrap_or(VersionSizeKey::Original),
         media_type: MediaType::from_str(&media_type_str).unwrap_or(MediaType::Photo),
         status: AssetStatus::from_str(&status_str).unwrap_or(AssetStatus::Pending),
-        metadata,
+        metadata: Arc::new(metadata),
     })
 }
 
@@ -3694,7 +3694,7 @@ mod tests {
             10,
             MediaType::Photo,
         )
-        .with_metadata(photo.metadata().clone());
+        .with_metadata_arc(photo.metadata_arc());
         db.upsert_seen(&record).await.unwrap();
 
         let pending = db.get_pending().await.unwrap();
