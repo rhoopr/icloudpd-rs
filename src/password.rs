@@ -8,10 +8,15 @@
 //! command, credential store, interactive prompt) and evaluates lazily — the
 //! password is only fetched at auth time and released immediately after.
 
-use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+// Permissive-mode warnings are unix-only (Windows has no POSIX mode bits).
+// The dedup cache (HashSet / Mutex / OnceLock) is scoped to that path.
+#[cfg(unix)]
+use std::collections::HashSet;
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Context;
 pub use secrecy::{ExposeSecret, SecretString};
