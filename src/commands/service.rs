@@ -99,13 +99,29 @@ pub(crate) async fn init_photos_service(
     }
 
     let session_box: Box<dyn icloud::photos::PhotosSession> = Box::new(shared_session.clone());
-    let service = icloud::photos::PhotosService::new(
+    let service = match icloud::photos::PhotosService::new(
         ckdatabasews_url.clone(),
         session_box,
         params,
         api_retry_config,
     )
-    .await?;
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            // The pool-reset retry also failed. Surface it before bubbling
+            // so watch-mode operators can correlate reauth cycles with
+            // sustained CloudKit partition issues.
+            tracing::warn!(
+                url = %ckdatabasews_url,
+                attempt = 2,
+                error = %e,
+                "init_photos_service retry after pool reset failed; \
+                 sync_loop will fall through to full SRP re-auth"
+            );
+            return Err(e.into());
+        }
+    };
     Ok((shared_session, service))
 }
 

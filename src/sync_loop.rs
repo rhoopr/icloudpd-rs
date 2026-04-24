@@ -489,7 +489,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             tracing::debug!(count, "Reset failed assets to pending");
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to reset failed assets: {e}");
+                            tracing::warn!(error = %e, "Failed to reset failed assets");
                         }
                     }
                 }
