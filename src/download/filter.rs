@@ -463,6 +463,7 @@ enum CollisionStrategy {
 /// Shared context for `resolve_download_path` -- groups the mutable/config
 /// references that every call needs so the function stays under clippy's
 /// argument limit.
+#[derive(Debug)]
 struct ResolveContext<'a> {
     config: &'a DownloadConfig,
     created_local: &'a DateTime<Local>,

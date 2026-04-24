@@ -450,6 +450,7 @@ fn read_dir_entries(dir: &Path) -> FxHashMap<String, u64> {
 /// Async callers should pre-populate directories with `ensure_dir_async()` before
 /// entering tight sync loops (e.g. `filter_asset_to_tasks`), so that the sync
 /// lookup methods (`exists`, `file_size`, `find_ampm_variant`) never hit disk.
+#[derive(Debug)]
 pub(crate) struct DirCache {
     dirs: FxHashMap<PathBuf, FxHashMap<String, u64>>,
 }

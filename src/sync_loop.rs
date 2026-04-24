@@ -990,6 +990,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 }
 
 /// Outcome of a single sync cycle across all libraries.
+#[derive(Debug)]
 struct CycleResult {
     failed_count: usize,
     session_expired: bool,
@@ -1160,7 +1161,7 @@ async fn run_cycle(
             Arc::new(rustc_hash::FxHashSet::default()),
             asset_groupings,
         );
-        let download_client = shared_session.read().await.download_client();
+        let download_client = shared_session.read().await.download_client().clone();
         let sync_result = download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,

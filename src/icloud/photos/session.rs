@@ -111,7 +111,7 @@ impl PhotosSession for crate::auth::SharedSession {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
-        let client = self.read().await.http_client();
+        let client = self.read().await.http_client().clone();
         PhotosSession::post(&client, url, body, headers).await
     }
 

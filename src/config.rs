@@ -440,6 +440,7 @@ fn resolve_flag(cli_flag: Option<bool>, toml_val: Option<bool>) -> bool {
 ///
 /// Bundles the fields that moved from per-command `AuthArgs` to
 /// global options on `Cli`.
+#[derive(Debug)]
 pub(crate) struct GlobalArgs {
     pub username: Option<String>,
     pub domain: Option<Domain>,

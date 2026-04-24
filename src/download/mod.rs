@@ -192,6 +192,7 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
 
 /// Fields shared between [`hash_download_config`] and [`compute_config_hash`]
 /// that affect path resolution and asset eligibility.
+#[derive(Debug)]
 struct SharedHashFields<'a> {
     directory: &'a std::path::Path,
     folder_structure: &'a str,

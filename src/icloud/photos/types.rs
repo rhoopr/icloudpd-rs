@@ -5,7 +5,7 @@ pub use crate::types::{AssetItemType, AssetVersionSize, ChangeReason};
 /// Uses `Box<str>` instead of `String` for url, `asset_type`, and checksum
 /// to save 8 bytes per field (16 vs 24 bytes) since these strings are
 /// never mutated after construction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetVersion {
     pub size: u64,
     pub url: Box<str>,
