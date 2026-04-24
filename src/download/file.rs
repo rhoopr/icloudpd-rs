@@ -472,7 +472,9 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
         let mut file = std::fs::File::open(&path)
             .with_context(|| format!("opening {} for SHA-256", path.display()))?;
         let mut sha256 = Sha256::new();
-        let mut buf = [0u8; 8192];
+        // 64 KiB reduces read() syscalls ~8x vs 8 KiB on multi-GB videos
+        // without meaningful RSS impact on the blocking pool.
+        let mut buf = [0u8; 65536];
         loop {
             use std::io::Read;
             let n = file
