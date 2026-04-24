@@ -208,7 +208,17 @@ pub trait StateDb: Send + Sync {
     /// terminal status (`downloaded` or `failed`). Touching a `pending` row
     /// will cause `promote_pending_to_failed` to promote it to `failed` at
     /// sync end - see `upsert_seen` docs and issue #211.
-    async fn touch_last_seen(&self, asset_id: &str) -> Result<(), StateError>;
+    /// Bump `last_seen_at` on every row in `asset_ids` to the same
+    /// timestamp inside a single transaction. Collapses what would
+    /// otherwise be N individual UPDATEs (and N fsyncs under WAL
+    /// mode) into one — hot on mostly-synced libraries where the
+    /// producer skips thousands of assets per cycle.
+    ///
+    /// The pending-row caveat still applies: the caller must ensure
+    /// every ID already has a terminal status (`downloaded` or
+    /// `failed`) before bumping, otherwise `promote_pending_to_failed`
+    /// will promote it at sync end — see issue #211.
+    async fn touch_last_seen_many(&self, asset_ids: &[&str]) -> Result<(), StateError>;
 
     /// Sample up to `limit` local paths of downloaded assets.
     /// Used to spot-check that "downloaded" files still exist on disk.
@@ -1124,16 +1134,26 @@ impl StateDb for SqliteStateDb {
         Ok(deleted as u64)
     }
 
-    async fn touch_last_seen(&self, asset_id: &str) -> Result<(), StateError> {
-        let conn = self.acquire_lock("touch_last_seen")?;
-
+    async fn touch_last_seen_many(&self, asset_ids: &[&str]) -> Result<(), StateError> {
+        if asset_ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.acquire_lock("touch_last_seen_many")?;
         let now = Utc::now().timestamp();
-        conn.execute(
-            "UPDATE assets SET last_seen_at = ?1 WHERE id = ?2",
-            rusqlite::params![now, asset_id],
-        )
-        .map_err(|e| StateError::query("touch_last_seen", e))?;
-
+        let tx = conn
+            .transaction()
+            .map_err(|e| StateError::query("touch_last_seen_many::begin", e))?;
+        {
+            let mut stmt = tx
+                .prepare_cached("UPDATE assets SET last_seen_at = ?1 WHERE id = ?2")
+                .map_err(|e| StateError::query("touch_last_seen_many::prepare", e))?;
+            for id in asset_ids {
+                stmt.execute(rusqlite::params![now, id])
+                    .map_err(|e| StateError::query("touch_last_seen_many::execute", e))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| StateError::query("touch_last_seen_many::commit", e))?;
         Ok(())
     }
 
@@ -2337,7 +2357,7 @@ mod tests {
         };
 
         // Touch last_seen_at — should set it to now(), which is > backdated value
-        db.touch_last_seen("TOUCH_1").await.unwrap();
+        db.touch_last_seen_many(&["TOUCH_1"]).await.unwrap();
 
         let updated_ts: i64 = {
             let conn = db.conn.lock().unwrap();
@@ -2352,6 +2372,51 @@ mod tests {
             updated_ts > original_ts,
             "last_seen_at should be updated: {updated_ts} > {original_ts}"
         );
+    }
+
+    // touch_last_seen_many must bump every id in one transaction and
+    // be a no-op for an empty slice (the producer feeds an empty set
+    // on libraries that don't skip anything).
+    #[tokio::test]
+    async fn touch_last_seen_many_bumps_every_id_in_one_batch() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for i in 0..5 {
+            let id = format!("BATCH_{i}");
+            let ck = format!("ck{i}");
+            let fname = format!("f{i}.jpg");
+            let rec = TestAssetRecord::new(&id)
+                .checksum(&ck)
+                .filename(&fname)
+                .size(10)
+                .build();
+            db.upsert_seen(&rec).await.unwrap();
+            db.backdate_last_seen(&id, 100);
+        }
+
+        let ids: Vec<&str> = (0..5).map(|_| "").collect();
+        // Build the slice after constructing owned strings to keep them alive.
+        let id_strings: Vec<String> = (0..5).map(|i| format!("BATCH_{i}")).collect();
+        let id_refs: Vec<&str> = id_strings.iter().map(String::as_str).collect();
+        // (ids above is just to document the slice shape.)
+        let _ = ids;
+
+        db.touch_last_seen_many(&id_refs).await.unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT last_seen_at FROM assets WHERE id = ?1")
+            .unwrap();
+        for id in &id_refs {
+            let ts: i64 = stmt.query_row([*id], |r| r.get(0)).unwrap();
+            assert!(ts > 100, "row {id} must be bumped past the backdated 100");
+        }
+    }
+
+    #[tokio::test]
+    async fn touch_last_seen_many_empty_slice_is_noop() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        // No rows; no assertion about state needed — just verify Ok(()).
+        db.touch_last_seen_many(&[]).await.unwrap();
     }
 
     #[tokio::test]
@@ -3168,7 +3233,9 @@ mod tests {
         let sync_started_at = chrono::Utc::now().timestamp();
 
         // Caller violates the contract: bumps last_seen_at on a pending row.
-        db.touch_last_seen("PENDING_CARRYOVER").await.unwrap();
+        db.touch_last_seen_many(&["PENDING_CARRYOVER"])
+            .await
+            .unwrap();
 
         let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
         assert_eq!(

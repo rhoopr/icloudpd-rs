@@ -908,6 +908,12 @@ where
         let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
         let mut seen_ids: FxHashSet<Arc<str>> = FxHashSet::default();
+        // Skipped-asset IDs accumulated across the producer run and
+        // flushed to the DB in a single transaction at the end. This
+        // collapses N UPDATE statements (one per fast-skip / on-disk
+        // skip) into one batched UPDATE so the producer loop doesn't
+        // serialize behind an fsync-per-asset under WAL mode.
+        let mut touched_ids: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
         let forecast_check = |size: u64| -> bool {
@@ -1010,10 +1016,8 @@ where
                                 &download_ctx,
                             )
                             .await;
-                            if let Some(db) = &producer_state_db {
-                                if let Err(e) = db.touch_last_seen(asset.id()).await {
-                                    tracing::debug!(error = %e, asset_id = asset.id(), "Failed to update last-seen timestamp");
-                                }
+                            if producer_state_db.is_some() {
+                                touched_ids.insert(asset.id_arc());
                             }
                             skips.by_state += 1;
                             producer_pb.inc(1);
@@ -1039,10 +1043,8 @@ where
                             &download_ctx,
                         )
                         .await;
-                        if let Some(db) = &producer_state_db {
-                            if let Err(e) = db.touch_last_seen(asset.id()).await {
-                                tracing::debug!(error = %e, asset_id = asset.id(), "Failed to touch last_seen for on-disk asset");
-                            }
+                        if producer_state_db.is_some() {
+                            touched_ids.insert(asset.id_arc());
                         }
                         skips.on_disk += 1;
                         producer_pb.inc(1);
@@ -1278,6 +1280,29 @@ where
                     "Asset accounting mismatch -- some assets may be untracked"
                 );
             });
+        }
+
+        // Flush the accumulated last_seen_at updates in one transaction.
+        // Running after the producer loop exits means we skip the fsync-
+        // per-asset cost that dominated sync-start on mostly-synced
+        // libraries. last_seen_at is observational and only affects the
+        // stuck-pipeline promotion window via sync_started_at, so a
+        // deferred flush is safe for terminal-status rows (which is all
+        // touched_ids contains).
+        if let Some(db) = &producer_state_db {
+            if !touched_ids.is_empty() {
+                let touched_count = touched_ids.len();
+                let ids: Vec<&str> = touched_ids.iter().map(AsRef::as_ref).collect();
+                if let Err(e) = db.touch_last_seen_many(&ids).await {
+                    producer_pb.suspend(|| {
+                        tracing::warn!(
+                            error = %e,
+                            count = touched_count,
+                            "Failed to batch-update last_seen_at for skipped assets"
+                        );
+                    });
+                }
+            }
         }
 
         skips
@@ -3079,8 +3104,10 @@ mod tests {
         async fn delete_metadata_by_prefix(&self, _: &str) -> Result<u64, StateError> {
             unimplemented!()
         }
-        async fn touch_last_seen(&self, _: &str) -> Result<(), StateError> {
-            unimplemented!()
+        async fn touch_last_seen_many(&self, _: &[&str]) -> Result<(), StateError> {
+            // Unused in these tests; default no-op so they don't bump the
+            // pipeline's batch-flush path.
+            Ok(())
         }
         async fn sample_downloaded_paths(
             &self,
