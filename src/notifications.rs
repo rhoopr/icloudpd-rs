@@ -159,12 +159,29 @@ impl Notifier {
 
         tracing::debug!(event = event_str, "Firing notification script");
 
-        let concurrency = Arc::clone(&self.concurrency);
-        tokio::spawn(async move {
-            let Ok(permit) = concurrency.acquire_owned().await else {
-                // Semaphore closed during shutdown — safe to skip.
+        // Drop on saturation rather than queue: spawning a task that then
+        // parks on `acquire_owned().await` is a softer version of the
+        // unbounded-spawn behavior the semaphore exists to prevent. With
+        // `try_acquire_owned` we also keep the saturation path observable
+        // via the `notifier saturated` warning.
+        let permit = match Arc::clone(&self.concurrency).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                tracing::warn!(
+                    event = event_str,
+                    in_flight = NOTIFIER_MAX_INFLIGHT,
+                    "Notifier saturated, dropping event"
+                );
                 return;
-            };
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                // Only reachable if the underlying semaphore is closed,
+                // which kei never does. Treat as a process-exit no-op.
+                return;
+            }
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
             match run_script(&script, event_str, &message, &username, data.as_ref()).await {
                 Ok(status) if status.success() => {
                     tracing::debug!(event = event_str, "Notification script completed");
@@ -184,7 +201,6 @@ impl Notifier {
                     );
                 }
             }
-            drop(permit);
         });
     }
 }
@@ -485,6 +501,80 @@ mod tests {
         assert!(
             max_concurrent <= NOTIFIER_MAX_INFLIGHT,
             "semaphore did not cap concurrent scripts: max observed {max_concurrent}, cap is {NOTIFIER_MAX_INFLIGHT}",
+        );
+    }
+
+    /// When more than `NOTIFIER_MAX_INFLIGHT` events are fired while every
+    /// permit is held, the surplus events must be **dropped**, not queued.
+    /// With the old `acquire_owned().await` we'd spawn a task per event and
+    /// the surplus would run as permits became free; with `try_acquire_owned`
+    /// the surplus saturates and we drop on the floor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn notifier_drops_events_when_saturated() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter_dir = dir.path().join("inflight");
+        std::fs::create_dir_all(&counter_dir).unwrap();
+        let release = dir.path().join("release");
+        let invocations = dir.path().join("invocations");
+
+        // Each invocation appends one byte to `invocations` (single-byte
+        // append is atomic on Linux), creates a per-pid marker, blocks on
+        // `release`, then removes the marker.
+        let body = format!(
+            "#!/bin/sh\nprintf x >> \"{}\"\nmarker=\"{}/$$\"\n: > \"$marker\"\n\
+             while [ ! -f \"{}\" ]; do sleep 0.02; done\nrm -f \"$marker\"\n",
+            invocations.display(),
+            counter_dir.display(),
+            release.display(),
+        );
+        let script_path = write_test_script(dir.path(), "saturate.sh", body.as_bytes());
+
+        let notifier = Notifier::new(Some(script_path));
+        let n_events = NOTIFIER_MAX_INFLIGHT * 4;
+        for _ in 0..n_events {
+            notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
+        }
+
+        // Wait until permits are saturated. With `try_acquire_owned`,
+        // dropped events return immediately, so we should reach the cap
+        // quickly and stay there.
+        let count_markers = || {
+            std::fs::read_dir(&counter_dir)
+                .map(|it| it.flatten().count())
+                .unwrap_or(0)
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if count_markers() >= NOTIFIER_MAX_INFLIGHT {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            count_markers(),
+            NOTIFIER_MAX_INFLIGHT,
+            "expected exactly {NOTIFIER_MAX_INFLIGHT} scripts to be holding permits"
+        );
+
+        // Release the barrier and wait for everything in flight to drain.
+        std::fs::write(&release, b"").unwrap();
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < cleanup_deadline {
+            if count_markers() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(count_markers(), 0, "scripts did not drain after release");
+
+        // Even after permits become available, the dropped events must
+        // not retroactively run. Total invocations must equal the cap.
+        let total_invocations = std::fs::read(&invocations).map(|b| b.len()).unwrap_or(0);
+        assert_eq!(
+            total_invocations, NOTIFIER_MAX_INFLIGHT,
+            "expected exactly {NOTIFIER_MAX_INFLIGHT} script invocations \
+             (cap), got {total_invocations} -- saturation drop regressed"
         );
     }
 
