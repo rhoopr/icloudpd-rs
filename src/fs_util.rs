@@ -7,6 +7,11 @@ use std::path::Path;
 /// session-file deletion, EXDEV unwind) where a previous `let _ =` was
 /// silently dropping errors that violated the "no silent failures"
 /// invariant.
+///
+/// Gated on the `xmp` feature because the only sync caller is
+/// `download/metadata.rs::TmpGuard::drop`, which is itself xmp-gated.
+/// The async sibling `log_remove_async` is unconditionally compiled.
+#[cfg(feature = "xmp")]
 pub(crate) fn log_remove(path: &Path) {
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -71,11 +76,26 @@ pub(crate) fn atomic_install(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// fsync `path` if it exists. Treats NotFound as a no-op so callers don't
 /// have to special-case the EXDEV path (where the original src was already
 /// consumed by a copy).
+///
+/// Unix-only. On Windows `std::fs::File::open` returns a read-only handle
+/// and `FlushFileBuffers` requires write access, so the natural
+/// implementation here returns `ERROR_ACCESS_DENIED`. NTFS journals
+/// metadata anyway, so the data-blocks-vs-rename ordering risk this
+/// guards on Linux doesn't manifest the same way; treat the Windows path
+/// as a no-op rather than carry a fragile reopen-with-write workaround.
 fn fsync_file(path: &Path) -> std::io::Result<()> {
-    match std::fs::File::open(path) {
-        Ok(f) => f.sync_all(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    #[cfg(unix)]
+    {
+        match std::fs::File::open(path) {
+            Ok(f) => f.sync_all(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 
