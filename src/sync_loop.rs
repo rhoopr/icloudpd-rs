@@ -1640,7 +1640,7 @@ mod tests {
     fn is_session_error_through_boxed_error_returns_false() {
         // A boxed error of a foreign type wrapped via anyhow::Error::from.
         let boxed: Box<dyn std::error::Error + Send + Sync> =
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, "foreign"));
+            Box::new(std::io::Error::other("foreign"));
         let e: anyhow::Error = anyhow::Error::from_boxed(boxed);
         assert!(
             !is_session_error(&e),
@@ -2049,5 +2049,723 @@ mod tests {
             matches!(mode, download::SyncMode::Full),
             "no state DB must yield Full, got {mode:?}"
         );
+    }
+
+    // ── check_changes_database ───────────────────────────────────────
+    //
+    // Watch-mode wakes the sync loop on a fixed interval. The first thing
+    // each cycle does is hit the `changes/database` endpoint to ask Apple
+    // "anything actually changed?" If we mis-classify the response we
+    // either hammer Apple uselessly (no changes but proceeded) or silently
+    // skip a real delta (changes pending but skipped). Pin every branch.
+
+    /// Build a `LibraryState` that's just enough for `check_changes_database`.
+    /// The `plan` and `library` fields are unused by that function, so an
+    /// empty plan + a stub library is safe.
+    fn make_library_state(zone: &str, sync_token_key: &str) -> LibraryState {
+        let stub_session = Box::new(
+            crate::test_helpers::MockPhotosSession::new().ok(serde_json::json!({"records": []})),
+        );
+        LibraryState {
+            library: crate::icloud::photos::PhotoLibrary::new_stub(stub_session),
+            zone_name: zone.to_string(),
+            sync_token_key: sync_token_key.to_string(),
+            plan: crate::commands::AlbumPlan { passes: Vec::new() },
+        }
+    }
+
+    /// CG-5: `more_coming=true` with empty zones must NOT skip the cycle.
+    /// Production logic: `if zones.is_empty() && !more_coming { skip }`.
+    /// A regression that flipped the conjunction would silently skip every
+    /// page-bearing wakeup — silent loss of pending changes.
+    #[tokio::test]
+    async fn check_changes_database_more_coming_does_not_skip() {
+        use serde_json::json;
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-tok-2",
+            "moreComing": true,
+            "zones": []
+        }));
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let db: Arc<dyn state::StateDb> = make_state_db();
+        // Pre-populate a stored sync token so the function actually
+        // makes the changes/database HTTP call (the `has_token` early
+        // return otherwise short-circuits).
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-1")
+            .await
+            .expect("set token");
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+
+        let skip = check_changes_database(&Some(Arc::clone(&db)), &lib_state, &mut svc).await;
+
+        assert!(
+            !skip,
+            "more_coming=true must not skip the cycle (more pages pending)"
+        );
+        // db_sync_token should have been persisted so the next cycle
+        // continues paging from where we left off.
+        let stored = db
+            .get_metadata("db_sync_token")
+            .await
+            .expect("read db_sync_token")
+            .expect("token persisted");
+        assert_eq!(stored, "db-tok-2");
+    }
+
+    /// CG-6: empty zones + `more_coming=false` must return `skip=true`.
+    /// This is the optimistic short-circuit: Apple confirmed there are no
+    /// pending changes, so we save a full enumeration cycle. A regression
+    /// that flipped this branch would either burn a CloudKit query per
+    /// idle wakeup (cost) or silently skip a real cycle (loss).
+    #[tokio::test]
+    async fn check_changes_database_empty_zones_skips_cycle() {
+        use serde_json::json;
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-tok-3",
+            "moreComing": false,
+            "zones": []
+        }));
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let db: Arc<dyn state::StateDb> = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("set token");
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+
+        let skip = check_changes_database(&Some(Arc::clone(&db)), &lib_state, &mut svc).await;
+
+        assert!(skip, "empty zones + more_coming=false must skip the cycle");
+        // The new db_sync_token must still be persisted even on skip:
+        // otherwise the next call re-asks from scratch and we'd get an
+        // unbounded list of all zones.
+        let stored = db
+            .get_metadata("db_sync_token")
+            .await
+            .expect("read db_sync_token")
+            .expect("token persisted on skip");
+        assert_eq!(stored, "db-tok-3");
+    }
+
+    /// Companion to CG-6: a non-empty zones list MUST NOT skip — even
+    /// when more_coming=false. This is the real-work path; pinning it
+    /// alongside the skip path catches a flipped branch in either
+    /// direction.
+    #[tokio::test]
+    async fn check_changes_database_zone_changes_present_does_not_skip() {
+        use serde_json::json;
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-tok-4",
+            "moreComing": false,
+            "zones": [
+                {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "ps-tok-new"}
+            ]
+        }));
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let db: Arc<dyn state::StateDb> = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("set token");
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+
+        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        assert!(!skip, "zones-present response must not skip the cycle");
+    }
+
+    /// CG-6 corner: no stored sync token at all must return false (don't
+    /// skip) without making the HTTP call. Pinning this prevents a future
+    /// refactor that flipped the early return from silently consuming an
+    /// Apple call slot on bootstrap.
+    #[tokio::test]
+    async fn check_changes_database_no_stored_token_does_not_skip() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        // Empty DB — no `sync_token:PrimarySync` set.
+        let db: Arc<dyn state::StateDb> = make_state_db();
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+
+        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        assert!(!skip, "no stored token must skip-result false (continue)");
+    }
+
+    /// CG-7: a `set_metadata("db_sync_token", ...)` write failure must
+    /// NOT break the cycle. The current implementation logs a warning and
+    /// continues. A regression that propagated the error would crash watch
+    /// mode whenever a sqlite hiccup hit that single write.
+    #[tokio::test]
+    async fn check_changes_database_token_persist_failure_does_not_skip() {
+        use serde_json::json;
+        // StateDb that succeeds on get_metadata("sync_token:...") but
+        // fails on set_metadata("db_sync_token", ...) — the only write
+        // path inside `check_changes_database`.
+        struct PartiallyFailingDb {
+            inner: Arc<dyn state::StateDb>,
+        }
+
+        #[async_trait::async_trait]
+        impl state::StateDb for PartiallyFailingDb {
+            #[cfg(test)]
+            async fn should_download(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn upsert_seen(
+                &self,
+                _: &state::types::AssetRecord,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_downloaded(
+                &self,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_failed(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed_sample(
+                &self,
+                _: u32,
+            ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_pending(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_summary(
+                &self,
+            ) -> Result<state::types::SyncSummary, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_page(
+                &self,
+                _: u64,
+                _: u32,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn complete_sync_run(
+                &self,
+                _: i64,
+                _: &state::types::SyncRunStats,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn begin_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn end_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn list_interrupted_enumerations(
+                &self,
+            ) -> Result<Vec<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_pending_to_failed(
+                &self,
+                _: i64,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_ids(
+                &self,
+            ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_all_known_ids(
+                &self,
+            ) -> Result<std::collections::HashSet<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_checksums(
+                &self,
+            ) -> Result<std::collections::HashMap<(String, String), String>, state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_attempt_counts(
+                &self,
+            ) -> Result<std::collections::HashMap<String, u32>, state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_metadata(
+                &self,
+                key: &str,
+            ) -> Result<Option<String>, state::error::StateError> {
+                self.inner.get_metadata(key).await
+            }
+            async fn set_metadata(
+                &self,
+                key: &str,
+                _value: &str,
+            ) -> Result<(), state::error::StateError> {
+                if key == "db_sync_token" {
+                    Err(state::error::StateError::LockPoisoned(
+                        "simulated db_sync_token write failure".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            async fn delete_metadata_by_prefix(
+                &self,
+                _: &str,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn touch_last_seen_many(
+                &self,
+                _: &[&str],
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn sample_downloaded_paths(
+                &self,
+                _: usize,
+            ) -> Result<Vec<std::path::PathBuf>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn add_asset_album(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_asset_albums(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_asset_people(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_soft_deleted(
+                &self,
+                _: &str,
+                _: Option<chrono::DateTime<chrono::Utc>>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn record_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_metadata_hashes(
+                &self,
+            ) -> Result<std::collections::HashMap<(String, String), String>, state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_metadata_retry_markers(
+                &self,
+            ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_pending_metadata_rewrites(
+                &self,
+                _: usize,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn update_metadata_hash(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn clear_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn has_downloaded_without_metadata_hash(
+                &self,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+        }
+
+        // Inner DB has the stored sync token so the changes/database call
+        // is actually attempted.
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed token");
+        let db: Arc<dyn state::StateDb> = Arc::new(PartiallyFailingDb { inner });
+
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-tok-bad-write",
+            "moreComing": false,
+            "zones": [
+                {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "ps-tok-new"}
+            ]
+        }));
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+
+        // The function logs the write failure and continues. zones non-empty
+        // means it must return false (don't skip).
+        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        assert!(
+            !skip,
+            "db_sync_token write failure must not propagate as a skip"
+        );
+    }
+
+    // ── preload_asset_groupings ──────────────────────────────────────
+    //
+    // CG-8: `preload_asset_groupings` must be best-effort: a hiccup
+    // loading people must NOT empty the albums map, and vice versa.
+    // XMP-sidecar runs read this struct; biasing the entire grouping
+    // empty would silently strip metadata from every downloaded photo.
+
+    /// CG-8: when `get_all_asset_albums` succeeds but
+    /// `get_all_asset_people` fails, the result still includes albums.
+    #[tokio::test]
+    async fn preload_asset_groupings_partial_people_failure_keeps_albums() {
+        use std::collections::{HashMap, HashSet};
+
+        struct PartialDb {
+            inner: Arc<dyn state::StateDb>,
+        }
+
+        #[async_trait::async_trait]
+        impl state::StateDb for PartialDb {
+            #[cfg(test)]
+            async fn should_download(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn upsert_seen(
+                &self,
+                _: &state::types::AssetRecord,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_downloaded(
+                &self,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_failed(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_failed_sample(
+                &self,
+                _: u32,
+            ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError>
+            {
+                unimplemented!()
+            }
+            async fn get_pending(
+                &self,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_summary(
+                &self,
+            ) -> Result<state::types::SyncSummary, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_page(
+                &self,
+                _: u64,
+                _: u32,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn complete_sync_run(
+                &self,
+                _: i64,
+                _: &state::types::SyncRunStats,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn begin_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn end_enum_progress(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn list_interrupted_enumerations(
+                &self,
+            ) -> Result<Vec<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn promote_pending_to_failed(
+                &self,
+                _: i64,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_ids(
+                &self,
+            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_all_known_ids(&self) -> Result<HashSet<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_checksums(
+                &self,
+            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_attempt_counts(
+                &self,
+            ) -> Result<HashMap<String, u32>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_metadata(
+                &self,
+                _: &str,
+            ) -> Result<Option<String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn set_metadata(&self, _: &str, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn delete_metadata_by_prefix(
+                &self,
+                _: &str,
+            ) -> Result<u64, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn touch_last_seen_many(
+                &self,
+                _: &[&str],
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn sample_downloaded_paths(
+                &self,
+                _: usize,
+            ) -> Result<Vec<std::path::PathBuf>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn add_asset_album(
+                &self,
+                asset_id: &str,
+                album_name: &str,
+                source: &str,
+            ) -> Result<(), state::error::StateError> {
+                self.inner
+                    .add_asset_album(asset_id, album_name, source)
+                    .await
+            }
+            async fn get_all_asset_albums(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                self.inner.get_all_asset_albums().await
+            }
+            async fn get_all_asset_people(
+                &self,
+            ) -> Result<Vec<(String, String)>, state::error::StateError> {
+                Err(state::error::StateError::LockPoisoned(
+                    "simulated people-table read failure".into(),
+                ))
+            }
+            async fn mark_soft_deleted(
+                &self,
+                _: &str,
+                _: Option<chrono::DateTime<chrono::Utc>>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn record_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_downloaded_metadata_hashes(
+                &self,
+            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_metadata_retry_markers(
+                &self,
+            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn get_pending_metadata_rewrites(
+                &self,
+                _: usize,
+            ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+                unimplemented!()
+            }
+            async fn update_metadata_hash(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn clear_metadata_write_failure(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn has_downloaded_without_metadata_hash(
+                &self,
+            ) -> Result<bool, state::error::StateError> {
+                unimplemented!()
+            }
+        }
+
+        // Seed the inner DB with two album memberships across two assets,
+        // so we can verify the surviving map is non-empty.
+        let inner = make_state_db();
+        inner
+            .add_asset_album("ASSET_A", "Vacation", "icloud")
+            .await
+            .expect("add album A");
+        inner
+            .add_asset_album("ASSET_B", "Family", "icloud")
+            .await
+            .expect("add album B");
+
+        let db: Option<Arc<dyn state::StateDb>> = Some(Arc::new(PartialDb { inner }));
+
+        let groupings = preload_asset_groupings(&db).await;
+        // Albums must survive intact.
+        assert_eq!(
+            groupings.albums.len(),
+            2,
+            "two assets with album memberships expected, got {}",
+            groupings.albums.len()
+        );
+        assert!(groupings.albums.contains_key("ASSET_A"));
+        assert!(groupings.albums.contains_key("ASSET_B"));
+        // People map is empty (the read failed) — but the function still
+        // returns Some groupings rather than panicking.
+        assert!(
+            groupings.people.is_empty(),
+            "people map should be empty when its read failed; got {} entries",
+            groupings.people.len()
+        );
+    }
+
+    /// Companion: `state_db = None` returns an empty grouping struct.
+    #[tokio::test]
+    async fn preload_asset_groupings_no_db_returns_empty() {
+        let groupings = preload_asset_groupings(&None).await;
+        assert!(groupings.albums.is_empty());
+        assert!(groupings.people.is_empty());
     }
 }
