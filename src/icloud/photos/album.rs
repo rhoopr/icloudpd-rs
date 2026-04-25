@@ -22,10 +22,12 @@ use crate::retry::RetryConfig;
 /// page can be either real end-of-list or a transient gap at this rank
 /// range (e.g., a block of fully-deleted records aligning with a page
 /// boundary). We probe forward by one `page_size` on each empty page and
-/// only terminate after this many consecutive empty probes — two gives
-/// us defense against a single-page gap at the cost of one extra request
-/// on true EOF.
-const MAX_EMPTY_PAGE_PROBES: u32 = 2;
+/// only terminate after this many consecutive empty probes.
+///
+/// Set conservatively so a multi-page run of fully-deleted records does
+/// not silently truncate enumeration; the cost on true EOF is at most
+/// `MAX_EMPTY_PAGE_PROBES - 1` extra empty requests per fetcher.
+const MAX_EMPTY_PAGE_PROBES: u32 = 5;
 
 /// A boxed, pinned stream of photo asset results.
 type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
@@ -632,10 +634,16 @@ impl PhotoAlbum {
                 if record_count == 0 {
                     consecutive_empty_pages += 1;
                     if consecutive_empty_pages >= MAX_EMPTY_PAGE_PROBES {
-                        tracing::debug!(
+                        // Promoted to info! so an enumeration that
+                        // terminates after probing past empty pages is
+                        // visible in normal logs — operators chasing a
+                        // suspected silent truncation should see the
+                        // probe count and total_sent here.
+                        tracing::info!(
                             album = %name,
                             offset,
                             probes = consecutive_empty_pages,
+                            total_sent,
                             "End of album (consecutive empty pages)"
                         );
                         break;
@@ -1289,6 +1297,80 @@ mod tests {
         assert_eq!(
             count, 2,
             "both master-1 and master-2 should be yielded; the single empty page in between must not terminate enumeration"
+        );
+    }
+
+    /// Robustness regression for CF-2 (2026-04-25 review): a contiguous
+    /// run of fully-deleted records aligned to the page boundary used to
+    /// truncate enumeration after 2 empty probes, leaving real assets
+    /// past the run silently absent. With `MAX_EMPTY_PAGE_PROBES = 5`,
+    /// four consecutive empty pages must not terminate; records on page 6
+    /// must still be enumerated.
+    #[tokio::test]
+    async fn test_photo_stream_tolerates_four_consecutive_empty_pages() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosSession::new()
+            .ok(canned_page("master-1", None))
+            // 4 consecutive empty pages (within tolerance).
+            .ok(json!({"records": []}))
+            .ok(json!({"records": []}))
+            .ok(json!({"records": []}))
+            .ok(json!({"records": []}))
+            // Records reappear past the empty run.
+            .ok(canned_page("master-2", None));
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+        tokio::pin!(stream);
+
+        let mut count = 0u32;
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+            count += 1;
+        }
+        assert_eq!(
+            count, 2,
+            "master-2 must be yielded even after 4 consecutive empty probes; \
+             the previous threshold of 2 would have silently dropped it"
+        );
+    }
+
+    /// Pins the upper bound on the probe walk: `MAX_EMPTY_PAGE_PROBES`
+    /// consecutive empty pages must terminate before any subsequent
+    /// records are observed. This guards against an unbounded probe
+    /// regression in the other direction (the fetcher walking forever on
+    /// a genuinely empty tail).
+    #[tokio::test]
+    async fn test_photo_stream_terminates_after_max_empty_probes() {
+        use tokio_stream::StreamExt;
+
+        // 1 record, then 5 empty pages (= MAX_EMPTY_PAGE_PROBES). A 6th
+        // page with a record would be unreachable; the test asserts it is
+        // never observed.
+        let mock = MockPhotosSession::new()
+            .ok(canned_page("master-1", None))
+            .ok(json!({"records": []}))
+            .ok(json!({"records": []}))
+            .ok(json!({"records": []}))
+            .ok(json!({"records": []}))
+            .ok(json!({"records": []}))
+            // Should never be requested — terminator should fire first.
+            .ok(canned_page("master-unreachable", None));
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+        tokio::pin!(stream);
+
+        let mut count = 0u32;
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+            count += 1;
+        }
+        assert_eq!(
+            count, 1,
+            "only master-1 should be yielded; enumeration must terminate \
+             after MAX_EMPTY_PAGE_PROBES consecutive empty pages"
         );
     }
 

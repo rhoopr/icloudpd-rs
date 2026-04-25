@@ -269,12 +269,32 @@ impl CredentialStore {
 }
 
 /// Atomically write data to a file with 0o600 permissions (synchronous).
+///
+/// The temp file is fsynced before the rename and the parent directory is
+/// fsynced afterwards (Unix only) so a power loss between the rename
+/// returning and the kernel committing data + directory blocks can't leave
+/// the credential file pointing at uninitialised content. A corrupt
+/// credential file forces the user to re-enter their password (loud
+/// recovery), which is acceptable; an empty-or-garbage credential file
+/// silently failing decrypt is the failure mode this avoids.
 fn atomic_write_sync(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
     let tmp = path.with_file_name(tmp_name);
-    std::fs::write(&tmp, data)
-        .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("Failed to open temp file: {}", tmp.display()))?;
+        f.write_all(data)
+            .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("Failed to fsync temp file: {}", tmp.display()))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -282,6 +302,13 @@ fn atomic_write_sync(path: &Path, data: &[u8]) -> Result<()> {
     }
     std::fs::rename(&tmp, path)
         .with_context(|| format!("Failed to rename {} to {}", tmp.display(), path.display()))?;
+    if let Err(e) = crate::fs_util::fsync_parent_dir(path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "fsync of parent directory failed after atomic_write_sync"
+        );
+    }
     Ok(())
 }
 

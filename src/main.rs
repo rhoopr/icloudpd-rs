@@ -480,7 +480,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // Log migration warnings now that tracing is initialized.
     if let Some(report) = &migration_report {
         for msg in &report.warnings {
-            tracing::warn!("{msg}");
+            tracing::warn!(message = %msg, "Config migration warning");
         }
     }
 
