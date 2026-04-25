@@ -1207,6 +1207,40 @@ mod tests {
         );
     }
 
+    /// `read_bounded_error_body` stops reading off the wire once it
+    /// has `MAX_PRESERVED_BODY + 16` bytes, even if the server sent
+    /// orders of magnitude more. A regression to `resp.text().await`
+    /// would buffer the full body and fail this assertion. The
+    /// existing `wiremock_oversized_body_is_truncated` test only
+    /// proves the *output* is clipped (because `truncate_body` runs
+    /// after the read), so it can't distinguish "streamed and stopped"
+    /// from "buffered and trimmed".
+    #[tokio::test]
+    async fn read_bounded_error_body_caps_at_max_plus_grace() {
+        let server = MockServer::start().await;
+        let huge = "x".repeat(64 * 1024);
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(&huge))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{}/records/query", server.uri()))
+            .body("{}")
+            .send()
+            .await
+            .expect("request");
+        assert!(resp.status().is_server_error());
+
+        let body = read_bounded_error_body(resp, "test").await;
+        assert!(
+            body.len() <= MAX_PRESERVED_BODY + 16,
+            "streaming cap breached: body.len() = {}, cap = {}",
+            body.len(),
+            MAX_PRESERVED_BODY + 16
+        );
+    }
+
     /// An oversized body is truncated with the `…` marker so a
     /// pathological CloudKit response (HTML error page, stack trace)
     /// can't blow up the error path.
