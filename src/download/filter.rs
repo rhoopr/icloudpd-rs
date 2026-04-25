@@ -660,10 +660,10 @@ pub(super) fn filter_asset_to_tasks(
 
     // Strip non-ASCII characters unless --keep-unicode-in-filenames is set.
     // Matches Python's default behavior of calling remove_unicode_chars() on filenames.
-    let base_filename = if config.keep_unicode_in_filenames {
+    let base_filename: String = if config.keep_unicode_in_filenames {
         raw_filename.to_string()
     } else {
-        paths::remove_unicode_chars(raw_filename)
+        paths::remove_unicode_chars(raw_filename).into_owned()
     };
 
     let created_local: DateTime<Local> = asset.created().with_timezone(&Local);

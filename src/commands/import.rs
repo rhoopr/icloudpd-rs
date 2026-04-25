@@ -163,10 +163,10 @@ pub(crate) async fn run_import_existing(
                     .map_or("", |(_, v)| v.asset_type.as_ref());
                 download::paths::generate_fingerprint_filename(asset.id(), asset_type)
             };
-            let base_filename = if keep_unicode {
+            let base_filename: String = if keep_unicode {
                 raw_filename
             } else {
-                download::paths::remove_unicode_chars(&raw_filename)
+                download::paths::remove_unicode_chars(&raw_filename).into_owned()
             };
 
             // Get the created date in local time for path computation
