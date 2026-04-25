@@ -142,7 +142,7 @@ async fn maybe_notify_shared_libraries(
     else {
         return;
     };
-    tracing::warn!("{msg}");
+    tracing::warn!(message = %msg, "Shared library notice");
 
     if let Some(db) = state_db {
         if let Err(e) = db.set_metadata(SHARED_LIBRARY_NOTICE_KEY, "1").await {
@@ -363,7 +363,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
             }
             password::SavePasswordAction::SkipWithWarning(reason) => {
-                tracing::warn!("{reason}");
+                tracing::warn!(reason = %reason, "Skipping save of password to credential store");
             }
         }
     }

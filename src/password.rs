@@ -257,7 +257,11 @@ fn warn_if_permissive_mode(path: &Path) {
         return;
     };
     if let Some(msg) = check_password_file_mode(path, meta.permissions().mode()) {
-        tracing::warn!("{msg}");
+        tracing::warn!(
+            path = %path.display(),
+            message = %msg,
+            "Permissive password file mode"
+        );
     }
 }
 
