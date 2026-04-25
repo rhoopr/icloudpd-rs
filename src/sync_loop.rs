@@ -2515,6 +2515,7 @@ mod tests {
 
     /// CG-8: when `get_all_asset_albums` succeeds but
     /// `get_all_asset_people` fails, the result still includes albums.
+    #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn preload_asset_groupings_partial_people_failure_keeps_albums() {
         use std::collections::{HashMap, HashSet};
@@ -2780,6 +2781,7 @@ mod tests {
     }
 
     /// Companion: `state_db = None` returns an empty grouping struct.
+    #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn preload_asset_groupings_no_db_returns_empty() {
         let groupings = preload_asset_groupings(&None).await;
