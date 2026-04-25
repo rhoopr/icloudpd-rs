@@ -603,7 +603,9 @@ impl DeltaRecordBuffer {
         reason: ChangeReason,
         events: &mut Vec<ChangeEvent>,
     ) {
-        let master_name: Box<str> = master_record.record_name.clone().into_boxed_str();
+        // Box::from(&str) copies only the bytes, without the String's Vec
+        // capacity slack that .clone().into_boxed_str() would drag along.
+        let master_name: Box<str> = Box::from(master_record.record_name.as_str());
         let asset = PhotoAsset::from_records(master_record, asset_record);
         events.push(ChangeEvent {
             record_name: master_name,

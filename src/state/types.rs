@@ -209,34 +209,40 @@ impl AssetMetadata {
         let mut hasher = Sha256::new();
         let h = &mut hasher;
         hash_bool(h, "fav", self.is_favorite);
-        hash_opt(h, "rat", self.rating.map(|v| v.to_string()));
-        hash_opt(h, "lat", self.latitude.map(format_f64));
-        hash_opt(h, "lng", self.longitude.map(format_f64));
-        hash_opt(h, "alt", self.altitude.map(format_f64));
-        hash_opt(h, "ori", self.orientation.map(|v| v.to_string()));
-        hash_opt(h, "dur", self.duration_secs.map(format_f64));
-        hash_opt(h, "tzo", self.timezone_offset.map(|v| v.to_string()));
-        hash_opt(h, "w", self.width.map(|v| v.to_string()));
-        hash_opt(h, "hh", self.height.map(|v| v.to_string()));
-        hash_opt(h, "tit", self.title.clone());
-        hash_opt(h, "kw", self.keywords.clone());
-        hash_opt(h, "desc", self.description.clone());
-        hash_opt(h, "sub", self.media_subtype.clone());
-        hash_opt(h, "bur", self.burst_id.clone());
+        // Bind formatted values so their `&str` lives long enough to pass
+        // through `hash_opt`. The String-typed fields below go in directly
+        // as `&str` — no clone.
+        let rat = self.rating.map(|v| v.to_string());
+        let lat = self.latitude.map(format_f64);
+        let lng = self.longitude.map(format_f64);
+        let alt = self.altitude.map(format_f64);
+        let ori = self.orientation.map(|v| v.to_string());
+        let dur = self.duration_secs.map(format_f64);
+        let tzo = self.timezone_offset.map(|v| v.to_string());
+        let w = self.width.map(|v| v.to_string());
+        let hh = self.height.map(|v| v.to_string());
+        let m_mod = self.modified_at.map(|dt| dt.timestamp().to_string());
+        let delat = self.deleted_at.map(|dt| dt.timestamp().to_string());
+        hash_opt(h, "rat", rat.as_deref());
+        hash_opt(h, "lat", lat.as_deref());
+        hash_opt(h, "lng", lng.as_deref());
+        hash_opt(h, "alt", alt.as_deref());
+        hash_opt(h, "ori", ori.as_deref());
+        hash_opt(h, "dur", dur.as_deref());
+        hash_opt(h, "tzo", tzo.as_deref());
+        hash_opt(h, "w", w.as_deref());
+        hash_opt(h, "hh", hh.as_deref());
+        hash_opt(h, "tit", self.title.as_deref());
+        hash_opt(h, "kw", self.keywords.as_deref());
+        hash_opt(h, "desc", self.description.as_deref());
+        hash_opt(h, "sub", self.media_subtype.as_deref());
+        hash_opt(h, "bur", self.burst_id.as_deref());
         hash_bool(h, "hid", self.is_hidden);
         hash_bool(h, "arc", self.is_archived);
-        hash_opt(
-            h,
-            "mod",
-            self.modified_at.map(|dt| dt.timestamp().to_string()),
-        );
+        hash_opt(h, "mod", m_mod.as_deref());
         hash_bool(h, "del", self.is_deleted);
-        hash_opt(
-            h,
-            "delat",
-            self.deleted_at.map(|dt| dt.timestamp().to_string()),
-        );
-        hash_opt(h, "pd", self.provider_data.clone());
+        hash_opt(h, "delat", delat.as_deref());
+        hash_opt(h, "pd", self.provider_data.as_deref());
         let digest = hasher.finalize();
         data_encoding::HEXLOWER.encode(&digest)
     }
@@ -247,7 +253,7 @@ impl AssetMetadata {
     }
 }
 
-fn hash_opt(hasher: &mut sha2::Sha256, tag: &str, value: Option<String>) {
+fn hash_opt(hasher: &mut sha2::Sha256, tag: &str, value: Option<&str>) {
     use sha2::Digest;
     hasher.update(tag.as_bytes());
     hasher.update(b"|");
