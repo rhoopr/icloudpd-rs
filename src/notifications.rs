@@ -508,8 +508,10 @@ mod tests {
     /// permit is held, the surplus events must be **dropped**, not queued.
     /// With the old `acquire_owned().await` we'd spawn a task per event and
     /// the surplus would run as permits became free; with `try_acquire_owned`
-    /// the surplus saturates and we drop on the floor.
+    /// the surplus saturates and we drop on the floor. After permits are
+    /// released, fresh events must be able to acquire (no permit leak).
     #[cfg(unix)]
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn notifier_drops_events_when_saturated() {
         let dir = tempfile::tempdir().unwrap();
@@ -575,6 +577,38 @@ mod tests {
             total_invocations, NOTIFIER_MAX_INFLIGHT,
             "expected exactly {NOTIFIER_MAX_INFLIGHT} script invocations \
              (cap), got {total_invocations} -- saturation drop regressed"
+        );
+
+        // The surplus events must have logged a saturation warning.
+        // `logs_contain` checks the captured tracing output for this
+        // test's scope.
+        assert!(
+            logs_contain("Notifier saturated"),
+            "expected at least one 'Notifier saturated' warning during the flood"
+        );
+
+        // Permit release sanity: after the first 8 scripts exited, their
+        // permits should be back in the pool. Fire a fresh batch using
+        // the same notifier; with `release` already in place, each new
+        // script exits immediately. If permits leaked we'd never reach
+        // `NOTIFIER_MAX_INFLIGHT + extra` invocations.
+        let extra = 4usize;
+        for _ in 0..extra {
+            notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
+        }
+        let expected_total = NOTIFIER_MAX_INFLIGHT + extra;
+        let invocation_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut final_total = 0usize;
+        while tokio::time::Instant::now() < invocation_deadline {
+            final_total = std::fs::read(&invocations).map(|b| b.len()).unwrap_or(0);
+            if final_total >= expected_total {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            final_total, expected_total,
+            "post-release events did not run -- permit leak in saturation path"
         );
     }
 
