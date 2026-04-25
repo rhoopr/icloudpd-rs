@@ -333,9 +333,9 @@ impl PhotoAsset {
         &self.asset_metadata
     }
 
-    /// Shared handle on the metadata. Consumers that persist the
-    /// metadata (state DB writes via [`AssetRecord::with_metadata_arc`])
-    /// clone the `Arc` instead of deep-cloning every owned string.
+    /// Shared handle on the metadata. Consumers that persist the metadata
+    /// (state DB writes via `AssetRecord::with_metadata_arc`) clone the
+    /// `Arc` instead of deep-cloning every owned string.
     #[must_use]
     pub fn metadata_arc(&self) -> Arc<AssetMetadata> {
         Arc::clone(&self.asset_metadata)
