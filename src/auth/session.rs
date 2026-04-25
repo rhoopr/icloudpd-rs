@@ -127,15 +127,34 @@ fn parse_legacy_cookies(contents: &str) -> Vec<CookieEntry> {
 }
 
 /// Atomically write `data` to `path` via a temp file + rename.
+///
 /// Sets 0o600 permissions on Unix before renaming, so the file is never
-/// world-readable even momentarily.
+/// world-readable even momentarily. The temp file is fsynced before the
+/// rename and the parent directory is fsynced afterwards (Unix only) so
+/// a power loss between the rename returning and the kernel committing
+/// data + directory blocks can't leave `path` pointing at uninitialised
+/// content or vanish on the next mount.
 async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
     let tmp = path.with_file_name(tmp_name);
-    fs::write(&tmp, data)
-        .await
-        .with_context(|| format!("Failed to write temp file {}", tmp.display()))?;
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .await
+            .with_context(|| format!("Failed to open temp file {}", tmp.display()))?;
+        f.write_all(data)
+            .await
+            .with_context(|| format!("Failed to write temp file {}", tmp.display()))?;
+        f.sync_all()
+            .await
+            .with_context(|| format!("Failed to fsync temp file {}", tmp.display()))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -144,6 +163,17 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     fs::rename(&tmp, path)
         .await
         .with_context(|| format!("Failed to rename {} to {}", tmp.display(), path.display()))?;
+    let path_buf = path.to_path_buf();
+    if let Err(e) = tokio::task::spawn_blocking(move || crate::fs_util::fsync_parent_dir(&path_buf))
+        .await
+        .map_err(|e| anyhow::anyhow!("parent fsync join error: {e}"))?
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "fsync of parent directory failed after atomic_write"
+        );
+    }
     Ok(())
 }
 

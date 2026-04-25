@@ -2,12 +2,50 @@
 
 use std::path::Path;
 
-/// Install `src` at `dst` atomically. Prefers `rename` (atomic on the same
-/// device); on EXDEV, copies to a sibling of `dst` on the destination device
-/// and renames that sibling into place so a mid-copy crash can't expose a
-/// half-written `dst`.
+/// Open `path`'s parent directory and `fsync` it so a preceding `rename`'s
+/// directory entry survives a power loss. Unix-only; on Windows this is a
+/// no-op because the std API doesn't expose a directory handle for fsync.
+///
+/// Errors from the open or sync are returned to the caller. Callers that
+/// want best-effort durability without bubbling the error should log and
+/// drop it themselves.
+pub(crate) fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let dir = std::fs::File::open(parent)?;
+        dir.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Install `src` at `dst` atomically.
+///
+/// Prefers `rename` (atomic on the same device); on EXDEV, copies to a
+/// sibling of `dst` on the destination device and renames that sibling
+/// into place so a mid-copy crash can't expose a half-written `dst`.
+///
+/// `src`'s data is fsynced before the rename and `dst`'s parent directory
+/// is fsynced after, so a power loss between the rename returning and the
+/// kernel committing data + directory blocks can't leave `dst` pointing
+/// at an uninitialised file or vanish on the next mount.
 pub(crate) fn atomic_install(src: &Path, dst: &Path) -> std::io::Result<()> {
     atomic_install_with(src, dst, |s, d| std::fs::rename(s, d))
+}
+
+/// fsync `path` if it exists. Treats NotFound as a no-op so callers don't
+/// have to special-case the EXDEV path (where the original src was already
+/// consumed by a copy).
+fn fsync_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::File::open(path) {
+        Ok(f) => f.sync_all(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Test hook: like [`atomic_install`] but accepts an injectable `rename` so
@@ -19,6 +57,7 @@ fn atomic_install_with<R>(src: &Path, dst: &Path, rename: R) -> std::io::Result<
 where
     R: FnOnce(&Path, &Path) -> std::io::Result<()>,
 {
+    fsync_file(src)?;
     if let Err(rename_err) = rename(src, dst) {
         let ext = dst.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
         let dst_sibling = dst.with_extension(format!("{ext}.kei-xdev-tmp-{}", std::process::id()));
@@ -33,12 +72,24 @@ where
             );
             return Err(rename_err);
         }
+        // Fsync the sibling we just copied before renaming it into place.
+        fsync_file(&dst_sibling)?;
         if let Err(final_err) = std::fs::rename(&dst_sibling, dst) {
             let _ = std::fs::remove_file(&dst_sibling);
             let _ = std::fs::remove_file(src);
             return Err(final_err);
         }
         let _ = std::fs::remove_file(src);
+    }
+    // Best-effort: a parent-dir fsync failure shouldn't fail the install,
+    // but it's worth logging so an operator chasing durability incidents
+    // can see it.
+    if let Err(e) = fsync_parent_dir(dst) {
+        tracing::warn!(
+            path = %dst.display(),
+            error = %e,
+            "fsync of parent directory failed after atomic_install"
+        );
     }
     Ok(())
 }
@@ -114,6 +165,50 @@ mod tests {
                 "EXDEV fallback must clean up its sibling tmp: {name}"
             );
         }
+    }
+
+    /// CF-3 (2026-04-25 review): `fsync_parent_dir` returns `Ok(())` for an
+    /// extant directory on every supported platform. On Unix it actually
+    /// opens and fsyncs the parent; on Windows it's a documented no-op. The
+    /// test pins both platforms to "doesn't error" so a future regression
+    /// that drops the cfg gate or changes the open mode surfaces here.
+    #[test]
+    fn fsync_parent_dir_succeeds_for_extant_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("anchor.txt");
+        std::fs::write(&file, b"x").unwrap();
+        fsync_parent_dir(&file).expect("fsync_parent_dir should succeed");
+    }
+
+    /// `fsync_parent_dir` on Unix surfaces a NotFound when the parent itself
+    /// is missing; on other platforms it's a no-op and returns Ok. Pinning
+    /// the Unix branch makes accidental swallowing of the error visible.
+    #[cfg(unix)]
+    #[test]
+    fn fsync_parent_dir_unix_errors_when_parent_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("nope/sub/file.txt");
+        let err = fsync_parent_dir(&file).expect_err("missing parent should error on unix");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// CF-3 happy-path coverage: a same-device install of a freshly written
+    /// src succeeds end-to-end with the new fsync calls in the chain.
+    /// Regression guard if a future refactor drops the fsync of src or the
+    /// parent fsync and breaks the call (e.g. by accidentally borrowing a
+    /// closed File past sync_all).
+    #[test]
+    fn atomic_install_round_trip_fsyncs_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.tmp");
+        let dst = dir.path().join("dst.json");
+        let payload = b"durable payload";
+        std::fs::write(&src, payload).unwrap();
+
+        atomic_install(&src, &dst).expect("atomic_install with fsync should succeed");
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), payload);
     }
 
     /// If the initial rename fails and the cross-device copy also fails
