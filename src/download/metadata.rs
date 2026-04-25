@@ -229,7 +229,7 @@ impl<'a> TmpGuard<'a> {
 impl Drop for TmpGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = std::fs::remove_file(self.path);
+            crate::fs_util::log_remove(self.path);
         }
     }
 }

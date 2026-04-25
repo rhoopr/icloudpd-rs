@@ -191,7 +191,7 @@ pub(crate) async fn strip_session_routing_state(session_file: &Path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(_) => {
-            let _ = fs::remove_file(session_file).await;
+            crate::fs_util::log_remove_async(session_file).await;
             return;
         }
     };
@@ -199,7 +199,7 @@ pub(crate) async fn strip_session_routing_state(session_file: &Path) {
     let mut map: HashMap<String, String> = match serde_json::from_str(&contents) {
         Ok(m) => m,
         Err(_) => {
-            let _ = fs::remove_file(session_file).await;
+            crate::fs_util::log_remove_async(session_file).await;
             return;
         }
     };
@@ -210,18 +210,18 @@ pub(crate) async fn strip_session_routing_state(session_file: &Path) {
         Ok(json) => {
             if let Err(e) = atomic_write(session_file, json.as_bytes()).await {
                 tracing::warn!(error = %e, "Could not rewrite session file, removing");
-                let _ = fs::remove_file(session_file).await;
+                crate::fs_util::log_remove_async(session_file).await;
             }
         }
         Err(e) => {
             tracing::warn!(error = %e, "Could not serialise stripped session, removing");
-            let _ = fs::remove_file(session_file).await;
+            crate::fs_util::log_remove_async(session_file).await;
         }
     }
 
     // Invalidate validation cache since session is being reset
     let cache_file = session_file.with_extension("cache");
-    let _ = fs::remove_file(&cache_file).await;
+    crate::fs_util::log_remove_async(&cache_file).await;
 }
 
 /// Build the API and download HTTP clients for a session.

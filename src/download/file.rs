@@ -273,7 +273,7 @@ async fn attempt_download<C: DownloadClient>(
     if let Some(ct) = &response.content_type {
         let ct_lower = ct.to_ascii_lowercase();
         if ct_lower.starts_with("text/html") {
-            let _ = fs::remove_file(part_path).await;
+            crate::fs_util::log_remove_async(part_path).await;
             return Err(DownloadError::InvalidContent {
                 path: path_str.into(),
                 reason: format!("server returned content-type: {ct}").into(),
@@ -299,7 +299,7 @@ async fn attempt_download<C: DownloadClient>(
                     expected,
                     "Resume bytes inconsistent with API-reported size; discarding .part and restarting"
                 );
-                let _ = fs::remove_file(&part_path).await;
+                crate::fs_util::log_remove_async(part_path).await;
                 return Err(DownloadError::ContentLengthMismatch {
                     path: path_str.into(),
                     expected,
@@ -315,7 +315,7 @@ async fn attempt_download<C: DownloadClient>(
     // When resuming, open append-only without create (the file must exist —
     // we read its length at the top of this function).
     let mut file = if truncate {
-        let _ = fs::remove_file(&part_path).await;
+        crate::fs_util::log_remove_async(part_path).await;
         OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -367,7 +367,7 @@ async fn attempt_download<C: DownloadClient>(
     drop(file);
     if let Err(e) = stream_result {
         if !e.is_retryable() {
-            let _ = fs::remove_file(&part_path).await;
+            crate::fs_util::log_remove_async(part_path).await;
         }
         return Err(e);
     }
@@ -377,7 +377,7 @@ async fn attempt_download<C: DownloadClient>(
     if let Some(expected_len) = content_length {
         let total_bytes = bytes_written - effective_offset;
         if total_bytes != expected_len {
-            let _ = fs::remove_file(&part_path).await;
+            crate::fs_util::log_remove_async(part_path).await;
             return Err(DownloadError::ContentLengthMismatch {
                 path: path_str.into(),
                 expected: expected_len,
@@ -390,7 +390,7 @@ async fn attempt_download<C: DownloadClient>(
     // Catches truncation when the CDN omits Content-Length (chunked transfer).
     if let Some(expected) = expected_size {
         if bytes_written != expected {
-            let _ = fs::remove_file(&part_path).await;
+            crate::fs_util::log_remove_async(part_path).await;
             return Err(DownloadError::ContentLengthMismatch {
                 path: path_str.into(),
                 expected,
@@ -421,7 +421,7 @@ async fn attempt_download<C: DownloadClient>(
     .await
     .map_err(|e| DownloadError::Disk(Box::new(std::io::Error::other(e))))?;
     if let Err(e) = validation {
-        let _ = fs::remove_file(&part_path).await;
+        crate::fs_util::log_remove_async(part_path).await;
         return Err(e);
     }
 

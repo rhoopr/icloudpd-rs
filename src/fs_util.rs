@@ -2,6 +2,37 @@
 
 use std::path::Path;
 
+/// Remove `path`, treating `NotFound` as success and logging any other
+/// error at `warn!`. Use this in cleanup paths (`.part` cleanup, corrupt
+/// session-file deletion, EXDEV unwind) where a previous `let _ =` was
+/// silently dropping errors that violated the "no silent failures"
+/// invariant.
+pub(crate) fn log_remove(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to remove file during cleanup"
+            );
+        }
+    }
+}
+
+/// Async sibling of [`log_remove`] for callers already on a tokio task;
+/// uses `tokio::fs::remove_file` so it doesn't block a runtime worker.
+pub(crate) async fn log_remove_async(path: &Path) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to remove file during cleanup"
+            );
+        }
+    }
+}
+
 /// Open `path`'s parent directory and `fsync` it so a preceding `rename`'s
 /// directory entry survives a power loss. Unix-only; on Windows this is a
 /// no-op because the std API doesn't expose a directory handle for fsync.
