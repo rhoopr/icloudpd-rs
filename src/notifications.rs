@@ -430,74 +430,107 @@ mod tests {
         assert_eq!(output.trim(), "42|3|100|1500000|80");
     }
 
-    /// Fire many more events than `NOTIFIER_MAX_INFLIGHT` at a script
-    /// that blocks on a release file, and confirm the semaphore caps
-    /// the number of scripts running at any one moment. Without the
-    /// `acquire_owned` wrap, all events would spawn `/bin/sh`
-    /// concurrently and the marker count would exceed the cap.
+    /// Test scaffold: a barrier-blocked sh script that tracks both
+    /// concurrent in-flight invocations (per-pid marker files) and
+    /// total invocations (single-byte appends). Each invocation:
+    /// 1. Appends one byte to `invocations` (atomic on Linux).
+    /// 2. Drops a marker file at `inflight/$pid`.
+    /// 3. Polls until `release` exists.
+    /// 4. Removes its marker on exit.
+    #[cfg(unix)]
+    struct BarrierFixture {
+        _dir: tempfile::TempDir,
+        counter_dir: PathBuf,
+        release: PathBuf,
+        invocations: PathBuf,
+        script_path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl BarrierFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let counter_dir = dir.path().join("inflight");
+            std::fs::create_dir_all(&counter_dir).unwrap();
+            let release = dir.path().join("release");
+            let invocations = dir.path().join("invocations");
+            let body = format!(
+                "#!/bin/sh\nprintf x >> \"{}\"\nmarker=\"{}/$$\"\n: > \"$marker\"\n\
+                 while [ ! -f \"{}\" ]; do sleep 0.02; done\nrm -f \"$marker\"\n",
+                invocations.display(),
+                counter_dir.display(),
+                release.display(),
+            );
+            let script_path = write_test_script(dir.path(), "barrier.sh", body.as_bytes());
+            Self {
+                _dir: dir,
+                counter_dir,
+                release,
+                invocations,
+                script_path,
+            }
+        }
+
+        fn count_markers(&self) -> usize {
+            std::fs::read_dir(&self.counter_dir)
+                .map(|it| it.flatten().count())
+                .unwrap_or(0)
+        }
+
+        fn count_invocations(&self) -> usize {
+            std::fs::read(&self.invocations)
+                .map(|b| b.len())
+                .unwrap_or(0)
+        }
+
+        fn release_barrier(&self) {
+            std::fs::write(&self.release, b"").unwrap();
+        }
+
+        async fn wait_until<F: FnMut() -> bool>(&self, timeout: Duration, mut pred: F) {
+            let deadline = tokio::time::Instant::now() + timeout;
+            while tokio::time::Instant::now() < deadline {
+                if pred() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    /// Fire more events than `NOTIFIER_MAX_INFLIGHT` at a barrier script
+    /// and confirm the semaphore caps concurrent in-flight invocations.
+    /// Without the cap, every event would spawn `/bin/sh` concurrently
+    /// and the marker count would exceed `NOTIFIER_MAX_INFLIGHT`.
     #[cfg(unix)]
     #[tokio::test]
     async fn notifier_semaphore_caps_concurrent_inflight() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter_dir = dir.path().join("inflight");
-        std::fs::create_dir_all(&counter_dir).unwrap();
-        let release = dir.path().join("release");
-
-        // Each script invocation creates a unique marker, polls until the
-        // release file exists, then removes the marker on exit.
-        let body = format!(
-            "#!/bin/sh\nmarker=\"{}/$$\"\n: > \"$marker\"\n\
-             while [ ! -f \"{}\" ]; do sleep 0.02; done\nrm -f \"$marker\"\n",
-            counter_dir.display(),
-            release.display(),
-        );
-        let script_path = write_test_script(dir.path(), "barrier.sh", body.as_bytes());
-
-        let notifier = Notifier::new(Some(script_path));
-        let n_events = NOTIFIER_MAX_INFLIGHT * 2;
-        for _ in 0..n_events {
+        let fixture = BarrierFixture::new();
+        let notifier = Notifier::new(Some(fixture.script_path.clone()));
+        for _ in 0..NOTIFIER_MAX_INFLIGHT * 2 {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
 
-        // Wait until the steady state is reached, then sample for a
-        // window to confirm the cap holds. `count_markers` is
-        // best-effort: if a marker is in the process of being created
-        // or removed, we may briefly miss it, but the maximum across
-        // many samples is a tight bound.
-        let count_markers = || {
-            std::fs::read_dir(&counter_dir)
-                .map(|it| it.flatten().count())
-                .unwrap_or(0)
-        };
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut max_concurrent = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
-            max_concurrent = max_concurrent.max(count_markers());
+            max_concurrent = max_concurrent.max(fixture.count_markers());
             if max_concurrent >= NOTIFIER_MAX_INFLIGHT {
                 for _ in 0..10 {
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                    max_concurrent = max_concurrent.max(count_markers());
+                    max_concurrent = max_concurrent.max(fixture.count_markers());
                 }
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        // Release every blocked script so they can exit cleanly.
-        std::fs::write(&release, b"").unwrap();
-        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::time::Instant::now() < cleanup_deadline {
-            if count_markers() == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        fixture.release_barrier();
+        fixture
+            .wait_until(Duration::from_secs(5), || fixture.count_markers() == 0)
+            .await;
 
-        assert!(
-            max_concurrent >= 1,
-            "no scripts ever ran — test setup bug (script never created a marker)"
-        );
+        assert!(max_concurrent >= 1, "no scripts ever ran -- test setup bug");
         assert!(
             max_concurrent <= NOTIFIER_MAX_INFLIGHT,
             "semaphore did not cap concurrent scripts: max observed {max_concurrent}, cap is {NOTIFIER_MAX_INFLIGHT}",
@@ -509,106 +542,65 @@ mod tests {
     /// With the old `acquire_owned().await` we'd spawn a task per event and
     /// the surplus would run as permits became free; with `try_acquire_owned`
     /// the surplus saturates and we drop on the floor. After permits are
-    /// released, fresh events must be able to acquire (no permit leak).
+    /// released, fresh events must still be able to acquire (no permit leak).
     #[cfg(unix)]
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn notifier_drops_events_when_saturated() {
-        let dir = tempfile::tempdir().unwrap();
-        let counter_dir = dir.path().join("inflight");
-        std::fs::create_dir_all(&counter_dir).unwrap();
-        let release = dir.path().join("release");
-        let invocations = dir.path().join("invocations");
-
-        // Each invocation appends one byte to `invocations` (single-byte
-        // append is atomic on Linux), creates a per-pid marker, blocks on
-        // `release`, then removes the marker.
-        let body = format!(
-            "#!/bin/sh\nprintf x >> \"{}\"\nmarker=\"{}/$$\"\n: > \"$marker\"\n\
-             while [ ! -f \"{}\" ]; do sleep 0.02; done\nrm -f \"$marker\"\n",
-            invocations.display(),
-            counter_dir.display(),
-            release.display(),
-        );
-        let script_path = write_test_script(dir.path(), "saturate.sh", body.as_bytes());
-
-        let notifier = Notifier::new(Some(script_path));
-        let n_events = NOTIFIER_MAX_INFLIGHT * 4;
-        for _ in 0..n_events {
+        let fixture = BarrierFixture::new();
+        let notifier = Notifier::new(Some(fixture.script_path.clone()));
+        for _ in 0..NOTIFIER_MAX_INFLIGHT * 4 {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
 
-        // Wait until permits are saturated. With `try_acquire_owned`,
-        // dropped events return immediately, so we should reach the cap
-        // quickly and stay there.
-        let count_markers = || {
-            std::fs::read_dir(&counter_dir)
-                .map(|it| it.flatten().count())
-                .unwrap_or(0)
-        };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            if count_markers() >= NOTIFIER_MAX_INFLIGHT {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        fixture
+            .wait_until(Duration::from_secs(5), || {
+                fixture.count_markers() >= NOTIFIER_MAX_INFLIGHT
+            })
+            .await;
         assert_eq!(
-            count_markers(),
+            fixture.count_markers(),
             NOTIFIER_MAX_INFLIGHT,
-            "expected exactly {NOTIFIER_MAX_INFLIGHT} scripts to be holding permits"
+            "expected exactly {NOTIFIER_MAX_INFLIGHT} scripts holding permits"
         );
 
-        // Release the barrier and wait for everything in flight to drain.
-        std::fs::write(&release, b"").unwrap();
-        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::time::Instant::now() < cleanup_deadline {
-            if count_markers() == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(count_markers(), 0, "scripts did not drain after release");
-
-        // Even after permits become available, the dropped events must
-        // not retroactively run. Total invocations must equal the cap.
-        let total_invocations = std::fs::read(&invocations).map(|b| b.len()).unwrap_or(0);
+        fixture.release_barrier();
+        fixture
+            .wait_until(Duration::from_secs(5), || fixture.count_markers() == 0)
+            .await;
         assert_eq!(
-            total_invocations, NOTIFIER_MAX_INFLIGHT,
-            "expected exactly {NOTIFIER_MAX_INFLIGHT} script invocations \
-             (cap), got {total_invocations} -- saturation drop regressed"
+            fixture.count_markers(),
+            0,
+            "scripts did not drain after release"
         );
 
-        // The surplus events must have logged a saturation warning.
-        // `logs_contain` checks the captured tracing output for this
-        // test's scope.
+        // Dropped events must not retroactively run once permits are free.
+        assert_eq!(
+            fixture.count_invocations(),
+            NOTIFIER_MAX_INFLIGHT,
+            "saturation drop regressed: surplus events ran retroactively"
+        );
         assert!(
             logs_contain("Notifier saturated"),
-            "expected at least one 'Notifier saturated' warning during the flood"
+            "expected a 'Notifier saturated' warning during the flood"
         );
 
-        // Permit release sanity: after the first 8 scripts exited, their
-        // permits should be back in the pool. Fire a fresh batch using
-        // the same notifier; with `release` already in place, each new
-        // script exits immediately. If permits leaked we'd never reach
-        // `NOTIFIER_MAX_INFLIGHT + extra` invocations.
-        let extra = 4usize;
-        for _ in 0..extra {
+        // Permit-leak guard: after drain, fresh events should run.
+        // With `release` in place, each new script exits immediately.
+        const FRESH_BATCH: usize = 4;
+        for _ in 0..FRESH_BATCH {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
-        let expected_total = NOTIFIER_MAX_INFLIGHT + extra;
-        let invocation_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut final_total = 0usize;
-        while tokio::time::Instant::now() < invocation_deadline {
-            final_total = std::fs::read(&invocations).map(|b| b.len()).unwrap_or(0);
-            if final_total >= expected_total {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let expected_total = NOTIFIER_MAX_INFLIGHT + FRESH_BATCH;
+        fixture
+            .wait_until(Duration::from_secs(5), || {
+                fixture.count_invocations() >= expected_total
+            })
+            .await;
         assert_eq!(
-            final_total, expected_total,
-            "post-release events did not run -- permit leak in saturation path"
+            fixture.count_invocations(),
+            expected_total,
+            "permit leak: post-release events failed to acquire"
         );
     }
 

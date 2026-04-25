@@ -3599,8 +3599,8 @@ mod tests {
     async fn producer_flushes_touched_ids_so_pending_on_disk_skip_promotes() {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
-        use crate::state::{MediaType, SqliteStateDb, StateDb};
-        use chrono::TimeZone;
+        use crate::state::{SqliteStateDb, StateDb};
+        use crate::test_helpers::TestAssetRecord;
         use futures_util::stream;
         use std::sync::Arc;
 
@@ -3617,20 +3617,12 @@ mod tests {
 
         let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
 
-        // Pending row carried over from a prior interrupted sync. We
-        // backdate `last_seen_at` so it sits below `sync_started_at`
-        // until this run's producer flush bumps it.
         let prior_seen_at = chrono::Utc::now().timestamp() - 86400;
-        let record = AssetRecord::new_pending(
-            "STUCK".into(),
-            VersionSizeKey::Original,
-            "ck_stuck".into(),
-            "stuck.jpg".into(),
-            chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
-            None,
-            1234,
-            MediaType::Photo,
-        );
+        let record = TestAssetRecord::new("STUCK")
+            .checksum("ck_stuck")
+            .filename("stuck.jpg")
+            .size(1234)
+            .build();
         db.upsert_seen(&record).await.unwrap();
         db.backdate_last_seen("STUCK", prior_seen_at);
 
@@ -3640,11 +3632,9 @@ mod tests {
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
 
-        // Pre-create the file at the path the producer will compute,
-        // with matching size, so `filter_asset_to_tasks` resolves to
-        // "already on disk, skip" and returns no tasks. Computing the
-        // path via the same helper the producer uses keeps the test
-        // tz-independent.
+        // Pre-create the on-disk file at the path the producer will
+        // compute so `filter_asset_to_tasks` returns no tasks. Reuses
+        // `local_download_path` to stay tz-independent.
         let asset = carryover_asset();
         let target_path = crate::download::paths::local_download_path(
             &config.directory,
@@ -3665,18 +3655,10 @@ mod tests {
             .await
             .expect("sync must complete");
 
-        // The pre-existing on-disk file routed the asset through the
-        // `tasks.is_empty()` branch, which pushed its id into
-        // `touched_ids`. The producer task's end-of-loop flush then
-        // bumped `last_seen_at >= sync_started_at`, making this row
-        // visible to `promote_pending_to_failed`.
         let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
         assert_eq!(
             promoted, 1,
-            "stuck pending row hitting the on-disk-skip path must have its \
-             last_seen_at bumped by the deferred touched_ids flush so that \
-             promote_pending_to_failed promotes it at sync end -- this is \
-             load-bearing for stuck-pipeline recovery"
+            "stuck pending row must be promoted by the deferred touched_ids flush"
         );
 
         let failed = db.get_failed().await.unwrap();
