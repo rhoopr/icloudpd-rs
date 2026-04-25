@@ -1077,7 +1077,7 @@ pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_r
     matches!(outcome, download::DownloadOutcome::Success) && !dry_run
 }
 
-/// Decide whether the reauth path inside the watch loop should block on a
+/// Decide whether the reauth path inside the sync loop should block on a
 /// 2FA prompt or surface the error to the caller.
 ///
 /// In **watch mode** a 2FA-required error is recoverable: the loop notifies
@@ -1087,10 +1087,12 @@ pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_r
 /// a cron, the systemd unit's first start) needs the error so it can exit
 /// non-zero and the operator can run `kei login get-code`. CG-19.
 ///
-/// Mirrors the predicate used at the entry-point auth path (`run_sync`'s
-/// initial `auth::authenticate` call already returns the error in non-watch
-/// mode); this helper documents the contract for the *reauth* branch where
-/// the same decision was previously inline.
+/// Note that the **entry-point** auth path (`run_sync`'s initial
+/// `auth::authenticate` call) intentionally does NOT use this predicate --
+/// it always parks on `wait_and_retry_2fa` because the user is presumed
+/// present at a terminal during the initial command. This helper exists
+/// because the *reauth* branch fires mid-cycle, by which point a one-shot
+/// caller has long since detached and there is no operator to type a code.
 pub(crate) fn should_wait_for_2fa(is_watch_mode: bool, err: &anyhow::Error) -> bool {
     is_watch_mode
         && err
