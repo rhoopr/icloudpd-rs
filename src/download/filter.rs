@@ -669,11 +669,9 @@ pub(super) fn filter_asset_to_tasks(
     let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
     let versions = apply_raw_policy(asset.versions(), config.align_raw);
     let mut tasks = SmallVec::new();
-    // Build the metadata payload once per asset. Live-photo assets
-    // emit up to two DownloadTasks (primary image + MOV companion); both
-    // share the same metadata. Arc::clone on the task side is a refcount
-    // bump instead of a second parse of the keywords JSON + clone of
-    // every Option<String>.
+    // Live-photo assets emit two DownloadTasks (primary + MOV companion)
+    // that share the same metadata; build the payload once and Arc::clone
+    // it onto each task.
     let payload = build_payload(asset, config);
     // Track the effective primary filename (including any dedup suffix) so the
     // live photo MOV companion is derived from the same name, keeping them paired.

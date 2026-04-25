@@ -200,24 +200,14 @@ pub trait StateDb: Send + Sync {
     /// Returns the number of rows deleted.
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError>;
 
-    /// Update `last_seen_at` for all versions of an asset without requiring
-    /// full metadata. Used by the early skip path to avoid path resolution.
-    ///
-    /// Safe to call for assets the consumer will not finalize (trust-state
-    /// fast-skip, on-disk dedup, etc.) only when the row already has a
-    /// terminal status (`downloaded` or `failed`). Touching a `pending` row
-    /// will cause `promote_pending_to_failed` to promote it to `failed` at
-    /// sync end - see `upsert_seen` docs and issue #211.
     /// Bump `last_seen_at` on every row in `asset_ids` to the same
-    /// timestamp inside a single transaction. Collapses what would
-    /// otherwise be N individual UPDATEs (and N fsyncs under WAL
-    /// mode) into one — hot on mostly-synced libraries where the
-    /// producer skips thousands of assets per cycle.
+    /// timestamp inside a single transaction. Used by the early skip path
+    /// to avoid path resolution on mostly-synced libraries.
     ///
-    /// The pending-row caveat still applies: the caller must ensure
-    /// every ID already has a terminal status (`downloaded` or
-    /// `failed`) before bumping, otherwise `promote_pending_to_failed`
-    /// will promote it at sync end — see issue #211.
+    /// Caller must ensure every ID already has a terminal status
+    /// (`downloaded` or `failed`); touching a `pending` row will cause
+    /// `promote_pending_to_failed` to promote it to `failed` at sync end —
+    /// see `upsert_seen` docs and issue #211.
     async fn touch_last_seen_many(&self, asset_ids: &[&str]) -> Result<(), StateError>;
 
     /// Sample up to `limit` local paths of downloaded assets.
