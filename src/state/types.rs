@@ -150,7 +150,9 @@ impl MediaType {
 #[derive(Debug, Clone, Default)]
 pub struct AssetMetadata {
     /// Provider that created this record ("icloud", "takeout", etc.).
-    pub source: Option<String>,
+    /// Uses `Arc<str>` so repeated source names share a single allocation
+    /// via the global string interner.
+    pub source: Option<Arc<str>>,
     /// Provider-native favorite/heart flag.
     pub is_favorite: bool,
     /// 1-5 star rating (providers with boolean favorites set 5).

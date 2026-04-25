@@ -210,12 +210,12 @@ fn extract_versions(
                 continue;
             };
 
-        let asset_type: Box<str> = match fields
+        let asset_type: std::sync::Arc<str> = match fields
             .get(type_field)
             .and_then(|f| f.get("value"))
             .and_then(Value::as_str)
         {
-            Some(s) if !s.is_empty() => s.into(),
+            Some(s) if !s.is_empty() => crate::string_interner::intern(s),
             _ => {
                 tracing::warn!(
                     asset = %record_name,

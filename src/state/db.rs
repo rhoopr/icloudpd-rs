@@ -1562,7 +1562,8 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
     let last_error: Option<String> = row.get(13)?;
     let local_checksum: Option<String> = row.get(14)?;
 
-    let source: Option<String> = row.get(15)?;
+    let source_str: Option<String> = row.get(15)?;
+    let source = source_str.map(|s| crate::string_interner::intern(&s));
     let is_favorite: i64 = row.get(16)?;
     let rating: Option<i64> = row.get(17)?;
     let latitude: Option<f64> = row.get(18)?;

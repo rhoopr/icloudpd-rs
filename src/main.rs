@@ -44,6 +44,7 @@ mod retry;
 mod setup;
 mod shutdown;
 mod state;
+mod string_interner;
 mod sync_loop;
 mod systemd;
 mod types;
