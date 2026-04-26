@@ -89,6 +89,8 @@ pub(crate) struct TomlFilters {
     /// grammar as `--library` (`primary`, `shared`, raw zone names, friendly
     /// aliases, `!name` exclusions).
     pub libraries: Option<Vec<String>>,
+    /// Deprecated v0.13: use `albums` (an array). Removed in v0.20.
+    pub album: Option<String>,
     pub albums: Option<Vec<String>>,
     /// v0.13+ smart-folder selector. Same value grammar as `albums`.
     pub smart_folders: Option<Vec<String>>,
@@ -301,6 +303,21 @@ fn warn_selection_flag_unimplemented(flag_pair: &str, effect: &str) {
     }
 }
 
+/// Stderr deprecation warning, scheduled for removal in v0.20.0. `old` is the
+/// surface being deprecated (e.g. `` `--exclude-album` ``); `replacement` is
+/// the suggested new form.
+fn warn_deprecated(old: &str, replacement: &str) {
+    #[allow(
+        clippy::print_stderr,
+        reason = "runs during config load, before tracing subscriber is installed"
+    )]
+    {
+        eprintln!(
+            "warning: {old} is deprecated and will be removed in v0.20.0; use {replacement} instead"
+        );
+    }
+}
+
 /// Translate the legacy `(AlbumSelection, exclude_albums, LibrarySelection,
 /// folder_structure)` tuple plus the new `raw_smart_folders` raw list into
 /// the v0.13 [`Selection`]. Pure function so the truth table is testable
@@ -382,35 +399,38 @@ pub(crate) fn derive_selection(
     )
 }
 
-/// Convert a raw `Vec<String>` (from CLI or TOML) into an [`AlbumSelection`],
-/// enforcing that `-a all` is not mixed with specific album names.
+/// Convert a raw `Vec<String>` (from CLI or TOML, with optional `!name`
+/// exclusions and `all`/`none` sentinels) into the legacy
+/// `(AlbumSelection, exclude_albums)` pair. Validates the new v0.13 grammar
+/// (contradictions, sentinel rules) by routing through
+/// [`crate::selection::parse_album_selector`], then lowers the result back
+/// into the legacy shape so the unchanged sync pipeline keeps working until
+/// PR6 swaps in the new resolver.
 fn resolve_album_selection(
     raw: Vec<String>,
     folder_structure: &str,
-) -> anyhow::Result<AlbumSelection> {
-    let has_all = raw.iter().any(|s| s.eq_ignore_ascii_case("all"));
-    if has_all {
-        let non_all: Vec<&String> = raw
-            .iter()
-            .filter(|s| !s.eq_ignore_ascii_case("all"))
-            .collect();
-        anyhow::ensure!(
-            non_all.is_empty(),
-            "'-a all' cannot be combined with other album names; got {raw:?}. \
-             Pass either '-a all' alone or a list of specific names."
-        );
-        return Ok(AlbumSelection::All);
-    }
+) -> anyhow::Result<(AlbumSelection, Vec<String>)> {
     if raw.is_empty() {
-        // Smart default: bare `{album}` in the folder template implies
-        // "every album, plus an unfiled pass" without the user having to
-        // also pass `-a all`.
+        // Bare `{album}` in the folder template implies "every album, plus an
+        // unfiled pass" without the user having to also pass `--album all`.
+        // Removed in v0.20 (the new default already includes albums:all).
         if crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}") {
-            return Ok(AlbumSelection::All);
+            return Ok((AlbumSelection::All, Vec::new()));
         }
-        return Ok(AlbumSelection::LibraryOnly);
+        return Ok((AlbumSelection::LibraryOnly, Vec::new()));
     }
-    Ok(AlbumSelection::Named(raw))
+
+    let selector = crate::selection::parse_album_selector(&raw, true)?;
+    Ok(match selector {
+        crate::selection::AlbumSelector::None => (AlbumSelection::LibraryOnly, Vec::new()),
+        crate::selection::AlbumSelector::All { excluded } => {
+            (AlbumSelection::All, excluded.into_iter().collect())
+        }
+        crate::selection::AlbumSelector::Named { included, excluded } => (
+            AlbumSelection::Named(included.into_iter().collect()),
+            excluded.into_iter().collect(),
+        ),
+    })
 }
 
 /// Application configuration.
@@ -1045,8 +1065,53 @@ impl Config {
 
         // Filters
         let library = resolve_library_selection(sync.library, toml_filters);
-        let raw_albums = resolve_vec(sync.albums, toml_filters.and_then(|f| f.albums.clone()));
-        let albums = resolve_album_selection(raw_albums, &folder_structure)?;
+        let toml_albums = toml_filters.and_then(|f| f.albums.clone());
+        let toml_album_singular = toml_filters.and_then(|f| f.album.clone());
+        if toml_album_singular.is_some() {
+            warn_deprecated(
+                "`[filters].album` (singular string)",
+                "`[filters].albums = [\"name\"]` (array)",
+            );
+        }
+        // Lift the deprecated singular `album` key into the array form so the
+        // shared resolver only ever sees one shape. CLI takes precedence; TOML
+        // singular only applies when the array form is absent.
+        let toml_albums_resolved = toml_albums.or_else(|| toml_album_singular.map(|s| vec![s]));
+        let raw_albums = resolve_vec(sync.albums, toml_albums_resolved);
+
+        let cli_excludes_present = !sync.exclude_albums.is_empty();
+        let toml_exclude_albums = toml_filters.and_then(|f| f.exclude_albums.clone());
+        if cli_excludes_present {
+            warn_deprecated(
+                "`--exclude-album` / `KEI_EXCLUDE_ALBUM`",
+                "`--album '!NAME'`",
+            );
+        }
+        if toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty()) {
+            warn_deprecated(
+                "`[filters].exclude_albums`",
+                "`!name` entries inside `[filters].albums`",
+            );
+        }
+        let exclude_albums = resolve_vec(sync.exclude_albums, toml_exclude_albums);
+        // Fold deprecated excludes into the raw album list as `!name` so the
+        // new selector grammar performs all validation (contradictions,
+        // sentinel rules) in one place. Legacy excludes also remain on
+        // `Config.exclude_albums` for the unchanged sync pipeline.
+        let mut merged_raw = raw_albums;
+        for name in &exclude_albums {
+            merged_raw.push(format!("!{name}"));
+        }
+        let (albums, parsed_excludes) = resolve_album_selection(merged_raw, &folder_structure)?;
+        // Until PR6, the legacy pipeline reads `Config.exclude_albums`. Use
+        // the deprecated list when supplied so existing behaviour is exact;
+        // otherwise expose any `!name` excludes the user wrote inline so the
+        // new grammar still drives the legacy path.
+        let exclude_albums = if exclude_albums.is_empty() {
+            parsed_excludes
+        } else {
+            exclude_albums
+        };
         let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
         let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
         // Resolve live photo mode: --live-photo-mode > --skip-live-photos > TOML photos > TOML filters compat
@@ -1079,10 +1144,6 @@ impl Config {
         } else {
             LivePhotoMode::Both
         };
-        let exclude_albums = resolve_vec(
-            sync.exclude_albums,
-            toml_filters.and_then(|f| f.exclude_albums.clone()),
-        );
         let raw_smart_folders = resolve_vec(
             sync.smart_folders,
             toml_filters.and_then(|f| f.smart_folders.clone()),
@@ -1474,6 +1535,7 @@ impl Config {
             }),
             filters: Some(TomlFilters {
                 library: library_str,
+                album: None, // emit only the array form; deprecated singular dropped on round-trip
                 libraries: {
                     // Emit only when the user picked something other than
                     // the default (primary). Default `[primary]` round-trips
@@ -4322,7 +4384,7 @@ mod tests {
         let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("'-a all' cannot be combined"),
+            msg.contains("'--album all' cannot be combined with literal album names"),
             "unexpected error: {msg}"
         );
     }
@@ -4367,10 +4429,118 @@ mod tests {
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string(), "Trip".to_string()];
         let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        // Names are normalised through the v0.13 selector grammar, which uses
+        // a BTreeSet for deterministic ordering — alphabetical, regardless of
+        // CLI input order.
         assert_eq!(
             cfg.albums,
-            AlbumSelection::Named(vec!["Vacation".to_string(), "Trip".to_string()])
+            AlbumSelection::Named(vec!["Trip".to_string(), "Vacation".to_string()])
         );
+    }
+
+    #[test]
+    fn test_build_album_inline_exclude_only_implies_all() {
+        // `--album '!Family'` with no positive value resolves to "all minus
+        // Family" via the new grammar; no `--album all` needed.
+        let mut sync = default_sync();
+        sync.albums = vec!["!Family".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::All);
+        assert_eq!(cfg.exclude_albums, vec!["Family".to_string()]);
+    }
+
+    #[test]
+    fn test_build_album_all_with_inline_exclude() {
+        let mut sync = default_sync();
+        sync.albums = vec!["all".to_string(), "!Family".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::All);
+        assert_eq!(cfg.exclude_albums, vec!["Family".to_string()]);
+    }
+
+    #[test]
+    fn test_build_album_named_with_inline_exclude() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string(), "!Family".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(
+            cfg.albums,
+            AlbumSelection::Named(vec!["Vacation".to_string()])
+        );
+        assert_eq!(cfg.exclude_albums, vec!["Family".to_string()]);
+    }
+
+    #[test]
+    fn test_build_album_none_sentinel_maps_to_library_only() {
+        let mut sync = default_sync();
+        sync.albums = vec!["none".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
+    }
+
+    #[test]
+    fn test_build_album_contradiction_bails() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string(), "!Vacation".to_string()];
+        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot both include and exclude"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_album_none_mixed_with_names_bails() {
+        let mut sync = default_sync();
+        sync.albums = vec!["none".to_string(), "Vacation".to_string()];
+        let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'--album none' cannot be combined"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_exclude_album_cli_merges_into_excludes() {
+        // Deprecated --exclude-album still works: each entry feeds into the
+        // selector as `!name` so the legacy and new pipelines both observe it.
+        let mut sync = default_sync();
+        sync.albums = vec!["all".to_string()];
+        sync.exclude_albums = vec!["Family".to_string(), "Hidden".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::All);
+        assert_eq!(cfg.exclude_albums, vec!["Family", "Hidden"]);
+    }
+
+    #[test]
+    fn test_build_toml_album_singular_lifted_into_array() {
+        let toml: TomlConfig = toml::from_str("[filters]\nalbum = \"Vacation\"\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.albums,
+            AlbumSelection::Named(vec!["Vacation".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_build_toml_albums_array_takes_precedence_over_singular() {
+        let toml: TomlConfig =
+            toml::from_str("[filters]\nalbum = \"Singular\"\nalbums = [\"Array\"]\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            default_password(),
+            default_sync(),
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.albums, AlbumSelection::Named(vec!["Array".to_string()]));
     }
 
     // ── folder_structure {album} placement validation ──────────────

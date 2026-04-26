@@ -497,6 +497,16 @@ fn smart_folder_flag_accepts_multiple() {
 }
 
 #[test]
+fn album_flag_accepts_inline_exclusion() {
+    common::cmd()
+        .args([
+            "sync", "--album", "all", "--album", "!Family", "--album", "none", "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
 fn unfiled_flag_accepts_bare_and_explicit_value() {
     common::cmd()
         .args(["sync", "--unfiled", "--help"])
