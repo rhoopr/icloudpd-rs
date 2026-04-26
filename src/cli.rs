@@ -230,9 +230,8 @@ pub struct SyncArgs {
     /// are skipped unless opted in). Accepts the same value grammar as
     /// `--album`: a name, the sentinel `all` (every smart folder except
     /// Hidden / Recently Deleted), `all-with-sensitive` (include those two),
-    /// `none`, or `!name` to exclude. Apple's smart folders are: Favorites,
-    /// Videos, Selfies, Live Photos, Portrait, Long Exposure, Panoramas,
-    /// Screenshots, Bursts, Animated, Slo-mo, Time-lapse, Hidden,
+    /// `none`, or `!name` to exclude. Available names: Favorites, Videos,
+    /// Live, Panoramas, Screenshots, Bursts, Slo-mo, Time-lapse, Hidden,
     /// Recently Deleted.
     #[arg(long = "smart-folder", env = "KEI_SMART_FOLDER", value_parser = non_empty_string)]
     pub smart_folders: Vec<String>,
