@@ -2277,7 +2277,7 @@ fn format_bytes(bytes: u64) -> String {
 
 /// Log a formatted summary of sync statistics.
 pub(super) fn log_sync_summary(title: &str, stats: &super::SyncStats) {
-    tracing::info!("{title}");
+    tracing::info!(title = %title, "Sync summary");
 
     // Line 1: core counts
     let skipped = stats.skipped.total() - stats.skipped.duplicates;

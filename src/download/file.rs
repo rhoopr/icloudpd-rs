@@ -273,7 +273,7 @@ async fn attempt_download<C: DownloadClient>(
     if let Some(ct) = &response.content_type {
         let ct_lower = ct.to_ascii_lowercase();
         if ct_lower.starts_with("text/html") {
-            let _ = fs::remove_file(part_path).await;
+            crate::fs_util::log_remove_async(part_path).await;
             return Err(DownloadError::InvalidContent {
                 path: path_str.into(),
                 reason: format!("server returned content-type: {ct}").into(),
@@ -299,7 +299,7 @@ async fn attempt_download<C: DownloadClient>(
                     expected,
                     "Resume bytes inconsistent with API-reported size; discarding .part and restarting"
                 );
-                let _ = fs::remove_file(&part_path).await;
+                crate::fs_util::log_remove_async(part_path).await;
                 return Err(DownloadError::ContentLengthMismatch {
                     path: path_str.into(),
                     expected,
@@ -315,7 +315,7 @@ async fn attempt_download<C: DownloadClient>(
     // When resuming, open append-only without create (the file must exist —
     // we read its length at the top of this function).
     let mut file = if truncate {
-        let _ = fs::remove_file(&part_path).await;
+        crate::fs_util::log_remove_async(part_path).await;
         OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -367,7 +367,7 @@ async fn attempt_download<C: DownloadClient>(
     drop(file);
     if let Err(e) = stream_result {
         if !e.is_retryable() {
-            let _ = fs::remove_file(&part_path).await;
+            crate::fs_util::log_remove_async(part_path).await;
         }
         return Err(e);
     }
@@ -377,7 +377,7 @@ async fn attempt_download<C: DownloadClient>(
     if let Some(expected_len) = content_length {
         let total_bytes = bytes_written - effective_offset;
         if total_bytes != expected_len {
-            let _ = fs::remove_file(&part_path).await;
+            crate::fs_util::log_remove_async(part_path).await;
             return Err(DownloadError::ContentLengthMismatch {
                 path: path_str.into(),
                 expected: expected_len,
@@ -390,7 +390,7 @@ async fn attempt_download<C: DownloadClient>(
     // Catches truncation when the CDN omits Content-Length (chunked transfer).
     if let Some(expected) = expected_size {
         if bytes_written != expected {
-            let _ = fs::remove_file(&part_path).await;
+            crate::fs_util::log_remove_async(part_path).await;
             return Err(DownloadError::ContentLengthMismatch {
                 path: path_str.into(),
                 expected,
@@ -421,7 +421,7 @@ async fn attempt_download<C: DownloadClient>(
     .await
     .map_err(|e| DownloadError::Disk(Box::new(std::io::Error::other(e))))?;
     if let Err(e) = validation {
-        let _ = fs::remove_file(&part_path).await;
+        crate::fs_util::log_remove_async(part_path).await;
         return Err(e);
     }
 
@@ -813,6 +813,45 @@ mod tests {
         let temp = result.unwrap();
         // The filename should be just the suffix since the encoded part is empty
         assert_eq!(temp.file_name().unwrap().to_str().unwrap(), ".kei-tmp");
+    }
+
+    /// Robustness regression for CF-1 (2026-04-25 review). Apple does
+    /// not publish a content hash for assets, so kei cannot verify
+    /// downloaded bytes against a server-side digest. Instead it stores
+    /// the SHA-256 of what landed on disk in `local_checksum` and surfaces
+    /// post-hoc divergence via `kei verify --checksums`. This pins the
+    /// digest of a fixed JPEG-shaped payload — a future change to the
+    /// hash routine (different algorithm, different buffer windowing,
+    /// alternate hex encoding) will fail this assertion before it
+    /// silently rewrites every user's stored checksum on the next sync.
+    #[tokio::test]
+    async fn compute_sha256_jpeg_payload_pins_digest_for_regression() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("pinned.jpg");
+        // Minimal JFIF-shaped payload: SOI + APP0(JFIF) header + 16 body
+        // bytes + EOI. Magic bytes pass `validate_downloaded_content`.
+        let payload: [u8; 38] = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, // SOI + APP0 length
+            0x4A, 0x46, 0x49, 0x46, 0x00, // "JFIF\0"
+            0x01, 0x01, // version 1.1
+            0x00, // density units
+            0x00, 0x01, 0x00, 0x01, // X / Y density
+            0x00, 0x00, // thumbnail w/h
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF, // body
+            0xFF, 0xD9, // EOI
+        ];
+        std::fs::write(&file_path, payload).unwrap();
+
+        let hash = compute_sha256(&file_path).await.unwrap();
+        assert_eq!(
+            hash, "17ec927c65744de82d16f52109b59283318111f9e3e3258439e624a5755f888c",
+            "SHA-256 of the pinned JPEG fixture changed; if the hash routine \
+             was updated intentionally, every user's stored local_checksum will \
+             diverge from a fresh `verify --checksums` run on the next sync. \
+             Coordinate any change with a state-DB migration that re-hashes \
+             existing rows."
+        );
     }
 
     #[tokio::test]
