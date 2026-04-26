@@ -17,7 +17,7 @@ pub(crate) use password::run_password;
 pub(crate) use reconcile::run_reconcile;
 pub(crate) use reset::{run_reset_state, run_reset_sync_token};
 pub(crate) use service::{
-    attempt_reauth, init_photos_service, resolve_albums, resolve_libraries, wait_and_retry_2fa,
+    attempt_reauth, init_photos_service, resolve_libraries, resolve_passes, wait_and_retry_2fa,
     AlbumPass, AlbumPlan, MAX_REAUTH_ATTEMPTS,
 };
 pub(crate) use status::run_status;

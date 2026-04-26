@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::auth;
 use crate::cli;
 use crate::commands::{
-    attempt_reauth, init_photos_service, resolve_albums, resolve_libraries, wait_and_retry_2fa,
+    attempt_reauth, init_photos_service, resolve_libraries, resolve_passes, wait_and_retry_2fa,
     MAX_REAUTH_ATTEMPTS,
 };
 use crate::config;
@@ -618,13 +618,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     for library in &libraries {
         let zone_name = library.zone_name().to_string();
         let sync_token_key = format!("sync_token:{zone_name}");
-        let plan = resolve_albums(
-            library,
-            &config.albums,
-            &config.exclude_albums,
-            &config.folder_structure,
-        )
-        .await?;
+        let plan = resolve_passes(library, &config.selection).await?;
         library_states.push(LibraryState {
             library: library.clone(),
             zone_name,
@@ -925,19 +919,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             reacquire_session(&shared_session, &config, &password_provider).await;
 
             // Re-resolve albums per-library to discover newly created iCloud albums.
-            // TODO: When --exclude-album is set without --album, this re-fetches the
-            // entire excluded album(s) to collect asset IDs. For large excluded albums
-            // this is expensive -- consider caching exclude_asset_ids across watch
-            // cycles and only refreshing when the album's sync token changes.
+            // The unfiled pass re-fetches each selected album's IDs to refresh the
+            // exclusion set; for libraries with many albums this can be slow under
+            // watch mode. PR12+ may add per-album sync-token caching.
             for lib_state in &mut library_states {
-                match resolve_albums(
-                    &lib_state.library,
-                    &config.albums,
-                    &config.exclude_albums,
-                    &config.folder_structure,
-                )
-                .await
-                {
+                match resolve_passes(&lib_state.library, &config.selection).await {
                     Ok(refreshed) => {
                         lib_state.plan = refreshed;
                         consecutive_album_refresh_failures = 0;
