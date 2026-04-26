@@ -339,8 +339,24 @@ impl std::fmt::Debug for SqliteStateDb {
 
 impl SqliteStateDb {
     /// Open or create a database at the given path.
+    ///
+    /// Creates the parent directory if it doesn't exist; see
+    /// [`StateError::ParentDir`].
     pub async fn open(path: &Path) -> Result<Self, StateError> {
         let path = path.to_path_buf();
+
+        // create_dir_all is idempotent on an existing directory, so concurrent
+        // opens on the same path don't race here. SQLite's own file locking
+        // handles the open() race that follows.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|source| StateError::ParentDir {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+        }
+
         let path_clone = path.clone();
 
         let conn = tokio::task::spawn_blocking(move || {
@@ -3245,6 +3261,75 @@ mod tests {
 
         let result = SqliteStateDb::open(&path).await;
         assert!(result.is_err(), "opening a truncated DB should fail");
+    }
+
+    // Regression test for #264: on a fresh install the cookie/data directory
+    // doesn't exist yet for commands that open the DB before auth runs
+    // (import-existing, status, verify, reset, reconcile). SqliteStateDb::open
+    // must create the parent directory itself rather than letting SQLite fail
+    // with a generic "unable to open database file" (error code 14).
+    #[tokio::test]
+    async fn open_creates_missing_parent_directory() {
+        let dir = test_dir();
+        let nested = dir.path().join("does/not/exist/yet");
+        let path = nested.join("state.db");
+
+        assert!(!nested.exists(), "precondition: parent dir must be missing");
+
+        let db = SqliteStateDb::open(&path)
+            .await
+            .expect("open should create the missing parent directory");
+
+        assert!(nested.is_dir(), "parent directory should be created");
+        assert!(path.is_file(), "DB file should be created");
+
+        // Sanity: the DB is actually usable, not just opened then closed.
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 0);
+        assert_eq!(summary.pending, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_returns_parent_dir_error_on_unwritable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Skip when running as root: 0o555 doesn't restrict root, so the
+        // mkdir would succeed and the assertion below would falsely fail.
+        // SAFETY: libc::geteuid() is a stateless POSIX FFI call with no
+        // preconditions, no side effects, and a uid_t return value; it cannot
+        // violate Rust memory safety.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let dir = test_dir();
+        let readonly = dir.path().join("readonly");
+        tokio::fs::create_dir(&readonly).await.unwrap();
+        tokio::fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let path = readonly.join("nested/state.db");
+        let result = SqliteStateDb::open(&path).await;
+
+        // Restore writable permissions so TempDir cleanup can remove it.
+        tokio::fs::set_permissions(&readonly, fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let err = result.expect_err("expected ParentDir error on read-only parent");
+        match &err {
+            StateError::ParentDir { path: p, .. } => {
+                assert!(
+                    p.starts_with(&readonly),
+                    "ParentDir path {} should be under {}",
+                    p.display(),
+                    readonly.display(),
+                );
+            }
+            other => panic!("expected StateError::ParentDir, got {other:?}"),
+        }
     }
 
     #[tokio::test]

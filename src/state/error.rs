@@ -7,6 +7,19 @@ use thiserror::Error;
 /// Errors that can occur during state database operations.
 #[derive(Error, Debug)]
 pub enum StateError {
+    /// Failed to create the parent directory for the database file.
+    ///
+    /// `SqliteStateDb::open` creates the parent directory before opening
+    /// so SQLite doesn't fail with a generic "unable to open database
+    /// file" on a fresh install (issue #264). This variant surfaces the
+    /// underlying mkdir failure (e.g. permission denied) distinctly from
+    /// a SQLite-level open error.
+    #[error("Failed to create parent directory {path}: {source}")]
+    ParentDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     /// Failed to open or create the database file.
     #[error("Failed to open database at {path}: {source}")]
     Open {
@@ -140,6 +153,27 @@ mod tests {
         assert!(
             display.starts_with("Failed to open database at"),
             "unexpected prefix: {display}"
+        );
+    }
+
+    #[test]
+    fn parent_dir_error_display_includes_path() {
+        let err = StateError::ParentDir {
+            path: PathBuf::from("/tmp/claude/missing/dir"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let display = err.to_string();
+        assert!(
+            display.contains("/tmp/claude/missing/dir"),
+            "expected path in display, got: {display}"
+        );
+        assert!(
+            display.starts_with("Failed to create parent directory"),
+            "unexpected prefix: {display}"
+        );
+        assert!(
+            display.contains("denied"),
+            "expected source message in display, got: {display}"
         );
     }
 }
