@@ -1079,9 +1079,10 @@ impl Config {
         let toml_albums_resolved = toml_albums.or_else(|| toml_album_singular.map(|s| vec![s]));
         let raw_albums = resolve_vec(sync.albums, toml_albums_resolved);
 
-        let cli_excludes_present = !sync.exclude_albums.is_empty();
         let toml_exclude_albums = toml_filters.and_then(|f| f.exclude_albums.clone());
-        if cli_excludes_present {
+        let legacy_excludes_supplied = !sync.exclude_albums.is_empty()
+            || toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty());
+        if !sync.exclude_albums.is_empty() {
             warn_deprecated(
                 "`--exclude-album` / `KEI_EXCLUDE_ALBUM`",
                 "`--album '!NAME'`",
@@ -1103,14 +1104,14 @@ impl Config {
             merged_raw.push(format!("!{name}"));
         }
         let (albums, parsed_excludes) = resolve_album_selection(merged_raw, &folder_structure)?;
-        // Until PR6, the legacy pipeline reads `Config.exclude_albums`. Use
-        // the deprecated list when supplied so existing behaviour is exact;
-        // otherwise expose any `!name` excludes the user wrote inline so the
-        // new grammar still drives the legacy path.
-        let exclude_albums = if exclude_albums.is_empty() {
-            parsed_excludes
-        } else {
+        // Until PR6, the legacy pipeline reads `Config.exclude_albums`. Prefer
+        // the deprecated list when the user actually supplied it (exact legacy
+        // behaviour); otherwise surface inline `!name` excludes so the new
+        // grammar still drives the legacy path.
+        let exclude_albums = if legacy_excludes_supplied {
             exclude_albums
+        } else {
+            parsed_excludes
         };
         let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
         let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
@@ -1118,28 +1119,18 @@ impl Config {
         let live_photo_mode = if let Some(mode) = sync.live_photo_mode {
             mode
         } else if sync.skip_live_photos == Some(true) {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS` is deprecated and will be removed in v0.20.0, use `--live-photo-mode skip` instead"
-                );
-            }
+            warn_deprecated(
+                "`--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS`",
+                "`--live-photo-mode skip`",
+            );
             LivePhotoMode::Skip
         } else if let Some(mode) = toml_photos.and_then(|p| p.live_photo_mode) {
             mode
         } else if toml_filters.and_then(|f| f.skip_live_photos) == Some(true) {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `[filters] skip_live_photos` is deprecated and will be removed in v0.20.0, use `[photos] live_photo_mode = \"skip\"` instead"
-                );
-            }
+            warn_deprecated(
+                "`[filters].skip_live_photos`",
+                "`[photos].live_photo_mode = \"skip\"`",
+            );
             LivePhotoMode::Skip
         } else {
             LivePhotoMode::Both
