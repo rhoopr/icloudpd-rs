@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`kei import-existing` no longer fails on a fresh install.** On a brand-new machine (no prior `kei sync` or `kei login` run), the command bailed out with `Failed to open database at ...: unable to open database file: Error code 14` because the `~/.config/kei/cookies/` parent directory didn't exist yet, and SQLite won't `mkdir -p` for you. `SqliteStateDb::open` now creates the parent directory before opening the DB, so `import-existing` works without the previously-required `kei login` workaround. (#264)
 - **`--file-match-policy name-id7` no longer risks producing a path separator inside a filename.** The 7-char asset-ID suffix baked into every filename was generated via standard base64, whose alphabet includes `/` and `+`. A CloudKit asset ID containing certain bytes (e.g. a `?` early in the ID) would produce `/` as the 4th base64 character, causing kei to drop that asset into a surprise subdirectory instead of the expected filename. kei now uses URL-safe base64 (`-` / `_`) for the suffix. Files that previously got the bug land at a new path on next sync and may re-download once. Added a fuzz test that walks every single-byte input and asserts the suffix only contains `[A-Za-z0-9_-]`.
 
 ### Security
