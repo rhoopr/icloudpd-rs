@@ -237,7 +237,14 @@ fuzz MODE="list" *ARGS="":
                 cargo +nightly fuzz list
                 exit 2
             fi
-            cargo +nightly fuzz run "$target" -- -max_total_time="$seconds"
+            # Pass fuzz/seeds/<target> as an extra corpus dir when it exists, so
+            # checked-in regression inputs replay on every run alongside the
+            # auto-managed fuzz/corpus/<target>/.
+            extra=()
+            if [ -d "fuzz/seeds/$target" ]; then
+                extra+=("fuzz/seeds/$target")
+            fi
+            cargo +nightly fuzz run "$target" "${extra[@]}" -- -max_total_time="$seconds"
             ;;
         *)
             echo "Unknown mode: {{MODE}}" >&2

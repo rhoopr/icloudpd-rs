@@ -29,6 +29,15 @@ tracing = "0.1"
 # whole module via `#[path]` requires them to compile.
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt"] }
+# heif.rs needs these. mp4-atom is pinned to the same git rev as the kei
+# crate (../Cargo.toml) so the inlined module sees the same API surface,
+# including the `uri ` infe-item fix that kei #274 motivated.
+mp4-atom = { git = "https://github.com/kixelated/mp4-atom", rev = "d1e9e923571cbbb42c049aec7f53cd70c6f3d8ff" }
+thiserror = "2"
+# xmp_packet + heif_xmp_probe drive Adobe's vendored XMP Toolkit.
+# `xmp` is feature-gated default-on in kei; the fuzz crate hard-depends on
+# the FFI to keep the harnesses callable from any toolchain.
+xmp_toolkit = "1"
 
 [[bin]]
 name = "cloudkit_json"
@@ -47,6 +56,27 @@ bench = false
 [[bin]]
 name = "paths_sanitization"
 path = "fuzz_targets/paths_sanitization.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "heif_atoms"
+path = "fuzz_targets/heif_atoms.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xmp_packet"
+path = "fuzz_targets/xmp_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "heif_xmp_probe"
+path = "fuzz_targets/heif_xmp_probe.rs"
 test = false
 doc = false
 bench = false
