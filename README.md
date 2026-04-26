@@ -38,7 +38,7 @@ iCloud Photos supported today. Google Takeout and Immich next.
 > | `--folder-structure-smart-folders` | `{smart-folder}` |
 
 > [!TIP]
-> Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) maps every flag and shows how to `kei sync` without re-downloading.
+> Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) shows how to `kei sync` without re-downloading.
 
 ---
 
