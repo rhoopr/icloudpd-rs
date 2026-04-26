@@ -496,6 +496,22 @@ fn smart_folder_flag_accepts_multiple() {
         .success();
 }
 
+#[test]
+fn unfiled_flag_accepts_bare_and_explicit_value() {
+    common::cmd()
+        .args(["sync", "--unfiled", "--help"])
+        .assert()
+        .success();
+    common::cmd()
+        .args(["sync", "--unfiled", "false", "--help"])
+        .assert()
+        .success();
+    common::cmd()
+        .args(["sync", "--unfiled", "true", "--help"])
+        .assert()
+        .success();
+}
+
 // ── Default command (no subcommand = sync) ──────────────────────────────
 
 #[test]

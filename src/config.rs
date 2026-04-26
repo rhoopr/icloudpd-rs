@@ -290,12 +290,18 @@ fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
 ///
 /// Smart folders have no legacy field; `raw_smart_folders` is parsed
 /// directly into a [`SmartFolderSelector`]. Empty list → `None`.
+///
+/// `unfiled_override` is `Some(b)` when the user passed `--unfiled` (or set
+/// `[filters].unfiled` in TOML) and `None` otherwise. When `None`, unfiled is
+/// computed from the legacy `albums` + `folder_structure` truth table so
+/// existing configs keep their current pass set.
 pub(crate) fn derive_selection(
     albums: &AlbumSelection,
     exclude_albums: &[String],
     library: &LibrarySelection,
     folder_structure: &str,
     raw_smart_folders: &[String],
+    unfiled_override: Option<bool>,
 ) -> anyhow::Result<crate::selection::Selection> {
     // Build the raw album list as if the user had written it on the CLI.
     // Feeds through `build_selection` so the production path exercises every
@@ -336,11 +342,11 @@ pub(crate) fn derive_selection(
     // library sweep with no exclusion set" — semantically identical.
     let template_has_album =
         crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}");
-    let unfiled = match albums {
+    let unfiled = unfiled_override.unwrap_or(match albums {
         AlbumSelection::LibraryOnly => true,
         AlbumSelection::All => template_has_album,
         AlbumSelection::Named(_) => false,
-    };
+    });
 
     crate::selection::build_selection(
         &raw_albums,
@@ -1070,6 +1076,35 @@ impl Config {
             }
         }
 
+        let unfiled_override = sync
+            .unfiled
+            .or_else(|| toml_filters.and_then(|f| f.unfiled));
+        // Until the v0.13 resolver lands (PR6), `--unfiled` is recorded on
+        // `selection` but the legacy resolver still decides whether the
+        // unfiled pass runs. Warn when the user's explicit value would diverge
+        // from the legacy default so a `--unfiled false` opt-out doesn't
+        // silently still run the pass.
+        if let Some(explicit) = unfiled_override {
+            let template_has_album =
+                crate::download::paths::strip_python_wrapper(&folder_structure).contains("{album}");
+            let legacy = match &albums {
+                AlbumSelection::LibraryOnly => true,
+                AlbumSelection::All => template_has_album,
+                AlbumSelection::Named(_) => false,
+            };
+            if explicit != legacy {
+                #[allow(
+                    clippy::print_stderr,
+                    reason = "runs during config load, before tracing subscriber is installed"
+                )]
+                {
+                    eprintln!(
+                        "warning: `--unfiled` / `[filters].unfiled` is recognised but not yet wired into the sync pipeline; this run will use the legacy unfiled-pass rules (unfiled = {legacy}). Tracking issue: #215."
+                    );
+                }
+            }
+        }
+
         // Derive the v0.13 [`Selection`] from the legacy `albums` /
         // `exclude_albums` / `library` fields so the new model is populated
         // even before the resolver consumes it. Behaviour-preserving: every
@@ -1081,6 +1116,7 @@ impl Config {
             &library,
             &folder_structure,
             &raw_smart_folders,
+            unfiled_override,
         )?;
         let filename_exclude_strs = resolve_vec(
             sync.filename_exclude,
@@ -5083,6 +5119,69 @@ mod tests {
         sync.smart_folders = vec!["all".to_string(), "all-with-sensitive".to_string()];
         let err = Config::build(&default_globals(), default_password(), sync, None).unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    fn build_with_unfiled(cli: Option<bool>, toml_str: Option<&str>) -> Config {
+        let mut sync = default_sync();
+        sync.unfiled = cli;
+        let toml = toml_str.map(|s| toml::from_str::<TomlConfig>(s).unwrap());
+        Config::build(&default_globals(), default_password(), sync, toml).unwrap()
+    }
+
+    #[test]
+    fn test_unfiled_default_no_flags_is_true() {
+        let cfg = build_with_unfiled(None, None);
+        assert!(
+            cfg.selection.unfiled,
+            "default LibraryOnly should preserve legacy unfiled = true"
+        );
+    }
+
+    #[test]
+    fn test_unfiled_default_with_named_albums_is_false() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string()];
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert!(
+            !cfg.selection.unfiled,
+            "named-album default should preserve legacy unfiled = false"
+        );
+    }
+
+    #[test]
+    fn test_unfiled_cli_true_explicit() {
+        let cfg = build_with_unfiled(Some(true), None);
+        assert!(cfg.selection.unfiled);
+    }
+
+    #[test]
+    fn test_unfiled_cli_false_explicit() {
+        let cfg = build_with_unfiled(Some(false), None);
+        assert!(!cfg.selection.unfiled);
+    }
+
+    #[test]
+    fn test_unfiled_cli_overrides_named_album_legacy() {
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string()];
+        sync.unfiled = Some(true);
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert!(
+            cfg.selection.unfiled,
+            "explicit --unfiled true should win over the named-album legacy default of false"
+        );
+    }
+
+    #[test]
+    fn test_unfiled_from_toml() {
+        let cfg = build_with_unfiled(None, Some("[filters]\nunfiled = false\n"));
+        assert!(!cfg.selection.unfiled);
+    }
+
+    #[test]
+    fn test_unfiled_cli_overrides_toml() {
+        let cfg = build_with_unfiled(Some(true), Some("[filters]\nunfiled = false\n"));
+        assert!(cfg.selection.unfiled);
     }
 
     #[test]

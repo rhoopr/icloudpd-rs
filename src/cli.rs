@@ -236,6 +236,13 @@ pub struct SyncArgs {
     #[arg(long = "smart-folder", env = "KEI_SMART_FOLDER", value_parser = non_empty_string)]
     pub smart_folders: Vec<String>,
 
+    /// Run a separate pass for photos not in any user album. Default: `true`.
+    /// Pass `--unfiled false` to skip the unfiled pass (e.g. when you only
+    /// want named album passes). Independent of `--album`: `--album Vacation`
+    /// still runs the unfiled pass unless this flag is explicitly disabled.
+    #[arg(long, env = "KEI_UNFILED", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub unfiled: Option<bool>,
+
     /// Exclude files matching glob pattern(s) (e.g. "*.AAE", "Screenshot*")
     #[arg(long = "filename-exclude", env = "KEI_FILENAME_EXCLUDE", value_delimiter = ',', value_parser = non_empty_string)]
     pub filename_exclude: Vec<String>,
@@ -817,6 +824,9 @@ impl SyncArgs {
         }
         if self.bandwidth_limit.is_none() {
             self.bandwidth_limit = fallback.bandwidth_limit;
+        }
+        if self.unfiled.is_none() {
+            self.unfiled = fallback.unfiled;
         }
         if self.skip_videos.is_none() {
             self.skip_videos = fallback.skip_videos;
@@ -1974,6 +1984,36 @@ mod tests {
         args.push("--skip-videos");
         let cli = parse(&args);
         assert_eq!(cli.sync.skip_videos, Some(true));
+    }
+
+    #[test]
+    fn test_unfiled_flag_default_none() {
+        let cli = parse(&base_args());
+        assert_eq!(cli.sync.unfiled, None);
+    }
+
+    #[test]
+    fn test_unfiled_flag_bare_true() {
+        let mut args = base_args();
+        args.push("--unfiled");
+        let cli = parse(&args);
+        assert_eq!(cli.sync.unfiled, Some(true));
+    }
+
+    #[test]
+    fn test_unfiled_flag_explicit_false() {
+        let mut args = base_args();
+        args.extend(["--unfiled", "false"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.unfiled, Some(false));
+    }
+
+    #[test]
+    fn test_unfiled_flag_explicit_true() {
+        let mut args = base_args();
+        args.extend(["--unfiled", "true"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.unfiled, Some(true));
     }
 
     #[test]
