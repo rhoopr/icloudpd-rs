@@ -138,32 +138,29 @@ fn split_exclusion(raw: &str) -> (&str, bool) {
     raw.strip_prefix('!').map_or((raw, false), |r| (r, true))
 }
 
-/// Sentinel words recognised across categories. Returned as borrowed `&str`
-/// so we can compare without allocating.
-fn is_sentinel_all(s: &str) -> bool {
-    s.eq_ignore_ascii_case("all")
-}
-
-fn is_sentinel_none(s: &str) -> bool {
-    s.eq_ignore_ascii_case("none")
-}
-
-fn is_sentinel_all_with_sensitive(s: &str) -> bool {
-    s.eq_ignore_ascii_case("all-with-sensitive")
-}
-
-fn is_sentinel_primary(s: &str) -> bool {
-    s.eq_ignore_ascii_case("primary")
-}
-
-fn is_sentinel_shared(s: &str) -> bool {
-    s.eq_ignore_ascii_case("shared")
+/// Insert into a BTreeSet, bailing if the value was already present. The
+/// duplicate-check pattern repeats across every parser; this lets callers
+/// describe the offending item once.
+fn insert_unique(
+    set: &mut BTreeSet<String>,
+    value: String,
+    flag: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        set.insert(value),
+        "--{flag} '{name}' specified more than once"
+    );
+    Ok(())
 }
 
 /// Parse `--album` raw values into an [`AlbumSelector`]. `default_to_all` is
 /// true when the user passed no `--album` flag at all (so the bare `!Foo`
 /// exclusion case still resolves to "all minus Foo").
-pub fn parse_album_selector(raw: &[String], default_to_all: bool) -> anyhow::Result<AlbumSelector> {
+pub(crate) fn parse_album_selector(
+    raw: &[String],
+    default_to_all: bool,
+) -> anyhow::Result<AlbumSelector> {
     if raw.is_empty() {
         return Ok(if default_to_all {
             AlbumSelector::default()
@@ -181,28 +178,27 @@ pub fn parse_album_selector(raw: &[String], default_to_all: bool) -> anyhow::Res
         let trimmed = entry.trim();
         anyhow::ensure!(!trimmed.is_empty(), "--album value must not be empty");
         let (name, is_exclude) = split_exclusion(trimmed);
-        if is_sentinel_all(name) {
+        if name.eq_ignore_ascii_case("all") {
             anyhow::ensure!(
                 !is_exclude,
                 "'!all' is not a valid --album value; pass --album none instead"
             );
             has_all = true;
-        } else if is_sentinel_none(name) {
+        } else if name.eq_ignore_ascii_case("none") {
             anyhow::ensure!(
                 !is_exclude,
                 "'!none' is not a valid --album value; just omit it"
             );
             has_none = true;
         } else if is_exclude {
-            anyhow::ensure!(
-                excluded.insert(name.to_string()),
-                "--album '!{name}' specified more than once"
-            );
+            insert_unique(
+                &mut excluded,
+                name.to_string(),
+                "album",
+                &format!("!{name}"),
+            )?;
         } else {
-            anyhow::ensure!(
-                included.insert(name.to_string()),
-                "--album '{name}' specified more than once"
-            );
+            insert_unique(&mut included, name.to_string(), "album", name)?;
         }
     }
 
@@ -231,7 +227,7 @@ pub fn parse_album_selector(raw: &[String], default_to_all: bool) -> anyhow::Res
 
 /// Parse `--smart-folder` raw values. Default is `None` — smart folders are
 /// off unless the user opts in.
-pub fn parse_smart_folder_selector(raw: &[String]) -> anyhow::Result<SmartFolderSelector> {
+pub(crate) fn parse_smart_folder_selector(raw: &[String]) -> anyhow::Result<SmartFolderSelector> {
     if raw.is_empty() {
         return Ok(SmartFolderSelector::None);
     }
@@ -249,28 +245,27 @@ pub fn parse_smart_folder_selector(raw: &[String]) -> anyhow::Result<SmartFolder
             "--smart-folder value must not be empty"
         );
         let (name, is_exclude) = split_exclusion(trimmed);
-        if is_sentinel_all(name) {
+        if name.eq_ignore_ascii_case("all") {
             anyhow::ensure!(!is_exclude, "'!all' is not a valid --smart-folder value");
             has_all = true;
-        } else if is_sentinel_all_with_sensitive(name) {
+        } else if name.eq_ignore_ascii_case("all-with-sensitive") {
             anyhow::ensure!(
                 !is_exclude,
                 "'!all-with-sensitive' is not a valid --smart-folder value"
             );
             has_all_sensitive = true;
-        } else if is_sentinel_none(name) {
+        } else if name.eq_ignore_ascii_case("none") {
             anyhow::ensure!(!is_exclude, "'!none' is not a valid --smart-folder value");
             has_none = true;
         } else if is_exclude {
-            anyhow::ensure!(
-                excluded.insert(name.to_string()),
-                "--smart-folder '!{name}' specified more than once"
-            );
+            insert_unique(
+                &mut excluded,
+                name.to_string(),
+                "smart-folder",
+                &format!("!{name}"),
+            )?;
         } else {
-            anyhow::ensure!(
-                included.insert(name.to_string()),
-                "--smart-folder '{name}' specified more than once"
-            );
+            insert_unique(&mut included, name.to_string(), "smart-folder", name)?;
         }
     }
 
@@ -312,7 +307,7 @@ pub fn parse_smart_folder_selector(raw: &[String]) -> anyhow::Result<SmartFolder
 ///
 /// Default (empty input) = `primary = true` only. Sentinels: `primary`,
 /// `shared`, `all`, `none`, plus literal zone names / friendly aliases.
-pub fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySelector> {
+pub(crate) fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySelector> {
     if raw.is_empty() {
         return Ok(LibrarySelector::default());
     }
@@ -330,40 +325,43 @@ pub fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySelector>
         let trimmed = entry.trim();
         anyhow::ensure!(!trimmed.is_empty(), "--library value must not be empty");
         let (name, is_exclude) = split_exclusion(trimmed);
-        if is_sentinel_all(name) {
+        if name.eq_ignore_ascii_case("all") {
             anyhow::ensure!(!is_exclude, "'!all' is not a valid --library value");
             has_all = true;
-        } else if is_sentinel_none(name) {
+        } else if name.eq_ignore_ascii_case("none") {
             anyhow::ensure!(!is_exclude, "'!none' is not a valid --library value");
             has_none = true;
-        } else if is_sentinel_primary(name) {
+        } else if name.eq_ignore_ascii_case("primary") {
             if is_exclude {
-                anyhow::ensure!(
-                    sel.excluded.insert("primary".to_string()),
-                    "--library '!primary' specified more than once"
-                );
+                insert_unique(
+                    &mut sel.excluded,
+                    "primary".to_string(),
+                    "library",
+                    "!primary",
+                )?;
             } else {
                 sel.primary = true;
             }
-        } else if is_sentinel_shared(name) {
+        } else if name.eq_ignore_ascii_case("shared") {
             if is_exclude {
-                anyhow::ensure!(
-                    sel.excluded.insert("shared".to_string()),
-                    "--library '!shared' specified more than once"
-                );
+                insert_unique(
+                    &mut sel.excluded,
+                    "shared".to_string(),
+                    "library",
+                    "!shared",
+                )?;
             } else {
                 sel.shared_all = true;
             }
         } else if is_exclude {
-            anyhow::ensure!(
-                sel.excluded.insert(name.to_string()),
-                "--library '!{name}' specified more than once"
-            );
+            insert_unique(
+                &mut sel.excluded,
+                name.to_string(),
+                "library",
+                &format!("!{name}"),
+            )?;
         } else {
-            anyhow::ensure!(
-                sel.named.insert(name.to_string()),
-                "--library '{name}' specified more than once"
-            );
+            insert_unique(&mut sel.named, name.to_string(), "library", name)?;
         }
     }
 
@@ -414,7 +412,7 @@ fn contradiction_check(
 /// `cli_smart_folders` and `cli_libraries` are the matching raw lists.
 /// `unfiled_explicit` is the explicit `--unfiled` value if the user passed
 /// one, `None` to use the default (`true`).
-pub fn build_selection(
+pub(crate) fn build_selection(
     raw_albums: &[String],
     raw_smart_folders: &[String],
     raw_libraries: &[String],
