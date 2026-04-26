@@ -209,6 +209,43 @@ release TARGET="":
         in_section { print }
     ' CHANGELOG.md | sed '/./,$!d' | awk 'NR==1 && /^$/ {next} {print}'
 
+# Fuzz: list | build | run TARGET [SECONDS]. Requires nightly + cargo-fuzz; install with `rustup install nightly && cargo install cargo-fuzz`.
+fuzz MODE="list" *ARGS="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v cargo-fuzz >/dev/null 2>&1; then
+        echo "cargo-fuzz not installed. Run: cargo install cargo-fuzz" >&2
+        exit 1
+    fi
+    if ! rustup toolchain list | grep -q '^nightly'; then
+        echo "nightly toolchain not installed. Run: rustup install nightly" >&2
+        exit 1
+    fi
+    case "{{MODE}}" in
+        list)
+            cargo +nightly fuzz list
+            ;;
+        build)
+            cargo +nightly fuzz build
+            ;;
+        run)
+            args=({{ARGS}})
+            target="${args[0]:-}"
+            seconds="${args[1]:-60}"
+            if [ -z "$target" ]; then
+                echo "usage: just fuzz run TARGET [SECONDS]" >&2
+                cargo +nightly fuzz list
+                exit 2
+            fi
+            cargo +nightly fuzz run "$target" -- -max_total_time="$seconds"
+            ;;
+        *)
+            echo "Unknown mode: {{MODE}}" >&2
+            echo "Modes: list | build | run TARGET [SECONDS]" >&2
+            exit 1
+            ;;
+    esac
+
 # Create branch NAME off a freshly fetched origin/main (CLAUDE.md branch-from-fresh-main rule).
 branch NAME:
     #!/usr/bin/env bash

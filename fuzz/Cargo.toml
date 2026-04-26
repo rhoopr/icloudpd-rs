@@ -1,0 +1,52 @@
+[package]
+name = "kei-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Fuzz harnesses inline the modules under test via `#[path]` rather than
+# depending on the `kei` crate as a library — kei is a binary-only crate and
+# the parsers we want to fuzz are `pub(crate)`. Each harness re-imports the
+# external dependencies directly so we don't pull in the kei build graph.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# Match the versions declared in ../Cargo.toml so the inlined modules
+# compile against the same trait/impl set as production.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+plist = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+rustc-hash = "2.1"
+tracing = "0.1"
+# paths.rs's `generate_fingerprint_filename` and `DirCache::ensure_dir_async`
+# pull these in. The harness doesn't drive those code paths, but inlining the
+# whole module via `#[path]` requires them to compile.
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt"] }
+
+[[bin]]
+name = "cloudkit_json"
+path = "fuzz_targets/cloudkit_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "enc_decoders"
+path = "fuzz_targets/enc_decoders.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "paths_sanitization"
+path = "fuzz_targets/paths_sanitization.rs"
+test = false
+doc = false
+bench = false
