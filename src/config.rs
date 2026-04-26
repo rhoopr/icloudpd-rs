@@ -270,6 +270,37 @@ fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Today's truth table for whether the unfiled pass runs, derived from the
+/// legacy `(albums, folder_structure)` tuple. Replaced by `Selection.unfiled`
+/// once PR6 lands the new resolver; until then both `Config::build` (to detect
+/// divergence from `--unfiled`) and `derive_selection` (to fill the default)
+/// need the same answer.
+fn legacy_unfiled_default(albums: &AlbumSelection, folder_structure: &str) -> bool {
+    let template_has_album =
+        crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}");
+    match albums {
+        AlbumSelection::LibraryOnly => true,
+        AlbumSelection::All => template_has_album,
+        AlbumSelection::Named(_) => false,
+    }
+}
+
+/// Stderr warning for v0.13 selection flags that are parsed but not yet
+/// consumed by the sync pipeline (PR6 wires them in). `flag_pair` is the
+/// `` `--cli` / `[toml]` `` rendering; `effect` describes the run's actual
+/// behaviour so users see the divergence from their explicit value.
+fn warn_selection_flag_unimplemented(flag_pair: &str, effect: &str) {
+    #[allow(
+        clippy::print_stderr,
+        reason = "runs during config load, before tracing subscriber is installed"
+    )]
+    {
+        eprintln!(
+            "warning: {flag_pair} is recognised but not yet wired into the sync pipeline; this run will {effect}. Tracking issue: #215."
+        );
+    }
+}
+
 /// Translate the legacy `(AlbumSelection, exclude_albums, LibrarySelection,
 /// folder_structure)` tuple plus the new `raw_smart_folders` raw list into
 /// the v0.13 [`Selection`]. Pure function so the truth table is testable
@@ -340,13 +371,8 @@ pub(crate) fn derive_selection(
     // is itself an unfiled-equivalent, so we mark unfiled = true for it too;
     // the new resolver will treat that as "skip per-album passes, run one
     // library sweep with no exclusion set" — semantically identical.
-    let template_has_album =
-        crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}");
-    let unfiled = unfiled_override.unwrap_or(match albums {
-        AlbumSelection::LibraryOnly => true,
-        AlbumSelection::All => template_has_album,
-        AlbumSelection::Named(_) => false,
-    });
+    let unfiled =
+        unfiled_override.unwrap_or_else(|| legacy_unfiled_default(albums, folder_structure));
 
     crate::selection::build_selection(
         &raw_albums,
@@ -1061,47 +1087,26 @@ impl Config {
             sync.smart_folders,
             toml_filters.and_then(|f| f.smart_folders.clone()),
         );
-        // Until the v0.13 resolver lands (PR6), `--smart-folder` is parsed
-        // and stored on `selection` but not consumed by the sync pipeline.
-        // Warn so users don't silently get nothing back.
+        // PR2-PR9 selection flags are parsed into `selection` before the new
+        // resolver lands in PR6, so warn whenever an explicit value would not
+        // match the legacy pipeline's behaviour.
         if !raw_smart_folders.is_empty() {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--smart-folder` / `[filters].smart_folders` is recognised but not yet wired into the sync pipeline; this run will not download smart folders. Tracking issue: #215."
-                );
-            }
+            warn_selection_flag_unimplemented(
+                "`--smart-folder` / `[filters].smart_folders`",
+                "not download smart folders",
+            );
         }
 
         let unfiled_override = sync
             .unfiled
             .or_else(|| toml_filters.and_then(|f| f.unfiled));
-        // Until the v0.13 resolver lands (PR6), `--unfiled` is recorded on
-        // `selection` but the legacy resolver still decides whether the
-        // unfiled pass runs. Warn when the user's explicit value would diverge
-        // from the legacy default so a `--unfiled false` opt-out doesn't
-        // silently still run the pass.
         if let Some(explicit) = unfiled_override {
-            let template_has_album =
-                crate::download::paths::strip_python_wrapper(&folder_structure).contains("{album}");
-            let legacy = match &albums {
-                AlbumSelection::LibraryOnly => true,
-                AlbumSelection::All => template_has_album,
-                AlbumSelection::Named(_) => false,
-            };
+            let legacy = legacy_unfiled_default(&albums, &folder_structure);
             if explicit != legacy {
-                #[allow(
-                    clippy::print_stderr,
-                    reason = "runs during config load, before tracing subscriber is installed"
-                )]
-                {
-                    eprintln!(
-                        "warning: `--unfiled` / `[filters].unfiled` is recognised but not yet wired into the sync pipeline; this run will use the legacy unfiled-pass rules (unfiled = {legacy}). Tracking issue: #215."
-                    );
-                }
+                warn_selection_flag_unimplemented(
+                    "`--unfiled` / `[filters].unfiled`",
+                    &format!("use the legacy unfiled-pass rules (unfiled = {legacy})"),
+                );
             }
         }
 
