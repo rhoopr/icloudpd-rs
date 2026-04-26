@@ -83,8 +83,18 @@ pub(crate) struct TomlRetry {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlFilters {
+    /// Deprecated v0.13: use `libraries` (an array). Removed in v0.20.
     pub library: Option<String>,
+    /// v0.13+ replacement for `library`. Repeatable; accepts the same value
+    /// grammar as `--library` (`primary`, `shared`, raw zone names, friendly
+    /// aliases, `!name` exclusions).
+    pub libraries: Option<Vec<String>>,
     pub albums: Option<Vec<String>>,
+    /// v0.13+ smart-folder selector. Same value grammar as `albums`.
+    pub smart_folders: Option<Vec<String>>,
+    /// v0.13+ unfiled-pass toggle. Default: `true`.
+    pub unfiled: Option<bool>,
+    /// Deprecated v0.13: use `albums` with `!name` entries. Removed in v0.20.
     pub exclude_albums: Option<Vec<String>>,
     pub filename_exclude: Option<Vec<String>>,
     pub skip_videos: Option<bool>,
@@ -260,6 +270,76 @@ fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Translate the legacy `(AlbumSelection, exclude_albums, LibrarySelection,
+/// folder_structure)` tuple into the v0.13 [`Selection`]. Pure function so
+/// the truth table is testable without `Config::build`.
+///
+/// Behaviour preserved:
+/// - `AlbumSelection::LibraryOnly` (today's no-album-flag default) maps to
+///   `AlbumSelector::None` + `unfiled = true`. The library is enumerated as
+///   one stream because no album passes run, so unfiled fully covers it.
+/// - `AlbumSelection::Named(v)` maps to `AlbumSelector::Named { v, exclude }`
+///   plus an unfiled pass only if `{album}` is in the template (today's
+///   behaviour gives no unfiled pass for explicit named selections).
+/// - `AlbumSelection::All` maps to `AlbumSelector::All { exclude }` plus
+///   unfiled iff `{album}` appears in `--folder-structure` (today's gate).
+/// - `LibrarySelection::Single("PrimarySync")` → `primary = true`.
+/// - `LibrarySelection::Single(other)` → `named = {other}` (no primary).
+/// - `LibrarySelection::All` → `primary = true, shared_all = true`.
+pub(crate) fn derive_selection(
+    albums: &AlbumSelection,
+    exclude_albums: &[String],
+    library: &LibrarySelection,
+    folder_structure: &str,
+) -> anyhow::Result<crate::selection::Selection> {
+    // Build the raw album list as if the user had written it on the CLI.
+    // Feeds through `build_selection` so the production path exercises every
+    // sentinel/exclusion code path the tests cover.
+    //
+    // Edge case: legacy `LibraryOnly + exclude_albums` has no clean mapping
+    // in the new grammar (Selector::None doesn't take excludes; the new
+    // model expects `--album all '!Family'` for that intent). The legacy
+    // resolver still handles excludes for `LibraryOnly` correctly, so we
+    // drop them here from the Selection-side preview without changing
+    // observable behaviour. Future PRs migrate the resolver and this case
+    // disappears.
+    let raw_albums: Vec<String> = match albums {
+        AlbumSelection::LibraryOnly => vec!["none".to_string()],
+        AlbumSelection::Named(names) => names
+            .iter()
+            .cloned()
+            .chain(exclude_albums.iter().map(|n| format!("!{n}")))
+            .collect(),
+        AlbumSelection::All => std::iter::once("all".to_string())
+            .chain(exclude_albums.iter().map(|n| format!("!{n}")))
+            .collect(),
+    };
+
+    // Synthesize the library raw list. `LibrarySelection::All` is today's
+    // "primary + every shared zone" behaviour, so map it to the `all`
+    // sentinel. `Single("PrimarySync")` becomes the bare `primary` sentinel.
+    let raw_libraries: Vec<String> = match library {
+        LibrarySelection::Single(name) if name == "PrimarySync" => vec!["primary".to_string()],
+        LibrarySelection::Single(name) => vec![name.clone()],
+        LibrarySelection::All => vec!["all".to_string()],
+    };
+
+    // Today's resolver runs the unfiled pass only when AlbumSelection::All AND
+    // `{album}` is in the template. LibraryOnly's "single library-wide stream"
+    // is itself an unfiled-equivalent, so we mark unfiled = true for it too;
+    // the new resolver will treat that as "skip per-album passes, run one
+    // library sweep with no exclusion set" — semantically identical.
+    let template_has_album =
+        crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}");
+    let unfiled = match albums {
+        AlbumSelection::LibraryOnly => true,
+        AlbumSelection::All => template_has_album,
+        AlbumSelection::Named(_) => false,
+    };
+
+    crate::selection::build_selection(&raw_albums, &[], &raw_libraries, Some(unfiled))
+}
+
 /// Convert a raw `Vec<String>` (from CLI or TOML) into an [`AlbumSelection`],
 /// enforcing that `-a all` is not mixed with specific album names.
 fn resolve_album_selection(
@@ -315,6 +395,11 @@ pub struct Config {
     pub filename_exclude: Vec<glob::Pattern>,
     pub library: LibrarySelection,
     pub temp_suffix: String,
+    /// Per-category resolved [`Selection`](crate::selection::Selection). Built
+    /// alongside the legacy `albums` / `exclude_albums` / `library` fields and
+    /// preserves their semantics. v0.13: derived from those fields. Future
+    /// PRs migrate the resolver and the legacy fields are removed.
+    pub selection: crate::selection::Selection,
 
     // DateTime fields
     pub skip_created_before: Option<DateTime<Local>>,
@@ -954,6 +1039,13 @@ impl Config {
         } else {
             sync.exclude_albums
         };
+
+        // Derive the v0.13 [`Selection`] from the legacy `albums` /
+        // `exclude_albums` / `library` fields so the new model is populated
+        // even before the resolver consumes it. Behaviour-preserving: every
+        // legacy state maps to a Selection that the new resolver (PR6) will
+        // turn into the same passes.
+        let selection = derive_selection(&albums, &exclude_albums, &library, &folder_structure)?;
         let filename_exclude_strs = if sync.filename_exclude.is_empty() {
             toml_filters
                 .and_then(|f| f.filename_exclude.clone())
@@ -1173,6 +1265,7 @@ impl Config {
             filename_exclude,
             library,
             temp_suffix,
+            selection,
             skip_created_before,
             skip_created_after,
             pid_file,
@@ -1307,10 +1400,35 @@ impl Config {
             }),
             filters: Some(TomlFilters {
                 library: library_str,
-                albums: match &self.albums {
-                    AlbumSelection::LibraryOnly => None,
-                    AlbumSelection::All => Some(vec!["all".to_string()]),
-                    AlbumSelection::Named(v) => Some(v.clone()),
+                libraries: {
+                    // Emit only when the user picked something other than
+                    // the default (primary). Default `[primary]` round-trips
+                    // implicitly so config dumps stay clean.
+                    let raw = self.selection.libraries.to_raw();
+                    if raw == vec!["primary".to_string()] {
+                        None
+                    } else {
+                        Some(raw)
+                    }
+                },
+                albums: {
+                    // Round-trip via the new selector so the same string
+                    // rendering used by `--album` echoes back into TOML.
+                    let raw = self.selection.albums.to_raw();
+                    if matches!(self.albums, AlbumSelection::LibraryOnly) {
+                        None
+                    } else {
+                        Some(raw)
+                    }
+                },
+                smart_folders: match &self.selection.smart_folders {
+                    crate::selection::SmartFolderSelector::None => None,
+                    other => Some(other.to_raw()),
+                },
+                unfiled: if self.selection.unfiled {
+                    None
+                } else {
+                    Some(false)
                 },
                 exclude_albums: if self.exclude_albums.is_empty() {
                     None

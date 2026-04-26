@@ -41,6 +41,7 @@ mod notifications;
 mod password;
 mod report;
 mod retry;
+mod selection;
 mod setup;
 mod shutdown;
 mod state;

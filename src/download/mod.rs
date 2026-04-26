@@ -2229,6 +2229,7 @@ mod tests {
             filename_exclude: vec![],
             library: crate::config::LibrarySelection::Single("PrimarySync".into()),
             temp_suffix: dl_config.temp_suffix.to_string(),
+            selection: crate::selection::Selection::default(),
             skip_created_before: None,
             skip_created_after: None,
             pid_file: None,
