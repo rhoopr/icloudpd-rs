@@ -224,10 +224,11 @@ pub(crate) fn resolve_library_selection(
              pass a single zone name or use `--library all`"
         );
     }
+    // `primary + shared` ≡ today's `--library all`: include every zone.
+    if selector.primary && selector.shared_all && selector.named.is_empty() {
+        return Ok(LibrarySelection::All);
+    }
     if selector.primary && (selector.shared_all || !selector.named.is_empty()) {
-        if selector.shared_all && selector.named.is_empty() {
-            return Ok(LibrarySelection::All);
-        }
         anyhow::bail!(
             "combining `--library primary` with shared zones requires the v0.13 multi-library resolver (tracked in PR6); \
              pass `--library all` for every library or a single zone name"
