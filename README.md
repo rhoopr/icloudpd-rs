@@ -15,6 +15,19 @@
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
 </p>
 
+> [!IMPORTANT]
+> v0.13 reshapes selection and folder-structure flags. `--exclude-album NAME` becomes `--album '!NAME'`. `--library` accepts multiple values. `kei sync` with no flags now runs per-album passes plus an unfiled pass. Legacy `{album}` in `--folder-structure` auto-migrates with a warning until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md).
+>
+> | Flag | Default |
+> |---|---|
+> | `--album` | `all` |
+> | `--smart-folder` | `none` |
+> | `--library` | `primary` |
+> | `--unfiled` | `true` |
+> | `--folder-structure` | `%Y/%m/%d` |
+> | `--folder-structure-albums` | `{album}` |
+> | `--folder-structure-smart-folders` | `{smart-folder}` |
+
 Sync your cloud photos to local storage. Fast, resumable, single binary, runs unattended.
 
 - Parallel downloads with incremental sync (seconds on large libraries after the first run)
