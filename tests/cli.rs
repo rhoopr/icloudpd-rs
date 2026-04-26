@@ -524,6 +524,32 @@ fn album_flag_accepts_inline_exclusion() {
 }
 
 #[test]
+fn folder_structure_albums_flag_parses() {
+    common::cmd()
+        .args([
+            "sync",
+            "--folder-structure-albums",
+            "{album}/%Y/%m/%d",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn folder_structure_smart_folders_flag_parses() {
+    common::cmd()
+        .args([
+            "sync",
+            "--folder-structure-smart-folders",
+            "{smart-folder}/%Y",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
 fn unfiled_flag_accepts_bare_and_explicit_value() {
     common::cmd()
         .args(["sync", "--unfiled", "--help"])

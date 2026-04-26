@@ -315,6 +315,20 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
 
+    /// Folder structure used by every album pass. Default `{album}` (flat
+    /// per-album folders, no inherited date hierarchy). Set to e.g.
+    /// `"{album}/%Y/%m/%d"` to add a date hierarchy inside each album
+    /// folder. Wired into the path renderer in a follow-up PR (#215).
+    #[arg(long, env = "KEI_FOLDER_STRUCTURE_ALBUMS")]
+    pub folder_structure_albums: Option<String>,
+
+    /// Folder structure used by every smart-folder pass. Default
+    /// `{smart-folder}` (flat per-smart-folder folders). Set to e.g.
+    /// `"{smart-folder}/%Y/%m/%d"` to add a date hierarchy. Wired into the
+    /// path renderer in a follow-up PR (#215).
+    #[arg(long, env = "KEI_FOLDER_STRUCTURE_SMART_FOLDERS")]
+    pub folder_structure_smart_folders: Option<String>,
+
     /// Write `DateTimeOriginal` EXIF tag if missing
     #[cfg(feature = "xmp")]
     #[arg(long, env = "KEI_SET_EXIF_DATETIME", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
@@ -848,6 +862,14 @@ impl SyncArgs {
         }
         if self.folder_structure.is_none() {
             self.folder_structure.clone_from(&fallback.folder_structure);
+        }
+        if self.folder_structure_albums.is_none() {
+            self.folder_structure_albums
+                .clone_from(&fallback.folder_structure_albums);
+        }
+        if self.folder_structure_smart_folders.is_none() {
+            self.folder_structure_smart_folders
+                .clone_from(&fallback.folder_structure_smart_folders);
         }
         #[cfg(feature = "xmp")]
         {
