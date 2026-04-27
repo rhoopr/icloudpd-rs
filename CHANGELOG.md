@@ -20,6 +20,7 @@ Selection and folder-structure flag redesign. `--exclude-album` becomes `--album
 - **`{library}` token in folder-structure templates.** Renders as `PrimarySync` or a truncated raw zone name (`SharedSync-A1B2C3D4`) so users running multi-library syncs can keep paths separate. Allowed in any template; must be the first path segment; single occurrence. Combined with `{album}` or `{smart-folder}`, the order is always `{library}/{album}/...`. The truncated form is what the flag accepts back, so a path segment can be copied directly into `--library`. ([#215])
 - **Per-zone primary key in the state DB (schema v8).** The `assets` table now keys on `(library, id, version_size)` so an asset present in both PrimarySync and a shared library tracks two distinct rows instead of silently sharing one. Existing rows backfill to `library = "PrimarySync"` on first sync after upgrade -- accounts that were already syncing only the primary library see no behavior change. Users who had shared libraries pre-v8 may have a small set of misattributed rows from the backfill; the next sync writes correct per-zone rows alongside, and the misattributed leftovers are harmless (they don't trigger re-downloads since the live asset is keyed correctly). ([#215])
 - **Multi-library commingle warning at startup.** When more than one library is in scope and none of the active templates includes `{library}`, kei warns that paths share a namespace and the state DB will dedup cross-library matches by ID. Informational; the run continues. Users who want intentional merge see the warning and ignore it; users who wanted separation get pointed at `{library}`. ([#215])
+- **Fuzz harnesses for 10 parser entry points.** New `fuzz/` directory with cargo-fuzz targets covering CloudKit JSON deserializers, auth responses (SRP init, account login, 2FA challenge), TOML config, the `*Enc` field decoders, path sanitization, HEIF atom walking, the HEIF XMP probe pipeline, Adobe XMP Toolkit (run via FFI so ASan can see C++ memory bugs), `PhotoAsset::from_records`, and the state enum `from_str` parsers. Checked-in seeds under `fuzz/seeds/` include two OOM regression repros for an upstream `mp4-atom` bug that kei calls synchronously during the EXIF probe. `just fuzz run TARGET` replays them on every invocation. ([#287])
 
 ### Changed
 
@@ -27,6 +28,8 @@ Selection and folder-structure flag redesign. `--exclude-album` becomes `--album
 - **`--folder-structure` now drives only the unfiled pass.** Album passes consume `--folder-structure-albums`; smart-folder passes consume `--folder-structure-smart-folders`. The legacy `{album}`-in-base auto-migrates with a warning (split across the two new templates) so existing configs keep working through v0.19. Removed in v0.20. ([#215])
 - **`--library` now matches album names across every library in scope.** `--album Family` resolves to an album named "Family" in every selected library. To get distinct paths per library, add `{library}` to the relevant template; otherwise paths commingle and the state DB dedups by asset ID (same rule the multi-library warning surfaces at startup). ([#215])
 - **First sync after upgrade triggers a full enumeration.** The sync-token invalidation hash now folds in the new library selector shape (and the per-zone state DB key), so existing sync tokens hash differently and kei refetches the full asset list once before resuming incremental syncs. Subsequent runs return to incremental performance. No data loss; idempotent. ([#215])
+- **kei now compiles as a library plus a thin binary shim.** `src/main.rs` is a 7-line entry point that calls `kei::main_inner()`; the module tree moved verbatim into `src/lib.rs`. Behavior is identical: `cargo install kei`, the docker image, and `cargo run` all build and run the same binary. The crate has a lib target now, which lets the in-tree fuzz harnesses depend on it directly instead of re-inlining source files via `#[path]`. A new `__fuzz_internals` Cargo feature gates `pub mod __fuzz` containing wrappers around `pub(crate)` parser entry points; default builds don't include it. ([#287])
+- **Live recovery tests now print kei's stderr on failure.** `sync_recovers_deleted_file` and `sync_truncated_file_does_not_cause_data_loss` previously panicked with just "deleted file should be re-downloaded" or "correctly-sized photo must be on disk". kei had exited 0, so `assert().success()` discarded stderr before the disk-state check ran, leaving nothing actionable when the tests failed intermittently. Both now run with `RUST_LOG=kei=debug` and include the captured stderr plus a post-sync walkdir in the panic message. ([#287])
 
 ### Deprecated
 
@@ -100,6 +103,7 @@ Selection and folder-structure flag redesign. `--exclude-album` becomes `--album
 [#269]: https://github.com/rhoopr/kei/issues/269
 [#272]: https://github.com/rhoopr/kei/issues/272
 [#274]: https://github.com/rhoopr/kei/issues/274
+[#287]: https://github.com/rhoopr/kei/pull/287
 
 ---
 
