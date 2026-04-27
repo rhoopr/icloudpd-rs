@@ -1524,52 +1524,6 @@ fn sync_report_json_writes_valid_schema() {
     });
 }
 
-/// Verify passing the same album twice still downloads exactly once (dedup).
-///
-/// Exercises the multi-`--album` code path end-to-end. A richer test would
-/// use two distinct small albums, but only `kei-test` exists in the
-/// test account, so we assert dedup as the minimal multi-filter invariant.
-#[test]
-#[ignore]
-fn sync_multi_album_dedups() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
-    common::with_auth_retry(|| {
-        let download_dir = tempdir().expect("tempdir");
-
-        common::cmd()
-            .args([
-                "sync",
-                "--album",
-                album(),
-                "--album",
-                album(),
-                "--username",
-                &username,
-                "--password",
-                &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-                "--directory",
-                download_dir.path().to_str().unwrap(),
-                "--no-progress-bar",
-                "--no-incremental",
-            ])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
-
-        let files = common::walkdir(download_dir.path());
-        assert_eq!(
-            files.len(),
-            3,
-            "duplicate album names should dedup to 3 files, got {}: {:?}",
-            files.len(),
-            files
-        );
-    });
-}
-
 // ── Download integrity ──────────────────────────────────────────────────
 
 /// Data-sacred invariant: if the user (or `rm -rf` accident) deletes a synced

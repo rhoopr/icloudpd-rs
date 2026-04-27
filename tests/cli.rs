@@ -524,6 +524,29 @@ fn album_flag_accepts_inline_exclusion() {
 }
 
 #[test]
+fn album_flag_rejects_duplicates() {
+    common::cmd()
+        .args([
+            "sync",
+            "--album",
+            "Vacation",
+            "--album",
+            "Vacation",
+            "--username",
+            "dummy@example.com",
+            "--password",
+            "x",
+            "--data-dir",
+            "/tmp/claude/kei-no-such",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--album 'Vacation' specified more than once",
+        ));
+}
+
+#[test]
 fn folder_structure_albums_flag_parses() {
     common::cmd()
         .args([
