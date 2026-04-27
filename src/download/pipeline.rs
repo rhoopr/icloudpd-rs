@@ -652,6 +652,24 @@ pub(super) struct PassResult {
     pub(super) rate_limit_observations: usize,
 }
 
+/// Return the subset of `paths` that do not exist on disk.
+///
+/// Uses `tokio::fs::try_exists` so a sample of up to 500 paths can be
+/// stat'd without blocking the async runtime thread; the older
+/// `Path::exists()` form pauses the executor for seconds on slow
+/// filesystems (NFS, SMB). Treats stat errors as "missing" so a
+/// transient permissions error correctly flips trust-state off rather
+/// than passing through the trust gate (CF-5).
+async fn sample_missing_paths(paths: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut missing = Vec::new();
+    for p in paths {
+        if !tokio::fs::try_exists(p).await.unwrap_or(false) {
+            missing.push(p.clone());
+        }
+    }
+    missing
+}
+
 /// Streaming download pipeline that consumes a pre-built combined stream.
 ///
 /// This is the core producer/consumer download logic from `stream_and_download`,
@@ -833,7 +851,12 @@ where
                 .clamp(5, 500);
             match db.sample_downloaded_paths(sample_count).await {
                 Ok(paths) => {
-                    let missing: Vec<_> = paths.iter().filter(|p| !p.exists()).collect();
+                    // Stat via tokio::fs::try_exists so the sample (up to 500
+                    // paths) doesn't block the async runtime thread on slow
+                    // filesystems (NFS, SMB). Mirrors the metadata-rewrite
+                    // worker (see comment at the `try_exists` call ~line 401).
+                    // CF-5.
+                    let missing = sample_missing_paths(&paths).await;
                     if !missing.is_empty() {
                         tracing::warn!(
                             sampled = paths.len(),
@@ -3912,5 +3935,55 @@ mod tests {
             1,
             "marker must survive when the file is absent so a future sync retries"
         );
+    }
+
+    /// CF-5 (2026-04-27): the trust-state sample-check moved off the
+    /// blocking `Path::exists` onto `tokio::fs::try_exists`. Pin the helper:
+    /// existing paths are not in the missing set, non-existent paths are.
+    #[tokio::test]
+    async fn sample_missing_paths_returns_only_absent_paths() {
+        use std::fs::File;
+        use std::io::Write;
+
+        let dir = tempfile::Builder::new()
+            .prefix("kei-sample-missing-")
+            .tempdir_in("/tmp/claude")
+            .expect("tempdir in /tmp/claude");
+
+        let present = dir.path().join("present.jpg");
+        File::create(&present).unwrap().write_all(b"x").unwrap();
+
+        let absent = dir.path().join("absent.jpg");
+
+        let paths = vec![present.clone(), absent.clone()];
+        let missing = sample_missing_paths(&paths).await;
+
+        assert_eq!(missing, vec![absent], "only the absent path should surface");
+    }
+
+    /// CF-5: an all-empty input yields an empty output (no false positives
+    /// when the sample query returns no rows).
+    #[tokio::test]
+    async fn sample_missing_paths_empty_input_yields_empty_output() {
+        let missing = sample_missing_paths(&[]).await;
+        assert!(missing.is_empty());
+    }
+
+    /// CF-5: every path absent → every path returned. Pins the inverse of
+    /// the happy path so the iteration shape can't drift.
+    #[tokio::test]
+    async fn sample_missing_paths_all_absent_returns_full_input() {
+        let dir = tempfile::Builder::new()
+            .prefix("kei-sample-all-absent-")
+            .tempdir_in("/tmp/claude")
+            .expect("tempdir in /tmp/claude");
+        // Don't create any of these files; the whole input is absent.
+        let paths = vec![
+            dir.path().join("a.jpg"),
+            dir.path().join("b.jpg"),
+            dir.path().join("c.jpg"),
+        ];
+        let missing = sample_missing_paths(&paths).await;
+        assert_eq!(missing, paths);
     }
 }
