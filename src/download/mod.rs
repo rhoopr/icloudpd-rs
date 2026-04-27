@@ -1101,6 +1101,51 @@ async fn build_download_tasks(
 /// filters `ChangeEvent`s to downloadable assets, and feeds them through
 /// the existing download pipeline. Falls back to `SyncMode::Full` if the
 /// token is invalid or expired.
+/// Walk a tree rooted at `root`, removing files whose name ends with
+/// `suffix` and whose mtime is older than `cutoff_secs`. Returns the count
+/// of removed files. A `read_dir` failure on any subdirectory logs a
+/// `warn!` and skips that subtree -- the original code swallowed the error
+/// silently, leaving operators without a breadcrumb when transient FS
+/// hiccups (e.g. an unmount mid-walk) prevented cleanup (CF-3).
+fn walk_and_remove_orphan_parts(root: std::path::PathBuf, suffix: &str, cutoff_secs: i64) -> usize {
+    let mut cleaned = 0usize;
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(
+                    path = %current.display(),
+                    error = %e,
+                    "failed to read directory during orphan-part cleanup"
+                );
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.ends_with(suffix) {
+                    if let Ok(meta) = path.metadata() {
+                        if let Ok(mtime) = meta.modified() {
+                            let mtime_secs = mtime
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            if mtime_secs < cutoff_secs && std::fs::remove_file(&path).is_ok() {
+                                cleaned += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cleaned
+}
+
 /// Remove orphaned `.part` files from the download directory.
 ///
 /// Scans the download directory for files ending with `temp_suffix` that are
@@ -1129,34 +1174,7 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
     let cutoff_secs = cutoff.timestamp();
 
     let cleaned = tokio::task::spawn_blocking(move || {
-        let mut cleaned = 0usize;
-        let mut stack = vec![dir];
-        while let Some(current) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&current) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.ends_with(suffix.as_ref()) {
-                        if let Ok(meta) = path.metadata() {
-                            if let Ok(mtime) = meta.modified() {
-                                let mtime_secs = mtime
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs() as i64)
-                                    .unwrap_or(0);
-                                if mtime_secs < cutoff_secs && std::fs::remove_file(&path).is_ok() {
-                                    cleaned += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        cleaned
+        walk_and_remove_orphan_parts(dir, &suffix, cutoff_secs)
     })
     .await
     .unwrap_or(0);
@@ -3808,6 +3826,86 @@ mod tests {
 
         assert_eq!(counts, vec![0, 0]);
         assert_eq!(errors, 2);
+    }
+
+    /// CF-3 (2026-04-27): the orphan-part walk must remove .part files older
+    /// than the cutoff and leave non-matching files alone. To avoid
+    /// depending on a third-party mtime crate, drive the cutoff itself: a
+    /// cutoff far in the future treats every just-created file as "older",
+    /// while a cutoff in the distant past leaves everything intact.
+    #[test]
+    fn walk_and_remove_orphan_parts_removes_part_files_only() {
+        use std::fs::File;
+        use std::io::Write;
+
+        let dir = tempfile::Builder::new()
+            .prefix("kei-orphan-parts-")
+            .tempdir_in("/tmp/claude")
+            .expect("tempdir in /tmp/claude");
+
+        let part = dir.path().join("photo.jpg.part");
+        File::create(&part).unwrap().write_all(b"x").unwrap();
+
+        let unrelated = dir.path().join("photo.jpg");
+        File::create(&unrelated).unwrap().write_all(b"x").unwrap();
+
+        // Cutoff far in the future -> the just-created .part is "older".
+        let future = i64::MAX / 2;
+        let cleaned = walk_and_remove_orphan_parts(dir.path().to_path_buf(), ".part", future);
+        assert_eq!(cleaned, 1, "the .part file must be removed");
+        assert!(!part.exists());
+        assert!(unrelated.exists(), "non-.part file must be retained");
+
+        // Re-create and re-run with cutoff in the distant past; nothing to clean.
+        File::create(&part).unwrap().write_all(b"x").unwrap();
+        let cleaned = walk_and_remove_orphan_parts(dir.path().to_path_buf(), ".part", 0);
+        assert_eq!(cleaned, 0, "cutoff in the past must spare even .part files");
+        assert!(part.exists());
+    }
+
+    /// CF-3: a directory the process cannot read must NOT panic the walk
+    /// and MUST NOT abort it. With the fix in place the walk emits a
+    /// `warn!` for the failed `read_dir` and continues; pre-fix it
+    /// silently swallowed the error and produced no log breadcrumb. We
+    /// can't capture log output without an extra dependency, so this test
+    /// pins the structural contract: the walk completes, doesn't panic,
+    /// and still cleans the readable siblings.
+    #[cfg(unix)]
+    #[test]
+    fn walk_and_remove_orphan_parts_continues_past_unreadable_subdir() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix("kei-orphan-parts-unreadable-")
+            .tempdir_in("/tmp/claude")
+            .expect("tempdir in /tmp/claude");
+
+        // Sibling subdir with a .part file: should be cleaned.
+        let readable = dir.path().join("readable");
+        std::fs::create_dir(&readable).unwrap();
+        let part = readable.join("photo.jpg.part");
+        File::create(&part).unwrap().write_all(b"x").unwrap();
+
+        // Unreadable subdir: read_dir fails. The walk must log a warn and
+        // continue rather than aborting or silently dropping the error.
+        let unreadable = dir.path().join("unreadable");
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let future = i64::MAX / 2;
+        let cleaned = walk_and_remove_orphan_parts(dir.path().to_path_buf(), ".part", future);
+
+        // Restore perms so the tempdir can be cleaned up.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            cleaned, 1,
+            ".part in the readable sibling must still be cleaned despite \
+             the unreadable subdirectory"
+        );
+        assert!(!part.exists());
     }
 
     /// Companion: accumulating into an empty `SyncStats` is a faithful copy
