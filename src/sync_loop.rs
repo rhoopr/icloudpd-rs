@@ -60,7 +60,7 @@ fn is_session_error(err: &anyhow::Error) -> bool {
         .is_some_and(crate::icloud::error::ICloudError::is_session_error)
 }
 
-/// Given the user's library selection, the count of iCloud shared libraries
+/// Given the user's library selector, the count of iCloud shared libraries
 /// on the account, and whether the notice has already fired, return the
 /// warning message to emit, or `None` if no notice is warranted.
 ///
@@ -68,17 +68,17 @@ fn is_session_error(err: &anyhow::Error) -> bool {
 /// `PhotosService` or the state DB. The I/O wrapper lives in
 /// [`maybe_notify_shared_libraries`].
 fn should_notify_shared_libraries(
-    selection: &config::LibrarySelection,
+    selector: &crate::selection::LibrarySelector,
     shared_count: usize,
     already_notified: bool,
 ) -> Option<String> {
     if already_notified || shared_count == 0 {
         return None;
     }
-    // Only users on the `PrimarySync` default see the notice. Anyone who
-    // explicitly picked `--library all` or a specific shared zone has
-    // already made a deliberate choice.
-    if !matches!(selection, config::LibrarySelection::Single(s) if s == "PrimarySync") {
+    // Only users on the `primary`-only default see the notice. Anyone who
+    // explicitly picked a different shape (`shared`, `all`, named zones,
+    // exclusions) has already made a deliberate choice.
+    if selector != &crate::selection::LibrarySelector::default() {
         return None;
     }
     let (word, verb) = if shared_count == 1 {
@@ -89,7 +89,7 @@ fn should_notify_shared_libraries(
     Some(format!(
         "Detected {shared_count} iCloud shared {word} on this account; only the primary \
          library {verb} being synced. To include shared libraries too, set \
-         `[filters] library = \"all\"` in config.toml (or pass `--library all`). \
+         `[filters] libraries = [\"all\"]` in config.toml (or pass `--library all`). \
          Run `kei list libraries` to enumerate every zone."
     ))
 }
@@ -101,7 +101,7 @@ fn should_notify_shared_libraries(
 /// later-added library. The probe and marker write are best-effort: failures
 /// degrade to `tracing::debug!` and skip without breaking the sync.
 async fn maybe_notify_shared_libraries(
-    selection: &config::LibrarySelection,
+    selector: &crate::selection::LibrarySelector,
     photos_service: &mut crate::icloud::photos::PhotosService,
     state_db: Option<&Arc<dyn state::StateDb>>,
 ) {
@@ -126,7 +126,7 @@ async fn maybe_notify_shared_libraries(
     // Skip the probe when the user explicitly picked a non-default library;
     // they've already opted in or out. `should_notify_shared_libraries`
     // repeats this check defensively.
-    if !matches!(selection, config::LibrarySelection::Single(s) if s == "PrimarySync") {
+    if selector != &crate::selection::LibrarySelector::default() {
         return;
     }
 
@@ -141,8 +141,7 @@ async fn maybe_notify_shared_libraries(
         }
     };
 
-    let Some(msg) = should_notify_shared_libraries(selection, shared_count, already_notified)
-    else {
+    let Some(msg) = should_notify_shared_libraries(selector, shared_count, already_notified) else {
         return;
     };
     tracing::warn!(message = %msg, "Shared library notice");
@@ -401,7 +400,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
             Err(e) => return Err(e),
         };
-        match resolve_libraries(&config.library, &mut ps).await {
+        match resolve_libraries(&config.selection.libraries, &mut ps).await {
             Ok(libs) => break (ss, ps, libs),
             Err(e) if !retried_after_session_error && is_session_error(&e) => {
                 tracing::warn!(
@@ -502,7 +501,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // First-sync notice: tell users on the `PrimarySync` default about any
     // shared libraries they could be syncing. Runs once per data dir,
     // gated by state DB metadata.
-    maybe_notify_shared_libraries(&config.library, &mut photos_service, state_db.as_ref()).await;
+    maybe_notify_shared_libraries(
+        &config.selection.libraries,
+        &mut photos_service,
+        state_db.as_ref(),
+    )
+    .await;
 
     // Handle --reset-sync-token (hidden compat flag): clear stored tokens before the sync loop
     if reset_sync_token {
@@ -1473,8 +1477,16 @@ async fn reacquire_session(
 mod tests {
     use super::*;
 
-    fn primary() -> config::LibrarySelection {
-        config::LibrarySelection::Single("PrimarySync".to_string())
+    fn primary() -> crate::selection::LibrarySelector {
+        crate::selection::LibrarySelector::default()
+    }
+
+    fn all_libraries() -> crate::selection::LibrarySelector {
+        crate::selection::parse_library_selector(&["all".to_string()]).unwrap()
+    }
+
+    fn shared_zone() -> crate::selection::LibrarySelector {
+        crate::selection::parse_library_selector(&["SharedSync-ABCD1234".to_string()]).unwrap()
     }
 
     #[test]
@@ -1493,15 +1505,14 @@ mod tests {
     fn notice_suppressed_when_user_picked_all() {
         // Anyone who explicitly set `--library all` has already opted in;
         // nothing to tell them.
-        assert!(should_notify_shared_libraries(&config::LibrarySelection::All, 3, false).is_none());
+        assert!(should_notify_shared_libraries(&all_libraries(), 3, false).is_none());
     }
 
     #[test]
     fn notice_suppressed_when_user_picked_shared_zone_explicitly() {
         // A user who typed out `--library SharedSync-ABCD1234` has also made
         // a choice; don't second-guess them.
-        let explicit = config::LibrarySelection::Single("SharedSync-ABCD1234".to_string());
-        assert!(should_notify_shared_libraries(&explicit, 3, false).is_none());
+        assert!(should_notify_shared_libraries(&shared_zone(), 3, false).is_none());
     }
 
     #[test]
@@ -1518,7 +1529,7 @@ mod tests {
         // The guidance is what the notice is for - it must name the config
         // key, the CLI flag, and the discovery subcommand.
         assert!(
-            msg.contains("[filters] library = \"all\""),
+            msg.contains("[filters] libraries = [\"all\"]"),
             "TOML guidance missing: {msg}"
         );
         assert!(msg.contains("--library all"), "CLI guidance missing: {msg}");
@@ -1544,7 +1555,7 @@ mod tests {
     #[test]
     fn notice_suppressed_when_both_user_opted_out_and_already_notified() {
         // Belt-and-braces: every suppression condition stacks correctly.
-        assert!(should_notify_shared_libraries(&config::LibrarySelection::All, 0, true).is_none());
+        assert!(should_notify_shared_libraries(&all_libraries(), 0, true).is_none());
     }
 
     // The run_sync reauth retry branch keys on whether an error from

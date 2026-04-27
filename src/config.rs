@@ -181,29 +181,18 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
 
 // ── Application Config ──────────────────────────────────────────────
 
-/// Which library (or libraries) to sync.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LibrarySelection {
-    /// A single named library (e.g. "`PrimarySync`", "SharedSync-ABCD1234").
-    Single(String),
-    /// All available libraries (primary + private + shared).
-    All,
-}
-
-/// Resolve library selection from CLI > TOML > default (`primary`). The CLI
-/// list and the TOML `[filters].libraries` array share the v0.13 grammar
+/// Resolve `--library` from CLI > TOML > default (`primary`). The CLI list
+/// and the TOML `[filters].libraries` array share the v0.13 grammar
 /// (`primary` / `shared` / `all` / `none` / `!name` / raw zone names);
 /// `[filters].library` (singular) is a deprecated alias warned at use.
 ///
-/// Until PR6 lands the multi-library resolver, the lowered legacy
-/// [`LibrarySelection`] only models "single library" or "every library", so
-/// shapes that need PR6 (e.g. `primary + shared` without `all`, multiple
-/// named zones, `--library` excludes against today's pipeline) bail with a
-/// pointer to the new flag surface.
-pub(crate) fn resolve_library_selection(
+/// Returns the parsed [`crate::selection::LibrarySelector`]; the matching
+/// against live CloudKit zones happens in
+/// `commands::service::resolve_libraries`.
+pub(crate) fn resolve_library_selector(
     cli_libraries: Vec<String>,
     toml_filters: Option<&TomlFilters>,
-) -> anyhow::Result<LibrarySelection> {
+) -> anyhow::Result<crate::selection::LibrarySelector> {
     let toml_libraries = toml_filters.and_then(|f| f.libraries.clone());
     let toml_library_singular = toml_filters.and_then(|f| f.library.clone());
     if toml_library_singular.is_some() {
@@ -214,60 +203,7 @@ pub(crate) fn resolve_library_selection(
     }
     let toml_libraries_resolved = toml_libraries.or_else(|| toml_library_singular.map(|s| vec![s]));
     let raw = resolve_vec(cli_libraries, toml_libraries_resolved);
-
-    let selector = crate::selection::parse_library_selector(&raw)?;
-
-    if !selector.excluded.is_empty() {
-        anyhow::bail!(
-            "`!name` library exclusions require the v0.13 multi-library resolver (tracked in PR6); \
-             pass an explicit `--library` allow-list for now"
-        );
-    }
-    if selector.named.len() > 1 {
-        anyhow::bail!(
-            "selecting multiple named libraries requires the v0.13 multi-library resolver (tracked in PR6); \
-             pass a single zone name or use `--library all`"
-        );
-    }
-    // `primary + shared` ≡ today's `--library all`: include every zone.
-    if selector.primary && selector.shared_all && selector.named.is_empty() {
-        return Ok(LibrarySelection::All);
-    }
-    if selector.primary && (selector.shared_all || !selector.named.is_empty()) {
-        anyhow::bail!(
-            "combining `--library primary` with shared zones requires the v0.13 multi-library resolver (tracked in PR6); \
-             pass `--library all` for every library or a single zone name"
-        );
-    }
-    if selector.shared_all && !selector.named.is_empty() {
-        anyhow::bail!(
-            "combining `--library shared` with named zones requires the v0.13 multi-library resolver (tracked in PR6); \
-             pass `--library all` for every library or a single zone name"
-        );
-    }
-
-    if selector.shared_all {
-        // `shared` alone has no legacy single-zone equivalent — primary is
-        // always part of today's "all libraries" sweep.
-        anyhow::bail!(
-            "`--library shared` (every shared zone, primary excluded) requires the v0.13 multi-library resolver (tracked in PR6); \
-             pass `--library all` for every library or a specific SharedSync zone name"
-        );
-    }
-    if let Some(name) = selector.named.into_iter().next() {
-        return Ok(LibrarySelection::Single(name));
-    }
-    // primary (default or explicit) → today's `--library PrimarySync`.
-    Ok(LibrarySelection::Single("PrimarySync".to_string()))
-}
-
-impl std::fmt::Display for LibrarySelection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Single(name) => f.write_str(name),
-            Self::All => f.write_str("all"),
-        }
-    }
+    crate::selection::parse_library_selector(&raw)
 }
 
 /// Which albums to sync.
@@ -502,51 +438,45 @@ fn warn_deprecated(old: &str, replacement: &str) {
     }
 }
 
-/// Translate the legacy `(AlbumSelection, exclude_albums, LibrarySelection,
-/// folder_structure)` tuple plus the new `raw_smart_folders` raw list into
-/// the v0.13 [`crate::selection::Selection`]. Pure function so the truth
-/// table is testable without `Config::build`.
+/// Translate the legacy `(AlbumSelection, exclude_albums, folder_structure)`
+/// tuple plus the parsed library/smart-folder selectors into the v0.13
+/// [`crate::selection::Selection`]. Pure function so the truth table is
+/// testable without `Config::build`.
 ///
-/// Behaviour preserved (legacy fields):
-/// - `AlbumSelection::LibraryOnly` (today's no-album-flag default) maps to
-///   `AlbumSelector::None` + `unfiled = true`. The library is enumerated as
-///   one stream because no album passes run, so unfiled fully covers it.
+/// Behaviour preserved for legacy album fields:
+/// - `AlbumSelection::LibraryOnly` (no-album-flag default) maps to
+///   `AlbumSelector::None`. The library is enumerated as one stream and the
+///   unfiled pass covers it.
 /// - `AlbumSelection::Named(v)` maps to `AlbumSelector::Named { v, exclude }`
-///   plus an unfiled pass only if `{album}` is in the template (today's
-///   behaviour gives no unfiled pass for explicit named selections).
+///   plus an unfiled pass only if `{album}` is in the template.
 /// - `AlbumSelection::All` maps to `AlbumSelector::All { exclude }` plus
-///   unfiled iff `{album}` appears in `--folder-structure` (today's gate).
-/// - `LibrarySelection::Single("PrimarySync")` → `primary = true`.
-/// - `LibrarySelection::Single(other)` → `named = {other}` (no primary).
-/// - `LibrarySelection::All` → `primary = true, shared_all = true`.
+///   unfiled iff `{album}` appears in `--folder-structure`.
 ///
-/// Smart folders have no legacy field; `raw_smart_folders` is parsed
-/// directly into a [`crate::selection::SmartFolderSelector`]. Empty list →
-/// `None`.
+/// Library and smart-folder selectors are passed through directly — their
+/// new-grammar parsing already happened in `Config::build`.
 ///
 /// `unfiled_override` is `Some(b)` when the user passed `--unfiled` (or set
-/// `[filters].unfiled` in TOML) and `None` otherwise. When `None`, unfiled is
-/// computed from the legacy `albums` + `folder_structure` truth table so
+/// `[filters].unfiled` in TOML) and `None` otherwise. When `None`, unfiled
+/// is computed from the legacy `albums` + `folder_structure` truth table so
 /// existing configs keep their current pass set.
 pub(crate) fn derive_selection(
     albums: &AlbumSelection,
     exclude_albums: &[String],
-    library: &LibrarySelection,
+    library: &crate::selection::LibrarySelector,
     folder_structure: &str,
     raw_smart_folders: &[String],
     unfiled_override: Option<bool>,
 ) -> anyhow::Result<crate::selection::Selection> {
     // Build the raw album list as if the user had written it on the CLI.
-    // Feeds through `build_selection` so the production path exercises every
-    // sentinel/exclusion code path the tests cover.
+    // Feeds through `parse_album_selector` so the production path exercises
+    // every sentinel/exclusion code path the tests cover.
     //
     // Edge case: legacy `LibraryOnly + exclude_albums` has no clean mapping
     // in the new grammar (Selector::None doesn't take excludes; the new
     // model expects `--album all '!Family'` for that intent). The legacy
     // resolver still handles excludes for `LibraryOnly` correctly, so we
     // drop them here from the Selection-side preview without changing
-    // observable behaviour. Future PRs migrate the resolver and this case
-    // disappears.
+    // observable behaviour.
     let raw_albums: Vec<String> = match albums {
         AlbumSelection::LibraryOnly => vec!["none".to_string()],
         AlbumSelection::Named(names) => names
@@ -559,29 +489,15 @@ pub(crate) fn derive_selection(
             .collect(),
     };
 
-    // Synthesize the library raw list. `LibrarySelection::All` is today's
-    // "primary + every shared zone" behaviour, so map it to the `all`
-    // sentinel. `Single("PrimarySync")` becomes the bare `primary` sentinel.
-    let raw_libraries: Vec<String> = match library {
-        LibrarySelection::Single(name) if name == "PrimarySync" => vec!["primary".to_string()],
-        LibrarySelection::Single(name) => vec![name.clone()],
-        LibrarySelection::All => vec!["all".to_string()],
-    };
-
-    // Today's resolver runs the unfiled pass only when AlbumSelection::All AND
-    // `{album}` is in the template. LibraryOnly's "single library-wide stream"
-    // is itself an unfiled-equivalent, so we mark unfiled = true for it too;
-    // the new resolver will treat that as "skip per-album passes, run one
-    // library sweep with no exclusion set" — semantically identical.
     let unfiled =
         unfiled_override.unwrap_or_else(|| legacy_unfiled_default(albums, folder_structure));
 
-    crate::selection::build_selection(
-        &raw_albums,
-        raw_smart_folders,
-        &raw_libraries,
-        Some(unfiled),
-    )
+    Ok(crate::selection::Selection {
+        albums: crate::selection::parse_album_selector(&raw_albums, true)?,
+        smart_folders: crate::selection::parse_smart_folder_selector(raw_smart_folders)?,
+        libraries: library.clone(),
+        unfiled,
+    })
 }
 
 /// Outcome of [`auto_migrate_legacy_album_token`].
@@ -723,7 +639,6 @@ pub struct Config {
     pub albums: AlbumSelection,
     pub exclude_albums: Vec<String>,
     pub filename_exclude: Vec<glob::Pattern>,
-    pub library: LibrarySelection,
     pub temp_suffix: String,
     /// Per-category resolved [`Selection`](crate::selection::Selection). Built
     /// alongside the legacy `albums` / `exclude_albums` / `library` fields and
@@ -1349,7 +1264,7 @@ impl Config {
         );
 
         // Filters
-        let library = resolve_library_selection(sync.libraries, toml_filters)?;
+        let library_selector = resolve_library_selector(sync.libraries, toml_filters)?;
         let toml_albums = toml_filters.and_then(|f| f.albums.clone());
         let toml_album_singular = toml_filters.and_then(|f| f.album.clone());
         if toml_album_singular.is_some() {
@@ -1479,7 +1394,7 @@ impl Config {
         let selection = derive_selection(
             &albums,
             &exclude_albums,
-            &library,
+            &library_selector,
             &folder_structure,
             &raw_smart_folders,
             unfiled_override,
@@ -1700,7 +1615,6 @@ impl Config {
             albums,
             exclude_albums,
             filename_exclude,
-            library,
             temp_suffix,
             selection,
             skip_created_before,
@@ -1753,12 +1667,6 @@ impl Config {
     /// Only includes static fields suitable for persistence. Passwords are
     /// never included. Per-run flags (`dry_run`, `recent`, etc.) are omitted.
     pub(crate) fn to_toml(&self) -> TomlConfig {
-        let library_str = match &self.library {
-            LibrarySelection::Single(name) if name == "PrimarySync" => None,
-            LibrarySelection::Single(name) => Some(name.clone()),
-            LibrarySelection::All => Some("all".to_string()),
-        };
-
         TomlConfig {
             data_dir: None,  // derived from config path, not serialized unless explicit
             log_level: None, // only written if user explicitly set it
@@ -1850,7 +1758,7 @@ impl Config {
                 }),
             }),
             filters: Some(TomlFilters {
-                library: library_str,
+                library: None, // deprecated singular key never round-trips; new array form below
                 album: None, // emit only the array form; deprecated singular dropped on round-trip
                 libraries: {
                     // Emit only when the user picked something other than
@@ -2481,8 +2389,8 @@ mod tests {
         assert_eq!(cfg.threads_num, 10);
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
         assert_eq!(
-            cfg.library,
-            LibrarySelection::Single("PrimarySync".to_string())
+            cfg.selection.libraries.to_raw(),
+            vec!["primary".to_string()]
         );
         assert_eq!(cfg.max_retries, 3);
         assert_eq!(cfg.retry_delay_secs, 5);
@@ -2512,8 +2420,8 @@ mod tests {
         assert_eq!(cfg.threads_num, 4);
         assert_eq!(cfg.folder_structure, "%Y-%m");
         assert_eq!(
-            cfg.library,
-            LibrarySelection::Single("SharedSync-ABC".to_string())
+            cfg.selection.libraries.to_raw(),
+            vec!["SharedSync-ABC".to_string()]
         );
     }
 
@@ -2535,8 +2443,8 @@ mod tests {
         let cfg = Config::build(&default_globals(), default_password(), sync, Some(toml)).unwrap();
         assert_eq!(cfg.threads_num, 8);
         assert_eq!(
-            cfg.library,
-            LibrarySelection::Single("PrimarySync".to_string())
+            cfg.selection.libraries.to_raw(),
+            vec!["PrimarySync".to_string()]
         );
     }
 
@@ -2545,7 +2453,7 @@ mod tests {
         let mut sync = default_sync();
         sync.libraries = vec!["all".to_string()];
         let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.library, LibrarySelection::All);
+        assert_eq!(cfg.selection.libraries.to_raw(), vec!["all".to_string()]);
     }
 
     #[test]
@@ -2553,7 +2461,7 @@ mod tests {
         let mut sync = default_sync();
         sync.libraries = vec!["ALL".to_string()];
         let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.library, LibrarySelection::All);
+        assert_eq!(cfg.selection.libraries.to_raw(), vec!["all".to_string()]);
     }
 
     #[test]
@@ -2570,7 +2478,7 @@ mod tests {
             Some(toml),
         )
         .unwrap();
-        assert_eq!(cfg.library, LibrarySelection::All);
+        assert_eq!(cfg.selection.libraries.to_raw(), vec!["all".to_string()]);
     }
 
     #[test]
@@ -3895,8 +3803,8 @@ mod tests {
         assert_eq!(cfg.retry_delay_secs, 5);
         // Filters
         assert_eq!(
-            cfg.library,
-            LibrarySelection::Single("PrimarySync".to_string())
+            cfg.selection.libraries.to_raw(),
+            vec!["primary".to_string()]
         );
         assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
         assert!(!cfg.skip_videos);
@@ -4651,8 +4559,8 @@ mod tests {
         assert_eq!(cfg.max_retries, 1);
         assert_eq!(cfg.retry_delay_secs, 2);
         assert_eq!(
-            cfg.library,
-            LibrarySelection::Single("SharedSync-FULL".to_string())
+            cfg.selection.libraries.to_raw(),
+            vec!["SharedSync-FULL".to_string()]
         );
         assert_eq!(
             cfg.albums,
@@ -6110,18 +6018,19 @@ mod tests {
         assert!(validate_directory(Path::new("/data/sync")).is_ok());
     }
 
-    // ── resolve_library_selection ──────────────────────────────────
+    // ── resolve_library_selector ───────────────────────────────────
 
     #[test]
-    fn resolve_library_defaults_to_primary_sync() {
-        let result = resolve_library_selection(vec![], None).unwrap();
-        assert_eq!(result, LibrarySelection::Single("PrimarySync".to_string()));
+    fn resolve_library_defaults_to_primary_only() {
+        let sel = resolve_library_selector(vec![], None).unwrap();
+        assert_eq!(sel, crate::selection::LibrarySelector::default());
+        assert_eq!(sel.to_raw(), vec!["primary".to_string()]);
     }
 
     #[test]
-    fn resolve_library_primary_sentinel_maps_to_primary_sync() {
-        let result = resolve_library_selection(vec!["primary".to_string()], None).unwrap();
-        assert_eq!(result, LibrarySelection::Single("PrimarySync".to_string()));
+    fn resolve_library_primary_sentinel_round_trips() {
+        let sel = resolve_library_selector(vec!["primary".to_string()], None).unwrap();
+        assert!(sel.primary && !sel.shared_all && sel.named.is_empty());
     }
 
     #[test]
@@ -6130,13 +6039,10 @@ mod tests {
             libraries: Some(vec!["SharedSync-FROM-TOML".to_string()]),
             ..Default::default()
         };
-        let result =
-            resolve_library_selection(vec!["SharedSync-FROM-CLI".to_string()], Some(&toml_filters))
+        let sel =
+            resolve_library_selector(vec!["SharedSync-FROM-CLI".to_string()], Some(&toml_filters))
                 .unwrap();
-        assert_eq!(
-            result,
-            LibrarySelection::Single("SharedSync-FROM-CLI".to_string())
-        );
+        assert_eq!(sel.to_raw(), vec!["SharedSync-FROM-CLI".to_string()]);
     }
 
     #[test]
@@ -6145,11 +6051,8 @@ mod tests {
             libraries: Some(vec!["SharedSync-ABCD".to_string()]),
             ..Default::default()
         };
-        let result = resolve_library_selection(vec![], Some(&toml_filters)).unwrap();
-        assert_eq!(
-            result,
-            LibrarySelection::Single("SharedSync-ABCD".to_string())
-        );
+        let sel = resolve_library_selector(vec![], Some(&toml_filters)).unwrap();
+        assert_eq!(sel.to_raw(), vec!["SharedSync-ABCD".to_string()]);
     }
 
     #[test]
@@ -6158,11 +6061,8 @@ mod tests {
             library: Some("SharedSync-LEGACY".to_string()),
             ..Default::default()
         };
-        let result = resolve_library_selection(vec![], Some(&toml_filters)).unwrap();
-        assert_eq!(
-            result,
-            LibrarySelection::Single("SharedSync-LEGACY".to_string())
-        );
+        let sel = resolve_library_selector(vec![], Some(&toml_filters)).unwrap();
+        assert_eq!(sel.to_raw(), vec!["SharedSync-LEGACY".to_string()]);
     }
 
     #[test]
@@ -6172,61 +6072,52 @@ mod tests {
             libraries: Some(vec!["SharedSync-NEW".to_string()]),
             ..Default::default()
         };
-        let result = resolve_library_selection(vec![], Some(&toml_filters)).unwrap();
-        assert_eq!(
-            result,
-            LibrarySelection::Single("SharedSync-NEW".to_string())
-        );
+        let sel = resolve_library_selector(vec![], Some(&toml_filters)).unwrap();
+        assert_eq!(sel.to_raw(), vec!["SharedSync-NEW".to_string()]);
     }
 
     #[test]
     fn resolve_library_all_case_insensitive() {
         for sentinel in ["ALL", "All", "all"] {
-            let result = resolve_library_selection(vec![sentinel.to_string()], None).unwrap();
-            assert_eq!(result, LibrarySelection::All, "sentinel: {sentinel}");
+            let sel = resolve_library_selector(vec![sentinel.to_string()], None).unwrap();
+            assert_eq!(
+                sel.to_raw(),
+                vec!["all".to_string()],
+                "sentinel: {sentinel}"
+            );
         }
     }
 
     #[test]
-    fn resolve_library_shared_only_bails_until_pr6() {
-        let err = resolve_library_selection(vec!["shared".to_string()], None).unwrap_err();
-        assert!(
-            err.to_string().contains("multi-library resolver"),
-            "unexpected error: {err}"
-        );
+    fn resolve_library_shared_alone_keeps_shared_only() {
+        let sel = resolve_library_selector(vec!["shared".to_string()], None).unwrap();
+        assert!(!sel.primary, "primary must stay off for `shared` alone");
+        assert!(sel.shared_all);
+        assert!(sel.named.is_empty());
     }
 
     #[test]
-    fn resolve_library_multiple_named_bails_until_pr6() {
-        let err = resolve_library_selection(
+    fn resolve_library_multiple_named_keeps_both() {
+        let sel = resolve_library_selector(
             vec!["SharedSync-AAAA".to_string(), "SharedSync-BBBB".to_string()],
             None,
         )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("multi-library resolver"),
-            "unexpected error: {err}"
-        );
+        .unwrap();
+        assert_eq!(sel.named.len(), 2);
+        assert!(!sel.primary);
     }
 
     #[test]
-    fn resolve_library_exclusion_bails_until_pr6() {
-        let err =
-            resolve_library_selection(vec!["!SharedSync-AAAA".to_string()], None).unwrap_err();
-        assert!(
-            err.to_string().contains("multi-library resolver"),
-            "unexpected error: {err}"
-        );
+    fn resolve_library_exclusion_keeps_exclusion() {
+        let sel = resolve_library_selector(vec!["!SharedSync-AAAA".to_string()], None).unwrap();
+        assert!(sel.primary, "bare exclusion must lift category default");
+        assert_eq!(sel.excluded.len(), 1);
     }
 
     #[test]
     fn resolve_library_named_zone_passes_through() {
-        let result =
-            resolve_library_selection(vec!["SharedSync-ABCD1234".to_string()], None).unwrap();
-        assert_eq!(
-            result,
-            LibrarySelection::Single("SharedSync-ABCD1234".to_string())
-        );
+        let sel = resolve_library_selector(vec!["SharedSync-ABCD1234".to_string()], None).unwrap();
+        assert_eq!(sel.to_raw(), vec!["SharedSync-ABCD1234".to_string()]);
     }
 
     // ── --notify-systemd auto-detect via NOTIFY_SOCKET ────────────────

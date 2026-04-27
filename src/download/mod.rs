@@ -425,13 +425,13 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
         hasher.update(name.as_bytes());
         hasher.update(b"\0");
     }
-    // Library selection: tag byte + name bytes for Single variant
-    match &config.library {
-        crate::config::LibrarySelection::All => hasher.update([0]),
-        crate::config::LibrarySelection::Single(name) => {
-            hasher.update([1]);
-            hasher.update(name.as_bytes());
-        }
+    // Library selector: stable tag bytes per shape so changing the resolved
+    // library set invalidates sync tokens. `to_raw()` emits a deterministic
+    // ordering (`primary`/`shared`/named-then-`!excluded`).
+    for entry in config.selection.libraries.to_raw() {
+        hasher.update(b"library:");
+        hasher.update(entry.as_bytes());
+        hasher.update(b"\0");
     }
     finalize_hash(hasher)
 }
@@ -2356,7 +2356,6 @@ mod tests {
             albums: crate::config::AlbumSelection::LibraryOnly,
             exclude_albums: vec![],
             filename_exclude: vec![],
-            library: crate::config::LibrarySelection::Single("PrimarySync".into()),
             temp_suffix: dl_config.temp_suffix.to_string(),
             selection: crate::selection::Selection::default(),
             skip_created_before: None,
@@ -3258,7 +3257,7 @@ mod tests {
         let config = build_config_with(tmp.path(), "/photos", |_| {});
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "6b85f232defa2d2d",
+            hash, "a8fe0a9169180cf3",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3272,7 +3271,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "37dcd5e0a75fe788",
+            hash, "8e5fd4f4c01b7252",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }

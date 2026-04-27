@@ -3,7 +3,6 @@ use std::path::Path;
 use anyhow::Context;
 
 use crate::auth;
-use crate::config;
 use crate::icloud;
 use crate::retry;
 
@@ -340,23 +339,118 @@ pub(crate) fn build_photos_params(
     params
 }
 
-/// Resolve a `LibrarySelection` into concrete `PhotoLibrary` instances.
+/// Resolve a [`crate::selection::LibrarySelector`] into the concrete set of
+/// `PhotoLibrary` instances the sync loop iterates over. Walks every zone the
+/// account exposes (primary + private + shared), keeps the ones the
+/// `primary` / `shared_all` flags or the `named` set include, drops any that
+/// match `excluded`, and bails when a positive `named` entry resolves to
+/// nothing.
+///
+/// `named` and `excluded` entries match a zone by exact zone name (case
+/// insensitive) or by the truncated 8-char form
+/// (`paths::truncate_library_zone`) so the on-disk `{library}` segment can
+/// be copied straight back into `--library`. Friendly aliases like
+/// `shared:Owner Name` are not yet wired up to CloudKit ownership metadata
+/// and bail with a clear miss message until they are.
 pub(crate) async fn resolve_libraries(
-    selection: &config::LibrarySelection,
+    selector: &crate::selection::LibrarySelector,
     photos_service: &mut icloud::photos::PhotosService,
 ) -> anyhow::Result<Vec<icloud::photos::PhotoLibrary>> {
-    match selection {
-        config::LibrarySelection::All => {
-            tracing::debug!("Using all available libraries");
-            photos_service.all_libraries().await
+    use crate::download::paths::truncate_library_zone;
+
+    // Fast path for the default `--library primary`: skip the private +
+    // shared library HTTP listings. Saves two requests per sync for the
+    // common single-library case.
+    if selector == &crate::selection::LibrarySelector::default() {
+        let lib = photos_service
+            .get_library(crate::icloud::photos::PRIMARY_ZONE_NAME)
+            .await?;
+        return Ok(vec![lib.clone()]);
+    }
+
+    let all = photos_service.all_libraries().await?;
+
+    // Track which selector entries actually matched so we can bail on a
+    // positive miss (the spec's "Album 'Vacatiom' not found" rule, applied to
+    // libraries). `named` only; `excluded` misses just warn.
+    let mut named_hits: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(selector.named.len());
+    let mut chosen: Vec<icloud::photos::PhotoLibrary> = Vec::new();
+    let mut seen_zones: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for lib in &all {
+        let zone = lib.zone_name();
+        let truncated = truncate_library_zone(zone);
+        let is_primary = zone == crate::icloud::photos::PRIMARY_ZONE_NAME;
+        let is_shared = zone.starts_with("SharedSync-");
+
+        let included = (selector.primary && is_primary)
+            || (selector.shared_all && is_shared)
+            || selector.named.iter().any(|entry| {
+                let hit = library_entry_matches_zone(entry, zone, truncated);
+                if hit {
+                    named_hits.insert(entry.as_str());
+                }
+                hit
+            });
+        if !included {
+            continue;
         }
-        config::LibrarySelection::Single(name) => {
-            if name != "PrimarySync" {
-                tracing::debug!(library = %name, "Using non-default library");
-            }
-            Ok(vec![photos_service.get_library(name).await?.clone()])
+
+        let excluded = selector.excluded.iter().any(|entry| {
+            (entry.eq_ignore_ascii_case("primary") && is_primary)
+                || (entry.eq_ignore_ascii_case("shared") && is_shared)
+                || library_entry_matches_zone(entry, zone, truncated)
+        });
+        if excluded {
+            continue;
+        }
+
+        if seen_zones.insert(zone.to_string()) {
+            chosen.push(lib.clone());
         }
     }
+
+    if let Some(missed) = selector
+        .named
+        .iter()
+        .find(|n| !named_hits.contains(n.as_str()))
+    {
+        let known: Vec<&str> = all
+            .iter()
+            .map(icloud::photos::PhotoLibrary::zone_name)
+            .collect();
+        anyhow::bail!(
+            "--library '{missed}' not found. Available zones: {}. Run `kei list libraries` to see every zone with its truncated form.",
+            known.join(", ")
+        );
+    }
+
+    if chosen.is_empty() {
+        anyhow::bail!(
+            "--library resolved to zero libraries against this account; \
+             pass at least one of primary / shared / a zone name without \
+             excluding everything"
+        );
+    }
+
+    match chosen.as_slice() {
+        [only] if only.zone_name() != crate::icloud::photos::PRIMARY_ZONE_NAME => {
+            tracing::debug!(library = %only.zone_name(), "Using non-default library");
+        }
+        [_] => {} // primary-only logged in the fast path above
+        many => tracing::debug!(count = many.len(), "Using multiple libraries"),
+    }
+
+    Ok(chosen)
+}
+
+/// Match a `--library` entry (full zone name or truncated 8-char form)
+/// against a live zone, case-insensitive. The truncated form is what
+/// `{library}` renders into paths, so users can copy a path segment and
+/// paste it back into `--library`.
+fn library_entry_matches_zone(entry: &str, zone: &str, truncated: &str) -> bool {
+    entry.eq_ignore_ascii_case(zone) || entry.eq_ignore_ascii_case(truncated)
 }
 
 /// Category of a download pass: a named user album, an Apple-defined smart
@@ -1316,6 +1410,163 @@ mod tests {
                 ("Favorites".to_string(), PassKind::SmartFolder),
                 (library.all().name.to_string(), PassKind::Unfiled),
             ]
+        );
+    }
+
+    // ── resolve_libraries tests ──────────────────────────────────────
+
+    /// Build a `PhotosService` with a stub primary library plus the named
+    /// shared zones. Bypasses CloudKit listing endpoints by pre-populating
+    /// the lazy library maps.
+    fn photos_service_with_zones(shared_zones: &[&str]) -> icloud::photos::PhotosService {
+        use crate::icloud::photos::PhotoLibrary;
+        use std::collections::HashMap;
+
+        let primary =
+            PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), "PrimarySync");
+        let mut shared = HashMap::new();
+        for zone in shared_zones {
+            shared.insert(
+                (*zone).to_string(),
+                PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), zone),
+            );
+        }
+        icloud::photos::PhotosService::for_testing_with_libraries(
+            Box::new(MockPhotosSession::new()),
+            primary,
+            HashMap::new(),
+            shared,
+        )
+    }
+
+    fn selector_from(raw: &[&str]) -> crate::selection::LibrarySelector {
+        let owned: Vec<String> = raw.iter().map(|s| (*s).to_string()).collect();
+        crate::selection::parse_library_selector(&owned).unwrap()
+    }
+
+    fn zone_names(libs: &[icloud::photos::PhotoLibrary]) -> Vec<&str> {
+        libs.iter()
+            .map(icloud::photos::PhotoLibrary::zone_name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_default_returns_primary_only() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = crate::selection::LibrarySelector::default();
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        assert_eq!(zone_names(&libs), vec!["PrimarySync"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_all_returns_every_zone() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["all"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        let mut names = zone_names(&libs);
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["PrimarySync", "SharedSync-AAAA1111", "SharedSync-BBBB2222"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_shared_only_excludes_primary() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["shared"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        let mut names = zone_names(&libs);
+        names.sort_unstable();
+        assert_eq!(names, vec!["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_named_zone_returns_only_that_zone() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["SharedSync-AAAA1111"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        assert_eq!(zone_names(&libs), vec!["SharedSync-AAAA1111"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_named_zone_matches_truncated_form() {
+        let mut ps =
+            photos_service_with_zones(&["SharedSync-AAAA1111-2222-3333-4444-555555555555"]);
+        let sel = selector_from(&["SharedSync-AAAA1111"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        assert_eq!(
+            zone_names(&libs),
+            vec!["SharedSync-AAAA1111-2222-3333-4444-555555555555"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_primary_plus_named_returns_both() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["primary", "SharedSync-AAAA1111"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        let mut names = zone_names(&libs);
+        names.sort_unstable();
+        assert_eq!(names, vec!["PrimarySync", "SharedSync-AAAA1111"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_multiple_named_zones() {
+        let mut ps = photos_service_with_zones(&[
+            "SharedSync-AAAA1111",
+            "SharedSync-BBBB2222",
+            "SharedSync-CCCC3333",
+        ]);
+        let sel = selector_from(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        let mut names = zone_names(&libs);
+        names.sort_unstable();
+        assert_eq!(names, vec!["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_exclusion_drops_named_zone() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["all", "!SharedSync-AAAA1111"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        let mut names = zone_names(&libs);
+        names.sort_unstable();
+        assert_eq!(names, vec!["PrimarySync", "SharedSync-BBBB2222"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_exclusion_via_shared_sentinel() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+        let sel = selector_from(&["all", "!shared"]);
+        let libs = resolve_libraries(&sel, &mut ps).await.unwrap();
+        assert_eq!(zone_names(&libs), vec!["PrimarySync"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_named_miss_bails_with_helpful_error() {
+        let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111"]);
+        let sel = selector_from(&["SharedSync-NOPE"]);
+        let err = resolve_libraries(&sel, &mut ps).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SharedSync-NOPE"),
+            "miss must name the input: {msg}"
+        );
+        assert!(
+            msg.contains("Available zones") || msg.contains("kei list libraries"),
+            "miss must point at discovery: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_zero_match_after_exclusion_bails() {
+        let mut ps = photos_service_with_zones(&[]);
+        let sel = selector_from(&["primary", "!primary"]);
+        let err = resolve_libraries(&sel, &mut ps).await.unwrap_err();
+        assert!(
+            err.to_string().contains("zero libraries"),
+            "unexpected error: {err}"
         );
     }
 }

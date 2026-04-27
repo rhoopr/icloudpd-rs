@@ -406,12 +406,9 @@ fn contradiction_check(
     Ok(())
 }
 
-/// Build a [`Selection`] from raw CLI/TOML inputs.
-///
-/// `cli_albums_explicit` is the raw `--album` list (may be empty).
-/// `cli_smart_folders` and `cli_libraries` are the matching raw lists.
-/// `unfiled_explicit` is the explicit `--unfiled` value if the user passed
-/// one, `None` to use the default (`true`).
+/// Build a [`Selection`] from raw CLI/TOML inputs. Test-only convenience
+/// for exercising every parser in one shot.
+#[cfg(test)]
 pub(crate) fn build_selection(
     raw_albums: &[String],
     raw_smart_folders: &[String],

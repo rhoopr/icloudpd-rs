@@ -117,11 +117,11 @@ pub(crate) async fn run_import_existing(
     let (_shared_session, mut photos_service) =
         init_photos_service(auth_result, retry::RetryConfig::default()).await?;
 
-    // Resolve library selection (CLI > TOML > default PrimarySync)
+    // Resolve library selection (CLI > TOML > default `primary`)
     let toml_filters = toml.and_then(|t| t.filters.as_ref());
     let cli_libraries = args.library.into_iter().collect();
-    let selection = config::resolve_library_selection(cli_libraries, toml_filters)?;
-    let libraries = resolve_libraries(&selection, &mut photos_service).await?;
+    let selector = config::resolve_library_selector(cli_libraries, toml_filters)?;
+    let libraries = resolve_libraries(&selector, &mut photos_service).await?;
 
     if !args.no_progress_bar {
         println!("Scanning iCloud assets and matching with local files...");

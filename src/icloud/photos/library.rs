@@ -337,6 +337,24 @@ impl PhotoLibrary {
             retry_config: RetryConfig::default(),
         }
     }
+
+    /// Test-only constructor that pins a custom zone name on the stub.
+    /// Used by `resolve_libraries` tests that need distinct zones to
+    /// exercise selector matching.
+    pub(crate) fn new_stub_with_zone(session: Box<dyn PhotosSession>, zone_name: &str) -> Self {
+        Self {
+            service_endpoint: Arc::from("https://stub.example.com"),
+            params: Arc::new(HashMap::new()),
+            session,
+            zone_id: Arc::new(json!({"zoneName": zone_name})),
+            library_type: Arc::from(if zone_name.starts_with("SharedSync-") {
+                "shared"
+            } else {
+                "private"
+            }),
+            retry_config: RetryConfig::default(),
+        }
+    }
 }
 
 #[cfg(test)]
