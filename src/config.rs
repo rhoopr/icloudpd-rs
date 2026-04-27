@@ -998,29 +998,16 @@ impl Config {
         );
         validate_folder_structure(&folder_structure)?;
 
-        let folder_structure_albums_explicit = sync
-            .folder_structure_albums
-            .or_else(|| toml_dl.and_then(|d| d.folder_structure_albums.clone()));
-        if folder_structure_albums_explicit.is_some() {
-            warn_selection_flag_unimplemented(
-                "`--folder-structure-albums` / `[download].folder_structure_albums`",
-                "use the legacy `--folder-structure` for album passes",
-            );
-        }
-        let folder_structure_albums = folder_structure_albums_explicit
-            .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string());
-
-        let folder_structure_smart_folders_explicit = sync
-            .folder_structure_smart_folders
-            .or_else(|| toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()));
-        if folder_structure_smart_folders_explicit.is_some() {
-            warn_selection_flag_unimplemented(
-                "`--folder-structure-smart-folders` / `[download].folder_structure_smart_folders`",
-                "use the legacy `--folder-structure` for smart-folder passes",
-            );
-        }
-        let folder_structure_smart_folders = folder_structure_smart_folders_explicit
-            .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string());
+        let folder_structure_albums = resolve(
+            sync.folder_structure_albums,
+            toml_dl.and_then(|d| d.folder_structure_albums.clone()),
+            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+        );
+        let folder_structure_smart_folders = resolve(
+            sync.folder_structure_smart_folders,
+            toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()),
+            DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string(),
+        );
         // Resolve bandwidth limit (CLI bytes/sec > TOML human-readable string > None).
         let bandwidth_limit: Option<u64> = if let Some(n) = sync.bandwidth_limit {
             Some(n)

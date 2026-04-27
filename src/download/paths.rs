@@ -16,22 +16,35 @@ pub(crate) fn strip_python_wrapper(folder_structure: &str) -> &str {
     }
 }
 
-/// Expand the `{album}` token in a folder structure format string.
+/// Expand a named token (e.g. `{album}`, `{smart-folder}`) in a folder
+/// structure format string.
 ///
-/// Strips the Python-style wrapper, sanitizes the album name as a path
-/// component, escapes `%` for chrono strftime, and replaces `{album}`.
+/// Strips the Python-style wrapper, sanitizes `name` as a path component,
+/// escapes `%` for chrono strftime, and replaces every occurrence of `token`.
 /// Returns the original `folder_structure` (wrapper-stripped) unchanged if
-/// `{album}` is absent.
-pub(crate) fn expand_album_token(folder_structure: &str, album_name: Option<&str>) -> String {
+/// `token` is absent.
+pub(crate) fn expand_named_token(
+    folder_structure: &str,
+    token: &str,
+    name: Option<&str>,
+) -> String {
     let format_str = strip_python_wrapper(folder_structure);
-    if !format_str.contains("{album}") {
+    if !format_str.contains(token) {
         return format_str.to_string();
     }
-    let safe_name = album_name
+    let safe_name = name
         .filter(|n| !n.is_empty())
         .map(|n| sanitize_path_component(n).replace('%', "%%"))
         .unwrap_or_default();
-    format_str.replace("{album}", &safe_name)
+    format_str.replace(token, &safe_name)
+}
+
+/// Expand the `{album}` token in a folder structure format string. Thin
+/// wrapper around [`expand_named_token`] for the legacy single-template
+/// path renderer; per-category callers (PR8) use `expand_named_token`
+/// directly with the appropriate token.
+pub(crate) fn expand_album_token(folder_structure: &str, album_name: Option<&str>) -> String {
+    expand_named_token(folder_structure, "{album}", album_name)
 }
 
 /// Build the date-based parent directory for a photo asset (without filename).
@@ -1364,6 +1377,35 @@ mod tests {
         // Trailing % in album name must not panic
         let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("50% Off"));
         assert!(result.to_str().unwrap().contains("50% Off"));
+    }
+
+    #[test]
+    fn test_expand_named_token_smart_folder() {
+        let result = expand_named_token("{smart-folder}/%Y", "{smart-folder}", Some("Favorites"));
+        assert_eq!(result, "Favorites/%Y");
+    }
+
+    #[test]
+    fn test_expand_named_token_unknown_token_left_alone() {
+        // Caller picked the wrong token: don't substitute, leave the template
+        // as-is so callers can detect the mismatch via the literal token.
+        let result = expand_named_token("{album}/%Y", "{smart-folder}", Some("Favorites"));
+        assert_eq!(result, "{album}/%Y");
+    }
+
+    #[test]
+    fn test_expand_named_token_sanitizes_smart_folder_name() {
+        // Smart-folder names come from a fixed Apple list today, but the
+        // sanitisation contract still applies so future custom names can't
+        // path-traverse.
+        let result = expand_named_token("{smart-folder}/%Y", "{smart-folder}", Some("../etc"));
+        assert!(!result.contains("../"));
+    }
+
+    #[test]
+    fn test_expand_named_token_empty_name_collapses() {
+        let result = expand_named_token("{smart-folder}/%Y", "{smart-folder}", Some(""));
+        assert_eq!(result, "/%Y");
     }
 
     #[test]

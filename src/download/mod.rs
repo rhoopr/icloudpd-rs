@@ -240,6 +240,8 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
 struct SharedHashFields<'a> {
     directory: &'a std::path::Path,
     folder_structure: &'a str,
+    folder_structure_albums: &'a str,
+    folder_structure_smart_folders: &'a str,
     size: AssetVersionSize,
     live_photo_size: AssetVersionSize,
     file_match_policy: FileMatchPolicy,
@@ -264,6 +266,10 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
     hasher.update(f.directory.as_os_str().as_encoded_bytes());
     hasher.update(b"\0");
     hasher.update(f.folder_structure.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(f.folder_structure_albums.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(f.folder_structure_smart_folders.as_bytes());
     hasher.update(b"\0");
     hasher.update([f.size as u8]);
     hasher.update([f.live_photo_size as u8]);
@@ -314,6 +320,8 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
         &SharedHashFields {
             directory: &config.directory,
             folder_structure: &config.folder_structure,
+            folder_structure_albums: &config.folder_structure_albums,
+            folder_structure_smart_folders: &config.folder_structure_smart_folders,
             size: config.size,
             live_photo_size: config.live_photo_size,
             file_match_policy: config.file_match_policy,
@@ -362,6 +370,8 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
         &SharedHashFields {
             directory: &config.directory,
             folder_structure: &config.folder_structure,
+            folder_structure_albums: &config.folder_structure_albums,
+            folder_structure_smart_folders: &config.folder_structure_smart_folders,
             size,
             live_photo_size,
             file_match_policy: config.file_match_policy,
@@ -429,7 +439,14 @@ pub(crate) struct DownloadConfig {
     /// `with_exclude_ids`) refcount-bump instead of deep-cloning the
     /// PathBuf. Same pattern as `asset_groupings` and `exclude_asset_ids`.
     pub(crate) directory: Arc<Path>,
+    /// Template for the unfiled (library-wide) pass. Also the source the
+    /// per-pass clone in `with_pass` reads when the pass is `Unfiled`. After
+    /// `with_pass` runs, this field holds the *expanded* per-pass template.
     pub(crate) folder_structure: String,
+    /// Template for `PassKind::Album` passes (default `{album}`).
+    pub(crate) folder_structure_albums: String,
+    /// Template for `PassKind::SmartFolder` passes (default `{smart-folder}`).
+    pub(crate) folder_structure_smart_folders: String,
     pub(crate) size: AssetVersionSize,
     pub(crate) skip_videos: bool,
     pub(crate) skip_photos: bool,
@@ -503,42 +520,40 @@ impl DownloadConfig {
         self.folder_structure.contains("{album}")
     }
 
-    /// Clone this config with a different `album_name`, for per-album processing
-    /// when `{album}` is in `folder_structure`. Pre-expands the `{album}` token
-    /// in `folder_structure` so `local_download_dir` avoids per-asset
-    /// sanitize/escape/replace allocations.
+    /// Clone this config for a single download pass: pick the per-category
+    /// template (`folder_structure_albums` for [`PassKind::Album`],
+    /// `folder_structure_smart_folders` for [`PassKind::SmartFolder`],
+    /// `folder_structure` for [`PassKind::Unfiled`]), pre-expand the matching
+    /// token (`{album}` / `{smart-folder}`), and pin the pass's exclude-ids
+    /// set in one clone.
     ///
-    /// Setting `album_name` on the derived config is load-bearing: the
-    /// fast-skip bypass in the streaming pipeline uses `album_name.is_some()`
-    /// as the "this asset may legitimately land at multiple paths, don't
-    /// trust the DB" signal. An empty name still sets `Some("")`, so the
-    /// unfiled `library.all()` pass inherits the bypass too.
-    fn with_album_name(&self, name: Arc<str>) -> Self {
-        let album_ref = Some(name.as_ref()).filter(|n: &&str| !n.is_empty());
-        let folder_structure = paths::expand_album_token(&self.folder_structure, album_ref);
+    /// The unfiled pass keeps the legacy `{album}` token so users with a
+    /// historic `--folder-structure "{album}/..."` still get the same on-disk
+    /// tree (PR9 deprecates that combination with an auto-migration warning).
+    fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
+        use crate::commands::PassKind;
+        let (template, token) = match pass.kind {
+            PassKind::Album => (&self.folder_structure_albums, "{album}"),
+            PassKind::SmartFolder => (&self.folder_structure_smart_folders, "{smart-folder}"),
+            PassKind::Unfiled => (&self.folder_structure, "{album}"),
+        };
+        let name = &pass.album.name;
+        let name_ref = Some(name.as_ref()).filter(|n: &&str| !n.is_empty());
+        let folder_structure = paths::expand_named_token(template, token, name_ref);
         Self {
-            album_name: Some(name),
+            album_name: Some(Arc::clone(name)),
             directory: Arc::clone(&self.directory),
             folder_structure,
+            folder_structure_albums: self.folder_structure_albums.clone(),
+            folder_structure_smart_folders: self.folder_structure_smart_folders.clone(),
             filename_exclude: Arc::clone(&self.filename_exclude),
             temp_suffix: Arc::clone(&self.temp_suffix),
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
-            exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
+            exclude_asset_ids: Arc::clone(&pass.exclude_ids),
             asset_groupings: Arc::clone(&self.asset_groupings),
             bandwidth_limiter: self.bandwidth_limiter.clone(),
             ..*self
-        }
-    }
-
-    /// Clone this config for a single download pass: pre-expand `{album}`
-    /// and pin the pass's exclude-ids set in one clone. Equivalent to
-    /// `with_album_name(...).with_exclude_ids(...)` but avoids the second
-    /// allocation.
-    fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
-        Self {
-            exclude_asset_ids: Arc::clone(&pass.exclude_ids),
-            ..self.with_album_name(Arc::clone(&pass.album.name))
         }
     }
 
@@ -549,6 +564,8 @@ impl DownloadConfig {
         Self {
             directory: Arc::clone(&self.directory),
             folder_structure: self.folder_structure.clone(),
+            folder_structure_albums: self.folder_structure_albums.clone(),
+            folder_structure_smart_folders: self.folder_structure_smart_folders.clone(),
             filename_exclude: Arc::clone(&self.filename_exclude),
             temp_suffix: Arc::clone(&self.temp_suffix),
             state_db: self.state_db.clone(),
@@ -567,6 +584,11 @@ impl std::fmt::Debug for DownloadConfig {
         let mut s = f.debug_struct("DownloadConfig");
         s.field("directory", &self.directory)
             .field("folder_structure", &self.folder_structure)
+            .field("folder_structure_albums", &self.folder_structure_albums)
+            .field(
+                "folder_structure_smart_folders",
+                &self.folder_structure_smart_folders,
+            )
             .field("size", &self.size)
             .field("skip_videos", &self.skip_videos)
             .field("skip_photos", &self.skip_photos)
@@ -616,6 +638,9 @@ impl DownloadConfig {
         Self {
             directory: Arc::from(Path::new("/nonexistent/download_filter_tests")),
             folder_structure: "{:%Y/%m/%d}".to_string(),
+            folder_structure_albums: crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+            folder_structure_smart_folders: crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS
+                .to_string(),
             size: AssetVersionSize::Original,
             skip_videos: false,
             skip_photos: false,
@@ -2750,28 +2775,89 @@ mod tests {
         );
     }
 
-    // ── with_album_name tests ─────────────────────────────────────
+    // ── with_pass per-kind template selection ─────────────────────
+
+    fn make_pass(kind: crate::commands::PassKind, name: &str) -> crate::commands::AlbumPass {
+        use crate::icloud::photos::PhotoAlbum;
+        crate::commands::AlbumPass {
+            kind,
+            album: PhotoAlbum::stub_for_test(Arc::from(name)),
+            exclude_ids: std::sync::Arc::new(rustc_hash::FxHashSet::default()),
+        }
+    }
 
     #[test]
-    fn test_with_album_name_expands_album_token() {
+    fn test_with_pass_album_uses_albums_template() {
+        use crate::commands::PassKind;
+        let mut config = test_config();
+        config.folder_structure_albums = "{album}/%Y/%m/%d".to_string();
+        let derived = config.with_pass(&make_pass(PassKind::Album, "Vacation"));
+        assert_eq!(derived.folder_structure, "Vacation/%Y/%m/%d");
+        assert_eq!(derived.album_name.as_deref(), Some("Vacation"));
+    }
+
+    #[test]
+    fn test_with_pass_smart_folder_uses_smart_folders_template() {
+        use crate::commands::PassKind;
+        let mut config = test_config();
+        config.folder_structure_smart_folders = "{smart-folder}/%Y".to_string();
+        let derived = config.with_pass(&make_pass(PassKind::SmartFolder, "Favorites"));
+        assert_eq!(derived.folder_structure, "Favorites/%Y");
+    }
+
+    #[test]
+    fn test_with_pass_smart_folder_ignores_albums_template() {
+        // Spec: smart-folder passes use folder_structure_smart_folders, not
+        // folder_structure_albums. Using the wrong template would cause every
+        // smart-folder pass to substitute the smart-folder name into a
+        // user-customised album path (e.g. "My/Albums/{album}/..." would
+        // mis-render as "My/Albums/Favorites/...").
+        use crate::commands::PassKind;
+        let mut config = test_config();
+        config.folder_structure_albums = "{album}/album-tree".to_string();
+        config.folder_structure_smart_folders = "{smart-folder}/sf-tree".to_string();
+        let derived = config.with_pass(&make_pass(PassKind::SmartFolder, "Videos"));
+        assert!(derived.folder_structure.contains("sf-tree"));
+        assert!(!derived.folder_structure.contains("album-tree"));
+    }
+
+    #[test]
+    fn test_with_pass_unfiled_uses_base_folder_structure() {
+        // Unfiled pass keeps the legacy `{album}` token in `folder_structure`
+        // so existing configs with `--folder-structure "{album}/..."` still
+        // produce the same on-disk tree (PR9 deprecates that combo).
+        use crate::commands::PassKind;
+        let mut config = test_config();
+        config.folder_structure = "%Y/%m/%d".to_string();
+        let derived = config.with_pass(&make_pass(PassKind::Unfiled, ""));
+        assert_eq!(derived.folder_structure, "%Y/%m/%d");
+    }
+
+    #[test]
+    fn test_with_pass_unfiled_collapses_album_token_to_empty() {
+        use crate::commands::PassKind;
         let mut config = test_config();
         config.folder_structure = "{album}/%Y/%m/%d".to_string();
-        let derived = config.with_album_name(Arc::from("Vacation"));
-        assert_eq!(derived.folder_structure, "Vacation/%Y/%m/%d");
+        let derived = config.with_pass(&make_pass(PassKind::Unfiled, ""));
+        // Empty name strips the `{album}` segment for backwards compat.
+        assert!(!derived.folder_structure.contains("{album}"));
     }
 
     #[test]
-    fn test_with_album_name_sets_album_name_field() {
-        let config = test_config();
-        assert!(config.album_name.is_none());
-        let derived = config.with_album_name(Arc::from("Favorites"));
-        assert_eq!(derived.album_name.as_deref(), Some("Favorites"));
-    }
-
-    #[test]
-    fn test_with_album_name_preserves_all_fields() {
+    fn test_with_pass_album_sanitizes_name() {
+        use crate::commands::PassKind;
         let mut config = test_config();
-        config.folder_structure = "{album}/%Y".to_string();
+        config.folder_structure_albums = "{album}/%Y".to_string();
+        let derived = config.with_pass(&make_pass(PassKind::Album, "My/Album"));
+        // Path separators in album names must be sanitised before substitution.
+        assert!(!derived.folder_structure.starts_with("My/Album"));
+    }
+
+    #[test]
+    fn test_with_pass_preserves_all_fields() {
+        use crate::commands::PassKind;
+        let mut config = test_config();
+        config.folder_structure_albums = "{album}/%Y".to_string();
         config.skip_videos = true;
         config.skip_photos = true;
         config.live_photo_mode = LivePhotoMode::ImageOnly;
@@ -2784,7 +2870,7 @@ mod tests {
         }
         config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         config.temp_suffix = std::sync::Arc::from(".custom-tmp");
-        let derived = config.with_album_name(Arc::from("Test"));
+        let derived = config.with_pass(&make_pass(PassKind::Album, "Test"));
         assert!(derived.skip_videos);
         assert!(derived.skip_photos);
         assert_eq!(derived.live_photo_mode, LivePhotoMode::ImageOnly);
@@ -2796,37 +2882,6 @@ mod tests {
         assert_eq!(derived.filename_exclude.len(), 1);
         assert_eq!(&*derived.temp_suffix, ".custom-tmp");
         assert_eq!(derived.directory, config.directory);
-    }
-
-    #[test]
-    fn test_with_album_name_empty_name_leaves_token_stripped() {
-        let mut config = test_config();
-        config.folder_structure = "{album}/%Y/%m/%d".to_string();
-        let derived = config.with_album_name(Arc::from(""));
-        // Empty album name should strip the {album}/ prefix
-        assert!(!derived.folder_structure.contains("{album}"));
-        assert!(derived.album_name.as_deref() == Some(""));
-    }
-
-    #[test]
-    fn test_with_album_name_no_token_in_structure() {
-        let config = test_config(); // folder_structure = "%Y/%m/%d"
-        let derived = config.with_album_name(Arc::from("MyAlbum"));
-        // No {album} token, so structure should be unchanged
-        assert_eq!(derived.folder_structure, "%Y/%m/%d");
-        assert_eq!(derived.album_name.as_deref(), Some("MyAlbum"));
-    }
-
-    #[test]
-    fn test_with_album_name_sanitizes_special_chars() {
-        let mut config = test_config();
-        config.folder_structure = "{album}/%Y".to_string();
-        let derived = config.with_album_name(Arc::from("My/Album"));
-        // The expand_album_token sanitizes path separators
-        assert!(
-            !derived.folder_structure.contains('/')
-                || !derived.folder_structure.starts_with("My/Album")
-        );
     }
 
     // ── extract_skip_candidates: filename_exclude ─────────────────
@@ -2847,6 +2902,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_hash_changes_on_folder_structure_albums() {
+        // Per-category templates affect path resolution, so the trust-state
+        // hash must change with them or stale records pin assets to the wrong
+        // tree on the next run.
+        let mut config1 = test_config();
+        let mut config2 = test_config();
+        config1.folder_structure_albums = "{album}".to_string();
+        config2.folder_structure_albums = "{album}/%Y".to_string();
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_changes_on_folder_structure_smart_folders() {
+        let mut config1 = test_config();
+        let mut config2 = test_config();
+        config1.folder_structure_smart_folders = "{smart-folder}".to_string();
+        config2.folder_structure_smart_folders = "{smart-folder}/%Y".to_string();
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
     // ── Golden-hash stability tests ─────────────────────────────────
     //
     // These pin specific config values to specific hex outputs. If any
@@ -2859,7 +2941,7 @@ mod tests {
         let config = test_config();
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "557d246ae277e4aa",
+            hash, "6500d91b19aec487",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
     }
@@ -2896,7 +2978,7 @@ mod tests {
         ]);
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "e17212f54c74936b",
+            hash, "265311b50bfaeb17",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
     }
@@ -2907,7 +2989,7 @@ mod tests {
         let config = build_config_with(tmp.path(), "/photos", |_| {});
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "3ca58f7e3c69834f",
+            hash, "6b85f232defa2d2d",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -2921,7 +3003,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "907facf5394e2fa4",
+            hash, "37dcd5e0a75fe788",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }

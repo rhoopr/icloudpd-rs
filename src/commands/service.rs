@@ -359,6 +359,17 @@ pub(crate) async fn resolve_libraries(
     }
 }
 
+/// Category of a download pass. Selects which folder-structure template the
+/// renderer applies (`folder_structure_albums` / `_smart_folders` /
+/// `folder_structure`) and which token (`{album}` / `{smart-folder}`) is
+/// expanded in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassKind {
+    Album,
+    SmartFolder,
+    Unfiled,
+}
+
 /// One pass through a specific album (or the library-wide pseudo-album).
 ///
 /// `exclude_ids` is the per-pass set of asset IDs to filter out. Most passes
@@ -366,6 +377,7 @@ pub(crate) async fn resolve_libraries(
 /// album member (for the `-a all` + `{album}` unfiled pass) or with excluded
 /// albums' members (for `--exclude-album` without `--album`).
 pub(crate) struct AlbumPass {
+    pub kind: PassKind,
     pub album: icloud::photos::PhotoAlbum,
     pub exclude_ids: std::sync::Arc<rustc_hash::FxHashSet<String>>,
 }
@@ -379,6 +391,7 @@ pub(crate) struct AlbumPlan {
 impl std::fmt::Debug for AlbumPass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlbumPass")
+            .field("kind", &self.kind)
             .field("album_name", &self.album.name)
             .field("exclude_ids_len", &self.exclude_ids.len())
             .finish()
@@ -487,20 +500,21 @@ pub(crate) async fn resolve_passes(
     drain_named_into_passes(
         &mut album_map,
         selected_album_names,
-        "album",
+        PassKind::Album,
         &empty,
         &mut passes,
     );
     drain_named_into_passes(
         &mut album_map,
         selected_smart_names,
-        "smart_folder",
+        PassKind::SmartFolder,
         &empty,
         &mut passes,
     );
 
     if selection.unfiled {
         passes.push(AlbumPass {
+            kind: PassKind::Unfiled,
             album: library.all(),
             exclude_ids: std::sync::Arc::new(unfiled_exclude_ids),
         });
@@ -677,17 +691,18 @@ async fn compute_unfiled_exclude_ids(
 fn drain_named_into_passes(
     album_map: &mut std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
     mut names: Vec<String>,
-    label: &'static str,
+    kind: PassKind,
     empty_excludes: &std::sync::Arc<rustc_hash::FxHashSet<String>>,
     passes: &mut Vec<AlbumPass>,
 ) {
     names.sort();
     for name in names {
         let Some(album) = album_map.remove(name.as_str()) else {
-            tracing::warn!(category = label, name = %name, "Selected entry disappeared from map, skipping");
+            tracing::warn!(category = ?kind, name = %name, "Selected entry disappeared from map, skipping");
             continue;
         };
         passes.push(AlbumPass {
+            kind,
             album,
             exclude_ids: std::sync::Arc::clone(empty_excludes),
         });
@@ -1250,5 +1265,46 @@ mod tests {
 
         let plan = resolve_passes(&library, &sel).await.unwrap();
         assert!(plan.passes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_tags_each_pass_with_correct_kind() {
+        // The renderer (PR8 in download/mod.rs::with_pass) routes per-category
+        // template selection on `pass.kind`, so the resolver must tag each
+        // pass: album → Album, smart-folder → SmartFolder, library-wide
+        // unfiled → Unfiled. Drift here silently misroutes passes to the
+        // wrong template.
+        let mock = MockPhotosSession::new()
+            .ok(serde_json::json!({"records": [folder_record("FOLDER_1", "Vacation")]}))
+            .ok(album_count_response(0))
+            .ok(serde_json::json!({"records": []}));
+        let library = stub_library(mock);
+        let sel = Selection {
+            albums: AlbumSelector::Named {
+                included: names(&["Vacation"]),
+                excluded: BTreeSet::new(),
+            },
+            smart_folders: SmartFolderSelector::Named {
+                included: names(&["Favorites"]),
+                excluded: BTreeSet::new(),
+            },
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: true,
+        };
+
+        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let kinds: Vec<(String, PassKind)> = plan
+            .passes
+            .iter()
+            .map(|p| (p.album.name.to_string(), p.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("Vacation".to_string(), PassKind::Album),
+                ("Favorites".to_string(), PassKind::SmartFolder),
+                (library.all().name.to_string(), PassKind::Unfiled),
+            ]
+        );
     }
 }

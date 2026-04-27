@@ -3351,6 +3351,9 @@ mod tests {
         let config = Arc::new(DownloadConfig {
             directory: std::sync::Arc::from(dir.path()),
             folder_structure: "{:%Y/%m/%d}".to_string(),
+            folder_structure_albums: crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+            folder_structure_smart_folders: crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS
+                .to_string(),
             size: AssetVersionSize::Original,
             skip_videos: false,
             skip_photos: false,
@@ -3440,6 +3443,9 @@ mod tests {
                 "/nonexistent/download_filter_tests",
             )),
             folder_structure: "{:%Y/%m/%d}".to_string(),
+            folder_structure_albums: crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+            folder_structure_smart_folders: crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS
+                .to_string(),
             size: AssetVersionSize::Original,
             skip_videos: false,
             skip_photos: false,

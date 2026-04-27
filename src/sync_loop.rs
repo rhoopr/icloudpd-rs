@@ -562,6 +562,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         Arc::new(download::DownloadConfig {
             directory: Arc::clone(&cfg_directory),
             folder_structure: config.folder_structure.clone(),
+            folder_structure_albums: config.folder_structure_albums.clone(),
+            folder_structure_smart_folders: config.folder_structure_smart_folders.clone(),
             size: config.size.into(),
             skip_videos: config.skip_videos,
             skip_photos: config.skip_photos,

@@ -831,6 +831,44 @@ impl std::fmt::Display for PhotoAlbum {
 }
 
 #[cfg(test)]
+impl PhotoAlbum {
+    /// Construct a `PhotoAlbum` with the given name for cross-module unit
+    /// tests. Wires a stub session that panics on any network call, so the
+    /// album is only safe to inspect by name / metadata.
+    pub(crate) fn stub_for_test(name: Arc<str>) -> Self {
+        struct StubSession;
+        #[async_trait::async_trait]
+        impl PhotosSession for StubSession {
+            async fn post(
+                &self,
+                _url: &str,
+                _body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                unimplemented!("stub")
+            }
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                Box::new(StubSession)
+            }
+        }
+        Self::new(
+            PhotoAlbumConfig {
+                params: Arc::new(HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name,
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(serde_json::json!({"zoneName": "PrimarySync"})),
+                retry_config: RetryConfig::default(),
+            },
+            Box::new(StubSession),
+        )
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_helpers::MockPhotosSession;
