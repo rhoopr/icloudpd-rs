@@ -467,6 +467,76 @@ pub(crate) fn derive_selection(
     )
 }
 
+/// Outcome of [`auto_migrate_legacy_album_token`].
+#[derive(Debug, PartialEq, Eq)]
+struct LegacyAlbumTokenMigration {
+    /// Base template after stripping the `{album}` segment.
+    folder_structure: String,
+    /// Album-pass template - either lifted from the legacy single template
+    /// (when the user did not set `--folder-structure-albums`) or preserved
+    /// as supplied.
+    folder_structure_albums: String,
+    /// Equivalent CLI/TOML pair to suggest to the user in the deprecation
+    /// warning. `None` when nothing was migrated.
+    suggestion: Option<String>,
+}
+
+/// Detect a legacy `{album}` token in `folder_structure` and split it across
+/// the new per-category templates so the path renderer (which now consumes
+/// `folder_structure_albums` for album passes) stays equivalent.
+///
+/// - `{album}/<rest>` migrates to `folder_structure_albums = "{album}/<rest>"`,
+///   `folder_structure = "<rest>"` (so the unfiled pass keeps its date
+///   hierarchy).
+/// - Bare `{album}` migrates to `folder_structure_albums = "{album}"`,
+///   `folder_structure = "none"` (the user explicitly opted out of any
+///   date hierarchy on either pass; "none" preserves that for unfiled).
+/// - When the user already set `folder_structure_albums`, the supplied
+///   value is preserved and only the base template is stripped.
+///
+/// Returns `suggestion: None` when the input has no `{album}` token, in
+/// which case the caller should not emit the deprecation warning.
+fn auto_migrate_legacy_album_token(
+    folder_structure: String,
+    folder_structure_albums: String,
+    folder_structure_albums_user_set: bool,
+) -> LegacyAlbumTokenMigration {
+    let stripped = crate::download::paths::strip_python_wrapper(&folder_structure);
+    if !stripped.contains("{album}") {
+        return LegacyAlbumTokenMigration {
+            folder_structure,
+            folder_structure_albums,
+            suggestion: None,
+        };
+    }
+
+    let new_albums = if folder_structure_albums_user_set {
+        folder_structure_albums
+    } else {
+        stripped.to_string()
+    };
+
+    let new_base = if stripped == "{album}" {
+        "none".to_string()
+    } else if let Some(rest) = stripped.strip_prefix("{album}/") {
+        rest.to_string()
+    } else {
+        // `validate_folder_structure` enforces `{album}` as the first
+        // segment, so any other shape is a bug in the validator. Leave the
+        // template untouched rather than corrupting it; the warning still
+        // tells the user to migrate manually.
+        stripped.to_string()
+    };
+
+    let suggestion =
+        format!("`--folder-structure {new_base:?} --folder-structure-albums {new_albums:?}`");
+    LegacyAlbumTokenMigration {
+        folder_structure: new_base,
+        folder_structure_albums: new_albums,
+        suggestion: Some(suggestion),
+    }
+}
+
 /// Convert a raw `Vec<String>` (from CLI or TOML, with optional `!name`
 /// exclusions and `all`/`none` sentinels) into the legacy
 /// `(AlbumSelection, exclude_albums)` pair. Validates the new v0.13 grammar
@@ -481,8 +551,14 @@ fn resolve_album_selection(
     if raw.is_empty() {
         // Bare `{album}` in the folder template implies "every album, plus an
         // unfiled pass" without the user having to also pass `--album all`.
-        // Removed in v0.20 (the new default already includes albums:all).
+        // The new selection model defaults `--album` to `all`, so this
+        // implicit promotion is no longer needed; preserved for v0.13 with a
+        // deprecation warning, removed in v0.20.
         if crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}") {
+            warn_deprecated(
+                "implicit `--album all` from `{album}` in `--folder-structure`",
+                "an explicit `--album all` (the default in v0.13)",
+            );
             return Ok((AlbumSelection::All, Vec::new()));
         }
         return Ok((AlbumSelection::LibraryOnly, Vec::new()));
@@ -998,6 +1074,12 @@ impl Config {
         );
         validate_folder_structure(&folder_structure)?;
 
+        // Track whether the user explicitly supplied a per-category album
+        // template; the legacy `{album}` auto-migration below preserves a
+        // user-supplied value but lifts the legacy template into the new
+        // field when it is unset.
+        let folder_structure_albums_user_set = sync.folder_structure_albums.is_some()
+            || toml_dl.is_some_and(|d| d.folder_structure_albums.is_some());
         let folder_structure_albums = resolve(
             sync.folder_structure_albums,
             toml_dl.and_then(|d| d.folder_structure_albums.clone()),
@@ -1196,6 +1278,22 @@ impl Config {
         } else {
             parsed_excludes
         };
+
+        // Auto-migrate legacy `{album}` in `--folder-structure` into the
+        // per-category templates the renderer now consumes. Runs after the
+        // album-selection resolver so the auto-`-a all`-from-token behaviour
+        // (also being deprecated) sees the original template before the
+        // token gets stripped from `folder_structure`.
+        let migration = auto_migrate_legacy_album_token(
+            folder_structure,
+            folder_structure_albums,
+            folder_structure_albums_user_set,
+        );
+        if let Some(ref suggestion) = migration.suggestion {
+            warn_deprecated("`{album}` in `--folder-structure`", suggestion);
+        }
+        let folder_structure = migration.folder_structure;
+        let folder_structure_albums = migration.folder_structure_albums;
         let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
         let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
         // Resolve live photo mode: --live-photo-mode > --skip-live-photos > TOML photos > TOML filters compat
@@ -4681,30 +4779,124 @@ mod tests {
     }
 
     #[test]
-    fn test_build_album_token_accepted_at_root() {
+    fn test_auto_migrate_no_token_passes_through() {
+        let m =
+            auto_migrate_legacy_album_token("%Y/%m/%d".to_string(), "{album}".to_string(), false);
+        assert_eq!(m.folder_structure, "%Y/%m/%d");
+        assert_eq!(m.folder_structure_albums, "{album}");
+        assert!(m.suggestion.is_none());
+    }
+
+    #[test]
+    fn test_auto_migrate_lifts_full_template_when_albums_unset() {
+        let m = auto_migrate_legacy_album_token(
+            "{album}/%Y/%m".to_string(),
+            "{album}".to_string(),
+            false,
+        );
+        assert_eq!(m.folder_structure, "%Y/%m");
+        assert_eq!(m.folder_structure_albums, "{album}/%Y/%m");
+        assert!(m.suggestion.is_some());
+    }
+
+    #[test]
+    fn test_auto_migrate_preserves_user_albums_template() {
+        let m = auto_migrate_legacy_album_token(
+            "{album}/%Y/%m".to_string(),
+            "{album}/custom".to_string(),
+            true,
+        );
+        assert_eq!(m.folder_structure, "%Y/%m");
+        assert_eq!(m.folder_structure_albums, "{album}/custom");
+        assert!(m.suggestion.is_some());
+    }
+
+    #[test]
+    fn test_auto_migrate_bare_album_token_uses_none_base() {
+        let m = auto_migrate_legacy_album_token(
+            "{album}".to_string(),
+            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+            false,
+        );
+        assert_eq!(m.folder_structure, "none");
+        assert_eq!(m.folder_structure_albums, "{album}");
+    }
+
+    #[test]
+    fn test_auto_migrate_unwraps_python_wrapper() {
+        let m = auto_migrate_legacy_album_token(
+            "{:{album}/%Y/%m}".to_string(),
+            "{album}".to_string(),
+            false,
+        );
+        assert_eq!(m.folder_structure, "%Y/%m");
+        assert_eq!(m.folder_structure_albums, "{album}/%Y/%m");
+    }
+
+    #[test]
+    fn test_build_album_token_at_root_migrates() {
+        // Legacy `{album}/%Y/%m` is auto-migrated: the album-pass template
+        // gets the original (so album passes still produce `Vacation/2024/06`)
+        // and the base template loses `{album}/` so the unfiled pass keeps
+        // its date hierarchy.
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{album}/%Y/%m".to_string());
         let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.folder_structure, "{album}/%Y/%m");
+        assert_eq!(cfg.folder_structure, "%Y/%m");
+        assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m");
     }
 
     #[test]
-    fn test_build_album_token_accepted_alone() {
+    fn test_build_album_token_alone_migrates_to_none() {
+        // Bare `{album}` had no date hierarchy on either pass; the
+        // migration preserves that by setting the unfiled template to
+        // "none" rather than the new default "%Y/%m/%d".
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{album}".to_string());
         let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.folder_structure, "{album}");
+        assert_eq!(cfg.folder_structure, "none");
+        assert_eq!(cfg.folder_structure_albums, "{album}");
     }
 
     #[test]
-    fn test_build_album_token_accepted_within_python_wrapper() {
+    fn test_build_album_token_within_python_wrapper_migrates() {
+        // The legacy Python `{:...}` wrapper is unwrapped by the migration
+        // so the resulting templates render directly through chrono's
+        // strftime (no nested wrapper to confuse the parser).
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         sync.folder_structure = Some("{:{album}/%Y/%m}".to_string());
         let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
-        assert_eq!(cfg.folder_structure, "{:{album}/%Y/%m}");
+        assert_eq!(cfg.folder_structure, "%Y/%m");
+        assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m");
+    }
+
+    #[test]
+    fn test_build_album_token_preserves_user_set_albums_template() {
+        // When the user explicitly set `--folder-structure-albums`, the
+        // legacy template is stripped from the base but the supplied album
+        // template is preserved verbatim - users get the migration warning
+        // but their explicit value wins.
+        let mut sync = default_sync();
+        sync.albums = vec!["Vacation".to_string()];
+        sync.folder_structure = Some("{album}/%Y".to_string());
+        sync.folder_structure_albums = Some("{album}/explicit".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure, "%Y");
+        assert_eq!(cfg.folder_structure_albums, "{album}/explicit");
+    }
+
+    #[test]
+    fn test_build_no_album_token_no_migration() {
+        // Without `{album}` in the template there is nothing to migrate;
+        // both fields keep their resolved values.
+        let mut sync = default_sync();
+        sync.folder_structure = Some("%Y/%m".to_string());
+        let cfg = Config::build(&default_globals(), default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure, "%Y/%m");
+        assert_eq!(cfg.folder_structure_albums, "{album}");
     }
 
     #[test]
