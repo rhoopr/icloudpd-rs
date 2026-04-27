@@ -4,39 +4,24 @@ version = "0.0.0"
 publish = false
 edition = "2021"
 
-# Fuzz harnesses inline the modules under test via `#[path]` rather than
-# depending on the `kei` crate as a library — kei is a binary-only crate and
-# the parsers we want to fuzz are `pub(crate)`. Each harness re-imports the
-# external dependencies directly so we don't pull in the kei build graph.
+# Fuzz harnesses depend on the kei lib through the `__fuzz_internals`
+# feature, which exposes a `kei::__fuzz` module of `pub fn` wrappers around
+# the parsers we want to drive. The internal types stay `pub(crate)`; the
+# wrappers take/return only externally-nameable types (bytes, strings,
+# `serde_json::Value`).
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+kei = { path = "..", features = ["__fuzz_internals"] }
 
-# Match the versions declared in ../Cargo.toml so the inlined modules
-# compile against the same trait/impl set as production.
-serde = { version = "1", features = ["derive"] }
+# Used directly by harnesses for synthesizing `serde_json::Value` shapes,
+# base64 wrapping, and the standalone `xmp_packet` target that talks to
+# `xmp_toolkit` without going through kei.
 serde_json = "1"
-plist = "1"
 base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-rustc-hash = "2.1"
-tracing = "0.1"
-# paths.rs's `generate_fingerprint_filename` and `DirCache::ensure_dir_async`
-# pull these in. The harness doesn't drive those code paths, but inlining the
-# whole module via `#[path]` requires them to compile.
-sha2 = "0.10"
-tokio = { version = "1", features = ["rt"] }
-# heif.rs needs these. mp4-atom is pinned to the same git rev as the kei
-# crate (../Cargo.toml) so the inlined module sees the same API surface,
-# including the `uri ` infe-item fix that kei #274 motivated.
-mp4-atom = { git = "https://github.com/kixelated/mp4-atom", rev = "d1e9e923571cbbb42c049aec7f53cd70c6f3d8ff" }
-thiserror = "2"
-# xmp_packet + heif_xmp_probe drive Adobe's vendored XMP Toolkit.
-# `xmp` is feature-gated default-on in kei; the fuzz crate hard-depends on
-# the FFI to keep the harnesses callable from any toolchain.
 xmp_toolkit = "1"
 
 [[bin]]
@@ -77,6 +62,34 @@ bench = false
 [[bin]]
 name = "heif_xmp_probe"
 path = "fuzz_targets/heif_xmp_probe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "toml_config"
+path = "fuzz_targets/toml_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_responses"
+path = "fuzz_targets/auth_responses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "photo_asset_from_record"
+path = "fuzz_targets/photo_asset_from_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_enums_from_str"
+path = "fuzz_targets/state_enums_from_str.rs"
 test = false
 doc = false
 bench = false

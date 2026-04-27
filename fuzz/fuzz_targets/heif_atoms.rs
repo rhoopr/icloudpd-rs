@@ -1,18 +1,15 @@
 #![no_main]
 
-// Inlines src/download/heif.rs and exercises `extract_xmp_bytes`, which walks
-// the ISO-BMFF atom tree of a HEIC file via mp4-atom to find the XMP packet.
-// Bug #274 (panic on `uri ` infe items in iOS-17 HEICs) lived here, which is
-// the case study for why this surface needs fuzz coverage: the parser sees
-// arbitrary container bytes from iCloud-hosted assets.
-
-#[allow(dead_code, reason = "harness only calls extract_xmp_bytes")]
-#[path = "../../src/download/heif.rs"]
-mod heif;
+// Drives `extract_xmp_bytes` and `is_heif_content` from
+// `src/download/heif.rs` over arbitrary bytes. Bug #274 (panic on `uri `
+// infe items in iOS-17 HEICs) lived here, and the upstream mp4-atom
+// `parse_vorbis_comment` OOM (kixelated/mp4-atom#154) shows up here too.
+// kei has a header-walk filter (PR #286) that closes the OOM, so this
+// target now exercises the post-filter path.
 
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = heif::extract_xmp_bytes(data);
-    let _ = heif::is_heif_content(data);
+    let _ = kei::__fuzz::heif_extract_xmp(data);
+    let _ = kei::__fuzz::heif_is_heif_content(data);
 });
