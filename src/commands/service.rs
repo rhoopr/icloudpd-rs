@@ -349,9 +349,7 @@ pub(crate) fn build_photos_params(
 /// `named` and `excluded` entries match a zone by exact zone name (case
 /// insensitive) or by the truncated 8-char form
 /// (`paths::truncate_library_zone`) so the on-disk `{library}` segment can
-/// be copied straight back into `--library`. Friendly aliases like
-/// `shared:Owner Name` are not yet wired up to CloudKit ownership metadata
-/// and bail with a clear miss message until they are.
+/// be copied straight back into `--library`.
 pub(crate) async fn resolve_libraries(
     selector: &crate::selection::LibrarySelector,
     photos_service: &mut icloud::photos::PhotosService,

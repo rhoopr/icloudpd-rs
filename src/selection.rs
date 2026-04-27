@@ -82,8 +82,9 @@ pub struct LibrarySelector {
     pub primary: bool,
     /// Sentinel `shared`: include every SharedSync-* zone.
     pub shared_all: bool,
-    /// Explicit zone names or friendly aliases (e.g. `shared:Owner Name`,
-    /// truncated `SharedSync-A1B2C3D4`, full UUID).
+    /// Explicit zone names. Either the full CloudKit zone (`PrimarySync`,
+    /// `SharedSync-A1B2C3D4-...-...`) or the truncated 8-char form
+    /// (`SharedSync-A1B2C3D4`) that `{library}` renders into paths.
     pub named: BTreeSet<String>,
     /// `!name` exclusions, applied after the include set is resolved.
     pub excluded: ExcludeSet,
@@ -305,8 +306,11 @@ pub(crate) fn parse_smart_folder_selector(raw: &[String]) -> anyhow::Result<Smar
 
 /// Parse `--library` raw values into a [`LibrarySelector`].
 ///
-/// Default (empty input) = `primary = true` only. Sentinels: `primary`,
-/// `shared`, `all`, `none`, plus literal zone names / friendly aliases.
+/// Default (empty input) = `primary = true` only. Accepted: bare sentinels
+/// (`primary`, `shared`, `all`, `none`) and zone names (`PrimarySync`,
+/// `SharedSync-A1B2C3D4` truncated, or the full UUID form), each with an
+/// optional `!` prefix for exclusions. `shared:Owner`-style friendly forms
+/// bail at parse time.
 pub(crate) fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySelector> {
     if raw.is_empty() {
         return Ok(LibrarySelector::default());
@@ -325,6 +329,16 @@ pub(crate) fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySe
         let trimmed = entry.trim();
         anyhow::ensure!(!trimmed.is_empty(), "--library value must not be empty");
         let (name, is_exclude) = split_exclusion(trimmed);
+        // CloudKit zone names use `-`, never `:`. The `:` forms are an old
+        // friendly-alias surface ("shared:Owner Name") that kei does not
+        // resolve. Bail at parse time with the supported alternatives so
+        // users don't get a "not found" surprise after a network round-trip.
+        if name.contains(':') {
+            anyhow::bail!(
+                "--library values are bare names (`primary`, `shared`, `all`) or zone names (`PrimarySync`, `SharedSync-XYZ`); \
+                 friendly forms like '{name}' are not supported. Run `kei list libraries` to see every zone."
+            );
+        }
         if name.eq_ignore_ascii_case("all") {
             anyhow::ensure!(!is_exclude, "'!all' is not a valid --library value");
             has_all = true;
@@ -771,9 +785,21 @@ mod tests {
     }
 
     #[test]
-    fn library_friendly_alias() {
-        let r = parse_library_selector(&s(&["shared:Owner Name"])).unwrap();
-        assert_eq!(r.named, set(&["shared:Owner Name"]));
+    fn library_friendly_alias_bails_at_parse_time() {
+        // Friendly forms ("shared:Owner Name", "primary:something") aren't
+        // supported. Bailing at parse beats a "not found" surprise after a
+        // CloudKit round-trip.
+        let err = parse_library_selector(&s(&["shared:Owner Name"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not supported"), "msg: {msg}");
+        assert!(msg.contains("shared:Owner Name"), "msg: {msg}");
+    }
+
+    #[test]
+    fn library_friendly_alias_bails_inside_exclusion() {
+        // Same rule applies to `!shared:Owner` exclusions.
+        let err = parse_library_selector(&s(&["!shared:Owner"])).unwrap_err();
+        assert!(err.to_string().contains("not supported"));
     }
 
     #[test]

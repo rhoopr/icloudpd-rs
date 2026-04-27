@@ -249,11 +249,9 @@ pub struct SyncArgs {
 
     /// Library/libraries to download. Repeatable; default `primary` (the
     /// PrimarySync zone). Accepts the same value grammar as `--album`: a
-    /// CloudKit zone name (e.g. `PrimarySync`, `SharedSync-A1B2C3D4`), the
-    /// sentinels `primary` / `shared` / `all` / `none`, or `!name` to
-    /// exclude. Friendly aliases (`shared:Owner Name`, truncated 8-char
-    /// SharedSync prefixes) are accepted but their CloudKit-side resolution
-    /// lands in a follow-up PR.
+    /// CloudKit zone name (full UUID or the truncated 8-char `SharedSync-`
+    /// prefix that `{library}` renders into paths), the sentinels
+    /// `primary` / `shared` / `all` / `none`, or `!name` to exclude.
     #[arg(long = "library", env = "KEI_LIBRARY", value_parser = non_empty_string)]
     pub libraries: Vec<String>,
 

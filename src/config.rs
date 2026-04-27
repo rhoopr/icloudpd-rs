@@ -91,8 +91,8 @@ pub(crate) struct TomlFilters {
     /// Deprecated v0.13: use `libraries` (an array). Removed in v0.20.
     pub library: Option<String>,
     /// v0.13+ replacement for `library`. Repeatable; accepts the same value
-    /// grammar as `--library` (`primary`, `shared`, raw zone names, friendly
-    /// aliases, `!name` exclusions).
+    /// grammar as `--library` (`primary`, `shared`, `all`, raw zone names,
+    /// `!name` exclusions).
     pub libraries: Option<Vec<String>>,
     /// Deprecated v0.13: use `albums` (an array). Removed in v0.20.
     pub album: Option<String>,
