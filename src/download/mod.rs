@@ -1318,6 +1318,39 @@ pub async fn download_photos_with_sync(
     result
 }
 
+/// Fold per-pass `album.len()` results into a `(counts, error_count)` tuple,
+/// logging a `warn!` for each failure. Errors are mapped to a count of 0 so
+/// downstream concurrency math still has a value, but the returned error
+/// count is the load-bearing signal: callers must treat it as an enumeration
+/// failure that suppresses sync token advancement (a swallowed `len()` error
+/// previously caused `total = 0`, which silently bypassed the pagination
+/// undercount check and advanced the token past un-enumerated change events).
+fn fold_pass_count_results(
+    results: Vec<anyhow::Result<u64>>,
+    passes: &[crate::commands::AlbumPass],
+) -> (Vec<u64>, usize) {
+    let mut errors: usize = 0;
+    let counts: Vec<u64> = results
+        .into_iter()
+        .zip(passes)
+        .map(|(result, pass)| match result {
+            Ok(n) => n,
+            Err(e) => {
+                errors += 1;
+                tracing::warn!(
+                    album = %pass.album,
+                    error = %e,
+                    "Failed to query album length; treating count as 0 and \
+                     blocking sync token advancement to force full \
+                     re-enumeration on next run"
+                );
+                0
+            }
+        })
+        .collect();
+    (counts, errors)
+}
+
 /// Full enumeration with syncToken capture.
 ///
 /// Uses `photo_stream_with_token` to capture the zone-level syncToken
@@ -1354,11 +1387,18 @@ async fn download_photos_full_with_token(
     // routinely 20+ round-trips before the first byte of the first
     // download. `buffered` (not `buffer_unordered`) preserves pass order
     // so the `zip(&pass_counts)` below stays aligned.
-    let pass_counts: Vec<u64> = stream::iter(passes)
-        .map(|pass| async move { pass.album.len().await.unwrap_or(0) })
+    // Capture per-pass `len()` errors instead of swallowing them as zero.
+    // A swallowed `len()` failure converted `total` to 0, which short-circuited
+    // the pagination-undercount check at line ~1450 (it only fires when
+    // `total > 0`); the cycle then returned `Success` with zero assets and the
+    // sync token advanced past un-enumerated change events. Treat any failure
+    // as a per-album enumeration error so token advancement is suppressed.
+    let pass_count_results: Vec<anyhow::Result<u64>> = stream::iter(passes)
+        .map(|pass| async move { pass.album.len().await })
         .buffered(config.concurrent_downloads)
         .collect()
         .await;
+    let (pass_counts, len_errors) = fold_pass_count_results(pass_count_results, passes);
     let mut total: u64 = pass_counts.iter().sum();
     if let Some(recent) = config.recent {
         total = total.min(u64::from(recent));
@@ -1370,7 +1410,7 @@ async fn download_photos_full_with_token(
     // copy per album folder. Non-{album} plans have a uniform exclude set
     // across passes (LibraryOnly: 1 pass; Named/All-without-{album}: every
     // pass has empty excludes) so streams merge for maximum concurrency.
-    let (streaming_result, token_receivers) = if needs_per_pass {
+    let (mut streaming_result, token_receivers) = if needs_per_pass {
         let pass_configs = build_pass_configs(passes, config);
         let mut combined_result = StreamingResult::default();
         let mut token_receivers = Vec::with_capacity(passes.len());
@@ -1444,10 +1484,18 @@ async fn download_photos_full_with_token(
         (result, token_receivers)
     };
 
+    // Fold `len()` failures into the streaming result's enumeration error
+    // tally so `build_download_outcome` returns `PartialFailure`. This is the
+    // signal `should_store_sync_token` reads to suppress token advancement.
+    streaming_result.enumeration_errors += len_errors;
+
     // Check if enumeration saw significantly fewer assets than the API reported.
     // This catches silent pagination truncation, dropped pages, or API hiccups
-    // that would otherwise go unnoticed.
-    let pagination_undercount = if total > 0 && !config.only_print_filenames && !config.dry_run {
+    // that would otherwise go unnoticed. Any `len()` failure also forces
+    // suppression because the recorded `total` is missing those passes.
+    let pagination_undercount = if len_errors > 0 {
+        true
+    } else if total > 0 && !config.only_print_filenames && !config.dry_run {
         let seen = streaming_result.assets_seen;
         let threshold = total * 95 / 100; // 5% tolerance
         if seen < threshold {
@@ -3679,6 +3727,87 @@ mod tests {
             3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13,
             "skip total must reflect summed breakdown"
         );
+    }
+
+    /// ADV-1 (2026-04-27): a transient `pass.album.len()` failure must not
+    /// reduce to a 0-count that silently advances the sync token. Folding
+    /// the per-pass results must surface the failure as an error count so
+    /// downstream gates can suppress token advancement.
+    #[test]
+    fn fold_pass_count_results_counts_errors_and_zeroes_failed_passes() {
+        use crate::commands::{AlbumPass, PassKind};
+        use crate::icloud::photos::PhotoAlbum;
+        use rustc_hash::FxHashSet;
+        use std::sync::Arc;
+
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: PhotoAlbum::stub_for_test(Arc::from("album_a")),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Album,
+                album: PhotoAlbum::stub_for_test(Arc::from("album_b")),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Album,
+                album: PhotoAlbum::stub_for_test(Arc::from("album_c")),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        // First and third pass succeed; second pass fails (transient len()
+        // error). The failed pass must contribute 0 to the counts vector and
+        // increment the error count by exactly 1.
+        let results = vec![
+            Ok(100),
+            Err(anyhow::anyhow!("simulated transient len() failure")),
+            Ok(50),
+        ];
+
+        let (counts, errors) = fold_pass_count_results(results, &passes);
+
+        assert_eq!(counts, vec![100, 0, 50]);
+        assert_eq!(
+            errors, 1,
+            "exactly one len() error must surface so token advancement is blocked"
+        );
+    }
+
+    /// Pin the all-failures case: every pass's `len()` errors out → counts
+    /// are all zero AND the error count equals the pass count, so the cycle
+    /// cannot be mistaken for a clean empty enumeration.
+    #[test]
+    fn fold_pass_count_results_all_errors_yields_full_error_count() {
+        use crate::commands::{AlbumPass, PassKind};
+        use crate::icloud::photos::PhotoAlbum;
+        use rustc_hash::FxHashSet;
+        use std::sync::Arc;
+
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: PhotoAlbum::stub_for_test(Arc::from("album_a")),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Album,
+                album: PhotoAlbum::stub_for_test(Arc::from("album_b")),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let results = vec![
+            Err(anyhow::anyhow!("first failure")),
+            Err(anyhow::anyhow!("second failure")),
+        ];
+
+        let (counts, errors) = fold_pass_count_results(results, &passes);
+
+        assert_eq!(counts, vec![0, 0]);
+        assert_eq!(errors, 2);
     }
 
     /// Companion: accumulating into an empty `SyncStats` is a faithful copy
