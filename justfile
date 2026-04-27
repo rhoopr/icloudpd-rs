@@ -237,14 +237,18 @@ fuzz MODE="list" *ARGS="":
                 cargo +nightly fuzz list
                 exit 2
             fi
-            # Pass fuzz/seeds/<target> as an extra corpus dir when it exists, so
-            # checked-in regression inputs replay on every run alongside the
-            # auto-managed fuzz/corpus/<target>/.
+            # libfuzzer treats the FIRST corpus dir as input/output (it
+            # writes new coverage-improving inputs there) and any later dirs
+            # as read-only auxiliary corpora. Pass fuzz/corpus/<target>
+            # first so libfuzzer's auto-saved finds land there, and
+            # fuzz/seeds/<target> second so checked-in regression inputs
+            # replay every run without getting clobbered by autogen entries.
+            mkdir -p "fuzz/corpus/$target"
             extra=()
             if [ -d "fuzz/seeds/$target" ]; then
                 extra+=("fuzz/seeds/$target")
             fi
-            cargo +nightly fuzz run "$target" "${extra[@]}" -- -max_total_time="$seconds"
+            cargo +nightly fuzz run "$target" "fuzz/corpus/$target" "${extra[@]}" -- -max_total_time="$seconds"
             ;;
         *)
             echo "Unknown mode: {{MODE}}" >&2

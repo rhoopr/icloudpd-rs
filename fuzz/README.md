@@ -54,16 +54,16 @@ are gitignored.
 | `enc_decoders` | `decode_string`, `decode_keywords`, `decode_location`, `decode_location_with_fallback` - both the JSON-shape path and the bplist-via-base64 path | `src/icloud/photos/enc.rs` |
 | `paths_sanitization` | `clean_filename`, `sanitize_path_component`, `expand_album_token`, `add_dedup_suffix`, `strip_python_wrapper`, `remove_unicode_chars` | `src/download/paths.rs` |
 | `heif_atoms` | `extract_xmp_bytes` and `is_heif_content` - mp4-atom walks the ISO-BMFF box tree on attacker-controlled HEIC bytes | `src/download/heif.rs` |
-| `xmp_packet` | `XmpMeta::from_str` directly - drives Adobe's vendored XMP Toolkit (C++ via FFI) on arbitrary UTF-8 | `xmp_toolkit` crate |
+| `xmp_packet` | `XmpMeta::from_str` directly - drives Adobe's vendored XMP Toolkit (C++ via FFI) on arbitrary UTF-8. cargo-fuzz only instruments Rust code, so libfuzzer is blind to coverage inside the C++ and this target is effectively dumb-fuzzed (ASan still catches memory bugs). A starter seed lives at `fuzz/seeds/xmp_packet/minimal.xmp`. | `xmp_toolkit` crate |
 | `heif_xmp_probe` | full `probe_exif_heif` pipeline: extract XMP from HEIC bytes, then parse it through xmp_toolkit | `src/download/heif.rs` + `xmp_toolkit` |
 
 ## Findings
 
 `heif_atoms` and `heif_xmp_probe` both find an unbounded allocation in
 `mp4-atom` within seconds: a 110-byte malformed input drives a
-~21 GiB `malloc` and trips libfuzzer's OOM guard. Repros are checked
-in at `fuzz/seeds/heif_atoms/regression-iloc-oom` and
-`fuzz/seeds/heif_xmp_probe/regression-iloc-oom`. Run them through
+~21 GiB `malloc` and trips libfuzzer's OOM guard. Two distinct repros
+per target are checked in at `fuzz/seeds/heif_atoms/regression-iloc-oom*`
+and `fuzz/seeds/heif_xmp_probe/regression-iloc-oom*`. Run them through
 the harness to reproduce:
 
 ```sh
