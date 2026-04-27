@@ -11,6 +11,20 @@ use rustc_hash::FxHashMap;
 /// Matched case-insensitively.
 pub(crate) const NO_DATE_STRUCTURE: &str = "none";
 
+/// Token replaced with an album name in `--folder-structure-albums`
+/// templates (also accepted in legacy `--folder-structure` for backward
+/// compatibility; auto-migrated at config load).
+pub(crate) const TOKEN_ALBUM: &str = "{album}";
+
+/// Token replaced with a smart-folder name in
+/// `--folder-structure-smart-folders` templates.
+pub(crate) const TOKEN_SMART_FOLDER: &str = "{smart-folder}";
+
+/// Token replaced with the path-friendly zone name (see
+/// [`truncate_library_zone`]). Valid in any folder-structure template;
+/// must be the leading path segment when present.
+pub(crate) const TOKEN_LIBRARY: &str = "{library}";
+
 /// Strip the legacy Python-style `{:%Y/%m/%d}` wrapper, returning the inner
 /// format string. Returns the input unchanged if the wrapper is absent.
 pub(crate) fn strip_python_wrapper(folder_structure: &str) -> &str {
@@ -69,11 +83,9 @@ pub(crate) fn truncate_library_zone(zone_name: &str) -> &str {
     if rest.len() <= KEEP {
         return zone_name;
     }
-    // CloudKit UUIDs are ASCII hex/dash, so an 8-byte slice is also an 8-char
-    // boundary. Defensive `is_char_boundary` check guards against a future
-    // schema change that introduces multibyte chars; on hit we drop back to
-    // the untruncated form rather than panic.
     let cut = PREFIX.len() + KEEP;
+    // Char-boundary guard: CloudKit UUIDs are ASCII hex/dash today; if
+    // that ever changes mid-codepoint, fall back to the full zone name.
     if !zone_name.is_char_boundary(cut) {
         return zone_name;
     }

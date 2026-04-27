@@ -347,6 +347,12 @@ fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
 /// per-template token rules: each kind allows exactly one category token
 /// (`{album}` for albums, `{smart-folder}` for smart folders, none for the
 /// unfiled base) and `{library}` is allowed in all three.
+///
+/// See also [`crate::commands::PassKind`], which classifies the same three
+/// categories at *render* time. The two enums look identical but encode
+/// different rules: `PassKind::Unfiled` reuses `{album}` as its render
+/// token (legacy compatibility), while `TemplateKind::Unfiled` *forbids*
+/// it (post-migration).
 #[derive(Debug, Clone, Copy)]
 enum TemplateKind {
     /// `--folder-structure-albums`.
@@ -372,16 +378,16 @@ impl TemplateKind {
     /// placement rules and for rejecting category tokens in the unfiled
     /// template.
     fn category_token(self) -> Option<&'static str> {
+        use crate::download::paths::{TOKEN_ALBUM, TOKEN_SMART_FOLDER};
         match self {
-            Self::Albums => Some("{album}"),
-            Self::SmartFolders => Some("{smart-folder}"),
+            Self::Albums => Some(TOKEN_ALBUM),
+            Self::SmartFolders => Some(TOKEN_SMART_FOLDER),
             Self::Unfiled => None,
         }
     }
 }
 
-/// Cross-template token & placement validator. Enforces, for the post-PR11
-/// surface:
+/// Cross-template token & placement validator. Enforces:
 ///
 /// - `{album}` is only valid in `--folder-structure-albums`; same for
 ///   `{smart-folder}` and `--folder-structure-smart-folders`. The opposite
@@ -394,14 +400,16 @@ impl TemplateKind {
 ///
 /// Bails at startup so misconfiguration surfaces before the first download.
 fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyhow::Result<()> {
+    use crate::download::paths::{TOKEN_ALBUM, TOKEN_LIBRARY, TOKEN_SMART_FOLDER};
+
     let stripped = crate::download::paths::strip_python_wrapper(folder_structure);
     let flag = kind.flag_name();
+    let category = kind.category_token();
 
     // Reject category tokens that don't belong here.
-    let category = kind.category_token();
     for (token, owner) in [
-        ("{album}", "--folder-structure-albums"),
-        ("{smart-folder}", "--folder-structure-smart-folders"),
+        (TOKEN_ALBUM, "--folder-structure-albums"),
+        (TOKEN_SMART_FOLDER, "--folder-structure-smart-folders"),
     ] {
         if Some(token) == category {
             continue;
@@ -413,12 +421,10 @@ fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyho
         }
     }
 
-    // Single-occurrence checks for every token that *is* allowed here.
-    let mut tokens_to_count: Vec<&str> = vec!["{library}"];
-    if let Some(cat) = category {
-        tokens_to_count.push(cat);
-    }
-    for token in &tokens_to_count {
+    // Single-occurrence checks for every token allowed in this kind.
+    // `{library}` is always allowed; the category token is only allowed in
+    // its owner kind.
+    for token in [Some(TOKEN_LIBRARY), category].into_iter().flatten() {
         let count = stripped.matches(token).count();
         if count > 1 {
             anyhow::bail!(
@@ -427,28 +433,23 @@ fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyho
         }
     }
 
-    // Placement rules. Build the list of tokens we need to check positions
-    // for and verify the segment ordering.
     let segments: Vec<&str> = stripped.split('/').filter(|s| !s.is_empty()).collect();
-    let has_library = stripped.contains("{library}");
-    let has_category = category.is_some_and(|c| stripped.contains(c));
+    let has_library = stripped.contains(TOKEN_LIBRARY);
 
-    if has_library && segments.first() != Some(&"{library}") {
+    if has_library && segments.first() != Some(&TOKEN_LIBRARY) {
         anyhow::bail!(
-            "'{{library}}' must be the first path segment of {flag}; got \"{folder_structure}\""
+            "'{TOKEN_LIBRARY}' must be the first path segment of {flag}; got \"{folder_structure}\""
         );
     }
-    if let Some(cat) = category {
-        if has_category {
-            let expected_index = if has_library { 1 } else { 0 };
-            if segments.get(expected_index) != Some(&cat) {
-                let position = if has_library {
-                    "must immediately follow '{library}'"
-                } else {
-                    "must be the first path segment"
-                };
-                anyhow::bail!("'{cat}' {position} of {flag}; got \"{folder_structure}\"");
-            }
+    if let Some(cat) = category.filter(|c| stripped.contains(*c)) {
+        let expected_index = if has_library { 1 } else { 0 };
+        if segments.get(expected_index) != Some(&cat) {
+            let position = if has_library {
+                "must immediately follow '{library}'"
+            } else {
+                "must be the first path segment"
+            };
+            anyhow::bail!("'{cat}' {position} of {flag}; got \"{folder_structure}\"");
         }
     }
 
@@ -1413,12 +1414,9 @@ impl Config {
         let folder_structure = migration.folder_structure;
         let folder_structure_albums = migration.folder_structure_albums;
 
-        // Validate every template's tokens after auto-migration so a user
-        // who pasted `{smart-folder}` into `--folder-structure-albums`, or
-        // put `{library}` in the wrong segment position, gets a clear bail
-        // before the first download. The unfiled template runs through too
-        // even though `{album}` should have been migrated out — anything
-        // left there (e.g. `{smart-folder}`) is still a configuration bug.
+        // Runs after auto-migration so the unfiled template has no `{album}`
+        // left to reject; remaining bugs (e.g. `{smart-folder}` in albums)
+        // surface here before the first download.
         validate_template_tokens(&folder_structure, TemplateKind::Unfiled)?;
         validate_template_tokens(&folder_structure_albums, TemplateKind::Albums)?;
         validate_template_tokens(&folder_structure_smart_folders, TemplateKind::SmartFolders)?;

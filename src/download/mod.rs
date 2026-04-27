@@ -555,8 +555,11 @@ impl DownloadConfig {
         // so callers see `SharedSync-A1B2C3D4/...` instead of the full UUID.
         // The state-DB key still uses the full `self.library` string.
         let library_for_path = paths::truncate_library_zone(&self.library);
-        let folder_structure =
-            paths::expand_named_token(&category_expanded, "{library}", Some(library_for_path));
+        let folder_structure = paths::expand_named_token(
+            &category_expanded,
+            paths::TOKEN_LIBRARY,
+            Some(library_for_path),
+        );
         Self {
             album_name: Some(Arc::clone(name)),
             directory: Arc::clone(&self.directory),
