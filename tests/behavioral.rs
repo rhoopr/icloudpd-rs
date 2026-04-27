@@ -3752,538 +3752,258 @@ fn reconcile_on_empty_db_prints_guidance_and_exits_clean() {
 // ═══════════════════════════════════════════════════════════════════════
 // v0.13 selection + per-category folder-structure surface
 //
-// Behavioral coverage for the redesign: legacy `{album}` migration,
-// per-category template round-trip, token validation bails, selection
-// emission. Stdout (resolved config) checks drive `kei config show`
-// from a TOML fixture, since `config show` doesn't accept sync-args.
-// CLI/env-flag tests drive `kei sync` and only assert stderr / exit
-// code so they don't require auth.
+// Stdout (resolved config) checks drive `kei config show` from a TOML
+// fixture, since that subcommand uses `SyncArgs::default()` and won't
+// accept sync flags. CLI/env-flag tests drive `kei sync` and only assert
+// stderr / exit code so they don't require auth.
 // ═══════════════════════════════════════════════════════════════════════
 
-/// `--folder-structure '{album}/%Y/%m/%d'` (the legacy combined form) must
-/// warn and point at the `--folder-structure-albums` migration target.
-#[test]
-fn migration_legacy_album_in_cli_warns() {
+/// Run `kei config show` against an inline TOML fixture and return the
+/// (stdout, stderr) pair. Builds a tempdir, writes `[download].directory`
+/// and the supplied `body` into it, then dumps the resolved config.
+fn run_config_show(body: &str) -> (String, String) {
     let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!("[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n{body}"),
+    )
+    .unwrap();
     let out = clean_cmd()
         .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
+            "config",
+            "show",
+            "--config",
+            config_path.to_str().unwrap(),
             "--data-dir",
             dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Build a `kei sync` invocation pre-populated with username, fresh tempdir
+/// `--download-dir` / `--data-dir` pair, and `--only-print-filenames` so the
+/// run exits before auth. Returns the live `Command` so callers can append
+/// flag-specific args. Tempdirs are leaked into the binary (which never
+/// touches them, as these tests bail in `Config::build`).
+fn sync_cmd_for_validation() -> assert_cmd::Command {
+    let dir = tempfile::tempdir().unwrap();
+    let dl_dir = tempfile::tempdir().unwrap();
+    let mut cmd = clean_cmd();
+    cmd.args([
+        "sync",
+        "--username",
+        "x@x.com",
+        "--download-dir",
+        dl_dir.path().to_str().unwrap(),
+        "--data-dir",
+        dir.path().to_str().unwrap(),
+    ]);
+    // Tempdirs leak intentionally: tests bail before sync touches them, and
+    // OS-level tmpfs cleanup handles the directories at process exit.
+    std::mem::forget(dir);
+    std::mem::forget(dl_dir);
+    cmd
+}
+
+#[test]
+fn migration_legacy_album_in_cli_warns() {
+    sync_cmd_for_validation()
+        .args([
             "--folder-structure",
             "{album}/%Y/%m/%d",
             "--only-print-filenames",
         ])
         .assert()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("`{album}` in `--folder-structure`") && stderr.contains("v0.20.0"),
-        "expected deprecation warning for legacy {{album}} token, stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("--folder-structure-albums"),
-        "warning must point at --folder-structure-albums, stderr: {stderr}"
-    );
+        .stderr(predicate::str::contains(
+            "`{album}` in `--folder-structure`",
+        ))
+        .stderr(predicate::str::contains("v0.20.0"))
+        .stderr(predicate::str::contains("--folder-structure-albums"));
 }
 
-/// Same migration triggered via `[download].folder_structure` in the TOML.
-/// Routes through `kei config show` so we can also confirm the resolved
-/// templates round-trip correctly after migration.
 #[test]
 fn migration_legacy_album_in_toml_warns_and_lifts() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nfolder_structure = \"{album}/%B\"\n",
-    )
-    .unwrap();
-    let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (stdout, stderr) = run_config_show("folder_structure = \"{album}/%B\"\n");
     assert!(
         stderr.contains("`{album}` in `--folder-structure`") && stderr.contains("v0.20.0"),
-        "TOML legacy form must produce the same deprecation warning, stderr: {stderr}"
+        "stderr: {stderr}"
     );
     assert!(
         stdout.contains("folder_structure_albums = \"{album}/%B\""),
-        "TOML legacy form must lift into folder_structure_albums, stdout: {stdout}"
+        "stdout: {stdout}"
     );
     assert!(
         stdout.contains("folder_structure = \"%B\""),
-        "TOML legacy form must strip the {{album}} prefix from base, stdout: {stdout}"
+        "stdout: {stdout}"
     );
 }
 
-/// Same migration triggered via the `KEI_FOLDER_STRUCTURE` env var. Locks in
-/// that all three input surfaces (CLI / TOML / env) flow through one helper.
+/// Locks in that all three input surfaces (CLI / TOML / env) flow through
+/// the same migration helper.
 #[test]
 fn migration_legacy_album_in_env_warns() {
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    let out = clean_cmd()
+    sync_cmd_for_validation()
         .env("KEI_FOLDER_STRUCTURE", "{album}/%Y")
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--only-print-filenames",
-        ])
+        .arg("--only-print-filenames")
         .assert()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("`{album}` in `--folder-structure`") && stderr.contains("v0.20.0"),
-        "env legacy form must produce the same deprecation warning, stderr: {stderr}"
-    );
+        .stderr(predicate::str::contains(
+            "`{album}` in `--folder-structure`",
+        ))
+        .stderr(predicate::str::contains("v0.20.0"));
 }
 
-/// When the user has *also* supplied `folder_structure_albums`, the user's
-/// value wins -- the legacy `{album}` segment in the base template is still
-/// stripped, the warning still fires, but the user's albums template is
-/// preserved untouched. Drives via TOML so we can assert resolved config.
+/// User's albums template wins; the legacy `{album}` segment in the base
+/// template still gets stripped (so no leftover token reaches the renderer)
+/// and the warning still fires.
 #[test]
 fn migration_legacy_album_preserves_user_set_albums_template() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nfolder_structure = \"{album}/%Y\"\nfolder_structure_albums = \"{album}/custom\"\n",
-    )
-    .unwrap();
-    let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (stdout, stderr) = run_config_show(
+        "folder_structure = \"{album}/%Y\"\nfolder_structure_albums = \"{album}/custom\"\n",
+    );
     assert!(
         stderr.contains("`{album}` in `--folder-structure`"),
-        "deprecation warning still fires when user-set albums template is present, stderr: {stderr}"
+        "stderr: {stderr}"
     );
     assert!(
         stdout.contains("folder_structure_albums = \"{album}/custom\""),
-        "user-set albums template must be preserved, stdout: {stdout}"
+        "stdout: {stdout}"
     );
     assert!(
         stdout.contains("folder_structure = \"%Y\""),
-        "base folder_structure must still be stripped of the {{album}} prefix, stdout: {stdout}"
+        "stdout: {stdout}"
     );
 }
 
-/// Sanity: a plain `--folder-structure '%Y/%m/%d'` (no legacy token) must
-/// not produce the migration warning. Guards against false-positive warnings
-/// on configs that already use the new shape.
 #[test]
 fn migration_no_warning_when_no_album_token() {
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    let out = clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--folder-structure",
-            "%Y/%m/%d",
-            "--only-print-filenames",
-        ])
+    sync_cmd_for_validation()
+        .args(["--folder-structure", "%Y/%m/%d", "--only-print-filenames"])
         .assert()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("`{album}` in `--folder-structure`"),
-        "no legacy token = no migration warning, stderr: {stderr}"
-    );
+        .stderr(predicate::str::contains("`{album}` in `--folder-structure`").not());
 }
 
-/// Per-category templates set in TOML round-trip back through `config show`
-/// when they differ from the defaults.
 #[test]
 fn config_show_emits_per_category_templates_from_toml() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        r#"
-[auth]
-username = "x@x.com"
-
-[download]
-directory = "/photos"
-folder_structure_albums = "{album}/%Y/%m"
-folder_structure_smart_folders = "{smart-folder}/%Y"
-"#,
-    )
-    .unwrap();
-    let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (stdout, _) = run_config_show(
+        "folder_structure_albums = \"{album}/%Y/%m\"\nfolder_structure_smart_folders = \"{smart-folder}/%Y\"\n",
+    );
     assert!(
         stdout.contains("folder_structure_albums = \"{album}/%Y/%m\""),
-        "albums template must round-trip from TOML, stdout: {stdout}"
+        "stdout: {stdout}"
     );
     assert!(
         stdout.contains("folder_structure_smart_folders = \"{smart-folder}/%Y\""),
-        "smart-folders template must round-trip from TOML, stdout: {stdout}"
+        "stdout: {stdout}"
     );
 }
 
-/// Default per-category templates (`{album}`, `{smart-folder}`) are *not*
-/// re-emitted by `config show` -- they're implicit defaults so configs stay
-/// minimal. Locks in that behaviour so a future refactor doesn't start
-/// emitting verbose redundant fields.
+/// Default per-category templates stay implicit -- a future refactor that
+/// starts emitting the defaults would inflate every dumped config.
 #[test]
 fn config_show_omits_default_per_category_templates() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n",
-    )
-    .unwrap();
-    let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (stdout, _) = run_config_show("");
     assert!(
         !stdout.contains("folder_structure_albums"),
-        "default folder_structure_albums must be omitted, stdout: {stdout}"
+        "stdout: {stdout}"
     );
     assert!(
         !stdout.contains("folder_structure_smart_folders"),
-        "default folder_structure_smart_folders must be omitted, stdout: {stdout}"
+        "stdout: {stdout}"
     );
 }
 
-/// `{album}` in `--folder-structure-smart-folders` is a category mismatch and
-/// must bail at startup before any sync work begins.
 #[test]
 fn sync_bails_on_album_token_in_smart_folders_template() {
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--folder-structure-smart-folders",
-            "{album}/%Y",
-        ])
+    sync_cmd_for_validation()
+        .args(["--folder-structure-smart-folders", "{album}/%Y"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("{album}"))
         .stderr(predicate::str::contains("--folder-structure-albums"));
 }
 
-/// `{smart-folder}` in `--folder-structure-albums` is a category mismatch and
-/// must bail at startup.
 #[test]
 fn sync_bails_on_smart_folder_token_in_albums_template() {
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--folder-structure-albums",
-            "{smart-folder}/foo",
-        ])
+    sync_cmd_for_validation()
+        .args(["--folder-structure-albums", "{smart-folder}/foo"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("{smart-folder}"))
         .stderr(predicate::str::contains("--folder-structure-smart-folders"));
 }
 
-/// `{library}` is only valid as the leading segment. Anything else bails.
 #[test]
 fn sync_bails_on_library_token_not_first_segment() {
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--folder-structure",
-            "%Y/{library}",
-        ])
+    sync_cmd_for_validation()
+        .args(["--folder-structure", "%Y/{library}"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("{library}"))
         .stderr(predicate::str::contains("first path segment"));
 }
 
-/// `{library}` is single-occurrence; repeats bail.
 #[test]
 fn sync_bails_on_duplicate_library_token() {
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--folder-structure-albums",
-            "{library}/{library}/{album}",
-        ])
+    sync_cmd_for_validation()
+        .args(["--folder-structure-albums", "{library}/{library}/{album}"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("{library}"))
         .stderr(predicate::str::contains("once"));
 }
 
-/// `--album Foo --album '!Foo'` is a contradiction inside one category and
-/// must bail at parse time, before any iCloud calls.
 #[test]
 fn sync_bails_on_within_album_contradiction() {
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--album",
-            "Family",
-            "--album",
-            "!Family",
-        ])
+    sync_cmd_for_validation()
+        .args(["--album", "Family", "--album", "!Family"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("include and exclude"))
         .stderr(predicate::str::contains("Family"));
 }
 
-/// `--library none` leaves kei without a source library and must bail.
 #[test]
 fn sync_bails_on_library_none() {
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--library",
-            "none",
-        ])
+    sync_cmd_for_validation()
+        .args(["--library", "none"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("--library none"));
 }
 
-/// Smart-folder selection from TOML round-trips through `config show` as
-/// the `[filters].smart_folders` array.
 #[test]
 fn config_show_emits_smart_folder_selection() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n\n[filters]\nsmart_folders = [\"Favorites\", \"!Hidden\"]\n",
-    )
-    .unwrap();
-    let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("smart_folders"),
-        "smart_folders array must be emitted, stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("Favorites"),
-        "included smart folder must round-trip, stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("!Hidden"),
-        "excluded smart folder must round-trip with `!` prefix, stdout: {stdout}"
-    );
+    let (stdout, _) =
+        run_config_show("\n[filters]\nsmart_folders = [\"Favorites\", \"!Hidden\"]\n");
+    assert!(stdout.contains("smart_folders"), "stdout: {stdout}");
+    assert!(stdout.contains("Favorites"), "stdout: {stdout}");
+    assert!(stdout.contains("!Hidden"), "stdout: {stdout}");
 }
 
-/// `[filters].unfiled = false` in TOML round-trips as `unfiled = false`.
 #[test]
 fn config_show_emits_unfiled_false_when_disabled() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n\n[filters]\nunfiled = false\n",
-    )
-    .unwrap();
-    let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("unfiled = false"),
-        "explicit unfiled = false must round-trip, stdout: {stdout}"
-    );
+    let (stdout, _) = run_config_show("\n[filters]\nunfiled = false\n");
+    assert!(stdout.contains("unfiled = false"), "stdout: {stdout}");
 }
 
-/// The default `unfiled = true` is implicit and must not be emitted.
-/// Locks in that defaults stay silent in dumped configs.
+/// Default `unfiled = true` stays implicit -- locks in that defaults don't
+/// inflate dumped configs.
 #[test]
 fn config_show_omits_unfiled_when_default_true() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n",
-    )
-    .unwrap();
-    let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !stdout.contains("unfiled = true"),
-        "default unfiled = true must stay implicit in dumped TOML, stdout: {stdout}"
-    );
+    let (stdout, _) = run_config_show("");
+    assert!(!stdout.contains("unfiled = true"), "stdout: {stdout}");
 }
 
-/// `[filters].libraries = ["all"]` (non-default) round-trips through
-/// `config show` as a `libraries` array. The default `["primary"]` stays
-/// implicit; this test pins the non-default emission path.
 #[test]
 fn config_show_emits_libraries_when_non_default() {
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n\n[filters]\nlibraries = [\"all\"]\n",
-    )
-    .unwrap();
-    let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("libraries = [\"all\"]"),
-        "non-default library array must round-trip, stdout: {stdout}"
-    );
+    let (stdout, _) = run_config_show("\n[filters]\nlibraries = [\"all\"]\n");
+    assert!(stdout.contains("libraries = [\"all\"]"), "stdout: {stdout}");
 }
