@@ -2,10 +2,11 @@
 
 Coverage-guided fuzz harnesses for the parsers in kei that consume
 attacker-controllable input: CloudKit JSON from Apple, base64-wrapped
-binary plists in `*Enc` metadata, filename / path sanitization on
-network-supplied strings, the HEIC atom tree on every downloaded
-HEIC, and the XMP packet inside it (which goes through Adobe's
-vendored C++ XMP Toolkit).
+binary plists in `*Enc` metadata, the iCloud auth response shapes,
+filename / path sanitization on network-supplied strings, the HEIC atom
+tree on every downloaded HEIC, and the XMP packet inside it (which goes
+through Adobe's vendored C++ XMP Toolkit). Plus user-supplied TOML
+config and corruptible on-disk state-DB enum strings.
 
 Run by hand. Not part of `just gate` or CI. The point is to leave a
 target running locally for minutes-to-hours when poking at a parser, or
@@ -56,6 +57,10 @@ are gitignored.
 | `heif_atoms` | `extract_xmp_bytes` and `is_heif_content` - mp4-atom walks the ISO-BMFF box tree on attacker-controlled HEIC bytes | `src/download/heif.rs` |
 | `xmp_packet` | `XmpMeta::from_str` directly - drives Adobe's vendored XMP Toolkit (C++ via FFI) on arbitrary UTF-8. cargo-fuzz only instruments Rust code, so libfuzzer is blind to coverage inside the C++ and this target is effectively dumb-fuzzed (ASan still catches memory bugs). A starter seed lives at `fuzz/seeds/xmp_packet/minimal.xmp`. | `xmp_toolkit` crate |
 | `heif_xmp_probe` | full `probe_exif_heif` pipeline: extract XMP from HEIC bytes, then parse it through xmp_toolkit | `src/download/heif.rs` + `xmp_toolkit` |
+| `toml_config` | `TomlConfig` deserializer + custom field deserializers (`folder_structure`, `RecentLimit`) + `deny_unknown_fields` boundary checks | `src/config.rs` |
+| `auth_responses` | `SrpInitResponse`, `AccountLoginResponse`, `TwoFactorChallenge` (with custom deserializer for `fsa_challenge` + `service_errors`) | `src/auth/responses.rs` |
+| `photo_asset_from_record` | `PhotoAsset::from_records`: drives `decode_filename`, `resolve_item_type`, `extract_versions`, and `metadata::extract` in one go. Splits input on the first NUL into two CloudKit `Record` JSON values | `src/icloud/photos/asset.rs` |
+| `state_enums_from_str` | inherent `from_str` parsers on `VersionSizeKey`, `AssetStatus`, `MediaType` - inputs come from a sqlite state DB on disk that could be replayed, hand-edited, or corrupted | `src/state/types.rs` |
 
 ## Findings
 
@@ -70,63 +75,54 @@ the harness to reproduce:
 cargo +nightly fuzz run heif_atoms fuzz/seeds/heif_atoms/regression-iloc-oom
 ```
 
-The bug is upstream in `mp4-atom`'s box parser, not in kei's code.
-kei calls `extract_xmp_bytes` synchronously on every HEIC during the
-EXIF probe, so a hostile HEIC could DoS the sync. Worth either an
-upstream PR or a wrapping size guard before the call.
+The bug is upstream in `mp4-atom`'s `parse_vorbis_comment`, not in
+kei's code. Filed as kixelated/mp4-atom#154. kei's defense-in-depth is
+PR #286, which walks top-level boxes by header and only invokes the
+iinf / iloc decoders. With #286 merged, neither harness reproduces the
+seeds anymore; without it, `just fuzz run heif_atoms` trips the seed on
+its first iteration.
 
-Until that's fixed, `just fuzz run heif_atoms` will always trip the
-seed on its first iteration. To fuzz past it (so libfuzzer can find
-*other* bugs in the same target) raise the OOM limit:
+To fuzz past the OOM (so libfuzzer can find *other* bugs in the same
+target before #286 lands) raise the limit:
 
 ```sh
 cargo +nightly fuzz run heif_atoms -- -max_total_time=60 -rss_limit_mb=4096
 ```
 
-## How the harnesses are wired
+## How the harnesses reach kei internals
 
-kei is a binary-only crate, so `[dependencies.kei]` from `fuzz/Cargo.toml`
-won't link. Each harness pulls in its module with a `#[path]` attribute
-and lists the external crates it needs in `fuzz/Cargo.toml` directly.
-That keeps the production crate untouched. The cost is that any
-parser whose module has internal `crate::` imports can't be fuzzed
-this way without first being reshaped.
+Every harness depends on the kei crate through the
+`__fuzz_internals` Cargo feature, which gates a `kei::__fuzz` module
+of `pub fn` wrappers around the parser entry points. The wrappers take
+and return only externally-nameable types (bytes, strings,
+`serde_json::Value`) and discard typed results internally, so kei's
+internal types stay `pub(crate)`. Production builds without the
+feature don't see the module at all.
+
+Before the lib+bin split, harnesses inlined source files via
+`#[path]`. That worked for leaf modules but broke for any parser
+whose module imported `crate::xxx` or `super::xxx`. The four
+non-leaf targets (`toml_config`, `auth_responses`,
+`photo_asset_from_record`, `state_enums_from_str`) only became
+fuzzable once the split landed.
 
 ## Adding a target
 
-1. Write `fuzz/fuzz_targets/<name>.rs` with a `#[path = "../../src/.../foo.rs"] mod foo;` and a `fuzz_target!` body that calls into `foo`.
-2. Add `[[bin]]` entry to `fuzz/Cargo.toml` with `name = "<name>"`.
-3. If the inlined module uses extra crates, add them to `[dependencies]` in `fuzz/Cargo.toml`.
-4. `just fuzz build` to confirm it links.
-
-Pick something whose input crosses a trust boundary - network response,
-on-disk file, user config. A pure-internal helper isn't worth a fuzz
-target.
+1. Pick something whose input crosses a trust boundary - network response, on-disk file, user config. A pure-internal helper isn't worth a fuzz target.
+2. Add a `pub fn` wrapper in `src/lib.rs` under `pub mod __fuzz` that takes externally-nameable input (`&[u8]`, `&str`, `serde_json::Value`), calls the parser, and discards the typed result.
+3. Write `fuzz/fuzz_targets/<name>.rs` that calls `kei::__fuzz::<your_wrapper>` from inside `fuzz_target!`.
+4. Add a `[[bin]]` entry to `fuzz/Cargo.toml`.
+5. `just fuzz build` to confirm it links.
 
 ## Seeds and regressions
 
-`fuzz/seeds/<target>/` is checked in. cargo-fuzz reads it on `run`
-alongside the auto-managed `corpus/<target>/`, so any input committed
-there survives a `corpus/` wipe and is replayed on every run. Use it
-for:
+`fuzz/seeds/<target>/` is checked in. `just fuzz run` passes it as a
+read-only auxiliary corpus alongside the writable
+`fuzz/corpus/<target>/`, so anything committed there replays on every
+run. Use it for:
 
-- Repros for known crashes (filename prefix `regression-`).
-- Hand-crafted inputs that exercise a code path the fuzzer keeps
-  missing.
+- repros for known crashes (filename prefix `regression-`)
+- hand-crafted inputs that exercise a code path the fuzzer keeps missing
 
 `corpus/<target>/` and `artifacts/<target>/` stay gitignored because
 they grow into the megabytes and aren't deterministic across runs.
-
-## Future targets
-
-These would need a real lib refactor (or selective `pub` widening) to
-get inlined cleanly:
-
-- `config.rs` TOML parser - has `use crate::password::SecretString` and `use crate::types::*`.
-- `auth/responses.rs` SRP / 2FA response deser - has `use super::error::AuthError`.
-- `icloud/photos/asset.rs`'s `PhotoAsset::from_records` - chains through 5 sibling modules plus `crate::state::AssetMetadata` and `crate::string_interner`. The inlining works but the stub set gets brittle.
-- `state/types.rs` `FromStr` impls for `VersionSizeKey` / `AssetStatus` / `MediaType` - small surface, but they pull `crate::types::AssetVersionSize`.
-
-The cleanest fix for all four is splitting kei into `lib.rs` + `main.rs`
-so `fuzz/Cargo.toml` can `[dependencies] kei = { path = ".." }` and the
-harnesses can call `kei::...` directly. That's a separate PR.
