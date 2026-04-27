@@ -15,13 +15,7 @@ use crate::state::StateDb;
 use crate::types::AssetVersionSize;
 
 use super::service::{init_photos_service, resolve_libraries};
-
-/// Library scope assigned to rows imported via `kei import-existing`. The
-/// command is library-blind today (it walks the local data dir, not iCloud
-/// zones) so we tag every row with the primary library — the only zone
-/// pre-v8 sync would have populated. Users with shared libraries should
-/// re-sync after import to repopulate the SharedSync rows.
-const IMPORT_LIBRARY: &str = "PrimarySync";
+use crate::icloud::photos::PRIMARY_ZONE_NAME;
 
 /// This imports existing local files into the state database by:
 /// 1. Enumerating all iCloud assets via the photos API
@@ -207,7 +201,7 @@ pub(crate) async fn run_import_existing(
             if !args.dry_run {
                 let media_type = download::determine_media_type(version_size, &asset);
                 let record = state::AssetRecord::new_pending(
-                    IMPORT_LIBRARY.to_string(),
+                    Arc::from(PRIMARY_ZONE_NAME),
                     asset.id().to_string(),
                     version_size,
                     version.checksum.to_string(),
@@ -232,7 +226,7 @@ pub(crate) async fn run_import_existing(
 
                 if let Err(e) = db
                     .mark_downloaded(
-                        IMPORT_LIBRARY,
+                        PRIMARY_ZONE_NAME,
                         asset.id(),
                         version_size.as_str(),
                         &expected_path,

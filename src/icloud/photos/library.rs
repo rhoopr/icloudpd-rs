@@ -10,6 +10,12 @@ use super::queries::encode_params;
 use super::session::PhotosSession;
 use super::smart_folders::smart_folders;
 use crate::icloud::error::ICloudError;
+
+/// CloudKit zone name for the user's own (non-shared) library. Used as the
+/// fallback when a `zone_id` JSON object lacks `zoneName`, as the backfill
+/// value for the v8 schema migration, and as the default scope for
+/// commands that operate library-blind (e.g. `import-existing`).
+pub(crate) const PRIMARY_ZONE_NAME: &str = "PrimarySync";
 use crate::retry::RetryConfig;
 
 // Apple's sentinel folder IDs — these are containers, not real albums.
@@ -308,7 +314,7 @@ impl PhotoLibrary {
         self.zone_id
             .get("zoneName")
             .and_then(|v| v.as_str())
-            .unwrap_or("PrimarySync")
+            .unwrap_or(PRIMARY_ZONE_NAME)
     }
 
     /// Clone the session for a new album/library — preserves the shared

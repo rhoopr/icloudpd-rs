@@ -22,6 +22,7 @@
 
 use std::cell::Cell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::cli;
 use crate::config;
@@ -38,7 +39,7 @@ const SCAN_PAGE_SIZE: u32 = 1000;
 
 #[derive(Debug)]
 struct MissingAsset {
-    library: Box<str>,
+    library: Arc<str>,
     id: Box<str>,
     version_size: VersionSizeKey,
     local_path: PathBuf,

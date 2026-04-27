@@ -1135,7 +1135,7 @@ where
                             if let Some(db) = &producer_state_db {
                                 let media_type = determine_media_type(task.version_size, &asset);
                                 let record = AssetRecord::new_pending(
-                                    config.library.to_string(),
+                                    Arc::clone(&config.library),
                                     task.asset_id.to_string(),
                                     task.version_size,
                                     task.checksum.to_string(),

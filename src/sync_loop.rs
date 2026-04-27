@@ -1716,29 +1716,25 @@ mod tests {
     }
 
     // ── warn_if_multi_library_paths_commingle ────────────────────────
-
+    //
+    // The function returns `()` and only side-effects via `tracing::warn!`,
+    // which has no observable effect in unit tests without a subscriber.
+    // This smoke test exercises every branch (single-library short-circuit,
+    // `{library}` in any of the three templates, multi-library without
+    // token) so a future regression that panics gets caught even without
+    // log capture.
     #[test]
-    fn warn_skipped_for_single_library() {
-        // Single library never warns regardless of templates.
-        warn_if_multi_library_paths_commingle(1, "%Y/%m/%d", "{album}", "{smart-folder}");
+    fn warn_if_multi_library_paths_commingle_exercises_every_branch() {
+        // Single-library short-circuit (no warn, no work).
         warn_if_multi_library_paths_commingle(0, "%Y/%m/%d", "{album}", "{smart-folder}");
-    }
+        warn_if_multi_library_paths_commingle(1, "%Y/%m/%d", "{album}", "{smart-folder}");
 
-    #[test]
-    fn warn_skipped_when_any_template_uses_library_token() {
-        // {library} in any of the three templates suppresses the warning.
-        // Function returns unit on all branches; we exercise each branch
-        // for coverage rather than asserting on log lines.
+        // `{library}` in any of the three templates suppresses the warn.
         warn_if_multi_library_paths_commingle(2, "{library}/%Y/%m/%d", "{album}", "{smart-folder}");
         warn_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{library}/{album}", "{smart-folder}");
         warn_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{album}", "{library}/{smart-folder}");
-    }
 
-    #[test]
-    fn warn_fires_for_multi_library_without_token() {
-        // No assertion on log output — Rust's tracing tests would need a
-        // subscriber. We still exercise the path so a future regression
-        // that panics on a None field-value or similar is caught.
+        // Multi-library without `{library}` triggers the warn path.
         warn_if_multi_library_paths_commingle(2, "%Y/%m/%d", "{album}", "{smart-folder}");
         warn_if_multi_library_paths_commingle(5, "none", "{album}", "{smart-folder}");
     }

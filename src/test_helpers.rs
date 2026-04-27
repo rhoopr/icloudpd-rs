@@ -37,7 +37,7 @@ pub struct TestAssetRecord {
 impl TestAssetRecord {
     pub fn new(id: &str) -> Self {
         Self {
-            library: "PrimarySync".to_string(),
+            library: crate::icloud::photos::PRIMARY_ZONE_NAME.to_string(),
             id: id.to_string(),
             version_size: VersionSizeKey::Original,
             checksum: "checksum123".to_string(),
@@ -97,7 +97,7 @@ impl TestAssetRecord {
 
     pub fn build(self) -> AssetRecord {
         let record = AssetRecord::new_pending(
-            self.library,
+            std::sync::Arc::from(self.library),
             self.id,
             self.version_size,
             self.checksum,

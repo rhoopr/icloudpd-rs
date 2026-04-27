@@ -695,7 +695,7 @@ impl DownloadConfig {
             exclude_asset_ids: std::sync::Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(AssetGroupings::default()),
             bandwidth_limiter: None,
-            library: Arc::from("PrimarySync"),
+            library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
         }
     }
 }
@@ -957,7 +957,7 @@ impl DownloadContext {
     ) -> Option<bool> {
         let version_size_str = version_size.as_str();
 
-        // Three-level lookup with borrowed keys — no allocation
+        // Borrowed `&str` keys at every level — no allocation per probe.
         let is_downloaded = self
             .downloaded_ids
             .get(library)
@@ -1700,7 +1700,7 @@ async fn download_photos_incremental(
             for task in &asset_tasks {
                 let media_type = determine_media_type(task.version_size, asset);
                 let record = AssetRecord::new_pending(
-                    config.library.to_string(),
+                    Arc::clone(&config.library),
                     task.asset_id.to_string(),
                     task.version_size,
                     task.checksum.to_string(),

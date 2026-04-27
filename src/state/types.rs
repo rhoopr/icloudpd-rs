@@ -298,8 +298,10 @@ pub struct AssetRecord {
     // 8-byte aligned heap types
     /// CloudKit zone name (e.g. "PrimarySync", "SharedSync-A1B2C3D4-...")
     /// scoping this asset. Part of the v8+ primary key so the same asset ID
-    /// across multiple shared zones cannot collide.
-    pub library: Box<str>,
+    /// across multiple shared zones cannot collide. `Arc<str>` so the
+    /// per-pass `DownloadConfig.library` can be refcount-cloned into every
+    /// AssetRecord instead of allocating a fresh `Box<str>` per asset.
+    pub library: Arc<str>,
     /// iCloud asset ID (recordName).
     pub id: Box<str>,
     /// SHA256 checksum of the file.
@@ -355,7 +357,7 @@ impl AssetRecord {
         reason = "this is the canonical constructor; every field is load-bearing"
     )]
     pub fn new_pending(
-        library: String,
+        library: Arc<str>,
         id: String,
         version_size: VersionSizeKey,
         checksum: String,
@@ -366,7 +368,7 @@ impl AssetRecord {
         media_type: MediaType,
     ) -> Self {
         Self {
-            library: library.into_boxed_str(),
+            library,
             id: id.into_boxed_str(),
             checksum: checksum.into_boxed_str(),
             filename: filename.into_boxed_str(),
@@ -552,7 +554,7 @@ mod tests {
     fn test_asset_record_new_pending() {
         let now = Utc::now();
         let record = AssetRecord::new_pending(
-            "PrimarySync".to_string(),
+            Arc::from("PrimarySync"),
             "ABC123".to_string(),
             VersionSizeKey::Original,
             "checksum123".to_string(),
@@ -573,7 +575,7 @@ mod tests {
     #[test]
     fn test_asset_record_size() {
         // V5 added AssetMetadata (22 optional fields + 4 bools); v8 added
-        // a `library: Box<str>` field (16 bytes). Cap lifted accordingly.
+        // a `library: Arc<str>` field (16 bytes). Cap lifted accordingly.
         // The hot-path skip decisions still use the pre-metadata fields;
         // metadata is loaded separately.
         assert!(
@@ -647,7 +649,7 @@ mod tests {
     fn test_with_metadata_refreshes_hash_if_missing() {
         let now = Utc::now();
         let record = AssetRecord::new_pending(
-            "PrimarySync".into(),
+            Arc::from("PrimarySync"),
             "A".into(),
             VersionSizeKey::Original,
             "ck".into(),
@@ -668,7 +670,7 @@ mod tests {
     fn test_with_metadata_preserves_existing_hash() {
         let now = Utc::now();
         let record = AssetRecord::new_pending(
-            "PrimarySync".into(),
+            Arc::from("PrimarySync"),
             "A".into(),
             VersionSizeKey::Original,
             "ck".into(),
@@ -712,7 +714,7 @@ mod tests {
         let now = Utc::now();
         let added = now - chrono::Duration::hours(1);
         let record = AssetRecord::new_pending(
-            "PrimarySync".to_string(),
+            Arc::from("PrimarySync"),
             "XYZ".to_string(),
             VersionSizeKey::LiveOriginal,
             "ck".to_string(),

@@ -1688,7 +1688,7 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
     };
 
     Ok(AssetRecord {
-        library: library.into_boxed_str(),
+        library: Arc::from(library),
         id: id.into_boxed_str(),
         checksum: checksum.into_boxed_str(),
         filename: filename.into_boxed_str(),
@@ -1734,10 +1734,10 @@ mod tests {
         assert_eq!(path, db.path());
     }
 
-    /// PR10 / schema v8: the same (id, version_size) under two different
-    /// libraries must coexist as distinct rows. Pre-v8, the second
-    /// `upsert_seen` would have UPDATEd the first row in place, silently
-    /// dropping the SharedSync zone's separate-asset state.
+    /// The same (id, version_size) under two different libraries must
+    /// coexist as distinct rows; without per-zone PK scope, the second
+    /// `upsert_seen` would UPDATE the first row in place and silently
+    /// drop the other zone's separate-asset state.
     #[tokio::test]
     async fn upsert_seen_keeps_distinct_rows_per_library() {
         let db = SqliteStateDb::open_in_memory().unwrap();
@@ -1784,8 +1784,8 @@ mod tests {
         )));
     }
 
-    /// PR10: `mark_failed` keyed by library must scope to one zone. The
-    /// other zone's row keeps its prior status.
+    /// `mark_failed` must scope to one zone; the other zone's row for
+    /// the same (id, version_size) keeps its prior status.
     #[tokio::test]
     async fn mark_failed_is_library_scoped() {
         let db = SqliteStateDb::open_in_memory().unwrap();
@@ -4414,7 +4414,7 @@ mod tests {
 
         let db = SqliteStateDb::open_in_memory().unwrap();
         let record = AssetRecord::new_pending(
-            "PrimarySync".to_string(),
+            Arc::from("PrimarySync"),
             photo.id().to_string(),
             VersionSizeKey::Original,
             "ck".to_string(),
