@@ -524,17 +524,14 @@ pub(crate) struct DownloadConfig {
 impl DownloadConfig {
     /// True when passes can produce divergent paths and need per-pass config
     /// expansion (`with_pass`) plus path-aware skip checks rather than the
-    /// legacy DB-only fast skip + merged-stream optimisation.
+    /// merged-stream optimisation + DB-only fast skip.
     ///
-    /// On v0.12 this only fired when `--folder-structure` contained `{album}`.
-    /// v0.13 splits the template into per-category fields
+    /// Divergence sources: any of the three template fields
     /// (`folder_structure`, `folder_structure_albums`,
-    /// `folder_structure_smart_folders`), each defaulting to a string that
-    /// expands a per-pass token (`{album}` / `{smart-folder}`), so divergence
-    /// is now the common case. The merged-stream branch in
-    /// `download_photos_full_with_token` skips `with_pass` and would otherwise
-    /// drop every pass through the unfiled template, silently losing the
-    /// per-category album/smart-folder folder structure that v0.13 documents.
+    /// `folder_structure_smart_folders`) carries a per-pass token
+    /// (`{album}` / `{smart-folder}` / `{library}`), or the per-category
+    /// templates differ from the base. Both cases mean a single merged
+    /// stream + base config would route assets to the wrong on-disk path.
     ///
     /// Only meaningful on the *base* config. A per-pass config produced by
     /// `with_album_name` / `with_pass` has had per-pass tokens expanded out
@@ -542,9 +539,12 @@ impl DownloadConfig {
     /// the base so this still reports the base verdict; per-pass code paths
     /// should check `album_name.is_some()` instead.
     pub(crate) fn requires_per_pass_paths(&self) -> bool {
-        let any_token = |s: &str| {
-            s.contains("{album}") || s.contains("{smart-folder}") || s.contains("{library}")
-        };
+        const PER_PASS_TOKENS: [&str; 3] = [
+            paths::TOKEN_ALBUM,
+            paths::TOKEN_SMART_FOLDER,
+            paths::TOKEN_LIBRARY,
+        ];
+        let any_token = |s: &str| PER_PASS_TOKENS.iter().any(|t| s.contains(t));
         any_token(&self.folder_structure)
             || any_token(&self.folder_structure_albums)
             || any_token(&self.folder_structure_smart_folders)
@@ -3016,64 +3016,61 @@ mod tests {
 
     // ── requires_per_pass_paths predicate ──────────────────────────
 
+    fn config_with_templates(base: &str, albums: &str, smart_folders: &str) -> DownloadConfig {
+        let mut c = test_config();
+        c.folder_structure = base.to_string();
+        c.folder_structure_albums = Arc::from(albums);
+        c.folder_structure_smart_folders = Arc::from(smart_folders);
+        c
+    }
+
     #[test]
     fn requires_per_pass_paths_fires_on_v013_defaults() {
-        // v0.13 defaults: base = "{:%Y/%m/%d}", folder_structure_albums =
-        // "{album}", folder_structure_smart_folders = "{smart-folder}". The
-        // per-category templates carry per-pass tokens, so every run with
-        // album or smart-folder passes needs per-pass config expansion.
-        // Returning false here is the regression that silently routed every
-        // album-pass photo through the unfiled `%Y/%m/%d` template.
-        let config = test_config();
-        assert!(config.requires_per_pass_paths());
+        // v0.13 defaults carry per-pass tokens in the per-category fields.
+        // Returning false here was the regression that silently routed every
+        // album-pass photo through the unfiled template.
+        assert!(test_config().requires_per_pass_paths());
     }
 
     #[test]
     fn requires_per_pass_paths_fires_on_legacy_album_in_base() {
-        let mut config = test_config();
-        config.folder_structure = "{album}/%Y".to_string();
-        config.folder_structure_albums = Arc::from("{album}/%Y");
-        config.folder_structure_smart_folders = Arc::from("{album}/%Y");
-        assert!(config.requires_per_pass_paths());
+        assert!(
+            config_with_templates("{album}/%Y", "{album}/%Y", "{album}/%Y")
+                .requires_per_pass_paths()
+        );
     }
 
     #[test]
     fn requires_per_pass_paths_fires_on_smart_folder_token() {
-        let mut config = test_config();
-        config.folder_structure = "%Y/%m/%d".to_string();
-        config.folder_structure_albums = Arc::from("%Y/%m/%d");
-        config.folder_structure_smart_folders = Arc::from("{smart-folder}");
-        assert!(config.requires_per_pass_paths());
+        assert!(
+            config_with_templates("%Y/%m/%d", "%Y/%m/%d", "{smart-folder}")
+                .requires_per_pass_paths()
+        );
     }
 
     #[test]
     fn requires_per_pass_paths_fires_on_library_token() {
-        let mut config = test_config();
-        config.folder_structure = "{library}/%Y".to_string();
-        config.folder_structure_albums = Arc::from("{library}/%Y");
-        config.folder_structure_smart_folders = Arc::from("{library}/%Y");
-        assert!(config.requires_per_pass_paths());
+        assert!(
+            config_with_templates("{library}/%Y", "{library}/%Y", "{library}/%Y")
+                .requires_per_pass_paths()
+        );
     }
 
     #[test]
     fn requires_per_pass_paths_fires_on_per_category_template_diverging_from_base() {
-        let mut config = test_config();
-        config.folder_structure = "%Y/%m/%d".to_string();
-        config.folder_structure_albums = Arc::from("MyAlbums/%Y/%m");
-        config.folder_structure_smart_folders = Arc::from("%Y/%m/%d");
-        assert!(config.requires_per_pass_paths());
+        assert!(
+            config_with_templates("%Y/%m/%d", "MyAlbums/%Y/%m", "%Y/%m/%d")
+                .requires_per_pass_paths()
+        );
     }
 
     #[test]
     fn requires_per_pass_paths_false_when_all_templates_are_identical_literals() {
         // Pure-literal, identical across all three fields, no per-pass token:
-        // every pass produces the same path, so the merged-stream branch is
-        // safe and the predicate returns false.
-        let mut config = test_config();
-        config.folder_structure = "%Y/%m/%d".to_string();
-        config.folder_structure_albums = Arc::from("%Y/%m/%d");
-        config.folder_structure_smart_folders = Arc::from("%Y/%m/%d");
-        assert!(!config.requires_per_pass_paths());
+        // the merged-stream branch is safe.
+        assert!(
+            !config_with_templates("%Y/%m/%d", "%Y/%m/%d", "%Y/%m/%d").requires_per_pass_paths()
+        );
     }
 
     // ── with_pass per-kind template selection ─────────────────────

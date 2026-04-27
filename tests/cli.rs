@@ -525,6 +525,8 @@ fn album_flag_accepts_inline_exclusion() {
 
 #[test]
 fn album_flag_rejects_duplicates() {
+    // Selector-grammar rejection fires pre-auth, before any data-dir / state
+    // access, so no `--data-dir` or auth setup is needed.
     common::cmd()
         .args([
             "sync",
@@ -536,8 +538,6 @@ fn album_flag_rejects_duplicates() {
             "dummy@example.com",
             "--password",
             "x",
-            "--data-dir",
-            "/tmp/claude/kei-no-such",
         ])
         .assert()
         .failure()
