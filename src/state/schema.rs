@@ -158,11 +158,63 @@ CREATE INDEX IF NOT EXISTS idx_assets_metadata_hash
 /// (library, id, version_size). SQLite cannot ALTER PRIMARY KEY in place,
 /// so we copy into a fresh table, drop, and rename.
 ///
-/// `assets_v8` is left over only on a mid-migration crash; the SAVEPOINT
-/// wrapper in `migrate()` rolls it back. The leading `DROP TABLE IF EXISTS`
-/// is belt-and-braces in case a prior migration attempt landed outside the
-/// savepoint somehow.
-const SCHEMA_V8: &str = r"
+/// Columns carried forward from the pre-v8 `assets` table into `assets_v8`.
+/// Single source of truth for the INSERT and SELECT lists in [`schema_v8`]
+/// so a column-order swap can't sneak through type-compatible cells (e.g.
+/// `local_path` <-> `local_checksum`, both TEXT). The `library` column is
+/// new in v8 and gets its constant `'PrimarySync'` from the migration body
+/// itself; it's not part of this list.
+const PRESERVED_COLUMNS_V8: &[&str] = &[
+    "id",
+    "version_size",
+    "checksum",
+    "filename",
+    "created_at",
+    "added_at",
+    "size_bytes",
+    "media_type",
+    "status",
+    "downloaded_at",
+    "local_path",
+    "last_seen_at",
+    "download_attempts",
+    "last_error",
+    "local_checksum",
+    "download_checksum",
+    "source",
+    "is_favorite",
+    "rating",
+    "latitude",
+    "longitude",
+    "altitude",
+    "orientation",
+    "duration_secs",
+    "timezone_offset",
+    "width",
+    "height",
+    "title",
+    "keywords",
+    "description",
+    "media_subtype",
+    "burst_id",
+    "is_hidden",
+    "is_archived",
+    "modified_at",
+    "is_deleted",
+    "deleted_at",
+    "provider_data",
+    "metadata_hash",
+    "metadata_write_failed_at",
+];
+
+/// Full v8 migration script. `assets_v8` is left over only on a mid-migration
+/// crash; the SAVEPOINT wrapper in `migrate()` rolls it back. The leading
+/// `DROP TABLE IF EXISTS` is belt-and-braces in case a prior migration
+/// attempt landed outside the savepoint somehow.
+fn schema_v8() -> String {
+    let preserved = PRESERVED_COLUMNS_V8.join(", ");
+    format!(
+        r"
 DROP TABLE IF EXISTS assets_v8;
 
 CREATE TABLE assets_v8 (
@@ -210,28 +262,8 @@ CREATE TABLE assets_v8 (
     PRIMARY KEY (library, id, version_size)
 );
 
-INSERT INTO assets_v8 (
-    library, id, version_size, checksum, filename,
-    created_at, added_at, size_bytes, media_type, status,
-    downloaded_at, local_path, last_seen_at, download_attempts, last_error,
-    local_checksum, download_checksum,
-    source, is_favorite, rating, latitude, longitude, altitude,
-    orientation, duration_secs, timezone_offset, width, height,
-    title, keywords, description, media_subtype, burst_id,
-    is_hidden, is_archived, modified_at, is_deleted, deleted_at,
-    provider_data, metadata_hash, metadata_write_failed_at
-)
-SELECT
-    'PrimarySync', id, version_size, checksum, filename,
-    created_at, added_at, size_bytes, media_type, status,
-    downloaded_at, local_path, last_seen_at, download_attempts, last_error,
-    local_checksum, download_checksum,
-    source, is_favorite, rating, latitude, longitude, altitude,
-    orientation, duration_secs, timezone_offset, width, height,
-    title, keywords, description, media_subtype, burst_id,
-    is_hidden, is_archived, modified_at, is_deleted, deleted_at,
-    provider_data, metadata_hash, metadata_write_failed_at
-FROM assets;
+INSERT INTO assets_v8 (library, {preserved})
+SELECT 'PrimarySync', {preserved} FROM assets;
 
 DROP TABLE assets;
 ALTER TABLE assets_v8 RENAME TO assets;
@@ -240,7 +272,9 @@ CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
 CREATE INDEX IF NOT EXISTS idx_assets_local_path ON assets(local_path);
 CREATE INDEX IF NOT EXISTS idx_assets_checksum ON assets(checksum);
 CREATE INDEX IF NOT EXISTS idx_assets_metadata_hash ON assets (metadata_hash) WHERE status = 'downloaded';
-";
+"
+    )
+}
 
 /// Check whether a column exists on a table using `PRAGMA table_info`.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StateError> {
@@ -337,7 +371,7 @@ fn migrate_to_version(
             // took a zone parameter), so backfilling every surviving row
             // with library='PrimarySync' is exact, not approximate.
             if !column_exists(conn, "assets", "library")? {
-                conn.execute_batch(SCHEMA_V8)?;
+                conn.execute_batch(&schema_v8())?;
             }
         }
         other => {
