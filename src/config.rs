@@ -131,6 +131,12 @@ pub(crate) struct TomlWatch {
     pub interval: Option<u64>,
     pub notify_systemd: Option<bool>,
     pub pid_file: Option<String>,
+    /// Run a full local-vs-state reconciliation walk every Nth watch cycle.
+    /// `None` or `0` disables the periodic walk (the manual `kei reconcile`
+    /// subcommand is unaffected). The walk is read-only: missing files are
+    /// reported via `tracing::warn!` and never auto-marked failed in the
+    /// state DB. The default is unset to preserve existing behaviour.
+    pub reconcile_every_n_cycles: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -641,6 +647,11 @@ pub struct Config {
     // 8-byte primitives
     pub watch_with_interval: Option<u64>,
     pub retry_delay_secs: u64,
+    /// Periodic reconciliation interval (cycles between full local-vs-state
+    /// walks). `None` or `Some(0)` disables the walk so the daemon's
+    /// behaviour matches pre-MS-4. See [`TomlWatch::reconcile_every_n_cycles`]
+    /// for the rationale.
+    pub reconcile_every_n_cycles: Option<u64>,
 
     // 4-byte primitives
     pub recent: Option<u32>,
@@ -1486,6 +1497,12 @@ impl Config {
                 .and_then(|w| w.pid_file.as_ref())
                 .map(PathBuf::from)
         });
+        // [watch] reconcile_every_n_cycles is TOML-only (no CLI flag yet).
+        // Treat `Some(0)` and absence identically — both disable the walk.
+        // The watch loop also short-circuits when not in watch mode.
+        let reconcile_every_n_cycles = toml_watch
+            .and_then(|w| w.reconcile_every_n_cycles)
+            .filter(|n| *n > 0);
 
         // Notifications
         let toml_notif = toml.as_ref().and_then(|t| t.notifications.as_ref());
@@ -1591,6 +1608,7 @@ impl Config {
             http_bind,
             watch_with_interval,
             retry_delay_secs,
+            reconcile_every_n_cycles,
             recent,
             max_retries,
             bandwidth_limit,
@@ -1822,6 +1840,7 @@ impl Config {
             watch: if self.watch_with_interval.is_some()
                 || self.notify_systemd
                 || self.pid_file.is_some()
+                || self.reconcile_every_n_cycles.is_some()
             {
                 Some(TomlWatch {
                     interval: self.watch_with_interval,
@@ -1831,6 +1850,7 @@ impl Config {
                         None
                     },
                     pid_file: self.pid_file.as_ref().map(|p| p.display().to_string()),
+                    reconcile_every_n_cycles: self.reconcile_every_n_cycles,
                 })
             } else {
                 None

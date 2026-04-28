@@ -2499,6 +2499,7 @@ mod tests {
             http_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
             watch_with_interval: None,
             retry_delay_secs: 5,
+            reconcile_every_n_cycles: None,
             recent: dl_config.recent,
             max_retries: 3,
             bandwidth_limit: None,

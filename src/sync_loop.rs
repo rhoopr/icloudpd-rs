@@ -678,12 +678,30 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     let mut health = health::HealthStatus::new();
     let mut consecutive_album_refresh_failures = 0u32;
+    // 1-based cycle counter for periodic-reconcile cadence (MS-4). Logged at
+    // cycle start so an operator chasing missed reconciliation runs has a
+    // breadcrumb. Cycle 1 is the first iteration of this loop, cycle 2 is the
+    // first re-entry under `--watch`, etc.
+    let mut cycle_index: u64 = 0;
+    if is_watch_mode {
+        match config.reconcile_every_n_cycles {
+            Some(n) if n > 0 => tracing::info!(
+                every_n_cycles = n,
+                "Periodic local-vs-state reconciliation enabled"
+            ),
+            _ => tracing::debug!(
+                "Periodic local-vs-state reconciliation disabled \
+                 (set [watch] reconcile_every_n_cycles in TOML to enable)"
+            ),
+        }
+    }
 
     loop {
         if shutdown_token.is_cancelled() {
             tracing::info!("Shutdown requested, exiting...");
             break;
         }
+        cycle_index = cycle_index.saturating_add(1);
 
         // In watch mode with incremental sync, use changes/database as a
         // cheap pre-check to skip cycles when nothing has changed.
@@ -917,6 +935,21 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
         }
 
+        // MS-4: periodic local-vs-state reconciliation. Read-only walk that
+        // surfaces missing files via `tracing::warn!`. State rows are NEVER
+        // mutated here -- the manual `kei reconcile` subcommand still owns
+        // the failed-status transition. Long-running daemons drift between
+        // assets.local_path and what's on disk (manual rm, mount glitches,
+        // etc.); a periodic visible signal beats waiting for the next sync
+        // to stumble over the missing files.
+        if is_watch_mode
+            && should_reconcile_this_cycle(cycle_index, config.reconcile_every_n_cycles)
+        {
+            if let Some(db) = state_db.as_ref() {
+                run_periodic_reconcile(db.as_ref(), cycle_index).await;
+            }
+        }
+
         if let Some(interval) = config.watch_with_interval {
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, exiting...");
@@ -1109,6 +1142,83 @@ pub(crate) fn should_store_sync_token_for_cycle(
     cycle_has_stale_plan: bool,
 ) -> bool {
     should_store_sync_token(outcome, dry_run) && !cycle_has_stale_plan
+}
+
+/// MS-4: walk every `downloaded` row in the state DB and warn when the
+/// recorded `local_path` is missing on disk. Read-only — no rows are mutated
+/// (the manual `kei reconcile` CLI still owns the `downloaded -> failed`
+/// transition). Triggered on a fixed cadence by the watch loop; surfaces
+/// long-running drift that the next sync would otherwise re-discover only
+/// after stumbling over the missing files.
+///
+/// Errors from the DB scan are logged at `warn!` rather than propagated:
+/// the periodic walk is a diagnostic, not a load-bearing correctness gate,
+/// and a transient SQLite hiccup must not crash the watch daemon.
+async fn run_periodic_reconcile(db: &dyn state::StateDb, cycle_index: u64) {
+    use crate::commands::reconcile::{scan_missing, MissingAsset};
+    tracing::info!(
+        cycle_index,
+        "Periodic reconciliation: scanning state DB for missing local files"
+    );
+    let mut sample_logged = 0usize;
+    const SAMPLE_LOG_CAP: usize = 25;
+    // Cap per-cycle log spam at SAMPLE_LOG_CAP missing entries; the
+    // aggregate count is logged below regardless of how many fired.
+    let report_missing = |m: &MissingAsset| {
+        if sample_logged < SAMPLE_LOG_CAP {
+            tracing::warn!(
+                asset_id = %m.id,
+                version_size = m.version_size.as_str(),
+                path = %m.local_path.display(),
+                "Reconcile: state row marks asset downloaded but local file is missing"
+            );
+            sample_logged += 1;
+        }
+    };
+    let report_no_path = |id: &str| {
+        tracing::debug!(asset_id = %id, "Reconcile: downloaded row has no local_path recorded");
+    };
+    let scan = scan_missing(db, report_missing, report_no_path).await;
+    match scan {
+        Ok((counts, missing)) => {
+            if missing.is_empty() && counts.no_path == 0 {
+                tracing::info!(
+                    present = counts.present,
+                    "Periodic reconciliation: all downloaded files present on disk"
+                );
+            } else {
+                tracing::warn!(
+                    present = counts.present,
+                    missing = counts.missing,
+                    no_path = counts.no_path,
+                    sample_logged,
+                    "Periodic reconciliation: drift detected; run `kei reconcile` to mark missing files for re-download"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Periodic reconciliation scan failed; will retry on next interval");
+        }
+    }
+}
+
+/// MS-4: should this watch cycle run a periodic local-vs-state reconciliation?
+///
+/// Returns `true` for the very first cycle whose 1-based index is a multiple
+/// of `every_n` (e.g. `every_n = 24` fires on cycle 24, 48, ...). The first
+/// firing is at cycle `every_n` rather than cycle 0 so a freshly-started
+/// daemon doesn't burn its startup time walking the disk before a single
+/// sync has run. Disabled (`None`) or `Some(0)` always returns `false`; the
+/// `cycle_index` is also 1-based so the first cycle is `1`.
+///
+/// Pure function so the cadence is unit-testable without spinning up a real
+/// watch loop or filesystem walk.
+pub(crate) fn should_reconcile_this_cycle(cycle_index: u64, every_n: Option<u64>) -> bool {
+    let n = match every_n {
+        Some(n) if n > 0 => n,
+        _ => return false,
+    };
+    cycle_index > 0 && cycle_index.is_multiple_of(n)
 }
 
 /// Decide whether the reauth path inside the sync loop should block on a
@@ -3099,6 +3209,96 @@ mod tests {
         // Only (Success, dry_run=false, stale=false) advances.
         assert!(should_store_sync_token_for_cycle(&success, false, false));
         assert!(!should_store_sync_token_for_cycle(&success, false, true));
+    }
+
+    // MS-4: periodic reconciliation cadence. The watch loop calls
+    // `should_reconcile_this_cycle` once per cycle to decide whether to walk
+    // the state DB and warn on missing local files. Tests pin the cadence
+    // so a future refactor can't silently disable the schedule.
+
+    /// MS-4: when `every_n` is `None`, the predicate must NEVER fire — this
+    /// is the default-disabled behaviour for daemons that don't opt into
+    /// periodic reconciliation.
+    #[test]
+    fn periodic_reconcile_disabled_when_every_n_is_none() {
+        for cycle in [1u64, 2, 24, 1_000, u64::MAX] {
+            assert!(
+                !should_reconcile_this_cycle(cycle, None),
+                "cycle {cycle} with every_n=None must NOT trigger reconciliation"
+            );
+        }
+    }
+
+    /// MS-4: `Some(0)` is treated identically to `None` — the config
+    /// resolver also filters this case, but the predicate is the load-bearing
+    /// gate so we pin both spellings here.
+    #[test]
+    fn periodic_reconcile_disabled_when_every_n_is_zero() {
+        for cycle in [1u64, 2, 24, 1_000] {
+            assert!(
+                !should_reconcile_this_cycle(cycle, Some(0)),
+                "cycle {cycle} with every_n=Some(0) must NOT trigger"
+            );
+        }
+    }
+
+    /// MS-4: the first firing must be at cycle == every_n, NOT cycle 0 or
+    /// cycle 1. A freshly-started daemon must run at least one full sync
+    /// before burning startup time on a state-DB walk.
+    #[test]
+    fn periodic_reconcile_first_fires_at_cycle_n_not_at_cycle_zero() {
+        // every_n = 24: cycles 1..23 must NOT fire; cycle 24 fires.
+        for cycle in 1u64..24 {
+            assert!(
+                !should_reconcile_this_cycle(cycle, Some(24)),
+                "cycle {cycle} must NOT trigger when every_n=24"
+            );
+        }
+        assert!(
+            should_reconcile_this_cycle(24, Some(24)),
+            "cycle 24 with every_n=24 must trigger"
+        );
+        // Cycle 0 is the pre-loop sentinel and must never fire even when
+        // 0 is divisible by N.
+        assert!(
+            !should_reconcile_this_cycle(0, Some(24)),
+            "cycle 0 (pre-loop sentinel) must NEVER trigger"
+        );
+    }
+
+    /// MS-4: subsequent firings must repeat at every multiple of `every_n`.
+    /// Pinning a few cycles past the first firing guards against an
+    /// off-by-one that lets the cadence drift over a long run.
+    #[test]
+    fn periodic_reconcile_fires_on_every_multiple_of_n() {
+        let n = 24;
+        for &cycle in &[24u64, 48, 72, 240, 24_000] {
+            assert!(
+                should_reconcile_this_cycle(cycle, Some(n)),
+                "cycle {cycle} (multiple of {n}) must trigger"
+            );
+        }
+        for &cycle in &[25u64, 47, 49, 71, 73, 239, 241] {
+            assert!(
+                !should_reconcile_this_cycle(cycle, Some(n)),
+                "cycle {cycle} (NOT a multiple of {n}) must NOT trigger"
+            );
+        }
+    }
+
+    /// MS-4: `every_n=1` makes every cycle trigger reconciliation. Allowed
+    /// (chatty but not a bug) and pinned because users debugging a drift
+    /// suspicion are likely to set it to 1 temporarily.
+    #[test]
+    fn periodic_reconcile_every_one_fires_every_cycle() {
+        for cycle in 1u64..=10 {
+            assert!(
+                should_reconcile_this_cycle(cycle, Some(1)),
+                "cycle {cycle} with every_n=1 must trigger"
+            );
+        }
+        // Sentinel still excluded.
+        assert!(!should_reconcile_this_cycle(0, Some(1)));
     }
 
     // CG-19: `should_wait_for_2fa` decides whether the reauth-time 2FA

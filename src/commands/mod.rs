@@ -3,7 +3,7 @@ mod import;
 mod list;
 mod login;
 mod password;
-mod reconcile;
+pub(crate) mod reconcile;
 mod reset;
 mod service;
 mod status;
