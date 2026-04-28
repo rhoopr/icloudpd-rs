@@ -560,7 +560,7 @@ async fn run_metadata_rewrites(
                 true
             };
 
-        let sidecar_ok = if metadata_flags.xmp_sidecar {
+        let sidecar_ok = if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
             let sidecar_path = path.clone();
             let sidecar_payload = payload.clone();
             let sidecar_created = created_local;
@@ -652,51 +652,60 @@ fn create_progress_bar(
     pb
 }
 
-/// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
-/// flow; individual flags gate which fields get written in the XMP packet.
-///
-/// `embed_xmp` enables the XMP-only fields that have no native EXIF equivalent
-/// (title, keywords, people, hidden/archived, media subtype, burst id).
-/// `xmp_sidecar` is orthogonal — it writes a `.xmp` file next to the photo
-/// without touching the photo bytes.
-#[derive(Debug, Clone, Copy, Default)]
-#[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-pub(super) struct MetadataFlags {
-    pub(super) datetime: bool,
-    pub(super) rating: bool,
-    pub(super) gps: bool,
-    pub(super) description: bool,
-    pub(super) embed_xmp: bool,
-    pub(super) xmp_sidecar: bool,
+bitflags::bitflags! {
+    /// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
+    /// flow; individual flags gate which fields get written in the XMP packet.
+    ///
+    /// `EMBED_XMP` enables the XMP-only fields that have no native EXIF equivalent
+    /// (title, keywords, people, hidden/archived, media subtype, burst id).
+    /// `XMP_SIDECAR` is orthogonal — it writes a `.xmp` file next to the photo
+    /// without touching the photo bytes.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
+    pub(super) struct MetadataFlags: u8 {
+        const DATETIME    = 1 << 0;
+        const RATING      = 1 << 1;
+        const GPS         = 1 << 2;
+        const DESCRIPTION = 1 << 3;
+        const EMBED_XMP   = 1 << 4;
+        const XMP_SIDECAR = 1 << 5;
+    }
 }
 
 impl MetadataFlags {
+    /// Set of flags that drive the `.part`-and-modify-before-rename flow.
+    /// Sidecar writes happen after the rename so `XMP_SIDECAR` is excluded.
+    const EMBED_MASK: Self = Self::DATETIME
+        .union(Self::RATING)
+        .union(Self::GPS)
+        .union(Self::DESCRIPTION)
+        .union(Self::EMBED_XMP);
+
     /// Whether any flag needs the downloaded bytes to stay as a `.part` file
-    /// for in-place XMP editing before the atomic rename. Sidecar writes
-    /// happen after the rename and don't need this, so they're excluded.
+    /// for in-place XMP editing before the atomic rename.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    pub(super) fn any_embed(&self) -> bool {
-        self.datetime || self.rating || self.gps || self.description || self.embed_xmp
+    pub(super) fn any_embed(self) -> bool {
+        self.intersects(Self::EMBED_MASK)
     }
 }
 
 impl From<&DownloadConfig> for MetadataFlags {
     #[cfg(feature = "xmp")]
     fn from(config: &DownloadConfig) -> Self {
-        Self {
-            datetime: config.set_exif_datetime,
-            rating: config.set_exif_rating,
-            gps: config.set_exif_gps,
-            description: config.set_exif_description,
-            embed_xmp: config.embed_xmp,
-            xmp_sidecar: config.xmp_sidecar,
-        }
+        let mut flags = Self::empty();
+        flags.set(Self::DATETIME, config.set_exif_datetime);
+        flags.set(Self::RATING, config.set_exif_rating);
+        flags.set(Self::GPS, config.set_exif_gps);
+        flags.set(Self::DESCRIPTION, config.set_exif_description);
+        flags.set(Self::EMBED_XMP, config.embed_xmp);
+        flags.set(Self::XMP_SIDECAR, config.xmp_sidecar);
+        flags
     }
 
     /// Build with every flag forced false when the `xmp` feature is off.
     #[cfg(not(feature = "xmp"))]
     fn from(_config: &DownloadConfig) -> Self {
-        Self::default()
+        Self::empty()
     }
 }
 
@@ -1760,7 +1769,7 @@ where
     #[cfg(feature = "xmp")]
     if let Some(db) = &state_db {
         let metadata_flags = MetadataFlags::from(config.as_ref());
-        if metadata_flags.any_embed() || metadata_flags.xmp_sidecar {
+        if metadata_flags.any_embed() || metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
             run_metadata_rewrites(db.as_ref(), metadata_flags, &shutdown_token).await;
         }
     }
@@ -2285,19 +2294,19 @@ fn plan_metadata_write(
 ) -> super::metadata::MetadataWrite {
     let mut write = super::metadata::MetadataWrite::default();
 
-    if flags.datetime && probe.datetime_original.is_none() {
+    if flags.contains(MetadataFlags::DATETIME) && probe.datetime_original.is_none() {
         write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
     }
-    if flags.rating {
+    if flags.contains(MetadataFlags::RATING) {
         write.rating = payload.rating;
     }
-    if flags.gps && !probe.has_gps {
+    if flags.contains(MetadataFlags::GPS) && !probe.has_gps {
         write.gps = gps_from_payload(payload);
     }
-    if flags.description {
+    if flags.contains(MetadataFlags::DESCRIPTION) {
         write.description.clone_from(&payload.description);
     }
-    if flags.embed_xmp {
+    if flags.contains(MetadataFlags::EMBED_XMP) {
         write.title.clone_from(&payload.title);
         write.keywords.clone_from(&payload.keywords);
         write.people.clone_from(&payload.people);
@@ -2441,7 +2450,7 @@ async fn download_single_task(
     }
 
     #[cfg(feature = "xmp")]
-    if metadata_flags.xmp_sidecar {
+    if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
         let sidecar_path = task.download_path.clone();
         let payload = task.metadata.clone();
         let created_local = task.created_local;
@@ -3192,10 +3201,7 @@ mod tests {
         assert!(w.people.is_empty());
         assert!(!w.is_hidden);
 
-        let flags_embed = MetadataFlags {
-            embed_xmp: true,
-            ..MetadataFlags::default()
-        };
+        let flags_embed = MetadataFlags::EMBED_XMP;
         let w = plan_metadata_write(
             flags_embed,
             &payload,
@@ -3215,11 +3221,7 @@ mod tests {
     #[test]
     fn plan_metadata_write_respects_probe_skip_for_datetime_and_gps() {
         let payload = rich_payload();
-        let flags = MetadataFlags {
-            datetime: true,
-            gps: true,
-            ..MetadataFlags::default()
-        };
+        let flags = MetadataFlags::DATETIME | MetadataFlags::GPS;
         let probe = crate::download::metadata::ExifProbe {
             datetime_original: Some("2020:01:01 00:00:00".into()),
             has_gps: true,
@@ -3268,13 +3270,13 @@ mod tests {
     fn metadata_flags_any_embed_captures_embed_only() {
         let mut flags = MetadataFlags::default();
         assert!(!flags.any_embed());
-        flags.xmp_sidecar = true;
+        flags.insert(MetadataFlags::XMP_SIDECAR);
         assert!(
             !flags.any_embed(),
             "sidecar-only must not trigger the .part-edit flow"
         );
-        flags.xmp_sidecar = false;
-        flags.embed_xmp = true;
+        flags.remove(MetadataFlags::XMP_SIDECAR);
+        flags.insert(MetadataFlags::EMBED_XMP);
         assert!(flags.any_embed());
     }
 
@@ -4365,11 +4367,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(&*pending[0].id, "REWRITE_1");
 
-        let flags = MetadataFlags {
-            rating: true,
-            embed_xmp: true,
-            ..MetadataFlags::default()
-        };
+        let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
         let token = CancellationToken::new();
         run_metadata_rewrites(&db, flags, &token).await;
 
@@ -4450,11 +4448,7 @@ mod tests {
             .await
             .unwrap();
 
-        let flags = MetadataFlags {
-            rating: true,
-            embed_xmp: true,
-            ..MetadataFlags::default()
-        };
+        let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
         let token = CancellationToken::new();
         run_metadata_rewrites(&db, flags, &token).await;
 
