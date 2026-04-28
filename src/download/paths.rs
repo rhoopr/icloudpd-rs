@@ -161,6 +161,15 @@ pub(crate) fn clean_filename(filename: &str) -> std::borrow::Cow<'_, str> {
         matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()
     }
 
+    // Empty input would otherwise join onto the download directory as
+    // nothing, silently producing a path identical to the directory and
+    // colliding across every asset that hits this branch. Mirror
+    // sanitize_path_component's `_` sentinel so the path is visible and
+    // distinct.
+    if filename.is_empty() {
+        return std::borrow::Cow::Borrowed("_");
+    }
+
     if filename.len() <= MAX_FILENAME_BYTES && !filename.contains(is_invalid) {
         return std::borrow::Cow::Borrowed(filename);
     }
@@ -1120,7 +1129,11 @@ mod tests {
 
     #[test]
     fn test_clean_filename_empty_string() {
-        assert_eq!(clean_filename(""), "");
+        // Empty filename is a degenerate API input that previously
+        // returned "" — joining onto the download directory then yielded
+        // the directory itself, silently colliding across assets. Mirror
+        // sanitize_path_component's `_` sentinel so it surfaces.
+        assert_eq!(clean_filename(""), "_");
     }
 
     #[test]
