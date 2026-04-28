@@ -1918,12 +1918,19 @@ async fn download_photos_incremental(
                 .as_deref()
                 .filter(|n| !n.is_empty())
             {
-                if let Err(e) = db.add_asset_album(asset.id(), album_name, "icloud").await {
+                if let Err(e) = pipeline::add_asset_album_with_retry(
+                    db.as_ref(),
+                    asset.id(),
+                    album_name,
+                    "icloud",
+                )
+                .await
+                {
                     tracing::warn!(
                         asset_id = %asset.id(),
                         album = %album_name,
                         error = %e,
-                        "Failed to record album membership"
+                        "Failed to record album membership after retries"
                     );
                 }
             }

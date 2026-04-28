@@ -213,6 +213,52 @@ struct PendingStateWrite {
 const STATE_WRITE_MAX_RETRIES: u32 = 6;
 const _: () = assert!(STATE_WRITE_MAX_RETRIES <= 32, "shift overflow in backoff");
 
+/// NB-2: bounded retry attempts for `add_asset_album`. SQLite-busy under WAL
+/// contention is the dominant transient failure; three attempts at
+/// 200ms / 400ms / 800ms cover the common case while staying short enough
+/// that a wedged DB doesn't stall the producer indefinitely. After the
+/// retries are exhausted the call falls through to a `warn!` (preserving
+/// existing behaviour) and album membership self-heals on the next
+/// enumeration.
+const ADD_ASSET_ALBUM_MAX_RETRIES: u32 = 3;
+
+/// NB-2: insert an asset/album row with a bounded inline retry loop. The
+/// underlying call is `INSERT OR IGNORE` so retries are idempotent. Returns
+/// the final result so the caller can log on persistent failure.
+///
+/// The retry shape mirrors `flush_pending_state_writes` (200ms × 2^attempt)
+/// rather than introducing a new primitive.
+pub(super) async fn add_asset_album_with_retry(
+    db: &dyn StateDb,
+    asset_id: &str,
+    album_name: &str,
+    source: &str,
+) -> Result<(), crate::state::error::StateError> {
+    for attempt in 1..=ADD_ASSET_ALBUM_MAX_RETRIES {
+        match db.add_asset_album(asset_id, album_name, source).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if attempt < ADD_ASSET_ALBUM_MAX_RETRIES {
+                    tracing::debug!(
+                        asset_id,
+                        album = album_name,
+                        attempt,
+                        error = %e,
+                        "add_asset_album retry"
+                    );
+                    let base_ms = 200u64 * u64::from(1u32 << (attempt - 1));
+                    tokio::time::sleep(Duration::from_millis(base_ms)).await;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    // Unreachable because the loop returns on every iteration once `attempt`
+    // hits the cap, but the borrow checker doesn't know that.
+    unreachable!("add_asset_album_with_retry exited the retry loop without returning")
+}
+
 /// Minimum pending-queue size at which a 100% flush failure rate is treated
 /// as "state DB unwritable" rather than a transient lock race. Five is large
 /// enough that a short flurry of lock contention won't trigger a bail, but
@@ -1258,14 +1304,19 @@ where
                                 // the next incremental sync fills it in.
                                 if let Some(album) = config.album_name.as_deref() {
                                     if !album.is_empty() {
-                                        if let Err(e) =
-                                            db.add_asset_album(asset.id(), album, "icloud").await
+                                        if let Err(e) = add_asset_album_with_retry(
+                                            db.as_ref(),
+                                            asset.id(),
+                                            album,
+                                            "icloud",
+                                        )
+                                        .await
                                         {
                                             tracing::warn!(
                                                 asset_id = %asset.id(),
                                                 album = %album,
                                                 error = %e,
-                                                "Failed to record album membership"
+                                                "Failed to record album membership after retries"
                                             );
                                         }
                                     }
@@ -2705,6 +2756,284 @@ mod tests {
             "after re-snapshot to 1 GiB free, queued 500 GiB+ must trigger Bail"
         );
         assert!(total > refreshed_free, "queued total dwarfs refreshed free");
+    }
+
+    // ── NB-2: add_asset_album retry tests ─────────────────────────────────
+
+    /// StateDb stub whose `add_asset_album` returns `LockPoisoned` for the
+    /// first `fail_first` calls, then succeeds. Tracks total call count so
+    /// tests can pin the retry-attempt accounting. Other methods panic
+    /// because the test path never reaches them.
+    struct AlbumRetryStubDb {
+        remaining_failures: AtomicUsize,
+        calls: AtomicUsize,
+        recorded: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl AlbumRetryStubDb {
+        fn new(fail_first: usize) -> Self {
+            Self {
+                remaining_failures: AtomicUsize::new(fail_first),
+                calls: AtomicUsize::new(0),
+                recorded: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StateDb for AlbumRetryStubDb {
+        #[cfg(test)]
+        async fn should_download(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &Path,
+        ) -> Result<bool, StateError> {
+            unimplemented!()
+        }
+        async fn upsert_seen(&self, _: &AssetRecord) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn mark_downloaded(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &Path,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn mark_failed(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+        async fn get_failed_sample(&self, _: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
+            unimplemented!()
+        }
+        async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+        async fn get_summary(&self) -> Result<SyncSummary, StateError> {
+            unimplemented!()
+        }
+        async fn get_downloaded_page(
+            &self,
+            _: u64,
+            _: u32,
+        ) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+        async fn start_sync_run(&self) -> Result<i64, StateError> {
+            unimplemented!()
+        }
+        async fn complete_sync_run(&self, _: i64, _: &SyncRunStats) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+            unimplemented!()
+        }
+        async fn begin_enum_progress(&self, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn end_enum_progress(&self, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+            unimplemented!()
+        }
+        async fn reset_failed(&self) -> Result<u64, StateError> {
+            unimplemented!()
+        }
+        async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+            unimplemented!()
+        }
+        async fn promote_pending_to_failed(&self, _: i64) -> Result<u64, StateError> {
+            unimplemented!()
+        }
+        async fn get_downloaded_ids(
+            &self,
+        ) -> Result<HashSet<(String, String, String)>, StateError> {
+            unimplemented!()
+        }
+        async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+            unimplemented!()
+        }
+        async fn touch_last_seen_many(&self, _: &str, _: &[&str]) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn sample_downloaded_paths(
+            &self,
+            _: usize,
+        ) -> Result<Vec<std::path::PathBuf>, StateError> {
+            unimplemented!()
+        }
+        async fn add_asset_album(
+            &self,
+            asset_id: &str,
+            album_name: &str,
+            source: &str,
+        ) -> Result<(), StateError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let prev = self.remaining_failures.fetch_sub(1, Ordering::Relaxed);
+            if prev > 0 {
+                Err(StateError::LockPoisoned("simulated SQLite busy".into()))
+            } else {
+                self.remaining_failures.store(0, Ordering::Relaxed);
+                self.recorded.lock().unwrap().push((
+                    asset_id.to_string(),
+                    album_name.to_string(),
+                    source.to_string(),
+                ));
+                Ok(())
+            }
+        }
+        async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError> {
+            unimplemented!()
+        }
+        async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
+            unimplemented!()
+        }
+        async fn mark_soft_deleted(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn mark_hidden_at_source(&self, _: &str, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn record_metadata_write_failure(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn clear_metadata_write_failure(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+            unimplemented!()
+        }
+        async fn get_downloaded_checksums(
+            &self,
+        ) -> Result<HashMap<(String, String, String), String>, StateError> {
+            unimplemented!()
+        }
+        async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+            unimplemented!()
+        }
+        async fn get_metadata(&self, _: &str) -> Result<Option<String>, StateError> {
+            unimplemented!()
+        }
+        async fn set_metadata(&self, _: &str, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+        async fn delete_metadata_by_prefix(&self, _: &str) -> Result<u64, StateError> {
+            unimplemented!()
+        }
+        async fn get_downloaded_metadata_hashes(
+            &self,
+        ) -> Result<HashMap<(String, String, String), String>, StateError> {
+            unimplemented!()
+        }
+        async fn get_metadata_retry_markers(
+            &self,
+        ) -> Result<HashSet<(String, String, String)>, StateError> {
+            unimplemented!()
+        }
+        async fn get_pending_metadata_rewrites(
+            &self,
+            _: usize,
+        ) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+        async fn update_metadata_hash(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
+            unimplemented!()
+        }
+    }
+
+    /// NB-2: a single transient `LockPoisoned` from `add_asset_album` must
+    /// be retried so the album-membership row lands. Pre-fix this caller
+    /// logged at `warn!` and dropped the row, leaving downstream consumers
+    /// (EXIF keywords, Immich albums) with incomplete data until the next
+    /// full enumeration repopulated it.
+    #[tokio::test]
+    async fn add_asset_album_retry_recovers_after_one_transient_failure() {
+        let stub = AlbumRetryStubDb::new(1); // fail once, succeed on retry
+        let result = add_asset_album_with_retry(&stub, "ASSET_A", "Favorites", "icloud").await;
+        assert!(
+            result.is_ok(),
+            "transient SQLite-busy must be retried, not surfaced as Err"
+        );
+        let recorded = stub.recorded.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one row must be recorded");
+        assert_eq!(
+            recorded[0],
+            ("ASSET_A".into(), "Favorites".into(), "icloud".into())
+        );
+        assert_eq!(
+            stub.calls.load(Ordering::Relaxed),
+            2,
+            "must hit the DB twice: one fail + one success"
+        );
+    }
+
+    /// NB-2: when failures persist beyond the retry cap, the error must
+    /// surface so the caller can log at `warn!` (existing behaviour) — a
+    /// genuinely-wedged DB shouldn't be silently retried forever.
+    #[tokio::test]
+    async fn add_asset_album_retry_surfaces_persistent_failure() {
+        // Fail more times than the retry cap.
+        let stub = AlbumRetryStubDb::new((ADD_ASSET_ALBUM_MAX_RETRIES + 5) as usize);
+        let result = add_asset_album_with_retry(&stub, "ASSET_B", "Trip", "icloud").await;
+        assert!(
+            result.is_err(),
+            "persistent failure must propagate so the caller's warn! fires"
+        );
+        assert_eq!(
+            stub.calls.load(Ordering::Relaxed) as u32,
+            ADD_ASSET_ALBUM_MAX_RETRIES,
+            "must attempt exactly ADD_ASSET_ALBUM_MAX_RETRIES times before giving up"
+        );
+        assert!(
+            stub.recorded.lock().unwrap().is_empty(),
+            "no row must be recorded when all attempts fail"
+        );
+    }
+
+    /// NB-2: a first-call success must not pay the retry cost. Pinning so
+    /// the retry loop doesn't accidentally turn into "retry on every call".
+    #[tokio::test]
+    async fn add_asset_album_retry_no_op_on_first_success() {
+        let stub = AlbumRetryStubDb::new(0);
+        let result = add_asset_album_with_retry(&stub, "ASSET_C", "Holiday", "icloud").await;
+        assert!(result.is_ok());
+        assert_eq!(
+            stub.calls.load(Ordering::Relaxed),
+            1,
+            "first-call success must hit the DB exactly once"
+        );
     }
 
     // ── maybe_warn_rate_limit_pressure ─────────────────────────────────────
