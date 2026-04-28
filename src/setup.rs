@@ -152,8 +152,11 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     // Step 8: Extras
     ask_extras(&mut answers)?;
 
-    // Generate TOML
-    let toml_content = generate_toml(&answers).expect("formatting into a String never fails");
+    // Generate TOML. fmt::Write into a String is infallible by contract;
+    // map any Err into a context-bearing anyhow error so the user sees a
+    // sane message rather than a panic if std ever changes that contract.
+    let toml_content = generate_toml(&answers)
+        .map_err(|e| anyhow::anyhow!("failed to format generated TOML: {e}"))?;
 
     // Preview
     println!();
