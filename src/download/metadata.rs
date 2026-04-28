@@ -488,11 +488,43 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
             .sync_all()
             .with_context(|| format!("fsync for {}", tmp_path.display()))?;
     }
-    let guard = TmpGuard::new(&tmp_path);
+
+    // MS-6: Defense-in-depth — read the first 12 bytes back and confirm
+    // the rewritten file still starts with a HEIF `ftyp` brand before
+    // atomic-renaming over the user's data. Catches any future
+    // insert_xmp regression that produces non-HEIF output (corrupted
+    // ftyp, wrong magic, truncated header) before the corrupt file
+    // becomes visible.
+    let validate_guard = TmpGuard::new(&tmp_path);
+    validate_heif_post_rewrite(&tmp_path)?;
     std::fs::rename(&tmp_path, path)
         .with_context(|| format!("Renaming {} -> {}", tmp_path.display(), path.display()))?;
-    guard.disarm();
+    validate_guard.disarm();
     tracing::debug!(path = %path.display(), "Applied HEIC metadata");
+    Ok(())
+}
+
+/// Read the first 12 bytes of `tmp_path` and verify the file starts with
+/// an ISO-BMFF `ftyp` box whose major brand is in the HEIF family. Used
+/// as a sanity check between `insert_xmp` and the atomic rename so a
+/// malformed rewrite never lands on disk.
+fn validate_heif_post_rewrite(tmp_path: &Path) -> Result<()> {
+    use std::io::Read;
+    let mut probe = std::fs::File::open(tmp_path)
+        .with_context(|| format!("Reopening {} for magic-byte probe", tmp_path.display()))?;
+    let mut head = [0u8; 12];
+    probe
+        .read_exact(&mut head)
+        .with_context(|| format!("Reading magic bytes of {}", tmp_path.display()))?;
+    if !heif::is_heif_content(&head) {
+        anyhow::bail!(
+            "Post-rewrite HEIC at {} lacks an ISO-BMFF ftyp/HEIF brand in the \
+             first 12 bytes (got {:02x?}); refusing to atomic-rename a \
+             corrupt file over the user's data",
+            tmp_path.display(),
+            head
+        );
+    }
     Ok(())
 }
 
@@ -597,6 +629,66 @@ mod tests {
             guard.disarm();
         }
         assert!(path.exists(), "disarmed TmpGuard must not delete the file");
+        fs::remove_file(&path).ok();
+    }
+
+    /// MS-6: validate_heif_post_rewrite must accept a real HEIC head and
+    /// reject anything that doesn't begin with an ISO-BMFF ftyp/HEIF
+    /// brand. The probe reads only the first 12 bytes, so a minimal
+    /// fixture is sufficient.
+    #[test]
+    fn validate_heif_post_rewrite_accepts_known_heif_brand() {
+        let dir = test_tmp_dir("ms6_validate");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("good.heic");
+        // ftyp box: size=0x18, kind=ftyp, major_brand=heic, minor_version=0,
+        // compatible_brands=[heic, mif1].
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x18_u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(b"mif1");
+        fs::write(&path, &bytes).unwrap();
+        validate_heif_post_rewrite(&path).expect("known-good heic head must validate");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn validate_heif_post_rewrite_rejects_jpeg_magic() {
+        let dir = test_tmp_dir("ms6_validate");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad-jpeg.heic");
+        // 12 bytes of JPEG SOI + FFD8FFE0 + JFIF header — definitely not HEIF.
+        fs::write(
+            &path,
+            &[
+                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01,
+            ],
+        )
+        .unwrap();
+        let err = validate_heif_post_rewrite(&path).unwrap_err();
+        assert!(err.to_string().contains("ftyp/HEIF brand"), "msg: {err}");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn validate_heif_post_rewrite_rejects_non_heif_iso_bmff() {
+        let dir = test_tmp_dir("ms6_validate");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mp4.heic");
+        // ftyp present but with mp42 brand — valid ISO-BMFF, not HEIF.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x18_u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"mp42");
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(b"mp42");
+        bytes.extend_from_slice(b"isom");
+        fs::write(&path, &bytes).unwrap();
+        let err = validate_heif_post_rewrite(&path).unwrap_err();
+        assert!(err.to_string().contains("ftyp/HEIF brand"), "msg: {err}");
         fs::remove_file(&path).ok();
     }
 
