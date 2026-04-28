@@ -297,9 +297,19 @@ async fn update_metadata_marker(
     exif_ok: bool,
 ) {
     if exif_ok {
-        let _ = db
+        if let Err(e) = db
             .clear_metadata_write_failure(library, asset_id, version_size)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                library,
+                asset_id,
+                version_size,
+                error = %e,
+                "Could not clear metadata-write-failed marker; asset will be \
+                 re-rewritten on next sync"
+            );
+        }
         return;
     }
     if let Err(e) = db
@@ -3600,6 +3610,7 @@ mod tests {
     struct FailingStateDb {
         remaining_failures: AtomicUsize,
         successes: AtomicUsize,
+        fail_metadata_clear: AtomicBool,
     }
 
     impl FailingStateDb {
@@ -3607,7 +3618,14 @@ mod tests {
             Self {
                 remaining_failures: AtomicUsize::new(fail_count),
                 successes: AtomicUsize::new(0),
+                fail_metadata_clear: AtomicBool::new(false),
             }
+        }
+
+        fn with_failing_metadata_clear() -> Self {
+            let s = Self::new(0);
+            s.fail_metadata_clear.store(true, Ordering::Relaxed);
+            s
         }
 
         fn success_count(&self) -> usize {
@@ -3771,7 +3789,11 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<(), StateError> {
-            Ok(())
+            if self.fail_metadata_clear.load(Ordering::Relaxed) {
+                Err(StateError::LockPoisoned("simulated clear failure".into()))
+            } else {
+                Ok(())
+            }
         }
         async fn get_downloaded_metadata_hashes(
             &self,
@@ -3809,6 +3831,26 @@ mod tests {
         let result = flush_pending_state_writes(&db, &[]).await;
         assert_eq!(result, 0);
         assert_eq!(db.success_count(), 0);
+    }
+
+    /// CG-13: when `clear_metadata_write_failure` returns Err, the
+    /// previous `let _ = ...` swallow let the metadata-rewrite marker
+    /// stay set forever. The asset would be re-rewritten on every
+    /// subsequent sync. Surface the failure as a structured warn so it
+    /// shows up in logs/metrics.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn update_metadata_marker_warns_when_clear_fails() {
+        let db = FailingStateDb::with_failing_metadata_clear();
+        update_metadata_marker(&db, "PrimarySync", "ASSET_X", "original", true).await;
+        assert!(
+            logs_contain("Could not clear metadata-write-failed marker"),
+            "warn must fire when clear returns Err"
+        );
+        assert!(
+            logs_contain("asset_id=\"ASSET_X\""),
+            "structured asset_id field expected"
+        );
     }
 
     #[tokio::test]
