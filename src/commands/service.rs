@@ -431,6 +431,36 @@ pub(crate) async fn resolve_libraries(
         );
     }
 
+    // Path collision guard. `truncate_library_zone` keeps the first 8 hex
+    // chars of `SharedSync-<UUID>`; CloudKit UUIDs are not guaranteed
+    // unique on that prefix, so two distinct shared zones can render to
+    // the same `{library}` path segment. If both land in the chosen set,
+    // multi-library sync silently overwrites one zone's bytes with the
+    // other's (state DB stays per-zone distinct under the v8 PK so the
+    // corruption is invisible). Bail with both full UUIDs and the
+    // truncated form so the user can pin a longer prefix via `--library
+    // SharedSync-<longer>`.
+    let mut by_truncated: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::with_capacity(chosen.len());
+    for lib in &chosen {
+        let zone = lib.zone_name();
+        by_truncated
+            .entry(truncate_library_zone(zone))
+            .or_default()
+            .push(zone);
+    }
+    if let Some((truncated, zones)) = by_truncated.iter().find(|(_, zones)| zones.len() > 1) {
+        let mut sorted = zones.clone();
+        sorted.sort_unstable();
+        anyhow::bail!(
+            "Multiple selected libraries collapse to the same `{{library}}` path \
+             segment `{truncated}`: [{full}]. The 8-char shared-library prefix \
+             collides; pin one of these zones via `--library <longer-prefix>` \
+             (use `kei list libraries` to see every zone with its truncated form).",
+            full = sorted.join(", "),
+        );
+    }
+
     match chosen.as_slice() {
         [only] if only.zone_name() != crate::icloud::photos::PRIMARY_ZONE_NAME => {
             tracing::debug!(library = %only.zone_name(), "Using non-default library");
@@ -1598,6 +1628,58 @@ mod tests {
         let mut names = zone_names(&libs);
         names.sort_unstable();
         assert_eq!(names, vec!["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_truncated_collision_bails() {
+        // CloudKit UUIDs are not guaranteed unique on the leading 8 hex
+        // characters that `truncate_library_zone` keeps. Two distinct
+        // shared zones whose UUIDs collide on that prefix render to the
+        // same `{library}` segment on disk; without a resolver-time bail,
+        // multi-library sync silently overwrites one zone's bytes with
+        // the other's. State DB stays per-zone-distinct under the v8 PK
+        // so the corruption is invisible until users notice missing
+        // files. The repo's own paths.rs unit test pins the prefix
+        // collision invariant; this test pins the bail that relies on it.
+        let mut ps = photos_service_with_zones(&[
+            "SharedSync-AAAA1111-EEEE-2222-3333-444444444444",
+            "SharedSync-AAAA1111-FFFF-5555-6666-777777777777",
+        ]);
+        let sel = selector_from(&["all"]);
+        let err = resolve_libraries(&sel, &mut ps)
+            .await
+            .expect_err("two zones sharing the 8-hex truncation prefix must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SharedSync-AAAA1111-EEEE-2222-3333-444444444444")
+                && msg.contains("SharedSync-AAAA1111-FFFF-5555-6666-777777777777"),
+            "bail must name both colliding full UUIDs so the user can pin a longer form; got: {msg}"
+        );
+        assert!(
+            msg.contains("SharedSync-AAAA1111"),
+            "bail must include the truncated form that's the collision point; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_libraries_truncated_collision_with_explicit_zone_does_not_bail() {
+        // The bail is only relevant when *both* colliding zones land in
+        // the chosen set. If the user pins one of them via a longer
+        // `--library SharedSync-AAAA1111-EEEE`, the other is excluded
+        // and the on-disk paths can't collide, so the resolver must not
+        // bail.
+        let mut ps = photos_service_with_zones(&[
+            "SharedSync-AAAA1111-EEEE-2222-3333-444444444444",
+            "SharedSync-AAAA1111-FFFF-5555-6666-777777777777",
+        ]);
+        let sel = selector_from(&["SharedSync-AAAA1111-EEEE-2222-3333-444444444444"]);
+        let libs = resolve_libraries(&sel, &mut ps)
+            .await
+            .expect("explicit single-zone selection must not trip the collision bail");
+        assert_eq!(
+            zone_names(&libs),
+            vec!["SharedSync-AAAA1111-EEEE-2222-3333-444444444444"]
+        );
     }
 
     #[tokio::test]
