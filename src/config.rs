@@ -2471,6 +2471,52 @@ mod tests {
     }
 
     #[test]
+    fn config_build_unfiled_bare_flag_resolves_to_true() {
+        // Bare `--unfiled` (no value) sets `cli.sync.unfiled = Some(true)`
+        // via clap's `default_missing_value = "true"`. The cli.rs unit test
+        // pins the parse but the runtime path through Config::build is
+        // untested — a clap-default flip or a derive_selection regression
+        // that dropped the override would silently land. This test drives
+        // the parser through to the resolved Selection.
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["kei", "sync", "--unfiled"]).unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let mut globals = default_globals();
+        globals.username = Some("u@example.com".to_string());
+        let cfg = Config::build(&globals, &default_password(), sync, None).unwrap();
+        assert!(
+            cfg.selection.unfiled,
+            "bare --unfiled must resolve Selection.unfiled = true"
+        );
+    }
+
+    #[test]
+    fn config_build_unfiled_explicit_false_resolves_to_false() {
+        // Symmetric pin: explicit `--unfiled false` must override the
+        // `true` default. The legacy resolver also defaulted unfiled to
+        // true under most configurations, so a regression that swallowed
+        // the explicit `false` would not show up in any current test.
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["kei", "sync", "--unfiled", "false"]).unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let mut globals = default_globals();
+        globals.username = Some("u@example.com".to_string());
+        let cfg = Config::build(&globals, &default_password(), sync, None).unwrap();
+        assert!(
+            !cfg.selection.unfiled,
+            "explicit `--unfiled false` must resolve Selection.unfiled = false"
+        );
+    }
+
+    #[test]
     fn test_build_hardcoded_default_when_both_absent() {
         let cfg = Config::build(
             &default_globals(),

@@ -1049,6 +1049,118 @@ mod tests {
     }
 
     #[test]
+    fn v8_migration_preserves_every_column_value() {
+        // The v8 INSERT/SELECT/CREATE block hand-lists 41 columns three
+        // times. A future v9 (or any later recreate-table dance) that
+        // mismatches the INSERT column list against the SELECT projection
+        // would silently swap two type-compatible columns (TEXT/TEXT, or
+        // INTEGER/INTEGER) and corrupt every existing row. The other v8
+        // tests spot-check ~10 columns; this one drives via PRAGMA so the
+        // assertion stays exhaustive without manual upkeep when columns
+        // are added.
+        use rusqlite::types::Value;
+
+        let conn = Connection::open_in_memory().unwrap();
+        build_v7_schema(&conn);
+
+        // Enumerate every v7 column dynamically. Each row is (name, type).
+        let cols: Vec<(String, String)> = conn
+            .prepare("PRAGMA table_info('assets')")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.len() >= 30,
+            "v7 should expose at least 30 asset columns; got {}",
+            cols.len()
+        );
+
+        // Per-column distinct sentinel keyed by name + index. Embedding the
+        // column name in TEXT sentinels means a v9 INSERT that swaps two
+        // TEXT columns (e.g. metadata_hash <-> provider_data) lands a value
+        // tagged with the wrong column name and the assertion below fires.
+        fn sentinel(col: &str, ty: &str, idx: usize) -> Value {
+            // PK fields need stable values: id is the primary lookup key
+            // and must round-trip verbatim; version_size is part of the PK
+            // and constrained to known sizes elsewhere.
+            if col == "id" {
+                return Value::Text(format!("ID_SENTINEL_{idx}"));
+            }
+            if col == "version_size" {
+                return Value::Text("original".to_string());
+            }
+            let upper = ty.to_ascii_uppercase();
+            if upper.contains("INT") {
+                #[allow(
+                    clippy::cast_possible_wrap,
+                    reason = "idx is a small column index, never overflows i64"
+                )]
+                let v = 1000_i64 + idx as i64;
+                Value::Integer(v)
+            } else if upper.contains("REAL") || upper.contains("FLOA") {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "idx is a small column index, exact in f64"
+                )]
+                let v = 1.5_f64 + idx as f64;
+                Value::Real(v)
+            } else {
+                Value::Text(format!("SENTINEL_{col}_{idx}"))
+            }
+        }
+
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        let placeholders: Vec<String> = (1..=cols.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "INSERT INTO assets ({}) VALUES ({})",
+            names.join(", "),
+            placeholders.join(", ")
+        );
+        let values: Vec<Value> = cols
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ty))| sentinel(name, ty, i))
+            .collect();
+        conn.execute(&sql, rusqlite::params_from_iter(values.iter()))
+            .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Read every v7 column back. v8 added `library` (backfilled to
+        // 'PrimarySync'); we verify it separately below.
+        for (idx, (name, ty)) in cols.iter().enumerate() {
+            let actual: Value = conn
+                .query_row(
+                    &format!("SELECT {name} FROM assets WHERE id = 'ID_SENTINEL_0'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|e| panic!("v8 lost column `{name}`: {e}"));
+            let expected = sentinel(name, ty, idx);
+            assert_eq!(
+                actual, expected,
+                "v8 migration mismatch on column `{name}` (type `{ty}`); \
+                 likely INSERT/SELECT column-list swap"
+            );
+        }
+
+        // v8 backfilled `library` to PrimarySync for surviving rows.
+        let lib: String = conn
+            .query_row(
+                "SELECT library FROM assets WHERE id = 'ID_SENTINEL_0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lib, "PrimarySync");
+    }
+
+    #[test]
     fn test_v8_leftover_assets_v8_table_does_not_block_migration() {
         let conn = Connection::open_in_memory().unwrap();
         build_v7_schema(&conn);

@@ -1410,6 +1410,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resolve_passes_threading_from_cli_input() {
+        // End-to-end thread of the v0.13 selection flags through the
+        // production parse layer: clap → Cli → Config::build → Selection
+        // → resolve_passes. The cli.rs help-shadow tests for these flags
+        // only exercise the parser; a regression that drops --smart-folder
+        // or flips --unfiled's default between Cli and Selection lands
+        // green there. This test is the one place that drives the runtime
+        // wiring and asserts on the resolved pass list.
+        use crate::cli::{Cli, Command, PasswordArgs};
+        use clap::Parser;
+
+        let cookie_dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from([
+            "kei",
+            "--username",
+            "u@example.com",
+            "--data-dir",
+            cookie_dir.path().to_str().unwrap(),
+            "sync",
+            "--album",
+            "all",
+            "--smart-folder",
+            "Favorites",
+            "--unfiled",
+            "false",
+            "--library",
+            "shared",
+        ])
+        .unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let globals = crate::config::GlobalArgs::from_cli(&cli);
+        let cfg =
+            crate::config::Config::build(&globals, &PasswordArgs::default(), sync, None).unwrap();
+
+        // Sanity-check the cli → Selection wiring before pinning the pass list.
+        assert_eq!(cfg.selection.libraries.to_raw(), vec!["shared".to_string()]);
+        assert!(matches!(
+            cfg.selection.albums,
+            AlbumSelector::All { ref excluded } if excluded.is_empty()
+        ));
+        assert!(matches!(
+            cfg.selection.smart_folders,
+            SmartFolderSelector::Named { ref included, ref excluded }
+                if included.contains("Favorites") && excluded.is_empty()
+        ));
+        assert!(!cfg.selection.unfiled);
+
+        // Stub a library exposing one user album ("Vacation") plus the
+        // Favorites smart folder. resolve_passes only consumes the first
+        // response (`library.albums().await?`); subsequent .ok()s match
+        // the resolve_passes_tags_each_pass_with_correct_kind pattern.
+        let mock = MockPhotosSession::new()
+            .ok(serde_json::json!({"records": [folder_record("FOLDER_VAC", "Vacation")]}))
+            .ok(album_count_response(0))
+            .ok(serde_json::json!({"records": []}));
+        let library = stub_library(mock);
+
+        let plan = resolve_passes(&library, &cfg.selection).await.unwrap();
+        let pairs: Vec<(String, PassKind)> = plan
+            .passes
+            .iter()
+            .map(|p| (p.album.name.to_string(), p.kind))
+            .collect();
+        // --album all → 1 Album pass, --smart-folder Favorites → 1 SmartFolder
+        // pass, --unfiled false → 0 Unfiled passes.
+        assert_eq!(
+            pairs,
+            vec![
+                ("Vacation".to_string(), PassKind::Album),
+                ("Favorites".to_string(), PassKind::SmartFolder),
+            ],
+            "expected [Album(Vacation), SmartFolder(Favorites)] (no unfiled), got {pairs:?}"
+        );
+    }
+
     // ── resolve_libraries tests ──────────────────────────────────────
 
     /// Build a `PhotosService` with a stub primary library plus the named

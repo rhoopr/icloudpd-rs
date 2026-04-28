@@ -854,6 +854,52 @@ mod tests {
     }
 
     #[test]
+    fn insert_xmp_output_keeps_ftyp_with_known_heif_brand() {
+        // The post-download magic-byte check (`is_heif_content`) currently
+        // runs on the original bytes; nothing re-checks the file header
+        // after `insert_xmp` rewrites it. A regression in the rewriter
+        // that produced a malformed prefix (e.g. truncated `ftyp` size,
+        // wrong brand, double atom) would land on disk and only surface
+        // when downstream tools (Immich, iCloud re-import) refuse the
+        // file. This test pins the invariant on the canonical fixture so
+        // any prefix-shape regression fails loudly here first.
+        const SAMPLE_HEIC: &[u8] = include_bytes!("../../tests/data/sample.heic");
+        // Sanity: the fixture itself has to start with a HEIF brand or
+        // the test is meaningless.
+        assert!(
+            is_heif_content(SAMPLE_HEIC),
+            "fixture sample.heic must already be HEIF-shaped"
+        );
+
+        let mut out: Vec<u8> = Vec::new();
+        insert_xmp(
+            SAMPLE_HEIC,
+            b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>",
+            &mut out,
+        )
+        .expect("insert_xmp on a valid HEIC fixture must succeed");
+        assert!(
+            out.len() >= 12,
+            "rewritten output must contain at least ftyp(8) + brand(4); got {} bytes",
+            out.len()
+        );
+        // Bytes 4..8 must be the FourCC "ftyp"; bytes 8..12 must be one
+        // of the brands `is_heif_content` accepts. This is exactly the
+        // contract the post-rewrite magic-byte check would assert.
+        assert_eq!(
+            &out[4..8],
+            b"ftyp",
+            "rewritten output must begin with an ftyp box; first 12 bytes: {:?}",
+            &out[..12]
+        );
+        assert!(
+            is_heif_content(&out),
+            "rewritten output must still pass is_heif_content; first 12 bytes: {:?}",
+            &out[..12]
+        );
+    }
+
+    #[test]
     fn heif_error_io_variant_carries_underlying_io_error() {
         // Sanity-check the Io variant — the writer used by insert_xmp is
         // any std::io::Write, and io::Error must convert via From.

@@ -676,6 +676,55 @@ threads_num = 4
 }
 
 #[test]
+fn config_show_emits_unfiled_false_when_explicit() {
+    // The cli.rs help-shadow test for --unfiled only verifies clap parses;
+    // it does not pin the resolved value all the way through Config::build
+    // → Selection → to_toml. A clap-default flip (or a derive_selection
+    // regression) that swallowed the explicit `false` would land green
+    // there. `to_toml()` only emits `unfiled` when the resolved value
+    // differs from the `true` default, so an explicit `false` is the case
+    // we can observe directly in `kei config show` output.
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[auth]
+username = "x@x.com"
+
+[filters]
+unfiled = false
+"#,
+    )
+    .unwrap();
+
+    let out = clean_cmd()
+        .args([
+            "config",
+            "show",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: toml::Value = toml::from_str(&stdout).expect("config show must emit valid TOML");
+    let unfiled = parsed
+        .get("filters")
+        .and_then(|f| f.get("unfiled"))
+        .and_then(toml::Value::as_bool);
+    assert_eq!(
+        unfiled,
+        Some(false),
+        "config show must round-trip explicit `unfiled = false`; got:\n{stdout}"
+    );
+}
+
+#[test]
 fn config_show_cli_overrides_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
