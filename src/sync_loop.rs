@@ -281,7 +281,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             config.directory.display()
         )
     })?;
-    let _ = tokio::fs::remove_file(&probe).await;
+    if let Err(e) = tokio::fs::remove_file(&probe).await {
+        tracing::trace!(
+            probe = %probe.display(),
+            error = %e,
+            "Could not clean up writability-probe file; harmless leakage"
+        );
+    }
 
     // Abort if available disk space is too low. See `check_min_disk_space`
     // for the pure inner check.

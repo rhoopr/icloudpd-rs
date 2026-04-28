@@ -141,17 +141,18 @@ fn split_exclusion(raw: &str) -> (&str, bool) {
 
 /// Insert into a BTreeSet, bailing if the value was already present. The
 /// duplicate-check pattern repeats across every parser; this lets callers
-/// describe the offending item once.
+/// describe the offending item once. `display_name` is a closure so the
+/// `format!("!{name}")` allocation only runs on the bail path, not on
+/// every successful insert.
 fn insert_unique(
     set: &mut BTreeSet<String>,
     value: String,
     flag: &str,
-    name: &str,
+    display_name: impl FnOnce() -> String,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        set.insert(value),
-        "--{flag} '{name}' specified more than once"
-    );
+    if !set.insert(value) {
+        anyhow::bail!("--{flag} '{}' specified more than once", display_name());
+    }
     Ok(())
 }
 
@@ -192,14 +193,13 @@ pub(crate) fn parse_album_selector(
             );
             has_none = true;
         } else if is_exclude {
-            insert_unique(
-                &mut excluded,
-                name.to_string(),
-                "album",
-                &format!("!{name}"),
-            )?;
+            insert_unique(&mut excluded, name.to_string(), "album", || {
+                format!("!{name}")
+            })?;
         } else {
-            insert_unique(&mut included, name.to_string(), "album", name)?;
+            insert_unique(&mut included, name.to_string(), "album", || {
+                name.to_string()
+            })?;
         }
     }
 
@@ -259,14 +259,13 @@ pub(crate) fn parse_smart_folder_selector(raw: &[String]) -> anyhow::Result<Smar
             anyhow::ensure!(!is_exclude, "'!none' is not a valid --smart-folder value");
             has_none = true;
         } else if is_exclude {
-            insert_unique(
-                &mut excluded,
-                name.to_string(),
-                "smart-folder",
-                &format!("!{name}"),
-            )?;
+            insert_unique(&mut excluded, name.to_string(), "smart-folder", || {
+                format!("!{name}")
+            })?;
         } else {
-            insert_unique(&mut included, name.to_string(), "smart-folder", name)?;
+            insert_unique(&mut included, name.to_string(), "smart-folder", || {
+                name.to_string()
+            })?;
         }
     }
 
@@ -347,35 +346,28 @@ pub(crate) fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySe
             has_none = true;
         } else if name.eq_ignore_ascii_case("primary") {
             if is_exclude {
-                insert_unique(
-                    &mut sel.excluded,
-                    "primary".to_string(),
-                    "library",
-                    "!primary",
-                )?;
+                insert_unique(&mut sel.excluded, "primary".to_string(), "library", || {
+                    "!primary".to_string()
+                })?;
             } else {
                 sel.primary = true;
             }
         } else if name.eq_ignore_ascii_case("shared") {
             if is_exclude {
-                insert_unique(
-                    &mut sel.excluded,
-                    "shared".to_string(),
-                    "library",
-                    "!shared",
-                )?;
+                insert_unique(&mut sel.excluded, "shared".to_string(), "library", || {
+                    "!shared".to_string()
+                })?;
             } else {
                 sel.shared_all = true;
             }
         } else if is_exclude {
-            insert_unique(
-                &mut sel.excluded,
-                name.to_string(),
-                "library",
-                &format!("!{name}"),
-            )?;
+            insert_unique(&mut sel.excluded, name.to_string(), "library", || {
+                format!("!{name}")
+            })?;
         } else {
-            insert_unique(&mut sel.named, name.to_string(), "library", name)?;
+            insert_unique(&mut sel.named, name.to_string(), "library", || {
+                name.to_string()
+            })?;
         }
     }
 
