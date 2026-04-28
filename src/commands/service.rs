@@ -658,8 +658,8 @@ pub(crate) async fn resolve_passes(
 }
 
 /// Pick the user-album names selected by `albums`. Bails on missing
-/// `Named` entries (with the available list as a hint); warns on missing
-/// `excluded` entries.
+/// `Named` entries and on missing `excluded` entries (typo-only excludes
+/// would otherwise let the unintended album through silently).
 fn pick_album_names(
     selector: &crate::selection::AlbumSelector,
     album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
@@ -669,11 +669,7 @@ fn pick_album_names(
     match selector {
         AlbumSelector::None => Ok(Vec::new()),
         AlbumSelector::All { excluded } => {
-            for name in excluded {
-                if !album_map.contains_key(name.as_str()) {
-                    tracing::warn!(album = %name, "Excluded album not found, ignoring");
-                }
-            }
+            bail_unknown_excluded_albums(excluded, album_map, smart_names)?;
             Ok(album_map
                 .keys()
                 .filter(|name| {
@@ -704,14 +700,28 @@ fn pick_album_names(
                     anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
                 }
             }
-            for name in excluded {
-                if !album_map.contains_key(name.as_str()) && !included.contains(name) {
-                    tracing::warn!(album = %name, "Excluded album not found, ignoring");
-                }
-            }
+            bail_unknown_excluded_albums(excluded, album_map, smart_names)?;
             Ok(chosen)
         }
     }
+}
+
+fn bail_unknown_excluded_albums(
+    excluded: &std::collections::BTreeSet<String>,
+    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    smart_names: &rustc_hash::FxHashSet<&'static str>,
+) -> anyhow::Result<()> {
+    for name in excluded {
+        if !album_map.contains_key(name.as_str()) {
+            let mut available: Vec<&String> = album_map
+                .keys()
+                .filter(|k| !smart_names.contains(k.as_str()))
+                .collect();
+            available.sort();
+            anyhow::bail!("Excluded album '{name}' not found. Available albums: {available:?}");
+        }
+    }
+    Ok(())
 }
 
 /// Pick the smart-folder names selected by `smart_folders`. Bails on
@@ -796,20 +806,32 @@ async fn compute_unfiled_exclude_ids(
         return Ok(rustc_hash::FxHashSet::default());
     }
 
-    let per_album: Vec<rustc_hash::FxHashSet<String>> = futures_util::stream::iter(
-        selected_album_names
-            .iter()
-            .filter_map(|name| album_map.get(name.as_str()).map(|album| (name, album))),
-    )
-    .map(|(name, album)| async move {
-        tracing::debug!(album = %name, "Pre-fetching IDs for unfiled exclusion set");
-        let mut set = rustc_hash::FxHashSet::default();
-        collect_album_asset_ids(album, &mut set).await?;
-        anyhow::Ok(set)
-    })
-    .buffer_unordered(EXCLUSION_FETCH_CONCURRENCY)
-    .try_collect()
-    .await?;
+    // Defensive: pick_album_names validated every name against album_map,
+    // so a miss here means the map mutated between checks. Bail loudly
+    // rather than silently shrinking the exclusion set, which would let
+    // already-filed assets re-download under --unfiled.
+    let mut tuples: Vec<(&String, &icloud::photos::PhotoAlbum)> =
+        Vec::with_capacity(selected_album_names.len());
+    for name in selected_album_names {
+        match album_map.get(name.as_str()) {
+            Some(album) => tuples.push((name, album)),
+            None => anyhow::bail!(
+                "Selected album '{name}' missing from library album map at \
+                 unfiled-exclusion time"
+            ),
+        }
+    }
+
+    let per_album: Vec<rustc_hash::FxHashSet<String>> = futures_util::stream::iter(tuples)
+        .map(|(name, album)| async move {
+            tracing::debug!(album = %name, "Pre-fetching IDs for unfiled exclusion set");
+            let mut set = rustc_hash::FxHashSet::default();
+            collect_album_asset_ids(album, &mut set).await?;
+            anyhow::Ok(set)
+        })
+        .buffer_unordered(EXCLUSION_FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
 
     let mut union = rustc_hash::FxHashSet::default();
     for set in per_album {
@@ -1208,6 +1230,68 @@ mod tests {
         let plan = resolve_passes(&library, &sel).await.unwrap();
         assert_eq!(plan.passes.len(), 1);
         assert!(plan.passes[0].exclude_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_all_albums_excluded_typo_bails() {
+        // CG-3: a typo in --album !X must surface the user's mistake. Silent
+        // warn lets a real album get included that the user meant to drop.
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation"),
+            folder_record("FOLDER_2", "Family")
+        ]}));
+        let library = stub_library(mock);
+        let sel = selection_with_albums(
+            AlbumSelector::All {
+                excluded: names(&["Vacationn"]),
+            },
+            false,
+        );
+
+        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Vacationn") && msg.to_lowercase().contains("not found"),
+            "msg: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_passes_named_albums_excluded_typo_bails() {
+        // CG-3 paired case: Named selector with a typo'd exclude.
+        let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
+            folder_record("FOLDER_1", "Vacation"),
+            folder_record("FOLDER_2", "Family")
+        ]}));
+        let library = stub_library(mock);
+        let sel = selection_with_albums(
+            AlbumSelector::Named {
+                included: names(&["Vacation"]),
+                excluded: names(&["Vacationn"]),
+            },
+            false,
+        );
+
+        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Vacationn") && msg.to_lowercase().contains("not found"),
+            "msg: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_unfiled_exclude_ids_bails_on_missing_album() {
+        // CG-5 defensive: if a selected album is somehow missing from the
+        // library album map at exclusion time, surface it instead of
+        // silently producing an empty exclusion set (which would let
+        // already-filed assets re-download under --unfiled).
+        let album_map = std::collections::HashMap::new();
+        let selected = vec!["GhostAlbum".to_string()];
+        let err = compute_unfiled_exclude_ids(&album_map, &selected)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("GhostAlbum"), "msg: {err}");
     }
 
     // ── is_misdirected_request tests ──────────────────────────────────
