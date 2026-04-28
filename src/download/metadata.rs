@@ -453,9 +453,15 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
         .with_context(|| format!("Reading {} for HEIC update", path.display()))?;
 
     // Preserve any XMP the file already carries (e.g. Apple Live Photo or
-    // depth markers) by parsing it into the XmpMeta we mutate. If parsing
-    // fails or there's no existing XMP, start from an empty packet.
-    let existing_xmp_bytes = heif::extract_xmp_bytes(&input);
+    // depth markers) by parsing it into the XmpMeta we mutate. Use the
+    // strict variant so a structurally-broken iinf/iloc surfaces as an
+    // error instead of silently stripping pre-existing XMP — the failure
+    // then propagates to record_metadata_write_failure so the asset
+    // re-drives metadata on the next sync. If the XMP packet itself is
+    // malformed UTF-8 / RDF, fall back to an empty packet (string-level
+    // failure isn't structural).
+    let existing_xmp_bytes = heif::extract_xmp_strict(&input)
+        .with_context(|| format!("Reading existing XMP from {}", path.display()))?;
     let mut meta = existing_xmp_bytes
         .as_deref()
         .and_then(|bytes| std::str::from_utf8(bytes).ok())

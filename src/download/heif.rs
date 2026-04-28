@@ -39,6 +39,13 @@ pub(crate) enum HeifError {
     #[error("Unparsable trailing bytes at offset {offset}/{total} (file likely truncated)")]
     UnparsableTail { offset: u64, total: u64 },
 
+    #[error("`{kind}` sub-box of `meta` failed to decode: {source}")]
+    MetaSubBoxDecode {
+        kind: FourCC,
+        #[source]
+        source: mp4_atom::Error,
+    },
+
     #[error("HEIC has no `meta` box at the top level ({input_len} bytes scanned)")]
     MissingMeta { input_len: usize },
 
@@ -120,27 +127,51 @@ pub(crate) fn is_heif_content(bytes: &[u8]) -> bool {
 /// function avoids the problem regardless of when that lands by only
 /// invoking the iinf / iloc decoders we actually need.
 pub(crate) fn extract_xmp_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    match extract_xmp_strict(bytes) {
+        Ok(opt) => opt,
+        Err(_) => None,
+    }
+}
+
+/// Strict variant of [`extract_xmp_bytes`] that distinguishes "no XMP item
+/// present" (`Ok(None)`) from "the file's iinf/iloc structure failed to
+/// decode" (`Err(MetaSubBoxDecode)`). Used by the metadata write path so a
+/// malformed item map fails loudly instead of silently stripping pre-existing
+/// XMP.
+pub(crate) fn extract_xmp_strict(bytes: &[u8]) -> Result<Option<Vec<u8>>, HeifError> {
     let mut cursor: &[u8] = bytes;
     while cursor.has_remaining() {
-        let header = Header::decode_maybe(&mut cursor).ok().flatten()?;
+        let Some(header) = Header::decode_maybe(&mut cursor).ok().flatten() else {
+            return Ok(None);
+        };
         let body_size = header.size.unwrap_or(cursor.remaining());
         if body_size > cursor.remaining() {
-            return None;
+            return Ok(None);
         }
         if header.kind == FourCC::new(b"meta") {
+            let Some(body) = cursor.get(..body_size) else {
+                return Ok(None);
+            };
             // HEIC has at most one top-level `meta` box; stop either way.
-            return extract_xmp_from_meta(bytes, cursor.get(..body_size)?);
+            return extract_xmp_from_meta(bytes, body);
         }
         cursor.advance(body_size);
     }
-    None
+    Ok(None)
 }
 
 /// Pull the iinf + iloc out of a `meta` box body and resolve the XMP extent
 /// against the original file bytes. Walks the meta sub-boxes by header only
 /// and decodes only `iinf` and `iloc`, so a hostile sub-atom (e.g. a nested
 /// `dfLa`) can't reach the unbounded-allocation parsers either.
-fn extract_xmp_from_meta(file_bytes: &[u8], meta_body: &[u8]) -> Option<Vec<u8>> {
+///
+/// Returns `Err(MetaSubBoxDecode)` if iinf or iloc decode fails — the caller
+/// can then mark the asset as needing metadata-rewrite. Returns `Ok(None)`
+/// for legitimately-absent XMP (no iinf, no XMP item, etc).
+fn extract_xmp_from_meta(
+    file_bytes: &[u8],
+    meta_body: &[u8],
+) -> Result<Option<Vec<u8>>, HeifError> {
     let mut cursor: &[u8] = meta_body;
 
     // Two on-the-wire formats for `meta`:
@@ -150,28 +181,34 @@ fn extract_xmp_from_meta(file_bytes: &[u8], meta_body: &[u8]) -> Option<Vec<u8>>
     // mp4_atom::Meta::decode_body.
     if cursor.len() >= 8 && cursor.get(4..8) != Some(b"hdlr".as_slice()) {
         if cursor.len() < 4 {
-            return None;
+            return Ok(None);
         }
         cursor.advance(4);
     }
 
     // Skip hdlr; we don't need its contents.
-    let hdlr = Header::decode_maybe(&mut cursor).ok().flatten()?;
+    let Some(hdlr) = Header::decode_maybe(&mut cursor).ok().flatten() else {
+        return Ok(None);
+    };
     let hdlr_size = hdlr.size.unwrap_or(cursor.remaining());
     if hdlr_size > cursor.remaining() {
-        return None;
+        return Ok(None);
     }
     cursor.advance(hdlr_size);
 
     let mut iinf: Option<Iinf> = None;
     let mut iloc: Option<Iloc> = None;
     while cursor.has_remaining() {
-        let h = Header::decode_maybe(&mut cursor).ok().flatten()?;
+        let Some(h) = Header::decode_maybe(&mut cursor).ok().flatten() else {
+            return Ok(None);
+        };
         let sz = h.size.unwrap_or(cursor.remaining());
         if sz > cursor.remaining() {
-            return None;
+            return Ok(None);
         }
-        let body = cursor.get(..sz)?;
+        let Some(body) = cursor.get(..sz) else {
+            return Ok(None);
+        };
         // Defense-in-depth cap on the bytes handed to the typed decoders:
         // HEIC iinf/iloc are KB-scale in real-world files. If a future
         // mp4-atom audit turns up the same `Vec::with_capacity(<attacker
@@ -182,50 +219,46 @@ fn extract_xmp_from_meta(file_bytes: &[u8], meta_body: &[u8]) -> Option<Vec<u8>>
         const MAX_META_SUBBOX_BYTES: usize = 8 * 1024 * 1024;
         if body.len() <= MAX_META_SUBBOX_BYTES {
             if h.kind == FourCC::new(b"iinf") {
-                match Iinf::decode_body(&mut &body[..]) {
-                    Ok(parsed) => iinf = Some(parsed),
-                    Err(e) => {
-                        tracing::warn!(
-                            box_kind = "iinf",
-                            body_len = body.len(),
-                            error = %e,
-                            "HEIC iinf decode failed; treating XMP as absent so write \
-                             path can re-embed without trusting a malformed item map"
-                        );
+                iinf = Some(Iinf::decode_body(&mut &body[..]).map_err(|source| {
+                    HeifError::MetaSubBoxDecode {
+                        kind: FourCC::new(b"iinf"),
+                        source,
                     }
-                }
+                })?);
             } else if h.kind == FourCC::new(b"iloc") {
-                match Iloc::decode_body(&mut &body[..]) {
-                    Ok(parsed) => iloc = Some(parsed),
-                    Err(e) => {
-                        tracing::warn!(
-                            box_kind = "iloc",
-                            body_len = body.len(),
-                            error = %e,
-                            "HEIC iloc decode failed; treating XMP as absent so write \
-                             path can re-embed without trusting a malformed location map"
-                        );
+                iloc = Some(Iloc::decode_body(&mut &body[..]).map_err(|source| {
+                    HeifError::MetaSubBoxDecode {
+                        kind: FourCC::new(b"iloc"),
+                        source,
                     }
-                }
+                })?);
             }
         }
         cursor.advance(sz);
     }
 
-    let iinf = iinf?;
-    let iloc = iloc?;
-    let xmp_entry = iinf.item_infos.iter().find(|e| {
+    let (Some(iinf), Some(iloc)) = (iinf, iloc) else {
+        return Ok(None);
+    };
+    let Some(xmp_entry) = iinf.item_infos.iter().find(|e| {
         e.item_type == Some(FourCC::new(b"mime"))
             && e.content_type.as_deref() == Some("application/rdf+xml")
-    })?;
-    let loc = iloc
+    }) else {
+        return Ok(None);
+    };
+    let Some(loc) = iloc
         .item_locations
         .iter()
-        .find(|l| l.item_id == xmp_entry.item_id)?;
+        .find(|l| l.item_id == xmp_entry.item_id)
+    else {
+        return Ok(None);
+    };
     if loc.construction_method != 0 {
-        return None;
+        return Ok(None);
     }
-    let extent = loc.extents.first()?;
+    let Some(extent) = loc.extents.first() else {
+        return Ok(None);
+    };
     #[allow(
         clippy::cast_possible_truncation,
         reason = "HEIC file byte offsets/lengths fit in usize on 64-bit; kei targets 64-bit platforms"
@@ -235,8 +268,10 @@ fn extract_xmp_from_meta(file_bytes: &[u8], meta_body: &[u8]) -> Option<Vec<u8>>
         clippy::cast_possible_truncation,
         reason = "HEIC extent length fits in usize on 64-bit"
     )]
-    let end = start.checked_add(extent.length as usize)?;
-    file_bytes.get(start..end).map(<[u8]>::to_vec)
+    let Some(end) = start.checked_add(extent.length as usize) else {
+        return Ok(None);
+    };
+    Ok(file_bytes.get(start..end).map(<[u8]>::to_vec))
 }
 
 /// Surgically insert (or replace) the XMP `mime` item inside a HEIC file,
@@ -823,17 +858,30 @@ mod tests {
         assert!(extract_xmp_bytes(&meta_box).is_none());
     }
 
-    /// CG-14: a malformed iinf inside an otherwise-walkable meta box
-    /// previously surfaced as a silent None — indistinguishable from
-    /// "no XMP present". A structurally broken HEIC must now log a
-    /// warn so the operator (and an integration test) can tell why
-    /// XMP wasn't found.
-    #[tracing_test::traced_test]
+    /// CG-14 / MS-5-full: a malformed iinf inside an otherwise-walkable
+    /// meta box previously surfaced as a silent None — indistinguishable
+    /// from "no XMP present". The strict variant must surface the
+    /// structural failure as a typed `HeifError::MetaSubBoxDecode` so the
+    /// metadata-write path can mark the asset for rewrite next sync. The
+    /// lenient `extract_xmp_bytes` collapses the same input to None for
+    /// callers (e.g. the EXIF probe) that don't care about the cause.
     #[test]
-    fn extract_xmp_bytes_logs_warn_on_iinf_decode_failure() {
-        // Build a meta box with a valid hdlr followed by an iinf box
-        // whose body is a 1-byte truncated payload — Iinf::decode_body
-        // requires at least version+flags+entry_count which is 6 bytes.
+    fn extract_xmp_strict_returns_meta_sub_box_decode_on_malformed_iinf() {
+        let meta_box = malformed_iinf_meta_box();
+
+        let err = extract_xmp_strict(&meta_box).unwrap_err();
+        match err {
+            HeifError::MetaSubBoxDecode { kind, .. } => {
+                assert_eq!(kind, FourCC::new(b"iinf"));
+            }
+            other => panic!("expected MetaSubBoxDecode for iinf, got {other:?}"),
+        }
+
+        // Lenient variant: same input, structural failure collapsed to None.
+        assert!(extract_xmp_bytes(&meta_box).is_none());
+    }
+
+    fn malformed_iinf_meta_box() -> Vec<u8> {
         let mut hdlr: Vec<u8> = Vec::new();
         hdlr.extend_from_slice(&0x21_u32.to_be_bytes());
         hdlr.extend_from_slice(b"hdlr");
@@ -844,9 +892,11 @@ mod tests {
         hdlr.push(0);
 
         let mut iinf: Vec<u8> = Vec::new();
-        iinf.extend_from_slice(&0x09_u32.to_be_bytes()); // size = 9 (header 8 + body 1)
+        // size = 9 (header 8 + body 1); body is 1 byte but Iinf::decode_body
+        // requires at least version+flags+entry_count (6 bytes).
+        iinf.extend_from_slice(&0x09_u32.to_be_bytes());
         iinf.extend_from_slice(b"iinf");
-        iinf.push(0); // 1-byte body — too short for version+flags+count
+        iinf.push(0);
 
         let mut meta_body: Vec<u8> = Vec::new();
         meta_body.extend_from_slice(&[0; 4]);
@@ -858,13 +908,7 @@ mod tests {
         meta_box.extend_from_slice(&total.to_be_bytes());
         meta_box.extend_from_slice(b"meta");
         meta_box.extend_from_slice(&meta_body);
-
-        assert!(extract_xmp_bytes(&meta_box).is_none());
-        assert!(
-            logs_contain("HEIC iinf decode failed"),
-            "warn must fire on malformed iinf"
-        );
-        assert!(logs_contain("box_kind=\"iinf\""));
+        meta_box
     }
 
     // ── insert_xmp: typed errors per failure mode ──
