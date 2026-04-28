@@ -423,11 +423,7 @@ pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) ->
     let hash = Sha256::digest(asset_id.as_bytes());
     let ext = item_type_extension(asset_type);
     let mut result = String::with_capacity(12 + 1 + ext.len());
-    #[allow(
-        clippy::indexing_slicing,
-        reason = "SHA-256 output is always 32 bytes; 6 is unconditionally in-bounds"
-    )]
-    for &b in &hash[..6] {
+    for b in hash.iter().take(6) {
         let _ = Write::write_fmt(&mut result, format_args!("{b:02x}"));
     }
     result.push('.');
