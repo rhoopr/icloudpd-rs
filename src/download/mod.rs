@@ -4062,8 +4062,8 @@ mod tests {
 
         let dir = tempfile::Builder::new()
             .prefix("kei-orphan-parts-")
-            .tempdir_in("/tmp/claude")
-            .expect("tempdir in /tmp/claude");
+            .tempdir()
+            .expect("tempdir");
 
         let part = dir.path().join("photo.jpg.part");
         File::create(&part).unwrap().write_all(b"x").unwrap();
@@ -4103,8 +4103,8 @@ mod tests {
 
         let dir = tempfile::Builder::new()
             .prefix("kei-orphan-parts-unreadable-")
-            .tempdir_in("/tmp/claude")
-            .expect("tempdir in /tmp/claude");
+            .tempdir()
+            .expect("tempdir");
 
         // Sibling subdir with a .part file: should be cleaned.
         let readable = dir.path().join("readable");
@@ -4147,8 +4147,8 @@ mod tests {
 
         let dir = tempfile::Builder::new()
             .prefix("kei-orphan-parts-recent-")
-            .tempdir_in("/tmp/claude")
-            .expect("tempdir in /tmp/claude");
+            .tempdir()
+            .expect("tempdir");
 
         // Two .part files. We can't easily set mtime without a filetime
         // crate, so synthesize the test by driving (now_secs, cutoff_secs,
@@ -4217,8 +4217,8 @@ mod tests {
 
         let dir = tempfile::Builder::new()
             .prefix("kei-orphan-parts-mixed-")
-            .tempdir_in("/tmp/claude")
-            .expect("tempdir in /tmp/claude");
+            .tempdir()
+            .expect("tempdir");
 
         // Both files have a real-now mtime. We can't backdate one without
         // a filetime crate, so this test pins the symmetric case:

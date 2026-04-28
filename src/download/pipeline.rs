@@ -4470,8 +4470,8 @@ mod tests {
 
         let dir = tempfile::Builder::new()
             .prefix("kei-sample-missing-")
-            .tempdir_in("/tmp/claude")
-            .expect("tempdir in /tmp/claude");
+            .tempdir()
+            .expect("tempdir");
 
         let present = dir.path().join("present.jpg");
         File::create(&present).unwrap().write_all(b"x").unwrap();
@@ -4498,8 +4498,8 @@ mod tests {
     async fn sample_missing_paths_all_absent_returns_full_input() {
         let dir = tempfile::Builder::new()
             .prefix("kei-sample-all-absent-")
-            .tempdir_in("/tmp/claude")
-            .expect("tempdir in /tmp/claude");
+            .tempdir()
+            .expect("tempdir");
         // Don't create any of these files; the whole input is absent.
         let paths = vec![
             dir.path().join("a.jpg"),

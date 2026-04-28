@@ -3080,7 +3080,7 @@ mod tests {
         // punting the failure to the first auth attempt.
         let mut pw = default_password();
         pw.password_command = Some("echo anything".to_string());
-        let result = Config::build(&default_globals(), pw, default_sync(), None);
+        let result = Config::build(&default_globals(), &pw, default_sync(), None);
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not supported on Windows"), "{err}");
         assert!(err.contains("--password-file"), "{err}");
