@@ -1366,30 +1366,34 @@ where
                 }
                 Err(e) => {
                     enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    producer_pb.suspend(|| tracing::error!(error = %e, "Error fetching asset"));
+                    // NB-1: single-line `tracing::error!` doesn't need the
+                    // progress bar suspended; the bar redraws cleanly after
+                    // a one-line emit and the suspend was just paying a
+                    // hot-loop cost for no observable benefit.
+                    tracing::error!(error = %e, "Error fetching asset");
                 }
             }
         }
 
         let total_skipped = skips.total();
         if total_skipped > 0 {
-            producer_pb.suspend(|| {
-                tracing::debug!(
-                    state = skips.by_state,
-                    on_disk = skips.on_disk,
-                    ampm_variant = skips.ampm_variant,
-                    media_type = skips.by_media_type,
-                    date_range = skips.by_date_range,
-                    live_photo = skips.by_live_photo,
-                    filename = skips.by_filename,
-                    excluded_album = skips.by_excluded_album,
-                    duplicates = skips.duplicates,
-                    retry_exhausted = skips.retry_exhausted,
-                    retry_only = skips.retry_only,
-                    total = total_skipped,
-                    "Skipped assets"
-                );
-            });
+            // NB-1: single tracing event, runs once after the producer loop
+            // exits — no suspend needed.
+            tracing::debug!(
+                state = skips.by_state,
+                on_disk = skips.on_disk,
+                ampm_variant = skips.ampm_variant,
+                media_type = skips.by_media_type,
+                date_range = skips.by_date_range,
+                live_photo = skips.by_live_photo,
+                filename = skips.by_filename,
+                excluded_album = skips.by_excluded_album,
+                duplicates = skips.duplicates,
+                retry_exhausted = skips.retry_exhausted,
+                retry_only = skips.retry_only,
+                total = total_skipped,
+                "Skipped assets"
+            );
         }
 
         // Invariant: every unique asset must be either skipped or forwarded.
@@ -1398,16 +1402,15 @@ where
         let skipped_unique = (total_skipped - skips.duplicates) as u64;
         let accounted = skipped_unique + assets_forwarded;
         if accounted != seen {
-            producer_pb.suspend(|| {
-                tracing::warn!(
-                    assets_seen = seen,
-                    accounted,
-                    forwarded = assets_forwarded,
-                    skipped = skipped_unique,
-                    duplicates = skips.duplicates,
-                    "Asset accounting mismatch -- some assets may be untracked"
-                );
-            });
+            // NB-1: single tracing event; no suspend.
+            tracing::warn!(
+                assets_seen = seen,
+                accounted,
+                forwarded = assets_forwarded,
+                skipped = skipped_unique,
+                duplicates = skips.duplicates,
+                "Asset accounting mismatch -- some assets may be untracked"
+            );
         }
 
         // Flush the accumulated last_seen_at updates in one transaction.
