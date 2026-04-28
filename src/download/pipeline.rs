@@ -39,6 +39,17 @@ enum BatchForecast {
     Bail,
 }
 
+/// MS-5: re-snapshot the free-disk probe every this many bytes queued. The
+/// producer caches `initial_free` at enumeration start so per-task probes
+/// don't hammer `statvfs` on every asset, but a long sync can run for hours
+/// while another process fills the FS. Without periodic refresh the bail
+/// decision rides on a stale snapshot; downloads still fail loudly with
+/// ENOSPC, but the sync would have been cancelled earlier with up-to-date
+/// data. 10 GiB is small enough to catch a fast-filling FS quickly and
+/// large enough that the periodic stat call is cheap relative to bytes
+/// downloaded.
+pub(super) const FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
 /// Classify the impact of adding `size` bytes to the running queued total
 /// against the free-space snapshot captured at enumeration start.
 ///
@@ -63,6 +74,21 @@ fn batch_forecast_decision(
         return (BatchForecast::Warn, total);
     }
     (BatchForecast::Continue, total)
+}
+
+/// MS-5: decide whether the producer should re-snapshot free disk space on
+/// this `forecast_check` call.
+///
+/// `total` is the cumulative queued-bytes value just returned by
+/// `batch_forecast_decision`; `last_snapshot_total` is the queued-bytes
+/// value at the previous re-snapshot (initially zero, since the first
+/// snapshot happens at enumeration start before any bytes are queued).
+/// Returns `true` when the gap is at or above `interval`.
+///
+/// Pure helper so the cadence is testable without spinning up the producer
+/// loop or touching the filesystem.
+fn should_resnapshot_free_space(total: u64, last_snapshot_total: u64, interval: u64) -> bool {
+    interval > 0 && total.saturating_sub(last_snapshot_total) >= interval
 }
 
 /// Per-asset outcome in the producer's task loop. Ordered by ascending
@@ -931,14 +957,18 @@ where
     let enum_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let enum_errors_producer = Arc::clone(&enum_errors);
 
-    // Batch-size forecast: snapshot free space once at the start of
-    // enumeration and track bytes queued to consumers. Emit a one-time warn
-    // at 90% and cancel the sync at 100%. This catches the "batch much
-    // larger than free space" case early, before downloads run the disk dry
-    // mid-stream. We snapshot free space once so the threshold reflects
-    // "headroom at start" — per-task rechecks against a shrinking denominator
-    // would fire noisy false-positives as downloads consume the disk normally.
-    let initial_free = crate::available_disk_space(&config.directory);
+    // Batch-size forecast: snapshot free space at enumeration start and
+    // track bytes queued to consumers. Emit a one-time warn at 90% and
+    // cancel the sync at 100%. This catches the "batch much larger than
+    // free space" case early, before downloads run the disk dry mid-stream.
+    //
+    // MS-5: a multi-hour sync can have its FS filled by an unrelated process
+    // mid-run. Refresh `initial_free` every FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES
+    // queued so the bail decision rides on fresher data. Per-task rechecks
+    // against a shrinking denominator would fire noisy false-positives as
+    // downloads naturally consume the disk; the 10 GiB cadence is a
+    // compromise between "stale" and "noisy".
+    let initial_free_at_start = crate::available_disk_space(&config.directory);
     let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -963,7 +993,49 @@ where
         let mut touched_ids: Vec<Arc<str>> = Vec::new();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
+        // MS-5: free-space probe lives in an `AtomicU64` (sentinel
+        // `u64::MAX` = "no probe available") so the producer task can
+        // refresh it every FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES queued
+        // without breaking `Send`. The producer is a single task, so atomic
+        // ordering can stay Relaxed.
+        const FREE_PROBE_NONE_SENTINEL: u64 = u64::MAX;
+        let initial_free_atomic = std::sync::atomic::AtomicU64::new(
+            initial_free_at_start.unwrap_or(FREE_PROBE_NONE_SENTINEL),
+        );
+        let last_resnapshot_total = std::sync::atomic::AtomicU64::new(0);
+        let directory_for_resnapshot = config.directory.clone();
         let forecast_check = |size: u64| -> bool {
+            // Re-snapshot before classifying so the decision uses the
+            // freshest data on the boundary call.
+            let total_so_far = queued_bytes_producer.load(std::sync::atomic::Ordering::Relaxed);
+            if should_resnapshot_free_space(
+                total_so_far + size,
+                last_resnapshot_total.load(std::sync::atomic::Ordering::Relaxed),
+                FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES,
+            ) {
+                if let Some(refreshed) = crate::available_disk_space(&directory_for_resnapshot) {
+                    let prior = initial_free_atomic.load(std::sync::atomic::Ordering::Relaxed);
+                    initial_free_atomic.store(refreshed, std::sync::atomic::Ordering::Relaxed);
+                    last_resnapshot_total
+                        .store(total_so_far + size, std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(
+                        prior_free_bytes = if prior == FREE_PROBE_NONE_SENTINEL {
+                            0
+                        } else {
+                            prior
+                        },
+                        refreshed_free_bytes = refreshed,
+                        queued_bytes = total_so_far + size,
+                        "Refreshed free-disk snapshot"
+                    );
+                }
+            }
+            let raw = initial_free_atomic.load(std::sync::atomic::Ordering::Relaxed);
+            let initial_free = if raw == FREE_PROBE_NONE_SENTINEL {
+                None
+            } else {
+                Some(raw)
+            };
             let (decision, total) = batch_forecast_decision(
                 size,
                 initial_free,
@@ -2562,6 +2634,74 @@ mod tests {
         let (decision, total) = batch_forecast_decision(0, Some(1000), &queued, &warn);
         assert_eq!(decision, BatchForecast::Continue);
         assert_eq!(total, 500);
+    }
+
+    // ── MS-5: free-space re-snapshot cadence ───────────────────────────────
+
+    /// MS-5: a re-snapshot is required once the running queued total has
+    /// crossed `interval` bytes past the last snapshot point. Pinning the
+    /// happy path so a future tweak doesn't regress to the stale-snapshot
+    /// behaviour the fix was added to repair.
+    #[test]
+    fn should_resnapshot_free_space_fires_at_interval_boundary() {
+        let interval = FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES;
+        // Just below the interval: no resnapshot.
+        assert!(!should_resnapshot_free_space(interval - 1, 0, interval));
+        // Exactly at the interval: resnapshot required.
+        assert!(should_resnapshot_free_space(interval, 0, interval));
+        // Past the interval: resnapshot still required (caller updates
+        // last_snapshot to suppress repeats; this helper is stateless).
+        assert!(should_resnapshot_free_space(interval * 2, 0, interval));
+    }
+
+    /// MS-5: when the interval is 0 the helper must return `false` for any
+    /// total. Guards against accidentally turning the cadence into "every
+    /// call" if a constant is ever zeroed out.
+    #[test]
+    fn should_resnapshot_free_space_zero_interval_never_fires() {
+        for total in [0u64, 1, 1_000, u64::MAX] {
+            assert!(
+                !should_resnapshot_free_space(total, 0, 0),
+                "interval=0 must never request a resnapshot (total={total})"
+            );
+        }
+    }
+
+    /// MS-5: drives the helper through a sequence where the simulated free
+    /// space drops between snapshots and asserts the bail decision picks up
+    /// the fresher snapshot. Pre-fix, the bail rode on the stale 1 TiB
+    /// snapshot and never fired even though the FS had only 1 GiB left.
+    #[test]
+    fn batch_forecast_resnapshot_picks_up_fs_filling_mid_sync() {
+        let queued = AtomicU64::new(0);
+        let warn = AtomicBool::new(false);
+
+        // Snapshot 1: 1 TiB free. Queue 500 GiB → still well under 90%, no
+        // warn or bail.
+        let initial_free = 1024u64 * 1024 * 1024 * 1024; // 1 TiB
+        let snapshot1_total = 500u64 * 1024 * 1024 * 1024; // 500 GiB
+        let (decision, total) =
+            batch_forecast_decision(snapshot1_total, Some(initial_free), &queued, &warn);
+        assert_eq!(
+            decision,
+            BatchForecast::Continue,
+            "500 GiB / 1 TiB stays under 90%"
+        );
+        assert_eq!(total, snapshot1_total);
+
+        // Between snapshots an unrelated process consumed almost all the
+        // disk. Refresh free-space to 1 GiB. Even though `queued` already
+        // counts 500 GiB, the next forecast call should see the fresher
+        // 1 GiB free figure and bail.
+        let refreshed_free = 1024u64 * 1024 * 1024; // 1 GiB
+        let (decision, total) =
+            batch_forecast_decision(1024 * 1024, Some(refreshed_free), &queued, &warn);
+        assert_eq!(
+            decision,
+            BatchForecast::Bail,
+            "after re-snapshot to 1 GiB free, queued 500 GiB+ must trigger Bail"
+        );
+        assert!(total > refreshed_free, "queued total dwarfs refreshed free");
     }
 
     // ── maybe_warn_rate_limit_pressure ─────────────────────────────────────
