@@ -2295,16 +2295,16 @@ fn plan_metadata_write(
         write.gps = gps_from_payload(payload);
     }
     if flags.description {
-        write.description = payload.description.clone();
+        write.description.clone_from(&payload.description);
     }
     if flags.embed_xmp {
-        write.title = payload.title.clone();
-        write.keywords = payload.keywords.clone();
-        write.people = payload.people.clone();
+        write.title.clone_from(&payload.title);
+        write.keywords.clone_from(&payload.keywords);
+        write.people.clone_from(&payload.people);
         write.is_hidden = payload.is_hidden;
         write.is_archived = payload.is_archived;
-        write.media_subtype = payload.media_subtype.clone();
-        write.burst_id = payload.burst_id.clone();
+        write.media_subtype.clone_from(&payload.media_subtype);
+        write.burst_id.clone_from(&payload.burst_id);
     }
 
     write
