@@ -439,66 +439,31 @@ pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) ->
 ///
 /// macOS uses various whitespace characters before AM/PM:
 /// - Regular space (U+0020): `1.40.01 PM`
+/// - No-break space (U+00A0): `1.40.01\u{00A0}PM`
 /// - Narrow no-break space (U+202F): `1.40.01\u{202F}PM`
 /// - No space: `1.40.01PM`
 ///
 /// This function strips any of these to produce a consistent `1.40.01PM` form,
 /// enabling matching between files created with different locale settings.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "every `bytes[i + k]` read below is preceded by an `i + k < len` check or a \
-              `bytes[i] < 0x80` ASCII guard that makes `i + 1 <= len`; the UTF-8 fallback \
-              slice `s[i..]` is valid because `i < len` and we land on a char boundary"
-)]
 pub(crate) fn normalize_ampm(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // Check for whitespace characters that may precede AM/PM:
-        // - Regular space (U+0020): 1 byte
-        // - No-break space (U+00A0): 2 bytes (0xC2, 0xA0)
-        // - Narrow no-break space (U+202F): 3 bytes (0xE2, 0x80, 0xAF)
-        let ws_len = if bytes[i] == b' ' {
-            1
-        } else if i + 1 < len && bytes[i] == 0xC2 && bytes[i + 1] == 0xA0 {
-            2 // U+00A0
-        } else if i + 2 < len && bytes[i] == 0xE2 && bytes[i + 1] == 0x80 && bytes[i + 2] == 0xAF {
-            3 // U+202F
-        } else {
-            0
-        };
-
-        if ws_len > 0 && i + ws_len + 1 < len {
-            let next = bytes[i + ws_len].to_ascii_uppercase();
-            let next2 = bytes[i + ws_len + 1].to_ascii_uppercase();
-            if (next == b'A' || next == b'P') && next2 == b'M' {
-                // Skip the whitespace, the AM/PM chars will be added on next iterations
-                i += ws_len;
-                continue;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        // If this char is a known AM/PM-prefix whitespace variant and the
+        // next two chars spell "AM" or "PM" (case-insensitive), drop the
+        // whitespace — the A/P + M will be appended on subsequent
+        // iterations as normal.
+        if matches!(c, ' ' | '\u{00A0}' | '\u{202F}') {
+            let mut lookahead = chars.clone();
+            if let (Some(c1), Some(c2)) = (lookahead.next(), lookahead.next()) {
+                let c1u = c1.to_ascii_uppercase();
+                let c2u = c2.to_ascii_uppercase();
+                if (c1u == 'A' || c1u == 'P') && c2u == 'M' {
+                    continue;
+                }
             }
         }
-
-        // Safe: we only skip known valid UTF-8 boundaries above
-        if bytes[i] < 0x80 {
-            result.push(bytes[i] as char);
-            i += 1;
-        } else {
-            // Multi-byte UTF-8: decode the char and advance past it
-            // Safe: i < len and bytes[i] >= 0x80 guarantees a multi-byte char starts here
-            #[allow(
-                clippy::expect_used,
-                reason = "i < len bound checked above; &str guarantees valid UTF-8 so chars().next() is Some"
-            )]
-            let ch = s[i..]
-                .chars()
-                .next()
-                .expect("i < len guarantees a char exists");
-            result.push(ch);
-            i += ch.len_utf8();
-        }
+        result.push(c);
     }
     result
 }
