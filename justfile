@@ -43,6 +43,7 @@ test MODE="":
             _live_env
             cargo test --test sync -- --ignored --test-threads=1
             cargo test --test state_auth -- --ignored --test-threads=1
+            cargo test --test import_existing_live -- --ignored --test-threads=1
             ;;
         concurrency)
             _live_env
@@ -93,6 +94,7 @@ cov MODE="" BASE="main":
             cargo llvm-cov --no-report --test behavioral
             cargo llvm-cov --no-report --test sync -- --include-ignored --test-threads=1
             cargo llvm-cov --no-report --test state_auth -- --include-ignored --test-threads=1
+            cargo llvm-cov --no-report --test import_existing_live -- --include-ignored --test-threads=1
             cargo llvm-cov report --summary-only
             ;;
         patch)

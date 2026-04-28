@@ -11,10 +11,11 @@ explains what runs where.
 tests/
   common/mod.rs       shared Rust helpers (require_preauth, walkdir, auth-retry)
   data/               fixtures (sample.heic, etc.)
-  cli.rs              argument parsing and help output
-  behavioral.rs       offline end-to-end behavior (pre-seeded DB, real binary)
-  sync.rs             live sync flow against iCloud (#[ignore] live tests)
-  state_auth.rs       live status / reset / verify / import commands
+  cli.rs                       argument parsing and help output
+  behavioral.rs                offline end-to-end behavior (pre-seeded DB, real binary)
+  sync.rs                      live sync flow against iCloud (#[ignore] live tests)
+  state_auth.rs                live status / reset / verify / import commands
+  import_existing_live.rs      live import-existing scenarios (#[ignore] live tests)
   shell/
     lib.sh            shared helpers: release-binary, preflight, check, scratch
     concurrency.sh    concurrency, resume, partial-failure exit code
@@ -31,6 +32,7 @@ tests/
 | `cargo test --test behavioral` | 112 | no | `just test fast` |
 | `cargo test --test sync` | 43 `#[ignore]` | yes | `just test live` |
 | `cargo test --test state_auth` | 17 `#[ignore]` | yes | `just test live` |
+| `cargo test --test import_existing_live` | 9 `#[ignore]` | yes | `just test live` |
 | `tests/shell/concurrency.sh` | 8 | yes | `just test concurrency` |
 | `tests/shell/state-machine.sh` | 20 | yes | `just test state` |
 | `tests/shell/docker.sh` | 16 | yes | `just test docker` |
@@ -110,6 +112,7 @@ details are baked into test code.
 | `KEI_TEST_ALBUM` | `kei-test` | Test album name |
 | `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image under test |
 | `KEI_TEST_SCRATCH_DIR` | `/tmp/kei-tests-$USER` | Base dir for shell-suite scratch |
+| `KEI_IMPORT_FIXTURE_DIR` | `/tmp/claude/kei-import-fixture` | Where `import_existing_live.rs` caches its `--recent 100` sync fixture across runs |
 
 `just test live` applies a few defaults on top (`ICLOUD_TEST_COOKIE_DIR=~/.config/kei`,
 `KEI_TEST_ALBUM=icloudpd-test`) that match this repo's maintainer setup.
@@ -139,6 +142,14 @@ happens:
   download flow, filters, EXIF/XMP write-through, HEIC embed, sidecars.
 - **`state_auth.rs`** - live iCloud, `#[ignore]` gated. Covers status /
   reset-state / verify / import-existing / retry-failed.
+- **`import_existing_live.rs`** - live iCloud, `#[ignore]` gated.
+  Comprehensive `import-existing` scenarios: matches a real-sync fixture,
+  dry-run, idempotency, `--recent` cap, `--recent Nd` rejection, truncated
+  / missing files producing unmatched, deprecated `--directory` alias,
+  TOML-only resolution. Companion to the wiremock unit tests in
+  `src/commands/import.rs::wiremock_tests` -- live verifies real Apple
+  CloudKit shapes work end-to-end; wiremock covers the policy matrix
+  exhaustively.
 - **`shell/concurrency.sh`** - things that need `kill -9` mid-process,
   `chmod 555` on a target dir, direct sqlite3 assertions on the state
   DB mid-test. Hard to do cleanly from Rust.
