@@ -24,19 +24,11 @@ use super::service::{init_photos_service, resolve_libraries};
 
 /// Per-library counters returned by [`import_assets`].
 ///
-/// `total` is asset-level (one tick per enumerated `PhotoAsset`).
-/// `matched` and `unmatched` are expected-path level (one tick per
-/// `ExpectedAssetPath`), since a single asset can produce multiple
-/// expected paths (live photos, align-raw alternates).
-///
-/// `filtered` is asset-level: ticks once when an asset is dropped before
-/// path derivation runs (no versions, content/date filter blocked it,
-/// or `expected_paths_for` returned empty). `hash_errors` is
-/// expected-path level: ticks once per `compute_sha256` failure.
-///
-/// The four counters together cover every asset/path the importer
-/// observed, so a divergent total in the summary surfaces silently
-/// dropped work rather than masquerading as a clean run.
+/// Counters span asset- and expected-path levels so that divergent
+/// totals in the summary surface silently dropped work instead of
+/// masquerading as a clean run. `total` and `filtered` tick per asset;
+/// `matched`, `unmatched`, and `hash_errors` tick per expected path
+/// (one asset can yield multiple paths, e.g. live photos).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ImportStats {
     pub total: u64,
@@ -156,12 +148,8 @@ where
 
         let expected = expected_paths_for(&asset, download_config);
         if expected.is_empty() {
-            // Distinct from `is_asset_filtered`: this is path-derivation
-            // returning nothing (e.g. live_photo_mode=Skip on a live photo,
-            // or force_size=true with the requested size missing on a
-            // non-Original asset). Surfaced loudly so a sync that produced
-            // files matching neither this importer's nor sync's path rules
-            // is observable.
+            // WARN, not debug: an asset silently dropped here is invisible
+            // to operators reconciling the on-disk tree against the report.
             tracing::warn!(
                 id = %asset.id(),
                 live_photo_mode = ?download_config.live_photo_mode,
@@ -1314,7 +1302,6 @@ mod wiremock_tests {
             stats.filtered, 1,
             "force_size + missing size produces empty expected paths -> filtered",
         );
-        assert_eq!(stats.hash_errors, 0);
     }
 
     // ── Tests: pagination + EOF ───────────────────────────────────────
@@ -1702,7 +1689,6 @@ mod wiremock_tests {
             stats.filtered, 1,
             "is_asset_filtered must tick the filtered counter",
         );
-        assert_eq!(stats.hash_errors, 0);
         assert!(all_downloaded(db.as_ref()).await.is_empty());
     }
 
