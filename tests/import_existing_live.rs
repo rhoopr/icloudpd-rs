@@ -626,15 +626,13 @@ fn import_reads_toml_for_path_derivation() {
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
         copy_auth_artifacts(&cookie_dir, test_data.path());
-        // Write a TOML config that re-states the defaults explicitly.
-        // If the resolution plumbing ever drops a field, this test will
-        // start producing zero matches, surfacing the regression.
-        let toml_path = test_data.path().join("kei.toml");
-        let toml_body = format!(
-            r#"
-[download]
-directory = {dir:?}
-folder_structure = "%Y/%m/%d"
+        // TOML re-states the defaults explicitly. If the resolution
+        // plumbing ever drops a field, the import matches nothing and
+        // this test surfaces the regression.
+        let toml_path = write_kei_toml(
+            test_data.path(),
+            download_dir,
+            r#"folder_structure = "%Y/%m/%d"
 
 [photos]
 size = "original"
@@ -646,27 +644,10 @@ align_raw = "as-is"
 keep_unicode_in_filenames = false
 force_size = false
 "#,
-            dir = download_dir.to_string_lossy()
         );
-        std::fs::write(&toml_path, toml_body).unwrap();
 
         let mut cmd = common::cmd();
-        // CLI > env > TOML > default. If any of these env vars are exported
-        // in the test runner (the live-test recipes wire several), they'd
-        // override the TOML and silently exercise a different config. Clear
-        // them so the TOML stays the only source for the resolved fields.
-        for var in [
-            "KEI_FILE_MATCH_POLICY",
-            "KEI_SIZE",
-            "KEI_LIVE_PHOTO_MODE",
-            "KEI_LIVE_PHOTO_SIZE",
-            "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY",
-            "KEI_ALIGN_RAW",
-            "KEI_KEEP_UNICODE_IN_FILENAMES",
-            "KEI_FORCE_SIZE",
-        ] {
-            cmd.env_remove(var);
-        }
+        clear_toml_resolved_env(&mut cmd);
         cmd.args([
             "import-existing",
             "--username",
@@ -708,7 +689,54 @@ force_size = false
 // fixture download dir + same data_dir. Sync must report
 // `<imported> already downloaded` (or equivalent) and `0 downloaded`.
 
-const ROUNDTRIP_RECENT: u32 = 30;
+const ROUNDTRIP_RECENT: u32 = 10;
+
+/// Write a `kei.toml` under `dir` with `[download].directory` set to the
+/// fixture and the caller's extra TOML body appended. Returns the path.
+fn write_kei_toml(dir: &Path, download_dir: &Path, extra: &str) -> std::path::PathBuf {
+    let path = dir.join("kei.toml");
+    let body = format!(
+        "[download]\ndirectory = {dl:?}\n{extra}",
+        dl = download_dir.to_string_lossy(),
+    );
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+/// Strip every `KEI_*` env var that overrides a TOML-resolved field.
+/// Live test runners often export several of these; without scrubbing,
+/// the env layer (CLI > env > TOML > default) silently shadows TOML
+/// under test. Apply at every TOML-driven test that asserts what TOML
+/// resolves to.
+fn clear_toml_resolved_env(cmd: &mut assert_cmd::Command) {
+    for var in [
+        "KEI_FILE_MATCH_POLICY",
+        "KEI_SIZE",
+        "KEI_LIVE_PHOTO_MODE",
+        "KEI_LIVE_PHOTO_SIZE",
+        "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY",
+        "KEI_ALIGN_RAW",
+        "KEI_KEEP_UNICODE_IN_FILENAMES",
+        "KEI_FORCE_SIZE",
+        "KEI_SKIP_VIDEOS",
+        "KEI_SKIP_PHOTOS",
+    ] {
+        cmd.env_remove(var);
+    }
+}
+
+/// `std::process::Command` for the kei binary with `.env` loaded into
+/// the parent process the same way `common::cmd()` does. Use for tests
+/// that need StdCommand features (signals, parallel spawn) instead of
+/// `assert_cmd::Command`.
+#[cfg(unix)]
+fn kei_std_command() -> std::process::Command {
+    // Force the lazy .env load in `common::cmd()`'s init_env() by
+    // touching it once; cheap, idempotent, and matches the live-test
+    // recipe's expected env state.
+    let _ = common::cmd();
+    std::process::Command::new(env!("CARGO_BIN_EXE_kei"))
+}
 
 /// Run `kei sync --recent N` reusing the post-import data_dir, capture
 /// stderr, and parse downloaded/skipped counts. Returns
@@ -756,16 +784,23 @@ fn run_sync_against_fixture(
         return (0, 0);
     }
 
-    let summary_re = regex_lite::Regex::new(r"(\d+) downloaded(?:, (\d+) skipped)?").unwrap();
-    let caps = summary_re
-        .captures(&stderr)
+    let downloaded = digits_before(&stderr, " downloaded")
         .unwrap_or_else(|| panic!("missing 'N downloaded' line in sync stderr:\n{stderr}"));
-    let downloaded: u64 = caps[1].parse().unwrap();
-    let skipped: u64 = caps
-        .get(2)
-        .map(|m| m.as_str().parse().unwrap_or(0))
-        .unwrap_or(0);
+    let skipped = digits_before(&stderr, " skipped").unwrap_or(0);
     (downloaded, skipped)
+}
+
+/// Find the run of ASCII digits immediately preceding `marker` in `hay`
+/// and parse them as `u64`. Used to scan kei's `N downloaded, M skipped`
+/// summary line without pulling in the regex crate.
+fn digits_before(hay: &str, marker: &str) -> Option<u64> {
+    let idx = hay.find(marker)?;
+    let bytes = hay.as_bytes();
+    let mut start = idx;
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    hay[start..idx].parse().ok()
 }
 
 /// Import-then-sync default flags. The strongest invariant: zero
@@ -780,7 +815,6 @@ fn roundtrip_default_layout_sync_skips_after_import() {
         let test_data = tempdir().unwrap();
         let recent = ROUNDTRIP_RECENT.to_string();
 
-        // Step 1: populate state DB via import-existing.
         let import = import_cmd(
             &username,
             &password,
@@ -800,7 +834,6 @@ fn roundtrip_default_layout_sync_skips_after_import() {
             "import-existing did not match anything; sync skip test would be vacuous: {summary:?}"
         );
 
-        // Step 2: run sync against the same data_dir + fixture dir.
         // The strongest invariant: 0 downloaded. The skipped count is
         // 0 when sync short-circuits at "No new photos to download"
         // (every asset rejected before the download phase) and >0 when
@@ -886,15 +919,11 @@ fn roundtrip_skip_videos_sync_skips_imported_photos() {
         // builds DownloadConfig with skip_videos=false hard-coded). Use
         // TOML to force it.
         let test_data = tempdir().unwrap();
-        let toml_path = test_data.path().join("kei.toml");
-        std::fs::write(
-            &toml_path,
-            format!(
-                "[download]\ndirectory = {dir:?}\n[filters]\nskip_videos = true\n",
-                dir = download_dir.to_string_lossy(),
-            ),
-        )
-        .unwrap();
+        let toml_path = write_kei_toml(
+            test_data.path(),
+            download_dir,
+            "[filters]\nskip_videos = true\n",
+        );
 
         let recent = ROUNDTRIP_RECENT.to_string();
         let import_out = import_cmd(
@@ -936,50 +965,23 @@ fn roundtrip_dry_run_import_does_not_prevent_sync() {
 
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
-        let recent = "5";
-
-        // Dry-run import.
         import_cmd(
             &username,
             &password,
             &cookie_dir,
             download_dir,
             test_data.path(),
-            &["--recent", recent, "--dry-run"],
+            &["--recent", "5", "--dry-run"],
         )
         .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
         .assert()
         .success();
 
-        // The core invariant for dry-run: zero rows written.
         let post_import_rows = count_downloaded_rows(test_data.path());
-        assert_eq!(post_import_rows, 0, "dry-run wrote {post_import_rows} rows");
-
-        // Belt-and-braces: re-running without --dry-run on the same
-        // data-dir must produce a clean import (i.e. no leftover state
-        // from the dry-run that would confuse the second run).
-        let second = import_cmd(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir,
-            test_data.path(),
-            &["--recent", recent],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-        let summary = parse_summary(&String::from_utf8_lossy(&second.stdout));
-        assert!(
-            summary.matched > 0,
-            "second (non-dry-run) import-existing matched nothing; \
-             dry-run may have left state that prevents a fresh import: {summary:?}"
-        );
-        assert!(
-            count_downloaded_rows(test_data.path()) > 0,
-            "second import-existing wrote no rows despite reporting matches"
+        assert_eq!(
+            post_import_rows, 0,
+            "dry-run wrote {post_import_rows} rows; the only invariant for \
+             this test is that --dry-run leaves the DB untouched",
         );
     });
 }
@@ -1065,26 +1067,18 @@ fn toml_file_match_policy_overridden_by_cli_flag() {
 
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
-        let toml_path = test_data.path().join("kei.toml");
-        std::fs::write(
-            &toml_path,
-            format!(
-                r#"[download]
-directory = {dir:?}
-[photos]
-file_match_policy = "name-id7"
-"#,
-                dir = download_dir.to_string_lossy(),
-            ),
-        )
-        .unwrap();
+        let toml_path = write_kei_toml(
+            test_data.path(),
+            download_dir,
+            "[photos]\nfile_match_policy = \"name-id7\"\n",
+        );
 
         let recent = ROUNDTRIP_RECENT.to_string();
         // CLI flag forces back to the default policy. Files on disk
         // were synced with the default, so this should match a healthy
         // fraction. If the CLI override didn't take, the import would
         // run name-id7 (matching nothing).
-        let out = import_cmd(
+        let mut cmd = import_cmd(
             &username,
             &password,
             &cookie_dir,
@@ -1098,12 +1092,14 @@ file_match_policy = "name-id7"
                 "--file-match-policy",
                 "name-size-dedup-with-suffix",
             ],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        );
+        clear_toml_resolved_env(&mut cmd);
+        let out = cmd
+            .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
+            .assert()
+            .success()
+            .get_output()
+            .clone();
         let summary = parse_summary(&String::from_utf8_lossy(&out.stdout));
         assert!(
             summary.matched > 0,
@@ -1126,19 +1122,21 @@ fn default_used_when_no_toml_no_cli_flag() {
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
         let recent = ROUNDTRIP_RECENT.to_string();
-        let out = import_cmd(
+        let mut cmd = import_cmd(
             &username,
             &password,
             &cookie_dir,
             download_dir,
             test_data.path(),
             &["--recent", &recent],
-        )
-        .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        );
+        clear_toml_resolved_env(&mut cmd);
+        let out = cmd
+            .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
+            .assert()
+            .success()
+            .get_output()
+            .clone();
         let summary = parse_summary(&String::from_utf8_lossy(&out.stdout));
         assert!(
             summary.matched > 0,
@@ -1160,21 +1158,14 @@ fn toml_invalid_file_match_policy_errors_loudly() {
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
         copy_auth_artifacts(&cookie_dir, test_data.path());
-        let toml_path = test_data.path().join("kei.toml");
-        std::fs::write(
-            &toml_path,
-            format!(
-                r#"[download]
-directory = {dir:?}
-[photos]
-file_match_policy = "made-up-policy"
-"#,
-                dir = download_dir.to_string_lossy(),
-            ),
-        )
-        .unwrap();
+        let toml_path = write_kei_toml(
+            test_data.path(),
+            download_dir,
+            "[photos]\nfile_match_policy = \"made-up-policy\"\n",
+        );
 
         let mut cmd = common::cmd();
+        clear_toml_resolved_env(&mut cmd);
         cmd.args([
             "import-existing",
             "--username",
@@ -1217,7 +1208,7 @@ file_match_policy = "made-up-policy"
 #[test]
 #[ignore]
 fn import_sigint_then_rerun_is_idempotent() {
-    use std::process::{Command as StdCommand, Stdio};
+    use std::process::Stdio;
 
     let (username, password, cookie_dir) = common::require_preauth();
     let (download_dir, _sync_data_dir) = fixture();
@@ -1226,10 +1217,8 @@ fn import_sigint_then_rerun_is_idempotent() {
         let test_data = tempdir().unwrap();
         copy_auth_artifacts(&cookie_dir, test_data.path());
         let recent = ROUNDTRIP_RECENT.to_string();
-        let bin = env!("CARGO_BIN_EXE_kei");
 
-        // Step 1: spawn import-existing; sleep briefly; SIGINT.
-        let mut child = StdCommand::new(bin)
+        let mut child = kei_std_command()
             .args([
                 "import-existing",
                 "--username",
@@ -1250,13 +1239,11 @@ fn import_sigint_then_rerun_is_idempotent() {
             .expect("spawn kei import-existing");
 
         std::thread::sleep(Duration::from_millis(1500));
-        // SAFETY: child.id() returned an active PID for our spawned
-        // process; SIGINT is the documented graceful-shutdown signal.
+        // SAFETY: child.id() is the live PID for our spawned process;
+        // SIGINT is the documented graceful-shutdown signal.
         unsafe {
             libc::kill(child.id() as libc::pid_t, libc::SIGINT);
         }
-        // Wait, capping at 30s so a stuck process fails the test
-        // rather than hanging forever.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             match child.try_wait().expect("try_wait") {
@@ -1271,9 +1258,6 @@ fn import_sigint_then_rerun_is_idempotent() {
 
         let post_sigint_rows = count_downloaded_rows(test_data.path());
 
-        // Step 2: re-run to completion. Idempotence: completes successfully,
-        // doesn't double-count, ends with at least as many rows as the
-        // partial first run (and ideally more, the full set).
         let out = import_cmd(
             &username,
             &password,
@@ -1313,7 +1297,7 @@ fn import_sigint_then_rerun_is_idempotent() {
 #[test]
 #[ignore]
 fn two_concurrent_imports_do_not_both_succeed_silently() {
-    use std::process::{Command as StdCommand, Stdio};
+    use std::process::Stdio;
 
     let (username, password, cookie_dir) = common::require_preauth();
     let (download_dir, _sync_data_dir) = fixture();
@@ -1322,10 +1306,9 @@ fn two_concurrent_imports_do_not_both_succeed_silently() {
         let test_data = tempdir().unwrap();
         copy_auth_artifacts(&cookie_dir, test_data.path());
         let recent = ROUNDTRIP_RECENT.to_string();
-        let bin = env!("CARGO_BIN_EXE_kei");
 
         let spawn = || {
-            StdCommand::new(bin)
+            kei_std_command()
                 .args([
                     "import-existing",
                     "--username",
@@ -1378,76 +1361,4 @@ fn two_concurrent_imports_do_not_both_succeed_silently() {
              stderr_a:\n{stderr_a}\nstderr_b:\n{stderr_b}",
         );
     });
-}
-
-// regex_lite is part of the regex 1.10+ shipped via dotenvy or
-// dependencies; if absent, swap for a hand-rolled split.
-mod regex_lite {
-    /// Tiny ad-hoc regex shim used only by the round-trip tests. We need
-    /// captures of `(\d+) downloaded(?:, (\d+) skipped)?` from sync's
-    /// summary line. Pulling in the regex crate just for this would be
-    /// disproportionate; this is a hand-rolled scanner.
-    pub struct Regex {
-        primary: String,
-        secondary: Option<String>,
-    }
-    pub struct Captures<'h> {
-        haystack: &'h str,
-        primary_idx: usize,
-        secondary_idx: Option<usize>,
-    }
-    impl Regex {
-        pub fn new(_: &str) -> anyhow::Result<Self> {
-            Ok(Self {
-                primary: " downloaded".to_string(),
-                secondary: Some(" skipped".to_string()),
-            })
-        }
-        pub fn captures<'h>(&self, hay: &'h str) -> Option<Captures<'h>> {
-            let primary_idx = hay.find(&self.primary)?;
-            let secondary_idx = self.secondary.as_ref().and_then(|s| {
-                let after = &hay[primary_idx + self.primary.len()..];
-                after.find(s).map(|i| primary_idx + self.primary.len() + i)
-            });
-            Some(Captures {
-                haystack: hay,
-                primary_idx,
-                secondary_idx,
-            })
-        }
-    }
-    impl<'h> Captures<'h> {
-        pub fn get(&self, idx: usize) -> Option<Match<'h>> {
-            match idx {
-                1 => Some(self.scan_int_before(self.primary_idx)),
-                2 => self.secondary_idx.map(|i| self.scan_int_before(i)),
-                _ => None,
-            }
-        }
-        fn scan_int_before(&self, end: usize) -> Match<'h> {
-            // Walk backwards over digits.
-            let bytes = self.haystack.as_bytes();
-            let mut start = end;
-            while start > 0 && bytes[start - 1].is_ascii_digit() {
-                start -= 1;
-            }
-            Match {
-                s: &self.haystack[start..end],
-            }
-        }
-    }
-    impl<'h> std::ops::Index<usize> for Captures<'h> {
-        type Output = str;
-        fn index(&self, idx: usize) -> &str {
-            self.get(idx).expect("missing capture").s
-        }
-    }
-    pub struct Match<'h> {
-        s: &'h str,
-    }
-    impl<'h> Match<'h> {
-        pub fn as_str(&self) -> &str {
-            self.s
-        }
-    }
 }

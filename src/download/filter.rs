@@ -1265,41 +1265,28 @@ mod tests {
     // most likely to drift apart (file_match_policy, size variants, live
     // photo modes, raw alignment).
 
-    fn assert_primary_path_parity(asset: &PhotoAsset, config: &DownloadConfig, label: &str) {
+    fn assert_path_parity(
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        which: VersionSizeKey,
+        label: &str,
+    ) {
+        let want_live = matches!(which, VersionSizeKey::LiveOriginal);
         let expected = expected_paths_for(asset, config);
         let tasks = filter_asset_fresh(asset, config);
-        let primary_expected = expected
+        let exp = expected
             .iter()
-            .find(|p| !matches!(p.version_size, VersionSizeKey::LiveOriginal))
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveOriginal) == want_live)
             .map(|p| p.path.clone())
             .unwrap_or_default();
-        let primary_task = tasks
+        let got = tasks
             .iter()
-            .find(|t| !matches!(t.version_size, VersionSizeKey::LiveOriginal))
+            .find(|t| matches!(t.version_size, VersionSizeKey::LiveOriginal) == want_live)
             .map(|t| t.download_path.to_path_buf())
             .unwrap_or_default();
         assert_eq!(
-            primary_expected, primary_task,
-            "{label}: expected_paths_for primary path drifted from filter_asset_to_tasks"
-        );
-    }
-
-    fn assert_live_mov_parity(asset: &PhotoAsset, config: &DownloadConfig, label: &str) {
-        let expected = expected_paths_for(asset, config);
-        let tasks = filter_asset_fresh(asset, config);
-        let mov_expected = expected
-            .iter()
-            .find(|p| matches!(p.version_size, VersionSizeKey::LiveOriginal))
-            .map(|p| p.path.clone())
-            .unwrap_or_default();
-        let mov_task = tasks
-            .iter()
-            .find(|t| matches!(t.version_size, VersionSizeKey::LiveOriginal))
-            .map(|t| t.download_path.to_path_buf())
-            .unwrap_or_default();
-        assert_eq!(
-            mov_expected, mov_task,
-            "{label}: expected_paths_for live-MOV path drifted from filter_asset_to_tasks"
+            exp, got,
+            "{label}: expected_paths_for path drifted from filter_asset_to_tasks"
         );
     }
 
@@ -1309,7 +1296,7 @@ mod tests {
             .filename("IMG_5001.JPG")
             .build();
         let config = test_config();
-        assert_primary_path_parity(&asset, &config, "default");
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "default");
     }
 
     #[test]
@@ -1319,7 +1306,7 @@ mod tests {
             .build();
         let mut config = test_config();
         config.file_match_policy = FileMatchPolicy::NameId7;
-        assert_primary_path_parity(&asset, &config, "NameId7");
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "NameId7");
     }
 
     #[test]
@@ -1332,7 +1319,7 @@ mod tests {
         let mut config = test_config();
         config.size = AssetVersionSize::Medium;
         config.force_size = false;
-        assert_primary_path_parity(&asset, &config, "Medium fallback");
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "Medium fallback");
     }
 
     #[test]
@@ -1344,8 +1331,18 @@ mod tests {
             .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
             .build();
         let config = test_config();
-        assert_primary_path_parity(&asset, &config, "live both primary");
-        assert_live_mov_parity(&asset, &config, "live both mov");
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "live both primary",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "live both mov",
+        );
     }
 
     #[test]
@@ -1358,8 +1355,18 @@ mod tests {
             .build();
         let mut config = test_config();
         config.file_match_policy = FileMatchPolicy::NameId7;
-        assert_primary_path_parity(&asset, &config, "live id7 primary");
-        assert_live_mov_parity(&asset, &config, "live id7 mov");
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "live id7 primary",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "live id7 mov",
+        );
     }
 
     #[test]
@@ -1373,8 +1380,18 @@ mod tests {
             .build();
         let mut config = test_config();
         config.live_photo_mode = LivePhotoMode::VideoOnly;
-        assert_primary_path_parity(&asset, &config, "video-only primary (absent)");
-        assert_live_mov_parity(&asset, &config, "video-only mov");
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "video-only primary (absent)",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "video-only mov",
+        );
     }
 
     #[test]
@@ -1391,8 +1408,18 @@ mod tests {
             .build();
         let mut config = test_config();
         config.live_photo_mov_filename_policy = LivePhotoMovFilenamePolicy::Original;
-        assert_primary_path_parity(&asset, &config, "mov policy=Original primary");
-        assert_live_mov_parity(&asset, &config, "mov policy=Original mov");
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "mov policy=Original primary",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "mov policy=Original mov",
+        );
     }
 
     #[test]
@@ -1403,7 +1430,12 @@ mod tests {
         let mut config = test_config();
         config.folder_structure = "{album}/%Y".to_string();
         config.album_name = Some(Arc::from("Vacation 2025"));
-        assert_primary_path_parity(&asset, &config, "album in template");
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "album in template",
+        );
     }
 
     // ── expected_paths_for negative-space coverage ───────────────────────

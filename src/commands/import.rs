@@ -1662,7 +1662,6 @@ mod wiremock_tests {
         std::fs::create_dir_all(&dl).unwrap();
         let mut config = base_config(&dl);
         config.skip_photos = true;
-        // File on disk so the only way for matched to stay 0 is the gate.
         stage_expected(&asset.to_photo_asset(), &base_config(&dl));
 
         let db = open_db(&tmp).await;
@@ -1715,7 +1714,6 @@ mod wiremock_tests {
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
         let mut config = base_config(&dl);
-        // Glob matches the filename above.
         let pattern = glob::Pattern::new("IMG_BLOCK.*").expect("compile glob");
         config.filename_exclude = Arc::from(vec![pattern]);
         stage_expected(&asset.to_photo_asset(), &base_config(&dl));
@@ -1760,8 +1758,6 @@ mod wiremock_tests {
         std::fs::create_dir_all(&dl).unwrap();
         let config = base_config(&dl);
 
-        // Stage the real file in a sibling dir, then symlink it to where
-        // expected_paths_for says the file should be.
         let real_dir = tmp.path().join("real");
         std::fs::create_dir_all(&real_dir).unwrap();
         let real = real_dir.join("IMG_SYM.JPG");
@@ -1846,9 +1842,8 @@ mod wiremock_tests {
         std::fs::create_dir_all(&dl).unwrap();
         let config = base_config(&dl);
 
-        // Stage the real file elsewhere and hardlink it into the
-        // expected location. metadata.len follows the inode so a hardlink
-        // is indistinguishable from a regular file at this layer.
+        // metadata.len follows the inode, so a hardlink is
+        // indistinguishable from a regular file at this layer.
         let real_dir = tmp.path().join("orig");
         std::fs::create_dir_all(&real_dir).unwrap();
         let real = real_dir.join("IMG_H1.JPG");
@@ -1882,43 +1877,28 @@ mod wiremock_tests {
             "ck_denied1",
             "public.jpeg",
         );
-        let visible = WiremockAsset::new("VIS1", "IMG_V.JPG", "public.jpeg").orig(
-            1000,
-            "ck_vis1",
-            "public.jpeg",
-        );
         let tmp = TempDir::new().unwrap();
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
         let config = base_config(&dl);
 
-        // Stage both expected files, then strip read+execute on the
-        // blocked file's parent dir so resolve_match_path's stat fails.
         let blocked_paths = stage_expected(&blocked.to_photo_asset(), &config);
-        stage_expected(&visible.to_photo_asset(), &config);
         let blocked_parent = blocked_paths[0].parent().expect("parent").to_path_buf();
         std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o000))
             .expect("chmod 000");
 
         let db = open_db(&tmp).await;
-        let stats = run_import(&server, &[blocked, visible], db.as_ref(), &config, false).await;
+        let stats = run_import(&server, &[blocked], db.as_ref(), &config, false).await;
 
-        // Restore so TempDir cleanup can drop the file.
         let _ = std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o755));
 
-        assert_eq!(stats.total, 2, "both assets must be enumerated");
-        // Both assets share asset_date default, so they land under the
-        // same `%Y/%m/%d` parent dir; stripping perms on one parent
-        // blocks both files. The invariant we're pinning is "no panic,
-        // no abort": every enumerated asset reaches a terminal state.
+        assert_eq!(stats.total, 1);
+        // The invariant: the asset reaches a terminal state (no panic,
+        // no abort) -- either matched or unmatched.
+        assert_eq!(stats.matched + stats.unmatched, 1, "got {stats:?}");
         assert_eq!(
-            stats.matched + stats.unmatched,
-            stats.total,
-            "every enumerated asset must reach a terminal state, got {stats:?}",
-        );
-        assert!(
-            all_downloaded(db.as_ref()).await.len() == stats.matched as usize,
-            "DB downloaded rows must equal matched count",
+            all_downloaded(db.as_ref()).await.len(),
+            stats.matched as usize,
         );
     }
 

@@ -701,8 +701,6 @@ async fn kei_preserves_uppercase_extension_from_icloud() {
     std::fs::create_dir_all(&dl).unwrap();
     let config = base_config(&dl);
 
-    // Stage at the *uppercase* extension to prove kei's expected_paths_for
-    // emits uppercase, not lowercase.
     let fixtures: &[(&str, &str, u64)] = &[("2020/01/15", "PHOTO_42.JPG", 50_000)];
     stage_icloudpd_fixtures(&dl, fixtures);
 
@@ -735,14 +733,14 @@ async fn kei_uses_fingerprint_filename_when_filename_missing() {
     use crate::download::paths::generate_fingerprint_filename;
     use serde_json::json;
 
-    let server = MockServer::start().await;
+    // No MockServer needed: filename absence is exercised against a
+    // hand-built PhotoAsset fed directly to import_assets.
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
     let config = base_config(&dl);
 
-    // Build asset directly via JSON: omit filenameEnc so PhotoAsset's
-    // `filename()` returns None and expected_paths_for falls back.
+    // Omit filenameEnc so PhotoAsset::filename() returns None.
     let record_name = "FNGR_RECORD_99";
     let asset_date = ts_for_folder("2024/03/14");
     let master = json!({
@@ -762,12 +760,9 @@ async fn kei_uses_fingerprint_filename_when_filename_missing() {
     });
     let asset = PhotoAsset::new(master, asset_record);
 
-    // What kei's fingerprint fallback should land on.
     let fp_name = generate_fingerprint_filename(record_name, "public.jpeg");
     stage_file(&dl.join("2024/03/14").join(&fp_name), 7777);
 
-    // Drive import_assets with a hand-built single-asset stream so we
-    // don't need a wire fixture for this case.
     let stream = futures_util::stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]);
     let (tx, panic_rx) = tokio::sync::oneshot::channel::<bool>();
     drop(tx);
@@ -784,7 +779,6 @@ async fn kei_uses_fingerprint_filename_when_filename_missing() {
     .await
     .expect("import_assets ok");
     assert_eq!(stats.matched, 1, "kei must use the fingerprint fallback");
-    let _ = server; // suppress unused-mut on server (not used; kept for symmetry)
 }
 
 /// `RawTreatmentPolicy::Unchanged` (kei's default) keeps the iCloud-side
