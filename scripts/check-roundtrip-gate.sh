@@ -23,7 +23,15 @@ if [ "${KEI_SKIP_ROUNDTRIP_GATE:-0}" = "1" ]; then
 fi
 
 if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
-    echo "roundtrip-gate: base ref '$BASE_REF' not found; skipping (run \`git fetch origin main\`)" >&2
+    # CI environments always have origin/main fetched; a missing base ref
+    # there is a real configuration bug and we fail loudly. Locally, we
+    # warn and skip so a fresh checkout doesn't hard-block on `just gate`
+    # before the user has had a chance to run `git fetch origin main`.
+    if [ "${CI:-}" = "true" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
+        echo "roundtrip-gate: base ref '$BASE_REF' not found in CI; check checkout config" >&2
+        exit 1
+    fi
+    echo "roundtrip-gate: WARNING base ref '$BASE_REF' not found locally; skipping detector. Run \`git fetch origin main\` to enable the gate." >&2
     exit 0
 fi
 
