@@ -166,6 +166,18 @@ where
             };
 
             if !dry_run {
+                // Hash the file BEFORE creating the pending row. If the read
+                // fails (permissions, vanished file, I/O error), bailing
+                // here leaves no orphan `pending` row that a future sync
+                // would wrongly skip.
+                let local_checksum = match download::file::compute_sha256(&expected_path).await {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
+                        continue;
+                    }
+                };
+
                 let media_type = download::determine_media_type(version_size, &asset);
                 let record = state::AssetRecord::new_pending(
                     asset.id().to_string(),
@@ -185,14 +197,6 @@ where
                     tracing::warn!(asset_id = %asset.id(), version = ?version_size, error = %e, "Failed to record asset");
                     continue;
                 }
-
-                let local_checksum = match download::file::compute_sha256(&expected_path).await {
-                    Ok(hash) => hash,
-                    Err(e) => {
-                        tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
-                        continue;
-                    }
-                };
 
                 if let Err(e) = db
                     .mark_downloaded(
@@ -1483,6 +1487,153 @@ mod wiremock_tests {
             stats.unmatched, 0,
             "filter happens before path derivation; unmatched stays 0",
         );
+    }
+
+    // ── Gap-coverage tests ────────────────────────────────────────────
+    //
+    // Three scenarios surfaced during PR review that the broader suite
+    // didn't pin down:
+    //   1. compute_sha256 failure leaving an orphan pending row in the DB
+    //   2. LivePhotoMode::Skip emitting no path end-to-end
+    //   3. is_asset_filtered actually being honored by import_assets
+
+    /// Pre-fix, `import_assets` did `upsert_seen` (creates a `pending` row)
+    /// BEFORE `compute_sha256`, so an unreadable file left an orphan
+    /// pending row that future syncs would silently skip. The hash is now
+    /// computed first; this test pins the no-orphan invariant.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_orphan_pending_row_when_compute_sha256_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("HASHFAIL", "IMG_HF.JPG", "public.jpeg").orig(
+            1234,
+            "ck_hf",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+
+        // Stage the file the matcher will land on, then strip read perms
+        // so File::open in compute_sha256 fails with EACCES.
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        assert_eq!(expected.len(), 1);
+        stage_file(&expected[0].path, expected[0].size);
+        std::fs::set_permissions(&expected[0].path, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+
+        // Restore perms so TempDir cleanup can drop the file.
+        let _ = std::fs::set_permissions(&expected[0].path, std::fs::Permissions::from_mode(0o644));
+
+        // metadata.len matched, so resolve_match_path returned Some. But
+        // compute_sha256 failed, so we bailed before upsert_seen.
+        assert_eq!(stats.total, 1);
+        assert_eq!(
+            stats.matched, 0,
+            "hash failure means we did not record a match"
+        );
+        assert_eq!(
+            stats.unmatched, 0,
+            "the file *was* found, just not hashable"
+        );
+        assert!(
+            all_downloaded(db.as_ref()).await.is_empty(),
+            "no downloaded rows",
+        );
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(
+            summary.total_assets, 0,
+            "no orphan pending row left behind by failed hash; summary={summary:?}",
+        );
+    }
+
+    /// End-to-end pin for the LivePhotoMode::Skip semantic across the
+    /// whole `import_assets` pipeline: enumerated, but neither matched
+    /// nor unmatched, with no DB writes -- distinct from
+    /// `live_photo_skip_drops_image_and_mov` above which is the same
+    /// shape but explicit about why.
+    #[tokio::test]
+    async fn live_photo_skip_emits_no_path_end_to_end() {
+        let server = MockServer::start().await;
+        let live = WiremockAsset::new("SKIPLIVE", "IMG_SL.HEIC", "public.heic")
+            .orig(1000, "ck_sl", "public.heic")
+            .live_mov(2000, "ck_sl_mov");
+        let still = WiremockAsset::new("SKIPSTILL", "IMG_SS.JPG", "public.jpeg").orig(
+            500,
+            "ck_ss",
+            "public.jpeg",
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut config = base_config(&dl);
+        config.live_photo_mode = LivePhotoMode::Skip;
+
+        // Stage the still photo's expected path (sync would have written
+        // it under Skip; live photo files are NOT staged).
+        stage_expected(&still.to_photo_asset(), &config);
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[live, still], db.as_ref(), &config, false).await;
+
+        assert_eq!(stats.total, 2, "both assets enumerated");
+        assert_eq!(stats.matched, 1, "still matched, live dropped entirely");
+        assert_eq!(stats.unmatched, 0);
+        let rows = all_downloaded(db.as_ref()).await;
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].filename.ends_with(".JPG"),
+            "the still, not the HEIC"
+        );
+    }
+
+    /// Verifies `import_assets` actually invokes `is_asset_filtered`. We
+    /// can't easily flip skip_videos through `build_import_download_config`
+    /// (it hardcodes false), but `exclude_asset_ids` is honored by
+    /// `is_asset_filtered` and we can set it directly on the test
+    /// `DownloadConfig`. If `import_assets` ever stops calling the gate,
+    /// this test fails with `matched=1` instead of `matched=0`.
+    #[tokio::test]
+    async fn is_asset_filtered_blocks_excluded_asset_id() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("EXCL1", "IMG_EX.JPG", "public.jpeg").orig(
+            1000,
+            "ck_excl1",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut config = base_config(&dl);
+
+        // File is on disk and would match without the filter.
+        stage_expected(&asset.to_photo_asset(), &config);
+
+        // Add the asset's id to the exclude set.
+        let mut excluded: FxHashSet<String> = FxHashSet::default();
+        excluded.insert("EXCL1".to_string());
+        config.exclude_asset_ids = Arc::new(excluded);
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+
+        assert_eq!(stats.total, 1, "asset still enumerated");
+        assert_eq!(
+            stats.matched, 0,
+            "is_asset_filtered must block the excluded id before path derivation"
+        );
+        assert_eq!(
+            stats.unmatched, 0,
+            "filter runs before resolve_match_path; unmatched stays 0",
+        );
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
     }
 
     // ── icloudpd compat baseline ──────────────────────────────────────
