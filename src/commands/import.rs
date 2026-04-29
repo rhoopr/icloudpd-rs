@@ -23,11 +23,27 @@ use crate::types::{
 use super::service::{init_photos_service, resolve_libraries};
 
 /// Per-library counters returned by [`import_assets`].
+///
+/// `total` is asset-level (one tick per enumerated `PhotoAsset`).
+/// `matched` and `unmatched` are expected-path level (one tick per
+/// `ExpectedAssetPath`), since a single asset can produce multiple
+/// expected paths (live photos, align-raw alternates).
+///
+/// `filtered` is asset-level: ticks once when an asset is dropped before
+/// path derivation runs (no versions, content/date filter blocked it,
+/// or `expected_paths_for` returned empty). `hash_errors` is
+/// expected-path level: ticks once per `compute_sha256` failure.
+///
+/// The four counters together cover every asset/path the importer
+/// observed, so a divergent total in the summary surfaces silently
+/// dropped work rather than masquerading as a clean run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ImportStats {
     pub total: u64,
     pub matched: u64,
     pub unmatched: u64,
+    pub filtered: u64,
+    pub hash_errors: u64,
 }
 
 impl std::ops::AddAssign for ImportStats {
@@ -35,6 +51,8 @@ impl std::ops::AddAssign for ImportStats {
         self.total += rhs.total;
         self.matched += rhs.matched;
         self.unmatched += rhs.unmatched;
+        self.filtered += rhs.filtered;
+        self.hash_errors += rhs.hash_errors;
     }
 }
 
@@ -120,6 +138,7 @@ where
 
         if asset.versions().is_empty() {
             tracing::debug!(id = %asset.id(), "Skipping asset with no versions");
+            stats.filtered += 1;
             continue;
         }
 
@@ -131,11 +150,25 @@ where
         // contract uniformly so the gate stays in one place.
         if let Some(reason) = is_asset_filtered(&asset, download_config) {
             tracing::debug!(id = %asset.id(), ?reason, "Skipping (is_asset_filtered)");
+            stats.filtered += 1;
             continue;
         }
 
         let expected = expected_paths_for(&asset, download_config);
         if expected.is_empty() {
+            // Distinct from `is_asset_filtered`: this is path-derivation
+            // returning nothing (e.g. live_photo_mode=Skip on a live photo,
+            // or force_size=true with the requested size missing on a
+            // non-Original asset). Surfaced loudly so a sync that produced
+            // files matching neither this importer's nor sync's path rules
+            // is observable.
+            tracing::warn!(
+                id = %asset.id(),
+                live_photo_mode = ?download_config.live_photo_mode,
+                force_size = download_config.force_size,
+                "Skipping asset with no expected paths from path-derivation",
+            );
+            stats.filtered += 1;
             continue;
         }
 
@@ -178,6 +211,7 @@ where
                     Ok(hash) => hash,
                     Err(e) => {
                         tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
+                        stats.hash_errors += 1;
                         continue;
                     }
                 };
@@ -346,6 +380,8 @@ pub(crate) async fn run_import_existing(
     println!("  Total assets scanned: {}", totals.total);
     println!("  Files matched:        {}", totals.matched);
     println!("  Unmatched versions:   {}", totals.unmatched);
+    println!("  Filtered (no path):   {}", totals.filtered);
+    println!("  Hash errors:          {}", totals.hash_errors);
 
     Ok(())
 }
@@ -1070,6 +1106,11 @@ mod wiremock_tests {
             stats.unmatched, 0,
             "no path is attempted under Skip, so unmatched stays 0",
         );
+        assert_eq!(
+            stats.filtered, 1,
+            "empty expected paths must tick the filtered counter",
+        );
+        assert_eq!(stats.hash_errors, 0);
         assert!(
             all_downloaded(db.as_ref()).await.is_empty(),
             "no DB rows for skipped live photo"
@@ -1269,6 +1310,11 @@ mod wiremock_tests {
         assert_eq!(stats.total, 1);
         assert_eq!(stats.matched, 0, "force_size strict must skip");
         assert_eq!(stats.unmatched, 0);
+        assert_eq!(
+            stats.filtered, 1,
+            "force_size + missing size produces empty expected paths -> filtered",
+        );
+        assert_eq!(stats.hash_errors, 0);
     }
 
     // ── Tests: pagination + EOF ───────────────────────────────────────
@@ -1495,6 +1541,7 @@ mod wiremock_tests {
             stats.unmatched, 0,
             "filter happens before path derivation; unmatched stays 0",
         );
+        assert_eq!(stats.filtered, 1);
     }
 
     // ── Gap-coverage tests ────────────────────────────────────────────
@@ -1550,6 +1597,11 @@ mod wiremock_tests {
             stats.unmatched, 0,
             "the file *was* found, just not hashable"
         );
+        assert_eq!(stats.filtered, 0);
+        assert_eq!(
+            stats.hash_errors, 1,
+            "compute_sha256 failure must tick the hash_errors counter",
+        );
         assert!(
             all_downloaded(db.as_ref()).await.is_empty(),
             "no downloaded rows",
@@ -1594,6 +1646,11 @@ mod wiremock_tests {
         assert_eq!(stats.total, 2, "both assets enumerated");
         assert_eq!(stats.matched, 1, "still matched, live dropped entirely");
         assert_eq!(stats.unmatched, 0);
+        assert_eq!(
+            stats.filtered, 1,
+            "live photo with empty expected paths must tick filtered",
+        );
+        assert_eq!(stats.hash_errors, 0);
         let rows = all_downloaded(db.as_ref()).await;
         assert_eq!(rows.len(), 1);
         assert!(
@@ -1641,6 +1698,11 @@ mod wiremock_tests {
             stats.unmatched, 0,
             "filter runs before resolve_match_path; unmatched stays 0",
         );
+        assert_eq!(
+            stats.filtered, 1,
+            "is_asset_filtered must tick the filtered counter",
+        );
+        assert_eq!(stats.hash_errors, 0);
         assert!(all_downloaded(db.as_ref()).await.is_empty());
     }
 
@@ -1677,6 +1739,7 @@ mod wiremock_tests {
         assert_eq!(stats.total, 1);
         assert_eq!(stats.matched, 0, "skip_photos must drop the still");
         assert_eq!(stats.unmatched, 0, "filter fires before resolve_match_path");
+        assert_eq!(stats.filtered, 1);
         assert!(all_downloaded(db.as_ref()).await.is_empty());
     }
 
@@ -1707,6 +1770,7 @@ mod wiremock_tests {
             "date filter must drop the asset before hash"
         );
         assert_eq!(stats.unmatched, 0);
+        assert_eq!(stats.filtered, 1);
         assert!(all_downloaded(db.as_ref()).await.is_empty());
     }
 
@@ -1734,6 +1798,7 @@ mod wiremock_tests {
             "filename_exclude must drop the asset before hash"
         );
         assert_eq!(stats.unmatched, 0);
+        assert_eq!(stats.filtered, 1);
         assert!(all_downloaded(db.as_ref()).await.is_empty());
     }
 
