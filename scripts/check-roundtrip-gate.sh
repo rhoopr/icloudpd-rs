@@ -30,7 +30,7 @@ fi
 MERGE_BASE=$(git merge-base "$BASE_REF" HEAD)
 
 # Diff body, added lines only, excluding the +++ header.
-ADDED_LINES=$(git diff "$MERGE_BASE...HEAD" -- 'src/**/*.rs' | grep -E '^\+[^+]' || true)
+ADDED_LINES=$(git diff "$MERGE_BASE...HEAD" -- ':(glob)src/**/*.rs' | grep -E '^\+[^+]' || true)
 
 SERIALIZER_HITS=$(printf '%s\n' "$ADDED_LINES" | grep -E '\bfn (to_raw|to_string|serialize|to_toml|to_json)\b|\bimpl[^{]*\bSerialize\b' || true)
 
@@ -39,7 +39,7 @@ if [ -z "$SERIALIZER_HITS" ]; then
 fi
 
 # Test diff (tests/ tree + any *.rs in src/ since #[cfg(test)] modules live there).
-TEST_DIFF=$(git diff "$MERGE_BASE...HEAD" -- 'tests/**/*.rs' 'src/**/*.rs' | grep -E '^\+[^+]' || true)
+TEST_DIFF=$(git diff "$MERGE_BASE...HEAD" -- ':(glob)tests/**/*.rs' ':(glob)src/**/*.rs' | grep -E '^\+[^+]' || true)
 
 ROUNDTRIP_SIGNAL=$(printf '%s\n' "$TEST_DIFF" | grep -E 'roundtrip|round_trip|serialize.*parse|parse.*serialize|to_raw.*from_raw|from_raw.*to_raw' || true)
 
