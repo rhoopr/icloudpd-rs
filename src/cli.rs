@@ -494,6 +494,10 @@ pub struct ImportArgs {
     #[arg(long)]
     pub keep_unicode_in_filenames: Option<bool>,
 
+    /// File matching and dedup policy (must match what was used during sync)
+    #[arg(long, env = "KEI_FILE_MATCH_POLICY", value_enum)]
+    pub file_match_policy: Option<FileMatchPolicy>,
+
     /// Number of recent photos to check (`--recent 100`). The `--recent Nd`
     /// days form is only supported in `sync`; import-existing errors on use.
     #[arg(long, value_parser = parse_recent_limit)]
