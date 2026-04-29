@@ -11,6 +11,7 @@ use crate::cli;
 use crate::config;
 use crate::download;
 use crate::download::filter::{expected_paths_for, is_asset_filtered, ExpectedAssetPath};
+use crate::download::paths::DirCache;
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
@@ -48,16 +49,21 @@ impl std::ops::AddAssign for ImportStats {
     }
 }
 
-/// Find the on-disk path that satisfies the expected size, trying the
-/// primary path first and -- for `NameSizeDedupWithSuffix` policy -- the
-/// `<stem>-<size><ext>` collision shape as a fallback.
+/// Find the on-disk path that satisfies the expected size, trying in
+/// order:
+/// 1. the primary path,
+/// 2. the `<stem>-<size><ext>` dedup-collision shape (only under
+///    `NameSizeDedupWithSuffix`), and
+/// 3. an AM/PM whitespace sibling (for filenames containing AM/PM —
+///    macOS screenshots use NBSP `\u{202F}`, but a tree synced through
+///    a different tool may have a regular space, and vice versa).
 ///
-/// Returns `(path, metadata)` for the matching file, or `None` if neither
-/// candidate exists with size `expected_size`.
+/// Returns `(path, metadata)` for the matching file, or `None`.
 async fn resolve_match_path(
     primary: &Path,
     expected_size: u64,
     policy: FileMatchPolicy,
+    dir_cache: &mut DirCache,
 ) -> Option<(std::path::PathBuf, std::fs::Metadata)> {
     if let Ok(m) = tokio::fs::metadata(primary).await {
         if m.len() == expected_size {
@@ -78,6 +84,21 @@ async fn resolve_match_path(
         if let Ok(m) = tokio::fs::metadata(&suffixed).await {
             if m.len() == expected_size {
                 return Some((suffixed, m));
+            }
+        }
+    }
+    if let Some(parent) = primary.parent() {
+        dir_cache.ensure_dir_async(parent).await;
+        if let Some(variant) = dir_cache.find_ampm_variant(primary) {
+            if let Ok(m) = tokio::fs::metadata(&variant).await {
+                if m.len() == expected_size {
+                    tracing::info!(
+                        primary = %primary.display(),
+                        variant = %variant.display(),
+                        "Matched AM/PM whitespace variant on disk",
+                    );
+                    return Some((variant, m));
+                }
             }
         }
     }
@@ -112,6 +133,10 @@ where
 
     tokio::pin!(stream);
     let mut stats = ImportStats::default();
+    // One cache per library scan. Each parent directory is read_dir'd
+    // exactly once; the AM/PM variant probe (and any future sibling
+    // probes) reuse it.
+    let mut dir_cache = DirCache::new();
 
     while let Some(result) = stream.next().await {
         let asset: PhotoAsset = match result {
@@ -180,6 +205,7 @@ where
                 &primary_path,
                 expected_size,
                 download_config.file_match_policy,
+                &mut dir_cache,
             )
             .await
             {
@@ -2105,6 +2131,105 @@ mod wiremock_tests {
             downloaded.is_empty(),
             "no downloaded rows expected after bail, got {n}",
             n = downloaded.len(),
+        );
+    }
+
+    // ── AM/PM whitespace variant probe ────────────────────────────────
+    //
+    // macOS uses NARROW NO-BREAK SPACE (U+202F) before AM/PM in default
+    // screenshot filenames since macOS 13. A user whose tree was synced
+    // via a third-party tool that normalized the filename to a regular
+    // space (or the other way around) would otherwise see every such
+    // photo come up unmatched on import. The DirCache-backed AM/PM probe
+    // bridges both directions.
+
+    #[tokio::test]
+    async fn ampm_variant_with_regular_space_on_disk_matches_nbsp_from_icloud() {
+        let server = MockServer::start().await;
+        // iCloud filename uses NARROW NO-BREAK SPACE (U+202F). The probe
+        // only kicks in when the on-disk filename is being compared
+        // against an AM/PM-bearing iCloud filename — keep_unicode is on
+        // so the U+202F survives path-derivation.
+        let icloud_filename = "Screenshot 2025-01-14 at 1.40.01\u{202F}PM.PNG";
+        let asset = WiremockAsset::new("AMPM_NBSP", icloud_filename, "public.png").orig(
+            4096,
+            "ck_ampm_nbsp",
+            "public.png",
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut config = base_config(&dl);
+        config.keep_unicode_in_filenames = true;
+
+        // Stage on disk under the regular-space variant (what a tree
+        // normalized by a third-party tool would have).
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        assert_eq!(expected.len(), 1);
+        let icloud_path = expected[0].path.clone();
+        let parent = icloud_path.parent().unwrap();
+        let regular_space_filename = "Screenshot 2025-01-14 at 1.40.01 PM.PNG";
+        let on_disk = parent.join(regular_space_filename);
+        stage_file(&on_disk, expected[0].size);
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+
+        assert_eq!(stats.total, 1);
+        assert_eq!(
+            stats.matched, 1,
+            "AM/PM variant on disk must match the iCloud NBSP form",
+        );
+        assert_eq!(stats.unmatched, 0);
+        let rows = all_downloaded(db.as_ref()).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].local_path.as_deref().map(StdPath::new),
+            Some(on_disk.as_path()),
+            "DB must record the variant path that was actually adopted",
+        );
+    }
+
+    #[tokio::test]
+    async fn ampm_variant_with_nbsp_on_disk_matches_regular_space_from_icloud() {
+        let server = MockServer::start().await;
+        // iCloud filename uses a regular space.
+        let icloud_filename = "Screenshot 2025-01-14 at 1.40.02 PM.PNG";
+        let asset = WiremockAsset::new("AMPM_REG", icloud_filename, "public.png").orig(
+            8192,
+            "ck_ampm_reg",
+            "public.png",
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let mut config = base_config(&dl);
+        config.keep_unicode_in_filenames = true;
+
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        assert_eq!(expected.len(), 1);
+        let icloud_path = expected[0].path.clone();
+        let parent = icloud_path.parent().unwrap();
+        let nbsp_filename = "Screenshot 2025-01-14 at 1.40.02\u{202F}PM.PNG";
+        let on_disk = parent.join(nbsp_filename);
+        stage_file(&on_disk, expected[0].size);
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+
+        assert_eq!(stats.total, 1);
+        assert_eq!(
+            stats.matched, 1,
+            "NBSP variant on disk must match the iCloud regular-space form",
+        );
+        assert_eq!(stats.unmatched, 0);
+        let rows = all_downloaded(db.as_ref()).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].local_path.as_deref().map(StdPath::new),
+            Some(on_disk.as_path()),
         );
     }
 
