@@ -560,6 +560,47 @@ fn import_existing_recent_flag() {
         .success();
 }
 
+#[test]
+fn import_existing_file_match_policy_all_variants() {
+    for variant in ["name-size-dedup-with-suffix", "name-id7"] {
+        common::cmd()
+            .args([
+                "import-existing",
+                "--download-dir",
+                "/tmp",
+                "--file-match-policy",
+                variant,
+                "--help",
+            ])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn import_existing_file_match_policy_rejects_invalid() {
+    common::cmd()
+        .args([
+            "import-existing",
+            "--download-dir",
+            "/tmp",
+            "--file-match-policy",
+            "bogus",
+            "--help",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn import_existing_file_match_policy_from_env() {
+    common::cmd()
+        .env("KEI_FILE_MATCH_POLICY", "name-id7")
+        .args(["import-existing", "--download-dir", "/tmp", "--help"])
+        .assert()
+        .success();
+}
+
 // ── Env var credential passthrough ──────────────────────────────────────
 
 #[test]
