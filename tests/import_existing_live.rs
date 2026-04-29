@@ -258,13 +258,15 @@ fn import_matches_default_layout_after_sync() {
         let summary = parse_summary(&stdout);
         assert!(summary.total > 0, "expected some assets, got {summary:?}");
         // With the same `--recent N` as the fixture sync, every enumerated
-        // asset's primary version should already be on disk. A small slop
-        // accommodates the rare case where sync skipped an asset (e.g.
-        // 0-byte placeholder, ProRAW filtered by `align_raw`) but
-        // import-existing still enumerates it.
+        // asset's primary version should already be on disk. The expected
+        // ratio in the happy path is ~1.0; tighten to 0.95 so a regression
+        // that drops half the matches actually fails. The 5% headroom
+        // accommodates rare cases (0-byte placeholder, ProRAW filtered by
+        // `align_raw`, LivePhotoMode::Skip on a live photo) where
+        // import-existing enumerates an asset sync skipped.
         let match_ratio = (summary.matched as f64) / (summary.total as f64);
         assert!(
-            match_ratio > 0.5,
+            match_ratio > 0.95,
             "match ratio too low: {match_ratio:.2} ({summary:?})\n{stdout}"
         );
 
@@ -649,6 +651,22 @@ force_size = false
         std::fs::write(&toml_path, toml_body).unwrap();
 
         let mut cmd = common::cmd();
+        // CLI > env > TOML > default. If any of these env vars are exported
+        // in the test runner (the live-test recipes wire several), they'd
+        // override the TOML and silently exercise a different config. Clear
+        // them so the TOML stays the only source for the resolved fields.
+        for var in [
+            "KEI_FILE_MATCH_POLICY",
+            "KEI_SIZE",
+            "KEI_LIVE_PHOTO_MODE",
+            "KEI_LIVE_PHOTO_SIZE",
+            "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY",
+            "KEI_ALIGN_RAW",
+            "KEI_KEEP_UNICODE_IN_FILENAMES",
+            "KEI_FORCE_SIZE",
+        ] {
+            cmd.env_remove(var);
+        }
         cmd.args([
             "import-existing",
             "--username",
