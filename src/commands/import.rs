@@ -67,10 +67,12 @@ pub(crate) async fn run_import_existing(
         .or_else(|| toml_photos.and_then(|p| p.keep_unicode_in_filenames))
         .unwrap_or(false);
 
-    // Resolve file_match_policy from TOML (default: NameSizeDedupWithSuffix to
-    // match sync's default).
-    let file_match_policy = toml_photos
-        .and_then(|p| p.file_match_policy)
+    // Resolve file_match_policy as CLI > env > TOML > default (matching sync).
+    // Same silent-failure class as the original bug: with KEI_FILE_MATCH_POLICY
+    // set but no TOML, the import would still report 0 matched.
+    let file_match_policy = args
+        .file_match_policy
+        .or_else(|| toml_photos.and_then(|p| p.file_match_policy))
         .unwrap_or(FileMatchPolicy::NameSizeDedupWithSuffix);
 
     // import-existing walks files on disk, not iCloud creation dates, so the
