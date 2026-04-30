@@ -450,13 +450,24 @@ pub(super) struct DerivedPath {
     pub(super) check_ampm_on_disk: bool,
 }
 
-/// Inputs derived once per asset and shared by `derive_primary` /
-/// `derive_mov_companion`. Keeping them in a struct avoids re-walking
-/// `asset.versions()` and re-running `apply_raw_policy` for sync, where
-/// the MOV step depends on the resolved primary filename and so can't
-/// just consume `derive_expected_paths`'s output.
+/// Real filename if the asset has one, otherwise a deterministic
+/// fingerprint synthesized from the asset id + first-version UTI. Borrowed
+/// when real, owned when synthesized.
+fn raw_filename(asset: &crate::icloud::photos::PhotoAsset) -> Cow<'_, str> {
+    if let Some(f) = asset.filename() {
+        Cow::Borrowed(f)
+    } else {
+        let asset_type = asset
+            .versions()
+            .first()
+            .map_or("", |(_, v)| v.asset_type.as_ref());
+        Cow::Owned(paths::generate_fingerprint_filename(asset.id(), asset_type))
+    }
+}
+
+/// Per-asset inputs that don't change between primary and MOV companion
+/// derivation.
 pub(super) struct DerivationContext<'a> {
-    pub(super) is_live_photo: bool,
     pub(super) base_filename: String,
     pub(super) created_local: DateTime<Local>,
     pub(super) versions: Cow<'a, VersionsMap>,
@@ -467,29 +478,16 @@ impl<'a> DerivationContext<'a> {
         asset: &'a crate::icloud::photos::PhotoAsset,
         config: &DownloadConfig,
     ) -> Self {
-        let is_live_photo = asset.is_live_photo();
-        let raw_filename: Cow<'_, str> = if let Some(f) = asset.filename() {
-            Cow::Borrowed(f)
-        } else {
-            let asset_type = asset
-                .versions()
-                .first()
-                .map_or("", |(_, v)| v.asset_type.as_ref());
-            Cow::Owned(paths::generate_fingerprint_filename(asset.id(), asset_type))
-        };
+        let raw = raw_filename(asset);
         let base_filename: String = if config.keep_unicode_in_filenames {
-            raw_filename.into_owned()
+            raw.into_owned()
         } else {
-            paths::remove_unicode_chars(&raw_filename).into_owned()
+            paths::remove_unicode_chars(&raw).into_owned()
         };
-        let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
-        let versions = apply_raw_policy(asset.versions(), config.align_raw);
-
         Self {
-            is_live_photo,
             base_filename,
-            created_local,
-            versions,
+            created_local: asset.created().with_timezone(&Local),
+            versions: apply_raw_policy(asset.versions(), config.align_raw),
         }
     }
 
@@ -509,10 +507,11 @@ pub(super) fn derive_primary(
     config: &DownloadConfig,
     ctx: &DerivationContext<'_>,
 ) -> Option<DerivedPath> {
-    if config.live_photo_mode == LivePhotoMode::Skip && ctx.is_live_photo {
-        return None;
-    }
-    if config.live_photo_mode == LivePhotoMode::VideoOnly && ctx.is_live_photo {
+    if matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Skip | LivePhotoMode::VideoOnly
+    ) && asset.is_live_photo()
+    {
         return None;
     }
 
@@ -631,14 +630,11 @@ pub(super) fn derive_expected_paths(
 ) -> SmallVec<[DerivedPath; 2]> {
     let ctx = DerivationContext::build(asset, config);
     let mut out = SmallVec::new();
-    let primary_filename = if let Some(p) = derive_primary(asset, config, &ctx) {
-        let fname = p.filename.clone();
+    if let Some(p) = derive_primary(asset, config, &ctx) {
         out.push(p);
-        Some(fname)
-    } else {
-        None
-    };
-    if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename.as_deref()) {
+    }
+    let primary_filename = out.first().map(|p: &DerivedPath| p.filename.as_str());
+    if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename) {
         out.push(mov);
     }
     out
@@ -876,14 +872,10 @@ pub(super) fn filter_asset_to_tasks(
 ) -> SmallVec<[DownloadTask; 2]> {
     // Sync-only fingerprint-fallback exclusion: when `asset.filename()` is
     // None, log the synthesized name and apply `filename_exclude` patterns
-    // to it (since `is_asset_filtered` only sees real filenames). Import
-    // never has populated `filename_exclude`, so it doesn't need this.
+    // to it (`is_asset_filtered` only sees real filenames). Import never
+    // populates `filename_exclude`.
     if asset.filename().is_none() {
-        let asset_type = asset
-            .versions()
-            .first()
-            .map_or("", |(_, v)| v.asset_type.as_ref());
-        let fp = paths::generate_fingerprint_filename(asset.id(), asset_type);
+        let fp = raw_filename(asset);
         tracing::info!(
             asset_id = %asset.id(),
             filename = %fp,
@@ -904,14 +896,8 @@ pub(super) fn filter_asset_to_tasks(
     }
 
     let ctx = DerivationContext::build(asset, config);
-    // Live-photo assets emit two DownloadTasks (primary + MOV companion)
-    // that share the same metadata; build the payload once and Arc::clone
-    // it onto each task.
     let payload = build_payload(asset, config);
     let mut tasks = SmallVec::new();
-    // Track the effective primary filename (including any dedup suffix) so
-    // the live photo MOV companion is paired by stem after collision
-    // resolution.
     let mut effective_primary_filename: Option<String> = None;
 
     if let Some(d) = derive_primary(asset, config, &ctx) {
@@ -970,8 +956,6 @@ pub(super) fn filter_asset_to_tasks(
         }
     }
 
-    // MOV is re-derived against the *resolved* primary filename so a
-    // dedup'd primary keeps its MOV paired by stem.
     if let Some(d) =
         derive_mov_companion(asset, config, &ctx, effective_primary_filename.as_deref())
     {
