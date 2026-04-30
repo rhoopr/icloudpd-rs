@@ -5,12 +5,12 @@
 //! `icloud_photos_downloader`'s own test suite), then runs kei's
 //! `import_assets` loop and asserts every file matches.
 //!
-//! Why this exists: kei's positioning is "Rust rewrite of icloudpd," so the
-//! migration story is `import-existing` against a library produced by
-//! icloudpd. These tests prove kei's path computation produces identical
-//! strings to icloudpd's at every flag profile we care about. If a test in
-//! this module fails, kei has diverged from icloudpd's layout and migrating
-//! users will see unmatched files.
+//! Why this exists: kei's iCloud adapter is the migration target for users
+//! coming from icloudpd, and `import-existing` runs against libraries that
+//! icloudpd produced. These tests prove kei's path computation produces
+//! identical strings to icloudpd's at every flag profile we care about. If
+//! a test in this module fails, kei has diverged from icloudpd's layout and
+//! migrating users will see unmatched files.
 //!
 //! Source files mirrored:
 //!   - `tests/test_download_photos.py` (default policy)

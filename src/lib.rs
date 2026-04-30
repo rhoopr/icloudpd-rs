@@ -1,9 +1,11 @@
-//! kei: photo sync engine — Rust rewrite of icloud-photos-downloader.
+//! kei: media sync engine.
 //!
-//! Downloads photos and videos from iCloud via Apple's private `CloudKit` APIs.
-//! Authentication uses SRP-6a with Apple's custom variant, followed by optional
-//! 2FA. Photos are streamed with exponential-backoff retries on transient
-//! failures.
+//! Moves photos and videos between cloud services and local storage as a
+//! transparent layer: provider-agnostic core with provider-specific adapters.
+//! iCloud is the first source: authentication uses SRP-6a with Apple's custom
+//! variant followed by optional 2FA, and assets are streamed from `CloudKit`
+//! with exponential-backoff retries on transient failures. Additional sources
+//! (Google Takeout, Immich, Nextcloud, ...) plug into the same pipeline.
 //!
 //! Lint configuration lives in `[lints.clippy]` in `Cargo.toml`.
 
