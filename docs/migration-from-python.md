@@ -7,19 +7,19 @@ If you're already running [icloud-photos-downloader](https://github.com/icloud-p
 Point kei at the same directory you've been downloading to:
 
 ```sh
-kei import-existing --username you@example.com --directory ~/Photos/iCloud
+kei import-existing --username you@example.com --download-dir ~/Photos/iCloud
 ```
 
 This scans your local files and builds a SQLite state database so kei knows what's already been downloaded. The next `sync` run will only fetch what's new or previously failed.
 
-The import matches files by computing the expected path for each iCloud asset (using `--folder-structure` and `--directory`) and checking if a file exists at that path with a matching size. **If your folder structure or directory doesn't match what Python used, the import will silently count those files as unmatched** - it won't error out or download duplicates. The unmatched count is printed at the end. If most files show as unmatched, double-check that your `--folder-structure` matches your existing layout.
+The import matches files by computing the expected path for each iCloud asset (using `--folder-structure` and `--download-dir`) and checking if a file exists at that path with a matching size. **If your folder structure or directory doesn't match what Python used, the import will silently count those files as unmatched** - it won't error out or download duplicates. The unmatched count is printed at the end. If most files show as unmatched, double-check that your `--folder-structure` matches your existing layout.
 
 The import is idempotent - running it multiple times is safe. It uses `upsert` operations, so re-importing the same files just updates the existing database entries.
 
 ## Step 2: Run your first sync
 
 ```sh
-kei sync --username you@example.com --directory ~/Photos/iCloud
+kei sync --username you@example.com --download-dir ~/Photos/iCloud
 ```
 
 You'll need to authenticate fresh - kei can't reuse Python's `~/.pyicloud` session cookies (different format). After the first 2FA approval, sessions are persisted to `~/.config/kei/` (see `--data-dir`) and reused on subsequent runs.
@@ -34,10 +34,10 @@ Most flags are the same or very close. Here's the full mapping:
 |------|-------|
 | `-u, --username` | |
 | `-p, --password` | |
-| `-d, --directory` | |
+| `-d, --download-dir` | Renamed from Python's `-d, --directory`. The old flag still parses (hidden, with a deprecation warning) — drop it on your next run. |
 | `-a, --album` | Multiple `--album` flags supported, same as Python |
 | `-l, --list-albums` | Deprecated; use `kei list albums` |
-| `--library` | Default: `PrimarySync`. Use `all` to sync every library at once |
+| `--library` | Default library when none is specified: `PrimarySync`. Use `all` to sync every library at once. |
 | `--list-libraries` | Deprecated; use `kei list libraries` |
 | `--recent` | |
 | `--skip-videos` | |
@@ -66,8 +66,8 @@ Most flags are the same or very close. Here's the full mapping:
 |--------|------|-------------|
 | `--folder-structure "{:%Y/%m/%d}"` | `--folder-structure "%Y/%m/%d"` | Both Python `{:%Y}` and plain `%Y` strftime syntax accepted. You can keep using the Python format. |
 | `--size original` | `--size original` | Same values, but Python allows multiple `--size` flags (not yet supported in Rust - [#14](https://github.com/rhoopr/kei/issues/14)) |
-| `--cookie-directory ~/.pyicloud` | `--data-dir ~/.config/kei/` | New flag name and default path. `--cookie-directory` still accepted as hidden alias. |
-| `--threads-num` (deprecated, always 1) | `--threads 10` | Actually works in Rust. Default: 10 parallel downloads. kei's `--threads-num` still parses as a deprecated alias. |
+| `--cookie-directory ~/.pyicloud` | `--data-dir ~/.config/kei/` | New flag name and default path. `--cookie-directory` is still accepted (hidden from `--help`) but deprecated and will be removed in v0.20.0. |
+| `--threads-num` (deprecated, always 1) | `--threads 10` | Actually works in Rust. Default: 10 parallel downloads. kei's `--threads-num` is also deprecated (still parses, hidden, removal in v0.20.0); prefer `--threads`. |
 | `--notification-script` | `--notification-script` | Same flag name, but kei passes `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars. Python only fired on 2FA expiry; kei also fires on `sync_complete`, `sync_failed`, `session_expired`. |
 
 ### Flags not yet implemented
@@ -94,8 +94,7 @@ Most flags are the same or very close. Here's the full mapping:
 | `--save-password` | Persist password to OS keyring or encrypted file after successful auth. |
 | `password set\|clear\|backend` | Manage stored credentials. `credential` still works as hidden alias. See [Credentials](https://github.com/rhoopr/kei/wiki/Credentials). |
 | `--data-dir` | Session, state, and credential storage directory (replaces `--cookie-directory`). |
-| `--max-retries` | Retry limit per download (Python hardcoded `MAX_RETRIES = 0`) |
-| `--retry-delay` | Base delay for exponential backoff |
+| `--max-retries` | Retry limit per download (Python hardcoded `MAX_RETRIES = 0`). The initial backoff delay is now derived from this value automatically; the explicit `--retry-delay` flag still parses but is deprecated and slated for removal in v0.20.0. |
 | `--temp-suffix` | Suffix for partial downloads (default: `.kei-tmp`) |
 | `--no-incremental` | Force full library scan instead of syncToken delta sync. Use when you suspect the incremental state is stale, or to verify that incremental results match a full enumeration. |
 | `reset sync-token` | Clear stored sync tokens so the next sync does a full re-enumeration. Flag `--reset-sync-token` on sync still accepted as hidden alias. |
@@ -159,7 +158,7 @@ script = "/config/notify.sh"
 If you already have photos downloaded from the Python version, mount the same directory and run the import:
 
 ```sh
-docker exec kei kei import-existing --directory /photos
+docker exec kei kei import-existing --download-dir /photos
 ```
 
 ## Known differences in output
