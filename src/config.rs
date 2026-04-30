@@ -436,6 +436,110 @@ fn resolve_flag(cli_flag: Option<bool>, toml_val: Option<bool>) -> bool {
     cli_flag.or(toml_val).unwrap_or(false)
 }
 
+/// CLI inputs for [`resolve_path_derivation_fields`].
+///
+/// Each field is `Option<T>`; `Some` means the CLI (or env var) supplied
+/// the value, `None` means fall through to TOML and then to the default.
+/// Sync's `--skip-live-photos` deprecation is folded into `live_photo_mode`
+/// by the caller before calling the resolver.
+#[derive(Debug, Default)]
+pub(crate) struct PathDerivationCliArgs {
+    pub folder_structure: Option<String>,
+    pub size: Option<VersionSize>,
+    pub live_photo_mode: Option<LivePhotoMode>,
+    pub live_photo_size: Option<LivePhotoSize>,
+    pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
+    pub align_raw: Option<RawTreatmentPolicy>,
+    pub file_match_policy: Option<FileMatchPolicy>,
+    pub force_size: Option<bool>,
+    pub keep_unicode_in_filenames: Option<bool>,
+}
+
+/// Resolved path-derivation fields used by both `Config::build` (sync) and
+/// `build_import_download_config` (import-existing) so the two code paths
+/// derive identical expected file paths for the same inputs.
+#[derive(Debug)]
+pub(crate) struct PathDerivationFields {
+    pub folder_structure: String,
+    pub size: VersionSize,
+    pub live_photo_mode: LivePhotoMode,
+    pub live_photo_size: LivePhotoSize,
+    pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
+    pub align_raw: RawTreatmentPolicy,
+    pub file_match_policy: FileMatchPolicy,
+    pub force_size: bool,
+    pub keep_unicode_in_filenames: bool,
+}
+
+/// Resolve the CLI > TOML > default chain for every field that affects
+/// path derivation, shared by sync and import. The smart default for
+/// `live_photo_size` (track `--size adjusted` when the user didn't
+/// override it) lives here so import-existing matches sync.
+pub(crate) fn resolve_path_derivation_fields(
+    cli: PathDerivationCliArgs,
+    toml: Option<&TomlConfig>,
+) -> PathDerivationFields {
+    let toml_dl = toml.and_then(|t| t.download.as_ref());
+    let toml_photos = toml.and_then(|t| t.photos.as_ref());
+
+    let folder_structure = cli
+        .folder_structure
+        .or_else(|| toml_dl.and_then(|d| d.folder_structure.clone()))
+        .unwrap_or_else(|| "%Y/%m/%d".to_string());
+    let size = resolve(
+        cli.size,
+        toml_photos.and_then(|p| p.size),
+        VersionSize::Original,
+    );
+    let default_live_photo_size = if size == VersionSize::Adjusted {
+        LivePhotoSize::Adjusted
+    } else {
+        LivePhotoSize::Original
+    };
+    let live_photo_size = resolve(
+        cli.live_photo_size,
+        toml_photos.and_then(|p| p.live_photo_size),
+        default_live_photo_size,
+    );
+    let live_photo_mode = resolve(
+        cli.live_photo_mode,
+        toml_photos.and_then(|p| p.live_photo_mode),
+        LivePhotoMode::Both,
+    );
+    let live_photo_mov_filename_policy = resolve(
+        cli.live_photo_mov_filename_policy,
+        toml_photos.and_then(|p| p.live_photo_mov_filename_policy),
+        LivePhotoMovFilenamePolicy::Suffix,
+    );
+    let align_raw = resolve(
+        cli.align_raw,
+        toml_photos.and_then(|p| p.align_raw),
+        RawTreatmentPolicy::Unchanged,
+    );
+    let file_match_policy = resolve(
+        cli.file_match_policy,
+        toml_photos.and_then(|p| p.file_match_policy),
+        FileMatchPolicy::NameSizeDedupWithSuffix,
+    );
+    let force_size = resolve_flag(cli.force_size, toml_photos.and_then(|p| p.force_size));
+    let keep_unicode_in_filenames = resolve_flag(
+        cli.keep_unicode_in_filenames,
+        toml_photos.and_then(|p| p.keep_unicode_in_filenames),
+    );
+
+    PathDerivationFields {
+        folder_structure,
+        size,
+        live_photo_mode,
+        live_photo_size,
+        live_photo_mov_filename_policy,
+        align_raw,
+        file_match_policy,
+        force_size,
+        keep_unicode_in_filenames,
+    }
+}
+
 /// Global CLI args needed by `resolve_auth` and `Config::build`.
 ///
 /// Bundles the fields that moved from per-command `AuthArgs` to
@@ -917,9 +1021,14 @@ impl Config {
         let albums = resolve_album_selection(raw_albums, &folder_structure)?;
         let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
         let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
-        // Resolve live photo mode: --live-photo-mode > --skip-live-photos > TOML photos > TOML filters compat
-        let live_photo_mode = if let Some(mode) = sync.live_photo_mode {
-            mode
+        // Fold sync's deprecated `--skip-live-photos` / `[filters]
+        // skip_live_photos` paths into a single `Option<LivePhotoMode>` so
+        // the shared resolver still sees the chosen value and emits the
+        // deprecation warnings before falling through to defaults.
+        let live_photo_mode_pre_resolved: Option<LivePhotoMode> = if let Some(mode) =
+            sync.live_photo_mode
+        {
+            Some(mode)
         } else if sync.skip_live_photos == Some(true) {
             #[allow(
                 clippy::print_stderr,
@@ -930,9 +1039,9 @@ impl Config {
                     "warning: `--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS` is deprecated and will be removed in v0.20.0, use `--live-photo-mode skip` instead"
                 );
             }
-            LivePhotoMode::Skip
+            Some(LivePhotoMode::Skip)
         } else if let Some(mode) = toml_photos.and_then(|p| p.live_photo_mode) {
-            mode
+            Some(mode)
         } else if toml_filters.and_then(|f| f.skip_live_photos) == Some(true) {
             #[allow(
                 clippy::print_stderr,
@@ -943,9 +1052,9 @@ impl Config {
                     "warning: `[filters] skip_live_photos` is deprecated and will be removed in v0.20.0, use `[photos] live_photo_mode = \"skip\"` instead"
                 );
             }
-            LivePhotoMode::Skip
+            Some(LivePhotoMode::Skip)
         } else {
-            LivePhotoMode::Both
+            None
         };
         let exclude_albums = if sync.exclude_albums.is_empty() {
             toml_filters
@@ -1018,43 +1127,32 @@ impl Config {
             }
         }
 
-        // Photos
-        let size = resolve(
-            sync.size,
-            toml_photos.and_then(|p| p.size),
-            VersionSize::Original,
-        );
-        // When --size adjusted and live-photo-size is not explicitly set,
-        // default to adjusted live photo companions too.
-        let default_live_photo_size = if size == VersionSize::Adjusted {
-            LivePhotoSize::Adjusted
-        } else {
-            LivePhotoSize::Original
-        };
-        let live_photo_size = resolve(
-            sync.live_photo_size,
-            toml_photos.and_then(|p| p.live_photo_size),
-            default_live_photo_size,
-        );
-        let live_photo_mov_filename_policy = resolve(
-            sync.live_photo_mov_filename_policy,
-            toml_photos.and_then(|p| p.live_photo_mov_filename_policy),
-            LivePhotoMovFilenamePolicy::Suffix,
-        );
-        let align_raw = resolve(
-            sync.align_raw,
-            toml_photos.and_then(|p| p.align_raw),
-            RawTreatmentPolicy::Unchanged,
-        );
-        let file_match_policy = resolve(
-            sync.file_match_policy,
-            toml_photos.and_then(|p| p.file_match_policy),
-            FileMatchPolicy::NameSizeDedupWithSuffix,
-        );
-        let force_size = resolve_flag(sync.force_size, toml_photos.and_then(|p| p.force_size));
-        let keep_unicode_in_filenames = resolve_flag(
-            sync.keep_unicode_in_filenames,
-            toml_photos.and_then(|p| p.keep_unicode_in_filenames),
+        // Path-derivation knobs (CLI > TOML > default). `folder_structure`
+        // was already resolved above for `resolve_album_selection`; pass
+        // it through so the resolver short-circuits.
+        let PathDerivationFields {
+            folder_structure: _,
+            size,
+            live_photo_mode,
+            live_photo_size,
+            live_photo_mov_filename_policy,
+            align_raw,
+            file_match_policy,
+            force_size,
+            keep_unicode_in_filenames,
+        } = resolve_path_derivation_fields(
+            PathDerivationCliArgs {
+                folder_structure: Some(folder_structure.clone()),
+                size: sync.size,
+                live_photo_mode: live_photo_mode_pre_resolved,
+                live_photo_size: sync.live_photo_size,
+                live_photo_mov_filename_policy: sync.live_photo_mov_filename_policy,
+                align_raw: sync.align_raw,
+                file_match_policy: sync.file_match_policy,
+                force_size: sync.force_size,
+                keep_unicode_in_filenames: sync.keep_unicode_in_filenames,
+            },
+            toml.as_ref(),
         );
 
         // Watch
@@ -3572,6 +3670,124 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(cfg.file_match_policy, FileMatchPolicy::NameId7));
+    }
+
+    // ── resolve_path_derivation_fields: shared by sync + import ─────
+
+    /// Defaults are wired so a caller passing all-`None` CLI args and no
+    /// TOML lands on the documented defaults — this is the no-flags path
+    /// both `sync` and `import-existing` follow when invoked bare.
+    #[test]
+    fn resolve_path_derivation_all_defaults() {
+        let pd = resolve_path_derivation_fields(PathDerivationCliArgs::default(), None);
+        assert_eq!(pd.folder_structure, "%Y/%m/%d");
+        assert_eq!(pd.size, VersionSize::Original);
+        assert_eq!(pd.live_photo_mode, LivePhotoMode::Both);
+        assert_eq!(pd.live_photo_size, LivePhotoSize::Original);
+        assert_eq!(
+            pd.live_photo_mov_filename_policy,
+            LivePhotoMovFilenamePolicy::Suffix
+        );
+        assert_eq!(pd.align_raw, RawTreatmentPolicy::Unchanged);
+        assert_eq!(
+            pd.file_match_policy,
+            FileMatchPolicy::NameSizeDedupWithSuffix
+        );
+        assert!(!pd.force_size);
+        assert!(!pd.keep_unicode_in_filenames);
+    }
+
+    /// `--size adjusted` without explicit `--live-photo-size` must drag
+    /// the live-photo companion size to `adjusted` too. Both sync and
+    /// import inherit this from the shared resolver — pinning here
+    /// catches anyone "simplifying" the smart default away.
+    #[test]
+    fn resolve_path_derivation_size_adjusted_drags_live_photo_size() {
+        let cli = PathDerivationCliArgs {
+            size: Some(VersionSize::Adjusted),
+            ..Default::default()
+        };
+        let pd = resolve_path_derivation_fields(cli, None);
+        assert_eq!(pd.size, VersionSize::Adjusted);
+        assert_eq!(
+            pd.live_photo_size,
+            LivePhotoSize::Adjusted,
+            "smart default: --size adjusted should drag live_photo_size"
+        );
+    }
+
+    /// CLI explicit `--live-photo-size original` must beat the smart
+    /// default so a user can opt out of the size-adjusted drag.
+    #[test]
+    fn resolve_path_derivation_explicit_live_photo_size_beats_smart_default() {
+        let cli = PathDerivationCliArgs {
+            size: Some(VersionSize::Adjusted),
+            live_photo_size: Some(LivePhotoSize::Original),
+            ..Default::default()
+        };
+        let pd = resolve_path_derivation_fields(cli, None);
+        assert_eq!(pd.live_photo_size, LivePhotoSize::Original);
+    }
+
+    /// CLI > TOML > default. The resolver short-circuits on the first
+    /// `Some`; this confirms we don't double-resolve and accidentally
+    /// fall through to the TOML value when the CLI already chose.
+    #[test]
+    fn resolve_path_derivation_cli_beats_toml() {
+        let toml: TomlConfig = toml::from_str(
+            r#"
+            [photos]
+            size = "adjusted"
+            file_match_policy = "name-id7"
+            force_size = true
+            keep_unicode_in_filenames = true
+            align_raw = "original"
+            "#,
+        )
+        .unwrap();
+        let cli = PathDerivationCliArgs {
+            size: Some(VersionSize::Original),
+            file_match_policy: Some(FileMatchPolicy::NameSizeDedupWithSuffix),
+            force_size: Some(false),
+            keep_unicode_in_filenames: Some(false),
+            align_raw: Some(RawTreatmentPolicy::Unchanged),
+            ..Default::default()
+        };
+        let pd = resolve_path_derivation_fields(cli, Some(&toml));
+        assert_eq!(pd.size, VersionSize::Original);
+        assert_eq!(
+            pd.file_match_policy,
+            FileMatchPolicy::NameSizeDedupWithSuffix
+        );
+        assert!(!pd.force_size);
+        assert!(!pd.keep_unicode_in_filenames);
+        assert_eq!(pd.align_raw, RawTreatmentPolicy::Unchanged);
+    }
+
+    /// TOML wins when the CLI is silent. Pin this so anyone refactoring
+    /// the resolver doesn't accidentally swallow TOML defaults.
+    #[test]
+    fn resolve_path_derivation_toml_when_cli_absent() {
+        let toml: TomlConfig = toml::from_str(
+            r#"
+            [download]
+            folder_structure = "%Y/%m"
+
+            [photos]
+            size = "adjusted"
+            live_photo_mode = "skip"
+            file_match_policy = "name-id7"
+            "#,
+        )
+        .unwrap();
+        let pd = resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml));
+        assert_eq!(pd.folder_structure, "%Y/%m");
+        assert_eq!(pd.size, VersionSize::Adjusted);
+        assert_eq!(pd.live_photo_mode, LivePhotoMode::Skip);
+        assert_eq!(pd.file_match_policy, FileMatchPolicy::NameId7);
+        // Smart default should still drag here because `--live-photo-size`
+        // wasn't set in either CLI or TOML.
+        assert_eq!(pd.live_photo_size, LivePhotoSize::Adjusted);
     }
 
     // ── Config::build: boolean flag merge exhaustive ───────────────

@@ -16,10 +16,7 @@ use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
 use crate::state::StateDb;
-use crate::types::{
-    AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize,
-    RawTreatmentPolicy, VersionSize,
-};
+use crate::types::FileMatchPolicy;
 
 use super::service::{init_photos_service, resolve_libraries};
 
@@ -402,10 +399,7 @@ fn build_import_download_config(
     args: &cli::ImportArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<download::DownloadConfig> {
-    use rustc_hash::FxHashSet;
-
     let toml_dl = toml.and_then(|t| t.download.as_ref());
-    let toml_photos = toml.and_then(|t| t.photos.as_ref());
 
     anyhow::ensure!(
         !(args.download_dir.is_some() && args.directory.is_some()),
@@ -431,98 +425,27 @@ fn build_import_download_config(
     }
     let directory: Arc<Path> = Arc::from(config::expand_tilde(&directory_str).as_path());
 
-    let folder_structure = args
-        .folder_structure
-        .clone()
-        .or_else(|| toml_dl.and_then(|d| d.folder_structure.clone()))
-        .unwrap_or_else(|| "%Y/%m/%d".to_string());
+    let path_fields = config::resolve_path_derivation_fields(
+        config::PathDerivationCliArgs {
+            folder_structure: args.folder_structure.clone(),
+            size: args.size,
+            live_photo_mode: args.live_photo_mode,
+            live_photo_size: args.live_photo_size,
+            live_photo_mov_filename_policy: args.live_photo_mov_filename_policy,
+            align_raw: args.align_raw,
+            file_match_policy: args.file_match_policy,
+            force_size: args.force_size,
+            keep_unicode_in_filenames: args.keep_unicode_in_filenames,
+        },
+        toml,
+    );
 
-    let keep_unicode_in_filenames = args
-        .keep_unicode_in_filenames
-        .or_else(|| toml_photos.and_then(|p| p.keep_unicode_in_filenames))
-        .unwrap_or(false);
-
-    let file_match_policy = args
-        .file_match_policy
-        .or_else(|| toml_photos.and_then(|p| p.file_match_policy))
-        .unwrap_or(FileMatchPolicy::NameSizeDedupWithSuffix);
-
-    let size: AssetVersionSize = args
-        .size
-        .or_else(|| toml_photos.and_then(|p| p.size))
-        .unwrap_or(VersionSize::Original)
-        .into();
-
-    let live_photo_mode = args
-        .live_photo_mode
-        .or_else(|| toml_photos.and_then(|p| p.live_photo_mode))
-        .unwrap_or(LivePhotoMode::Both);
-
-    let live_photo_size: AssetVersionSize = args
-        .live_photo_size
-        .or_else(|| toml_photos.and_then(|p| p.live_photo_size))
-        .unwrap_or(LivePhotoSize::Original)
-        .to_asset_version_size();
-
-    let live_photo_mov_filename_policy = args
-        .live_photo_mov_filename_policy
-        .or_else(|| toml_photos.and_then(|p| p.live_photo_mov_filename_policy))
-        .unwrap_or(LivePhotoMovFilenamePolicy::Suffix);
-
-    let align_raw = args
-        .align_raw
-        .or_else(|| toml_photos.and_then(|p| p.align_raw))
-        .unwrap_or(RawTreatmentPolicy::Unchanged);
-
-    let force_size = args
-        .force_size
-        .or_else(|| toml_photos.and_then(|p| p.force_size))
-        .unwrap_or(false);
-
-    Ok(download::DownloadConfig {
+    Ok(download::DownloadConfig::for_path_derivation_only(
         directory,
-        folder_structure,
-        size,
-        skip_videos: false,
-        skip_photos: false,
-        skip_created_before: None,
-        skip_created_after: None,
-        #[cfg(feature = "xmp")]
-        set_exif_datetime: false,
-        #[cfg(feature = "xmp")]
-        set_exif_rating: false,
-        #[cfg(feature = "xmp")]
-        set_exif_gps: false,
-        #[cfg(feature = "xmp")]
-        set_exif_description: false,
-        #[cfg(feature = "xmp")]
-        embed_xmp: false,
-        #[cfg(feature = "xmp")]
-        xmp_sidecar: false,
-        dry_run: args.dry_run,
-        concurrent_downloads: 1,
-        recent: None,
-        retry: retry::RetryConfig::default(),
-        live_photo_mode,
-        live_photo_size,
-        live_photo_mov_filename_policy,
-        align_raw,
-        no_progress_bar: args.no_progress_bar,
-        only_print_filenames: false,
-        file_match_policy,
-        force_size,
-        keep_unicode_in_filenames,
-        filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
-        temp_suffix: Arc::from(".kei-tmp"),
-        state_db: None,
-        retry_only: false,
-        max_download_attempts: 0,
-        sync_mode: download::SyncMode::Full,
-        album_name: None,
-        exclude_asset_ids: Arc::new(FxHashSet::default()),
-        asset_groupings: Arc::new(download::AssetGroupings::default()),
-        bandwidth_limiter: None,
-    })
+        path_fields,
+        args.dry_run,
+        args.no_progress_bar,
+    ))
 }
 
 #[cfg(test)]
@@ -2223,7 +2146,7 @@ mod build_config_tests {
     //! parse path that production uses.
     use super::build_import_download_config;
     use crate::cli::{Cli, Command};
-    use crate::config::{TomlConfig, TomlPhotos};
+    use crate::config::{Config, GlobalArgs, TomlConfig, TomlPhotos};
     use crate::types::{
         AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
         LivePhotoSize, RawTreatmentPolicy, VersionSize,
@@ -2452,6 +2375,91 @@ mod build_config_tests {
         assert!(
             msg.contains("--download-dir is required"),
             "error must name the missing flag, got: {msg}"
+        );
+    }
+
+    /// Sync's `Config::build` and import's `build_import_download_config`
+    /// share `resolve_path_derivation_fields`. For the same CLI/TOML
+    /// inputs the path-derivation knobs they emit must agree
+    /// byte-for-byte. If a future change layers extra logic into either
+    /// path without going through the shared resolver, this test catches
+    /// the drift.
+    #[test]
+    fn sync_and_import_agree_on_path_derivation_fields() {
+        use crate::cli::SyncArgs;
+
+        let toml_str = r#"
+            [download]
+            folder_structure = "%Y/%m"
+
+            [photos]
+            size = "adjusted"
+            file_match_policy = "name-id7"
+            live_photo_mov_filename_policy = "original"
+            align_raw = "original"
+            force_size = true
+            keep_unicode_in_filenames = true
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+
+        let import_args = parse_import_args(&[
+            "--folder-structure",
+            "%Y/%m",
+            "--size",
+            "adjusted",
+            "--file-match-policy",
+            "name-id7",
+            "--live-photo-mov-filename-policy",
+            "original",
+            "--align-raw",
+            "original",
+            "--force-size",
+            "--keep-unicode-in-filenames",
+        ]);
+        let import_cfg = build_import_download_config(&import_args, Some(&toml)).unwrap();
+
+        let sync = SyncArgs {
+            folder_structure: Some("%Y/%m".to_string()),
+            size: Some(VersionSize::Adjusted),
+            file_match_policy: Some(FileMatchPolicy::NameId7),
+            live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
+            align_raw: Some(RawTreatmentPolicy::PreferOriginal),
+            force_size: Some(true),
+            keep_unicode_in_filenames: Some(true),
+            directory: Some("/photos".to_string()),
+            ..Default::default()
+        };
+        let globals = GlobalArgs {
+            username: Some("u@example.com".to_string()),
+            domain: None,
+            data_dir: None,
+            cookie_directory: None,
+        };
+        let sync_cfg = Config::build(
+            &globals,
+            crate::cli::PasswordArgs::default(),
+            sync,
+            Some(toml.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(import_cfg.folder_structure, sync_cfg.folder_structure);
+        assert_eq!(import_cfg.size, sync_cfg.size.into());
+        assert_eq!(import_cfg.live_photo_mode, sync_cfg.live_photo_mode);
+        assert_eq!(
+            import_cfg.live_photo_size,
+            sync_cfg.live_photo_size.to_asset_version_size()
+        );
+        assert_eq!(
+            import_cfg.live_photo_mov_filename_policy,
+            sync_cfg.live_photo_mov_filename_policy
+        );
+        assert_eq!(import_cfg.align_raw, sync_cfg.align_raw);
+        assert_eq!(import_cfg.file_match_policy, sync_cfg.file_match_policy);
+        assert_eq!(import_cfg.force_size, sync_cfg.force_size);
+        assert_eq!(
+            import_cfg.keep_unicode_in_filenames,
+            sync_cfg.keep_unicode_in_filenames
         );
     }
 
