@@ -786,7 +786,9 @@ fn import_existing_rejects_nonexistent_directory() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Directory does not exist"));
+        .stderr(predicate::str::contains(
+            "Cannot read download directory /does/not/exist/anywhere",
+        ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
