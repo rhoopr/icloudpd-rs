@@ -64,23 +64,26 @@ are gitignored.
 
 ## Findings
 
-`heif_atoms` and `heif_xmp_probe` both find an unbounded allocation in
-`mp4-atom` within seconds: a 110-byte malformed input drives a
-~21 GiB `malloc` and trips libfuzzer's OOM guard. Two distinct repros
-per target are checked in at `fuzz/seeds/heif_atoms/regression-iloc-oom*`
-and `fuzz/seeds/heif_xmp_probe/regression-iloc-oom*`. Run them through
-the harness to reproduce:
+`heif_atoms` and `heif_xmp_probe` originally found an unbounded allocation
+in `mp4-atom`: a 110-byte malformed input drove a ~21 GiB `malloc` and
+tripped libfuzzer's OOM guard. Two distinct repros per target are checked
+in at `fuzz/seeds/heif_atoms/regression-iloc-oom*` and
+`fuzz/seeds/heif_xmp_probe/regression-iloc-oom*` for posterity:
 
 ```sh
 cargo +nightly fuzz run heif_atoms fuzz/seeds/heif_atoms/regression-iloc-oom
 ```
 
-The bug is upstream in `mp4-atom`'s `parse_vorbis_comment`, not in
-kei's code. Filed as kixelated/mp4-atom#154. kei's defense-in-depth is
-PR #286, which walks top-level boxes by header and only invokes the
-iinf / iloc decoders. With #286 merged, neither harness reproduces the
-seeds anymore; without it, `just fuzz run heif_atoms` trips the seed on
-its first iteration.
+Two independent fixes ship the regression:
+
+- Upstream: kixelated/mp4-atom#157 caps `parse_vorbis_comment` and `Avcc`
+  at a 4 KiB upfront reservation (closes mp4-atom #154). kei's pinned
+  rev includes it.
+- kei: PR #286 walks top-level boxes by header and only invokes the
+  iinf / iloc decoders, skipping `dfLa` / `Avcc` entirely. Defense-in-depth
+  against any sibling decoder regressing in the same shape.
+
+Either fix on its own makes the seeds non-reproducing; both ship together.
 
 To fuzz past the OOM (so libfuzzer can find *other* bugs in the same
 target before #286 lands) raise the limit:

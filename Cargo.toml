@@ -86,12 +86,17 @@ xmp_toolkit = { version = "1", optional = true }
 # lives in a `mime`-type item inside the `meta` box; mp4-atom gives us the
 # box primitives to surgically insert it without decoding image data.
 #
-# Pinned to a git rev past PR #123 (which adds `uri ` infe-item support
-# needed for iOS 17+ HEICs that embed `tag:apple.com,2023:photos/<id>`
-# references — see kei #274). The fix is on `main` but unreleased; v0.11.0
-# is gated behind kixelated/mp4-atom#130. Switch back to a crates.io
-# version when 0.11.0 ships.
-mp4-atom = { git = "https://github.com/kixelated/mp4-atom", rev = "d1e9e923571cbbb42c049aec7f53cd70c6f3d8ff" }
+# Rev-tracking upstream main because several fixes we depend on are merged
+# but not yet in a crates.io release (0.11.0 is unreleased):
+#   - #123  `uri ` infe-item support for iOS 17+ HEICs (kei #274)
+#   - #153  colr cursor advance for `prof` / `rICC` ICC profiles, fixing
+#           metadata embed on HDR HEICs (kei #269, #276)
+#   - #157  bound `Vec::with_capacity` in `parse_vorbis_comment` / `Avcc`,
+#           fixes the fuzz-found OOM (upstream #154)
+#   - #161  drops the unmaintained `paste` dep in favor of `pastey`,
+#           clearing RUSTSEC-2024-0436 (kei #310)
+# Switch back to a crates.io version once a release containing these ships.
+mp4-atom = { git = "https://github.com/kixelated/mp4-atom", rev = "3366b08671a6d6d7292532b922d1973f6718d5a1" }
 
 # Error handling
 anyhow = "1"
