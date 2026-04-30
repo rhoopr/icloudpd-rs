@@ -427,140 +427,235 @@ pub(crate) struct ExpectedAssetPath {
     pub(crate) version_size: VersionSizeKey,
 }
 
-/// Compute the file paths sync would produce for an asset under the given
-/// config, without doing collision resolution or disk I/O.
-///
-/// Returns up to two entries: the primary version and an optional live-photo
-/// MOV companion. Returns empty when the asset has no version sync would
-/// download (e.g. `force_size` set + size unavailable, or a live-photo
-/// image-only/skip mode with no primary).
-///
-/// Caller must invoke [`is_asset_filtered`] first to apply content/date
-/// filters; this function only handles version selection + filename derivation.
-///
-/// Used by `import-existing` to find files on disk; sync's
-/// [`filter_asset_to_tasks`] is the source of truth and adds collision
-/// resolution + DownloadTask wiring on top of the same derivation chain.
-pub(crate) fn expected_paths_for(
-    asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
-) -> SmallVec<[ExpectedAssetPath; 2]> {
-    let is_live_photo = asset.is_live_photo();
+/// Bare expected path for one version, before any on-disk / claimed-path
+/// collision resolution. The single source of truth shared by
+/// `expected_paths_for` (import) and `filter_asset_to_tasks` (sync).
+#[derive(Debug, Clone)]
+pub(super) struct DerivedPath {
+    /// Absolute path the file would land at, before any dedup suffix.
+    pub(super) path: PathBuf,
+    /// Basename of `path`. Sync's collision layer uses this as the input
+    /// to `add_dedup_suffix` / `insert_suffix` when colliding with an
+    /// existing different-size file.
+    pub(super) filename: String,
+    /// CDN URL for the version. Carried so sync can build a `DownloadTask`
+    /// without re-walking `asset.versions()`. Unused by import.
+    pub(super) url: Box<str>,
+    pub(super) checksum: Box<str>,
+    pub(super) size: u64,
+    pub(super) version_size: VersionSizeKey,
+    /// True for the primary photo (where AM/PM whitespace variants matter
+    /// when matching on disk), false for the MOV companion. Sync's
+    /// collision layer threads this into `resolve_download_path`.
+    pub(super) check_ampm_on_disk: bool,
+}
 
-    let fallback_filename;
-    let raw_filename = if let Some(f) = asset.filename() {
-        f
+/// Real filename if the asset has one, otherwise a deterministic
+/// fingerprint synthesized from the asset id + first-version UTI. Borrowed
+/// when real, owned when synthesized.
+fn raw_filename(asset: &crate::icloud::photos::PhotoAsset) -> Cow<'_, str> {
+    if let Some(f) = asset.filename() {
+        Cow::Borrowed(f)
     } else {
         let asset_type = asset
             .versions()
             .first()
             .map_or("", |(_, v)| v.asset_type.as_ref());
-        fallback_filename = paths::generate_fingerprint_filename(asset.id(), asset_type);
-        &fallback_filename
-    };
-    let base_filename: String = if config.keep_unicode_in_filenames {
-        raw_filename.to_string()
-    } else {
-        paths::remove_unicode_chars(raw_filename).into_owned()
-    };
+        Cow::Owned(paths::generate_fingerprint_filename(asset.id(), asset_type))
+    }
+}
 
-    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
-    let versions = apply_raw_policy(asset.versions(), config.align_raw);
-    let mut result = SmallVec::new();
-    let mut effective_primary_filename: Option<String> = None;
+/// Per-asset inputs that don't change between primary and MOV companion
+/// derivation.
+pub(super) struct DerivationContext<'a> {
+    pub(super) base_filename: String,
+    pub(super) created_local: DateTime<Local>,
+    pub(super) versions: Cow<'a, VersionsMap>,
+}
 
-    // LivePhotoMode::Skip drops the live photo entirely (image + MOV) per the
-    // type's contract; emitting a primary path would make import-existing scan
-    // for a file sync never wrote and report it unmatched. Bail before version
-    // selection so the result stays empty for the live-photo case.
-    if config.live_photo_mode == LivePhotoMode::Skip && is_live_photo {
-        return result;
+impl<'a> DerivationContext<'a> {
+    pub(super) fn build(
+        asset: &'a crate::icloud::photos::PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Self {
+        let raw = raw_filename(asset);
+        let base_filename: String = if config.keep_unicode_in_filenames {
+            raw.into_owned()
+        } else {
+            paths::remove_unicode_chars(&raw).into_owned()
+        };
+        Self {
+            base_filename,
+            created_local: asset.created().with_timezone(&Local),
+            versions: apply_raw_policy(asset.versions(), config.align_raw),
+        }
     }
 
-    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
-        versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
-    };
+    fn get_version(&self, key: AssetVersionSize) -> Option<&AssetVersion> {
+        self.versions
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+    }
+}
 
-    let (primary, effective_size) = match version_with_fallback(
+/// Build the primary `DerivedPath` (or `None` if no primary should be
+/// emitted under this config — Skip-mode live photo, VideoOnly mode,
+/// or no usable version under `force_size`).
+pub(super) fn derive_primary(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    ctx: &DerivationContext<'_>,
+) -> Option<DerivedPath> {
+    if matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Skip | LivePhotoMode::VideoOnly
+    ) && asset.is_live_photo()
+    {
+        return None;
+    }
+
+    let get_version = |key: &AssetVersionSize| ctx.get_version(*key);
+    let (version, effective_size) = version_with_fallback(
         &get_version,
         config.size,
         AssetVersionSize::Original,
         config.force_size,
-    ) {
-        Some((v, s)) => (Some(v), s),
-        None => (None, config.size),
+    )?;
+
+    let mapped = paths::map_filename_extension(&ctx.base_filename, &version.asset_type);
+    let sized = match effective_size {
+        AssetVersionSize::Medium => paths::insert_suffix(&mapped, "medium"),
+        AssetVersionSize::Thumb => paths::insert_suffix(&mapped, "thumb"),
+        _ => mapped,
     };
-    let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
+    let filename = match config.file_match_policy {
+        FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized, asset.id()),
+        FileMatchPolicy::NameSizeDedupWithSuffix => sized,
+    };
+    let path = paths::local_download_path(
+        &config.directory,
+        &config.folder_structure,
+        &ctx.created_local,
+        &filename,
+        config.album_name.as_deref(),
+    );
 
-    if let Some(version) = primary.filter(|_| !skip_primary) {
-        let mapped = paths::map_filename_extension(&base_filename, &version.asset_type);
-        let sized = match effective_size {
-            AssetVersionSize::Medium => paths::insert_suffix(&mapped, "medium"),
-            AssetVersionSize::Thumb => paths::insert_suffix(&mapped, "thumb"),
-            _ => mapped,
-        };
-        let filename = match config.file_match_policy {
-            FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized, asset.id()),
-            FileMatchPolicy::NameSizeDedupWithSuffix => sized,
-        };
-        let path = paths::local_download_path(
-            &config.directory,
-            &config.folder_structure,
-            &created_local,
-            &filename,
-            config.album_name.as_deref(),
-        );
-        effective_primary_filename = Some(filename);
-        result.push(ExpectedAssetPath {
-            path,
-            size: version.size,
-            checksum: version.checksum.clone(),
-            version_size: VersionSizeKey::from(effective_size),
-        });
-    }
+    Some(DerivedPath {
+        path,
+        filename,
+        url: version.url.clone(),
+        checksum: version.checksum.clone(),
+        size: version.size,
+        version_size: VersionSizeKey::from(effective_size),
+        check_ampm_on_disk: true,
+    })
+}
 
-    if matches!(
+/// Build the live-photo MOV companion `DerivedPath` (or `None` when no
+/// MOV applies — non-image asset, Skip / ImageOnly mode, no live version
+/// available).
+///
+/// `primary_effective_filename` is the filename the primary lands at:
+/// import passes the *derived* primary filename (no collision yet);
+/// sync passes the *resolved* primary filename (after dedup suffix, if
+/// any), so a dedup'd primary keeps its MOV paired by filename stem.
+pub(super) fn derive_mov_companion(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    ctx: &DerivationContext<'_>,
+    primary_effective_filename: Option<&str>,
+) -> Option<DerivedPath> {
+    if !matches!(
         config.live_photo_mode,
         LivePhotoMode::Both | LivePhotoMode::VideoOnly
-    ) && asset.item_type() == Some(AssetItemType::Image)
-    {
-        let live = version_with_fallback(
-            &get_version,
-            config.live_photo_size,
-            AssetVersionSize::LiveOriginal,
-            config.force_size,
-        );
-        if let Some((live_version, effective_live_size)) = live {
-            let live_base = match config.file_match_policy {
-                FileMatchPolicy::NameId7 => paths::apply_name_id7(&base_filename, asset.id()),
-                FileMatchPolicy::NameSizeDedupWithSuffix => effective_primary_filename
-                    .as_deref()
-                    .unwrap_or(&base_filename)
-                    .to_string(),
-            };
-            let mov_filename = match config.live_photo_mov_filename_policy {
-                LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
-                LivePhotoMovFilenamePolicy::Original => {
-                    paths::live_photo_mov_path_original(&live_base)
-                }
-            };
-            let mov_path = paths::local_download_path(
-                &config.directory,
-                &config.folder_structure,
-                &created_local,
-                &mov_filename,
-                config.album_name.as_deref(),
-            );
-            result.push(ExpectedAssetPath {
-                path: mov_path,
-                size: live_version.size,
-                checksum: live_version.checksum.clone(),
-                version_size: VersionSizeKey::from(effective_live_size),
-            });
-        }
+    ) {
+        return None;
+    }
+    if asset.item_type() != Some(AssetItemType::Image) {
+        return None;
     }
 
-    result
+    let get_version = |key: &AssetVersionSize| ctx.get_version(*key);
+    let (live_version, effective_live_size) = version_with_fallback(
+        &get_version,
+        config.live_photo_size,
+        AssetVersionSize::LiveOriginal,
+        config.force_size,
+    )?;
+
+    let live_base = match config.file_match_policy {
+        FileMatchPolicy::NameId7 => paths::apply_name_id7(&ctx.base_filename, asset.id()),
+        FileMatchPolicy::NameSizeDedupWithSuffix => primary_effective_filename
+            .unwrap_or(&ctx.base_filename)
+            .to_string(),
+    };
+    let mov_filename = match config.live_photo_mov_filename_policy {
+        LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
+        LivePhotoMovFilenamePolicy::Original => paths::live_photo_mov_path_original(&live_base),
+    };
+    let mov_path = paths::local_download_path(
+        &config.directory,
+        &config.folder_structure,
+        &ctx.created_local,
+        &mov_filename,
+        config.album_name.as_deref(),
+    );
+
+    Some(DerivedPath {
+        path: mov_path,
+        filename: mov_filename,
+        url: live_version.url.clone(),
+        checksum: live_version.checksum.clone(),
+        size: live_version.size,
+        version_size: VersionSizeKey::from(effective_live_size),
+        check_ampm_on_disk: false,
+    })
+}
+
+/// Compute the bare expected paths sync would produce for an asset under
+/// the given config, without doing collision resolution or disk I/O.
+///
+/// Returns up to two entries: the primary version and an optional
+/// live-photo MOV companion. Empty result means no version applies
+/// (`force_size` + size unavailable, image-only asset under VideoOnly
+/// mode, or live-photo Skip mode).
+///
+/// Caller must invoke [`is_asset_filtered`] first to apply content/date
+/// filters; this function only handles version selection + filename
+/// derivation.
+pub(super) fn derive_expected_paths(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> SmallVec<[DerivedPath; 2]> {
+    let ctx = DerivationContext::build(asset, config);
+    let mut out = SmallVec::new();
+    if let Some(p) = derive_primary(asset, config, &ctx) {
+        out.push(p);
+    }
+    let primary_filename = out.first().map(|p: &DerivedPath| p.filename.as_str());
+    if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename) {
+        out.push(mov);
+    }
+    out
+}
+
+/// Compute the file paths sync would produce for an asset under the given
+/// config, mapped to the `ExpectedAssetPath` shape `import-existing`
+/// consumes. Thin wrapper over [`derive_expected_paths`].
+pub(crate) fn expected_paths_for(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> SmallVec<[ExpectedAssetPath; 2]> {
+    derive_expected_paths(asset, config)
+        .into_iter()
+        .map(|d| ExpectedAssetPath {
+            path: d.path,
+            size: d.size,
+            checksum: d.checksum,
+            version_size: d.version_size,
+        })
+        .collect()
 }
 
 /// Look up a version by key, falling back to `fallback_key` when the requested
@@ -775,107 +870,37 @@ pub(super) fn filter_asset_to_tasks(
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
 ) -> SmallVec<[DownloadTask; 2]> {
-    let is_live_photo = asset.is_live_photo();
-
-    let fallback_filename;
-    let raw_filename = if let Some(f) = asset.filename() {
-        f
-    } else {
-        // Generate fallback from asset ID fingerprint, matching Python behavior.
-        let asset_type = asset
-            .versions()
-            .first()
-            .map_or("", |(_, v)| v.asset_type.as_ref());
-        fallback_filename = paths::generate_fingerprint_filename(asset.id(), asset_type);
+    // Sync-only fingerprint-fallback exclusion: when `asset.filename()` is
+    // None, log the synthesized name and apply `filename_exclude` patterns
+    // to it (`is_asset_filtered` only sees real filenames). Import never
+    // populates `filename_exclude`.
+    if asset.filename().is_none() {
+        let fp = raw_filename(asset);
         tracing::info!(
             asset_id = %asset.id(),
-            filename = %fallback_filename,
+            filename = %fp,
             "Using fingerprint fallback filename"
         );
-        // is_asset_filtered only checks real filenames; check fallback against
-        // exclusion patterns here so fingerprint names are also filtered.
         if config
             .filename_exclude
             .iter()
-            .any(|p| p.matches_with(&fallback_filename, GLOB_CASE_INSENSITIVE))
+            .any(|p| p.matches_with(&fp, GLOB_CASE_INSENSITIVE))
         {
             tracing::debug!(
                 asset_id = %asset.id(),
-                filename = %fallback_filename,
+                filename = %fp,
                 "Skipping (filename_exclude match on fallback)"
             );
             return SmallVec::new();
         }
-        &fallback_filename
-    };
+    }
 
-    // Strip non-ASCII characters unless --keep-unicode-in-filenames is set.
-    // Matches Python's default behavior of calling remove_unicode_chars() on filenames.
-    let base_filename: String = if config.keep_unicode_in_filenames {
-        raw_filename.to_string()
-    } else {
-        paths::remove_unicode_chars(raw_filename).into_owned()
-    };
-
-    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
-    let versions = apply_raw_policy(asset.versions(), config.align_raw);
-    let mut tasks = SmallVec::new();
-    // Live-photo assets emit two DownloadTasks (primary + MOV companion)
-    // that share the same metadata; build the payload once and Arc::clone
-    // it onto each task.
+    let ctx = DerivationContext::build(asset, config);
     let payload = build_payload(asset, config);
-    // Track the effective primary filename (including any dedup suffix) so the
-    // live photo MOV companion is derived from the same name, keeping them paired.
+    let mut tasks = SmallVec::new();
     let mut effective_primary_filename: Option<String> = None;
 
-    // Helper closure to find a version by key in the SmallVec
-    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
-        versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
-    };
-
-    // Select requested version, falling back to Original when the requested size is
-    // unavailable (unless --force-size is set). Matches Python's behavior.
-    // Track the effective size so we only add "-medium"/"-thumb" suffix when
-    // the asset actually has that version (not on fallback to Original).
-    let (version, effective_size) = match version_with_fallback(
-        &get_version,
-        config.size,
-        AssetVersionSize::Original,
-        config.force_size,
-    ) {
-        Some((v, s)) => (Some(v), s),
-        None => (None, config.size),
-    };
-    // VideoOnly mode: skip the primary image for live photos, only emit MOV.
-    let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
-
-    if let Some(version) = version.filter(|_| !skip_primary) {
-        // Map the file extension based on the version's UTI asset_type
-        let mapped_filename = paths::map_filename_extension(&base_filename, &version.asset_type);
-
-        // Add size suffix for non-Original sizes (e.g., "-medium", "-thumb").
-        // Only when actually using that size, not on fallback to Original.
-        // Matches Python's VERSION_FILENAME_SUFFIX_LOOKUP.
-        let sized_filename = match effective_size {
-            AssetVersionSize::Medium => paths::insert_suffix(&mapped_filename, "medium"),
-            AssetVersionSize::Thumb => paths::insert_suffix(&mapped_filename, "thumb"),
-            _ => mapped_filename,
-        };
-
-        // Apply name-id7 policy: bake asset ID suffix into ALL filenames upfront
-        let filename = match config.file_match_policy {
-            FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized_filename, asset.id()),
-            FileMatchPolicy::NameSizeDedupWithSuffix => sized_filename,
-        };
-
-        let download_path = paths::local_download_path(
-            &config.directory,
-            &config.folder_structure,
-            &created_local,
-            &filename,
-            config.album_name.as_deref(),
-        );
-
+    if let Some(d) = derive_primary(asset, config, &ctx) {
         let strategy = match config.file_match_policy {
             FileMatchPolicy::NameId7 => CollisionStrategy::SkipIfExists,
             FileMatchPolicy::NameSizeDedupWithSuffix => CollisionStrategy::SizeDedup {
@@ -883,124 +908,100 @@ pub(super) fn filter_asset_to_tasks(
             },
         };
 
+        let DerivedPath {
+            path,
+            filename,
+            url,
+            checksum,
+            size,
+            version_size,
+            check_ampm_on_disk,
+        } = d;
         let final_path = {
-            let mut ctx = ResolveContext {
+            let mut rctx = ResolveContext {
                 config,
-                created_local: &created_local,
+                created_local: &ctx.created_local,
                 claimed_paths,
                 dir_cache,
             };
             resolve_download_path(
-                &download_path,
-                version.size,
+                &path,
+                size,
                 asset.id(),
                 strategy,
-                &mut ctx,
-                true, // check AM/PM variants for primary photos
-                || paths::add_dedup_suffix(&filename, version.size),
+                &mut rctx,
+                check_ampm_on_disk,
+                || paths::add_dedup_suffix(&filename, size),
                 "asset",
             )
         };
 
-        if let Some(path) = &final_path {
-            // Record the effective filename used for the primary download so the
-            // MOV companion is derived from it, keeping HEIC/MOV paired after dedup.
-            if let Some(stem) = path.file_name().and_then(|f| f.to_str()) {
+        if let Some(p) = &final_path {
+            if let Some(stem) = p.file_name().and_then(|f| f.to_str()) {
                 effective_primary_filename = Some(stem.to_string());
             }
         }
-        if let Some(path) = final_path {
-            claimed_paths.insert(NormalizedPath::new(path.clone()), version.size);
+        if let Some(p) = final_path {
+            claimed_paths.insert(NormalizedPath::new(p.clone()), size);
             tasks.push(DownloadTask {
-                url: version.url.clone(),
-                download_path: path,
-                checksum: version.checksum.clone(),
+                url,
+                download_path: p,
+                checksum,
                 asset_id: asset.id_arc(),
                 metadata: Arc::clone(&payload),
-                size: version.size,
-                created_local,
-                version_size: VersionSizeKey::from(effective_size),
+                size,
+                created_local: ctx.created_local,
+                version_size,
             });
         }
     }
 
-    // Live photo MOV companion -- only for images.
-    // Falls back from LiveAdjusted -> LiveOriginal when adjusted isn't available
-    // (mirrors the primary version fallback logic), unless --force-size is set.
-    if matches!(
-        config.live_photo_mode,
-        LivePhotoMode::Both | LivePhotoMode::VideoOnly
-    ) && asset.item_type() == Some(AssetItemType::Image)
+    if let Some(d) =
+        derive_mov_companion(asset, config, &ctx, effective_primary_filename.as_deref())
     {
-        let (live_version_opt, effective_live_size) = match version_with_fallback(
-            &get_version,
-            config.live_photo_size,
-            AssetVersionSize::LiveOriginal,
-            config.force_size,
-        ) {
-            Some((v, s)) => (Some(v), s),
-            None => (None, config.live_photo_size),
+        let DerivedPath {
+            path,
+            filename,
+            url,
+            checksum,
+            size,
+            version_size,
+            check_ampm_on_disk,
+        } = d;
+        let asset_id = asset.id();
+        let final_mov_path = {
+            let mut rctx = ResolveContext {
+                config,
+                created_local: &ctx.created_local,
+                claimed_paths,
+                dir_cache,
+            };
+            resolve_download_path(
+                &path,
+                size,
+                asset_id,
+                CollisionStrategy::SizeDedup {
+                    skip_zero_size: false,
+                },
+                &mut rctx,
+                check_ampm_on_disk,
+                || paths::insert_suffix(&filename, asset_id),
+                "live photo MOV",
+            )
         };
-        if let Some(live_version) = live_version_opt {
-            // Derive the MOV filename from the effective primary filename (which
-            // includes any dedup suffix) so the HEIC and MOV remain visually paired.
-            // Fall back to the base filename when no primary was produced (e.g. skipped).
-            let live_base = match config.file_match_policy {
-                FileMatchPolicy::NameId7 => paths::apply_name_id7(&base_filename, asset.id()),
-                FileMatchPolicy::NameSizeDedupWithSuffix => effective_primary_filename
-                    .as_deref()
-                    .unwrap_or(&base_filename)
-                    .to_string(),
-            };
-            let mov_filename = match config.live_photo_mov_filename_policy {
-                LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
-                LivePhotoMovFilenamePolicy::Original => {
-                    paths::live_photo_mov_path_original(&live_base)
-                }
-            };
-            let mov_path = paths::local_download_path(
-                &config.directory,
-                &config.folder_structure,
-                &created_local,
-                &mov_filename,
-                config.album_name.as_deref(),
-            );
 
-            let asset_id = asset.id();
-            let final_mov_path = {
-                let mut ctx = ResolveContext {
-                    config,
-                    created_local: &created_local,
-                    claimed_paths,
-                    dir_cache,
-                };
-                resolve_download_path(
-                    &mov_path,
-                    live_version.size,
-                    asset_id,
-                    CollisionStrategy::SizeDedup {
-                        skip_zero_size: false,
-                    },
-                    &mut ctx,
-                    false, // no AM/PM variants for MOV companions
-                    || paths::insert_suffix(&mov_filename, asset_id),
-                    "live photo MOV",
-                )
-            };
-
-            if let Some(path) = final_mov_path {
-                claimed_paths.insert(NormalizedPath::new(path.clone()), live_version.size);
-                tasks.push(DownloadTask {
-                    url: live_version.url.clone(),
-                    download_path: path,
-                    checksum: live_version.checksum.clone(),
-                    asset_id: asset.id_arc(),
-                    metadata: Arc::clone(&payload),
-                    size: live_version.size,
-                    created_local,
-                    version_size: VersionSizeKey::from(effective_live_size),
-                });
-            }
+        if let Some(p) = final_mov_path {
+            claimed_paths.insert(NormalizedPath::new(p.clone()), size);
+            tasks.push(DownloadTask {
+                url,
+                download_path: p,
+                checksum,
+                asset_id: asset.id_arc(),
+                metadata: Arc::clone(&payload),
+                size,
+                created_local: ctx.created_local,
+                version_size,
+            });
         }
     }
 
