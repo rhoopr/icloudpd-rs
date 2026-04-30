@@ -2378,12 +2378,12 @@ mod build_config_tests {
         );
     }
 
-    /// PR-6: Sync's `Config::build` and import's
-    /// `build_import_download_config` share `resolve_path_derivation_fields`.
-    /// For the same CLI/TOML inputs the path-derivation knobs they emit
-    /// must agree byte-for-byte. If a future change layers extra logic
-    /// into either path without going through the shared resolver, this
-    /// test catches the drift.
+    /// Sync's `Config::build` and import's `build_import_download_config`
+    /// share `resolve_path_derivation_fields`. For the same CLI/TOML
+    /// inputs the path-derivation knobs they emit must agree
+    /// byte-for-byte. If a future change layers extra logic into either
+    /// path without going through the shared resolver, this test catches
+    /// the drift.
     #[test]
     fn sync_and_import_agree_on_path_derivation_fields() {
         use crate::cli::SyncArgs;

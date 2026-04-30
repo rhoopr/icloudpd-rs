@@ -458,7 +458,7 @@ pub(crate) struct PathDerivationCliArgs {
 /// Resolved path-derivation fields used by both `Config::build` (sync) and
 /// `build_import_download_config` (import-existing) so the two code paths
 /// derive identical expected file paths for the same inputs.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct PathDerivationFields {
     pub folder_structure: String,
     pub size: VersionSize,
@@ -482,11 +482,10 @@ pub(crate) fn resolve_path_derivation_fields(
     let toml_dl = toml.and_then(|t| t.download.as_ref());
     let toml_photos = toml.and_then(|t| t.photos.as_ref());
 
-    let folder_structure = resolve(
-        cli.folder_structure,
-        toml_dl.and_then(|d| d.folder_structure.clone()),
-        "%Y/%m/%d".to_string(),
-    );
+    let folder_structure = cli
+        .folder_structure
+        .or_else(|| toml_dl.and_then(|d| d.folder_structure.clone()))
+        .unwrap_or_else(|| "%Y/%m/%d".to_string());
     let size = resolve(
         cli.size,
         toml_photos.and_then(|p| p.size),
@@ -1128,10 +1127,9 @@ impl Config {
             }
         }
 
-        // Photos / path-derivation: shared resolver (CLI > TOML > default
-        // chain identical to import-existing). `folder_structure` is
-        // already resolved above; pass it through as `Some(...)` so the
-        // resolver short-circuits.
+        // Path-derivation knobs (CLI > TOML > default). `folder_structure`
+        // was already resolved above for `resolve_album_selection`; pass
+        // it through so the resolver short-circuits.
         let PathDerivationFields {
             folder_structure: _,
             size,

@@ -503,18 +503,11 @@ impl DownloadConfig {
         self.folder_structure.contains("{album}")
     }
 
-    /// Construct a `DownloadConfig` populated only with the fields that
-    /// affect path derivation, leaving every download-pipeline field at an
-    /// inert default. Used by `import-existing`, which never instantiates a
-    /// pipeline; it only calls `expected_paths_for` to figure out where a
-    /// file *would* live on disk and matches that against existing files.
-    ///
-    /// The inert fields (state_db, retry, concurrent_downloads, bandwidth
-    /// limiter, sync_mode, album_name, etc.) are unread by the path
-    /// derivation layer; introducing real values here would silently
-    /// misroute import-existing if those fields ever start to influence
-    /// path computation. The asserting tests in `commands::import` cover
-    /// the expected-path matrix for the live values.
+    /// Construct a `DownloadConfig` with only the path-derivation fields
+    /// populated. Used by `import-existing`, which calls
+    /// `expected_paths_for` against existing files but never runs the
+    /// download pipeline; the pipeline-only fields (state_db, retry,
+    /// concurrent_downloads, etc.) stay at inert defaults.
     pub(crate) fn for_path_derivation_only(
         directory: Arc<Path>,
         fields: crate::config::PathDerivationFields,
