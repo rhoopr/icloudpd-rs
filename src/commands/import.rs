@@ -238,9 +238,7 @@ where
                             asset_id = %asset.id(),
                             version = ?version_size,
                             path = %expected_path.display(),
-                            "Recording empty filename: expected path has no UTF-8 \
-                             file_name component (non-UTF8 segment, trailing slash, \
-                             or path ends in `..`)"
+                            "Recording empty filename: expected path has no UTF-8 file_name component"
                         );
                         ""
                     })
@@ -323,10 +321,8 @@ pub(crate) async fn run_import_existing(
         }
     };
 
-    // Import only reads, so a missing directory means there's nothing to
-    // scan — bail clearly. `dir_cache::read_dir_entries` swallows read
-    // errors and returns an empty map, which would otherwise surface as
-    // a silent "0 files matched" report.
+    // Bail clearly on missing/non-dir; `dir_cache::read_dir_entries`
+    // swallows read errors and would otherwise report "0 files matched".
     match tokio::fs::metadata(&directory).await {
         Ok(m) if m.is_dir() => {}
         Ok(_) => anyhow::bail!("Not a directory: {}", directory.display()),
@@ -2485,27 +2481,11 @@ mod build_config_tests {
         );
     }
 
-    /// HF-4 / CF-5: import's `build_import_download_config` rejects the
-    /// same system directories sync's `Config::build` does, with the same
-    /// error shape. Closes the asymmetry where `import-existing
-    /// --download-dir /etc` would proceed past config build.
-    #[test]
-    fn build_import_download_config_rejects_system_directory() {
-        let args = parse_import_args(&[]);
-        // Override the parse default of /photos with /etc.
-        let mut args = args;
-        args.download_dir = Some("/etc".to_string());
-        let err = build_import_download_config(&args, None)
-            .expect_err("system directory must be rejected");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("Refusing to use system directory") && msg.contains("/etc"),
-            "error must name the rejection and the path, got: {msg}"
-        );
-    }
-
-    /// Cross-check that the helper produces the same rejection shape for
-    /// both call sites, so refactoring one path can't drift the other.
+    /// Sync's `Config::build` and import's `build_import_download_config`
+    /// share the same `validate_download_dir` system-directory deny list,
+    /// so a path like `/etc` must be rejected by both with the same error
+    /// shape. If a future refactor bypasses the helper from one path,
+    /// this test catches the drift.
     #[test]
     fn sync_and_import_reject_system_directory_with_same_message() {
         use crate::cli::SyncArgs;
@@ -2533,12 +2513,12 @@ mod build_config_tests {
 
         let import_msg = format!("{import_err:#}");
         let sync_msg = format!("{sync_err:#}");
-        assert!(
-            import_msg.contains("Refusing to use system directory")
-                && sync_msg.contains("Refusing to use system directory"),
-            "both must surface the shared rejection message; \
-             import: {import_msg}, sync: {sync_msg}"
-        );
+        for (label, msg) in [("import", &import_msg), ("sync", &sync_msg)] {
+            assert!(
+                msg.contains("Refusing to use system directory") && msg.contains("/etc"),
+                "{label} must name the rejection and the path; got: {msg}"
+            );
+        }
     }
 
     /// CG-10: setting both `--directory` (deprecated) and `--download-dir`
