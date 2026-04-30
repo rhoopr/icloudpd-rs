@@ -15,7 +15,7 @@ use crate::download::paths::{normalize_ampm, DirCache};
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
-use crate::state::{StateDb, StateError};
+use crate::state::StateDb;
 use crate::types::{
     AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize,
     RawTreatmentPolicy, VersionSize,
@@ -247,21 +247,12 @@ where
                     expected_size,
                     media_type,
                 );
-                match db
+                if let Err(e) = db
                     .import_adopt(&record, &expected_path, &local_checksum)
                     .await
                 {
-                    Ok(()) => {}
-                    Err(e @ StateError::AssetRowMissing { .. }) => {
-                        // Should be unreachable: the UPSERT and UPDATE run
-                        // in one transaction, so the UPDATE always matches.
-                        // Bail loudly rather than silently drop assets.
-                        anyhow::bail!("import scan aborted for library '{library_label}': {e}");
-                    }
-                    Err(e) => {
-                        tracing::warn!(asset_id = %asset.id(), version = ?version_size, error = %e, "Failed to adopt asset");
-                        continue;
-                    }
+                    tracing::warn!(asset_id = %asset.id(), version = ?version_size, error = %e, "Failed to adopt asset");
+                    continue;
                 }
             }
 

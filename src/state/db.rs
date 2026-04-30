@@ -78,10 +78,8 @@ pub trait StateDb: Send + Sync {
 
     /// Atomically upsert `record` and mark it downloaded in one transaction.
     ///
-    /// Used by `import-existing` so that an interrupted scan never leaves a
-    /// `pending` row with `local_path = NULL` on disk: either both writes
-    /// commit (asset is `downloaded`) or neither does (asset is absent and
-    /// the next run will re-adopt it).
+    /// Used by `import-existing` so an interrupted scan never leaves a
+    /// `pending` row with `local_path = NULL` for the next sync to redownload.
     async fn import_adopt(
         &self,
         record: &AssetRecord,
@@ -581,10 +579,8 @@ fn upsert_asset_row(
     Ok(())
 }
 
-/// Execute the `mark_downloaded` UPDATE on `conn`. Returns rows affected so
-/// the caller can decide whether zero rows is an error (mark_downloaded) or
-/// an internal bug (import_adopt — the prior UPSERT in the same transaction
-/// guarantees a row exists).
+/// Execute the `mark_downloaded` UPDATE on `conn`. Returns rows affected;
+/// callers decide what zero rows means in their context.
 fn update_status_to_downloaded(
     conn: &Connection,
     id: &str,
@@ -594,19 +590,21 @@ fn update_status_to_downloaded(
     download_checksum: Option<&str>,
     downloaded_at: i64,
 ) -> Result<usize, StateError> {
-    conn.execute(
-        "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
-         local_checksum = ?3, download_checksum = ?4, last_error = NULL \
-         WHERE id = ?5 AND version_size = ?6",
-        rusqlite::params![
-            downloaded_at,
-            local_path.to_string_lossy(),
-            local_checksum,
-            download_checksum,
-            id,
-            version_size
-        ],
-    )
+    let mut stmt = conn
+        .prepare_cached(
+            "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
+             local_checksum = ?3, download_checksum = ?4, last_error = NULL \
+             WHERE id = ?5 AND version_size = ?6",
+        )
+        .map_err(|e| StateError::query("mark_downloaded::prepare", e))?;
+    stmt.execute(rusqlite::params![
+        downloaded_at,
+        local_path.to_string_lossy(),
+        local_checksum,
+        download_checksum,
+        id,
+        version_size
+    ])
     .map_err(|e| StateError::query("mark_downloaded", e))
 }
 
@@ -781,17 +779,10 @@ impl StateDb for SqliteStateDb {
                 None,
                 now,
             )?;
-            // The UPSERT in the same transaction just inserted-or-updated
-            // this row, so the UPDATE must match. Zero rows here means our
-            // own SQL is wrong, not a missed dispatch — surface the same
-            // error variant so the call site can bail loudly.
-            if rows == 0 {
-                crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.inc();
-                return Err(StateError::AssetRowMissing {
-                    asset_id: record.id.to_string(),
-                    version_size: record.version_size.as_str().to_owned(),
-                });
-            }
+            debug_assert_eq!(
+                rows, 1,
+                "import_adopt UPDATE missed the row inserted by UPSERT in the same tx — SQL bug"
+            );
 
             tx.commit()
                 .map_err(|e| StateError::query("import_adopt::commit", e))?;
