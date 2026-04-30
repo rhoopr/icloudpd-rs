@@ -22,6 +22,12 @@ use crate::types::FileMatchPolicy;
 
 use super::service::{init_photos_service, resolve_libraries};
 
+/// Value of the `stage` field on the one-shot tracing event emitted by
+/// [`import_assets`] when the first asset is dequeued. Operators (and the
+/// live SIGINT idempotency test) sync on this token to know real scan
+/// work has started, distinct from process-spawn or auth completion.
+pub(crate) const SCAN_STARTED_STAGE: &str = "scan_started";
+
 /// Per-library counters returned by [`import_assets`].
 ///
 /// Counters span asset- and expected-path levels so that divergent
@@ -147,7 +153,7 @@ where
         // auth + library resolution + first-page latency.
         if !scan_started_emitted {
             tracing::info!(
-                stage = "scan_started",
+                stage = SCAN_STARTED_STAGE,
                 library = %library_label,
                 "import scan dequeued first asset",
             );
@@ -2238,7 +2244,7 @@ mod wiremock_tests {
         .expect("import_assets");
 
         assert!(
-            logs_contain("stage=\"scan_started\""),
+            logs_contain(&format!("stage=\"{}\"", super::SCAN_STARTED_STAGE)),
             "import_assets must emit stage=scan_started once first asset is dequeued",
         );
         assert!(
@@ -2274,7 +2280,7 @@ mod wiremock_tests {
         .expect("import_assets");
 
         assert!(
-            !logs_contain("stage=\"scan_started\""),
+            !logs_contain(&format!("stage=\"{}\"", super::SCAN_STARTED_STAGE)),
             "marker must not fire when no assets are dequeued",
         );
     }

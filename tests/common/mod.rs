@@ -324,6 +324,64 @@ pub fn require_preauth() -> (String, String, PathBuf) {
     (username, password, dir)
 }
 
+/// Stream a child's piped stderr on a worker thread until `predicate(line)`
+/// returns true or the deadline elapses. Returns `Some(())` on a hit,
+/// `None` on timeout / EOF.
+///
+/// Uses a worker thread + mpsc channel so the wall-clock deadline is honored
+/// even if the child stops emitting lines mid-stream (a bare `BufReader::lines()`
+/// loop on the test thread would block forever in that case).
+///
+/// `child.stderr` must have been spawned with `Stdio::piped()`. This call
+/// `take()`s it, so callers wanting both this sync point and full-output
+/// capture must split the stream themselves.
+#[allow(dead_code)]
+pub fn wait_for_stderr_line(
+    child: &mut std::process::Child,
+    predicate: impl Fn(&str) -> bool + Send + 'static,
+    deadline: std::time::Duration,
+) -> Option<()> {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+
+    let stderr = child.stderr.take().expect("child stderr must be piped");
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let mut buffered = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match buffered.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let end = Instant::now() + deadline;
+    while Instant::now() < end {
+        let remaining = end.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                if predicate(&line) {
+                    return Some(());
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// Recursively collect all regular files under `dir`, sorted for deterministic ordering.
 #[allow(dead_code)]
 pub fn walkdir(dir: &Path) -> Vec<PathBuf> {

@@ -1208,7 +1208,6 @@ fn toml_invalid_file_match_policy_errors_loudly() {
 #[test]
 #[ignore]
 fn import_sigint_then_rerun_is_idempotent() {
-    use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
     let (username, password, cookie_dir) = common::require_preauth();
@@ -1245,28 +1244,15 @@ fn import_sigint_then_rerun_is_idempotent() {
         // had started on slow networks (cancelling auth instead) and
         // long after first matches on fast ones (cancelling too late
         // to exercise mid-scan crash safety).
-        let stderr = child.stderr.take().expect("piped stderr");
-        let scan_started_deadline = std::time::Instant::now() + Duration::from_secs(120);
-        let reader = BufReader::new(stderr);
-        let mut saw_scan_started = false;
-        for line in reader.lines() {
-            if std::time::Instant::now() >= scan_started_deadline {
-                let _ = child.kill();
-                panic!("did not observe stage=scan_started within 120s");
-            }
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            if line.contains("stage=\"scan_started\"") || line.contains("stage=scan_started") {
-                saw_scan_started = true;
-                break;
-            }
-        }
-        assert!(
-            saw_scan_started,
-            "child stderr closed before stage=scan_started — child likely crashed pre-scan",
+        let saw_scan_started = common::wait_for_stderr_line(
+            &mut child,
+            |line| line.contains("stage=\"scan_started\""),
+            Duration::from_secs(120),
         );
+        if saw_scan_started.is_none() {
+            let _ = child.kill();
+            panic!("did not observe stage=scan_started within 120s");
+        }
 
         // SAFETY: child.id() is the live PID for our spawned process;
         // SIGINT is the documented graceful-shutdown signal.
