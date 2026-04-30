@@ -264,11 +264,9 @@ where
                 {
                     Ok(()) => {}
                     Err(e @ StateError::AssetRowMissing { .. }) => {
-                        // The row we just upsert_seen'd is gone. This is
-                        // an invariant violation (concurrent writer? DB
-                        // corruption?) that retry can't fix; bail so the
-                        // operator can investigate before more assets
-                        // are silently dropped.
+                        // Row vanished between upsert_seen and
+                        // mark_downloaded — retry can't fix this. Bail
+                        // before more assets are silently dropped.
                         anyhow::bail!("import scan aborted for library '{library_label}': {e}");
                     }
                     Err(e) => {

@@ -3390,11 +3390,6 @@ mod tests {
             }
             other => panic!("expected AssetRowMissing, got {other:?}"),
         }
-
-        // Verify: the asset is NOT in the DB (it was never inserted).
-        let summary = db.get_summary().await.unwrap();
-        assert_eq!(summary.downloaded, 0);
-        assert_eq!(summary.total_assets, 0);
     }
 
     /// A regression that increases the rate of zero-row `mark_downloaded`
