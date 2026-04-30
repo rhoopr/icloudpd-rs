@@ -230,15 +230,24 @@ where
                 };
 
                 let media_type = download::determine_media_type(version_size, &asset);
+                let filename = expected_path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or_else(|| {
+                        tracing::warn!(
+                            asset_id = %asset.id(),
+                            version = ?version_size,
+                            path = %expected_path.display(),
+                            "Recording empty filename: expected path has no UTF-8 file_name component"
+                        );
+                        ""
+                    })
+                    .to_string();
                 let record = state::AssetRecord::new_pending(
                     asset.id().to_string(),
                     version_size,
                     checksum.to_string(),
-                    expected_path
-                        .file_name()
-                        .and_then(|f| f.to_str())
-                        .unwrap_or("")
-                        .to_string(),
+                    filename,
                     asset.created(),
                     Some(asset.added_date()),
                     expected_size,
@@ -312,8 +321,15 @@ pub(crate) async fn run_import_existing(
         }
     };
 
-    if !directory.exists() {
-        anyhow::bail!("Directory does not exist: {}", directory.display());
+    // Bail clearly on missing/non-dir; `dir_cache::read_dir_entries`
+    // swallows read errors and would otherwise report "0 files matched".
+    match tokio::fs::metadata(&directory).await {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => anyhow::bail!("Not a directory: {}", directory.display()),
+        Err(e) => anyhow::bail!(
+            "Cannot read download directory {}: {e}",
+            directory.display()
+        ),
     }
 
     let db = Arc::new(state::SqliteStateDb::open(&db_path).await?);
@@ -423,7 +439,9 @@ fn build_import_download_config(
     if directory_str.is_empty() {
         anyhow::bail!("--download-dir is required for import-existing");
     }
-    let directory: Arc<Path> = Arc::from(config::expand_tilde(&directory_str).as_path());
+    let directory_path = config::expand_tilde(&directory_str);
+    config::validate_download_dir(&directory_path)?;
+    let directory: Arc<Path> = Arc::from(directory_path.as_path());
 
     let path_fields = config::resolve_path_derivation_fields(
         config::PathDerivationCliArgs {
@@ -2461,6 +2479,46 @@ mod build_config_tests {
             import_cfg.keep_unicode_in_filenames,
             sync_cfg.keep_unicode_in_filenames
         );
+    }
+
+    /// Sync's `Config::build` and import's `build_import_download_config`
+    /// share the same `validate_download_dir` system-directory deny list,
+    /// so a path like `/etc` must be rejected by both with the same error
+    /// shape. If a future refactor bypasses the helper from one path,
+    /// this test catches the drift.
+    #[test]
+    fn sync_and_import_reject_system_directory_with_same_message() {
+        use crate::cli::SyncArgs;
+
+        let import_args = {
+            let mut a = parse_import_args(&[]);
+            a.download_dir = Some("/etc".to_string());
+            a
+        };
+        let import_err = build_import_download_config(&import_args, None)
+            .expect_err("import: system dir must reject");
+
+        let sync = SyncArgs {
+            directory: Some("/etc".to_string()),
+            ..Default::default()
+        };
+        let globals = GlobalArgs {
+            username: Some("u@example.com".to_string()),
+            domain: None,
+            data_dir: None,
+            cookie_directory: None,
+        };
+        let sync_err = Config::build(&globals, crate::cli::PasswordArgs::default(), sync, None)
+            .expect_err("sync: system dir must reject");
+
+        let import_msg = format!("{import_err:#}");
+        let sync_msg = format!("{sync_err:#}");
+        for (label, msg) in [("import", &import_msg), ("sync", &sync_msg)] {
+            assert!(
+                msg.contains("Refusing to use system directory") && msg.contains("/etc"),
+                "{label} must name the rejection and the path; got: {msg}"
+            );
+        }
     }
 
     /// CG-10: setting both `--directory` (deprecated) and `--download-dir`

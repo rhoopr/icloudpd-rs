@@ -398,8 +398,11 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Reject system directories that should never be used as a download target.
-fn validate_directory(path: &Path) -> anyhow::Result<()> {
+/// Reject system directories that should never be used as a download
+/// target. Shared by sync (`Config::build`) and import-existing
+/// (`build_import_download_config`) so both refuse the same set with the
+/// same error message.
+pub(crate) fn validate_download_dir(path: &Path) -> anyhow::Result<()> {
     const DENIED: &[&str] = &[
         "/bin", "/sbin", "/usr", "/etc", "/dev", "/proc", "/sys", "/boot", "/lib", "/lib64",
         "/var", "/root",
@@ -863,7 +866,7 @@ impl Config {
             .map(|d| expand_tilde(&d))
             .unwrap_or_default();
         if !directory.as_os_str().is_empty() {
-            validate_directory(&directory)?;
+            validate_download_dir(&directory)?;
         }
         let folder_structure = resolve(
             sync.folder_structure,
@@ -5121,30 +5124,30 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_directory_rejects_root() {
-        assert!(validate_directory(Path::new("/")).is_err());
+    fn test_validate_download_dir_rejects_root() {
+        assert!(validate_download_dir(Path::new("/")).is_err());
     }
 
     #[test]
-    fn test_validate_directory_rejects_system_paths() {
+    fn test_validate_download_dir_rejects_system_paths() {
         for path in ["/usr", "/etc", "/boot", "/sys", "/proc", "/dev", "/var"] {
             assert!(
-                validate_directory(Path::new(path)).is_err(),
+                validate_download_dir(Path::new(path)).is_err(),
                 "should reject {path}"
             );
         }
     }
 
     #[test]
-    fn test_validate_directory_rejects_trailing_slash() {
-        assert!(validate_directory(Path::new("/etc/")).is_err());
+    fn test_validate_download_dir_rejects_trailing_slash() {
+        assert!(validate_download_dir(Path::new("/etc/")).is_err());
     }
 
     #[test]
-    fn test_validate_directory_accepts_normal_paths() {
-        assert!(validate_directory(Path::new("/home/user/photos")).is_ok());
-        assert!(validate_directory(Path::new("/mnt/photos")).is_ok());
-        assert!(validate_directory(Path::new("/data/sync")).is_ok());
+    fn test_validate_download_dir_accepts_normal_paths() {
+        assert!(validate_download_dir(Path::new("/home/user/photos")).is_ok());
+        assert!(validate_download_dir(Path::new("/mnt/photos")).is_ok());
+        assert!(validate_download_dir(Path::new("/data/sync")).is_ok());
     }
 
     // ── resolve_library_selection ──────────────────────────────────
