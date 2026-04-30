@@ -6,6 +6,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context;
+
 use crate::auth;
 use crate::cli;
 use crate::config;
@@ -364,6 +366,21 @@ pub(crate) async fn run_import_existing(
     let selection = config::resolve_library_selection(args.library.clone(), toml_filters);
     let libraries = resolve_libraries(&selection, &mut photos_service).await?;
 
+    let prior_db_total = db.get_summary().await?.total_assets;
+    if prior_db_total > 0 && !args.force_empty {
+        let mut empty_zones: Vec<String> = Vec::new();
+        for library in &libraries {
+            let count =
+                library.all().len().await.with_context(|| {
+                    format!("counting assets in library {}", library.zone_name())
+                })?;
+            if count == 0 {
+                empty_zones.push(library.zone_name().to_string());
+            }
+        }
+        check_empty_library_guard(&empty_zones, prior_db_total)?;
+    }
+
     if !args.no_progress_bar {
         println!("Scanning iCloud assets and matching with local files...");
     }
@@ -402,6 +419,25 @@ pub(crate) async fn run_import_existing(
     println!("  Hash errors:          {}", totals.hash_errors);
 
     Ok(())
+}
+
+/// Refuse to scan when one or more selected libraries returned zero assets
+/// while the state DB has prior asset rows -- the library is almost certainly
+/// mid-glitch (transient permissions / stale auth) and a `matched: 0` report
+/// would be misleading. Caller short-circuits when `prior_db_total == 0` or
+/// `--force-empty` is set, so this function only runs when a guard is wanted.
+fn check_empty_library_guard(empty_zones: &[String], prior_db_total: u64) -> anyhow::Result<()> {
+    if empty_zones.is_empty() {
+        return Ok(());
+    }
+    let zones = empty_zones.join(", ");
+    anyhow::bail!(
+        "library {zones} returned 0 assets but the state DB has {prior_db_total} prior \
+         asset rows -- aborting to avoid a misleading `matched: 0` report. This is most \
+         often a transient iCloud permissions glitch or stale auth; re-run after \
+         confirming via `kei list libraries` or the iCloud web UI. Pass --force-empty \
+         (or set KEI_FORCE_EMPTY=true) only if you genuinely emptied the library."
+    );
 }
 
 /// Resolve a [`download::DownloadConfig`] from import-existing CLI args + TOML.
@@ -2519,6 +2555,42 @@ mod build_config_tests {
                 "{label} must name the rejection and the path; got: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn empty_library_guard_passes_with_no_empty_zones() {
+        super::check_empty_library_guard(&[], 1234)
+            .expect("no empty zones must not bail regardless of prior count");
+    }
+
+    #[test]
+    fn empty_library_guard_bails_naming_zone_and_count() {
+        let zones = vec!["PrimarySync".to_string()];
+        let err = super::check_empty_library_guard(&zones, 4321)
+            .expect_err("empty zone with prior assets must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("PrimarySync"),
+            "must name the zone, got: {msg}"
+        );
+        assert!(
+            msg.contains("4321"),
+            "must name the prior count, got: {msg}"
+        );
+        assert!(
+            msg.contains("--force-empty"),
+            "must mention the override flag, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_library_guard_lists_all_empty_zones() {
+        let zones = vec!["PrimarySync".to_string(), "SharedSync-abc".to_string()];
+        let err = super::check_empty_library_guard(&zones, 99)
+            .expect_err("multiple empty zones must bail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("PrimarySync"), "missing PrimarySync: {msg}");
+        assert!(msg.contains("SharedSync-abc"), "missing SharedSync: {msg}");
     }
 
     /// CG-10: setting both `--directory` (deprecated) and `--download-dir`

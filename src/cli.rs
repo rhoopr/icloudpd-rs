@@ -537,6 +537,15 @@ pub struct ImportArgs {
     /// Disable progress bar
     #[arg(long)]
     pub no_progress_bar: bool,
+
+    /// Override the empty-library safety guard. Without this flag,
+    /// `import-existing` aborts when a library returns zero assets while
+    /// the state DB has prior asset rows -- the library is almost
+    /// certainly mid-glitch (transient permissions / stale auth) and
+    /// scanning would produce a misleading `matched: 0` report. Set
+    /// this only if you have genuinely emptied the library.
+    #[arg(long, env = "KEI_FORCE_EMPTY")]
+    pub force_empty: bool,
 }
 
 /// Arguments for the verify command.
@@ -2696,6 +2705,50 @@ mod tests {
     fn import_existing_force_size_flag_parses_to_true() {
         let args = parse_import(&["--force-size"]);
         assert_eq!(args.force_size, Some(true));
+    }
+
+    #[test]
+    fn import_existing_force_empty_flag_parses_to_true() {
+        let _guard = scrub_auth_env();
+        // SAFETY: scrub_auth_env serializes against the env_var test that
+        // also mutates KEI_FORCE_EMPTY. Clearing here protects against a
+        // developer shell that has KEI_FORCE_EMPTY=true exported.
+        unsafe {
+            std::env::remove_var("KEI_FORCE_EMPTY");
+        }
+        let args = parse_import(&["--force-empty"]);
+        assert!(args.force_empty);
+    }
+
+    #[test]
+    fn import_existing_force_empty_default_is_false() {
+        let _guard = scrub_auth_env();
+        // SAFETY: same rationale as the flag test above.
+        unsafe {
+            std::env::remove_var("KEI_FORCE_EMPTY");
+        }
+        let args = parse_import(&[]);
+        assert!(!args.force_empty);
+    }
+
+    #[test]
+    fn import_existing_force_empty_env_var_parses_to_true() {
+        let _guard = scrub_auth_env();
+        // SAFETY: scrub_auth_env serializes against any other test that
+        // mutates these env vars; KEI_FORCE_EMPTY is read synchronously by
+        // clap during parse below.
+        unsafe {
+            std::env::set_var("KEI_FORCE_EMPTY", "true");
+        }
+        let cli =
+            Cli::try_parse_from(["kei", "import-existing", "--download-dir", "/tmp"]).unwrap();
+        unsafe {
+            std::env::remove_var("KEI_FORCE_EMPTY");
+        }
+        match cli.command {
+            Some(Command::ImportExisting(args)) => assert!(args.force_empty),
+            _ => panic!("Expected ImportExisting command"),
+        }
     }
 
     #[test]
