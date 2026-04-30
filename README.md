@@ -44,12 +44,13 @@
 
 ```sh
 brew install rhoopr/kei/kei          # Homebrew
+
 docker pull ghcr.io/rhoopr/kei:latest # Docker
+:latest follows tagged releases. Use :main to track main HEAD for unreleased builds.
 ```
 
-`:latest` follows tagged releases. Use `:main` to track main HEAD for unreleased builds.
-
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, FreeBSD, and other install paths, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install).
+
 
 > [!IMPORTANT]
 > kei can't access your photos if Advanced Data Protection is on. Turn ADP off and enable "Access iCloud Data on the Web" in your Apple ID settings. Details: [Authentication wiki](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
