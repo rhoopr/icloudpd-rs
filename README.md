@@ -47,6 +47,8 @@ brew install rhoopr/kei/kei          # Homebrew
 docker pull ghcr.io/rhoopr/kei:latest # Docker
 ```
 
+`:latest` follows tagged releases. Use `:main` to track main HEAD for unreleased builds.
+
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, FreeBSD, and other install paths, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install).
 
 > [!IMPORTANT]
