@@ -1,0 +1,20 @@
+# cargo-audit advisory ignores. cargo-audit auto-loads this path
+# (`.cargo/audit.toml`) under both `just gate` and CI. Ignores are only
+# enforceable when the caller passes `--deny warnings` (or similar);
+# `cargo audit` alone exits 0 regardless of the ignore list.
+
+[advisories]
+ignore = [
+    # `paste 1.0.15` unmaintained. Reaches kei only transitively via
+    # `mp4-atom 0.10.1` (the HEIC atom editor used by the EXIF writer).
+    # Not a vulnerability; no actionable fix on our side until upstream
+    # mp4-atom ships a paste-free release. Tracked: kei issue #310.
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0436
+    "RUSTSEC-2024-0436",
+
+    # `rand 0.9.2` unsound with a custom logger. kei's direct
+    # rand=0.10.1 is unaffected; the 0.9.2 copy reaches us only
+    # transitively via reqwest -> quinn -> quinn-proto.
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0097
+    "RUSTSEC-2026-0097",
+]
