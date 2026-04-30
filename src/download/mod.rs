@@ -503,6 +503,70 @@ impl DownloadConfig {
         self.folder_structure.contains("{album}")
     }
 
+    /// Construct a `DownloadConfig` populated only with the fields that
+    /// affect path derivation, leaving every download-pipeline field at an
+    /// inert default. Used by `import-existing`, which never instantiates a
+    /// pipeline; it only calls `expected_paths_for` to figure out where a
+    /// file *would* live on disk and matches that against existing files.
+    ///
+    /// The inert fields (state_db, retry, concurrent_downloads, bandwidth
+    /// limiter, sync_mode, album_name, etc.) are unread by the path
+    /// derivation layer; introducing real values here would silently
+    /// misroute import-existing if those fields ever start to influence
+    /// path computation. The asserting tests in `commands::import` cover
+    /// the expected-path matrix for the live values.
+    pub(crate) fn for_path_derivation_only(
+        directory: Arc<Path>,
+        fields: crate::config::PathDerivationFields,
+        dry_run: bool,
+        no_progress_bar: bool,
+    ) -> Self {
+        Self {
+            directory,
+            folder_structure: fields.folder_structure,
+            size: fields.size.into(),
+            skip_videos: false,
+            skip_photos: false,
+            skip_created_before: None,
+            skip_created_after: None,
+            #[cfg(feature = "xmp")]
+            set_exif_datetime: false,
+            #[cfg(feature = "xmp")]
+            set_exif_rating: false,
+            #[cfg(feature = "xmp")]
+            set_exif_gps: false,
+            #[cfg(feature = "xmp")]
+            set_exif_description: false,
+            #[cfg(feature = "xmp")]
+            embed_xmp: false,
+            #[cfg(feature = "xmp")]
+            xmp_sidecar: false,
+            dry_run,
+            concurrent_downloads: 1,
+            recent: None,
+            retry: RetryConfig::default(),
+            live_photo_mode: fields.live_photo_mode,
+            live_photo_size: fields.live_photo_size.to_asset_version_size(),
+            live_photo_mov_filename_policy: fields.live_photo_mov_filename_policy,
+            align_raw: fields.align_raw,
+            no_progress_bar,
+            only_print_filenames: false,
+            file_match_policy: fields.file_match_policy,
+            force_size: fields.force_size,
+            keep_unicode_in_filenames: fields.keep_unicode_in_filenames,
+            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
+            temp_suffix: Arc::from(".kei-tmp"),
+            state_db: None,
+            retry_only: false,
+            max_download_attempts: 0,
+            sync_mode: SyncMode::Full,
+            album_name: None,
+            exclude_asset_ids: Arc::new(FxHashSet::default()),
+            asset_groupings: Arc::new(AssetGroupings::default()),
+            bandwidth_limiter: None,
+        }
+    }
+
     /// Clone this config with a different `album_name`, for per-album processing
     /// when `{album}` is in `folder_structure`. Pre-expands the `{album}` token
     /// in `folder_structure` so `local_download_dir` avoids per-asset
