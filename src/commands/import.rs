@@ -6,6 +6,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context;
+
 use crate::auth;
 use crate::cli;
 use crate::config;
@@ -364,6 +366,28 @@ pub(crate) async fn run_import_existing(
     let selection = config::resolve_library_selection(args.library.clone(), toml_filters);
     let libraries = resolve_libraries(&selection, &mut photos_service).await?;
 
+    let prior_db_total = db.get_summary().await?.total_assets;
+    if prior_db_total > 0 && !args.force_empty {
+        use futures_util::{StreamExt, TryStreamExt};
+        let counts: Vec<u64> =
+            futures_util::stream::iter(libraries.iter())
+                .map(|library| async move {
+                    library.all().len().await.with_context(|| {
+                        format!("counting assets in library {}", library.zone_name())
+                    })
+                })
+                .buffered(libraries.len().max(1))
+                .try_collect()
+                .await?;
+        let empty_zones: Vec<&str> = libraries
+            .iter()
+            .zip(&counts)
+            .filter(|(_, &count)| count == 0)
+            .map(|(library, _)| library.zone_name())
+            .collect();
+        validate_non_empty_libraries(&empty_zones, prior_db_total)?;
+    }
+
     if !args.no_progress_bar {
         println!("Scanning iCloud assets and matching with local files...");
     }
@@ -402,6 +426,32 @@ pub(crate) async fn run_import_existing(
     println!("  Hash errors:          {}", totals.hash_errors);
 
     Ok(())
+}
+
+/// Refuse to scan when one or more selected libraries returned zero assets
+/// while the state DB has prior asset rows. `prior_db_total` is global, not
+/// per-zone (the assets table has no zone column), so a brand-new SharedSync
+/// joining an account with a populated PrimarySync also trips this guard --
+/// `--force-empty` is the documented escape hatch for that case. Caller
+/// short-circuits when `prior_db_total == 0` or `--force-empty` is set, so
+/// this function only runs when a guard is wanted.
+fn validate_non_empty_libraries(empty_zones: &[&str], prior_db_total: u64) -> anyhow::Result<()> {
+    let [head, tail @ ..] = empty_zones else {
+        return Ok(());
+    };
+    let zones = if tail.is_empty() {
+        format!("library {head}")
+    } else {
+        format!("libraries {}", empty_zones.join(", "))
+    };
+    anyhow::bail!(
+        "{zones} returned 0 assets but the state DB has {prior_db_total} prior asset \
+         rows -- aborting to avoid a misleading `matched: 0` report. Most often this \
+         is a transient iCloud permissions glitch or stale auth; re-run after \
+         confirming via `kei list libraries` or the iCloud web UI. Pass --force-empty \
+         (or set KEI_FORCE_EMPTY=true) if you genuinely emptied the library or are \
+         attaching a new sub-library to an account that already has data."
+    );
 }
 
 /// Resolve a [`download::DownloadConfig`] from import-existing CLI args + TOML.
@@ -2519,6 +2569,42 @@ mod build_config_tests {
                 "{label} must name the rejection and the path; got: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn validate_non_empty_libraries_passes_with_no_empty_zones() {
+        super::validate_non_empty_libraries(&[], 1234)
+            .expect("no empty zones must not bail regardless of prior count");
+    }
+
+    #[test]
+    fn validate_non_empty_libraries_bails_naming_zone_and_count() {
+        let err = super::validate_non_empty_libraries(&["PrimarySync"], 4321)
+            .expect_err("empty zone with prior assets must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("library PrimarySync"),
+            "must use singular `library` and name the zone, got: {msg}"
+        );
+        assert!(
+            msg.contains("4321"),
+            "must name the prior count, got: {msg}"
+        );
+        assert!(
+            msg.contains("--force-empty"),
+            "must mention the override flag, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_non_empty_libraries_pluralizes_for_multiple_zones() {
+        let err = super::validate_non_empty_libraries(&["PrimarySync", "SharedSync-abc"], 99)
+            .expect_err("multiple empty zones must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("libraries PrimarySync, SharedSync-abc"),
+            "must use plural `libraries` and list both, got: {msg}"
+        );
     }
 
     /// CG-10: setting both `--directory` (deprecated) and `--download-dir`
