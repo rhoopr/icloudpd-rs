@@ -324,9 +324,38 @@ pub fn require_preauth() -> (String, String, PathBuf) {
     (username, password, dir)
 }
 
+/// Strip ANSI escape sequences from a string (for log assertions).
+///
+/// kei's `tracing_subscriber::fmt()` writer emits ANSI color codes even
+/// when stderr is a pipe (not a TTY), which splits log fields like
+/// `stage="scan_started"` with escape bytes around `=` and `"`. Stripping
+/// before predicate evaluation is what makes `wait_for_stderr_line`'s
+/// callers' substring checks robust.
+#[allow(dead_code)]
+pub fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Stream a child's piped stderr on a worker thread until `predicate(line)`
 /// returns true or the deadline elapses. Returns `Some(())` on a hit,
 /// `None` on timeout / EOF.
+///
+/// `predicate` is invoked on the ANSI-stripped form of each line, so callers
+/// can write plain substring checks against the rendered field text without
+/// worrying about color codes from kei's `tracing_subscriber::fmt()` writer.
 ///
 /// Uses a worker thread + mpsc channel so the wall-clock deadline is honored
 /// even if the child stops emitting lines mid-stream (a bare `BufReader::lines()`
@@ -370,7 +399,7 @@ pub fn wait_for_stderr_line(
         let remaining = end.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remaining) {
             Ok(line) => {
-                if predicate(&line) {
+                if predicate(&strip_ansi(&line)) {
                     return Some(());
                 }
             }
