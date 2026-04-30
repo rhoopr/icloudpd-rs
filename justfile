@@ -17,7 +17,7 @@ gate:
     cargo test --lib --test cli --test behavioral
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
     cargo fetch --locked
-    cargo audit
+    cargo audit --deny warnings
     typos
     bash scripts/check-roundtrip-gate.sh
 
