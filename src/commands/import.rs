@@ -22,6 +22,12 @@ use crate::types::FileMatchPolicy;
 
 use super::service::{init_photos_service, resolve_libraries};
 
+/// Value of the `stage` field on the one-shot tracing event emitted by
+/// [`import_assets`] when the first asset is dequeued. Operators (and the
+/// live SIGINT idempotency test) sync on this token to know real scan
+/// work has started, distinct from process-spawn or auth completion.
+pub(crate) const SCAN_STARTED_STAGE: &str = "scan_started";
+
 /// Per-library counters returned by [`import_assets`].
 ///
 /// Counters span asset- and expected-path levels so that divergent
@@ -138,8 +144,21 @@ where
     // One cache per library scan: each parent directory is read_dir'd at
     // most once across all sibling probes.
     let mut dir_cache = DirCache::new();
+    let mut scan_started_emitted = false;
 
     while let Some(result) = stream.next().await {
+        // Emit a one-shot marker as soon as the first asset is dequeued so
+        // tests (and operators tailing logs) can synchronise on real work
+        // having started, rather than racing on a wall-clock sleep against
+        // auth + library resolution + first-page latency.
+        if !scan_started_emitted {
+            tracing::info!(
+                stage = SCAN_STARTED_STAGE,
+                library = %library_label,
+                "import scan dequeued first asset",
+            );
+            scan_started_emitted = true;
+        }
         let asset: PhotoAsset = match result {
             Ok(a) => a,
             Err(e) => {
@@ -2190,6 +2209,80 @@ mod wiremock_tests {
             "Screenshot 2025-01-14 at 1.40.02\u{202F}PM.PNG",
         )
         .await;
+    }
+
+    /// The `stage="scan_started"` marker is the synchronisation point
+    /// the live SIGINT test polls for, so a regression that drops it
+    /// (e.g. wrapping `import_assets` in an early-return) would silently
+    /// break that test by reintroducing a sleep race. Pin its emission
+    /// via `tracing_test`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn import_emits_scan_started_marker_with_library_label() {
+        let tmp = TempDir::new().expect("tempdir");
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("S1", "IMG_SCAN.JPG", "public.jpeg").orig(
+            512,
+            "ck_s1",
+            "public.jpeg",
+        );
+        stub_records_query(&server, &[asset]).await;
+        let album = album_pointed_at(&server);
+        let (stream, panic_rx) = album.photo_stream(None, None, 1);
+        let db = open_db(&tmp).await;
+        let config = base_config(tmp.path());
+        import_assets(
+            stream,
+            panic_rx,
+            db.as_ref(),
+            &config,
+            "PrimarySync",
+            true,
+            false,
+        )
+        .await
+        .expect("import_assets");
+
+        assert!(
+            logs_contain(&format!("stage=\"{}\"", super::SCAN_STARTED_STAGE)),
+            "import_assets must emit stage=scan_started once first asset is dequeued",
+        );
+        assert!(
+            logs_contain("library=PrimarySync"),
+            "scan_started marker must carry the library_label for multi-library disambiguation",
+        );
+    }
+
+    /// Empty stream -> no marker. Operators tailing logs shouldn't see
+    /// `scan_started` for a library that produced zero assets (would
+    /// be misleading; the existing empty-library guard surfaces that
+    /// case at a higher level).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn import_skips_scan_started_marker_when_stream_empty() {
+        let tmp = TempDir::new().expect("tempdir");
+        let server = MockServer::start().await;
+        stub_records_query(&server, &[]).await;
+        let album = album_pointed_at(&server);
+        let (stream, panic_rx) = album.photo_stream(None, None, 1);
+        let db = open_db(&tmp).await;
+        let config = base_config(tmp.path());
+        import_assets(
+            stream,
+            panic_rx,
+            db.as_ref(),
+            &config,
+            "PrimarySync",
+            true,
+            false,
+        )
+        .await
+        .expect("import_assets");
+
+        assert!(
+            !logs_contain(&format!("stage=\"{}\"", super::SCAN_STARTED_STAGE)),
+            "marker must not fire when no assets are dequeued",
+        );
     }
 
     // ── icloudpd compat baseline ──────────────────────────────────────

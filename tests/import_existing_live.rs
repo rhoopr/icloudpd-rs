@@ -1234,11 +1234,26 @@ fn import_sigint_then_rerun_is_idempotent() {
                 "--no-progress-bar",
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn kei import-existing");
 
-        std::thread::sleep(Duration::from_millis(1500));
+        // Sync on the `stage="scan_started"` tracing marker the binary
+        // emits when the first asset is dequeued. This replaces a
+        // `thread::sleep(1500)` race that fired SIGINT before the scan
+        // had started on slow networks (cancelling auth instead) and
+        // long after first matches on fast ones (cancelling too late
+        // to exercise mid-scan crash safety).
+        let saw_scan_started = common::wait_for_stderr_line(
+            &mut child,
+            |line| line.contains("stage=\"scan_started\""),
+            Duration::from_secs(120),
+        );
+        if saw_scan_started.is_none() {
+            let _ = child.kill();
+            panic!("did not observe stage=scan_started within 120s");
+        }
+
         // SAFETY: child.id() is the live PID for our spawned process;
         // SIGINT is the documented graceful-shutdown signal.
         unsafe {
