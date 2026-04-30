@@ -368,17 +368,24 @@ pub(crate) async fn run_import_existing(
 
     let prior_db_total = db.get_summary().await?.total_assets;
     if prior_db_total > 0 && !args.force_empty {
-        let mut empty_zones: Vec<String> = Vec::new();
-        for library in &libraries {
-            let count =
-                library.all().len().await.with_context(|| {
-                    format!("counting assets in library {}", library.zone_name())
-                })?;
-            if count == 0 {
-                empty_zones.push(library.zone_name().to_string());
-            }
-        }
-        check_empty_library_guard(&empty_zones, prior_db_total)?;
+        use futures_util::{StreamExt, TryStreamExt};
+        let counts: Vec<u64> =
+            futures_util::stream::iter(libraries.iter())
+                .map(|library| async move {
+                    library.all().len().await.with_context(|| {
+                        format!("counting assets in library {}", library.zone_name())
+                    })
+                })
+                .buffered(libraries.len().max(1))
+                .try_collect()
+                .await?;
+        let empty_zones: Vec<&str> = libraries
+            .iter()
+            .zip(&counts)
+            .filter(|(_, &count)| count == 0)
+            .map(|(library, _)| library.zone_name())
+            .collect();
+        validate_non_empty_libraries(&empty_zones, prior_db_total)?;
     }
 
     if !args.no_progress_bar {
@@ -422,21 +429,28 @@ pub(crate) async fn run_import_existing(
 }
 
 /// Refuse to scan when one or more selected libraries returned zero assets
-/// while the state DB has prior asset rows -- the library is almost certainly
-/// mid-glitch (transient permissions / stale auth) and a `matched: 0` report
-/// would be misleading. Caller short-circuits when `prior_db_total == 0` or
-/// `--force-empty` is set, so this function only runs when a guard is wanted.
-fn check_empty_library_guard(empty_zones: &[String], prior_db_total: u64) -> anyhow::Result<()> {
-    if empty_zones.is_empty() {
+/// while the state DB has prior asset rows. `prior_db_total` is global, not
+/// per-zone (the assets table has no zone column), so a brand-new SharedSync
+/// joining an account with a populated PrimarySync also trips this guard --
+/// `--force-empty` is the documented escape hatch for that case. Caller
+/// short-circuits when `prior_db_total == 0` or `--force-empty` is set, so
+/// this function only runs when a guard is wanted.
+fn validate_non_empty_libraries(empty_zones: &[&str], prior_db_total: u64) -> anyhow::Result<()> {
+    let [head, tail @ ..] = empty_zones else {
         return Ok(());
-    }
-    let zones = empty_zones.join(", ");
+    };
+    let zones = if tail.is_empty() {
+        format!("library {head}")
+    } else {
+        format!("libraries {}", empty_zones.join(", "))
+    };
     anyhow::bail!(
-        "library {zones} returned 0 assets but the state DB has {prior_db_total} prior \
-         asset rows -- aborting to avoid a misleading `matched: 0` report. This is most \
-         often a transient iCloud permissions glitch or stale auth; re-run after \
+        "{zones} returned 0 assets but the state DB has {prior_db_total} prior asset \
+         rows -- aborting to avoid a misleading `matched: 0` report. Most often this \
+         is a transient iCloud permissions glitch or stale auth; re-run after \
          confirming via `kei list libraries` or the iCloud web UI. Pass --force-empty \
-         (or set KEI_FORCE_EMPTY=true) only if you genuinely emptied the library."
+         (or set KEI_FORCE_EMPTY=true) if you genuinely emptied the library or are \
+         attaching a new sub-library to an account that already has data."
     );
 }
 
@@ -2558,20 +2572,19 @@ mod build_config_tests {
     }
 
     #[test]
-    fn empty_library_guard_passes_with_no_empty_zones() {
-        super::check_empty_library_guard(&[], 1234)
+    fn validate_non_empty_libraries_passes_with_no_empty_zones() {
+        super::validate_non_empty_libraries(&[], 1234)
             .expect("no empty zones must not bail regardless of prior count");
     }
 
     #[test]
-    fn empty_library_guard_bails_naming_zone_and_count() {
-        let zones = vec!["PrimarySync".to_string()];
-        let err = super::check_empty_library_guard(&zones, 4321)
+    fn validate_non_empty_libraries_bails_naming_zone_and_count() {
+        let err = super::validate_non_empty_libraries(&["PrimarySync"], 4321)
             .expect_err("empty zone with prior assets must bail");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("PrimarySync"),
-            "must name the zone, got: {msg}"
+            msg.contains("library PrimarySync"),
+            "must use singular `library` and name the zone, got: {msg}"
         );
         assert!(
             msg.contains("4321"),
@@ -2584,13 +2597,14 @@ mod build_config_tests {
     }
 
     #[test]
-    fn empty_library_guard_lists_all_empty_zones() {
-        let zones = vec!["PrimarySync".to_string(), "SharedSync-abc".to_string()];
-        let err = super::check_empty_library_guard(&zones, 99)
+    fn validate_non_empty_libraries_pluralizes_for_multiple_zones() {
+        let err = super::validate_non_empty_libraries(&["PrimarySync", "SharedSync-abc"], 99)
             .expect_err("multiple empty zones must bail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("PrimarySync"), "missing PrimarySync: {msg}");
-        assert!(msg.contains("SharedSync-abc"), "missing SharedSync: {msg}");
+        assert!(
+            msg.contains("libraries PrimarySync, SharedSync-abc"),
+            "must use plural `libraries` and list both, got: {msg}"
+        );
     }
 
     /// CG-10: setting both `--directory` (deprecated) and `--download-dir`

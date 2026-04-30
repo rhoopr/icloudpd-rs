@@ -539,11 +539,13 @@ pub struct ImportArgs {
     pub no_progress_bar: bool,
 
     /// Override the empty-library safety guard. Without this flag,
-    /// `import-existing` aborts when a library returns zero assets while
-    /// the state DB has prior asset rows -- the library is almost
-    /// certainly mid-glitch (transient permissions / stale auth) and
-    /// scanning would produce a misleading `matched: 0` report. Set
-    /// this only if you have genuinely emptied the library.
+    /// `import-existing` aborts when a selected library returns zero
+    /// assets while the state DB has prior asset rows -- often a
+    /// transient iCloud permissions glitch or stale auth, where
+    /// scanning would silently produce a misleading `matched: 0`
+    /// report. Set this if you genuinely emptied the library, or if
+    /// you're attaching a new sub-library to an account that already
+    /// has data (the prior-row check is global, not per-zone).
     #[arg(long, env = "KEI_FORCE_EMPTY")]
     pub force_empty: bool,
 }
