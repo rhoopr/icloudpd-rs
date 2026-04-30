@@ -1040,7 +1040,9 @@ pub mod __fuzz {
     }
 
     /// Walk an HEIC byte buffer for the embedded XMP packet. Defense-in-depth
-    /// against the upstream mp4-atom OOM (kixelated/mp4-atom#154).
+    /// against the upstream mp4-atom OOM class that hit `parse_vorbis_comment`
+    /// (kixelated/mp4-atom#154, fixed upstream in #157) and any sibling
+    /// decoders that might regress in the same shape.
     pub fn heif_extract_xmp(bytes: &[u8]) -> Option<Vec<u8>> {
         crate::download::heif::extract_xmp_bytes(bytes)
     }

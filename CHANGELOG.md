@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **HDR / wide-gamut HEICs now embed XMP metadata correctly.** iOS HDR captures (iPhone 12 Pro and newer in HDR mode) carry an ICC profile in the HEIC `colr` atom under `colour_type = "prof"` (Display P3 / Display P3 Linear); a smaller share use `rICC`. The pinned mp4-atom rev decoded the profile bytes via `Buf::slice` without advancing the cursor, so the parent atom's strict end-check rejected every such file with `under decode: colr` and `--embed-xmp` / `--set-exif-rating` / `--set-exif-datetime` left the image without metadata. The kei-side retry marker would then loop forever. Fixed by bumping the mp4-atom pin past the upstream cursor-advance fix. Image bytes (`mdat`) were never affected. Closes #276; addresses #269.
+
+### Security
+
+- **`paste 1.0.15` (RUSTSEC-2024-0436, unmaintained) is no longer in the dependency graph.** Reached kei transitively through mp4-atom; the new pin uses upstream's `pastey` replacement. The `cargo audit` ignore for the advisory was removed from `.cargo/audit.toml`. Closes #310.
+
 ### Added
 
 - **Fuzz harnesses for 10 parser entry points.** New `fuzz/` directory with cargo-fuzz targets covering CloudKit JSON deserializers, auth responses (SRP init, account login, 2FA challenge), TOML config, the `*Enc` field decoders, path sanitization, HEIF atom walking, the HEIF XMP probe pipeline, Adobe XMP Toolkit (run via FFI so ASan can see C++ memory bugs), `PhotoAsset::from_records`, and the state enum `from_str` parsers. Checked-in seeds under `fuzz/seeds/` include two OOM regression repros for an upstream `mp4-atom` bug that kei calls synchronously during the EXIF probe. `just fuzz run TARGET` replays them on every invocation.
