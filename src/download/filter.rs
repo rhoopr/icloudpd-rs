@@ -254,19 +254,64 @@ pub(super) struct DownloadTask {
     pub(super) version_size: VersionSizeKey,
 }
 
-/// Apply the RAW alignment policy by swapping Original and Alternative versions
-/// when appropriate, matching Python's `apply_raw_policy()`.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "orig_idx / alt_idx come from `enumerate()` over `versions`; indexing back \
-              into `versions` or its clone is in-bounds by construction"
-)]
-fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'_, VersionsMap> {
-    if policy == RawTreatmentPolicy::Unchanged {
-        return Cow::Borrowed(versions);
+/// Borrowed view over a `VersionsMap` with an optional virtual swap of
+/// the keys at two indices. Lets [`apply_raw_policy`] relabel the
+/// `Original` / `Alternative` slots without cloning the version list.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct VersionsView<'a> {
+    versions: &'a VersionsMap,
+    /// `(orig_idx, alt_idx)` when the keys at those indices should be
+    /// presented swapped; iteration yields `Alternative` at `orig_idx`
+    /// and `Original` at `alt_idx`. `None` means iterate as-is.
+    swap: Option<(usize, usize)>,
+}
+
+impl<'a> VersionsView<'a> {
+    fn borrowed(versions: &'a VersionsMap) -> Self {
+        Self {
+            versions,
+            swap: None,
+        }
     }
 
-    // Find indices for Original and Alternative in a single pass
+    fn swapped(versions: &'a VersionsMap, orig_idx: usize, alt_idx: usize) -> Self {
+        Self {
+            versions,
+            swap: Some((orig_idx, alt_idx)),
+        }
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (AssetVersionSize, &'a AssetVersion)> + 'a {
+        let swap = self.swap;
+        self.versions.iter().enumerate().map(move |(idx, (k, v))| {
+            let key = match swap {
+                Some((orig, _)) if idx == orig => AssetVersionSize::Alternative,
+                Some((_, alt)) if idx == alt => AssetVersionSize::Original,
+                _ => *k,
+            };
+            (key, v)
+        })
+    }
+
+    pub(super) fn get(&self, key: AssetVersionSize) -> Option<&'a AssetVersion> {
+        self.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+}
+
+/// Apply the RAW alignment policy by virtually swapping Original and
+/// Alternative versions when appropriate, matching Python's
+/// `apply_raw_policy()`. Returns a borrowed view over the original map
+/// regardless of swap outcome.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "orig_idx / alt_idx come from `enumerate()` over `versions`; \
+              indexing back into `versions` is in-bounds by construction"
+)]
+fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> VersionsView<'_> {
+    if policy == RawTreatmentPolicy::Unchanged {
+        return VersionsView::borrowed(versions);
+    }
+
     let (orig_idx, alt_idx) =
         versions
             .iter()
@@ -278,7 +323,7 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'
             });
 
     let Some(alt_idx) = alt_idx else {
-        return Cow::Borrowed(versions);
+        return VersionsView::borrowed(versions);
     };
 
     let should_swap = match policy {
@@ -289,17 +334,10 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'
         RawTreatmentPolicy::Unchanged => false,
     };
 
-    if !should_swap {
-        return Cow::Borrowed(versions);
+    match (should_swap, orig_idx) {
+        (true, Some(orig_idx)) => VersionsView::swapped(versions, orig_idx, alt_idx),
+        _ => VersionsView::borrowed(versions),
     }
-
-    // Swap by cloning and modifying the keys
-    let mut swapped = versions.clone();
-    if let Some(orig_idx) = orig_idx {
-        swapped[orig_idx].0 = AssetVersionSize::Alternative;
-        swapped[alt_idx].0 = AssetVersionSize::Original;
-    }
-    Cow::Owned(swapped)
 }
 
 /// Returns the reason this asset should be skipped by content/metadata
@@ -470,7 +508,7 @@ fn raw_filename(asset: &crate::icloud::photos::PhotoAsset) -> Cow<'_, str> {
 pub(super) struct DerivationContext<'a> {
     pub(super) base_filename: String,
     pub(super) created_local: DateTime<Local>,
-    pub(super) versions: Cow<'a, VersionsMap>,
+    pub(super) versions: VersionsView<'a>,
 }
 
 impl<'a> DerivationContext<'a> {
@@ -492,10 +530,7 @@ impl<'a> DerivationContext<'a> {
     }
 
     fn get_version(&self, key: AssetVersionSize) -> Option<&AssetVersion> {
-        self.versions
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v)
+        self.versions.get(key)
     }
 }
 
@@ -2318,14 +2353,14 @@ mod tests {
             .build()
     }
 
-    /// Helper to get a version from a SmallVec by key
-    fn get_ver(versions: &VersionsMap, key: AssetVersionSize) -> Option<&AssetVersion> {
-        versions.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    /// Helper to get a version from a `VersionsView` by key.
+    fn get_ver<'a>(view: &VersionsView<'a>, key: AssetVersionSize) -> Option<&'a AssetVersion> {
+        view.get(key)
     }
 
-    /// Helper to check if a version exists in a SmallVec
-    fn has_ver(versions: &VersionsMap, key: AssetVersionSize) -> bool {
-        versions.iter().any(|(k, _)| *k == key)
+    /// Helper to check whether a version exists in a `VersionsView`.
+    fn has_ver(view: &VersionsView<'_>, key: AssetVersionSize) -> bool {
+        view.iter().any(|(k, _)| k == key)
     }
 
     #[test]
@@ -2407,6 +2442,46 @@ mod tests {
             "https://p01.icloud-content.com/orig"
         );
         assert!(!has_ver(&versions, AssetVersionSize::Alternative));
+    }
+
+    /// On a swap, `iter()` must preserve the underlying `VersionsMap`
+    /// element order — only the keys at the two swap slots flip. If a
+    /// future refactor reorders elements (e.g. surfacing `Original`
+    /// first regardless of position), this fails loudly.
+    #[test]
+    fn raw_policy_view_iter_order_matches_underlying_map() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let view = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
+
+        let elements: Vec<(AssetVersionSize, &str)> =
+            view.iter().map(|(k, v)| (k, v.url.as_ref())).collect();
+        assert_eq!(elements.len(), 2);
+        // Slot 0 (originally Original) reads as Alternative, still
+        // pointing at orig_url.
+        assert_eq!(elements[0].0, AssetVersionSize::Alternative);
+        assert_eq!(elements[0].1, "https://p01.icloud-content.com/orig");
+        // Slot 1 (originally Alternative) reads as Original, still
+        // pointing at alt_url.
+        assert_eq!(elements[1].0, AssetVersionSize::Original);
+        assert_eq!(elements[1].1, "https://p01.icloud-content.com/alt");
+    }
+
+    /// `Unchanged` policy must yield the underlying map verbatim — same
+    /// keys, same order — so callers see identical data to bypassing
+    /// `apply_raw_policy` entirely.
+    #[test]
+    fn raw_policy_unchanged_yields_underlying_map_verbatim() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let view = apply_raw_policy(asset.versions(), RawTreatmentPolicy::Unchanged);
+
+        let got: Vec<(AssetVersionSize, &str)> =
+            view.iter().map(|(k, v)| (k, v.url.as_ref())).collect();
+        let want: Vec<(AssetVersionSize, &str)> = asset
+            .versions()
+            .iter()
+            .map(|(k, v)| (*k, v.url.as_ref()))
+            .collect();
+        assert_eq!(got, want);
     }
 
     #[test]
