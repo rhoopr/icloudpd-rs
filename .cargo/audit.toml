@@ -1,7 +1,8 @@
 # cargo-audit advisory ignores. cargo-audit auto-loads this path
-# (`.cargo/audit.toml`) under both `just gate` and CI. Ignores are only
-# enforceable when the caller passes `--deny warnings` (or similar);
-# `cargo audit` alone exits 0 regardless of the ignore list.
+# (`.cargo/audit.toml`) under both `just gate` and CI. Without `--deny`
+# cargo-audit exits 0 on informational findings (unmaintained, unsound,
+# yanked) regardless of this list, so callers must pass `--deny warnings`
+# for the ignores to be enforceable.
 
 [advisories]
 ignore = [

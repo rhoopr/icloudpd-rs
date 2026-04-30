@@ -57,7 +57,7 @@ jobs:
           if printf '%s\n' "$files" | grep -qE '^(src/|tests/|build\.rs$|Cargo\.toml$|Cargo\.lock$)'; then
             code=true
           fi
-          if printf '%s\n' "$files" | grep -qE '^(Cargo\.toml$|Cargo\.lock$)'; then
+          if printf '%s\n' "$files" | grep -qE '^(Cargo\.toml$|Cargo\.lock$|\.cargo/audit\.toml$)'; then
             cargo=true
           fi
           if printf '%s\n' "$files" | grep -qE '^(src/|Cargo\.toml$|Cargo\.lock$|Dockerfile$|\.dockerignore$)'; then
@@ -456,10 +456,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-audit
-      # Advisory ignores + rationale live in .cargo/audit.toml so the list
-      # is identical here and under `just gate`. cargo-audit auto-loads
-      # that path; --deny warnings makes the ignore enforceable (otherwise
-      # informational findings exit 0 regardless of the ignore list).
+      # Ignore list + rationale: .cargo/audit.toml.
       - run: cargo audit --deny warnings
 
   # Verifies the Dockerfile builds successfully for both release targets,
