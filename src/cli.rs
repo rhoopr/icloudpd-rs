@@ -329,8 +329,13 @@ pub struct SyncArgs {
     #[arg(long, conflicts_with = "watch_with_interval")]
     pub dry_run: bool,
 
-    /// Run continuously, waiting N seconds between runs (60..=86400)
-    #[arg(long, env = "KEI_WATCH_WITH_INTERVAL", value_parser = clap::value_parser!(u64).range(60..=86400))]
+    /// Run continuously, waiting N seconds between runs (60..=86400).
+    /// Resolution order: this flag > `[watch] interval` in TOML >
+    /// `KEI_WATCH_WITH_INTERVAL` env > unset (single-shot). The env form is
+    /// read inside `Config::build` rather than by clap, so a TOML setting
+    /// always overrides an env-only default (e.g. the one baked into the
+    /// docker image).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(60..=86400))]
     pub watch_with_interval: Option<u64>,
 
     /// Disable progress bar
