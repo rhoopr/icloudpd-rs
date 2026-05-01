@@ -40,12 +40,16 @@ cp "$COOKIES/".* "$DOCKER_CONFIG/" 2>/dev/null
 # Strip lock files so the container doesn't conflict with the host kei.
 rm -f "$DOCKER_CONFIG/"*.lock "$DOCKER_CONFIG/.lock"
 
+# Override the image's baked-in 24h watch default (Dockerfile sets
+# ENV KEI_WATCH_WITH_INTERVAL=86400). Empty value is parsed as unset
+# (see config.rs::parse_env_watch_interval). Applied to every one-shot
+# `docker run kei sync ...` below; the explicit watch-mode test (step
+# 10) sets --watch-with-interval directly.
+ONESHOT_ENV=(-e KEI_WATCH_WITH_INTERVAL=)
+
 echo "--- 1. Docker sync ($ALBUM album) ---"
-# `-e KEI_WATCH_WITH_INTERVAL=` overrides the image's baked-in 24h default
-# (Dockerfile sets ENV KEI_WATCH_WITH_INTERVAL=86400). Without this, every
-# one-shot `docker run kei sync ...` would sleep 24h after completing.
 docker run --rm \
-    -e KEI_WATCH_WITH_INTERVAL= \
+    "${ONESHOT_ENV[@]}" \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DOCKER_PHOTOS:/photos" \
     "$IMAGE" sync \
@@ -102,7 +106,7 @@ fi
 echo ""
 echo "--- 6. Idempotent re-sync (no new downloads) ---"
 docker run --rm \
-    -e KEI_WATCH_WITH_INTERVAL= \
+    "${ONESHOT_ENV[@]}" \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DOCKER_PHOTOS:/photos" \
     "$IMAGE" sync \
@@ -120,7 +124,7 @@ echo ""
 echo "--- 7. Dry run ---"
 DRY_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-dry-XXXXX")
 docker run --rm \
-    -e KEI_WATCH_WITH_INTERVAL= \
+    "${ONESHOT_ENV[@]}" \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DRY_PHOTOS:/photos" \
     "$IMAGE" sync \
@@ -204,7 +208,7 @@ printf '%s' "$ICLOUD_PASSWORD" > "$SECRETS_DIR/icloud_password"
 chmod 400 "$SECRETS_DIR/icloud_password"
 PWFILE_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-pwfile-XXXXX")
 PWFILE_OUT=$(docker run --rm \
-    -e KEI_WATCH_WITH_INTERVAL= \
+    "${ONESHOT_ENV[@]}" \
     -v "$DOCKER_CONFIG:/config" \
     -v "$PWFILE_PHOTOS:/photos" \
     -v "$SECRETS_DIR:/run/secrets:ro" \
