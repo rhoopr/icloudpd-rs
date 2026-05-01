@@ -724,22 +724,23 @@ pub(crate) fn resolve_password_command(
         .or_else(|| toml_auth.and_then(|a| a.password_command.clone()))
 }
 
-/// Parse the `KEI_WATCH_WITH_INTERVAL` env var into an `Option<u64>`.
-/// Pure helper so the parsing logic can be exercised without mutating the
-/// process-wide environment under test parallelism. Range validation is
-/// applied later in `Config::build_inner` so it covers TOML and CLI sources
-/// uniformly.
+const ENV_WATCH_INTERVAL: &str = "KEI_WATCH_WITH_INTERVAL";
+
+/// Parse `KEI_WATCH_WITH_INTERVAL` into an `Option<u64>`. Takes the raw
+/// `Result` so tests can exercise it without mutating the process env (which
+/// would race other `Config::build` callers under `--test-threads > 1`).
+/// Range validation lives in `Config::build_inner` so CLI/TOML/env share it.
 fn parse_env_watch_interval(
     raw: Result<String, std::env::VarError>,
 ) -> anyhow::Result<Option<u64>> {
     match raw {
         Ok(s) => Some(s.parse::<u64>().map_err(|e| {
-            anyhow::anyhow!("KEI_WATCH_WITH_INTERVAL is not a valid integer ({s:?}): {e}")
+            anyhow::anyhow!("{ENV_WATCH_INTERVAL} is not a valid integer ({s:?}): {e}")
         }))
         .transpose(),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("KEI_WATCH_WITH_INTERVAL contains non-UTF-8 bytes")
+            anyhow::bail!("{ENV_WATCH_INTERVAL} contains non-UTF-8 bytes")
         }
     }
 }
@@ -754,28 +755,11 @@ impl Config {
         sync: crate::cli::SyncArgs,
         toml: Option<TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let env_watch_interval =
-            parse_env_watch_interval(std::env::var("KEI_WATCH_WITH_INTERVAL"))?;
+        let env_watch_interval = parse_env_watch_interval(std::env::var(ENV_WATCH_INTERVAL))?;
         Self::build_inner(globals, pw, sync, toml, env_watch_interval)
     }
 
-    /// Test-only entry point that lets the suite inject an explicit
-    /// `KEI_WATCH_WITH_INTERVAL` value instead of mutating the process env.
-    /// Mutating env vars under `--test-threads > 1` races with every other
-    /// test that calls `Config::build`, so the precedence tests below take
-    /// this path.
-    #[cfg(test)]
-    pub(crate) fn build_with_env_watch_interval(
-        globals: &GlobalArgs,
-        pw: crate::cli::PasswordArgs,
-        sync: crate::cli::SyncArgs,
-        toml: Option<TomlConfig>,
-        env_watch_interval: Option<u64>,
-    ) -> anyhow::Result<Self> {
-        Self::build_inner(globals, pw, sync, toml, env_watch_interval)
-    }
-
-    fn build_inner(
+    pub(crate) fn build_inner(
         globals: &GlobalArgs,
         pw: crate::cli::PasswordArgs,
         sync: crate::cli::SyncArgs,
@@ -1207,12 +1191,8 @@ impl Config {
             toml.as_ref(),
         );
 
-        // Watch
-        // Precedence: CLI > [watch] interval TOML > KEI_WATCH_WITH_INTERVAL env
-        // > unset (single-shot). Env is read up front in the public `build()`
-        // entry point (not via clap's `env =`), so that an env-baked default,
-        // notably the one in the docker image, never silently overrides a
-        // user's TOML setting. See #293.
+        // Env read in `build()` (not via clap) so the docker image's ENV
+        // default sits below TOML in the precedence chain. See #293.
         let watch_with_interval = sync
             .watch_with_interval
             .or_else(|| toml_watch.and_then(|w| w.interval))
@@ -3950,8 +3930,23 @@ mod tests {
     }
 
     // Precedence tests for KEI_WATCH_WITH_INTERVAL inject the env value via
-    // `Config::build_with_env_watch_interval` rather than mutating the real
-    // process env, which would race with every other Config::build test.
+    // `Config::build_inner` directly, rather than mutating the real process
+    // env, which would race other `Config::build` callers under
+    // `--test-threads > 1`.
+
+    fn build_with_env(
+        sync: SyncArgs,
+        toml: Option<TomlConfig>,
+        env_watch_interval: Option<u64>,
+    ) -> anyhow::Result<Config> {
+        Config::build_inner(
+            &default_globals(),
+            default_password(),
+            sync,
+            toml,
+            env_watch_interval,
+        )
+    }
 
     /// Regression test for #293: a `[watch] interval` in TOML must beat the
     /// `KEI_WATCH_WITH_INTERVAL` env var (notably the docker image's baked
@@ -3964,14 +3959,7 @@ mod tests {
             interval = 3600
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build_with_env_watch_interval(
-            &default_globals(),
-            default_password(),
-            default_sync(),
-            Some(toml),
-            Some(86400),
-        )
-        .unwrap();
+        let cfg = build_with_env(default_sync(), Some(toml), Some(86400)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(3600));
     }
 
@@ -3979,57 +3967,26 @@ mod tests {
     fn test_build_watch_interval_cli_overrides_env() {
         let mut sync = default_sync();
         sync.watch_with_interval = Some(600);
-        let cfg = Config::build_with_env_watch_interval(
-            &default_globals(),
-            default_password(),
-            sync,
-            None,
-            Some(86400),
-        )
-        .unwrap();
+        let cfg = build_with_env(sync, None, Some(86400)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(600));
     }
 
     #[test]
     fn test_build_watch_interval_env_only() {
-        let cfg = Config::build_with_env_watch_interval(
-            &default_globals(),
-            default_password(),
-            default_sync(),
-            None,
-            Some(86400),
-        )
-        .unwrap();
+        let cfg = build_with_env(default_sync(), None, Some(86400)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(86400));
     }
 
     #[test]
     fn test_build_watch_interval_env_unset_means_single_shot() {
-        let cfg = Config::build_with_env_watch_interval(
-            &default_globals(),
-            default_password(),
-            default_sync(),
-            None,
-            None,
-        )
-        .unwrap();
+        let cfg = build_with_env(default_sync(), None, None).unwrap();
         assert!(cfg.watch_with_interval.is_none());
     }
 
-    /// Env-sourced values still go through the same range-validation site as
-    /// CLI and TOML, so an out-of-range `KEI_WATCH_WITH_INTERVAL` is rejected
-    /// with the standard message.
     #[test]
     fn test_build_watch_interval_env_below_minimum_rejected() {
         for bad in [0u64, 1, 30, 59] {
-            let err = Config::build_with_env_watch_interval(
-                &default_globals(),
-                default_password(),
-                default_sync(),
-                None,
-                Some(bad),
-            )
-            .unwrap_err();
+            let err = build_with_env(default_sync(), None, Some(bad)).unwrap_err();
             assert!(
                 err.to_string()
                     .contains("watch interval must be in 60..=86400"),
@@ -4041,14 +3998,7 @@ mod tests {
     #[test]
     fn test_build_watch_interval_env_above_maximum_rejected() {
         for bad in [86401u64, 100_000, u64::MAX] {
-            let err = Config::build_with_env_watch_interval(
-                &default_globals(),
-                default_password(),
-                default_sync(),
-                None,
-                Some(bad),
-            )
-            .unwrap_err();
+            let err = build_with_env(default_sync(), None, Some(bad)).unwrap_err();
             assert!(
                 err.to_string()
                     .contains("watch interval must be in 60..=86400"),
@@ -4057,8 +4007,8 @@ mod tests {
         }
     }
 
-    // Pure parser tests for `parse_env_watch_interval`. Synthetic
-    // `Result<String, VarError>` inputs avoid global env mutation.
+    // Pure parser tests use synthetic `Result<String, VarError>` inputs to
+    // avoid mutating the process env.
 
     #[test]
     fn test_parse_env_watch_interval_valid_number() {

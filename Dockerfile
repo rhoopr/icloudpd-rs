@@ -71,10 +71,8 @@ EXPOSE 9090
 HEALTHCHECK --interval=60s --timeout=5s --start-period=15m --retries=3 \
   CMD curl -f http://localhost:9090/healthz || exit 1
 
-# Default watch interval baked as env (24h). Read in Config::build with
-# lower precedence than `[watch] interval` in the mounted TOML, so users
-# can shorten the cycle via config without overriding the docker `command:`.
-# See #293.
+# Default watch interval (24h). Lower precedence than `[watch] interval`
+# in TOML so users can shorten the cycle without overriding `command:` (#293).
 ENV KEI_WATCH_WITH_INTERVAL=86400
 
 ENTRYPOINT ["kei"]
