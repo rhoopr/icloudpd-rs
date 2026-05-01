@@ -156,6 +156,14 @@ const EXIT_AUTH: u8 = 3;
 #[error("{0} downloads failed")]
 struct PartialSyncError(usize);
 
+#[expect(
+    clippy::string_slice,
+    reason = "floor_char_boundary guarantees a valid char boundary"
+)]
+pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    &s[..s.floor_char_boundary(max_bytes)]
+}
+
 /// Query available disk space on the filesystem containing `path`.
 ///
 /// Returns `None` if the statvfs call fails (e.g. path doesn't exist yet).

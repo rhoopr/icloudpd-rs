@@ -434,12 +434,10 @@ pub async fn validate_token(
     tracing::debug!("Session token is still valid");
     let text = read_response_body(response, "validate_token body").await;
     let data: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
-        #[expect(
-            clippy::string_slice,
-            reason = "floor_char_boundary guarantees a valid boundary"
-        )]
-        let preview = &text[..text.floor_char_boundary(200)];
-        format!("Validate: expected JSON but got: {:?}", preview)
+        format!(
+            "Validate: expected JSON but got: {:?}",
+            crate::truncate_str(&text, 200)
+        )
     })?;
     data.check_errors()?;
     Ok(data)
@@ -482,12 +480,10 @@ pub async fn authenticate_with_token(
 
     let text = read_response_body(response, "accountLogin body").await;
     let body: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
-        #[expect(
-            clippy::string_slice,
-            reason = "floor_char_boundary guarantees a valid boundary"
-        )]
-        let preview = &text[..text.floor_char_boundary(200)];
-        format!("Account login: expected JSON but got: {:?}", preview)
+        format!(
+            "Account login: expected JSON but got: {:?}",
+            crate::truncate_str(&text, 200)
+        )
     })?;
 
     // Check for body-level error indicators before proceeding
