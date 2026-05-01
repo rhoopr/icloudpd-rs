@@ -24,10 +24,7 @@ use pipeline::{
 
 pub(crate) use filter::determine_media_type;
 pub(crate) use filter::AssetGroupings;
-use filter::{
-    extract_skip_candidates, filter_asset_to_tasks, pre_ensure_asset_dir, DownloadTask,
-    NormalizedPath,
-};
+use filter::{filter_asset_to_tasks, pre_ensure_asset_dir, DownloadTask, NormalizedPath};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -1478,8 +1475,6 @@ async fn download_photos_incremental(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let uses_album_token = config.uses_album_expansion();
-
     // Each asset is paired with its source pass index so both `{album}`
     // expansion and per-pass exclusion (notably, the unfiled pass's set
     // that prevents assets already in some user album from downloading
@@ -1602,14 +1597,7 @@ async fn download_photos_incremental(
         "Assets to download from incremental sync"
     );
 
-    // Pre-load download context for O(1) state DB skip decisions
-    let download_ctx = if let Some(db) = &config.state_db {
-        DownloadContext::load(db.as_ref(), false).await
-    } else {
-        DownloadContext::default()
-    };
-
-    // Convert assets to download tasks, using state DB fast-skip where possible.
+    // Convert assets to download tasks via path-aware on-disk verification.
     // Each pass (concrete album or unfiled) gets its own derived config so
     // that both album-specific path expansion and per-pass exclude sets are
     // applied. Configs are cached per pass index to avoid redundant
@@ -1639,26 +1627,8 @@ async fn download_photos_incremental(
             continue;
         }
 
-        // `should_download_fast` keys on (asset_id, version_size, checksum)
-        // and is path-blind. In `{album}` mode the same asset may target
-        // multiple album folders; a DB-only skip would leave later copies
-        // missing from disk. Fall through to the path-aware filesystem
-        // check in that case.
-        if !uses_album_token {
-            let candidates = extract_skip_candidates(asset, effective_config);
-            if !candidates.is_empty()
-                && candidates.iter().all(|&(vs, cs)| {
-                    matches!(
-                        download_ctx.should_download_fast(asset.id(), vs, cs, true),
-                        Some(false)
-                    )
-                })
-            {
-                skip_breakdown.by_state += 1;
-                continue;
-            }
-        }
-
+        // Path-aware on-disk verification only; a DB-only fast-skip would
+        // miss user-deleted files on the incremental path.
         pre_ensure_asset_dir(&mut dir_cache, asset, effective_config).await;
         let asset_tasks =
             filter_asset_to_tasks(asset, effective_config, &mut claimed_paths, &mut dir_cache);

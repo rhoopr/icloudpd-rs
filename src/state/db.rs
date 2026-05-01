@@ -221,10 +221,6 @@ pub trait StateDb: Send + Sync {
     /// see `upsert_seen` docs and issue #211.
     async fn touch_last_seen_many(&self, asset_ids: &[&str]) -> Result<(), StateError>;
 
-    /// Sample up to `limit` local paths of downloaded assets.
-    /// Used to spot-check that "downloaded" files still exist on disk.
-    async fn sample_downloaded_paths(&self, limit: usize) -> Result<Vec<PathBuf>, StateError>;
-
     // ── v5 metadata operations ──
 
     /// Record an album membership entry. Idempotent via `INSERT OR IGNORE`.
@@ -1333,26 +1329,6 @@ impl StateDb for SqliteStateDb {
             tx.commit()
                 .map_err(|e| StateError::query("touch_last_seen_many::commit", e))?;
             Ok(())
-        })
-        .await
-    }
-
-    async fn sample_downloaded_paths(&self, limit: usize) -> Result<Vec<PathBuf>, StateError> {
-        self.with_conn("sample_downloaded_paths", move |conn| {
-            let mut stmt = conn
-                .prepare_cached(
-                    "SELECT local_path FROM assets WHERE status = 'downloaded' \
-                     AND local_path IS NOT NULL ORDER BY RANDOM() LIMIT ?1",
-                )
-                .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
-
-            let rows = stmt
-                .query_map(rusqlite::params![limit as i64], |row| {
-                    let p: String = row.get(0)?;
-                    Ok(PathBuf::from(p))
-                })
-                .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
-            collect_rows_with_warn(rows, "sample_downloaded_paths")
         })
         .await
     }
@@ -3828,48 +3804,6 @@ mod tests {
             Some("local_sha256"),
             "local_checksum should be stored"
         );
-    }
-
-    // ── Gap: sample_downloaded_paths returns actual paths ─────────────
-
-    #[tokio::test]
-    async fn sample_downloaded_paths_returns_stored_paths() {
-        let db = SqliteStateDb::open_in_memory().unwrap();
-
-        for i in 0..5 {
-            let record = TestAssetRecord::new(&format!("SAMPLE_{i}"))
-                .checksum(&format!("ck_{i}"))
-                .filename(&format!("photo_{i}.jpg"))
-                .size(1000)
-                .build();
-            db.upsert_seen(&record).await.unwrap();
-            db.mark_downloaded(
-                &format!("SAMPLE_{i}"),
-                "original",
-                Path::new(&format!("/photos/photo_{i}.jpg")),
-                &format!("hash_{i}"),
-                None,
-            )
-            .await
-            .unwrap();
-        }
-
-        let paths = db.sample_downloaded_paths(10).await.unwrap();
-        assert!(
-            !paths.is_empty(),
-            "should return at least some downloaded paths"
-        );
-        assert!(
-            paths.len() <= 5,
-            "should not return more than the number of downloaded assets"
-        );
-        for p in &paths {
-            assert!(
-                p.to_str().unwrap().starts_with("/photos/"),
-                "path should match what was stored: {:?}",
-                p
-            );
-        }
     }
 
     // ── v5 metadata round-trip ──────────────────────────────────────────
