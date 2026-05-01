@@ -858,6 +858,43 @@ mod tests {
     }
 
     #[test]
+    fn insert_xmp_then_extract_round_trips_payload() {
+        let heic = include_bytes!("../../tests/data/sample.heic");
+        let xmp = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF/></x:xmpmeta>";
+
+        let mut rewritten: Vec<u8> = Vec::new();
+        insert_xmp(heic.as_slice(), xmp.as_slice(), &mut rewritten)
+            .expect("insert_xmp must succeed on a valid HEIC");
+
+        let extracted = extract_xmp_bytes(&rewritten)
+            .expect("extract_xmp_bytes must find the XMP we just inserted");
+        assert_eq!(extracted, xmp, "round-tripped XMP must be byte-identical");
+    }
+
+    #[test]
+    fn insert_xmp_twice_retains_only_latest() {
+        let heic = include_bytes!("../../tests/data/sample.heic");
+        let first = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><first/></x:xmpmeta>";
+        let second = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><second/></x:xmpmeta>";
+
+        let mut after_first: Vec<u8> = Vec::new();
+        insert_xmp(heic.as_slice(), first.as_slice(), &mut after_first)
+            .expect("first insert must succeed");
+
+        let mut after_second: Vec<u8> = Vec::new();
+        insert_xmp(&after_first, second.as_slice(), &mut after_second)
+            .expect("second insert must succeed");
+
+        let extracted =
+            extract_xmp_bytes(&after_second).expect("extract must find XMP after double insert");
+        assert_eq!(
+            extracted,
+            second.as_slice(),
+            "only the latest XMP packet should be present"
+        );
+    }
+
+    #[test]
     fn heif_error_io_variant_carries_underlying_io_error() {
         // Sanity-check the Io variant — the writer used by insert_xmp is
         // any std::io::Write, and io::Error must convert via From.

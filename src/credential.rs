@@ -405,6 +405,35 @@ mod tests {
     }
 
     #[test]
+    fn public_api_store_retrieve_round_trips() {
+        let (_td, dir) = test_dir("pub_rt");
+        let store = CredentialStore::new("pub-rt@kei-test.invalid", &dir);
+        store.store("public_api_password").unwrap();
+        let retrieved = store.retrieve().unwrap().unwrap();
+        assert_eq!(retrieved.expose_secret(), "public_api_password");
+        let _ = store.delete();
+    }
+
+    #[test]
+    fn public_api_delete_clears_credential() {
+        let (_td, dir) = test_dir("pub_delete");
+        let store = CredentialStore::new("pub-del@kei-test.invalid", &dir);
+        store.store("to_delete").unwrap();
+        assert!(store.retrieve().unwrap().is_some());
+
+        store.delete().unwrap();
+        assert!(store.retrieve().unwrap().is_none());
+    }
+
+    #[test]
+    fn public_api_retrieve_empty_returns_none() {
+        let (_td, dir) = test_dir("pub_empty");
+        let store = CredentialStore::new("pub-empty@kei-test.invalid", &dir);
+        let result = store.retrieve().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn atomic_write_sync_permissions() {
         let (_td, dir) = test_dir("atomic_perms");
         let path = dir.join("test_atomic.bin");
