@@ -1804,7 +1804,6 @@ mod tests {
     #[tokio::test]
     async fn determine_sync_mode_state_db_error_falls_back_to_full() {
         use std::collections::{HashMap, HashSet};
-        use std::path::PathBuf;
 
         // Minimal failing impl: only `get_metadata` is reachable from
         // `determine_sync_mode`; every other method is unimplemented so
@@ -1957,12 +1956,6 @@ mod tests {
                 &self,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
-                unimplemented!()
-            }
-            async fn sample_downloaded_paths(
-                &self,
-                _: usize,
-            ) -> Result<Vec<PathBuf>, state::error::StateError> {
                 unimplemented!()
             }
             async fn add_asset_album(
@@ -2409,12 +2402,6 @@ mod tests {
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
-            async fn sample_downloaded_paths(
-                &self,
-                _: usize,
-            ) -> Result<Vec<std::path::PathBuf>, state::error::StateError> {
-                unimplemented!()
-            }
             async fn add_asset_album(
                 &self,
                 _: &str,
@@ -2686,12 +2673,6 @@ mod tests {
                 &self,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
-                unimplemented!()
-            }
-            async fn sample_downloaded_paths(
-                &self,
-                _: usize,
-            ) -> Result<Vec<std::path::PathBuf>, state::error::StateError> {
                 unimplemented!()
             }
             async fn add_asset_album(

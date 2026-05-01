@@ -420,7 +420,7 @@ fn import_existing_with_nonexistent_directory_fails() {
             .timeout(std::time::Duration::from_secs(60))
             .assert()
             .failure()
-            .stderr(predicate::str::contains("does not exist"));
+            .stderr(predicate::str::contains("Cannot read download directory"));
     });
 }
 

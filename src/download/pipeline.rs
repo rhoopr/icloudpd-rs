@@ -780,12 +780,13 @@ where
         "Download context loaded"
     );
 
-    // Determine if we can trust the state DB for early skips
-    let trust_state = if let Some(db) = &state_db {
+    // On flag drift, clear stored sync tokens so the next cycle falls back
+    // to full enumeration and picks up assets the old token would miss
+    // under the new filter settings.
+    if let Some(db) = &state_db {
         let config_hash = super::hash_download_config(config);
         let stored_hash = db.get_metadata("config_hash").await.unwrap_or(None);
-        let mut trust = stored_hash.as_deref() == Some(&config_hash);
-        if !trust {
+        if stored_hash.as_deref() != Some(&config_hash) {
             if stored_hash.is_some() {
                 tracing::info!("Download config changed since last sync, verifying all files");
                 // Clear stored sync tokens so the next cycle/run falls back to
@@ -805,44 +806,6 @@ where
                 tracing::warn!(error = %e, "Failed to persist config_hash");
             }
         }
-        trust = trust && !download_ctx.downloaded_ids.is_empty();
-
-        // Sample-check that "downloaded" files still exist on disk
-        if trust {
-            let sample_count = download_ctx
-                .downloaded_ids
-                .len()
-                .div_ceil(20) // ~5% sample
-                .clamp(5, 500);
-            match db.sample_downloaded_paths(sample_count).await {
-                Ok(paths) => {
-                    let missing: Vec<_> = paths.iter().filter(|p| !p.exists()).collect();
-                    if !missing.is_empty() {
-                        tracing::warn!(
-                            sampled = paths.len(),
-                            missing = missing.len(),
-                            "Sample check found missing files, disabling trust-state"
-                        );
-                        for p in &missing {
-                            tracing::debug!(path = %p.display(), "Missing downloaded file");
-                        }
-                        trust = false;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to sample downloaded paths, disabling trust-state");
-                    trust = false;
-                }
-            }
-        }
-        trust
-    } else {
-        false
-    };
-    if trust_state {
-        tracing::debug!(
-            "Trust-state mode active: skipping filesystem checks for DB-confirmed assets"
-        );
     }
 
     // Start sync run tracking
@@ -990,47 +953,9 @@ where
                         continue;
                     }
 
-                    // Fast-skip is path-blind; in `{album}` mode the same
-                    // asset may target multiple album folders, so skipping
-                    // after the first download would leave later folders
-                    // missing their copy. Fall through to the path-aware
-                    // filesystem/dir_cache check below. `album_name.is_some`
-                    // is the right signal here: `with_album_name` has
-                    // already expanded `{album}` out of folder_structure
-                    // by the time this runs, so checking the template
-                    // would always be false.
-                    if trust_state && config.album_name.is_none() {
-                        let candidates = extract_skip_candidates(&asset, config);
-                        if !candidates.is_empty()
-                            && candidates.iter().all(|&(vs, cs)| {
-                                matches!(
-                                    download_ctx.should_download_fast(asset.id(), vs, cs, true),
-                                    Some(false)
-                                )
-                            })
-                        {
-                            // Bytes are unchanged but metadata may have
-                            // drifted (favorite toggle, keyword add, GPS
-                            // edit). Tag the affected versions so the
-                            // rewrite worker at sync end re-applies
-                            // metadata to the existing files.
-                            tag_metadata_rewrites(
-                                producer_state_db.as_deref(),
-                                config,
-                                &asset,
-                                &candidates,
-                                &download_ctx,
-                            )
-                            .await;
-                            if producer_state_db.is_some() {
-                                touched_ids.push(asset.id_arc());
-                            }
-                            skips.by_state += 1;
-                            producer_pb.inc(1);
-                            continue;
-                        }
-                    }
-
+                    // Path-aware on-disk verification only; a DB-only fast-skip
+                    // missed user deletions when the startup sample-check
+                    // rolled wrong.
                     pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
 
                     let tasks =
@@ -3129,12 +3054,6 @@ mod tests {
             // pipeline's batch-flush path.
             Ok(())
         }
-        async fn sample_downloaded_paths(
-            &self,
-            _: usize,
-        ) -> Result<Vec<std::path::PathBuf>, StateError> {
-            unimplemented!()
-        }
         async fn add_asset_album(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
             Ok(())
         }
@@ -3667,6 +3586,95 @@ mod tests {
         let failed = db.get_failed().await.unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(&*failed[0].id, "STUCK");
+    }
+
+    /// Data-sacred regression for the trust-state fast-skip removal.
+    ///
+    /// When the state DB says an asset is `downloaded` and the config_hash
+    /// matches the prior sync, the producer must still verify the file is on
+    /// disk. A user-deleted file must be forwarded for re-download, not
+    /// fast-skipped on the strength of the DB row alone.
+    ///
+    /// Setup mirrors the prior failure mode: stored config_hash matches the
+    /// current config (so any past trust-state gate would activate), the row
+    /// is `downloaded` with a matching checksum, and the file is absent.
+    /// Asserts `result.failed` contains the asset (download was attempted
+    /// against a dead URL), proving the producer did not skip via state.
+    #[tokio::test]
+    async fn deleted_downloaded_file_is_forwarded_not_state_skipped() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::{SqliteStateDb, StateDb};
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        fn deleted_asset() -> PhotoAsset {
+            TestPhotoAsset::new("DELETED")
+                .filename("deleted.jpg")
+                .item_type("public.jpeg")
+                .orig_file_type("public.jpeg")
+                .orig_size(1234)
+                // Allowlisted CDN host so the URL passes version validation
+                // and the asset reaches the download phase; the non-base64
+                // checksum below makes the download fail before any network
+                // I/O, which surfaces as a `failed` row in the state DB.
+                .orig_url("https://p01.icloud-content.com/deleted.jpg")
+                .orig_checksum("ck_deleted")
+                .build()
+        }
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let asset = deleted_asset();
+
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let target_path = crate::download::paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &asset.created().with_timezone(&chrono::Local),
+            "deleted.jpg",
+            None,
+        );
+        let record = crate::test_helpers::TestAssetRecord::new("DELETED")
+            .checksum("ck_deleted")
+            .filename("deleted.jpg")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("DELETED", "original", &target_path, "ck_deleted", None)
+            .await
+            .unwrap();
+        let config_hash = crate::download::hash_download_config(&config);
+        db.set_metadata("config_hash", &config_hash).await.unwrap();
+
+        assert!(!target_path.exists(), "target file must not exist");
+
+        let client = reqwest::Client::new();
+        let stream1 = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(deleted_asset())]);
+        let result =
+            stream_and_download_from_stream(&client, stream1, &config, 1, CancellationToken::new())
+                .await
+                .expect("sync must complete");
+
+        // by_state was the counter on the now-removed trust-state fast-skip;
+        // a non-zero value here would mean the gate was reintroduced. A
+        // renamed-counter regression would slip past this alone, so we also
+        // assert the download phase ran (failed row below).
+        assert_eq!(
+            result.skip_summary.by_state, 0,
+            "deleted-but-DB-downloaded asset must not be state-skipped"
+        );
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(
+            failed.len(),
+            1,
+            "deleted file must be forwarded for re-download (which fails against the dead URL)"
+        );
+        assert_eq!(&*failed[0].id, "DELETED");
     }
 
     // ── run_metadata_rewrites end-to-end ───────────────────────────────────
