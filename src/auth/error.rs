@@ -338,6 +338,78 @@ mod tests {
     }
 
     #[test]
+    fn api_error_5xx_range_boundary_599_is_transient_600_is_not() {
+        let err_599 = AuthError::ApiError {
+            code: 599,
+            message: "test".into(),
+        };
+        assert!(
+            err_599.is_transient_apple_failure(),
+            "599 is within 500..600 and should be transient"
+        );
+
+        let err_600 = AuthError::ApiError {
+            code: 600,
+            message: "test".into(),
+        };
+        assert!(
+            !err_600.is_transient_apple_failure(),
+            "600 is outside 500..600 and should not be transient"
+        );
+
+        let err_499 = AuthError::ApiError {
+            code: 499,
+            message: "test".into(),
+        };
+        assert!(
+            !err_499.is_transient_apple_failure(),
+            "499 is below the 5xx range and should not be transient"
+        );
+    }
+
+    #[test]
+    fn service_error_enrichment_is_case_insensitive() {
+        let lowercase = AuthError::service_error("zone_not_found", "Zone not found");
+        assert!(
+            lowercase.to_string().contains("icloud.com"),
+            "lowercase code should still trigger enrichment"
+        );
+
+        let mixed = AuthError::service_error("Zone_Not_Found", "Zone not found");
+        assert!(
+            mixed.to_string().contains("icloud.com"),
+            "mixed-case code should still trigger enrichment"
+        );
+
+        let lowercase_auth = AuthError::service_error("authentication_failed", "Auth failed");
+        assert!(
+            lowercase_auth.to_string().contains("set up"),
+            "lowercase authentication_failed should enrich"
+        );
+
+        let lowercase_denied = AuthError::service_error("access_denied", "Denied");
+        assert!(
+            lowercase_denied.to_string().contains("wait a few minutes"),
+            "lowercase access_denied should enrich"
+        );
+    }
+
+    #[test]
+    fn service_error_enrichment_requires_exact_code_no_whitespace() {
+        let trailing_space = AuthError::service_error("ZONE_NOT_FOUND ", "Zone not found");
+        assert!(
+            !trailing_space.to_string().contains("icloud.com"),
+            "trailing space should not trigger enrichment (exact match after uppercasing)"
+        );
+
+        let prefixed = AuthError::service_error("X_ZONE_NOT_FOUND", "Zone not found");
+        assert!(
+            !prefixed.to_string().contains("icloud.com"),
+            "prefixed code should not trigger enrichment"
+        );
+    }
+
+    #[test]
     fn api_error_421_is_misdirected() {
         let err = AuthError::ApiError {
             code: 421,

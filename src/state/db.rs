@@ -4391,4 +4391,116 @@ mod tests {
             "the asset that wasn't enumerated this sync must not appear in the failed set"
         );
     }
+
+    #[tokio::test]
+    async fn mark_downloaded_fails_when_asset_row_missing() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let result = db
+            .mark_downloaded(
+                "NONEXISTENT_42",
+                "original",
+                Path::new("/tmp/claude/photo.jpg"),
+                "abc123hash",
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "mark_downloaded on an absent row must fail"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::AssetRowMissing {
+                    ref asset_id,
+                    ref version_size,
+                } if asset_id == "NONEXISTENT_42" && version_size == "original"
+            ),
+            "expected AssetRowMissing with correct ids, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_run_killed_mid_pass_preserves_downloaded_rows_on_next_open() {
+        let dir = test_dir();
+        let db_path = dir.path().join("crash_test.db");
+
+        let file_path_1 = dir.path().join("photo1.jpg");
+        let file_path_2 = dir.path().join("photo2.jpg");
+        std::fs::write(&file_path_1, b"photo 1 content").unwrap();
+        std::fs::write(&file_path_2, b"photo 2 content").unwrap();
+
+        {
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            let _run_id = db.start_sync_run().await.unwrap();
+
+            for (id, path) in [
+                ("A1", &file_path_1),
+                ("A2", &file_path_2),
+                ("A3", &file_path_1),
+            ] {
+                let record = TestAssetRecord::new(id).build();
+                db.upsert_seen(&record).await.unwrap();
+                if id != "A3" {
+                    db.mark_downloaded(id, "original", path, "hash", None)
+                        .await
+                        .unwrap();
+                }
+            }
+            // Drop without calling complete_sync_run — simulates kill -9
+        }
+
+        let db2 = SqliteStateDb::open(&db_path).await.unwrap();
+        let promoted = db2.promote_orphaned_sync_runs().await.unwrap();
+        assert_eq!(
+            promoted, 1,
+            "the orphaned running sync_run must be promoted"
+        );
+
+        let summary = db2.get_summary().await.unwrap();
+        assert_eq!(
+            summary.downloaded, 2,
+            "the two downloaded assets must survive the crash"
+        );
+        assert_eq!(
+            summary.pending, 1,
+            "the one pending asset must still be pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_db_at_future_schema_version_returns_loud_error() {
+        let dir = test_dir();
+        let db_path = dir.path().join("future.db");
+
+        {
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            db.with_conn("bump_version", |conn| {
+                conn.pragma_update(
+                    None,
+                    "user_version",
+                    crate::state::schema::SCHEMA_VERSION + 1,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        let result = SqliteStateDb::open(&db_path).await;
+        assert!(result.is_err(), "opening a future-version DB must fail");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::UnsupportedSchemaVersion { found, expected }
+                    if found == crate::state::schema::SCHEMA_VERSION + 1
+                    && expected == crate::state::schema::SCHEMA_VERSION
+            ),
+            "expected UnsupportedSchemaVersion, got: {err:?}"
+        );
+    }
 }
