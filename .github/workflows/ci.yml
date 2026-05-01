@@ -77,6 +77,19 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # Fails when a serializer changes in src/ without a corresponding
+  # round-trip test. Mirrors `just gate`'s check-roundtrip-gate.sh.
+  roundtrip:
+    name: Roundtrip gate
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: bash scripts/check-roundtrip-gate.sh
+
   # Catches common mistakes, unidiomatic code, and potential bugs
   # Acts as an additional layer of static analysis beyond the compiler
   clippy:
@@ -452,6 +465,7 @@ jobs:
     needs:
       - detect
       - fmt
+      - roundtrip
       - clippy
       - test
       - docs

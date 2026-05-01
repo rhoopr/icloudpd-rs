@@ -1,5 +1,5 @@
 # ── Build stage ──────────────────────────────────────────────────────
-FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.95.0-bookworm AS builder
 
 # Install cross-compilation toolchains when cross-compiling.
 # xmp_toolkit vendors Adobe's C++ XMP Toolkit and compiles it via `cc` on
@@ -54,7 +54,7 @@ RUN export TARGET=$(cat /tmp/target) && \
     cp target/$TARGET/release/kei /kei
 
 # ── Runtime stage ────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:bookworm-20250428-slim
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends bash curl ca-certificates libdbus-1-3 && \
