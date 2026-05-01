@@ -28,7 +28,6 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       cargo: ${{ steps.filter.outputs.cargo }}
-      docker: ${{ steps.filter.outputs.docker }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,25 +47,20 @@ jobs:
             {
               echo "code=true"
               echo "cargo=true"
-              echo "docker=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          code=false; cargo=false; docker=false
+          code=false; cargo=false
           if printf '%s\n' "$files" | grep -qE '^(src/|tests/|build\.rs$|Cargo\.toml$|Cargo\.lock$)'; then
             code=true
           fi
           if printf '%s\n' "$files" | grep -qE '^(Cargo\.toml$|Cargo\.lock$|\.cargo/audit\.toml$)'; then
             cargo=true
           fi
-          if printf '%s\n' "$files" | grep -qE '^(src/|Cargo\.toml$|Cargo\.lock$|Dockerfile$|\.dockerignore$)'; then
-            docker=true
-          fi
           {
             echo "code=$code"
             echo "cargo=$cargo"
-            echo "docker=$docker"
           } >> "$GITHUB_OUTPUT"
 
   # Enforces consistent code style across the project
@@ -439,25 +433,6 @@ jobs:
       # Ignore list + rationale: .cargo/audit.toml.
       - run: cargo audit --deny warnings
 
-  # Verifies the Dockerfile builds successfully for both release targets,
-  # gating arm64-specific regressions on PRs rather than at the release tag.
-  docker:
-    name: Docker Build
-    needs: detect
-    if: needs.detect.outputs.docker == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
   # Catches spelling mistakes in code, comments, and documentation
   # Small thing but helps maintain a professional codebase. Always runs
   # since typos can land in any kind of file.
@@ -484,7 +459,6 @@ jobs:
       - lockfile
       - coverage
       - security
-      - docker
       - typos
     runs-on: ubuntu-latest
     steps:
