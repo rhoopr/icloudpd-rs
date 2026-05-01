@@ -17,6 +17,12 @@ on:
         required: true
         type: string
 
+# Back-to-back main pushes: only the latest matters (same :main tag).
+# Release tags get their own group so they're never cancelled.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   docker:
     runs-on: ubuntu-latest

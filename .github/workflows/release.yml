@@ -1,14 +1,45 @@
 name: Release
 
 on:
-  release:
-    types: [created]
+  push:
+    tags: ['v*']
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Fast sanity checks before the expensive 5-target build matrix.
+  # Catches version mismatches, missing CHANGELOG, and new advisories
+  # before burning 15+ minutes of build time.
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+
+      - name: Verify CHANGELOG has entry for this version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+            echo "::error::No CHANGELOG.md entry found for version $VERSION"
+            exit 1
+          fi
+
+      - name: Security audit
+        run: cargo audit --deny warnings
+
   build:
+    needs: validate
     strategy:
       matrix:
         include:
@@ -129,18 +160,8 @@ jobs:
           NOTES=$(awk "/^## \[${VERSION}\]/{found=1; next} /^## \[|^---/{if(found) exit} found" CHANGELOG.md)
 
           if [ -z "$NOTES" ]; then
-            # Fall back to git log if CHANGELOG section not found
-            PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-            echo "notes<<EOF" >> $GITHUB_OUTPUT
-            if [ -z "$PREV_TAG" ]; then
-              echo "Initial release" >> $GITHUB_OUTPUT
-            else
-              echo "## Changes since $PREV_TAG" >> $GITHUB_OUTPUT
-              echo "" >> $GITHUB_OUTPUT
-              git log --pretty=format:"- %s" $PREV_TAG..HEAD >> $GITHUB_OUTPUT
-              echo "" >> $GITHUB_OUTPUT
-            fi
-            echo "EOF" >> $GITHUB_OUTPUT
+            echo "::error::CHANGELOG.md section for $VERSION is empty"
+            exit 1
           else
             echo "notes<<EOF" >> $GITHUB_OUTPUT
             echo "$NOTES" >> $GITHUB_OUTPUT
