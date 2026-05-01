@@ -181,15 +181,15 @@ async fn read_bounded_error_body(resp: reqwest::Response, url: &str) -> String {
 
 /// Shorten `body` to at most `MAX_PRESERVED_BODY` bytes without splitting
 /// a multi-byte UTF-8 character.
+#[expect(
+    clippy::string_slice,
+    reason = "floor_char_boundary guarantees the index is a valid char boundary"
+)]
 fn truncate_body(body: &str) -> String {
     if body.len() <= MAX_PRESERVED_BODY {
         return body.to_string();
     }
-    let mut end = MAX_PRESERVED_BODY;
-    while end > 0 && !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &body[..end])
+    format!("{}…", &body[..body.floor_char_boundary(MAX_PRESERVED_BODY)])
 }
 
 /// `CloudKit` server error codes that indicate a transient condition.

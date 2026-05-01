@@ -375,7 +375,7 @@ pub fn wait_for_stderr_line(
     use std::thread;
     use std::time::Instant;
 
-    let stderr = child.stderr.take().expect("child stderr must be piped");
+    let stderr = child.stderr.take()?;
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
         let mut buffered = BufReader::new(stderr);

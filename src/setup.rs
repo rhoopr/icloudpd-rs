@@ -651,6 +651,10 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
 // ── TOML generation ────────────────────────────────────────────────
 
+#[expect(
+    clippy::unused_result_ok,
+    reason = "writeln! to a String is infallible — .ok() is idiomatic fire-and-forget here"
+)]
 fn generate_toml(answers: &SetupAnswers) -> String {
     let mut out = String::with_capacity(2048);
 

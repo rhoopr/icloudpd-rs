@@ -149,6 +149,10 @@ pub fn decode_location_with_fallback(fields: &Value) -> Option<Location> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    reason = "comparing exact float constants in test fixtures"
+)]
 mod tests {
     use super::*;
     use serde_json::json;

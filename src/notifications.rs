@@ -276,7 +276,7 @@ async fn run_script(
         Ok(result?)
     } else {
         tracing::warn!("Notification script timed out, killing");
-        child.kill().await.ok();
+        let _ = child.kill().await;
         anyhow::bail!(
             "notification script timed out after {}s",
             SCRIPT_TIMEOUT.as_secs()

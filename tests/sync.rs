@@ -1,3 +1,7 @@
+#![allow(
+    clippy::string_slice,
+    reason = "test assertions on known-ASCII filenames"
+)]
 //! Sync tests with behavioral assertions (live iCloud API).
 //!
 //! Uses a test album in iCloud (default `kei-test`, override with

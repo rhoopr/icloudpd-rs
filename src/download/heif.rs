@@ -538,7 +538,7 @@ fn remap_point(file_offset: u64, ranges: &[(u64, u64, u64)]) -> Option<u64> {
 
 fn encoded_size(atom: &Any) -> u64 {
     let mut sink = Vec::new();
-    atom.encode(&mut sink).ok();
+    let _ = atom.encode(&mut sink);
     sink.len() as u64
 }
 

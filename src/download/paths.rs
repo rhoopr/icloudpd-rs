@@ -6,6 +6,10 @@ use base64::Engine;
 use chrono::{DateTime, Local};
 use rustc_hash::FxHashMap;
 
+#[expect(
+    clippy::string_slice,
+    reason = "indices from starts_with/ends_with on ASCII literals are always char-aligned"
+)]
 /// Strip the legacy Python-style `{:%Y/%m/%d}` wrapper, returning the inner
 /// format string. Returns the input unchanged if the wrapper is absent.
 pub(crate) fn strip_python_wrapper(folder_structure: &str) -> &str {
@@ -86,6 +90,10 @@ pub(crate) fn local_download_path(
 /// Maximum filename length in bytes for common filesystems (ext4, APFS, NTFS).
 const MAX_FILENAME_BYTES: usize = 255;
 
+#[expect(
+    clippy::string_slice,
+    reason = "indices from rfind('.') and floor_char_boundary are always char-aligned"
+)]
 /// Clean a filename by replacing characters that are invalid on common
 /// filesystems (`/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`) and control
 /// characters (including NUL) with `_`. Truncates filenames exceeding 255
@@ -266,6 +274,10 @@ const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
     ("org.webmproject.webp", "WEBP"),
 ];
 
+#[expect(
+    clippy::string_slice,
+    reason = "index from rfind('.') is always char-aligned"
+)]
 /// Replace a filename's extension based on the UTI `asset_type` string.
 ///
 /// If `asset_type` is found in `ITEM_TYPE_EXTENSIONS`, the filename's extension
@@ -282,6 +294,7 @@ pub(crate) fn map_filename_extension(filename: &str, asset_type: &str) -> String
     }
 }
 
+#[expect(clippy::string_slice, reason = "base64 output is pure ASCII")]
 /// Compute the first 7 characters of the base64-encoded asset ID.
 ///
 /// Used by the `name-id7` file match policy to create unique filenames.
@@ -310,6 +323,10 @@ pub(crate) fn apply_name_id7(filename: &str, id: &str) -> String {
     }
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "ext[1..] skips '.' from rfind — always char-aligned"
+)]
 /// Generate a live photo MOV filename using the "suffix" policy.
 ///
 /// For HEIC files: `photo.HEIC` → `photo_HEVC.MOV`
@@ -378,6 +395,10 @@ pub(crate) fn generate_fingerprint_filename(asset_id: &str, asset_type: &str) ->
     reason = "every `bytes[i + k]` read below is preceded by an `i + k < len` check or a \
               `bytes[i] < 0x80` ASCII guard that makes `i + 1 <= len`; the UTF-8 fallback \
               slice `s[i..]` is valid because `i < len` and we land on a char boundary"
+)]
+#[expect(
+    clippy::string_slice,
+    reason = "s[i..] always lands on a char boundary: i advances by known UTF-8 sequence lengths"
 )]
 pub(crate) fn normalize_ampm(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -586,6 +607,10 @@ pub(crate) fn live_photo_mov_path_original(filename: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::string_slice,
+    reason = "test assertions on known-safe string indices"
+)]
 mod tests {
     use super::*;
     use chrono::TimeZone;

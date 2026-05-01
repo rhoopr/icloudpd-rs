@@ -388,14 +388,14 @@ pub async fn authenticate_srp(
 
     let body: super::responses::SrpInitResponse = response.json().with_context(|| {
         let text = response.text();
-        let mut n = text.len().min(200);
-        while n > 0 && !text.is_char_boundary(n) {
-            n -= 1;
-        }
+        #[expect(
+            clippy::string_slice,
+            reason = "floor_char_boundary guarantees a valid boundary"
+        )]
+        let preview = &text[..text.floor_char_boundary(200)];
         format!(
             "SRP init: expected JSON but got (HTTP {}): {:?}",
-            response.status,
-            &text[..n]
+            response.status, preview
         )
     })?;
 

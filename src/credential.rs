@@ -246,7 +246,7 @@ impl CredentialStore {
         let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
         let cipher =
             Aes256Gcm::new_from_slice(&key_bytes).context("Failed to create AES cipher")?;
-        let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_e| {
             anyhow::anyhow!("Failed to decrypt credential (wrong key or corrupt file)")
         })?;
 
