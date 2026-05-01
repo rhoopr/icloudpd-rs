@@ -734,6 +734,7 @@ fn parse_env_watch_interval(
     raw: Result<String, std::env::VarError>,
 ) -> anyhow::Result<Option<u64>> {
     match raw {
+        Ok(s) if s.is_empty() => Ok(None),
         Ok(s) => Some(s.parse::<u64>().map_err(|e| {
             anyhow::anyhow!("{ENV_WATCH_INTERVAL} is not a valid integer ({s:?}): {e}")
         }))
@@ -4019,6 +4020,14 @@ mod tests {
     #[test]
     fn test_parse_env_watch_interval_not_present() {
         let parsed = parse_env_watch_interval(Err(std::env::VarError::NotPresent)).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    // Empty string == unset. Lets `docker run -e KEI_WATCH_WITH_INTERVAL=`
+    // override the image's baked-in 24h default for one-shot invocations.
+    #[test]
+    fn test_parse_env_watch_interval_empty_is_unset() {
+        let parsed = parse_env_watch_interval(Ok(String::new())).unwrap();
         assert!(parsed.is_none());
     }
 

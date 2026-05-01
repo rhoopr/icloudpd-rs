@@ -574,7 +574,7 @@ fn import_bails_on_missing_download_dir() {
         .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Directory does not exist"));
+        .stderr(predicate::str::contains("Cannot read download directory"));
     });
 }
 
