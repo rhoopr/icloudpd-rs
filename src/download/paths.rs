@@ -1409,18 +1409,18 @@ mod tests {
             .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
             .unwrap();
         let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("Trip/2024"));
-        let result_str = result.to_str().unwrap();
         assert!(
-            result_str.starts_with("/photos/"),
-            "path must stay under the root, got: {result_str}"
+            result.starts_with(dir),
+            "path must stay under the root, got: {result:?}"
+        );
+        let filename_part = result.to_string_lossy();
+        assert!(
+            !filename_part.contains("Trip/2024"),
+            "slash in album name must be sanitized, got: {filename_part}"
         );
         assert!(
-            !result_str.contains("Trip/2024"),
-            "slash in album name must be sanitized, got: {result_str}"
-        );
-        assert!(
-            result_str.contains("Trip_2024"),
-            "slash should become underscore, got: {result_str}"
+            filename_part.contains("Trip_2024"),
+            "slash should become underscore, got: {filename_part}"
         );
     }
 
@@ -1433,14 +1433,14 @@ mod tests {
 
         for album in ["../etc", "../../passwd", "..", "a/../b"] {
             let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some(album));
-            let result_str = result.to_str().unwrap();
             assert!(
-                result_str.starts_with("/photos/"),
-                "album={album:?}: path must start with root, got: {result_str}"
+                result.starts_with(dir),
+                "album={album:?}: path must start with root, got: {result:?}"
             );
+            let lossy = result.to_string_lossy();
             assert!(
-                !result_str.contains(".."),
-                "album={album:?}: traversal must be neutralized, got: {result_str}"
+                !lossy.contains(".."),
+                "album={album:?}: traversal must be neutralized, got: {lossy}"
             );
         }
     }
