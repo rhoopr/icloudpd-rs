@@ -345,7 +345,7 @@ fn verify_detects_missing_files() {
             "need files to delete for missing-file test"
         );
         for entry in files {
-            std::fs::remove_file(&entry).ok();
+            let _ = std::fs::remove_file(&entry);
         }
 
         verify_cmd(&username, &cookie_dir)

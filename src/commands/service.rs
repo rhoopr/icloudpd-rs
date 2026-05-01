@@ -163,7 +163,7 @@ pub(crate) async fn attempt_reauth(
         auth::validate_session(&mut session, domain),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Session validation timed out after 30s"))??;
+    .map_err(|_e| anyhow::anyhow!("Session validation timed out after 30s"))??;
     if valid {
         tracing::debug!("Session still valid after re-validation");
         return Ok(());
@@ -983,6 +983,10 @@ mod tests {
         // Keep the temp dir alive for the session's lifetime.
         // We intentionally leak it here; the OS cleans it up on process exit
         // and these are short-lived tests.
+        #[allow(
+            clippy::mem_forget,
+            reason = "intentional leak — temp dir must outlive session"
+        )]
         std::mem::forget(dir);
         let data = auth::responses::AccountLoginResponse {
             ds_info: None,

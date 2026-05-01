@@ -156,6 +156,14 @@ const EXIT_AUTH: u8 = 3;
 #[error("{0} downloads failed")]
 struct PartialSyncError(usize);
 
+#[expect(
+    clippy::string_slice,
+    reason = "floor_char_boundary guarantees a valid char boundary"
+)]
+pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    &s[..s.floor_char_boundary(max_bytes)]
+}
+
 /// Query available disk space on the filesystem containing `path`.
 ///
 /// Returns `None` if the statvfs call fails (e.g. path doesn't exist yet).
@@ -173,16 +181,16 @@ pub(crate) fn available_disk_space(path: &Path) -> Option<u64> {
     }
 
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: statvfs is zeroed before the call. libc::statvfs writes into
-    // the provided buffer and does not retain the pointer. c_path is valid
-    // for the duration of the call.
-    unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &raw mut stat) != 0 {
-            return None;
-        }
-        Some(widen(stat.f_bavail) * widen(stat.f_frsize))
+    // SAFETY: zeroed is valid for libc::statvfs (all-zero bit pattern is a
+    // valid struct — every field is an integer type).
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid NUL-terminated C string that outlives the
+    // call. statvfs writes into the provided buffer and does not retain the
+    // pointer.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) } != 0 {
+        return None;
     }
+    Some(widen(stat.f_bavail) * widen(stat.f_frsize))
 }
 
 #[cfg(not(unix))]

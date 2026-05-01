@@ -434,11 +434,10 @@ pub async fn validate_token(
     tracing::debug!("Session token is still valid");
     let text = read_response_body(response, "validate_token body").await;
     let data: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
-        let mut n = text.len().min(200);
-        while n > 0 && !text.is_char_boundary(n) {
-            n -= 1;
-        }
-        format!("Validate: expected JSON but got: {:?}", &text[..n])
+        format!(
+            "Validate: expected JSON but got: {:?}",
+            crate::truncate_str(&text, 200)
+        )
     })?;
     data.check_errors()?;
     Ok(data)
@@ -481,11 +480,10 @@ pub async fn authenticate_with_token(
 
     let text = read_response_body(response, "accountLogin body").await;
     let body: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
-        let mut n = text.len().min(200);
-        while n > 0 && !text.is_char_boundary(n) {
-            n -= 1;
-        }
-        format!("Account login: expected JSON but got: {:?}", &text[..n])
+        format!(
+            "Account login: expected JSON but got: {:?}",
+            crate::truncate_str(&text, 200)
+        )
     })?;
 
     // Check for body-level error indicators before proceeding

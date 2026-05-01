@@ -38,7 +38,7 @@ pub(crate) fn parse_bandwidth_limit(s: &str) -> Result<u64, String> {
     let (num_str, suffix) = trimmed.split_at(num_end);
     let n: f64 = num_str
         .parse()
-        .map_err(|_| format!("invalid bandwidth number `{num_str}`"))?;
+        .map_err(|_e| format!("invalid bandwidth number `{num_str}`"))?;
     if !n.is_finite() || n < 0.0 {
         return Err(format!(
             "invalid bandwidth number `{num_str}`: must be a finite non-negative number"
@@ -132,7 +132,7 @@ pub(crate) fn parse_recent_limit(s: &str) -> Result<RecentLimit, String> {
     };
     let n: u32 = num_str
         .parse()
-        .map_err(|_| format!("expected a positive integer or `Nd` form (got `{s}`)"))?;
+        .map_err(|_e| format!("expected a positive integer or `Nd` form (got `{s}`)"))?;
     if n == 0 {
         return Err(format!("must be greater than zero (got `{s}`)"));
     }
@@ -1149,6 +1149,11 @@ impl Command {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::undocumented_unsafe_blocks,
+    reason = "env var ops in tests are sequenced under a mutex — splitting/documenting adds noise"
+)]
 mod tests {
     use super::*;
     use clap::Parser;

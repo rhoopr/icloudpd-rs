@@ -1,3 +1,7 @@
+#![allow(
+    clippy::string_slice,
+    reason = "test assertions on known-ASCII filenames"
+)]
 //! Live `import-existing` tests against the real Apple CloudKit API.
 //!
 //! Strategy:

@@ -1676,7 +1676,7 @@ pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>>
     if let Some(days_str) = s.strip_suffix('d') {
         if let Ok(days) = days_str.parse::<u64>() {
             let days =
-                i64::try_from(days).map_err(|_| anyhow::anyhow!("interval '{s}' is too large"))?;
+                i64::try_from(days).map_err(|_e| anyhow::anyhow!("interval '{s}' is too large"))?;
             return Ok(Local::now() - chrono::Duration::days(days));
         }
     }

@@ -555,6 +555,7 @@ fn encode_altitude(meters: f64) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unused_result_ok, reason = "test cleanup is best-effort")]
 mod tests {
     use super::*;
     use std::fs;

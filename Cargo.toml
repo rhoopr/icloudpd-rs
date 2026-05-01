@@ -177,33 +177,53 @@ path = "tests/state_auth.rs"
 # Baseline lint group. Lower priority so individual lints below can override.
 all = { level = "warn", priority = -1 }
 
-# Locking footguns: holding a std::sync lock across .await deadlocks.
-# Same failure class as #249's blocking_lock panic.
-await_holding_lock = "warn"
-
-# Panic footguns. Tests scope these off inside `#[cfg(test)] mod tests`.
+# ── Don't Panic ───────────────────────────────────────────────────────
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"
 unimplemented = "warn"
 unreachable = "warn"
+get_unwrap = "warn"
+indexing_slicing = "warn"
+string_slice = "warn"
+unwrap_in_result = "warn"
+panic_in_result_fn = "warn"
 
-# Logging hygiene. `tracing` is the only approved logger. Allowed with reasons
-# in the stdout-producing CLI subcommands and a few pre-tracing paths.
-print_stdout = "warn"
-print_stderr = "warn"
-dbg_macro = "warn"
+# ── Don't Fail Silently ───────────────────────────────────────────────
+let_underscore_future = "warn"
+unused_result_ok = "warn"
+map_err_ignore = "warn"
 
-# Numeric-cast correctness. Every remaining site has a reviewed `#[allow]` + reason.
+# ── Don't Do Bad Async Stuff ─────────────────────────────────────────
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+large_futures = "warn"
+
+# ── Don't Do Unsafe Things with Memory ────────────────────────────────
+mem_forget = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+
+# ── Don't Do Bad Things with Numbers ─────────────────────────────────
 cast_possible_truncation = "warn"
 cast_precision_loss = "warn"
 cast_sign_loss = "warn"
+float_cmp = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+invalid_upcast_comparisons = "warn"
 
-# `[]` / `[..]` panic footguns. Refactor to `.get()` / `.first()` / pattern
-# match, or scope an `#[allow]` with a comment naming the invariant.
-indexing_slicing = "warn"
+# ── Don't Do Bad Things That Are Easy to Avoid ────────────────────────
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+iter_not_returning_iterator = "warn"
+expl_impl_clone_on_copy = "warn"
+dbg_macro = "warn"
 
-# Flags std API calls stabilized after the declared `rust-version`. Would
-# have caught #259's floor_char_boundary use at PR time, not at user build.
+# ── Logging hygiene ──────────────────────────────────────────────────
+print_stdout = "warn"
+print_stderr = "warn"
+
+# ── MSRV ─────────────────────────────────────────────────────────────
 incompatible_msrv = "warn"

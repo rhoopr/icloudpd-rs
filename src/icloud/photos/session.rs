@@ -185,11 +185,7 @@ fn truncate_body(body: &str) -> String {
     if body.len() <= MAX_PRESERVED_BODY {
         return body.to_string();
     }
-    let mut end = MAX_PRESERVED_BODY;
-    while end > 0 && !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &body[..end])
+    format!("{}…", crate::truncate_str(body, MAX_PRESERVED_BODY))
 }
 
 /// `CloudKit` server error codes that indicate a transient condition.

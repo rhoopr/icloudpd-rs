@@ -37,8 +37,13 @@ const MAX_SANITIZED_USERNAME_LEN: usize = 64;
 
 /// Sanitize a username by keeping only word characters (alphanumeric + underscore).
 /// Equivalent to Python's `re.match(r"\w", c)` filter.
+///
 /// Truncates to [`MAX_SANITIZED_USERNAME_LEN`] with a hash suffix if too long,
 /// preventing OS "File name too long" errors.
+#[expect(
+    clippy::string_slice,
+    reason = "indices from char_indices() are always valid char boundaries"
+)]
 pub fn sanitize_username(username: &str) -> String {
     let sanitized: String = username
         .chars()
