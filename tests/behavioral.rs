@@ -48,14 +48,17 @@ fn sanitize_username(username: &str) -> String {
         .collect()
 }
 
+/// Must match `src/state/schema.rs::SCHEMA_VERSION`. When the real schema
+/// bumps, update this constant AND the DDL below — `behavioral_schema_version_matches_binary`
+/// will fail if they drift.
+const BEHAVIORAL_SCHEMA_VERSION: i32 = 7;
+
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the latest schema from `src/state/schema.rs` so
 /// callers don't rely on the binary's migration path to fill in columns
-/// added after v1. Bump `SCHEMA_VERSION` and the DDL below together whenever
-/// schema.rs changes.
+/// added after v1. Bump `BEHAVIORAL_SCHEMA_VERSION` and the DDL below
+/// together whenever schema.rs changes.
 fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Connection {
-    const SCHEMA_VERSION: i32 = 4;
-
     let db_name = format!("{}.db", sanitize_username(username));
     let db_path = data_dir.join(db_name);
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -78,11 +81,38 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             last_error TEXT,
             local_checksum TEXT,
             download_checksum TEXT,
+            source TEXT NOT NULL DEFAULT 'icloud',
+            is_favorite INTEGER NOT NULL DEFAULT 0,
+            rating INTEGER,
+            latitude REAL,
+            longitude REAL,
+            altitude REAL,
+            orientation INTEGER,
+            duration_secs REAL,
+            timezone_offset INTEGER,
+            width INTEGER,
+            height INTEGER,
+            title TEXT,
+            keywords TEXT,
+            description TEXT,
+            media_subtype TEXT,
+            burst_id TEXT,
+            is_hidden INTEGER NOT NULL DEFAULT 0,
+            is_archived INTEGER NOT NULL DEFAULT 0,
+            modified_at INTEGER,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            deleted_at INTEGER,
+            provider_data TEXT,
+            metadata_hash TEXT,
+            metadata_write_failed_at INTEGER,
             PRIMARY KEY (id, version_size)
         );
         CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
         CREATE INDEX IF NOT EXISTS idx_assets_local_path ON assets(local_path);
         CREATE INDEX IF NOT EXISTS idx_assets_checksum ON assets(checksum);
+        CREATE INDEX IF NOT EXISTS idx_assets_metadata_hash
+            ON assets (metadata_hash) WHERE status = 'downloaded';
+
         CREATE TABLE IF NOT EXISTS sync_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             started_at INTEGER NOT NULL,
@@ -90,16 +120,31 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             assets_seen INTEGER DEFAULT 0,
             assets_downloaded INTEGER DEFAULT 0,
             assets_failed INTEGER DEFAULT 0,
-            interrupted INTEGER DEFAULT 0
+            interrupted INTEGER DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'running'
         );
+
         CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY NOT NULL,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS asset_albums (
+            asset_id   TEXT NOT NULL,
+            album_name TEXT NOT NULL,
+            source     TEXT NOT NULL,
+            PRIMARY KEY (asset_id, album_name, source)
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_people (
+            asset_id    TEXT NOT NULL,
+            person_name TEXT NOT NULL,
+            PRIMARY KEY (asset_id, person_name)
+        );
         ",
     )
     .unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+    conn.pragma_update(None, "user_version", BEHAVIORAL_SCHEMA_VERSION)
         .unwrap();
     conn
 }
@@ -3748,5 +3793,49 @@ fn reconcile_on_empty_db_prints_guidance_and_exits_clean() {
     assert!(
         stdout.contains("No state database") || stdout.contains("no state database"),
         "operator must see guidance when DB doesn't exist: {stdout}"
+    );
+}
+
+/// CG-8: Verify the behavioral test helper's schema stays in sync with the
+/// binary's migration path. If schema.rs bumps to v8+, this test fails until
+/// BEHAVIORAL_SCHEMA_VERSION and the DDL in `create_state_db` are updated.
+#[test]
+fn behavioral_schema_version_matches_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = create_state_db(dir.path(), "schema_check@example.com");
+
+    let version: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        version, BEHAVIORAL_SCHEMA_VERSION,
+        "create_state_db must set user_version to BEHAVIORAL_SCHEMA_VERSION"
+    );
+
+    fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+        conn.prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .any(|name| name.is_ok_and(|n| n == column))
+    }
+
+    assert!(
+        has_column(&conn, "assets", "metadata_write_failed_at"),
+        "v6 column metadata_write_failed_at must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "sync_runs", "status"),
+        "v7 column sync_runs.status must exist in the behavioral helper's DDL"
+    );
+
+    let has_asset_albums: bool = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='asset_albums'")
+        .unwrap()
+        .exists([])
+        .unwrap();
+    assert!(
+        has_asset_albums,
+        "v5 table asset_albums must exist in the behavioral helper's DDL"
     );
 }

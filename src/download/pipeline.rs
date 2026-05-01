@@ -1541,6 +1541,7 @@ pub(super) async fn build_download_outcome(
         let stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             skipped: skip_breakdown,
+            enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
             ..super::SyncStats::default()
@@ -1552,10 +1553,10 @@ pub(super) async fn build_download_outcome(
         } else {
             tracing::info!("No new photos to download");
         }
-        if retry_exhausted > 0 && !config.dry_run {
+        if (retry_exhausted > 0 || enumeration_errors > 0) && !config.dry_run {
             return Ok((
                 DownloadOutcome::PartialFailure {
-                    failed_count: retry_exhausted,
+                    failed_count: retry_exhausted + enumeration_errors,
                 },
                 stats,
             ));
@@ -3826,5 +3827,37 @@ mod tests {
             1,
             "marker must survive when the file is absent so a future sync retries"
         );
+    }
+
+    /// When zero assets were downloaded but the producer saw enumeration
+    /// errors (e.g. malformed API page), `build_download_outcome` must
+    /// return `PartialFailure` — not `Success`. Before the fix, the
+    /// zero-download branch ignored `enumeration_errors`, letting the
+    /// sync-token advance and silently skipping the errored assets.
+    #[tokio::test]
+    async fn zero_downloads_with_enumeration_errors_returns_partial_failure() {
+        use crate::download::{DownloadConfig, DownloadOutcome};
+
+        let streaming_result = StreamingResult {
+            enumeration_errors: 3,
+            ..StreamingResult::default()
+        };
+        let client = reqwest::Client::new();
+        let config = Arc::new(DownloadConfig::test_default());
+        let (outcome, stats) = build_download_outcome(
+            &client,
+            &[],
+            &config,
+            streaming_result,
+            Instant::now(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("should not error");
+        assert!(
+            matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 3 }),
+            "expected PartialFailure with failed_count=3, got {outcome:?}"
+        );
+        assert_eq!(stats.enumeration_errors, 3);
     }
 }

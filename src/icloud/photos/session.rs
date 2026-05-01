@@ -1272,4 +1272,57 @@ mod tests {
             preserved.len()
         );
     }
+
+    #[tokio::test]
+    async fn retry_post_persistent_503_terminates_within_max_attempts() {
+        struct Always503 {
+            call_count: std::sync::atomic::AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl PhotosSession for Always503 {
+            async fn post(
+                &self,
+                _url: &str,
+                _body: String,
+                _headers: &[(&str, &str)],
+            ) -> anyhow::Result<Value> {
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({
+                    "serverErrorCode": "TRY_AGAIN_LATER",
+                    "reason": "Service Unavailable"
+                }))
+            }
+
+            fn clone_box(&self) -> Box<dyn PhotosSession> {
+                panic!("not needed for test")
+            }
+        }
+
+        let session = Always503 {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        };
+        let config = RetryConfig {
+            max_retries: 4,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+
+        let result = retry_post(&session, "https://example.com/api", "{}", &[], &config).await;
+        assert!(result.is_err(), "persistent 503 must eventually fail");
+
+        let err = result.unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert!(
+            ck_err.retryable,
+            "final error must still be tagged retryable"
+        );
+
+        let total_calls = session.call_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            total_calls, 5,
+            "must be exactly max_retries + 1 = 5 attempts, got {total_calls}"
+        );
+    }
 }

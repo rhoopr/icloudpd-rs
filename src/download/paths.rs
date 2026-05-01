@@ -1401,4 +1401,65 @@ mod tests {
         let result = local_download_path(dir, "%Y/%m/%d", &date, "photo.jpg", Some("Vacation"));
         assert_eq!(result, PathBuf::from("/photos/2025/06/15/photo.jpg"));
     }
+
+    #[test]
+    fn album_with_slash_does_not_create_subdirectory() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("Trip/2024"));
+        assert!(
+            result.starts_with(dir),
+            "path must stay under the root, got: {result:?}"
+        );
+        let filename_part = result.to_string_lossy();
+        assert!(
+            !filename_part.contains("Trip/2024"),
+            "slash in album name must be sanitized, got: {filename_part}"
+        );
+        assert!(
+            filename_part.contains("Trip_2024"),
+            "slash should become underscore, got: {filename_part}"
+        );
+    }
+
+    #[test]
+    fn album_with_traversal_stays_inside_sync_root() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+
+        for album in ["../etc", "../../passwd", "..", "a/../b"] {
+            let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some(album));
+            assert!(
+                result.starts_with(dir),
+                "album={album:?}: path must start with root, got: {result:?}"
+            );
+            let lossy = result.to_string_lossy();
+            assert!(
+                !lossy.contains(".."),
+                "album={album:?}: traversal must be neutralized, got: {lossy}"
+            );
+        }
+    }
+
+    #[test]
+    fn album_with_traversal_composed_with_date_tokens() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = local_download_dir(dir, "{album}/%Y/%m", &date, Some("../etc"));
+        assert!(
+            result.starts_with(dir),
+            "traversal album composed with date tokens must stay inside root, got: {result:?}"
+        );
+        let components: Vec<_> = result.strip_prefix(dir).unwrap().components().collect();
+        assert!(
+            components.len() >= 2,
+            "should have album + year + month components, got: {components:?}"
+        );
+    }
 }

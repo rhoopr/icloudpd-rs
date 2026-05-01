@@ -593,7 +593,7 @@ pub enum ListCommand {
 }
 
 /// Password management actions.
-#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordAction {
     /// Store a password in the credential store (prompts interactively)
     Set,
