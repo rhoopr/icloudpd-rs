@@ -3836,12 +3836,14 @@ mod tests {
     /// sync-token advance and silently skipping the errored assets.
     #[tokio::test]
     async fn zero_downloads_with_enumeration_errors_returns_partial_failure() {
+        use crate::download::{DownloadConfig, DownloadOutcome};
+
         let streaming_result = StreamingResult {
             enumeration_errors: 3,
             ..StreamingResult::default()
         };
         let client = reqwest::Client::new();
-        let config = Arc::new(super::super::DownloadConfig::test_default());
+        let config = Arc::new(DownloadConfig::test_default());
         let (outcome, stats) = build_download_outcome(
             &client,
             &[],
@@ -3853,10 +3855,7 @@ mod tests {
         .await
         .expect("should not error");
         assert!(
-            matches!(
-                outcome,
-                super::super::DownloadOutcome::PartialFailure { failed_count: 3 }
-            ),
+            matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 3 }),
             "expected PartialFailure with failed_count=3, got {outcome:?}"
         );
         assert_eq!(stats.enumeration_errors, 3);

@@ -3812,25 +3812,20 @@ fn behavioral_schema_version_matches_binary() {
         "create_state_db must set user_version to BEHAVIORAL_SCHEMA_VERSION"
     );
 
-    let has_metadata_write_failed_at: bool = conn
-        .prepare("PRAGMA table_info(assets)")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .any(|name| name.is_ok_and(|n| n == "metadata_write_failed_at"));
+    fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+        conn.prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .any(|name| name.is_ok_and(|n| n == column))
+    }
+
     assert!(
-        has_metadata_write_failed_at,
+        has_column(&conn, "assets", "metadata_write_failed_at"),
         "v6 column metadata_write_failed_at must exist in the behavioral helper's DDL"
     );
-
-    let has_sync_runs_status: bool = conn
-        .prepare("PRAGMA table_info(sync_runs)")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .any(|name| name.is_ok_and(|n| n == "status"));
     assert!(
-        has_sync_runs_status,
+        has_column(&conn, "sync_runs", "status"),
         "v7 column sync_runs.status must exist in the behavioral helper's DDL"
     );
 
