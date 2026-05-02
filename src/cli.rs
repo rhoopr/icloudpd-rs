@@ -515,9 +515,13 @@ pub struct ImportArgs {
     #[command(flatten)]
     pub password: PasswordArgs,
 
-    /// Library to import (default: PrimarySync, use "all" for all libraries)
-    #[arg(long, env = "KEI_LIBRARY")]
-    pub library: Option<String>,
+    /// Library/libraries to import. Repeatable; default `primary`. Same value
+    /// grammar as `kei sync --library`: a CloudKit zone name (full UUID or
+    /// the truncated 8-char `SharedSync-` prefix that `{library}` renders
+    /// into paths), the sentinels `primary` / `shared` / `all` / `none`, or
+    /// `!name` to exclude.
+    #[arg(long = "library", env = "KEI_LIBRARY", value_parser = non_empty_string)]
+    pub libraries: Vec<String>,
 
     /// Local directory containing existing downloads
     #[arg(short = 'd', long = "download-dir", env = "KEI_DOWNLOAD_DIR", value_parser = non_empty_string)]
@@ -2722,7 +2726,7 @@ mod tests {
     }
 
     #[test]
-    fn test_import_existing_library_flag() {
+    fn test_import_existing_library_flag_single() {
         let cli = Cli::try_parse_from([
             "kei",
             "import-existing",
@@ -2733,10 +2737,43 @@ mod tests {
         ])
         .unwrap();
         if let Some(Command::ImportExisting(args)) = cli.command {
-            assert_eq!(args.library.as_deref(), Some("SharedSync-ABCD1234"));
+            assert_eq!(args.libraries, vec!["SharedSync-ABCD1234".to_string()]);
         } else {
             panic!("Expected ImportExisting command");
         }
+    }
+
+    /// Parity check with `kei sync --library`: import-existing's flag is also
+    /// repeatable and accepts mixed sentinels, zone names, and `!name`
+    /// exclusions in one invocation. Pre-v0.13 the flag was a single
+    /// `Option<String>` and a second `--library` silently won, so
+    /// multi-library import had to be configured via TOML.
+    #[test]
+    fn test_import_existing_library_flag_repeatable_with_mixed_grammar() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "import-existing",
+            "--library",
+            "primary",
+            "--library",
+            "SharedSync-ABCD1234",
+            "--library",
+            "!SharedSync-Photos",
+            "--download-dir",
+            "/photos",
+        ])
+        .unwrap();
+        let Some(Command::ImportExisting(args)) = cli.command else {
+            panic!("Expected ImportExisting command");
+        };
+        assert_eq!(
+            args.libraries,
+            vec![
+                "primary".to_string(),
+                "SharedSync-ABCD1234".to_string(),
+                "!SharedSync-Photos".to_string(),
+            ]
+        );
     }
 
     // ── import-existing path-derivation flags ──────────────────────────

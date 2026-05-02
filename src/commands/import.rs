@@ -382,8 +382,7 @@ pub(crate) async fn run_import_existing(
 
     // Resolve library selection (CLI > TOML > default `primary`)
     let toml_filters = toml.and_then(|t| t.filters.as_ref());
-    let cli_libraries = args.library.iter().cloned().collect();
-    let selector = config::resolve_library_selector(cli_libraries, toml_filters)?;
+    let selector = config::resolve_library_selector(args.libraries.clone(), toml_filters)?;
     let libraries = resolve_libraries(&selector, &mut photos_service).await?;
 
     // Album / smart-folder / unfiled selection comes from TOML for
@@ -482,16 +481,45 @@ pub(crate) async fn run_import_existing(
 /// `unfiled = true`). The `LibrarySelector` was already resolved upstream
 /// and is threaded in directly so `Selection.libraries` matches what
 /// `resolve_libraries` walked.
+///
+/// Honours the same deprecated `[filters]` keys that `Config::build` does
+/// for `kei sync` -- singular `album`, and `exclude_albums` -- so a TOML
+/// that hasn't been migrated to the v0.13 array shape produces the same
+/// `Selection` for both commands. Without this, sync would scope to e.g.
+/// `Vacation` minus `Drafts` while import-existing silently fell back to
+/// the all-albums default.
 fn build_import_selection(
     toml_filters: Option<&config::TomlFilters>,
     libraries: &crate::selection::LibrarySelector,
 ) -> anyhow::Result<crate::selection::Selection> {
     use crate::selection::{parse_album_selector, parse_smart_folder_selector, Selection};
 
-    let raw_albums: Vec<String> = toml_filters
+    let toml_album_singular = toml_filters.and_then(|f| f.album.clone());
+    if toml_album_singular.is_some() {
+        config::warn_deprecated(
+            "`[filters].album` (singular string)",
+            "`[filters].albums = [\"name\"]` (array)",
+        );
+    }
+    let toml_exclude_albums = toml_filters.and_then(|f| f.exclude_albums.clone());
+    if toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty()) {
+        config::warn_deprecated(
+            "`[filters].exclude_albums`",
+            "`!name` entries inside `[filters].albums`",
+        );
+    }
+    // Array form wins; lift the singular only when the array is absent so
+    // a user who set both during migration doesn't lose the array shape.
+    let mut raw_albums: Vec<String> = toml_filters
         .and_then(|f| f.albums.as_ref())
         .cloned()
+        .or_else(|| toml_album_singular.map(|s| vec![s]))
         .unwrap_or_default();
+    if let Some(excludes) = toml_exclude_albums {
+        for name in excludes {
+            raw_albums.push(format!("!{name}"));
+        }
+    }
     let raw_smart_folders: Vec<String> = toml_filters
         .and_then(|f| f.smart_folders.as_ref())
         .cloned()
@@ -594,6 +622,159 @@ fn build_import_download_config(
         args.dry_run,
         args.no_progress_bar,
     ))
+}
+
+#[cfg(test)]
+mod build_selection_tests {
+    //! Sync vs. import-existing parity for the v0.13 selector resolution. Both
+    //! commands must produce the same `Selection` from the same TOML, including
+    //! the deprecated singular `[filters].album` key and the deprecated
+    //! `[filters].exclude_albums` array. Without parity, a user with a TOML
+    //! that hasn't been migrated yet would see sync include an album that
+    //! import-existing silently skipped (or vice-versa for excludes).
+    use super::build_import_selection;
+    use crate::config::TomlFilters;
+    use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+    use std::collections::BTreeSet;
+
+    fn primary() -> LibrarySelector {
+        LibrarySelector::default()
+    }
+
+    /// `[filters].album = "Foo"` (singular, deprecated) should resolve to the
+    /// same `AlbumSelector::Named { ["Foo"], excluded: {} }` that
+    /// `[filters].albums = ["Foo"]` produces. Pre-fix, import-existing read
+    /// only the array form so the singular silently fell through to the
+    /// "all albums" default.
+    #[test]
+    fn deprecated_album_singular_lifts_to_named_selector() {
+        let filters = TomlFilters {
+            album: Some("Vacation".to_string()),
+            ..TomlFilters::default()
+        };
+        let selection = build_import_selection(Some(&filters), &primary())
+            .expect("build_import_selection accepts deprecated singular `album`");
+        match selection.albums {
+            AlbumSelector::Named { included, excluded } => {
+                assert_eq!(
+                    included,
+                    BTreeSet::from(["Vacation".to_string()]),
+                    "singular `[filters].album` must lift into the named-include set"
+                );
+                assert!(
+                    excluded.is_empty(),
+                    "no excludes were configured; the lift must not invent any"
+                );
+            }
+            other => panic!("expected AlbumSelector::Named, got {other:?}"),
+        }
+    }
+
+    /// `[filters].exclude_albums = ["Drafts"]` (deprecated) should fold into
+    /// the active selector as a `!Drafts` entry. Pre-fix, the deprecated
+    /// excludes were silently dropped on the import-existing path.
+    #[test]
+    fn deprecated_exclude_albums_fold_into_inline_excludes() {
+        let filters = TomlFilters {
+            albums: Some(vec!["all".to_string()]),
+            exclude_albums: Some(vec!["Drafts".to_string(), "Hidden".to_string()]),
+            ..TomlFilters::default()
+        };
+        let selection = build_import_selection(Some(&filters), &primary())
+            .expect("build_import_selection accepts deprecated exclude_albums");
+        match selection.albums {
+            AlbumSelector::All { excluded } => {
+                assert_eq!(
+                    excluded,
+                    BTreeSet::from(["Drafts".to_string(), "Hidden".to_string()]),
+                    "exclude_albums entries must surface as inline `!name` excludes"
+                );
+            }
+            other => panic!("expected AlbumSelector::All, got {other:?}"),
+        }
+    }
+
+    /// Combined: deprecated singular `album` + deprecated `exclude_albums`
+    /// is the legacy v0.12 shape. Both must thread through together.
+    #[test]
+    fn deprecated_singular_plus_excludes_combine() {
+        let filters = TomlFilters {
+            album: Some("Vacation".to_string()),
+            exclude_albums: Some(vec!["Drafts".to_string()]),
+            ..TomlFilters::default()
+        };
+        let selection = build_import_selection(Some(&filters), &primary()).expect("ok");
+        match selection.albums {
+            AlbumSelector::Named { included, excluded } => {
+                assert_eq!(included, BTreeSet::from(["Vacation".to_string()]));
+                assert_eq!(excluded, BTreeSet::from(["Drafts".to_string()]));
+            }
+            other => panic!("expected AlbumSelector::Named, got {other:?}"),
+        }
+    }
+
+    /// New-shape input (array `albums`) keeps working unchanged. Sanity check
+    /// that the deprecation-handling rewrite didn't regress the v0.13 path.
+    #[test]
+    fn new_albums_array_still_works() {
+        let filters = TomlFilters {
+            albums: Some(vec!["Vacation".to_string(), "!Family".to_string()]),
+            ..TomlFilters::default()
+        };
+        let selection = build_import_selection(Some(&filters), &primary()).expect("ok");
+        match selection.albums {
+            AlbumSelector::Named { included, excluded } => {
+                assert_eq!(included, BTreeSet::from(["Vacation".to_string()]));
+                assert_eq!(excluded, BTreeSet::from(["Family".to_string()]));
+            }
+            other => panic!("expected AlbumSelector::Named, got {other:?}"),
+        }
+    }
+
+    /// When both the array and the singular are set (mid-migration TOML), the
+    /// array wins. Mirrors `Config::build`'s precedence so sync and import
+    /// can't disagree on which key takes effect.
+    #[test]
+    fn albums_array_wins_over_singular_when_both_set() {
+        let filters = TomlFilters {
+            album: Some("OLD".to_string()),
+            albums: Some(vec!["NEW".to_string()]),
+            ..TomlFilters::default()
+        };
+        let selection = build_import_selection(Some(&filters), &primary()).expect("ok");
+        match selection.albums {
+            AlbumSelector::Named { included, .. } => {
+                assert_eq!(
+                    included,
+                    BTreeSet::from(["NEW".to_string()]),
+                    "array form must take precedence over the deprecated singular"
+                );
+            }
+            other => panic!("expected AlbumSelector::Named, got {other:?}"),
+        }
+    }
+
+    /// Empty TOML filters → defaults from `Selection::default()`. This is the
+    /// no-config-file case and must match `kei sync` with no flags.
+    #[test]
+    fn no_filters_yields_default_selection() {
+        let selection = build_import_selection(None, &primary()).expect("ok");
+        assert_eq!(selection.albums, AlbumSelector::default());
+        assert_eq!(selection.smart_folders, SmartFolderSelector::None);
+        assert!(
+            selection.unfiled,
+            "unfiled defaults to true to match v0.13 sync semantics"
+        );
+        assert_eq!(
+            selection,
+            Selection {
+                albums: AlbumSelector::default(),
+                smart_folders: SmartFolderSelector::None,
+                libraries: primary(),
+                unfiled: true,
+            }
+        );
+    }
 }
 
 #[cfg(test)]

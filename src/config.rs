@@ -411,7 +411,7 @@ const fn unfiled_default() -> bool {
 /// Stderr deprecation warning, scheduled for removal in v0.20.0. `old` is the
 /// surface being deprecated (e.g. `` `--exclude-album` ``); `replacement` is
 /// the suggested new form.
-fn warn_deprecated(old: &str, replacement: &str) {
+pub(crate) fn warn_deprecated(old: &str, replacement: &str) {
     #[allow(
         clippy::print_stderr,
         reason = "runs during config load, before tracing subscriber is installed"
