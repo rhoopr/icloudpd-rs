@@ -186,7 +186,7 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 8). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 9). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version — otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of

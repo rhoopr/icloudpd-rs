@@ -307,11 +307,13 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_FORCE_SIZE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub force_size: Option<bool>,
 
-    /// Folder structure for organizing downloads (e.g., "%Y/%m/%d",
-    /// "{album}/%Y/%B", "none"). `{album}` must be the first segment and
-    /// may only appear once. When `{album}` is used without `-a`, kei
-    /// auto-syncs every user-created album plus a library-wide pass for
-    /// unfiled photos (where `{album}` collapses to empty).
+    /// Folder structure for the unfiled pass (default `%Y/%m/%d`; pass
+    /// "none" for a flat layout). Album passes use
+    /// `--folder-structure-albums` (default `{album}`); smart-folder
+    /// passes use `--folder-structure-smart-folders` (default
+    /// `{smart-folder}`). Legacy `{album}` in this template auto-migrates
+    /// to `--folder-structure-albums` with a deprecation warning; that
+    /// compat path is removed in v0.20.
     #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
 

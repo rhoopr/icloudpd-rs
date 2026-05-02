@@ -267,8 +267,9 @@ pub(crate) const DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS: &str = "{smart-folder}"
 /// Runs *before* the legacy-`{album}` auto-migration so the migration helper
 /// can rely on the placement guarantee when lifting the segment out.
 fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
+    use crate::download::paths::TOKEN_ALBUM;
     let stripped = crate::download::paths::strip_python_wrapper(folder_structure);
-    let count = stripped.matches("{album}").count();
+    let count = stripped.matches(TOKEN_ALBUM).count();
     if count == 0 {
         return Ok(());
     }
@@ -277,7 +278,7 @@ fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
             "'{{album}}' may only appear once in --folder-structure; got {count} occurrences in \"{folder_structure}\""
         );
     }
-    if stripped.split('/').next() != Some("{album}") {
+    if stripped.split('/').next() != Some(TOKEN_ALBUM) {
         anyhow::bail!(
             "'{{album}}' must be the first path segment of --folder-structure; got \"{folder_structure}\""
         );
@@ -514,8 +515,9 @@ fn auto_migrate_legacy_album_token(
     folder_structure_albums: String,
     folder_structure_albums_user_set: bool,
 ) -> LegacyAlbumTokenMigration {
+    use crate::download::paths::TOKEN_ALBUM;
     let stripped = crate::download::paths::strip_python_wrapper(&folder_structure);
-    if !stripped.contains("{album}") {
+    if !stripped.contains(TOKEN_ALBUM) {
         return LegacyAlbumTokenMigration {
             folder_structure,
             folder_structure_albums,
@@ -536,10 +538,10 @@ fn auto_migrate_legacy_album_token(
     // would-be-malformed input is the safe outcome: the unfiled pass gets
     // no date hierarchy, but no unstripped `{album}` token leaks back
     // into the renderer's base path.
-    let new_base = stripped
-        .strip_prefix("{album}/")
-        .map(str::to_string)
-        .unwrap_or_else(|| crate::download::paths::NO_DATE_STRUCTURE.to_string());
+    let new_base = match stripped.split_once('/') {
+        Some((first, rest)) if first == TOKEN_ALBUM => rest.to_string(),
+        _ => crate::download::paths::NO_DATE_STRUCTURE.to_string(),
+    };
 
     // Single-quoted form so users can paste the suggestion straight into
     // a POSIX shell. `{:?}` would emit Rust string escapes (\n, \u{...})
@@ -573,7 +575,9 @@ fn resolve_album_selection(
         // includes albums:all -- but we keep the deprecation warning until
         // v0.20 so users with `{album}` in their unfiled template know to
         // migrate to `--folder-structure-albums`.
-        if crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}") {
+        if crate::download::paths::strip_python_wrapper(folder_structure)
+            .contains(crate::download::paths::TOKEN_ALBUM)
+        {
             warn_deprecated(
                 "implicit `--album all` from `{album}` in `--folder-structure`",
                 "an explicit `--album all` (now the default)",
@@ -824,11 +828,11 @@ pub(crate) fn resolve_path_derivation_fields(
     let folder_structure_albums = cli
         .folder_structure_albums
         .or_else(|| toml_dl.and_then(|d| d.folder_structure_albums.clone()))
-        .unwrap_or_else(|| "{album}".to_string());
+        .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string());
     let folder_structure_smart_folders = cli
         .folder_structure_smart_folders
         .or_else(|| toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()))
-        .unwrap_or_else(|| "{smart-folder}".to_string());
+        .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string());
     let size = resolve(
         cli.size,
         toml_photos.and_then(|p| p.size),
