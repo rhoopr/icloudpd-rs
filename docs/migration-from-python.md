@@ -12,7 +12,16 @@ kei import-existing --username you@example.com --download-dir ~/Photos/iCloud
 
 This scans your local files and builds a SQLite state database so kei knows what's already been downloaded. The next `sync` run will only fetch what's new or previously failed.
 
-The import matches files by computing the expected path for each iCloud asset (using `--folder-structure` and `--download-dir`) and checking if a file exists at that path with a matching size. **If your folder structure or directory doesn't match what Python used, the import will silently count those files as unmatched** - it won't error out or download duplicates. The unmatched count is printed at the end. If most files show as unmatched, double-check that your `--folder-structure` matches your existing layout.
+The import matches files by computing the expected path for each iCloud asset (using your folder-structure flags and `--download-dir`) and checking if a file exists at that path with a matching size. **If your folder structure or directory doesn't match what Python used, the import will silently count those files as unmatched** - it won't error out or download duplicates. The unmatched count is printed at the end. If most files show as unmatched, double-check that your folder-structure flags match your existing layout.
+
+If your existing tree was produced with `icloudpd --folder-structure '{album}/%Y/%m/%d'`, point `--folder-structure-albums` at the same template:
+
+```sh
+kei import-existing --username you@example.com --download-dir ~/Photos/iCloud \
+  --folder-structure-albums '{album}/%Y/%m/%d'
+```
+
+`--folder-structure` (without the `-albums` suffix) only covers the unfiled-pass tree in v0.13. Putting `{album}` there still works but auto-migrates with a deprecation warning.
 
 The import is idempotent - running it multiple times is safe. It uses `upsert` operations, so re-importing the same files just updates the existing database entries.
 
@@ -34,10 +43,10 @@ Most flags are the same or very close. Here's the full mapping:
 |------|-------|
 | `-u, --username` | |
 | `-p, --password` | |
-| `-d, --download-dir` | Renamed from Python's `-d, --directory`. The old flag still parses (hidden, with a deprecation warning) — drop it on your next run. |
-| `-a, --album` | Multiple `--album` flags supported, same as Python |
+| `-d, --download-dir` | Renamed from Python's `-d, --directory`. The old flag still parses (hidden, with a deprecation warning); drop it on your next run. |
+| `-a, --album` | Repeatable, like Python. v0.13 adds sentinels (`all` / `none`) and `!name` to exclude. Default is `all` (every user album), so `kei sync` with no `-a` syncs everything; pass `--album '!Drafts'` to omit one album from `all`. |
 | `-l, --list-albums` | Deprecated; use `kei list albums` |
-| `--library` | Default library when none is specified: `PrimarySync`. Use `all` to sync every library at once. |
+| `--library` | Repeatable in v0.13. Sentinels: `primary` (default), `shared`, `all`, `none`. Accepts named zones (`PrimarySync`, full `SharedSync-...` UUID, or the truncated 8-char prefix kei renders into paths) and `!name` to exclude. |
 | `--list-libraries` | Deprecated; use `kei list libraries` |
 | `--recent` | |
 | `--skip-videos` | |
@@ -64,7 +73,7 @@ Most flags are the same or very close. Here's the full mapping:
 
 | Python | Rust | What changed |
 |--------|------|-------------|
-| `--folder-structure "{:%Y/%m/%d}"` | `--folder-structure "%Y/%m/%d"` | Both Python `{:%Y}` and plain `%Y` strftime syntax accepted. You can keep using the Python format. |
+| `--folder-structure "{:%Y/%m/%d}"` | `--folder-structure "%Y/%m/%d"` | Both Python `{:%Y}` and plain `%Y` strftime accepted. v0.13 splits the template into three flags by pass type: `--folder-structure` is the unfiled-pass template (default `%Y/%m/%d`), `--folder-structure-albums` is the album-pass template (default `{album}` flat), `--folder-structure-smart-folders` is the smart-folder-pass template (default `{smart-folder}` flat). `{album}` still works in `--folder-structure` but auto-migrates to `--folder-structure-albums` with a deprecation warning; that compat path is removed in v0.20. See [v0.13 migration guide](v0.13-migration.md) for details. |
 | `--size original` | `--size original` | Same values, but Python allows multiple `--size` flags (not yet supported in Rust - [#14](https://github.com/rhoopr/kei/issues/14)) |
 | `--cookie-directory ~/.pyicloud` | `--data-dir ~/.config/kei/` | New flag name and default path. `--cookie-directory` is still accepted (hidden from `--help`) but deprecated and will be removed in v0.20.0. |
 | `--threads-num` (deprecated, always 1) | `--threads 10` | Actually works in Rust. Default: 10 parallel downloads. kei's `--threads-num` is also deprecated (still parses, hidden, removal in v0.20.0); prefer `--threads`. |
@@ -110,10 +119,23 @@ Most flags are the same or very close. Here's the full mapping:
 | `config show` | Dump resolved config as TOML |
 | `config setup` | Interactive config wizard (was top-level `setup`) |
 | `--live-photo-mode` | Control live photo handling: `both`, `image-only`, `video-only`, `skip`. Replaces `--skip-live-photos`. |
-| `--exclude-album` | Exclude specific albums from sync. Multi-value. |
+| `--smart-folder` | Sync Apple smart folders (Favorites, Hidden, Screenshots, ...). Repeatable. Sentinels `all` (excludes Hidden + Recently Deleted) / `all-with-sensitive` / `none` (default). New in v0.13. |
+| `--unfiled` | Toggle the library-wide unfiled pass for photos not in any user album. Defaults to `true`. New in v0.13. |
+| `--folder-structure-albums` | Per-pass template for album folders. Default `{album}` (flat). New in v0.13. |
+| `--folder-structure-smart-folders` | Per-pass template for smart-folder folders. Default `{smart-folder}` (flat). New in v0.13. |
 | `--filename-exclude` | Exclude files by glob pattern (e.g., `*.AAE`, `Screenshot*`). Case-insensitive, multi-value. |
-| `{album}` in `--folder-structure` | Organize by album name: `--folder-structure "{album}/%Y/%m"`. |
+| `{library}` in any folder-structure template | Renders as `PrimarySync` or a truncated 8-char `SharedSync-A1B2C3D4` zone name. Useful with `--library all` to keep multi-library trees separate. |
 | `KEI_*` env vars | Every CLI flag has an env var (`KEI_DOWNLOAD_DIR`, `KEI_DATA_DIR`, `KEI_SIZE`, etc.). Useful for Docker. |
+
+### Deprecated, scheduled for removal
+
+| Flag / pattern | Replacement | Removal |
+|---|---|---|
+| `--exclude-album NAME` (and `KEI_EXCLUDE_ALBUM`) | `--album '!NAME'`. The comma-separated env form (`KEI_EXCLUDE_ALBUM=A,B`) doesn't carry over - use one `--album '!A' --album '!B'` per name, or set `[filters].albums = ["!A", "!B"]` in TOML. | v0.20 |
+| `{album}` in `--folder-structure` | Move to `--folder-structure-albums`. Auto-migrates with a startup warning. | v0.20 |
+| `[filters].album` (TOML, single string) | `[filters].albums` (array) | v0.20 |
+| `[filters].exclude_albums` (TOML) | `[filters].albums` with `!name` entries | v0.20 |
+| `[filters].library` (TOML, single string) | `[filters].libraries` (array) | v0.20 |
 
 ## Docker migration
 
