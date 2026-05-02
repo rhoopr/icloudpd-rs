@@ -224,8 +224,9 @@ pub struct SyncArgs {
     #[arg(short = 'a', long = "album", env = "KEI_ALBUM", value_parser = non_empty_string)]
     pub albums: Vec<String>,
 
-    /// Album(s) to exclude from sync
-    #[arg(long = "exclude-album", env = "KEI_EXCLUDE_ALBUM", value_delimiter = ',', value_parser = non_empty_string)]
+    /// Deprecated: use --album '!NAME' (will be removed in v0.20.0). Note:
+    /// --exclude-album splits on commas; --album does not.
+    #[arg(long = "exclude-album", env = "KEI_EXCLUDE_ALBUM", value_delimiter = ',', value_parser = non_empty_string, hide = true)]
     pub exclude_albums: Vec<String>,
 
     /// Smart folder(s) to download. Repeatable; default empty (smart folders

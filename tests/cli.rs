@@ -82,6 +82,17 @@ fn sync_help_hides_deprecated_directory_flag() {
 }
 
 #[test]
+fn sync_help_hides_deprecated_exclude_album_flag() {
+    // `--exclude-album` still parses for backward compat but must not appear
+    // in help output; users should only see `--album '!NAME'`.
+    common::cmd()
+        .args(["sync", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--exclude-album").not());
+}
+
+#[test]
 fn sync_help_hides_deprecated_sync_token_flags() {
     // Both `--no-incremental` (deprecated, use `kei reset sync-token`) and
     // `--reset-sync-token` (hidden compat, use `kei reset sync-token`) are

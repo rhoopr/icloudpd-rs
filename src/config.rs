@@ -423,6 +423,22 @@ fn warn_deprecated(old: &str, replacement: &str) {
     }
 }
 
+/// Follow-up note that fires alongside the `--exclude-album` deprecation
+/// warning. The legacy flag splits on commas; the replacement `--album` flag
+/// does not, so a mechanical rewrite of `--exclude-album A,B` to
+/// `--album '!A,!B'` would silently produce one literal album name.
+fn warn_exclude_album_comma_split() {
+    #[allow(
+        clippy::print_stderr,
+        reason = "runs during config load, before tracing subscriber is installed"
+    )]
+    {
+        eprintln!(
+            "note: --exclude-album splits on commas; --album does not. --exclude-album A,B becomes --album '!A' --album '!B' (two flags), not --album '!A,!B' (one literal name)."
+        );
+    }
+}
+
 /// Translate the legacy `(AlbumSelection, exclude_albums)` tuple plus the
 /// parsed library/smart-folder selectors into the v0.13
 /// [`crate::selection::Selection`]. Pure function so the truth table is
@@ -1431,6 +1447,7 @@ impl Config {
                 "`--exclude-album` / `KEI_EXCLUDE_ALBUM`",
                 "`--album '!NAME'`",
             );
+            warn_exclude_album_comma_split();
         }
         if toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty()) {
             warn_deprecated(
