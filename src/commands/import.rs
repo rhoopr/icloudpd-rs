@@ -20,7 +20,7 @@ use crate::state;
 use crate::state::StateDb;
 use crate::types::FileMatchPolicy;
 
-use super::service::{init_photos_service, resolve_libraries};
+use super::service::{init_photos_service, resolve_libraries, resolve_passes};
 
 /// Value of the `stage` field on the one-shot tracing event emitted by
 /// [`import_assets`] when the first asset is dequeued. Operators (and the
@@ -133,6 +133,7 @@ pub(crate) async fn import_assets<S>(
     library_label: &str,
     dry_run: bool,
     show_progress: bool,
+    dir_cache: &mut DirCache,
 ) -> anyhow::Result<ImportStats>
 where
     S: futures_util::Stream<Item = anyhow::Result<PhotoAsset>>,
@@ -141,9 +142,6 @@ where
 
     tokio::pin!(stream);
     let mut stats = ImportStats::default();
-    // One cache per library scan: each parent directory is read_dir'd at
-    // most once across all sibling probes.
-    let mut dir_cache = DirCache::new();
     let mut scan_started_emitted = false;
 
     while let Some(result) = stream.next().await {
@@ -225,7 +223,7 @@ where
                 &primary_path,
                 expected_size,
                 download_config.file_match_policy,
-                &mut dir_cache,
+                dir_cache,
             )
             .await
             {
@@ -265,6 +263,7 @@ where
                     })
                     .to_string();
                 let record = state::AssetRecord::new_pending(
+                    Arc::from(library_label),
                     asset.id().to_string(),
                     version_size,
                     checksum.to_string(),
@@ -381,9 +380,17 @@ pub(crate) async fn run_import_existing(
     let (_shared_session, mut photos_service) =
         init_photos_service(auth_result, retry::RetryConfig::default()).await?;
 
+    // Resolve library selection (CLI > TOML > default `primary`)
     let toml_filters = toml.and_then(|t| t.filters.as_ref());
-    let selection = config::resolve_library_selection(args.library.clone(), toml_filters);
-    let libraries = resolve_libraries(&selection, &mut photos_service).await?;
+    let selector = config::resolve_library_selector(args.libraries.clone(), toml_filters)?;
+    let libraries = resolve_libraries(&selector, &mut photos_service).await?;
+
+    // Album / smart-folder / unfiled selection comes from TOML for
+    // import-existing (which has no per-pass CLI flags of its own). The
+    // resulting `Selection` drives `resolve_passes` below so import iterates
+    // the same passes sync would, and each pass uses its own
+    // `folder_structure_*` template when deriving expected paths.
+    let selection = build_import_selection(toml_filters, &selector)?;
 
     let prior_db_total = db.get_summary().await?.total_assets;
     if prior_db_total > 0 && !args.force_empty {
@@ -412,24 +419,43 @@ pub(crate) async fn run_import_existing(
     }
 
     let mut totals = ImportStats::default();
+    // Hoisted across passes: a multi-album asset's parent dir is read_dir'd
+    // once per library scan, not once per pass.
+    let mut dir_cache = DirCache::new();
 
     for library in &libraries {
         let zone = library.zone_name();
         tracing::debug!(zone = %zone, "Scanning library");
-        let all_album = library.all();
-        let (stream, panic_rx) = all_album.photo_stream(recent_count, None, 1);
+        let library_config = download_config.with_library(zone);
 
-        let stats = import_assets(
-            stream,
-            panic_rx,
-            db.as_ref(),
-            &download_config,
-            zone,
-            args.dry_run,
-            !args.no_progress_bar,
-        )
-        .await?;
-        totals += stats;
+        let plan = resolve_passes(library, &selection).await?;
+        if plan.passes.is_empty() {
+            tracing::debug!(zone = %zone, "No passes resolved; nothing to import");
+            continue;
+        }
+
+        for pass in &plan.passes {
+            let pass_config = library_config.with_pass(pass);
+            tracing::debug!(
+                zone = %zone,
+                kind = ?pass.kind,
+                template = %pass_config.folder_structure,
+                "Importing pass"
+            );
+            let (stream, panic_rx) = pass.album.photo_stream(recent_count, None, 1);
+            let stats = import_assets(
+                stream,
+                panic_rx,
+                db.as_ref(),
+                &pass_config,
+                zone,
+                args.dry_run,
+                !args.no_progress_bar,
+                &mut dir_cache,
+            )
+            .await?;
+            totals += stats;
+        }
     }
 
     println!();
@@ -445,6 +471,67 @@ pub(crate) async fn run_import_existing(
     println!("  Hash errors:          {}", totals.hash_errors);
 
     Ok(())
+}
+
+/// Build the [`Selection`] that `resolve_passes` consumes for import.
+///
+/// `import-existing` has no `--album` / `--smart-folder` / `--unfiled` CLI
+/// flags of its own, so the selection comes from `[filters]` in TOML (with
+/// the same defaults as sync: `albums = "all"`, `smart_folders = "none"`,
+/// `unfiled = true`). The `LibrarySelector` was already resolved upstream
+/// and is threaded in directly so `Selection.libraries` matches what
+/// `resolve_libraries` walked.
+///
+/// Honours the same deprecated `[filters]` keys that `Config::build` does
+/// for `kei sync` -- singular `album`, and `exclude_albums` -- so a TOML
+/// that hasn't been migrated to the v0.13 array shape produces the same
+/// `Selection` for both commands. Without this, sync would scope to e.g.
+/// `Vacation` minus `Drafts` while import-existing silently fell back to
+/// the all-albums default.
+fn build_import_selection(
+    toml_filters: Option<&config::TomlFilters>,
+    libraries: &crate::selection::LibrarySelector,
+) -> anyhow::Result<crate::selection::Selection> {
+    use crate::selection::{parse_album_selector, parse_smart_folder_selector, Selection};
+
+    let toml_album_singular = toml_filters.and_then(|f| f.album.clone());
+    if toml_album_singular.is_some() {
+        config::warn_deprecated(
+            "`[filters].album` (singular string)",
+            "`[filters].albums = [\"name\"]` (array)",
+        );
+    }
+    let toml_exclude_albums = toml_filters.and_then(|f| f.exclude_albums.clone());
+    if toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty()) {
+        config::warn_deprecated(
+            "`[filters].exclude_albums`",
+            "`!name` entries inside `[filters].albums`",
+        );
+    }
+    // Array form wins; lift the singular only when the array is absent so
+    // a user who set both during migration doesn't lose the array shape.
+    let mut raw_albums: Vec<String> = toml_filters
+        .and_then(|f| f.albums.as_ref())
+        .cloned()
+        .or_else(|| toml_album_singular.map(|s| vec![s]))
+        .unwrap_or_default();
+    if let Some(excludes) = toml_exclude_albums {
+        for name in excludes {
+            raw_albums.push(format!("!{name}"));
+        }
+    }
+    let raw_smart_folders: Vec<String> = toml_filters
+        .and_then(|f| f.smart_folders.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let unfiled = toml_filters.and_then(|f| f.unfiled).unwrap_or(true);
+
+    Ok(Selection {
+        albums: parse_album_selector(&raw_albums, true)?,
+        smart_folders: parse_smart_folder_selector(&raw_smart_folders)?,
+        libraries: libraries.clone(),
+        unfiled,
+    })
 }
 
 /// Refuse to scan when one or more selected libraries returned zero assets
@@ -515,6 +602,8 @@ fn build_import_download_config(
     let path_fields = config::resolve_path_derivation_fields(
         config::PathDerivationCliArgs {
             folder_structure: args.folder_structure.clone(),
+            folder_structure_albums: args.folder_structure_albums.clone(),
+            folder_structure_smart_folders: args.folder_structure_smart_folders.clone(),
             size: args.size,
             live_photo_mode: args.live_photo_mode,
             live_photo_size: args.live_photo_size,
@@ -533,6 +622,159 @@ fn build_import_download_config(
         args.dry_run,
         args.no_progress_bar,
     ))
+}
+
+#[cfg(test)]
+mod build_selection_tests {
+    //! Sync vs. import-existing parity for the v0.13 selector resolution. Both
+    //! commands must produce the same `Selection` from the same TOML, including
+    //! the deprecated singular `[filters].album` key and the deprecated
+    //! `[filters].exclude_albums` array. Without parity, a user with a TOML
+    //! that hasn't been migrated yet would see sync include an album that
+    //! import-existing silently skipped (or vice-versa for excludes).
+    use super::build_import_selection;
+    use crate::config::TomlFilters;
+    use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+    use std::collections::BTreeSet;
+
+    fn primary() -> LibrarySelector {
+        LibrarySelector::default()
+    }
+
+    /// `[filters].album = "Foo"` (singular, deprecated) should resolve to the
+    /// same `AlbumSelector::Named { ["Foo"], excluded: {} }` that
+    /// `[filters].albums = ["Foo"]` produces. Pre-fix, import-existing read
+    /// only the array form so the singular silently fell through to the
+    /// "all albums" default.
+    #[test]
+    fn deprecated_album_singular_lifts_to_named_selector() {
+        let filters = TomlFilters {
+            album: Some("Vacation".to_string()),
+            ..TomlFilters::default()
+        };
+        let selection = build_import_selection(Some(&filters), &primary())
+            .expect("build_import_selection accepts deprecated singular `album`");
+        match selection.albums {
+            AlbumSelector::Named { included, excluded } => {
+                assert_eq!(
+                    included,
+                    BTreeSet::from(["Vacation".to_string()]),
+                    "singular `[filters].album` must lift into the named-include set"
+                );
+                assert!(
+                    excluded.is_empty(),
+                    "no excludes were configured; the lift must not invent any"
+                );
+            }
+            other => panic!("expected AlbumSelector::Named, got {other:?}"),
+        }
+    }
+
+    /// `[filters].exclude_albums = ["Drafts"]` (deprecated) should fold into
+    /// the active selector as a `!Drafts` entry. Pre-fix, the deprecated
+    /// excludes were silently dropped on the import-existing path.
+    #[test]
+    fn deprecated_exclude_albums_fold_into_inline_excludes() {
+        let filters = TomlFilters {
+            albums: Some(vec!["all".to_string()]),
+            exclude_albums: Some(vec!["Drafts".to_string(), "Hidden".to_string()]),
+            ..TomlFilters::default()
+        };
+        let selection = build_import_selection(Some(&filters), &primary())
+            .expect("build_import_selection accepts deprecated exclude_albums");
+        match selection.albums {
+            AlbumSelector::All { excluded } => {
+                assert_eq!(
+                    excluded,
+                    BTreeSet::from(["Drafts".to_string(), "Hidden".to_string()]),
+                    "exclude_albums entries must surface as inline `!name` excludes"
+                );
+            }
+            other => panic!("expected AlbumSelector::All, got {other:?}"),
+        }
+    }
+
+    /// Combined: deprecated singular `album` + deprecated `exclude_albums`
+    /// is the legacy v0.12 shape. Both must thread through together.
+    #[test]
+    fn deprecated_singular_plus_excludes_combine() {
+        let filters = TomlFilters {
+            album: Some("Vacation".to_string()),
+            exclude_albums: Some(vec!["Drafts".to_string()]),
+            ..TomlFilters::default()
+        };
+        let selection = build_import_selection(Some(&filters), &primary()).expect("ok");
+        match selection.albums {
+            AlbumSelector::Named { included, excluded } => {
+                assert_eq!(included, BTreeSet::from(["Vacation".to_string()]));
+                assert_eq!(excluded, BTreeSet::from(["Drafts".to_string()]));
+            }
+            other => panic!("expected AlbumSelector::Named, got {other:?}"),
+        }
+    }
+
+    /// New-shape input (array `albums`) keeps working unchanged. Sanity check
+    /// that the deprecation-handling rewrite didn't regress the v0.13 path.
+    #[test]
+    fn new_albums_array_still_works() {
+        let filters = TomlFilters {
+            albums: Some(vec!["Vacation".to_string(), "!Family".to_string()]),
+            ..TomlFilters::default()
+        };
+        let selection = build_import_selection(Some(&filters), &primary()).expect("ok");
+        match selection.albums {
+            AlbumSelector::Named { included, excluded } => {
+                assert_eq!(included, BTreeSet::from(["Vacation".to_string()]));
+                assert_eq!(excluded, BTreeSet::from(["Family".to_string()]));
+            }
+            other => panic!("expected AlbumSelector::Named, got {other:?}"),
+        }
+    }
+
+    /// When both the array and the singular are set (mid-migration TOML), the
+    /// array wins. Mirrors `Config::build`'s precedence so sync and import
+    /// can't disagree on which key takes effect.
+    #[test]
+    fn albums_array_wins_over_singular_when_both_set() {
+        let filters = TomlFilters {
+            album: Some("OLD".to_string()),
+            albums: Some(vec!["NEW".to_string()]),
+            ..TomlFilters::default()
+        };
+        let selection = build_import_selection(Some(&filters), &primary()).expect("ok");
+        match selection.albums {
+            AlbumSelector::Named { included, .. } => {
+                assert_eq!(
+                    included,
+                    BTreeSet::from(["NEW".to_string()]),
+                    "array form must take precedence over the deprecated singular"
+                );
+            }
+            other => panic!("expected AlbumSelector::Named, got {other:?}"),
+        }
+    }
+
+    /// Empty TOML filters → defaults from `Selection::default()`. This is the
+    /// no-config-file case and must match `kei sync` with no flags.
+    #[test]
+    fn no_filters_yields_default_selection() {
+        let selection = build_import_selection(None, &primary()).expect("ok");
+        assert_eq!(selection.albums, AlbumSelector::default());
+        assert_eq!(selection.smart_folders, SmartFolderSelector::None);
+        assert!(
+            selection.unfiled,
+            "unfiled defaults to true to match v0.13 sync semantics"
+        );
+        assert_eq!(
+            selection,
+            Selection {
+                albums: AlbumSelector::default(),
+                smart_folders: SmartFolderSelector::None,
+                libraries: primary(),
+                unfiled: true,
+            }
+        );
+    }
 }
 
 #[cfg(test)]
@@ -567,6 +809,7 @@ mod wiremock_tests {
 
     use super::{import_assets, ImportStats};
     use crate::download::filter::expected_paths_for;
+    use crate::download::paths::DirCache;
     use crate::download::{AssetGroupings, DownloadConfig, SyncMode};
     use crate::icloud::photos::session::PhotosSession;
     use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotoAsset};
@@ -799,6 +1042,9 @@ mod wiremock_tests {
         DownloadConfig {
             directory: dir_arc,
             folder_structure: "%Y/%m/%d".to_string(),
+            folder_structure_albums: Arc::from("{album}"),
+            folder_structure_smart_folders: Arc::from("{smart-folder}"),
+            library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
             size: AssetVersionSize::Original,
             skip_videos: false,
             skip_photos: false,
@@ -880,9 +1126,19 @@ mod wiremock_tests {
         stub_records_query(server, assets).await;
         let album = album_pointed_at(server);
         let (stream, panic_rx) = album.photo_stream(None, None, 1);
-        import_assets(stream, panic_rx, db, config, "test-all", dry_run, false)
-            .await
-            .expect("import_assets")
+        let mut dir_cache = DirCache::new();
+        import_assets(
+            stream,
+            panic_rx,
+            db,
+            config,
+            "test-all",
+            dry_run,
+            false,
+            &mut dir_cache,
+        )
+        .await
+        .expect("import_assets")
     }
 
     // ── Tests: default flow ───────────────────────────────────────────
@@ -2013,9 +2269,19 @@ mod wiremock_tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
         drop(tx);
 
-        let stats = import_assets(stream, rx, db.as_ref(), &config, "test-all", false, false)
-            .await
-            .expect("clean exit must be Ok");
+        let mut dir_cache = DirCache::new();
+        let stats = import_assets(
+            stream,
+            rx,
+            db.as_ref(),
+            &config,
+            "test-all",
+            false,
+            false,
+            &mut dir_cache,
+        )
+        .await
+        .expect("clean exit must be Ok");
         assert_eq!(stats.total, 0);
         assert_eq!(stats.matched, 0);
         assert_eq!(stats.unmatched, 0);
@@ -2036,9 +2302,19 @@ mod wiremock_tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
         tx.send(true).expect("send panic signal");
 
-        let err = import_assets(stream, rx, db.as_ref(), &config, "test-all", false, false)
-            .await
-            .expect_err("must bail on fetcher panic");
+        let mut dir_cache = DirCache::new();
+        let err = import_assets(
+            stream,
+            rx,
+            db.as_ref(),
+            &config,
+            "test-all",
+            false,
+            false,
+            &mut dir_cache,
+        )
+        .await
+        .expect_err("must bail on fetcher panic");
         let msg = format!("{err}");
         assert!(
             msg.contains("import scan aborted") && msg.contains("test-all"),
@@ -2104,6 +2380,7 @@ mod wiremock_tests {
 
         let album = album_pointed_at(&server);
         let (stream, panic_rx) = album.photo_stream(None, None, 1);
+        let mut dir_cache = DirCache::new();
         let err = import_assets(
             stream,
             panic_rx,
@@ -2112,6 +2389,7 @@ mod wiremock_tests {
             "test-all",
             true,
             false,
+            &mut dir_cache,
         )
         .await
         .expect_err("must bail on fetcher Err");
@@ -2231,6 +2509,7 @@ mod wiremock_tests {
         let (stream, panic_rx) = album.photo_stream(None, None, 1);
         let db = open_db(&tmp).await;
         let config = base_config(tmp.path());
+        let mut dir_cache = DirCache::new();
         import_assets(
             stream,
             panic_rx,
@@ -2239,6 +2518,7 @@ mod wiremock_tests {
             "PrimarySync",
             true,
             false,
+            &mut dir_cache,
         )
         .await
         .expect("import_assets");
@@ -2267,6 +2547,7 @@ mod wiremock_tests {
         let (stream, panic_rx) = album.photo_stream(None, None, 1);
         let db = open_db(&tmp).await;
         let config = base_config(tmp.path());
+        let mut dir_cache = DirCache::new();
         import_assets(
             stream,
             panic_rx,
@@ -2275,6 +2556,7 @@ mod wiremock_tests {
             "PrimarySync",
             true,
             false,
+            &mut dir_cache,
         )
         .await
         .expect("import_assets");
@@ -2598,9 +2880,9 @@ mod build_config_tests {
         };
         let sync_cfg = Config::build(
             &globals,
-            crate::cli::PasswordArgs::default(),
+            &crate::cli::PasswordArgs::default(),
             sync,
-            Some(toml.clone()),
+            Some(&toml),
         )
         .unwrap();
 
@@ -2651,7 +2933,7 @@ mod build_config_tests {
             data_dir: None,
             cookie_directory: None,
         };
-        let sync_err = Config::build(&globals, crate::cli::PasswordArgs::default(), sync, None)
+        let sync_err = Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
             .expect_err("sync: system dir must reject");
 
         let import_msg = format!("{import_err:#}");

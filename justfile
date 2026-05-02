@@ -26,14 +26,14 @@ test MODE="":
     #!/usr/bin/env bash
     set -euo pipefail
     # Shared live-auth setup: sources .env if needed, applies the
-    # maintainer's cookie-dir / album defaults so the Rust-live and
-    # shell-live paths don't diverge. Overridable via the environment.
+    # maintainer's album default. Cookie dir falls through to the
+    # harness default (./.test-cookies) when unset. Overridable via
+    # the environment.
     _live_env() {
         if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f .env ]; then
             set -a; source .env; set +a
         fi
         : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
-        export ICLOUD_TEST_COOKIE_DIR="${ICLOUD_TEST_COOKIE_DIR:-$HOME/.config/kei}"
         export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
     }
     case "{{MODE}}" in
@@ -75,7 +75,6 @@ cov MODE="" BASE="main":
             set -a; source .env; set +a
         fi
         : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
-        export ICLOUD_TEST_COOKIE_DIR="${ICLOUD_TEST_COOKIE_DIR:-$HOME/.config/kei}"
         export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
     }
     case "{{MODE}}" in

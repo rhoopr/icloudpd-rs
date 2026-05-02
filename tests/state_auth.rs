@@ -38,9 +38,17 @@ fn sync_cmd(
     dir: &Path,
     recent: u32,
 ) -> assert_cmd::Command {
+    // `--album none` pins single-pass semantics (the unfiled pass alone
+    // enumerates the library). v0.13's no-flag default is `--album all`,
+    // which would multiply API calls per sync by `num_albums + 1` even
+    // under `--recent N` and overrun Apple's rate limits across the
+    // suite. The state-DB invariants tested here are pass-shape
+    // independent.
     let mut cmd = common::cmd();
     cmd.args([
         "sync",
+        "--album",
+        "none",
         "--recent",
         &recent.to_string(),
         "--username",
@@ -115,6 +123,9 @@ fn import_cmd(
     cmd
 }
 
+/// Like [`sync_cmd`] but for `--retry-failed` runs. Same `--album none`
+/// rationale: the test fixture is built to exercise retry-failed state
+/// transitions, not multi-pass enumeration.
 fn retry_failed_cmd(
     username: &str,
     password: &str,
@@ -124,6 +135,8 @@ fn retry_failed_cmd(
     let mut cmd = common::cmd();
     cmd.args([
         "sync",
+        "--album",
+        "none",
         "--retry-failed",
         "--username",
         username,

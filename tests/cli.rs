@@ -82,6 +82,17 @@ fn sync_help_hides_deprecated_directory_flag() {
 }
 
 #[test]
+fn sync_help_hides_deprecated_exclude_album_flag() {
+    // `--exclude-album` still parses for backward compat but must not appear
+    // in help output; users should only see `--album '!NAME'`.
+    common::cmd()
+        .args(["sync", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--exclude-album").not());
+}
+
+#[test]
 fn sync_help_hides_deprecated_sync_token_flags() {
     // Both `--no-incremental` (deprecated, use `kei reset sync-token`) and
     // `--reset-sync-token` (hidden compat, use `kei reset sync-token`) are
@@ -479,6 +490,115 @@ fn album_flag_accepts_multiple() {
         .success();
 }
 
+#[test]
+fn smart_folder_flag_accepts_multiple() {
+    common::cmd()
+        .args([
+            "sync",
+            "--smart-folder",
+            "Favorites",
+            "--smart-folder",
+            "all",
+            "--smart-folder",
+            "!Hidden",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn library_flag_accepts_repeatable_sentinels() {
+    common::cmd()
+        .args([
+            "sync",
+            "--library",
+            "primary",
+            "--library",
+            "shared",
+            "--library",
+            "!SharedSync-AAAA",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn album_flag_accepts_inline_exclusion() {
+    common::cmd()
+        .args([
+            "sync", "--album", "all", "--album", "!Family", "--album", "none", "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn album_flag_rejects_duplicates() {
+    // Selector-grammar rejection fires pre-auth, before any data-dir / state
+    // access, so no `--data-dir` or auth setup is needed.
+    common::cmd()
+        .args([
+            "sync",
+            "--album",
+            "Vacation",
+            "--album",
+            "Vacation",
+            "--username",
+            "dummy@example.com",
+            "--password",
+            "x",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--album 'Vacation' specified more than once",
+        ));
+}
+
+#[test]
+fn folder_structure_albums_flag_parses() {
+    common::cmd()
+        .args([
+            "sync",
+            "--folder-structure-albums",
+            "{album}/%Y/%m/%d",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn folder_structure_smart_folders_flag_parses() {
+    common::cmd()
+        .args([
+            "sync",
+            "--folder-structure-smart-folders",
+            "{smart-folder}/%Y",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn unfiled_flag_accepts_bare_and_explicit_value() {
+    common::cmd()
+        .args(["sync", "--unfiled", "--help"])
+        .assert()
+        .success();
+    common::cmd()
+        .args(["sync", "--unfiled", "false", "--help"])
+        .assert()
+        .success();
+    common::cmd()
+        .args(["sync", "--unfiled", "true", "--help"])
+        .assert()
+        .success();
+}
+
 // ── Default command (no subcommand = sync) ──────────────────────────────
 
 #[test]
@@ -523,6 +643,29 @@ fn import_existing_folder_structure_flag() {
             "/tmp",
             "--folder-structure",
             "%Y-%m",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn import_existing_library_flag_accepts_repeatable_sentinels() {
+    // --library on import-existing was added on the selection-flags-redesign
+    // branch (commit bcbd5b6) but had no parse test of its own. The flag
+    // shares the v0.13 grammar with `kei sync --library`: bare sentinels,
+    // raw zone names, and `!name` exclusions, all repeatable.
+    common::cmd()
+        .args([
+            "import-existing",
+            "--library",
+            "primary",
+            "--library",
+            "shared",
+            "--library",
+            "SharedSync-A1B2C3D4",
+            "--library",
+            "!SharedSync-AAAAAAAA",
             "--help",
         ])
         .assert()

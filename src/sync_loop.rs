@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::auth;
 use crate::cli;
 use crate::commands::{
-    attempt_reauth, init_photos_service, resolve_albums, resolve_libraries, wait_and_retry_2fa,
+    attempt_reauth, init_photos_service, resolve_libraries, resolve_passes, wait_and_retry_2fa,
     MAX_REAUTH_ATTEMPTS,
 };
 use crate::config;
@@ -38,6 +38,15 @@ struct LibraryState {
     /// Ordered list of download passes. Each pass carries its own
     /// exclude-asset-ids set. See [`crate::commands::AlbumPlan`].
     plan: crate::commands::AlbumPlan,
+    /// True when `resolve_passes` failed at the end of the prior cycle and
+    /// the plan above is the previous cycle's stale snapshot. Album
+    /// membership data captured under a stale plan can route assets to the
+    /// wrong pass (e.g. an asset added to a newly-created album shows up in
+    /// the unfiled pass), so any cycle that consumes a stale plan must not
+    /// advance the sync token for any zone -- doing so would skip the
+    /// change events those assets generated and leave `asset_albums`
+    /// permanently incomplete.
+    plan_is_stale: bool,
 }
 
 /// State-DB metadata key for the first-sync shared-library notice. Bumping
@@ -69,7 +78,7 @@ fn should_retry_session_init(err: &anyhow::Error, already_retried: bool) -> bool
     !already_retried && is_session_error(err)
 }
 
-/// Given the user's library selection, the count of iCloud shared libraries
+/// Given the user's library selector, the count of iCloud shared libraries
 /// on the account, and whether the notice has already fired, return the
 /// warning message to emit, or `None` if no notice is warranted.
 ///
@@ -77,17 +86,17 @@ fn should_retry_session_init(err: &anyhow::Error, already_retried: bool) -> bool
 /// `PhotosService` or the state DB. The I/O wrapper lives in
 /// [`maybe_notify_shared_libraries`].
 fn should_notify_shared_libraries(
-    selection: &config::LibrarySelection,
+    selector: &crate::selection::LibrarySelector,
     shared_count: usize,
     already_notified: bool,
 ) -> Option<String> {
     if already_notified || shared_count == 0 {
         return None;
     }
-    // Only users on the `PrimarySync` default see the notice. Anyone who
-    // explicitly picked `--library all` or a specific shared zone has
-    // already made a deliberate choice.
-    if !matches!(selection, config::LibrarySelection::Single(s) if s == "PrimarySync") {
+    // Only users on the `primary`-only default see the notice. Anyone who
+    // explicitly picked a different shape (`shared`, `all`, named zones,
+    // exclusions) has already made a deliberate choice.
+    if selector != &crate::selection::LibrarySelector::default() {
         return None;
     }
     let (word, verb) = if shared_count == 1 {
@@ -98,7 +107,7 @@ fn should_notify_shared_libraries(
     Some(format!(
         "Detected {shared_count} iCloud shared {word} on this account; only the primary \
          library {verb} being synced. To include shared libraries too, set \
-         `[filters] library = \"all\"` in config.toml (or pass `--library all`). \
+         `[filters] libraries = [\"all\"]` in config.toml (or pass `--library all`). \
          Run `kei list libraries` to enumerate every zone."
     ))
 }
@@ -110,9 +119,9 @@ fn should_notify_shared_libraries(
 /// later-added library. The probe and marker write are best-effort: failures
 /// degrade to `tracing::debug!` and skip without breaking the sync.
 async fn maybe_notify_shared_libraries(
-    selection: &config::LibrarySelection,
+    selector: &crate::selection::LibrarySelector,
     photos_service: &mut crate::icloud::photos::PhotosService,
-    state_db: Option<&Arc<dyn state::StateDb>>,
+    state_db: Option<&dyn state::StateDb>,
 ) {
     let already_notified = match state_db {
         Some(db) => match db.get_metadata(SHARED_LIBRARY_NOTICE_KEY).await {
@@ -135,7 +144,7 @@ async fn maybe_notify_shared_libraries(
     // Skip the probe when the user explicitly picked a non-default library;
     // they've already opted in or out. `should_notify_shared_libraries`
     // repeats this check defensively.
-    if !matches!(selection, config::LibrarySelection::Single(s) if s == "PrimarySync") {
+    if selector != &crate::selection::LibrarySelector::default() {
         return;
     }
 
@@ -150,8 +159,7 @@ async fn maybe_notify_shared_libraries(
         }
     };
 
-    let Some(msg) = should_notify_shared_libraries(selection, shared_count, already_notified)
-    else {
+    let Some(msg) = should_notify_shared_libraries(selector, shared_count, already_notified) else {
         return;
     };
     tracing::warn!(message = %msg, "Shared library notice");
@@ -201,7 +209,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .data_dir
         .clone()
         .or_else(|| globals.cookie_directory.clone());
-    let mut config = config::Config::build(globals, pw, sync, toml_config)?;
+    let mut config = config::Config::build(globals, &pw, sync, toml_config.as_ref())?;
 
     // On first run (no config file), persist CLI-provided values so
     // subsequent runs don't need the same flags again. Only when the
@@ -282,10 +290,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             config.directory.display()
         )
     })?;
-    let _ = tokio::fs::remove_file(&probe).await;
+    if let Err(e) = tokio::fs::remove_file(&probe).await {
+        tracing::trace!(
+            probe = %probe.display(),
+            error = %e,
+            "Could not clean up writability-probe file; harmless leakage"
+        );
+    }
 
-    // Abort if available disk space is too low. CG-20: see
-    // `check_min_disk_space` for the pure inner check.
+    // Abort if available disk space is too low. See `check_min_disk_space`
+    // for the pure inner check.
     if let Some(avail) = available_disk_space(&config.directory) {
         check_min_disk_space(avail, &config.directory)?;
     }
@@ -410,7 +424,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
             Err(e) => return Err(e),
         };
-        match resolve_libraries(&config.library, &mut ps).await {
+        match resolve_libraries(&config.selection.libraries, &mut ps).await {
             Ok(libs) => break (ss, ps, libs),
             Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
                 tracing::warn!(
@@ -511,7 +525,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // First-sync notice: tell users on the `PrimarySync` default about any
     // shared libraries they could be syncing. Runs once per data dir,
     // gated by state DB metadata.
-    maybe_notify_shared_libraries(&config.library, &mut photos_service, state_db.as_ref()).await;
+    maybe_notify_shared_libraries(
+        &config.selection.libraries,
+        &mut photos_service,
+        state_db.as_deref(),
+    )
+    .await;
 
     // Handle --reset-sync-token (hidden compat flag): clear stored tokens before the sync loop
     if reset_sync_token {
@@ -557,20 +576,27 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
     // Promote the String / Vec / PathBuf config fields to their Arc
     // counterparts once, outside the per-library closure. Otherwise the
-    // CF-12 Arc-sharing win is half-defeated: each build_download_config
+    // Arc-sharing win is half-defeated: each build_download_config
     // call would re-allocate directory / filename_exclude / temp_suffix
     // from scratch instead of refcount-bumping.
     let cfg_directory: Arc<std::path::Path> = Arc::from(config.directory.as_path());
     let cfg_filename_exclude: Arc<[glob::Pattern]> = Arc::from(config.filename_exclude.clone());
     let cfg_temp_suffix: Arc<str> = Arc::from(config.temp_suffix.as_str());
+    let cfg_folder_structure_albums: Arc<str> = Arc::from(config.folder_structure_albums.as_str());
+    let cfg_folder_structure_smart_folders: Arc<str> =
+        Arc::from(config.folder_structure_smart_folders.as_str());
 
     let build_download_config = |sync_mode: download::SyncMode,
                                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
-                                 asset_groupings: Arc<download::AssetGroupings>|
+                                 asset_groupings: Arc<download::AssetGroupings>,
+                                 library: Arc<str>|
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
             directory: Arc::clone(&cfg_directory),
             folder_structure: config.folder_structure.clone(),
+            folder_structure_albums: Arc::clone(&cfg_folder_structure_albums),
+            folder_structure_smart_folders: Arc::clone(&cfg_folder_structure_smart_folders),
+            library,
             size: config.size.into(),
             skip_videos: config.skip_videos,
             skip_photos: config.skip_photos,
@@ -627,20 +653,30 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     for library in &libraries {
         let zone_name = library.zone_name().to_string();
         let sync_token_key = format!("sync_token:{zone_name}");
-        let plan = resolve_albums(
-            library,
-            &config.albums,
-            &config.exclude_albums,
-            &config.folder_structure,
-        )
-        .await?;
+        let plan = resolve_passes(library, &config.selection).await?;
+        let (album_passes, smart_folder_passes, unfiled) = count_passes(&plan);
+        tracing::info!(
+            zone = %zone_name,
+            album_passes,
+            smart_folder_passes,
+            unfiled,
+            "Sync plan for library"
+        );
         library_states.push(LibraryState {
             library: library.clone(),
             zone_name,
             sync_token_key,
             plan,
+            plan_is_stale: false,
         });
     }
+    warn_if_multi_library_paths_commingle(
+        library_states.len(),
+        &config.folder_structure,
+        &config.folder_structure_albums,
+        &config.folder_structure_smart_folders,
+        &config.selection,
+    );
     sd_notifier.notify_ready();
 
     // Spawn the HTTP server (/healthz + /metrics) only in watch mode.
@@ -666,19 +702,37 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     let mut health = health::HealthStatus::new();
     let mut consecutive_album_refresh_failures = 0u32;
+    // 1-based cycle counter for periodic-reconcile cadence. Logged at
+    // cycle start so an operator chasing missed reconciliation runs has a
+    // breadcrumb. Cycle 1 is the first iteration of this loop, cycle 2 is the
+    // first re-entry under `--watch`, etc.
+    let mut cycle_index: u64 = 0;
+    if is_watch_mode {
+        match config.reconcile_every_n_cycles {
+            Some(n) if n > 0 => tracing::info!(
+                every_n_cycles = n,
+                "Periodic local-vs-state reconciliation enabled"
+            ),
+            _ => tracing::debug!(
+                "Periodic local-vs-state reconciliation disabled \
+                 (set [watch] reconcile_every_n_cycles in TOML to enable)"
+            ),
+        }
+    }
 
     loop {
         if shutdown_token.is_cancelled() {
             tracing::info!("Shutdown requested, exiting...");
             break;
         }
+        cycle_index = cycle_index.saturating_add(1);
 
         // In watch mode with incremental sync, use changes/database as a
         // cheap pre-check to skip cycles when nothing has changed.
         // Only used for single-library mode; multi-library skips this optimization.
         let skip_cycle = match library_states.as_slice() {
             [only] if is_watch_mode && !config.no_incremental => {
-                check_changes_database(&state_db, only, &mut photos_service).await
+                check_changes_database(state_db.as_deref(), only, &mut photos_service).await
             }
             _ => false,
         };
@@ -706,7 +760,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             let cycle_result = run_cycle(
                 &library_states,
                 &config,
-                &state_db,
+                state_db.as_deref(),
                 is_retry_failed,
                 &build_download_config,
                 &shared_session,
@@ -905,6 +959,21 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
         }
 
+        // Periodic local-vs-state reconciliation. Read-only walk that
+        // surfaces missing files via `tracing::warn!`. State rows are NEVER
+        // mutated here -- the manual `kei reconcile` subcommand still owns
+        // the failed-status transition. Long-running daemons drift between
+        // assets.local_path and what's on disk (manual rm, mount glitches,
+        // etc.); a periodic visible signal beats waiting for the next sync
+        // to stumble over the missing files.
+        if is_watch_mode
+            && should_reconcile_this_cycle(cycle_index, config.reconcile_every_n_cycles)
+        {
+            if let Some(db) = state_db.as_ref() {
+                run_periodic_reconcile(db.as_ref(), cycle_index).await;
+            }
+        }
+
         if let Some(interval) = config.watch_with_interval {
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, exiting...");
@@ -934,25 +1003,21 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             reacquire_session(&shared_session, &config, &password_provider).await;
 
             // Re-resolve albums per-library to discover newly created iCloud albums.
-            // TODO: When --exclude-album is set without --album, this re-fetches the
-            // entire excluded album(s) to collect asset IDs. For large excluded albums
-            // this is expensive -- consider caching exclude_asset_ids across watch
-            // cycles and only refreshing when the album's sync token changes.
+            // The unfiled pass re-fetches each selected album's IDs to refresh the
+            // exclusion set; for libraries with many albums this can be slow under
+            // watch mode. PR12+ may add per-album sync-token caching.
             for lib_state in &mut library_states {
-                match resolve_albums(
-                    &lib_state.library,
-                    &config.albums,
-                    &config.exclude_albums,
-                    &config.folder_structure,
-                )
-                .await
-                {
+                match resolve_passes(&lib_state.library, &config.selection).await {
                     Ok(refreshed) => {
                         lib_state.plan = refreshed;
+                        lib_state.plan_is_stale = false;
                         consecutive_album_refresh_failures = 0;
                     }
                     Err(e) => {
                         consecutive_album_refresh_failures += 1;
+                        // Mark the plan stale so the NEXT cycle's token
+                        // storage gate can suppress advancement.
+                        lib_state.plan_is_stale = true;
                         if consecutive_album_refresh_failures >= 3 {
                             tracing::error!(
                                 zone = %lib_state.zone_name,
@@ -1073,17 +1138,111 @@ async fn reauth_with_srp(
 /// The contract is "advance only on full success and not in dry-run":
 /// - On `PartialFailure`, a stored token would skip the failed assets on the
 ///   next incremental sync (they'd never appear in the delta again -- silent
-///   data loss). CG-9.
+///   data loss).
 /// - On `SessionExpired`, the cycle aborts mid-stream; the token may be
 ///   stale or only reflect a subset of the work.
 /// - In `--dry-run`, we promise to make no DB writes that survive the run
 ///   (apart from the `sync_runs` ledger). Advancing the token here would
-///   silently break the next real sync. CG-21.
+///   silently break the next real sync.
 ///
 /// The returned bool is the gate: callers still check that `sync_token` is
 /// `Some(_)` and that a state DB is configured before persisting.
 pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_run: bool) -> bool {
     matches!(outcome, download::DownloadOutcome::Success) && !dry_run
+}
+
+/// Cycle-level gate that combines the per-library outcome check with the
+/// cross-library "any plan is stale" override.
+///
+/// If any library entered the cycle with a reused plan (the prior
+/// album refresh failed), suppress sync-token advancement for every library
+/// in the cycle. A stale plan can route assets created or moved between
+/// cycles to the wrong pass; advancing the token would skip the change
+/// events that would surface those assets correctly on the next refresh,
+/// leaving `asset_albums` permanently incomplete.
+pub(crate) fn should_store_sync_token_for_cycle(
+    outcome: &download::DownloadOutcome,
+    dry_run: bool,
+    cycle_has_stale_plan: bool,
+) -> bool {
+    should_store_sync_token(outcome, dry_run) && !cycle_has_stale_plan
+}
+
+/// Walk every `downloaded` row in the state DB and warn when the
+/// recorded `local_path` is missing on disk. Read-only — no rows are mutated
+/// (the manual `kei reconcile` CLI still owns the `downloaded -> failed`
+/// transition). Triggered on a fixed cadence by the watch loop; surfaces
+/// long-running drift that the next sync would otherwise re-discover only
+/// after stumbling over the missing files.
+///
+/// Errors from the DB scan are logged at `warn!` rather than propagated:
+/// the periodic walk is a diagnostic, not a load-bearing correctness gate,
+/// and a transient SQLite hiccup must not crash the watch daemon.
+async fn run_periodic_reconcile(db: &dyn state::StateDb, cycle_index: u64) {
+    use crate::commands::reconcile::{scan_missing, MissingAsset};
+    tracing::info!(
+        cycle_index,
+        "Periodic reconciliation: scanning state DB for missing local files"
+    );
+    let mut sample_logged = 0usize;
+    const SAMPLE_LOG_CAP: usize = 25;
+    // Cap per-cycle log spam at SAMPLE_LOG_CAP missing entries; the
+    // aggregate count is logged below regardless of how many fired.
+    let report_missing = |m: &MissingAsset| {
+        if sample_logged < SAMPLE_LOG_CAP {
+            tracing::warn!(
+                asset_id = %m.id,
+                version_size = m.version_size.as_str(),
+                path = %m.local_path.display(),
+                "Reconcile: state row marks asset downloaded but local file is missing"
+            );
+            sample_logged += 1;
+        }
+    };
+    let report_no_path = |id: &str| {
+        tracing::debug!(asset_id = %id, "Reconcile: downloaded row has no local_path recorded");
+    };
+    let scan = scan_missing(db, report_missing, report_no_path).await;
+    match scan {
+        Ok((counts, missing)) => {
+            if missing.is_empty() && counts.no_path == 0 {
+                tracing::info!(
+                    present = counts.present,
+                    "Periodic reconciliation: all downloaded files present on disk"
+                );
+            } else {
+                tracing::warn!(
+                    present = counts.present,
+                    missing = counts.missing,
+                    no_path = counts.no_path,
+                    sample_logged,
+                    "Periodic reconciliation: drift detected; run `kei reconcile` to mark missing files for re-download"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Periodic reconciliation scan failed; will retry on next interval");
+        }
+    }
+}
+
+/// Should this watch cycle run a periodic local-vs-state reconciliation?
+///
+/// Returns `true` for the very first cycle whose 1-based index is a multiple
+/// of `every_n` (e.g. `every_n = 24` fires on cycle 24, 48, ...). The first
+/// firing is at cycle `every_n` rather than cycle 0 so a freshly-started
+/// daemon doesn't burn its startup time walking the disk before a single
+/// sync has run. Disabled (`None`) or `Some(0)` always returns `false`; the
+/// `cycle_index` is also 1-based so the first cycle is `1`.
+///
+/// Pure function so the cadence is unit-testable without spinning up a real
+/// watch loop or filesystem walk.
+pub(crate) fn should_reconcile_this_cycle(cycle_index: u64, every_n: Option<u64>) -> bool {
+    let n = match every_n {
+        Some(n) if n > 0 => n,
+        _ => return false,
+    };
+    cycle_index > 0 && cycle_index.is_multiple_of(n)
 }
 
 /// Decide whether the reauth path inside the sync loop should block on a
@@ -1094,7 +1253,7 @@ pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_r
 ///
 /// In **one-shot mode** there is nothing to wait on -- the caller (a CI run,
 /// a cron, the systemd unit's first start) needs the error so it can exit
-/// non-zero and the operator can run `kei login get-code`. CG-19.
+/// non-zero and the operator can run `kei login get-code`.
 ///
 /// Note that the **entry-point** auth path (`run_sync`'s initial
 /// `auth::authenticate` call) intentionally does NOT use this predicate --
@@ -1109,23 +1268,46 @@ pub(crate) fn should_wait_for_2fa(is_watch_mode: bool, err: &anyhow::Error) -> b
             .is_some_and(auth::error::AuthError::is_two_factor_required)
 }
 
+/// Closure shape used to derive a per-library `DownloadConfig` from the
+/// shared base config. Boxed dyn so `run_cycle` can accept a single
+/// reference instead of a generic parameter (avoids reuse-by-monomorphization
+/// blow-up in error messages).
+type BuildDownloadConfigFn<'a> = dyn Fn(
+        download::SyncMode,
+        Arc<rustc_hash::FxHashSet<String>>,
+        Arc<download::AssetGroupings>,
+        Arc<str>,
+    ) -> Arc<download::DownloadConfig>
+    + 'a;
+
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
 async fn run_cycle(
     library_states: &[LibraryState],
     config: &config::Config,
-    state_db: &Option<Arc<dyn state::StateDb>>,
+    state_db: Option<&dyn state::StateDb>,
     is_retry_failed: bool,
-    build_download_config: &dyn Fn(
-        download::SyncMode,
-        Arc<rustc_hash::FxHashSet<String>>,
-        Arc<download::AssetGroupings>,
-    ) -> Arc<download::DownloadConfig>,
+    build_download_config: &BuildDownloadConfigFn<'_>,
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
 ) -> anyhow::Result<CycleResult> {
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
+
+    // If ANY library entered the cycle with a stale plan (the prior
+    // album refresh failed and the previous plan is being reused), suppress
+    // sync-token advancement for every library in this cycle. A reused plan
+    // can route assets created or moved between cycles to the wrong pass and
+    // produce silently incomplete `asset_albums` data; without this gate the
+    // change events for those assets sit behind the advanced token and
+    // never replay.
+    let cycle_has_stale_plan = library_states.iter().any(|s| s.plan_is_stale);
+    if cycle_has_stale_plan {
+        tracing::warn!(
+            "One or more libraries are running on a stale album plan; sync \
+             token will not advance this cycle"
+        );
+    }
 
     for lib_state in library_states {
         if shutdown_token.is_cancelled() {
@@ -1195,7 +1377,7 @@ async fn run_cycle(
         // Skip the DB scan entirely when nothing downstream will read it.
         #[cfg(feature = "xmp")]
         let asset_groupings = if config.embed_xmp || config.xmp_sidecar {
-            preload_asset_groupings(state_db).await
+            preload_asset_groupings(state_db, &lib_state.zone_name).await
         } else {
             Arc::new(download::AssetGroupings::default())
         };
@@ -1208,6 +1390,7 @@ async fn run_cycle(
             sync_mode,
             Arc::new(rustc_hash::FxHashSet::default()),
             asset_groupings,
+            Arc::from(lib_state.zone_name.as_str()),
         );
         let download_client = shared_session.read().await.download_client().clone();
         let sync_result = download::download_photos_with_sync(
@@ -1225,7 +1408,11 @@ async fn run_cycle(
         // Note: the token is stored after download_photos_with_sync returns, which
         // means all batch flushes are complete. A crash here means the token is
         // NOT advanced, so assets will replay on next sync (safe, not data loss).
-        let should_store_token = should_store_sync_token(&sync_result.outcome, config.dry_run);
+        let should_store_token = should_store_sync_token_for_cycle(
+            &sync_result.outcome,
+            config.dry_run,
+            cycle_has_stale_plan,
+        );
         if should_store_token {
             if let Some(token) = &sync_result.sync_token {
                 if let Some(db) = state_db {
@@ -1243,7 +1430,7 @@ async fn run_cycle(
             );
         }
 
-        // Accumulate stats across libraries. CG-15.
+        // Accumulate stats across libraries.
         cycle_stats.accumulate(&sync_result.stats);
 
         match sync_result.outcome {
@@ -1274,16 +1461,20 @@ async fn run_cycle(
 ///
 /// Returns `true` when no zones report changes and `moreComing` is false.
 /// Bulk-load `asset_albums` + `asset_people` into an in-memory index so the
-/// filter phase can enrich payloads without per-asset DB hits.
+/// filter phase can enrich payloads without per-asset DB hits. Scoped to a
+/// single library so multi-library accounts don't cross-attribute album /
+/// person memberships across zones (the v9 schema scopes both join tables
+/// per library; this reader honours that scope).
 #[cfg(feature = "xmp")]
 async fn preload_asset_groupings(
-    state_db: &Option<Arc<dyn state::StateDb>>,
+    state_db: Option<&dyn state::StateDb>,
+    library: &str,
 ) -> Arc<download::AssetGroupings> {
     let Some(db) = state_db else {
         return Arc::new(download::AssetGroupings::default());
     };
-    let albums = db.get_all_asset_albums().await;
-    let people = db.get_all_asset_people().await;
+    let albums = db.get_all_asset_albums(library).await;
+    let people = db.get_all_asset_people(library).await;
     let mut groupings = download::AssetGroupings::default();
     match albums {
         Ok(rows) => {
@@ -1291,7 +1482,7 @@ async fn preload_asset_groupings(
                 groupings.albums.entry(asset_id).or_default().push(album);
             }
         }
-        Err(e) => tracing::warn!(error = %e, "Failed to preload asset_albums"),
+        Err(e) => tracing::warn!(error = %e, library, "Failed to preload asset_albums"),
     }
     match people {
         Ok(rows) => {
@@ -1299,13 +1490,13 @@ async fn preload_asset_groupings(
                 groupings.people.entry(asset_id).or_default().push(person);
             }
         }
-        Err(e) => tracing::warn!(error = %e, "Failed to preload asset_people"),
+        Err(e) => tracing::warn!(error = %e, library, "Failed to preload asset_people"),
     }
     Arc::new(groupings)
 }
 
 async fn check_changes_database(
-    state_db: &Option<Arc<dyn state::StateDb>>,
+    state_db: Option<&dyn state::StateDb>,
     lib_state: &LibraryState,
     photos_service: &mut crate::icloud::photos::PhotosService,
 ) -> bool {
@@ -1359,12 +1550,108 @@ async fn check_changes_database(
     }
 }
 
+/// Identify active-pass templates that lack `{library}` when multiple
+/// libraries are selected. Returns a sorted list of CLI flag names whose
+/// templates would let same-named assets from different zones land in the
+/// same on-disk path. Empty list means the multi-library plan is unambiguous.
+///
+/// The check is per-pass-kind: each *active* template (one whose pass kind
+/// will actually run under the current Selection) must contain `{library}`.
+pub(crate) fn count_passes(plan: &crate::commands::AlbumPlan) -> (usize, usize, bool) {
+    use crate::commands::PassKind;
+    let mut album = 0;
+    let mut smart_folder = 0;
+    let mut unfiled = false;
+    for pass in &plan.passes {
+        match pass.kind {
+            PassKind::Album => album += 1,
+            PassKind::SmartFolder => smart_folder += 1,
+            PassKind::Unfiled => unfiled = true,
+        }
+    }
+    (album, smart_folder, unfiled)
+}
+
+/// Template strings whose pass is disabled (e.g. `folder_structure_smart_folders`
+/// when `--smart-folder none`) don't render any path so they don't need
+/// `{library}` to keep the sync safe.
+fn find_multi_library_commingle_flags(
+    library_count: usize,
+    folder_structure: &str,
+    folder_structure_albums: &str,
+    folder_structure_smart_folders: &str,
+    selection: &crate::selection::Selection,
+) -> Vec<&'static str> {
+    use crate::selection::{AlbumSelector, SmartFolderSelector};
+
+    if library_count < 2 {
+        return Vec::new();
+    }
+
+    let unfiled_active = selection.unfiled;
+    let album_active = !matches!(selection.albums, AlbumSelector::None);
+    let smart_folder_active = !matches!(selection.smart_folders, SmartFolderSelector::None);
+
+    // All passes disabled — resolve_passes returns an empty plan, no path
+    // ever renders, multi-library can't commingle.
+    if !unfiled_active && !album_active && !smart_folder_active {
+        return Vec::new();
+    }
+
+    let mut missing: Vec<&'static str> = Vec::new();
+    if unfiled_active && !folder_structure.contains("{library}") {
+        missing.push("--folder-structure");
+    }
+    if album_active && !folder_structure_albums.contains("{library}") {
+        missing.push("--folder-structure-albums");
+    }
+    if smart_folder_active && !folder_structure_smart_folders.contains("{library}") {
+        missing.push("--folder-structure-smart-folders");
+    }
+    missing
+}
+
+/// Emit a startup warning when multi-library paths commingle. Informational:
+/// the run continues, and `file_match_policy` (default
+/// `name-size-dedup-with-suffix`) keeps two libraries from silently
+/// overwriting each other -- collisions land at `<name>-1.<ext>` rather
+/// than overwriting. The warning surfaces the namespace ambiguity so the
+/// user can add `{library}` to their templates if they want zone-disjoint
+/// trees.
+fn warn_if_multi_library_paths_commingle(
+    library_count: usize,
+    folder_structure: &str,
+    folder_structure_albums: &str,
+    folder_structure_smart_folders: &str,
+    selection: &crate::selection::Selection,
+) {
+    let missing = find_multi_library_commingle_flags(
+        library_count,
+        folder_structure,
+        folder_structure_albums,
+        folder_structure_smart_folders,
+        selection,
+    );
+    if missing.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        library_count,
+        missing = ?missing,
+        "Multi-library sync: active template(s) lack `{{library}}`; same-named \
+         assets from different zones will share an on-disk namespace. \
+         File-match policy keeps writes from overwriting (collisions get a \
+         `-N` suffix), but cross-library files end up interleaved. Add \
+         `{{library}}` to each listed template for zone-disjoint trees."
+    );
+}
+
 /// Determine the sync mode for a library: full enumeration or incremental.
 async fn determine_sync_mode(
     is_retry_failed: bool,
     no_incremental: bool,
     library_count: usize,
-    state_db: &Option<Arc<dyn state::StateDb>>,
+    state_db: Option<&dyn state::StateDb>,
     sync_token_key: &str,
     zone_name: &str,
 ) -> download::SyncMode {
@@ -1442,8 +1729,16 @@ async fn reacquire_session(
 mod tests {
     use super::*;
 
-    fn primary() -> config::LibrarySelection {
-        config::LibrarySelection::Single("PrimarySync".to_string())
+    fn primary() -> crate::selection::LibrarySelector {
+        crate::selection::LibrarySelector::default()
+    }
+
+    fn all_libraries() -> crate::selection::LibrarySelector {
+        crate::selection::parse_library_selector(&["all".to_string()]).unwrap()
+    }
+
+    fn shared_zone() -> crate::selection::LibrarySelector {
+        crate::selection::parse_library_selector(&["SharedSync-ABCD1234".to_string()]).unwrap()
     }
 
     #[test]
@@ -1462,15 +1757,14 @@ mod tests {
     fn notice_suppressed_when_user_picked_all() {
         // Anyone who explicitly set `--library all` has already opted in;
         // nothing to tell them.
-        assert!(should_notify_shared_libraries(&config::LibrarySelection::All, 3, false).is_none());
+        assert!(should_notify_shared_libraries(&all_libraries(), 3, false).is_none());
     }
 
     #[test]
     fn notice_suppressed_when_user_picked_shared_zone_explicitly() {
         // A user who typed out `--library SharedSync-ABCD1234` has also made
         // a choice; don't second-guess them.
-        let explicit = config::LibrarySelection::Single("SharedSync-ABCD1234".to_string());
-        assert!(should_notify_shared_libraries(&explicit, 3, false).is_none());
+        assert!(should_notify_shared_libraries(&shared_zone(), 3, false).is_none());
     }
 
     #[test]
@@ -1487,7 +1781,7 @@ mod tests {
         // The guidance is what the notice is for - it must name the config
         // key, the CLI flag, and the discovery subcommand.
         assert!(
-            msg.contains("[filters] library = \"all\""),
+            msg.contains("[filters] libraries = [\"all\"]"),
             "TOML guidance missing: {msg}"
         );
         assert!(msg.contains("--library all"), "CLI guidance missing: {msg}");
@@ -1513,7 +1807,7 @@ mod tests {
     #[test]
     fn notice_suppressed_when_both_user_opted_out_and_already_notified() {
         // Belt-and-braces: every suppression condition stacks correctly.
-        assert!(should_notify_shared_libraries(&config::LibrarySelection::All, 0, true).is_none());
+        assert!(should_notify_shared_libraries(&all_libraries(), 0, true).is_none());
     }
 
     // The run_sync reauth retry branch keys on whether an error from
@@ -1655,7 +1949,7 @@ mod tests {
         }
     }
 
-    // CG-18: classifier sees through `Box<dyn Error + Send + Sync>` wrappers.
+    // Classifier sees through `Box<dyn Error + Send + Sync>` wrappers.
     //
     // anyhow lets callers wrap raw boxed errors via `anyhow::Error::from`
     // when adapting third-party error returns. The downcast walk used by
@@ -1682,6 +1976,251 @@ mod tests {
             !is_session_error(&plain),
             "free-form anyhow::Error must not be classified as a session error"
         );
+    }
+
+    // ── find_multi_library_commingle_flags ───────────────────────────
+    //
+    // Multi-library sync without a `{library}` token lets same-named
+    // assets from different zones share an on-disk namespace. The
+    // `file_match_policy` keeps writes from silently overwriting (the
+    // default policy adds a `-N` suffix on collision), but the user
+    // probably wanted zone-disjoint trees. `warn_if_*` emits a startup
+    // warning; these tests pin the underlying `find_*` truth table.
+
+    /// Build a Selection that activates every pass kind. The default
+    /// `LibrarySelector` is fine — the guard reads only `albums`,
+    /// `smart_folders`, `unfiled` from the Selection.
+    fn selection_all_passes_active() -> crate::selection::Selection {
+        use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+        Selection {
+            albums: AlbumSelector::All {
+                excluded: std::collections::BTreeSet::new(),
+            },
+            smart_folders: SmartFolderSelector::All {
+                include_sensitive: false,
+                excluded: std::collections::BTreeSet::new(),
+            },
+            libraries: LibrarySelector::default(),
+            unfiled: true,
+        }
+    }
+
+    /// Build a Selection that activates only the unfiled pass.
+    fn selection_unfiled_only() -> crate::selection::Selection {
+        use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+        Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::None,
+            libraries: LibrarySelector::default(),
+            unfiled: true,
+        }
+    }
+
+    #[test]
+    fn find_multi_library_commingle_flags_short_circuits_under_two_libraries() {
+        // Zero or one library never flags any template, regardless of
+        // template content or active-pass selection.
+        let sel = selection_all_passes_active();
+        assert!(find_multi_library_commingle_flags(
+            0,
+            "%Y/%m/%d",
+            "{album}",
+            "{smart-folder}",
+            &sel
+        )
+        .is_empty());
+        assert!(find_multi_library_commingle_flags(
+            1,
+            "%Y/%m/%d",
+            "{album}",
+            "{smart-folder}",
+            &sel
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn find_multi_library_commingle_flags_accepts_library_token_in_active_template_only() {
+        // CG-7 contract: when every active template carries `{library}`,
+        // multi-library is safe. Inactive templates are irrelevant -
+        // their pass kind doesn't run.
+        let all = selection_all_passes_active();
+        assert!(
+            find_multi_library_commingle_flags(
+                2,
+                "{library}/%Y/%m/%d",
+                "{library}/{album}",
+                "{library}/{smart-folder}",
+                &all,
+            )
+            .is_empty(),
+            "every active template carries `{{library}}` - no commingle"
+        );
+
+        // When only the unfiled pass is active, the unfiled template is
+        // the only one that needs `{library}`. The album / smart-folder
+        // templates can be anything because no pass reads them.
+        let unfiled = selection_unfiled_only();
+        assert!(
+            find_multi_library_commingle_flags(
+                2,
+                "{library}/%Y/%m/%d",
+                "{album}",
+                "{smart-folder}",
+                &unfiled,
+            )
+            .is_empty(),
+            "only unfiled active and its template has `{{library}}`"
+        );
+    }
+
+    #[test]
+    fn find_multi_library_commingle_flags_reports_per_active_pass() {
+        // CG-6 contract: only *active* passes whose templates lack
+        // `{library}` show up in the missing-flags list.
+        //
+        // Scenario: --folder-structure-albums '{library}/{album}' (token
+        // present, active) + --folder-structure-smart-folders
+        // '{smart-folder}' (no token, active because --smart-folder all)
+        // + --unfiled false (inactive).
+        use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+        let sel = Selection {
+            albums: AlbumSelector::All {
+                excluded: std::collections::BTreeSet::new(),
+            },
+            smart_folders: SmartFolderSelector::All {
+                include_sensitive: false,
+                excluded: std::collections::BTreeSet::new(),
+            },
+            libraries: LibrarySelector::default(),
+            unfiled: false,
+        };
+        let missing = find_multi_library_commingle_flags(
+            2,
+            "%Y/%m/%d",
+            "{library}/{album}",
+            "{smart-folder}",
+            &sel,
+        );
+        assert_eq!(
+            missing,
+            vec!["--folder-structure-smart-folders"],
+            "only the active smart-folder pass with `{{library}}`-less template should be listed"
+        );
+
+        // Negative: same templates but smart-folder pass disabled. No
+        // active pass lacks `{library}`, so the list is empty.
+        let sel_no_smart = Selection {
+            albums: AlbumSelector::All {
+                excluded: std::collections::BTreeSet::new(),
+            },
+            smart_folders: SmartFolderSelector::None,
+            libraries: LibrarySelector::default(),
+            unfiled: false,
+        };
+        assert!(
+            find_multi_library_commingle_flags(
+                2,
+                "%Y/%m/%d",
+                "{library}/{album}",
+                "{smart-folder}",
+                &sel_no_smart,
+            )
+            .is_empty(),
+            "smart-folder inactive - its `{{library}}`-less template is irrelevant"
+        );
+    }
+
+    #[test]
+    fn find_multi_library_commingle_flags_reports_all_missing_when_every_active_template_lacks_token(
+    ) {
+        let sel = selection_all_passes_active();
+        let missing =
+            find_multi_library_commingle_flags(2, "%Y/%m/%d", "{album}", "{smart-folder}", &sel);
+        assert_eq!(
+            missing,
+            vec![
+                "--folder-structure",
+                "--folder-structure-albums",
+                "--folder-structure-smart-folders",
+            ],
+            "every active template lacks `{{library}}` - all three should be listed",
+        );
+    }
+
+    #[test]
+    fn find_multi_library_commingle_flags_reports_with_none_folder_structure_too() {
+        // `none` (date hierarchy disabled) is the worst-case commingle:
+        // every asset lands directly in the download dir. Still surfaces
+        // the unfiled flag so the user knows the namespace is shared.
+        let sel = selection_all_passes_active();
+        let missing =
+            find_multi_library_commingle_flags(5, "none", "{album}", "{smart-folder}", &sel);
+        assert!(missing.contains(&"--folder-structure"));
+    }
+
+    #[test]
+    fn find_multi_library_commingle_flags_short_circuits_when_no_passes_active() {
+        // --album none + --smart-folder none + --unfiled false: every
+        // pass is disabled, resolve_passes returns an empty plan, no
+        // path is ever rendered, so multi-library can't commingle even
+        // without `{library}` in any template.
+        use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+        let sel = Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::None,
+            libraries: LibrarySelector::default(),
+            unfiled: false,
+        };
+        assert!(
+            find_multi_library_commingle_flags(3, "%Y/%m/%d", "{album}", "{smart-folder}", &sel)
+                .is_empty(),
+            "no active passes - find_* must report empty"
+        );
+    }
+
+    // ── count_passes ────────────────────────────────────────────────────
+    //
+    // Pass tally feeds the per-library `Sync plan for library` info line.
+    // The numbers map directly to API surface (one enumeration per album /
+    // smart-folder pass + one for unfiled), so a regression that drops a
+    // category would silently mislead the operator.
+
+    fn make_pass(name: &str, kind: crate::commands::PassKind) -> crate::commands::AlbumPass {
+        crate::commands::AlbumPass {
+            kind,
+            album: crate::icloud::photos::PhotoAlbum::stub_for_test(std::sync::Arc::from(name)),
+            exclude_ids: std::sync::Arc::new(rustc_hash::FxHashSet::default()),
+        }
+    }
+
+    #[test]
+    fn count_passes_empty_plan_is_all_zero() {
+        let plan = crate::commands::AlbumPlan { passes: Vec::new() };
+        assert_eq!(count_passes(&plan), (0, 0, false));
+    }
+
+    #[test]
+    fn count_passes_tallies_each_kind_independently() {
+        use crate::commands::PassKind;
+        let plan = crate::commands::AlbumPlan {
+            passes: vec![
+                make_pass("Vacation", PassKind::Album),
+                make_pass("Family", PassKind::Album),
+                make_pass("Favorites", PassKind::SmartFolder),
+                make_pass("PrimarySync", PassKind::Unfiled),
+            ],
+        };
+        assert_eq!(count_passes(&plan), (2, 1, true));
+    }
+
+    #[test]
+    fn count_passes_unfiled_only_returns_zero_album_zero_smart_folder() {
+        use crate::commands::PassKind;
+        let plan = crate::commands::AlbumPlan {
+            passes: vec![make_pass("PrimarySync", PassKind::Unfiled)],
+        };
+        assert_eq!(count_passes(&plan), (0, 0, true));
     }
 
     // ── should_retry_session_init ──────────────────────────────────────
@@ -1726,7 +2265,7 @@ mod tests {
         Arc::new(state::SqliteStateDb::open_in_memory().expect("open in-memory state DB"))
     }
 
-    /// CG-1: `is_retry_failed=true` MUST force `SyncMode::Full` even when a
+    /// `is_retry_failed=true` MUST force `SyncMode::Full` even when a
     /// sync token is stored. A regression that picked Incremental during
     /// retry-failed would silently skip the previously-failed assets the
     /// user explicitly asked to retry — silent data loss.
@@ -1743,7 +2282,7 @@ mod tests {
             true,  // is_retry_failed
             false, // no_incremental
             1,
-            &Some(Arc::clone(&db)),
+            Some(db.as_ref()),
             sync_token_key,
             "PrimarySync",
         )
@@ -1755,7 +2294,7 @@ mod tests {
         );
     }
 
-    /// CG-2: `--no-incremental` MUST force `SyncMode::Full`, ignoring any
+    /// `--no-incremental` MUST force `SyncMode::Full`, ignoring any
     /// stored token. The flag exists so a user can deliberately re-enumerate
     /// (e.g. after a known incremental drift); silently downgrading would
     /// betray that contract.
@@ -1771,7 +2310,7 @@ mod tests {
             false, // is_retry_failed
             true,  // no_incremental
             1,
-            &Some(Arc::clone(&db)),
+            Some(db.as_ref()),
             sync_token_key,
             "PrimarySync",
         )
@@ -1783,7 +2322,7 @@ mod tests {
         );
     }
 
-    /// CG-3: an empty stored token must fall back to Full. Production
+    /// An empty stored token must fall back to Full. Production
     /// guards on `!token.is_empty()`; if a refactor flipped that check the
     /// caller would request `changes/zone` with empty token and silently
     /// drop pending events.
@@ -1800,7 +2339,7 @@ mod tests {
             false,
             false,
             1,
-            &Some(Arc::clone(&db)),
+            Some(db.as_ref()),
             sync_token_key,
             "PrimarySync",
         )
@@ -1821,7 +2360,7 @@ mod tests {
             false,
             false,
             1,
-            &Some(Arc::clone(&db)),
+            Some(db.as_ref()),
             sync_token_key,
             "PrimarySync",
         )
@@ -1832,7 +2371,7 @@ mod tests {
         );
     }
 
-    /// CG-4: when the state DB read fails, fall back to Full rather than
+    /// When the state DB read fails, fall back to Full rather than
     /// propagating. The watch loop must keep going even if sqlite hiccups —
     /// silently biasing toward Incremental on errors would mask data loss.
     ///
@@ -1858,6 +2397,7 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
                 _: &std::path::Path,
             ) -> Result<bool, state::error::StateError> {
                 unimplemented!()
@@ -1870,6 +2410,7 @@ mod tests {
             }
             async fn mark_downloaded(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
                 _: &std::path::Path,
@@ -1888,6 +2429,7 @@ mod tests {
             }
             async fn mark_failed(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
                 _: &str,
@@ -1961,7 +2503,7 @@ mod tests {
             }
             async fn get_downloaded_ids(
                 &self,
-            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+            ) -> Result<HashSet<(String, String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_known_ids(&self) -> Result<HashSet<String>, state::error::StateError> {
@@ -1969,7 +2511,8 @@ mod tests {
             }
             async fn get_downloaded_checksums(
                 &self,
-            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+            ) -> Result<HashMap<(String, String, String), String>, state::error::StateError>
+            {
                 unimplemented!()
             }
             async fn get_attempt_counts(
@@ -1994,6 +2537,7 @@ mod tests {
             }
             async fn touch_last_seen_many(
                 &self,
+                _: &str,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
@@ -2003,31 +2547,40 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_asset_albums(
                 &self,
+                _: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_asset_people(
                 &self,
+                _: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn mark_soft_deleted(
                 &self,
                 _: &str,
+                _: &str,
                 _: Option<chrono::DateTime<chrono::Utc>>,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
-            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+            async fn mark_hidden_at_source(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn record_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -2035,12 +2588,13 @@ mod tests {
             }
             async fn get_downloaded_metadata_hashes(
                 &self,
-            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+            ) -> Result<HashMap<(String, String, String), String>, state::error::StateError>
+            {
                 unimplemented!()
             }
             async fn get_metadata_retry_markers(
                 &self,
-            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+            ) -> Result<HashSet<(String, String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_pending_metadata_rewrites(
@@ -2054,11 +2608,13 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn clear_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -2077,7 +2633,7 @@ mod tests {
             false,
             false,
             1,
-            &Some(db),
+            Some(db.as_ref()),
             "sync_token:PrimarySync",
             "PrimarySync",
         )
@@ -2098,7 +2654,7 @@ mod tests {
             false,
             false,
             1,
-            &None,
+            None,
             "sync_token:PrimarySync",
             "PrimarySync",
         )
@@ -2130,10 +2686,11 @@ mod tests {
             zone_name: zone.to_string(),
             sync_token_key: sync_token_key.to_string(),
             plan: crate::commands::AlbumPlan { passes: Vec::new() },
+            plan_is_stale: false,
         }
     }
 
-    /// CG-5: `more_coming=true` with empty zones must NOT skip the cycle.
+    /// `more_coming=true` with empty zones must NOT skip the cycle.
     /// Production logic: `if zones.is_empty() && !more_coming { skip }`.
     /// A regression that flipped the conjunction would silently skip every
     /// page-bearing wakeup — silent loss of pending changes.
@@ -2160,7 +2717,7 @@ mod tests {
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(&Some(Arc::clone(&db)), &lib_state, &mut svc).await;
+        let skip = check_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
 
         assert!(
             !skip,
@@ -2176,7 +2733,7 @@ mod tests {
         assert_eq!(stored, "db-tok-2");
     }
 
-    /// CG-6: empty zones + `more_coming=false` must return `skip=true`.
+    /// Empty zones + `more_coming=false` must return `skip=true`.
     /// This is the optimistic short-circuit: Apple confirmed there are no
     /// pending changes, so we save a full enumeration cycle. A regression
     /// that flipped this branch would either burn a CloudKit query per
@@ -2201,7 +2758,7 @@ mod tests {
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(&Some(Arc::clone(&db)), &lib_state, &mut svc).await;
+        let skip = check_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
 
         assert!(skip, "empty zones + more_coming=false must skip the cycle");
         // The new db_sync_token must still be persisted even on skip:
@@ -2215,7 +2772,7 @@ mod tests {
         assert_eq!(stored, "db-tok-3");
     }
 
-    /// Companion to CG-6: a non-empty zones list MUST NOT skip — even
+    /// A non-empty zones list MUST NOT skip — even
     /// when more_coming=false. This is the real-work path; pinning it
     /// alongside the skip path catches a flipped branch in either
     /// direction.
@@ -2241,11 +2798,11 @@ mod tests {
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        let skip = check_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
         assert!(!skip, "zones-present response must not skip the cycle");
     }
 
-    /// CG-6 corner: no stored sync token at all must return false (don't
+    /// No stored sync token at all must return false (don't
     /// skip) without making the HTTP call. Pinning this prevents a future
     /// refactor that flipped the early return from silently consuming an
     /// Apple call slot on bootstrap.
@@ -2261,11 +2818,11 @@ mod tests {
         let db: Arc<dyn state::StateDb> = make_state_db();
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        let skip = check_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
         assert!(!skip, "no stored token must skip-result false (continue)");
     }
 
-    /// CG-7: a `set_metadata("db_sync_token", ...)` write failure must
+    /// A `set_metadata("db_sync_token", ...)` write failure must
     /// NOT break the cycle. The current implementation logs a warning and
     /// continues. A regression that propagated the error would crash watch
     /// mode whenever a sqlite hiccup hit that single write.
@@ -2287,6 +2844,7 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
                 _: &std::path::Path,
             ) -> Result<bool, state::error::StateError> {
                 unimplemented!()
@@ -2299,6 +2857,7 @@ mod tests {
             }
             async fn mark_downloaded(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
                 _: &std::path::Path,
@@ -2317,6 +2876,7 @@ mod tests {
             }
             async fn mark_failed(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
                 _: &str,
@@ -2390,7 +2950,7 @@ mod tests {
             }
             async fn get_downloaded_ids(
                 &self,
-            ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError>
+            ) -> Result<std::collections::HashSet<(String, String, String)>, state::error::StateError>
             {
                 unimplemented!()
             }
@@ -2401,8 +2961,10 @@ mod tests {
             }
             async fn get_downloaded_checksums(
                 &self,
-            ) -> Result<std::collections::HashMap<(String, String), String>, state::error::StateError>
-            {
+            ) -> Result<
+                std::collections::HashMap<(String, String, String), String>,
+                state::error::StateError,
+            > {
                 unimplemented!()
             }
             async fn get_attempt_counts(
@@ -2438,6 +3000,7 @@ mod tests {
             }
             async fn touch_last_seen_many(
                 &self,
+                _: &str,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
@@ -2447,31 +3010,40 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_asset_albums(
                 &self,
+                _: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_asset_people(
                 &self,
+                _: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn mark_soft_deleted(
                 &self,
                 _: &str,
+                _: &str,
                 _: Option<chrono::DateTime<chrono::Utc>>,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
-            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+            async fn mark_hidden_at_source(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn record_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -2479,13 +3051,15 @@ mod tests {
             }
             async fn get_downloaded_metadata_hashes(
                 &self,
-            ) -> Result<std::collections::HashMap<(String, String), String>, state::error::StateError>
-            {
+            ) -> Result<
+                std::collections::HashMap<(String, String, String), String>,
+                state::error::StateError,
+            > {
                 unimplemented!()
             }
             async fn get_metadata_retry_markers(
                 &self,
-            ) -> Result<std::collections::HashSet<(String, String)>, state::error::StateError>
+            ) -> Result<std::collections::HashSet<(String, String, String)>, state::error::StateError>
             {
                 unimplemented!()
             }
@@ -2500,11 +3074,13 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn clear_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -2542,7 +3118,7 @@ mod tests {
 
         // The function logs the write failure and continues. zones non-empty
         // means it must return false (don't skip).
-        let skip = check_changes_database(&Some(db), &lib_state, &mut svc).await;
+        let skip = check_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
         assert!(
             !skip,
             "db_sync_token write failure must not propagate as a skip"
@@ -2551,12 +3127,12 @@ mod tests {
 
     // ── preload_asset_groupings ──────────────────────────────────────
     //
-    // CG-8: `preload_asset_groupings` must be best-effort: a hiccup
+    // `preload_asset_groupings` must be best-effort: a hiccup
     // loading people must NOT empty the albums map, and vice versa.
     // XMP-sidecar runs read this struct; biasing the entire grouping
     // empty would silently strip metadata from every downloaded photo.
 
-    /// CG-8: when `get_all_asset_albums` succeeds but
+    /// When `get_all_asset_albums` succeeds but
     /// `get_all_asset_people` fails, the result still includes albums.
     #[cfg(feature = "xmp")]
     #[tokio::test]
@@ -2575,6 +3151,7 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
                 _: &std::path::Path,
             ) -> Result<bool, state::error::StateError> {
                 unimplemented!()
@@ -2587,6 +3164,7 @@ mod tests {
             }
             async fn mark_downloaded(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
                 _: &std::path::Path,
@@ -2605,6 +3183,7 @@ mod tests {
             }
             async fn mark_failed(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
                 _: &str,
@@ -2678,7 +3257,7 @@ mod tests {
             }
             async fn get_downloaded_ids(
                 &self,
-            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+            ) -> Result<HashSet<(String, String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_known_ids(&self) -> Result<HashSet<String>, state::error::StateError> {
@@ -2686,7 +3265,8 @@ mod tests {
             }
             async fn get_downloaded_checksums(
                 &self,
-            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+            ) -> Result<HashMap<(String, String, String), String>, state::error::StateError>
+            {
                 unimplemented!()
             }
             async fn get_attempt_counts(
@@ -2711,27 +3291,31 @@ mod tests {
             }
             async fn touch_last_seen_many(
                 &self,
+                _: &str,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn add_asset_album(
                 &self,
+                library: &str,
                 asset_id: &str,
                 album_name: &str,
                 source: &str,
             ) -> Result<(), state::error::StateError> {
                 self.inner
-                    .add_asset_album(asset_id, album_name, source)
+                    .add_asset_album(library, asset_id, album_name, source)
                     .await
             }
             async fn get_all_asset_albums(
                 &self,
+                library: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
-                self.inner.get_all_asset_albums().await
+                self.inner.get_all_asset_albums(library).await
             }
             async fn get_all_asset_people(
                 &self,
+                _: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
                 Err(state::error::StateError::LockPoisoned(
                     "simulated people-table read failure".into(),
@@ -2740,15 +3324,21 @@ mod tests {
             async fn mark_soft_deleted(
                 &self,
                 _: &str,
+                _: &str,
                 _: Option<chrono::DateTime<chrono::Utc>>,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
-            async fn mark_hidden_at_source(&self, _: &str) -> Result<(), state::error::StateError> {
+            async fn mark_hidden_at_source(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn record_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -2756,12 +3346,13 @@ mod tests {
             }
             async fn get_downloaded_metadata_hashes(
                 &self,
-            ) -> Result<HashMap<(String, String), String>, state::error::StateError> {
+            ) -> Result<HashMap<(String, String, String), String>, state::error::StateError>
+            {
                 unimplemented!()
             }
             async fn get_metadata_retry_markers(
                 &self,
-            ) -> Result<HashSet<(String, String)>, state::error::StateError> {
+            ) -> Result<HashSet<(String, String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_pending_metadata_rewrites(
@@ -2775,11 +3366,13 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn clear_metadata_write_failure(
                 &self,
+                _: &str,
                 _: &str,
                 _: &str,
             ) -> Result<(), state::error::StateError> {
@@ -2796,17 +3389,17 @@ mod tests {
         // so we can verify the surviving map is non-empty.
         let inner = make_state_db();
         inner
-            .add_asset_album("ASSET_A", "Vacation", "icloud")
+            .add_asset_album("PrimarySync", "ASSET_A", "Vacation", "icloud")
             .await
             .expect("add album A");
         inner
-            .add_asset_album("ASSET_B", "Family", "icloud")
+            .add_asset_album("PrimarySync", "ASSET_B", "Family", "icloud")
             .await
             .expect("add album B");
 
         let db: Option<Arc<dyn state::StateDb>> = Some(Arc::new(PartialDb { inner }));
 
-        let groupings = preload_asset_groupings(&db).await;
+        let groupings = preload_asset_groupings(db.as_deref(), "PrimarySync").await;
         // Albums must survive intact.
         assert_eq!(
             groupings.albums.len(),
@@ -2829,19 +3422,19 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn preload_asset_groupings_no_db_returns_empty() {
-        let groupings = preload_asset_groupings(&None).await;
+        let groupings = preload_asset_groupings(None, "PrimarySync").await;
         assert!(groupings.albums.is_empty());
         assert!(groupings.people.is_empty());
     }
 
-    // CG-9 / CG-21: `should_store_sync_token` is the single decision gate
+    // `should_store_sync_token` is the single decision gate
     // protecting the sync-token from being advanced after a partial sync or
     // a dry run. Both situations would lose change events on the next
     // incremental cycle ("user data is sacred"). The matrix below pins every
     // (outcome, dry_run) combination so a future refactor can't relax the
     // contract without a failing test.
 
-    /// CG-9: a partial download failure MUST NOT advance the stored sync
+    /// A partial download failure MUST NOT advance the stored sync
     /// token. Otherwise the next incremental sync would skip past the
     /// failed assets' change events and never retry them.
     #[test]
@@ -2858,7 +3451,7 @@ mod tests {
         );
     }
 
-    /// CG-9 companion: `SessionExpired` is also a non-success outcome and
+    /// `SessionExpired` is also a non-success outcome and
     /// MUST NOT advance the token. The cycle aborts mid-stream; the captured
     /// token may only reflect a subset of the work.
     #[test]
@@ -2870,7 +3463,7 @@ mod tests {
         assert!(!should_store_sync_token(&outcome, true));
     }
 
-    /// CG-21: in `--dry-run`, even a fully-successful pass MUST NOT advance
+    /// In `--dry-run`, even a fully-successful pass MUST NOT advance
     /// the token. Dry-run promises no DB writes that affect the next real
     /// sync; advancing the token would silently break the next incremental.
     #[test]
@@ -2894,12 +3487,140 @@ mod tests {
         );
     }
 
-    // CG-19: `should_wait_for_2fa` decides whether the reauth-time 2FA
+    /// A cycle that consumed a stale plan from a prior
+    /// failed `resolve_passes` MUST NOT advance the sync token even when the
+    /// per-library outcome is `Success`. A reused plan can route assets to
+    /// the wrong pass; advancing the token would skip the change events
+    /// that would surface the corrected membership on the next cycle.
+    #[test]
+    fn sync_loop_stale_plan_blocks_sync_token_advance_even_on_success() {
+        let outcome = download::DownloadOutcome::Success;
+        // Baseline: without a stale plan, Success advances the token.
+        assert!(should_store_sync_token_for_cycle(&outcome, false, false));
+        // With a stale plan: even Success must NOT advance the token.
+        assert!(
+            !should_store_sync_token_for_cycle(&outcome, false, true),
+            "stale-plan flag must veto token advancement on Success"
+        );
+    }
+
+    /// Stale-plan companion: dry_run and PartialFailure already block; pinning
+    /// the matrix so a future refactor can't silently change the AND/OR
+    /// shape of the gate.
+    #[test]
+    fn sync_loop_stale_plan_combines_with_existing_gates() {
+        let success = download::DownloadOutcome::Success;
+        let partial = download::DownloadOutcome::PartialFailure { failed_count: 1 };
+
+        // PartialFailure: blocked regardless of stale-plan flag.
+        assert!(!should_store_sync_token_for_cycle(&partial, false, false));
+        assert!(!should_store_sync_token_for_cycle(&partial, false, true));
+
+        // Dry-run: blocked regardless of stale-plan flag.
+        assert!(!should_store_sync_token_for_cycle(&success, true, false));
+        assert!(!should_store_sync_token_for_cycle(&success, true, true));
+
+        // Only (Success, dry_run=false, stale=false) advances.
+        assert!(should_store_sync_token_for_cycle(&success, false, false));
+        assert!(!should_store_sync_token_for_cycle(&success, false, true));
+    }
+
+    // Periodic reconciliation cadence. The watch loop calls
+    // `should_reconcile_this_cycle` once per cycle to decide whether to walk
+    // the state DB and warn on missing local files. Tests pin the cadence
+    // so a future refactor can't silently disable the schedule.
+
+    /// When `every_n` is `None`, the predicate must NEVER fire — this
+    /// is the default-disabled behaviour for daemons that don't opt into
+    /// periodic reconciliation.
+    #[test]
+    fn periodic_reconcile_disabled_when_every_n_is_none() {
+        for cycle in [1u64, 2, 24, 1_000, u64::MAX] {
+            assert!(
+                !should_reconcile_this_cycle(cycle, None),
+                "cycle {cycle} with every_n=None must NOT trigger reconciliation"
+            );
+        }
+    }
+
+    /// `Some(0)` is treated identically to `None` — the config
+    /// resolver also filters this case, but the predicate is the load-bearing
+    /// gate so we pin both spellings here.
+    #[test]
+    fn periodic_reconcile_disabled_when_every_n_is_zero() {
+        for cycle in [1u64, 2, 24, 1_000] {
+            assert!(
+                !should_reconcile_this_cycle(cycle, Some(0)),
+                "cycle {cycle} with every_n=Some(0) must NOT trigger"
+            );
+        }
+    }
+
+    /// The first firing must be at cycle == every_n, NOT cycle 0 or
+    /// cycle 1. A freshly-started daemon must run at least one full sync
+    /// before burning startup time on a state-DB walk.
+    #[test]
+    fn periodic_reconcile_first_fires_at_cycle_n_not_at_cycle_zero() {
+        // every_n = 24: cycles 1..23 must NOT fire; cycle 24 fires.
+        for cycle in 1u64..24 {
+            assert!(
+                !should_reconcile_this_cycle(cycle, Some(24)),
+                "cycle {cycle} must NOT trigger when every_n=24"
+            );
+        }
+        assert!(
+            should_reconcile_this_cycle(24, Some(24)),
+            "cycle 24 with every_n=24 must trigger"
+        );
+        // Cycle 0 is the pre-loop sentinel and must never fire even when
+        // 0 is divisible by N.
+        assert!(
+            !should_reconcile_this_cycle(0, Some(24)),
+            "cycle 0 (pre-loop sentinel) must NEVER trigger"
+        );
+    }
+
+    /// Subsequent firings must repeat at every multiple of `every_n`.
+    /// Pinning a few cycles past the first firing guards against an
+    /// off-by-one that lets the cadence drift over a long run.
+    #[test]
+    fn periodic_reconcile_fires_on_every_multiple_of_n() {
+        let n = 24;
+        for &cycle in &[24u64, 48, 72, 240, 24_000] {
+            assert!(
+                should_reconcile_this_cycle(cycle, Some(n)),
+                "cycle {cycle} (multiple of {n}) must trigger"
+            );
+        }
+        for &cycle in &[25u64, 47, 49, 71, 73, 239, 241] {
+            assert!(
+                !should_reconcile_this_cycle(cycle, Some(n)),
+                "cycle {cycle} (NOT a multiple of {n}) must NOT trigger"
+            );
+        }
+    }
+
+    /// `every_n=1` makes every cycle trigger reconciliation. Allowed
+    /// (chatty but not a bug) and pinned because users debugging a drift
+    /// suspicion are likely to set it to 1 temporarily.
+    #[test]
+    fn periodic_reconcile_every_one_fires_every_cycle() {
+        for cycle in 1u64..=10 {
+            assert!(
+                should_reconcile_this_cycle(cycle, Some(1)),
+                "cycle {cycle} with every_n=1 must trigger"
+            );
+        }
+        // Sentinel still excluded.
+        assert!(!should_reconcile_this_cycle(0, Some(1)));
+    }
+
+    // `should_wait_for_2fa` decides whether the reauth-time 2FA
     // branch parks the loop on a code prompt or surfaces the error. In
     // one-shot mode there is no operator at the keyboard; the error MUST
     // bubble up so cron / systemd / CI exits non-zero.
 
-    /// CG-19: a 2FA-required error in one-shot (`is_watch_mode = false`)
+    /// A 2FA-required error in one-shot (`is_watch_mode = false`)
     /// MUST NOT cause the helper to return `true`. The caller will then
     /// surface the error to the user instead of blocking forever on a
     /// 2FA prompt that no one is watching.
@@ -2912,7 +3633,7 @@ mod tests {
         );
     }
 
-    /// CG-19 companion: in watch mode the same error is recoverable;
+    /// In watch mode the same error is recoverable;
     /// the helper returns `true` so the loop can park.
     #[test]
     fn run_sync_2fa_required_in_watch_mode_waits() {

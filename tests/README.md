@@ -114,9 +114,10 @@ details are baked into test code.
 | `KEI_TEST_SCRATCH_DIR` | `/tmp/kei-tests-$USER` | Base dir for shell-suite scratch |
 | `KEI_IMPORT_FIXTURE_DIR` | `/tmp/claude/kei-import-fixture` | Where `import_existing_live.rs` caches its `--recent 100` sync fixture across runs |
 
-`just test live` applies a few defaults on top (`ICLOUD_TEST_COOKIE_DIR=~/.config/kei`,
-`KEI_TEST_ALBUM=icloudpd-test`) that match this repo's maintainer setup.
-Override them in your environment to point at your own account.
+`just test live` applies `KEI_TEST_ALBUM=icloudpd-test` to match this
+repo's maintainer setup. Override in your environment to point at your
+own account. Cookie dir falls through to the harness default
+(`./.test-cookies`); set `ICLOUD_TEST_COOKIE_DIR` to override.
 
 ## Rate limits
 

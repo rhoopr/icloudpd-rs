@@ -58,6 +58,7 @@ docker run --rm \
         --data-dir /config \
         --directory /photos \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --no-incremental \
     2>&1
@@ -115,6 +116,7 @@ docker run --rm \
         --data-dir /config \
         --directory /photos \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --log-level info \
     2>&1 | tee /dev/stderr | grep -qE "downloaded=0|No new photos"
@@ -133,6 +135,7 @@ docker run --rm \
         --data-dir /config \
         --directory /photos \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --dry-run \
     2>&1
@@ -171,6 +174,7 @@ docker run -d --name "$WATCH_NAME" \
         --data-dir /config \
         --directory /photos \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --watch-with-interval 60 \
         --log-level info >/dev/null
@@ -192,12 +196,17 @@ rm -rf "$WATCH_PHOTOS"
 
 echo ""
 echo "--- 11. HEALTHCHECK probe ---"
+# Reads consecutive_failures out of health.json with grep/awk so we don't
+# depend on jq being installed in the production image (slim debian, no
+# jq). The field is a top-level integer; the regex scopes the match to
+# its key so adjacent fields can't bleed in.
 docker run --rm --entrypoint sh \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" -c '
-      test -f /config/health.json \
-      && test "$(jq -r .consecutive_failures /config/health.json)" -lt 5 \
-      && echo HEALTHY
+      test -f /config/health.json || exit 1
+      cf=$(grep -oE "\"consecutive_failures\"[[:space:]]*:[[:space:]]*[0-9]+" /config/health.json \
+           | grep -oE "[0-9]+$")
+      test -n "$cf" && test "$cf" -lt 5 && echo HEALTHY
     ' 2>&1 | tee /dev/stderr | grep -q HEALTHY
 kei_check "healthcheck probe reports HEALTHY"
 
@@ -218,6 +227,7 @@ PWFILE_OUT=$(docker run --rm \
         --data-dir /config \
         --directory /photos \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --dry-run \
     2>&1)
