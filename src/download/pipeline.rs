@@ -237,6 +237,7 @@ const ADD_ASSET_ALBUM_MAX_RETRIES: u32 = 3;
 /// don't re-collide on the same SQLite lock.
 pub(super) async fn add_asset_album_with_retry(
     db: &dyn StateDb,
+    library: &str,
     asset_id: &str,
     album_name: &str,
     source: &str,
@@ -244,13 +245,17 @@ pub(super) async fn add_asset_album_with_retry(
     use rand::RngExt;
     let mut last_err: Option<crate::state::error::StateError> = None;
     for attempt in 1..=ADD_ASSET_ALBUM_MAX_RETRIES {
-        match db.add_asset_album(asset_id, album_name, source).await {
+        match db
+            .add_asset_album(library, asset_id, album_name, source)
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if attempt < ADD_ASSET_ALBUM_MAX_RETRIES {
                     tracing::debug!(
                         asset_id,
                         album = album_name,
+                        library,
                         attempt,
                         error = %e,
                         "add_asset_album retry"
@@ -1259,6 +1264,7 @@ where
                                     if !album.is_empty() {
                                         if let Err(e) = add_asset_album_with_retry(
                                             db.as_ref(),
+                                            &config.library,
                                             asset.id(),
                                             album,
                                             "icloud",
@@ -2847,6 +2853,7 @@ mod tests {
         }
         async fn add_asset_album(
             &self,
+            _library: &str,
             asset_id: &str,
             album_name: &str,
             source: &str,
@@ -2865,10 +2872,10 @@ mod tests {
                 Ok(())
             }
         }
-        async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError> {
+        async fn get_all_asset_albums(&self, _: &str) -> Result<Vec<(String, String)>, StateError> {
             unimplemented!()
         }
-        async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
+        async fn get_all_asset_people(&self, _: &str) -> Result<Vec<(String, String)>, StateError> {
             unimplemented!()
         }
         async fn mark_soft_deleted(
@@ -2953,7 +2960,9 @@ mod tests {
     #[tokio::test]
     async fn add_asset_album_retry_recovers_after_one_transient_failure() {
         let stub = AlbumRetryStubDb::new(1); // fail once, succeed on retry
-        let result = add_asset_album_with_retry(&stub, "ASSET_A", "Favorites", "icloud").await;
+        let result =
+            add_asset_album_with_retry(&stub, "PrimarySync", "ASSET_A", "Favorites", "icloud")
+                .await;
         assert!(
             result.is_ok(),
             "transient SQLite-busy must be retried, not surfaced as Err"
@@ -2978,7 +2987,8 @@ mod tests {
     async fn add_asset_album_retry_surfaces_persistent_failure() {
         // Fail more times than the retry cap.
         let stub = AlbumRetryStubDb::new((ADD_ASSET_ALBUM_MAX_RETRIES + 5) as usize);
-        let result = add_asset_album_with_retry(&stub, "ASSET_B", "Trip", "icloud").await;
+        let result =
+            add_asset_album_with_retry(&stub, "PrimarySync", "ASSET_B", "Trip", "icloud").await;
         assert!(
             result.is_err(),
             "persistent failure must propagate so the caller's warn! fires"
@@ -2999,7 +3009,8 @@ mod tests {
     #[tokio::test]
     async fn add_asset_album_retry_no_op_on_first_success() {
         let stub = AlbumRetryStubDb::new(0);
-        let result = add_asset_album_with_retry(&stub, "ASSET_C", "Holiday", "icloud").await;
+        let result =
+            add_asset_album_with_retry(&stub, "PrimarySync", "ASSET_C", "Holiday", "icloud").await;
         assert!(result.is_ok());
         assert_eq!(
             stub.calls.load(Ordering::Relaxed),
@@ -3648,13 +3659,19 @@ mod tests {
             // pipeline's batch-flush path.
             Ok(())
         }
-        async fn add_asset_album(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+        async fn add_asset_album(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), StateError> {
             Ok(())
         }
-        async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError> {
+        async fn get_all_asset_albums(&self, _: &str) -> Result<Vec<(String, String)>, StateError> {
             Ok(Vec::new())
         }
-        async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
+        async fn get_all_asset_people(&self, _: &str) -> Result<Vec<(String, String)>, StateError> {
             Ok(Vec::new())
         }
         async fn mark_soft_deleted(

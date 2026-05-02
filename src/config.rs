@@ -783,6 +783,8 @@ fn resolve_vec(cli: Vec<String>, toml: Option<Vec<String>>) -> Vec<String> {
 #[derive(Debug, Default)]
 pub(crate) struct PathDerivationCliArgs {
     pub folder_structure: Option<String>,
+    pub folder_structure_albums: Option<String>,
+    pub folder_structure_smart_folders: Option<String>,
     pub size: Option<VersionSize>,
     pub live_photo_mode: Option<LivePhotoMode>,
     pub live_photo_size: Option<LivePhotoSize>,
@@ -799,6 +801,8 @@ pub(crate) struct PathDerivationCliArgs {
 #[derive(Debug)]
 pub(crate) struct PathDerivationFields {
     pub folder_structure: String,
+    pub folder_structure_albums: String,
+    pub folder_structure_smart_folders: String,
     pub size: VersionSize,
     pub live_photo_mode: LivePhotoMode,
     pub live_photo_size: LivePhotoSize,
@@ -824,6 +828,14 @@ pub(crate) fn resolve_path_derivation_fields(
         .folder_structure
         .or_else(|| toml_dl.and_then(|d| d.folder_structure.clone()))
         .unwrap_or_else(|| "%Y/%m/%d".to_string());
+    let folder_structure_albums = cli
+        .folder_structure_albums
+        .or_else(|| toml_dl.and_then(|d| d.folder_structure_albums.clone()))
+        .unwrap_or_else(|| "{album}".to_string());
+    let folder_structure_smart_folders = cli
+        .folder_structure_smart_folders
+        .or_else(|| toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()))
+        .unwrap_or_else(|| "{smart-folder}".to_string());
     let size = resolve(
         cli.size,
         toml_photos.and_then(|p| p.size),
@@ -867,6 +879,8 @@ pub(crate) fn resolve_path_derivation_fields(
 
     PathDerivationFields {
         folder_structure,
+        folder_structure_albums,
+        folder_structure_smart_folders,
         size,
         live_photo_mode,
         live_photo_size,
@@ -1584,6 +1598,8 @@ impl Config {
         // it through so the resolver short-circuits.
         let PathDerivationFields {
             folder_structure: _,
+            folder_structure_albums: _,
+            folder_structure_smart_folders: _,
             size,
             live_photo_mode,
             live_photo_size,
@@ -1595,6 +1611,8 @@ impl Config {
         } = resolve_path_derivation_fields(
             PathDerivationCliArgs {
                 folder_structure: Some(folder_structure.clone()),
+                folder_structure_albums: Some(folder_structure_albums.clone()),
+                folder_structure_smart_folders: Some(folder_structure_smart_folders.clone()),
                 size: sync.size,
                 live_photo_mode: live_photo_mode_pre_resolved,
                 live_photo_size: sync.live_photo_size,

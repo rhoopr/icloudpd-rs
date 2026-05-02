@@ -1369,7 +1369,7 @@ async fn run_cycle(
         // Skip the DB scan entirely when nothing downstream will read it.
         #[cfg(feature = "xmp")]
         let asset_groupings = if config.embed_xmp || config.xmp_sidecar {
-            preload_asset_groupings(state_db).await
+            preload_asset_groupings(state_db, &lib_state.zone_name).await
         } else {
             Arc::new(download::AssetGroupings::default())
         };
@@ -1453,16 +1453,20 @@ async fn run_cycle(
 ///
 /// Returns `true` when no zones report changes and `moreComing` is false.
 /// Bulk-load `asset_albums` + `asset_people` into an in-memory index so the
-/// filter phase can enrich payloads without per-asset DB hits.
+/// filter phase can enrich payloads without per-asset DB hits. Scoped to a
+/// single library so multi-library accounts don't cross-attribute album /
+/// person memberships across zones (the v9 schema scopes both join tables
+/// per library; this reader honours that scope).
 #[cfg(feature = "xmp")]
 async fn preload_asset_groupings(
     state_db: Option<&dyn state::StateDb>,
+    library: &str,
 ) -> Arc<download::AssetGroupings> {
     let Some(db) = state_db else {
         return Arc::new(download::AssetGroupings::default());
     };
-    let albums = db.get_all_asset_albums().await;
-    let people = db.get_all_asset_people().await;
+    let albums = db.get_all_asset_albums(library).await;
+    let people = db.get_all_asset_people(library).await;
     let mut groupings = download::AssetGroupings::default();
     match albums {
         Ok(rows) => {
@@ -1470,7 +1474,7 @@ async fn preload_asset_groupings(
                 groupings.albums.entry(asset_id).or_default().push(album);
             }
         }
-        Err(e) => tracing::warn!(error = %e, "Failed to preload asset_albums"),
+        Err(e) => tracing::warn!(error = %e, library, "Failed to preload asset_albums"),
     }
     match people {
         Ok(rows) => {
@@ -1478,7 +1482,7 @@ async fn preload_asset_groupings(
                 groupings.people.entry(asset_id).or_default().push(person);
             }
         }
-        Err(e) => tracing::warn!(error = %e, "Failed to preload asset_people"),
+        Err(e) => tracing::warn!(error = %e, library, "Failed to preload asset_people"),
     }
     Arc::new(groupings)
 }
@@ -2476,16 +2480,19 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_asset_albums(
                 &self,
+                _: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_asset_people(
                 &self,
+                _: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
                 unimplemented!()
             }
@@ -2936,16 +2943,19 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_asset_albums(
                 &self,
+                _: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
                 unimplemented!()
             }
             async fn get_all_asset_people(
                 &self,
+                _: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
                 unimplemented!()
             }
@@ -3221,21 +3231,24 @@ mod tests {
             }
             async fn add_asset_album(
                 &self,
+                library: &str,
                 asset_id: &str,
                 album_name: &str,
                 source: &str,
             ) -> Result<(), state::error::StateError> {
                 self.inner
-                    .add_asset_album(asset_id, album_name, source)
+                    .add_asset_album(library, asset_id, album_name, source)
                     .await
             }
             async fn get_all_asset_albums(
                 &self,
+                library: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
-                self.inner.get_all_asset_albums().await
+                self.inner.get_all_asset_albums(library).await
             }
             async fn get_all_asset_people(
                 &self,
+                _: &str,
             ) -> Result<Vec<(String, String)>, state::error::StateError> {
                 Err(state::error::StateError::LockPoisoned(
                     "simulated people-table read failure".into(),
@@ -3309,17 +3322,17 @@ mod tests {
         // so we can verify the surviving map is non-empty.
         let inner = make_state_db();
         inner
-            .add_asset_album("ASSET_A", "Vacation", "icloud")
+            .add_asset_album("PrimarySync", "ASSET_A", "Vacation", "icloud")
             .await
             .expect("add album A");
         inner
-            .add_asset_album("ASSET_B", "Family", "icloud")
+            .add_asset_album("PrimarySync", "ASSET_B", "Family", "icloud")
             .await
             .expect("add album B");
 
         let db: Option<Arc<dyn state::StateDb>> = Some(Arc::new(PartialDb { inner }));
 
-        let groupings = preload_asset_groupings(db.as_deref()).await;
+        let groupings = preload_asset_groupings(db.as_deref(), "PrimarySync").await;
         // Albums must survive intact.
         assert_eq!(
             groupings.albums.len(),
@@ -3342,7 +3355,7 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[tokio::test]
     async fn preload_asset_groupings_no_db_returns_empty() {
-        let groupings = preload_asset_groupings(None).await;
+        let groupings = preload_asset_groupings(None, "PrimarySync").await;
         assert!(groupings.albums.is_empty());
         assert!(groupings.people.is_empty());
     }

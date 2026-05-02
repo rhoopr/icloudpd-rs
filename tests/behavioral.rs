@@ -54,10 +54,10 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match — preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 8;
+const HELPER_SCHEMA_VERSION: i32 = 9;
 
 /// Create a state DB at the expected path for the given username inside
-/// `data_dir`. Mirrors the v8 schema from `src/state/schema.rs` (the
+/// `data_dir`. Mirrors the v9 schema from `src/state/schema.rs` (the
 /// latest as of this writing) so the binary's migrate() loop is a no-op
 /// when it opens these DBs — i.e. tests run against the same shape
 /// production code writes on a fresh install. Bump `HELPER_SCHEMA_VERSION`
@@ -136,17 +136,23 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
         );
 
         CREATE TABLE IF NOT EXISTS asset_albums (
+            library    TEXT NOT NULL,
             asset_id   TEXT NOT NULL,
             album_name TEXT NOT NULL,
             source     TEXT NOT NULL,
-            PRIMARY KEY (asset_id, album_name, source)
+            PRIMARY KEY (library, asset_id, album_name, source)
         );
+        CREATE INDEX IF NOT EXISTS idx_asset_albums_lookup
+            ON asset_albums (library, asset_id);
 
         CREATE TABLE IF NOT EXISTS asset_people (
+            library     TEXT NOT NULL,
             asset_id    TEXT NOT NULL,
             person_name TEXT NOT NULL,
-            PRIMARY KEY (asset_id, person_name)
+            PRIMARY KEY (library, asset_id, person_name)
         );
+        CREATE INDEX IF NOT EXISTS idx_asset_people_lookup
+            ON asset_people (library, asset_id);
         ",
     )
     .unwrap();
@@ -198,7 +204,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 8;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 9;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -3912,6 +3918,14 @@ fn behavioral_helper_carries_every_migrated_column() {
     assert!(
         has_column(&conn, "assets", "library"),
         "v8 column assets.library must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "asset_albums", "library"),
+        "v9 column asset_albums.library must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "asset_people", "library"),
+        "v9 column asset_people.library must exist in the behavioral helper's DDL"
     );
 
     let has_asset_albums: bool = conn

@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 8;
+pub(crate) const SCHEMA_VERSION: i32 = 9;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -276,6 +276,52 @@ CREATE INDEX IF NOT EXISTS idx_assets_metadata_hash ON assets (metadata_hash) WH
     )
 }
 
+/// V9 recreate-table migration: extend `asset_albums` and `asset_people`
+/// PKs with `library` so multi-library accounts don't collide on shared
+/// asset IDs. Mirrors the v8 dance (no ALTER PRIMARY KEY in SQLite, so we
+/// copy into a fresh table and rename). Pre-v9 kei only wrote PrimarySync
+/// album/person rows (no library column existed); backfilling with
+/// `library='PrimarySync'` is exact, not approximate.
+fn schema_v9() -> &'static str {
+    r"
+DROP TABLE IF EXISTS asset_albums_v9;
+DROP TABLE IF EXISTS asset_people_v9;
+
+CREATE TABLE asset_albums_v9 (
+    library    TEXT NOT NULL,
+    asset_id   TEXT NOT NULL,
+    album_name TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    PRIMARY KEY (library, asset_id, album_name, source)
+);
+
+INSERT INTO asset_albums_v9 (library, asset_id, album_name, source)
+SELECT 'PrimarySync', asset_id, album_name, source FROM asset_albums;
+
+DROP TABLE asset_albums;
+ALTER TABLE asset_albums_v9 RENAME TO asset_albums;
+
+CREATE INDEX IF NOT EXISTS idx_asset_albums_lookup
+    ON asset_albums (library, asset_id);
+
+CREATE TABLE asset_people_v9 (
+    library     TEXT NOT NULL,
+    asset_id    TEXT NOT NULL,
+    person_name TEXT NOT NULL,
+    PRIMARY KEY (library, asset_id, person_name)
+);
+
+INSERT INTO asset_people_v9 (library, asset_id, person_name)
+SELECT 'PrimarySync', asset_id, person_name FROM asset_people;
+
+DROP TABLE asset_people;
+ALTER TABLE asset_people_v9 RENAME TO asset_people;
+
+CREATE INDEX IF NOT EXISTS idx_asset_people_lookup
+    ON asset_people (library, asset_id);
+"
+}
+
 /// Check whether a column exists on a table using `PRAGMA table_info`.
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StateError> {
     let mut stmt = conn
@@ -372,6 +418,18 @@ fn migrate_to_version(
             // with library='PrimarySync' is exact, not approximate.
             if !column_exists(conn, "assets", "library")? {
                 conn.execute_batch(&schema_v8())?;
+            }
+        }
+        9 => {
+            // Per-zone scope on the asset_albums and asset_people PKs.
+            // The v8 migration scoped `assets` per library but left the
+            // join tables keyed only on `asset_id`, so a multi-library
+            // account with the same asset in PrimarySync and a SharedSync
+            // zone would have its album/person memberships cross-attributed.
+            // Same backfill rationale as v8: pre-v9 writes only ever
+            // targeted PrimarySync.
+            if !column_exists(conn, "asset_albums", "library")? {
+                conn.execute_batch(schema_v9())?;
             }
         }
         other => {
@@ -1216,5 +1274,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!(leftover, 0);
+    }
+
+    /// v9 must add `library` to both join tables and backfill existing
+    /// rows to `'PrimarySync'`. Pre-v9 only PrimarySync rows ever existed
+    /// (no zone parameter on the writers), so the backfill is exact.
+    #[test]
+    fn test_v9_backfills_join_tables_to_primarysync() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Build v8 (everything up to but not including v9).
+        build_v7_schema(&conn);
+        conn.execute_batch(&schema_v8()).unwrap();
+        set_schema_version(&conn, 8).unwrap();
+
+        // Seed pre-v9 join-table rows (no library column yet).
+        conn.execute(
+            "INSERT INTO asset_albums (asset_id, album_name, source) VALUES \
+             ('A1', 'Vacation', 'icloud'), \
+             ('A2', 'Family', 'icloud')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO asset_people (asset_id, person_name) VALUES \
+             ('A1', 'Alice'), \
+             ('A2', 'Bob')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let albums: Vec<(String, String, String, String)> = conn
+            .prepare(
+                "SELECT library, asset_id, album_name, source FROM asset_albums ORDER BY asset_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            albums,
+            vec![
+                (
+                    "PrimarySync".into(),
+                    "A1".into(),
+                    "Vacation".into(),
+                    "icloud".into()
+                ),
+                (
+                    "PrimarySync".into(),
+                    "A2".into(),
+                    "Family".into(),
+                    "icloud".into()
+                ),
+            ]
+        );
+
+        let people: Vec<(String, String, String)> = conn
+            .prepare("SELECT library, asset_id, person_name FROM asset_people ORDER BY asset_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            people,
+            vec![
+                ("PrimarySync".into(), "A1".into(), "Alice".into()),
+                ("PrimarySync".into(), "A2".into(), "Bob".into()),
+            ]
+        );
+
+        // The new PK must reject same-library duplicates AND accept
+        // same-(asset_id, album_name, source) across different libraries.
+        let dup = conn.execute(
+            "INSERT INTO asset_albums (library, asset_id, album_name, source) \
+             VALUES ('PrimarySync', 'A1', 'Vacation', 'icloud')",
+            [],
+        );
+        assert!(dup.is_err(), "v9 PK must reject same-library duplicates");
+        let cross = conn.execute(
+            "INSERT INTO asset_albums (library, asset_id, album_name, source) \
+             VALUES ('SharedSync-AB', 'A1', 'Vacation', 'icloud')",
+            [],
+        );
+        assert!(
+            cross.is_ok(),
+            "v9 PK must accept same triple across libraries; got: {cross:?}"
+        );
+    }
+
+    #[test]
+    fn test_v9_indexes_recreated() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for idx in ["idx_asset_albums_lookup", "idx_asset_people_lookup"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = ?1",
+                    [idx],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "v9 must (re)create {idx}");
+        }
     }
 }

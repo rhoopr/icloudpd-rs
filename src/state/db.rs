@@ -238,24 +238,33 @@ pub trait StateDb: Send + Sync {
     /// Record an album membership entry. Idempotent via `INSERT OR IGNORE`.
     ///
     /// Called during album enumeration when an asset is seen in an album. The
-    /// `(asset_id, album_name, source)` composite key namespaces memberships
-    /// per provider so that multiple providers can coexist.
+    /// `(library, asset_id, album_name, source)` composite key namespaces
+    /// memberships per library and per provider so multi-library accounts
+    /// don't cross-attribute and multiple providers can coexist.
     async fn add_asset_album(
         &self,
+        library: &str,
         asset_id: &str,
         album_name: &str,
         source: &str,
     ) -> Result<(), StateError>;
 
-    /// Bulk-load every `(asset_id, album_name)` from `asset_albums`. Used at
-    /// sync start to populate the in-memory groupings index — downstream
-    /// writers look up album memberships without a per-asset DB hit.
+    /// Bulk-load `(asset_id, album_name)` rows for a single library. Used at
+    /// per-library sync start to populate the in-memory groupings index —
+    /// downstream writers look up album memberships without a per-asset DB
+    /// hit, and the load stays bounded by one library's row count.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError>;
+    async fn get_all_asset_albums(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError>;
 
-    /// Bulk-load every `(asset_id, person_name)` from `asset_people`.
+    /// Bulk-load `(asset_id, person_name)` rows for a single library.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError>;
+    async fn get_all_asset_people(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError>;
 
     /// Mark an asset as soft-deleted (all versions under `asset_id` in
     /// `library`).
@@ -1393,18 +1402,20 @@ impl StateDb for SqliteStateDb {
 
     async fn add_asset_album(
         &self,
+        library: &str,
         asset_id: &str,
         album_name: &str,
         source: &str,
     ) -> Result<(), StateError> {
+        let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         let album_name = album_name.to_owned();
         let source = source.to_owned();
         self.with_conn("add_asset_album", move |conn| {
             conn.execute(
-                "INSERT OR IGNORE INTO asset_albums (asset_id, album_name, source) \
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![asset_id, album_name, source],
+                "INSERT OR IGNORE INTO asset_albums (library, asset_id, album_name, source) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![library, asset_id, album_name, source],
             )
             .map_err(|e| StateError::query("add_asset_album", e))?;
             Ok(())
@@ -1412,13 +1423,17 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_all_asset_albums(&self) -> Result<Vec<(String, String)>, StateError> {
+    async fn get_all_asset_albums(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        let library = library.to_owned();
         self.with_conn("get_all_asset_albums", move |conn| {
             let mut stmt = conn
-                .prepare_cached("SELECT asset_id, album_name FROM asset_albums")
+                .prepare_cached("SELECT asset_id, album_name FROM asset_albums WHERE library = ?1")
                 .map_err(|e| StateError::query("get_all_asset_albums", e))?;
             let rows = stmt
-                .query_map([], |row| {
+                .query_map([&library], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(|e| StateError::query("get_all_asset_albums", e))?;
@@ -1427,13 +1442,17 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_all_asset_people(&self) -> Result<Vec<(String, String)>, StateError> {
+    async fn get_all_asset_people(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        let library = library.to_owned();
         self.with_conn("get_all_asset_people", move |conn| {
             let mut stmt = conn
-                .prepare_cached("SELECT asset_id, person_name FROM asset_people")
+                .prepare_cached("SELECT asset_id, person_name FROM asset_people WHERE library = ?1")
                 .map_err(|e| StateError::query("get_all_asset_people", e))?;
             let rows = stmt
-                .query_map([], |row| {
+                .query_map([&library], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(|e| StateError::query("get_all_asset_people", e))?;
@@ -1650,16 +1669,26 @@ impl StateDb for SqliteStateDb {
 
 #[cfg(test)]
 impl SqliteStateDb {
-    /// Overwrite `last_seen_at` for a specific asset. Used by tests that need
-    /// to simulate a pending row carried over from a prior sync. Callable
-    /// from any test module in the crate so cross-module state tests (e.g.
-    /// pipeline-level ghost-loop regression) don't have to reach for raw
-    /// `rusqlite::Connection` plumbing.
+    /// Overwrite `last_seen_at` for a specific asset in `PrimarySync`. Used
+    /// by tests that need to simulate a pending row carried over from a
+    /// prior sync. Callable from any test module in the crate so
+    /// cross-module state tests (e.g. pipeline-level ghost-loop regression)
+    /// don't have to reach for raw `rusqlite::Connection` plumbing.
+    ///
+    /// Library-scoped wrapper around the v8 PK; tests covering shared
+    /// libraries should use [`SqliteStateDb::backdate_last_seen_in`].
     pub(crate) fn backdate_last_seen(&self, asset_id: &str, ts: i64) {
+        self.backdate_last_seen_in(crate::icloud::photos::PRIMARY_ZONE_NAME, asset_id, ts);
+    }
+
+    /// Library-aware variant of [`Self::backdate_last_seen`]. The v8 PK
+    /// makes `(library, id, version_size)` distinct, so a same-id asset in
+    /// a shared library has its own row that this helper can address.
+    pub(crate) fn backdate_last_seen_in(&self, library: &str, asset_id: &str, ts: i64) {
         let conn = self.acquire_lock("test_backdate_last_seen").unwrap();
         conn.execute(
-            "UPDATE assets SET last_seen_at = ?1 WHERE id = ?2",
-            rusqlite::params![ts, asset_id],
+            "UPDATE assets SET last_seen_at = ?1 WHERE library = ?2 AND id = ?3",
+            rusqlite::params![ts, library, asset_id],
         )
         .unwrap();
     }
@@ -4296,10 +4325,10 @@ mod tests {
     #[tokio::test]
     async fn add_asset_album_is_idempotent() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        db.add_asset_album("A1", "Favorites", "icloud")
+        db.add_asset_album("PrimarySync", "A1", "Favorites", "icloud")
             .await
             .unwrap();
-        db.add_asset_album("A1", "Favorites", "icloud")
+        db.add_asset_album("PrimarySync", "A1", "Favorites", "icloud")
             .await
             .unwrap();
         let conn = db.acquire_lock("test").unwrap();
@@ -4316,10 +4345,10 @@ mod tests {
     #[tokio::test]
     async fn add_asset_album_respects_source_namespace() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        db.add_asset_album("A1", "Favorites", "icloud")
+        db.add_asset_album("PrimarySync", "A1", "Favorites", "icloud")
             .await
             .unwrap();
-        db.add_asset_album("A1", "Favorites", "takeout")
+        db.add_asset_album("PrimarySync", "A1", "Favorites", "takeout")
             .await
             .unwrap();
         let conn = db.acquire_lock("test").unwrap();
@@ -4333,6 +4362,32 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    /// v9 PK adds `library`: same `(asset_id, album_name, source)` triple
+    /// in two libraries must round-trip as two distinct rows. Pre-v9 this
+    /// silently collapsed via `INSERT OR IGNORE`.
+    #[tokio::test]
+    async fn add_asset_album_keeps_distinct_rows_per_library() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.add_asset_album("PrimarySync", "SHARED_ID", "Favorites", "icloud")
+            .await
+            .unwrap();
+        db.add_asset_album("SharedSync-A1B2C3D4", "SHARED_ID", "Favorites", "icloud")
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("test").unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_albums WHERE asset_id = 'SHARED_ID'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "v9 PK must keep per-library rows distinct on the same asset_id"
+        );
+    }
+
     #[tokio::test]
     async fn get_all_asset_people_returns_every_pair() {
         // asset_people has no production writer yet (reserved for future
@@ -4344,13 +4399,14 @@ mod tests {
             let conn = db.acquire_lock("seed").unwrap();
             for (aid, person) in [("A1", "Alice"), ("A1", "Bob"), ("A2", "Alice")] {
                 conn.execute(
-                    "INSERT INTO asset_people (asset_id, person_name) VALUES (?1, ?2)",
+                    "INSERT INTO asset_people (library, asset_id, person_name) \
+                     VALUES ('PrimarySync', ?1, ?2)",
                     rusqlite::params![aid, person],
                 )
                 .unwrap();
             }
         }
-        let rows = db.get_all_asset_people().await.unwrap();
+        let rows = db.get_all_asset_people("PrimarySync").await.unwrap();
         assert_eq!(rows.len(), 3);
         assert!(rows.contains(&("A1".into(), "Alice".into())));
         assert!(rows.contains(&("A1".into(), "Bob".into())));
@@ -4360,18 +4416,38 @@ mod tests {
     #[tokio::test]
     async fn get_all_asset_albums_returns_every_pair() {
         let db = SqliteStateDb::open_in_memory().unwrap();
-        db.add_asset_album("A1", "Favorites", "icloud")
+        db.add_asset_album("PrimarySync", "A1", "Favorites", "icloud")
             .await
             .unwrap();
-        db.add_asset_album("A1", "Trip", "icloud").await.unwrap();
-        db.add_asset_album("A2", "Favorites", "icloud")
+        db.add_asset_album("PrimarySync", "A1", "Trip", "icloud")
             .await
             .unwrap();
-        let rows = db.get_all_asset_albums().await.unwrap();
+        db.add_asset_album("PrimarySync", "A2", "Favorites", "icloud")
+            .await
+            .unwrap();
+        let rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
         assert_eq!(rows.len(), 3);
         assert!(rows.contains(&("A1".into(), "Favorites".into())));
         assert!(rows.contains(&("A1".into(), "Trip".into())));
         assert!(rows.contains(&("A2".into(), "Favorites".into())));
+    }
+
+    /// Reads must also be library-scoped: a SharedSync row with the same
+    /// asset_id must NOT bleed into PrimarySync's grouping load.
+    #[tokio::test]
+    async fn get_all_asset_albums_is_library_scoped() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.add_asset_album("PrimarySync", "ID", "Vacation", "icloud")
+            .await
+            .unwrap();
+        db.add_asset_album("SharedSync-AB", "ID", "Family", "icloud")
+            .await
+            .unwrap();
+
+        let primary = db.get_all_asset_albums("PrimarySync").await.unwrap();
+        let shared = db.get_all_asset_albums("SharedSync-AB").await.unwrap();
+        assert_eq!(primary, vec![("ID".into(), "Vacation".into())]);
+        assert_eq!(shared, vec![("ID".into(), "Family".into())]);
     }
 
     #[tokio::test]

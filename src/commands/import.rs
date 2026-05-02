@@ -20,7 +20,7 @@ use crate::state;
 use crate::state::StateDb;
 use crate::types::FileMatchPolicy;
 
-use super::service::{init_photos_service, resolve_libraries};
+use super::service::{init_photos_service, resolve_libraries, resolve_passes};
 
 /// Value of the `stage` field on the one-shot tracing event emitted by
 /// [`import_assets`] when the first asset is dequeued. Operators (and the
@@ -388,6 +388,13 @@ pub(crate) async fn run_import_existing(
     let selector = config::resolve_library_selector(cli_libraries, toml_filters)?;
     let libraries = resolve_libraries(&selector, &mut photos_service).await?;
 
+    // Album / smart-folder / unfiled selection comes from TOML for
+    // import-existing (which has no per-pass CLI flags of its own). The
+    // resulting `Selection` drives `resolve_passes` below so import iterates
+    // the same passes sync would, and each pass uses its own
+    // `folder_structure_*` template when deriving expected paths.
+    let selection = build_import_selection(toml_filters, &selector)?;
+
     let prior_db_total = db.get_summary().await?.total_assets;
     if prior_db_total > 0 && !args.force_empty {
         use futures_util::{StreamExt, TryStreamExt};
@@ -419,20 +426,41 @@ pub(crate) async fn run_import_existing(
     for library in &libraries {
         let zone = library.zone_name();
         tracing::debug!(zone = %zone, "Scanning library");
-        let all_album = library.all();
-        let (stream, panic_rx) = all_album.photo_stream(recent_count, None, 1);
 
-        let stats = import_assets(
-            stream,
-            panic_rx,
-            db.as_ref(),
-            &download_config,
-            zone,
-            args.dry_run,
-            !args.no_progress_bar,
-        )
-        .await?;
-        totals += stats;
+        // Pin the library on the per-library config so `with_pass` expands
+        // `{library}` to the right zone for each pass.
+        let library_config = download_config.with_library(zone);
+
+        let plan = resolve_passes(library, &selection).await?;
+        if plan.passes.is_empty() {
+            tracing::debug!(
+                zone = %zone,
+                "No passes resolved for library; nothing to import"
+            );
+            continue;
+        }
+
+        for pass in &plan.passes {
+            let pass_config = library_config.with_pass_for_import(pass);
+            tracing::debug!(
+                zone = %zone,
+                kind = ?pass.kind,
+                template = %pass_config.folder_structure,
+                "Importing pass"
+            );
+            let (stream, panic_rx) = pass.album.photo_stream(recent_count, None, 1);
+            let stats = import_assets(
+                stream,
+                panic_rx,
+                db.as_ref(),
+                &pass_config,
+                zone,
+                args.dry_run,
+                !args.no_progress_bar,
+            )
+            .await?;
+            totals += stats;
+        }
     }
 
     println!();
@@ -457,6 +485,38 @@ pub(crate) async fn run_import_existing(
 /// `--force-empty` is the documented escape hatch for that case. Caller
 /// short-circuits when `prior_db_total == 0` or `--force-empty` is set, so
 /// this function only runs when a guard is wanted.
+/// Build the [`Selection`] that `resolve_passes` consumes for import.
+///
+/// `import-existing` has no `--album` / `--smart-folder` / `--unfiled` CLI
+/// flags of its own, so the selection comes from `[filters]` in TOML (with
+/// the same defaults as sync: `albums = "all"`, `smart_folders = "none"`,
+/// `unfiled = true`). The `LibrarySelector` was already resolved upstream
+/// and is threaded in directly so `Selection.libraries` matches what
+/// `resolve_libraries` walked.
+fn build_import_selection(
+    toml_filters: Option<&config::TomlFilters>,
+    libraries: &crate::selection::LibrarySelector,
+) -> anyhow::Result<crate::selection::Selection> {
+    use crate::selection::{parse_album_selector, parse_smart_folder_selector, Selection};
+
+    let raw_albums: Vec<String> = toml_filters
+        .and_then(|f| f.albums.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let raw_smart_folders: Vec<String> = toml_filters
+        .and_then(|f| f.smart_folders.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let unfiled = toml_filters.and_then(|f| f.unfiled).unwrap_or(true);
+
+    Ok(Selection {
+        albums: parse_album_selector(&raw_albums, true)?,
+        smart_folders: parse_smart_folder_selector(&raw_smart_folders)?,
+        libraries: libraries.clone(),
+        unfiled,
+    })
+}
+
 fn validate_non_empty_libraries(empty_zones: &[&str], prior_db_total: u64) -> anyhow::Result<()> {
     let [head, tail @ ..] = empty_zones else {
         return Ok(());
@@ -518,6 +578,8 @@ fn build_import_download_config(
     let path_fields = config::resolve_path_derivation_fields(
         config::PathDerivationCliArgs {
             folder_structure: args.folder_structure.clone(),
+            folder_structure_albums: args.folder_structure_albums.clone(),
+            folder_structure_smart_folders: args.folder_structure_smart_folders.clone(),
             size: args.size,
             live_photo_mode: args.live_photo_mode,
             live_photo_size: args.live_photo_size,

@@ -576,8 +576,10 @@ impl DownloadConfig {
         Self {
             directory,
             folder_structure: fields.folder_structure,
-            folder_structure_albums: Arc::from("{album}"),
-            folder_structure_smart_folders: Arc::from("{smart-folder}"),
+            folder_structure_albums: Arc::from(fields.folder_structure_albums.as_str()),
+            folder_structure_smart_folders: Arc::from(
+                fields.folder_structure_smart_folders.as_str(),
+            ),
             library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
             size: fields.size.into(),
             skip_videos: false,
@@ -666,6 +668,36 @@ impl DownloadConfig {
             library: Arc::clone(&self.library),
             ..*self
         }
+    }
+
+    /// Clone this config with a different `library`. Import-existing pins
+    /// the per-library zone before calling `with_pass` so `{library}`
+    /// expands to the right path segment for each library iteration.
+    pub(crate) fn with_library(&self, library: &str) -> Self {
+        Self {
+            directory: Arc::clone(&self.directory),
+            folder_structure: self.folder_structure.clone(),
+            folder_structure_albums: Arc::clone(&self.folder_structure_albums),
+            folder_structure_smart_folders: Arc::clone(&self.folder_structure_smart_folders),
+            filename_exclude: Arc::clone(&self.filename_exclude),
+            temp_suffix: Arc::clone(&self.temp_suffix),
+            state_db: self.state_db.clone(),
+            sync_mode: self.sync_mode.clone(),
+            album_name: self.album_name.clone(),
+            exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
+            asset_groupings: Arc::clone(&self.asset_groupings),
+            bandwidth_limiter: self.bandwidth_limiter.clone(),
+            library: Arc::from(library),
+            ..*self
+        }
+    }
+
+    /// Visibility shim so `commands::import` can call the per-pass cloner
+    /// outside the `download` module. `with_pass` itself stays private; this
+    /// wrapper makes the contract ("import iterates per pass, same as sync")
+    /// explicit at the call site.
+    pub(crate) fn with_pass_for_import(&self, pass: &crate::commands::AlbumPass) -> Self {
+        self.with_pass(pass)
     }
 
     /// Clone this config with a different `exclude_asset_ids` set. Used
@@ -1044,6 +1076,14 @@ impl DownloadContext {
     ///   (only when `trust_state` is true)
     /// - `None` — downloaded with matching checksum but needs filesystem check
     ///   to confirm file is still on disk (when `trust_state` is false)
+    ///
+    /// `trust_state=true` skips the filesystem stat — used by
+    /// `--only-print-filenames` (no on-disk side effects, the user just
+    /// wants to see what *would* download). `trust_state=false` is the
+    /// production path: PR #318 removed the trust-state shortcut from real
+    /// syncs because the startup sample-check could miss user-deleted files.
+    /// Don't add new callers with `trust_state=true` outside the
+    /// only-print-filenames path without re-reading that incident.
     ///
     /// Uses borrowed `&str` keys for zero-allocation lookups.
     fn should_download_fast(
@@ -1986,6 +2026,7 @@ async fn download_photos_incremental(
             {
                 if let Err(e) = pipeline::add_asset_album_with_retry(
                     db.as_ref(),
+                    &effective_config.library,
                     asset.id(),
                     album_name,
                     "icloud",
@@ -1995,6 +2036,7 @@ async fn download_photos_incremental(
                     tracing::warn!(
                         asset_id = %asset.id(),
                         album = %album_name,
+                        library = %effective_config.library,
                         error = %e,
                         "Failed to record album membership after retries"
                     );

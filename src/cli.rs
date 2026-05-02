@@ -215,10 +215,12 @@ pub struct SyncArgs {
     #[arg(long = "directory", env = "KEI_DIRECTORY", value_parser = non_empty_string, hide = true)]
     pub directory: Option<String>,
 
-    /// Album(s) to download. Use `-a all` to sync every user-created album
-    /// in one run (Apple's smart folders like "Favorites" are skipped —
-    /// name them explicitly if you want them). `-a all` cannot be combined
-    /// with specific album names.
+    /// Album(s) to download. Repeatable; default `all` (every user-created
+    /// album, plus an unfiled pass for photos not in any album). Accepts a
+    /// literal name, the sentinels `all` / `none`, or `!name` to exclude.
+    /// Apple's smart folders like "Favorites" are skipped under `all`; use
+    /// `--smart-folder` to opt them in. `all` cannot be combined with
+    /// specific album names; mix exclusions instead (`--album all '!Foo'`).
     #[arg(short = 'a', long = "album", env = "KEI_ALBUM", value_parser = non_empty_string)]
     pub albums: Vec<String>,
 
@@ -522,9 +524,22 @@ pub struct ImportArgs {
     #[arg(long = "directory", env = "KEI_DIRECTORY", value_parser = non_empty_string, hide = true)]
     pub directory: Option<String>,
 
-    /// Folder structure used for existing downloads
+    /// Folder structure used by the unfiled pass when matching files on
+    /// disk (must match `--folder-structure` during sync).
     #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
     pub folder_structure: Option<String>,
+
+    /// Folder structure used by every album pass when matching files on
+    /// disk (must match `--folder-structure-albums` during sync). Default
+    /// `{album}`.
+    #[arg(long, env = "KEI_FOLDER_STRUCTURE_ALBUMS")]
+    pub folder_structure_albums: Option<String>,
+
+    /// Folder structure used by every smart-folder pass when matching
+    /// files on disk (must match `--folder-structure-smart-folders` during
+    /// sync). Default `{smart-folder}`.
+    #[arg(long, env = "KEI_FOLDER_STRUCTURE_SMART_FOLDERS")]
+    pub folder_structure_smart_folders: Option<String>,
 
     /// Keep Unicode in filenames (must match what was used during sync)
     #[arg(long, env = "KEI_KEEP_UNICODE_IN_FILENAMES", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
