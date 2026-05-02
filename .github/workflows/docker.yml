@@ -10,6 +10,18 @@ on:
       - Cargo.toml
       - Cargo.lock
       - Dockerfile
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Tag, branch, or SHA to build (e.g. v0.12.1)
+        required: true
+        type: string
+
+# Back-to-back main pushes: only the latest matters (same :main tag).
+# Release tags get their own group so they're never cancelled.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   docker:
@@ -20,6 +32,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - uses: docker/setup-qemu-action@v3
 
@@ -39,7 +53,8 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=main,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
 
       - uses: docker/build-push-action@v6
         with:

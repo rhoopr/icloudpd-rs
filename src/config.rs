@@ -722,8 +722,11 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Reject system directories that should never be used as a download target.
-fn validate_directory(path: &Path) -> anyhow::Result<()> {
+/// Reject system directories that should never be used as a download
+/// target. Shared by sync (`Config::build`) and import-existing
+/// (`build_import_download_config`) so both refuse the same set with the
+/// same error message.
+pub(crate) fn validate_download_dir(path: &Path) -> anyhow::Result<()> {
     const DENIED: &[&str] = &[
         "/bin", "/sbin", "/usr", "/etc", "/dev", "/proc", "/sys", "/boot", "/lib", "/lib64",
         "/var", "/root",
@@ -768,6 +771,110 @@ fn resolve_vec(cli: Vec<String>, toml: Option<Vec<String>>) -> Vec<String> {
         toml.unwrap_or_default()
     } else {
         cli
+    }
+}
+
+/// CLI inputs for [`resolve_path_derivation_fields`].
+///
+/// Each field is `Option<T>`; `Some` means the CLI (or env var) supplied
+/// the value, `None` means fall through to TOML and then to the default.
+/// Sync's `--skip-live-photos` deprecation is folded into `live_photo_mode`
+/// by the caller before calling the resolver.
+#[derive(Debug, Default)]
+pub(crate) struct PathDerivationCliArgs {
+    pub folder_structure: Option<String>,
+    pub size: Option<VersionSize>,
+    pub live_photo_mode: Option<LivePhotoMode>,
+    pub live_photo_size: Option<LivePhotoSize>,
+    pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
+    pub align_raw: Option<RawTreatmentPolicy>,
+    pub file_match_policy: Option<FileMatchPolicy>,
+    pub force_size: Option<bool>,
+    pub keep_unicode_in_filenames: Option<bool>,
+}
+
+/// Resolved path-derivation fields used by both `Config::build` (sync) and
+/// `build_import_download_config` (import-existing) so the two code paths
+/// derive identical expected file paths for the same inputs.
+#[derive(Debug)]
+pub(crate) struct PathDerivationFields {
+    pub folder_structure: String,
+    pub size: VersionSize,
+    pub live_photo_mode: LivePhotoMode,
+    pub live_photo_size: LivePhotoSize,
+    pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
+    pub align_raw: RawTreatmentPolicy,
+    pub file_match_policy: FileMatchPolicy,
+    pub force_size: bool,
+    pub keep_unicode_in_filenames: bool,
+}
+
+/// Resolve the CLI > TOML > default chain for every field that affects
+/// path derivation, shared by sync and import. The smart default for
+/// `live_photo_size` (track `--size adjusted` when the user didn't
+/// override it) lives here so import-existing matches sync.
+pub(crate) fn resolve_path_derivation_fields(
+    cli: PathDerivationCliArgs,
+    toml: Option<&TomlConfig>,
+) -> PathDerivationFields {
+    let toml_dl = toml.and_then(|t| t.download.as_ref());
+    let toml_photos = toml.and_then(|t| t.photos.as_ref());
+
+    let folder_structure = cli
+        .folder_structure
+        .or_else(|| toml_dl.and_then(|d| d.folder_structure.clone()))
+        .unwrap_or_else(|| "%Y/%m/%d".to_string());
+    let size = resolve(
+        cli.size,
+        toml_photos.and_then(|p| p.size),
+        VersionSize::Original,
+    );
+    let default_live_photo_size = if size == VersionSize::Adjusted {
+        LivePhotoSize::Adjusted
+    } else {
+        LivePhotoSize::Original
+    };
+    let live_photo_size = resolve(
+        cli.live_photo_size,
+        toml_photos.and_then(|p| p.live_photo_size),
+        default_live_photo_size,
+    );
+    let live_photo_mode = resolve(
+        cli.live_photo_mode,
+        toml_photos.and_then(|p| p.live_photo_mode),
+        LivePhotoMode::Both,
+    );
+    let live_photo_mov_filename_policy = resolve(
+        cli.live_photo_mov_filename_policy,
+        toml_photos.and_then(|p| p.live_photo_mov_filename_policy),
+        LivePhotoMovFilenamePolicy::Suffix,
+    );
+    let align_raw = resolve(
+        cli.align_raw,
+        toml_photos.and_then(|p| p.align_raw),
+        RawTreatmentPolicy::Unchanged,
+    );
+    let file_match_policy = resolve(
+        cli.file_match_policy,
+        toml_photos.and_then(|p| p.file_match_policy),
+        FileMatchPolicy::NameSizeDedupWithSuffix,
+    );
+    let force_size = resolve_flag(cli.force_size, toml_photos.and_then(|p| p.force_size));
+    let keep_unicode_in_filenames = resolve_flag(
+        cli.keep_unicode_in_filenames,
+        toml_photos.and_then(|p| p.keep_unicode_in_filenames),
+    );
+
+    PathDerivationFields {
+        folder_structure,
+        size,
+        live_photo_mode,
+        live_photo_size,
+        live_photo_mov_filename_policy,
+        align_raw,
+        file_match_policy,
+        force_size,
+        keep_unicode_in_filenames,
     }
 }
 
@@ -952,14 +1059,48 @@ pub(crate) fn resolve_password_command(
         .or_else(|| toml_auth.and_then(|a| a.password_command.clone()))
 }
 
+const ENV_WATCH_INTERVAL: &str = "KEI_WATCH_WITH_INTERVAL";
+
+/// Parse `KEI_WATCH_WITH_INTERVAL` into an `Option<u64>`. Takes the raw
+/// `Result` so tests can exercise it without mutating the process env (which
+/// would race other `Config::build` callers under `--test-threads > 1`).
+/// Range validation lives in `Config::build_inner` so CLI/TOML/env share it.
+fn parse_env_watch_interval(
+    raw: Result<String, std::env::VarError>,
+) -> anyhow::Result<Option<u64>> {
+    match raw {
+        Ok(s) if s.is_empty() => Ok(None),
+        Ok(s) => Some(s.parse::<u64>().map_err(|e| {
+            anyhow::anyhow!("{ENV_WATCH_INTERVAL} is not a valid integer ({s:?}): {e}")
+        }))
+        .transpose(),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{ENV_WATCH_INTERVAL} contains non-UTF-8 bytes")
+        }
+    }
+}
+
 impl Config {
     /// Build a Config by merging CLI args with optional TOML config.
-    /// Resolution order: CLI > TOML > hardcoded default.
+    /// Resolution order: CLI > TOML > env (`KEI_WATCH_WITH_INTERVAL` for the
+    /// watch interval; per-field for others) > hardcoded default.
     pub fn build(
         globals: &GlobalArgs,
         pw: &crate::cli::PasswordArgs,
         sync: crate::cli::SyncArgs,
         toml: Option<&TomlConfig>,
+    ) -> anyhow::Result<Self> {
+        let env_watch_interval = parse_env_watch_interval(std::env::var(ENV_WATCH_INTERVAL))?;
+        Self::build_inner(globals, pw, sync, toml, env_watch_interval)
+    }
+
+    pub(crate) fn build_inner(
+        globals: &GlobalArgs,
+        pw: &crate::cli::PasswordArgs,
+        sync: crate::cli::SyncArgs,
+        toml: Option<&TomlConfig>,
+        env_watch_interval: Option<u64>,
     ) -> anyhow::Result<Self> {
         let toml_auth = toml.and_then(|t| t.auth.as_ref());
 
@@ -1092,7 +1233,7 @@ impl Config {
             .map(|d| expand_tilde(&d))
             .unwrap_or_default();
         if !directory.as_os_str().is_empty() {
-            validate_directory(&directory)?;
+            validate_download_dir(&directory)?;
         }
         let folder_structure = resolve(
             sync.folder_structure,
@@ -1332,26 +1473,30 @@ impl Config {
 
         let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
         let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
-        // Resolve live photo mode: --live-photo-mode > --skip-live-photos > TOML photos > TOML filters compat
-        let live_photo_mode = if let Some(mode) = sync.live_photo_mode {
-            mode
-        } else if sync.skip_live_photos == Some(true) {
-            warn_deprecated(
-                "`--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS`",
-                "`--live-photo-mode skip`",
-            );
-            LivePhotoMode::Skip
-        } else if let Some(mode) = toml_photos.and_then(|p| p.live_photo_mode) {
-            mode
-        } else if toml_filters.and_then(|f| f.skip_live_photos) == Some(true) {
-            warn_deprecated(
-                "`[filters].skip_live_photos`",
-                "`[photos].live_photo_mode = \"skip\"`",
-            );
-            LivePhotoMode::Skip
-        } else {
-            LivePhotoMode::Both
-        };
+        // Fold sync's deprecated `--skip-live-photos` / `[filters]
+        // skip_live_photos` paths into a single `Option<LivePhotoMode>` so
+        // the shared resolver still sees the chosen value and emits the
+        // deprecation warnings before falling through to defaults.
+        let live_photo_mode_pre_resolved: Option<LivePhotoMode> =
+            if let Some(mode) = sync.live_photo_mode {
+                Some(mode)
+            } else if sync.skip_live_photos == Some(true) {
+                warn_deprecated(
+                    "`--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS`",
+                    "`--live-photo-mode skip`",
+                );
+                Some(LivePhotoMode::Skip)
+            } else if let Some(mode) = toml_photos.and_then(|p| p.live_photo_mode) {
+                Some(mode)
+            } else if toml_filters.and_then(|f| f.skip_live_photos) == Some(true) {
+                warn_deprecated(
+                    "`[filters].skip_live_photos`",
+                    "`[photos].live_photo_mode = \"skip\"`",
+                );
+                Some(LivePhotoMode::Skip)
+            } else {
+                None
+            };
         let raw_smart_folders = resolve_vec(
             sync.smart_folders,
             toml_filters.and_then(|f| f.smart_folders.clone()),
@@ -1434,49 +1579,40 @@ impl Config {
             }
         }
 
-        // Photos
-        let size = resolve(
-            sync.size,
-            toml_photos.and_then(|p| p.size),
-            VersionSize::Original,
-        );
-        // When --size adjusted and live-photo-size is not explicitly set,
-        // default to adjusted live photo companions too.
-        let default_live_photo_size = if size == VersionSize::Adjusted {
-            LivePhotoSize::Adjusted
-        } else {
-            LivePhotoSize::Original
-        };
-        let live_photo_size = resolve(
-            sync.live_photo_size,
-            toml_photos.and_then(|p| p.live_photo_size),
-            default_live_photo_size,
-        );
-        let live_photo_mov_filename_policy = resolve(
-            sync.live_photo_mov_filename_policy,
-            toml_photos.and_then(|p| p.live_photo_mov_filename_policy),
-            LivePhotoMovFilenamePolicy::Suffix,
-        );
-        let align_raw = resolve(
-            sync.align_raw,
-            toml_photos.and_then(|p| p.align_raw),
-            RawTreatmentPolicy::Unchanged,
-        );
-        let file_match_policy = resolve(
-            sync.file_match_policy,
-            toml_photos.and_then(|p| p.file_match_policy),
-            FileMatchPolicy::NameSizeDedupWithSuffix,
-        );
-        let force_size = resolve_flag(sync.force_size, toml_photos.and_then(|p| p.force_size));
-        let keep_unicode_in_filenames = resolve_flag(
-            sync.keep_unicode_in_filenames,
-            toml_photos.and_then(|p| p.keep_unicode_in_filenames),
+        // Path-derivation knobs (CLI > TOML > default). `folder_structure`
+        // was already resolved above for `resolve_album_selection`; pass
+        // it through so the resolver short-circuits.
+        let PathDerivationFields {
+            folder_structure: _,
+            size,
+            live_photo_mode,
+            live_photo_size,
+            live_photo_mov_filename_policy,
+            align_raw,
+            file_match_policy,
+            force_size,
+            keep_unicode_in_filenames,
+        } = resolve_path_derivation_fields(
+            PathDerivationCliArgs {
+                folder_structure: Some(folder_structure.clone()),
+                size: sync.size,
+                live_photo_mode: live_photo_mode_pre_resolved,
+                live_photo_size: sync.live_photo_size,
+                live_photo_mov_filename_policy: sync.live_photo_mov_filename_policy,
+                align_raw: sync.align_raw,
+                file_match_policy: sync.file_match_policy,
+                force_size: sync.force_size,
+                keep_unicode_in_filenames: sync.keep_unicode_in_filenames,
+            },
+            toml,
         );
 
-        // Watch
+        // Env read in `build()` (not via clap) so the docker image's ENV
+        // default sits below TOML in the precedence chain. See #293.
         let watch_with_interval = sync
             .watch_with_interval
-            .or_else(|| toml_watch.and_then(|w| w.interval));
+            .or_else(|| toml_watch.and_then(|w| w.interval))
+            .or(env_watch_interval);
         if let Some(n) = watch_with_interval {
             anyhow::ensure!(
                 (60..=86400).contains(&n),
@@ -2002,7 +2138,7 @@ pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>>
     if let Some(days_str) = s.strip_suffix('d') {
         if let Ok(days) = days_str.parse::<u64>() {
             let days =
-                i64::try_from(days).map_err(|_| anyhow::anyhow!("interval '{s}' is too large"))?;
+                i64::try_from(days).map_err(|_e| anyhow::anyhow!("interval '{s}' is too large"))?;
             return Ok(Local::now() - chrono::Duration::days(days));
         }
     }
@@ -4264,6 +4400,124 @@ mod tests {
         assert!(matches!(cfg.file_match_policy, FileMatchPolicy::NameId7));
     }
 
+    // ── resolve_path_derivation_fields: shared by sync + import ─────
+
+    /// Defaults are wired so a caller passing all-`None` CLI args and no
+    /// TOML lands on the documented defaults — this is the no-flags path
+    /// both `sync` and `import-existing` follow when invoked bare.
+    #[test]
+    fn resolve_path_derivation_all_defaults() {
+        let pd = resolve_path_derivation_fields(PathDerivationCliArgs::default(), None);
+        assert_eq!(pd.folder_structure, "%Y/%m/%d");
+        assert_eq!(pd.size, VersionSize::Original);
+        assert_eq!(pd.live_photo_mode, LivePhotoMode::Both);
+        assert_eq!(pd.live_photo_size, LivePhotoSize::Original);
+        assert_eq!(
+            pd.live_photo_mov_filename_policy,
+            LivePhotoMovFilenamePolicy::Suffix
+        );
+        assert_eq!(pd.align_raw, RawTreatmentPolicy::Unchanged);
+        assert_eq!(
+            pd.file_match_policy,
+            FileMatchPolicy::NameSizeDedupWithSuffix
+        );
+        assert!(!pd.force_size);
+        assert!(!pd.keep_unicode_in_filenames);
+    }
+
+    /// `--size adjusted` without explicit `--live-photo-size` must drag
+    /// the live-photo companion size to `adjusted` too. Both sync and
+    /// import inherit this from the shared resolver — pinning here
+    /// catches anyone "simplifying" the smart default away.
+    #[test]
+    fn resolve_path_derivation_size_adjusted_drags_live_photo_size() {
+        let cli = PathDerivationCliArgs {
+            size: Some(VersionSize::Adjusted),
+            ..Default::default()
+        };
+        let pd = resolve_path_derivation_fields(cli, None);
+        assert_eq!(pd.size, VersionSize::Adjusted);
+        assert_eq!(
+            pd.live_photo_size,
+            LivePhotoSize::Adjusted,
+            "smart default: --size adjusted should drag live_photo_size"
+        );
+    }
+
+    /// CLI explicit `--live-photo-size original` must beat the smart
+    /// default so a user can opt out of the size-adjusted drag.
+    #[test]
+    fn resolve_path_derivation_explicit_live_photo_size_beats_smart_default() {
+        let cli = PathDerivationCliArgs {
+            size: Some(VersionSize::Adjusted),
+            live_photo_size: Some(LivePhotoSize::Original),
+            ..Default::default()
+        };
+        let pd = resolve_path_derivation_fields(cli, None);
+        assert_eq!(pd.live_photo_size, LivePhotoSize::Original);
+    }
+
+    /// CLI > TOML > default. The resolver short-circuits on the first
+    /// `Some`; this confirms we don't double-resolve and accidentally
+    /// fall through to the TOML value when the CLI already chose.
+    #[test]
+    fn resolve_path_derivation_cli_beats_toml() {
+        let toml: TomlConfig = toml::from_str(
+            r#"
+            [photos]
+            size = "adjusted"
+            file_match_policy = "name-id7"
+            force_size = true
+            keep_unicode_in_filenames = true
+            align_raw = "original"
+            "#,
+        )
+        .unwrap();
+        let cli = PathDerivationCliArgs {
+            size: Some(VersionSize::Original),
+            file_match_policy: Some(FileMatchPolicy::NameSizeDedupWithSuffix),
+            force_size: Some(false),
+            keep_unicode_in_filenames: Some(false),
+            align_raw: Some(RawTreatmentPolicy::Unchanged),
+            ..Default::default()
+        };
+        let pd = resolve_path_derivation_fields(cli, Some(&toml));
+        assert_eq!(pd.size, VersionSize::Original);
+        assert_eq!(
+            pd.file_match_policy,
+            FileMatchPolicy::NameSizeDedupWithSuffix
+        );
+        assert!(!pd.force_size);
+        assert!(!pd.keep_unicode_in_filenames);
+        assert_eq!(pd.align_raw, RawTreatmentPolicy::Unchanged);
+    }
+
+    /// TOML wins when the CLI is silent. Pin this so anyone refactoring
+    /// the resolver doesn't accidentally swallow TOML defaults.
+    #[test]
+    fn resolve_path_derivation_toml_when_cli_absent() {
+        let toml: TomlConfig = toml::from_str(
+            r#"
+            [download]
+            folder_structure = "%Y/%m"
+
+            [photos]
+            size = "adjusted"
+            live_photo_mode = "skip"
+            file_match_policy = "name-id7"
+            "#,
+        )
+        .unwrap();
+        let pd = resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml));
+        assert_eq!(pd.folder_structure, "%Y/%m");
+        assert_eq!(pd.size, VersionSize::Adjusted);
+        assert_eq!(pd.live_photo_mode, LivePhotoMode::Skip);
+        assert_eq!(pd.file_match_policy, FileMatchPolicy::NameId7);
+        // Smart default should still drag here because `--live-photo-size`
+        // wasn't set in either CLI or TOML.
+        assert_eq!(pd.live_photo_size, LivePhotoSize::Adjusted);
+    }
+
     // ── Config::build: boolean flag merge exhaustive ───────────────
 
     #[cfg(feature = "xmp")]
@@ -4364,6 +4618,140 @@ mod tests {
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.watch_with_interval, Some(600));
+    }
+
+    // Precedence tests for KEI_WATCH_WITH_INTERVAL inject the env value via
+    // `Config::build_inner` directly, rather than mutating the real process
+    // env, which would race other `Config::build` callers under
+    // `--test-threads > 1`.
+
+    fn build_with_env(
+        sync: SyncArgs,
+        toml: Option<TomlConfig>,
+        env_watch_interval: Option<u64>,
+    ) -> anyhow::Result<Config> {
+        Config::build_inner(
+            &default_globals(),
+            &default_password(),
+            sync,
+            toml.as_ref(),
+            env_watch_interval,
+        )
+    }
+
+    /// Regression test for #293: a `[watch] interval` in TOML must beat the
+    /// `KEI_WATCH_WITH_INTERVAL` env var (notably the docker image's baked
+    /// 24-hour default). Before the fix the env was read by clap and treated
+    /// as equivalent to a CLI flag, so it silently overrode TOML.
+    #[test]
+    fn test_build_watch_interval_toml_overrides_env() {
+        let toml_str = r#"
+            [watch]
+            interval = 3600
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = build_with_env(default_sync(), Some(toml), Some(86400)).unwrap();
+        assert_eq!(cfg.watch_with_interval, Some(3600));
+    }
+
+    #[test]
+    fn test_build_watch_interval_cli_overrides_env() {
+        let mut sync = default_sync();
+        sync.watch_with_interval = Some(600);
+        let cfg = build_with_env(sync, None, Some(86400)).unwrap();
+        assert_eq!(cfg.watch_with_interval, Some(600));
+    }
+
+    #[test]
+    fn test_build_watch_interval_env_only() {
+        let cfg = build_with_env(default_sync(), None, Some(86400)).unwrap();
+        assert_eq!(cfg.watch_with_interval, Some(86400));
+    }
+
+    #[test]
+    fn test_build_watch_interval_env_unset_means_single_shot() {
+        let cfg = build_with_env(default_sync(), None, None).unwrap();
+        assert!(cfg.watch_with_interval.is_none());
+    }
+
+    #[test]
+    fn test_build_watch_interval_env_below_minimum_rejected() {
+        for bad in [0u64, 1, 30, 59] {
+            let err = build_with_env(default_sync(), None, Some(bad)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("watch interval must be in 60..=86400"),
+                "unexpected error for env={bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_watch_interval_env_above_maximum_rejected() {
+        for bad in [86401u64, 100_000, u64::MAX] {
+            let err = build_with_env(default_sync(), None, Some(bad)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("watch interval must be in 60..=86400"),
+                "unexpected error for env={bad}: {err}"
+            );
+        }
+    }
+
+    // Pure parser tests use synthetic `Result<String, VarError>` inputs to
+    // avoid mutating the process env.
+
+    #[test]
+    fn test_parse_env_watch_interval_valid_number() {
+        let parsed = parse_env_watch_interval(Ok("3600".to_string())).unwrap();
+        assert_eq!(parsed, Some(3600));
+    }
+
+    #[test]
+    fn test_parse_env_watch_interval_not_present() {
+        let parsed = parse_env_watch_interval(Err(std::env::VarError::NotPresent)).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    // Empty string == unset. Lets `docker run -e KEI_WATCH_WITH_INTERVAL=`
+    // override the image's baked-in 24h default for one-shot invocations.
+    #[test]
+    fn test_parse_env_watch_interval_empty_is_unset() {
+        let parsed = parse_env_watch_interval(Ok(String::new())).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn test_parse_env_watch_interval_garbage_rejected() {
+        let err = parse_env_watch_interval(Ok("not-a-number".to_string())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("KEI_WATCH_WITH_INTERVAL is not a valid integer"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_env_watch_interval_negative_rejected() {
+        let err = parse_env_watch_interval(Ok("-1".to_string())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("KEI_WATCH_WITH_INTERVAL is not a valid integer"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_env_watch_interval_non_unicode_rejected() {
+        let err = parse_env_watch_interval(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("placeholder"),
+        )))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("KEI_WATCH_WITH_INTERVAL contains non-UTF-8 bytes"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -6143,30 +6531,30 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_directory_rejects_root() {
-        assert!(validate_directory(Path::new("/")).is_err());
+    fn test_validate_download_dir_rejects_root() {
+        assert!(validate_download_dir(Path::new("/")).is_err());
     }
 
     #[test]
-    fn test_validate_directory_rejects_system_paths() {
+    fn test_validate_download_dir_rejects_system_paths() {
         for path in ["/usr", "/etc", "/boot", "/sys", "/proc", "/dev", "/var"] {
             assert!(
-                validate_directory(Path::new(path)).is_err(),
+                validate_download_dir(Path::new(path)).is_err(),
                 "should reject {path}"
             );
         }
     }
 
     #[test]
-    fn test_validate_directory_rejects_trailing_slash() {
-        assert!(validate_directory(Path::new("/etc/")).is_err());
+    fn test_validate_download_dir_rejects_trailing_slash() {
+        assert!(validate_download_dir(Path::new("/etc/")).is_err());
     }
 
     #[test]
-    fn test_validate_directory_accepts_normal_paths() {
-        assert!(validate_directory(Path::new("/home/user/photos")).is_ok());
-        assert!(validate_directory(Path::new("/mnt/photos")).is_ok());
-        assert!(validate_directory(Path::new("/data/sync")).is_ok());
+    fn test_validate_download_dir_accepts_normal_paths() {
+        assert!(validate_download_dir(Path::new("/home/user/photos")).is_ok());
+        assert!(validate_download_dir(Path::new("/mnt/photos")).is_ok());
+        assert!(validate_download_dir(Path::new("/data/sync")).is_ok());
     }
 
     // ── resolve_library_selector ───────────────────────────────────

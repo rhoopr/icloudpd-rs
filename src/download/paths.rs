@@ -25,6 +25,10 @@ pub(crate) const TOKEN_SMART_FOLDER: &str = "{smart-folder}";
 /// must be the leading path segment when present.
 pub(crate) const TOKEN_LIBRARY: &str = "{library}";
 
+#[expect(
+    clippy::string_slice,
+    reason = "indices from starts_with/ends_with on ASCII literals are always char-aligned"
+)]
 /// Strip the legacy Python-style `{:%Y/%m/%d}` wrapper, returning the inner
 /// format string. Returns the input unchanged if the wrapper is absent.
 pub(crate) fn strip_python_wrapper(folder_structure: &str) -> &str {
@@ -93,6 +97,10 @@ pub(crate) fn truncate_library_zone(zone_name: &str) -> &str {
     if !zone_name.is_char_boundary(cut) {
         return zone_name;
     }
+    #[expect(
+        clippy::string_slice,
+        reason = "is_char_boundary guard above ensures cut lands on a char boundary"
+    )]
     &zone_name[..cut]
 }
 
@@ -148,6 +156,10 @@ pub(crate) fn local_download_path(
 /// Maximum filename length in bytes for common filesystems (ext4, APFS, NTFS).
 const MAX_FILENAME_BYTES: usize = 255;
 
+#[expect(
+    clippy::string_slice,
+    reason = "indices from rfind('.') and floor_char_boundary are always char-aligned"
+)]
 /// Clean a filename by replacing characters that are invalid on common
 /// filesystems (`/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`) and control
 /// characters (including NUL) with `_`. Truncates filenames exceeding 255
@@ -337,6 +349,10 @@ const ITEM_TYPE_EXTENSIONS: &[(&str, &str)] = &[
     ("org.webmproject.webp", "WEBP"),
 ];
 
+#[expect(
+    clippy::string_slice,
+    reason = "index from rfind('.') is always char-aligned"
+)]
 /// Replace a filename's extension based on the UTI `asset_type` string.
 ///
 /// If `asset_type` is found in `ITEM_TYPE_EXTENSIONS`, the filename's extension
@@ -353,6 +369,7 @@ pub(crate) fn map_filename_extension(filename: &str, asset_type: &str) -> String
     }
 }
 
+#[expect(clippy::string_slice, reason = "base64 output is pure ASCII")]
 /// Compute the first 7 characters of the base64-encoded asset ID.
 ///
 /// Used by the `name-id7` file match policy to create unique filenames.
@@ -381,6 +398,10 @@ pub(crate) fn apply_name_id7(filename: &str, id: &str) -> String {
     }
 }
 
+#[expect(
+    clippy::string_slice,
+    reason = "ext[1..] skips '.' from rfind — always char-aligned"
+)]
 /// Generate a live photo MOV filename using the "suffix" policy.
 ///
 /// For HEIC files: `photo.HEIC` → `photo_HEVC.MOV`
@@ -618,6 +639,10 @@ pub(crate) fn live_photo_mov_path_original(filename: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::string_slice,
+    reason = "test assertions on known-safe string indices"
+)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
@@ -1520,5 +1545,66 @@ mod tests {
         // Without {album} in format, album_name is ignored
         let result = local_download_path(dir, "%Y/%m/%d", &date, "photo.jpg", Some("Vacation"));
         assert_eq!(result, PathBuf::from("/photos/2025/06/15/photo.jpg"));
+    }
+
+    #[test]
+    fn album_with_slash_does_not_create_subdirectory() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some("Trip/2024"));
+        assert!(
+            result.starts_with(dir),
+            "path must stay under the root, got: {result:?}"
+        );
+        let filename_part = result.to_string_lossy();
+        assert!(
+            !filename_part.contains("Trip/2024"),
+            "slash in album name must be sanitized, got: {filename_part}"
+        );
+        assert!(
+            filename_part.contains("Trip_2024"),
+            "slash should become underscore, got: {filename_part}"
+        );
+    }
+
+    #[test]
+    fn album_with_traversal_stays_inside_sync_root() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+
+        for album in ["../etc", "../../passwd", "..", "a/../b"] {
+            let result = local_download_path(dir, "{album}/%Y", &date, "photo.jpg", Some(album));
+            assert!(
+                result.starts_with(dir),
+                "album={album:?}: path must start with root, got: {result:?}"
+            );
+            let lossy = result.to_string_lossy();
+            assert!(
+                !lossy.contains(".."),
+                "album={album:?}: traversal must be neutralized, got: {lossy}"
+            );
+        }
+    }
+
+    #[test]
+    fn album_with_traversal_composed_with_date_tokens() {
+        let dir = Path::new("/photos");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let result = local_download_dir(dir, "{album}/%Y/%m", &date, Some("../etc"));
+        assert!(
+            result.starts_with(dir),
+            "traversal album composed with date tokens must stay inside root, got: {result:?}"
+        );
+        let components: Vec<_> = result.strip_prefix(dir).unwrap().components().collect();
+        assert!(
+            components.len() >= 2,
+            "should have album + year + month components, got: {components:?}"
+        );
     }
 }

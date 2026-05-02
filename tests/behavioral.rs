@@ -118,17 +118,7 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
         CREATE INDEX IF NOT EXISTS idx_assets_checksum ON assets(checksum);
         CREATE INDEX IF NOT EXISTS idx_assets_metadata_hash
             ON assets (metadata_hash) WHERE status = 'downloaded';
-        CREATE TABLE IF NOT EXISTS asset_albums (
-            asset_id   TEXT NOT NULL,
-            album_name TEXT NOT NULL,
-            source     TEXT NOT NULL,
-            PRIMARY KEY (asset_id, album_name, source)
-        );
-        CREATE TABLE IF NOT EXISTS asset_people (
-            asset_id    TEXT NOT NULL,
-            person_name TEXT NOT NULL,
-            PRIMARY KEY (asset_id, person_name)
-        );
+
         CREATE TABLE IF NOT EXISTS sync_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             started_at INTEGER NOT NULL,
@@ -139,9 +129,23 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             interrupted INTEGER DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'running'
         );
+
         CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY NOT NULL,
             value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_albums (
+            asset_id   TEXT NOT NULL,
+            album_name TEXT NOT NULL,
+            source     TEXT NOT NULL,
+            PRIMARY KEY (asset_id, album_name, source)
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_people (
+            asset_id    TEXT NOT NULL,
+            person_name TEXT NOT NULL,
+            PRIMARY KEY (asset_id, person_name)
         );
         ",
     )
@@ -915,7 +919,9 @@ fn import_existing_rejects_nonexistent_directory() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Directory does not exist"));
+        .stderr(predicate::str::contains(
+            "Cannot read download directory /does/not/exist/anywhere",
+        ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3878,6 +3884,47 @@ fn reconcile_on_empty_db_prints_guidance_and_exits_clean() {
     );
 }
 
+/// Pin the per-version columns added by each schema migration so a future
+/// helper-DDL refactor that drops one fails this test instead of silently
+/// shipping a behavioral suite running against a thinner shape than the
+/// binary writes.
+#[test]
+fn behavioral_helper_carries_every_migrated_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = create_state_db(dir.path(), "schema_check@example.com");
+
+    fn has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+        conn.prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .any(|name| name.is_ok_and(|n| n == column))
+    }
+
+    assert!(
+        has_column(&conn, "assets", "metadata_write_failed_at"),
+        "v6 column metadata_write_failed_at must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "sync_runs", "status"),
+        "v7 column sync_runs.status must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "assets", "library"),
+        "v8 column assets.library must exist in the behavioral helper's DDL"
+    );
+
+    let has_asset_albums: bool = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='asset_albums'")
+        .unwrap()
+        .exists([])
+        .unwrap();
+    assert!(
+        has_asset_albums,
+        "v5 table asset_albums must exist in the behavioral helper's DDL"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // v0.13 selection + per-category folder-structure surface
 //
@@ -3937,8 +3984,8 @@ fn sync_cmd_for_validation() -> assert_cmd::Command {
     ]);
     // Tempdirs leak intentionally: tests bail before sync touches them, and
     // OS-level tmpfs cleanup handles the directories at process exit.
-    std::mem::forget(dir);
-    std::mem::forget(dl_dir);
+    let _ = dir.keep();
+    let _ = dl_dir.keep();
     cmd
 }
 

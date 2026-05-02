@@ -121,11 +121,12 @@ pub(crate) fn is_heif_content(bytes: &[u8]) -> bool {
 /// rather than using `Any::decode_maybe` which dispatches into mp4-atom's
 /// full type table on every box kind. That dispatch is unsafe for
 /// kei: parsers like `Dfla::decode_body` (`flac.rs::parse_vorbis_comment`)
-/// and `Avcc::decode_body` allocate from attacker-controlled length fields
-/// without a `min(..)` cap, so a malformed sub-100-byte HEIC turns into a
-/// 20+ GiB allocation. Filed upstream as kixelated/mp4-atom#154; this
-/// function avoids the problem regardless of when that lands by only
-/// invoking the iinf / iloc decoders we actually need.
+/// and `Avcc::decode_body` allocated from attacker-controlled length fields
+/// without a `min(..)` cap, so a malformed sub-100-byte HEIC turned into a
+/// 20+ GiB allocation. Fixed upstream in kixelated/mp4-atom#157 (the rev
+/// pinned in Cargo.toml includes it); this header-walk is retained as
+/// defense-in-depth against the same class of bug surfacing in a sibling
+/// decoder we don't actually need.
 pub(crate) fn extract_xmp_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
     extract_xmp_strict(bytes).unwrap_or_default()
 }
@@ -207,12 +208,12 @@ fn extract_xmp_from_meta(
             return Ok(None);
         };
         // Defense-in-depth cap on the bytes handed to the typed decoders:
-        // HEIC iinf/iloc are KB-scale in real-world files. If a future
-        // mp4-atom audit turns up the same `Vec::with_capacity(<attacker
-        // count>)` pattern in `ItemInfoEntry::decode_body` or
-        // `ItemLocation::decode_body` that bit `parse_vorbis_comment`
-        // (kixelated/mp4-atom#154), this guard shorts the OOM before the
-        // decoder ever sees the body.
+        // HEIC iinf/iloc are KB-scale in real-world files. The original
+        // `Vec::with_capacity(<attacker count>)` shape that bit
+        // `parse_vorbis_comment` is fixed upstream (kixelated/mp4-atom#157,
+        // closing #154); this guard remains so the same pattern surfacing
+        // later in `ItemInfoEntry::decode_body` or `ItemLocation::decode_body`
+        // shorts the OOM before the decoder ever sees the body.
         const MAX_META_SUBBOX_BYTES: usize = 8 * 1024 * 1024;
         if body.len() <= MAX_META_SUBBOX_BYTES {
             if h.kind == FourCC::new(b"iinf") {
@@ -792,9 +793,10 @@ mod tests {
         // Pre-fix, `Any::decode_maybe` saw a top-level `dfLa` FourCC,
         // dispatched to `Dfla::decode_body` -> `parse_vorbis_comment`, and
         // tried to `Vec::with_capacity(~876_000_000)` for a `Vec<String>`
-        // (~21 GiB) - upstream kixelated/mp4-atom#154. The kei-side fix is
-        // to walk top-level boxes by header and only descend into `meta`,
-        // so this input must return None promptly without allocating.
+        // (~21 GiB) - upstream kixelated/mp4-atom#154, fixed in #157. The
+        // kei-side fix is independent: walk top-level boxes by header and
+        // only descend into `meta`, so a hostile `dfLa` here is skipped
+        // even if a future regression reintroduces the upstream bug.
         const REPRO: &[u8] = &[
             0x00, 0x00, 0x00, 0x08, 0x00, 0x1d, 0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x64, 0x66,
             0x4c, 0x61, 0x00, 0x00, 0x00, 0xf6, 0x6a, 0x00, 0x00, 0x10, 0x0d, 0xaa, 0x6b, 0x9d,
@@ -811,11 +813,13 @@ mod tests {
 
     #[test]
     fn extract_xmp_bytes_meta_with_nested_dfla_is_safe() {
-        // The same upstream OOM is reachable from a `meta` box that contains
+        // The same upstream OOM was reachable from a `meta` box containing
         // a nested `dfLa` sub-atom, because mp4_atom::Meta::decode_body uses
-        // `Any::decode_maybe` internally on every item. The kei-side fix
-        // also walks meta sub-boxes by header so only `iinf`/`iloc` decoders
-        // run; an attacker-supplied `dfLa` inside `meta` is skipped.
+        // `Any::decode_maybe` internally on every item. Upstream #157 caps
+        // the `parse_vorbis_comment` allocation at the root, but the kei
+        // header-walk also descends into meta with only `iinf`/`iloc`
+        // decoders, so an attacker-supplied `dfLa` inside `meta` is skipped
+        // regardless of upstream regressions.
         //
         // Layout: <meta box header> <version+flags> <hdlr box> <dfLa box>.
         // The dfLa body declares 0xFFFF_FFFF Vorbis comment fields; pre-fix
@@ -1009,6 +1013,43 @@ mod tests {
             is_heif_content(&out),
             "rewritten output must still pass is_heif_content; first 12 bytes: {:?}",
             &out[..12]
+        );
+    }
+
+    #[test]
+    fn insert_xmp_then_extract_round_trips_payload() {
+        let heic = include_bytes!("../../tests/data/sample.heic");
+        let xmp = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF/></x:xmpmeta>";
+
+        let mut rewritten: Vec<u8> = Vec::new();
+        insert_xmp(heic.as_slice(), xmp.as_slice(), &mut rewritten)
+            .expect("insert_xmp must succeed on a valid HEIC");
+
+        let extracted = extract_xmp_bytes(&rewritten)
+            .expect("extract_xmp_bytes must find the XMP we just inserted");
+        assert_eq!(extracted, xmp, "round-tripped XMP must be byte-identical");
+    }
+
+    #[test]
+    fn insert_xmp_twice_retains_only_latest() {
+        let heic = include_bytes!("../../tests/data/sample.heic");
+        let first = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><first/></x:xmpmeta>";
+        let second = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><second/></x:xmpmeta>";
+
+        let mut after_first: Vec<u8> = Vec::new();
+        insert_xmp(heic.as_slice(), first.as_slice(), &mut after_first)
+            .expect("first insert must succeed");
+
+        let mut after_second: Vec<u8> = Vec::new();
+        insert_xmp(&after_first, second.as_slice(), &mut after_second)
+            .expect("second insert must succeed");
+
+        let extracted =
+            extract_xmp_bytes(&after_second).expect("extract must find XMP after double insert");
+        assert_eq!(
+            extracted,
+            second.as_slice(),
+            "only the latest XMP packet should be present"
         );
     }
 

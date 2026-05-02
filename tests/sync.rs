@@ -1,3 +1,7 @@
+#![allow(
+    clippy::string_slice,
+    reason = "test assertions on known-ASCII filenames"
+)]
 //! Sync tests with behavioral assertions (live iCloud API).
 //!
 //! Uses a test album in iCloud (default `kei-test`, override with
@@ -996,7 +1000,7 @@ fn sync_threads_num_reflected_in_log() {
             .success();
 
         let stderr = String::from_utf8_lossy(&assertion.get_output().stderr);
-        let clean = strip_ansi(&stderr);
+        let clean = common::strip_ansi(&stderr);
         assert!(
             clean.contains("concurrency=1"),
             "log should reflect --threads-num 1, stderr:\n{clean}"
@@ -1464,7 +1468,7 @@ fn sync_watch_runs_multiple_cycles() {
             match rx.recv_timeout(remaining) {
                 Ok(line) => {
                     snippet.push_str(&line);
-                    if strip_ansi(&line).contains("Waiting before next cycle") {
+                    if common::strip_ansi(&line).contains("Waiting before next cycle") {
                         markers += 1;
                         if markers >= 2 {
                             break;
@@ -1485,8 +1489,11 @@ fn sync_watch_runs_multiple_cycles() {
             markers >= 2,
             "watch should drive at least 2 cycles, got {markers}. \
              snippet: {}\n--- full stderr (first 2000 chars) ---\n{}",
-            strip_ansi(&snippet).chars().take(800).collect::<String>(),
-            strip_ansi(&full_stderr)
+            common::strip_ansi(&snippet)
+                .chars()
+                .take(800)
+                .collect::<String>(),
+            common::strip_ansi(&full_stderr)
                 .chars()
                 .take(2000)
                 .collect::<String>()
@@ -1718,22 +1725,4 @@ fn file_name_contains(p: &std::path::Path, pattern: &str) -> bool {
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .contains(pattern)
-}
-
-/// Strip ANSI escape sequences from a string (for log output assertions).
-fn strip_ansi(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut in_escape = false;
-    for c in s.chars() {
-        if c == '\x1b' {
-            in_escape = true;
-        } else if in_escape {
-            if c.is_ascii_alphabetic() {
-                in_escape = false;
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
 }

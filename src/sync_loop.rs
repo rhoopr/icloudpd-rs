@@ -69,6 +69,15 @@ fn is_session_error(err: &anyhow::Error) -> bool {
         .is_some_and(crate::icloud::error::ICloudError::is_session_error)
 }
 
+/// Whether a CloudKit init/query error should trigger an SRP re-auth retry.
+///
+/// Returns `true` only on the first session-error encounter. A second
+/// session-error bails cleanly instead of looping under Docker's restart
+/// policy.
+fn should_retry_session_init(err: &anyhow::Error, already_retried: bool) -> bool {
+    !already_retried && is_session_error(err)
+}
+
 /// Given the user's library selector, the count of iCloud shared libraries
 /// on the account, and whether the notice has already fired, return the
 /// warning message to emit, or `None` if no notice is warranted.
@@ -403,7 +412,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         let init_result = init_photos_service(this_auth, api_retry_config).await;
         let (ss, mut ps) = match init_result {
             Ok(pair) => pair,
-            Err(e) if !retried_after_session_error && is_session_error(&e) => {
+            Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
                 tracing::warn!(
                     error = %e,
                     "CloudKit init failed with stale-session signature; forcing SRP re-authentication"
@@ -417,7 +426,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         };
         match resolve_libraries(&config.selection.libraries, &mut ps).await {
             Ok(libs) => break (ss, ps, libs),
-            Err(e) if !retried_after_session_error && is_session_error(&e) => {
+            Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
                 tracing::warn!(
                     error = %e,
                     "CloudKit returned stale-session signature; forcing SRP re-authentication"
@@ -2143,6 +2152,37 @@ mod tests {
         );
     }
 
+    // ── should_retry_session_init ──────────────────────────────────────
+    //
+    // The init retry guard allows exactly one SRP re-auth on a session-error,
+    // then bails. This prevents infinite loops under Docker restart policies.
+
+    #[test]
+    fn should_retry_session_init_true_on_first_421() {
+        let err: anyhow::Error = crate::icloud::error::ICloudError::MisdirectedRequest.into();
+        assert!(should_retry_session_init(&err, false));
+    }
+
+    #[test]
+    fn should_retry_session_init_false_on_second_421() {
+        let err: anyhow::Error = crate::icloud::error::ICloudError::MisdirectedRequest.into();
+        assert!(!should_retry_session_init(&err, true));
+    }
+
+    #[test]
+    fn should_retry_session_init_false_for_non_session_error() {
+        let err: anyhow::Error =
+            crate::icloud::error::ICloudError::Connection("timeout".into()).into();
+        assert!(!should_retry_session_init(&err, false));
+    }
+
+    #[test]
+    fn should_retry_session_init_true_for_first_401() {
+        let err: anyhow::Error =
+            crate::icloud::error::ICloudError::SessionExpired { status: 401 }.into();
+        assert!(should_retry_session_init(&err, false));
+    }
+
     // ── determine_sync_mode ──────────────────────────────────────────
     //
     // Sync-mode decision is the gatekeeper for the kei "user data is sacred"
@@ -2272,7 +2312,6 @@ mod tests {
     #[tokio::test]
     async fn determine_sync_mode_state_db_error_falls_back_to_full() {
         use std::collections::{HashMap, HashSet};
-        use std::path::PathBuf;
 
         // Minimal failing impl: only `get_metadata` is reachable from
         // `determine_sync_mode`; every other method is unimplemented so
@@ -2306,6 +2345,14 @@ mod tests {
                 _: &std::path::Path,
                 _: &str,
                 _: Option<&str>,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
+            async fn import_adopt(
+                &self,
+                _: &state::types::AssetRecord,
+                _: &std::path::Path,
+                _: &str,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
@@ -2422,12 +2469,6 @@ mod tests {
                 _: &str,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
-                unimplemented!()
-            }
-            async fn sample_downloaded_paths(
-                &self,
-                _: usize,
-            ) -> Result<Vec<PathBuf>, state::error::StateError> {
                 unimplemented!()
             }
             async fn add_asset_album(
@@ -2751,6 +2792,14 @@ mod tests {
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
+            async fn import_adopt(
+                &self,
+                _: &state::types::AssetRecord,
+                _: &std::path::Path,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
             async fn mark_failed(
                 &self,
                 _: &str,
@@ -2880,12 +2929,6 @@ mod tests {
                 _: &str,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
-                unimplemented!()
-            }
-            async fn sample_downloaded_paths(
-                &self,
-                _: usize,
-            ) -> Result<Vec<std::path::PathBuf>, state::error::StateError> {
                 unimplemented!()
             }
             async fn add_asset_album(
@@ -3053,6 +3096,14 @@ mod tests {
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
+            async fn import_adopt(
+                &self,
+                _: &state::types::AssetRecord,
+                _: &std::path::Path,
+                _: &str,
+            ) -> Result<(), state::error::StateError> {
+                unimplemented!()
+            }
             async fn mark_failed(
                 &self,
                 _: &str,
@@ -3166,12 +3217,6 @@ mod tests {
                 _: &str,
                 _: &[&str],
             ) -> Result<(), state::error::StateError> {
-                unimplemented!()
-            }
-            async fn sample_downloaded_paths(
-                &self,
-                _: usize,
-            ) -> Result<Vec<std::path::PathBuf>, state::error::StateError> {
                 unimplemented!()
             }
             async fn add_asset_album(

@@ -257,7 +257,7 @@ fn validate_download_url(raw: &str) -> Result<(), &'static str> {
     if raw.is_empty() {
         return Err("empty URL");
     }
-    let parsed = url::Url::parse(raw).map_err(|_| "malformed URL")?;
+    let parsed = url::Url::parse(raw).map_err(|_e| "malformed URL")?;
     if parsed.scheme() != "https" {
         return Err("non-https scheme");
     }
@@ -389,7 +389,8 @@ impl PhotoAsset {
         &self.versions
     }
 
-    /// Get a specific version by size key.
+    /// Get a specific version by size key. Test-only convenience.
+    #[cfg(test)]
     pub fn get_version(&self, key: AssetVersionSize) -> Option<&AssetVersion> {
         self.versions
             .iter()

@@ -43,11 +43,14 @@
 ## Install
 
 ```sh
-brew install rhoopr/kei/kei          # Homebrew
-docker pull ghcr.io/rhoopr/kei:latest # Docker
+brew install rhoopr/kei/kei             # Homebrew
+
+docker pull ghcr.io/rhoopr/kei:latest   # Docker
+# :latest follows tagged releases. Use :main to track main HEAD for unreleased builds.
 ```
 
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, FreeBSD, and other install paths, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install).
+
 
 > [!IMPORTANT]
 > kei can't access your photos if Advanced Data Protection is on. Turn ADP off and enable "Access iCloud Data on the Web" in your Apple ID settings. Details: [Authentication wiki](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
@@ -96,4 +99,4 @@ MIT - see [LICENSE](LICENSE)
 
 ## Acknowledgments
 
-kei started as `icloudpd-rs`, a Rust rewrite of [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader). Thanks to the original maintainers for their reverse-engineering work.
+The iCloud adapter builds on years of reverse-engineering by the [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) project (kei was originally published as `icloudpd-rs` before broadening to a multi-provider sync engine). Thanks to the original maintainers for their work, which made the iCloud side of kei possible.

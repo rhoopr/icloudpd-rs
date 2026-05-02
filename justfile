@@ -7,15 +7,19 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 _default:
     @just --list
 
-# Pre-push gate: fmt + clippy + offline tests + doc + audit + typos.
+# Pre-push gate: fmt + clippy + offline tests + doc + audit + typos +
+# round-trip property gate. The round-trip gate fails when this branch
+# adds/changes a serializer in src/ without a paired round-trip test;
+# see scripts/check-roundtrip-gate.sh for the detector and override.
 gate:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --lib --test cli --test behavioral
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
     cargo fetch --locked
-    cargo audit
+    cargo audit --deny warnings
     typos
+    bash scripts/check-roundtrip-gate.sh
 
 # Test dispatcher: offline | fast | live | concurrency | state | docker | PATTERN.
 test MODE="":
@@ -43,6 +47,7 @@ test MODE="":
             _live_env
             cargo test --test sync -- --ignored --test-threads=1
             cargo test --test state_auth -- --ignored --test-threads=1
+            cargo test --test import_existing_live -- --ignored --test-threads=1
             ;;
         concurrency)
             _live_env
@@ -93,6 +98,7 @@ cov MODE="" BASE="main":
             cargo llvm-cov --no-report --test behavioral
             cargo llvm-cov --no-report --test sync -- --include-ignored --test-threads=1
             cargo llvm-cov --no-report --test state_auth -- --include-ignored --test-threads=1
+            cargo llvm-cov --no-report --test import_existing_live -- --include-ignored --test-threads=1
             cargo llvm-cov report --summary-only
             ;;
         patch)

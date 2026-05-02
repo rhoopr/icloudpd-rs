@@ -78,6 +78,17 @@ pub trait StateDb: Send + Sync {
         download_checksum: Option<&str>,
     ) -> Result<(), StateError>;
 
+    /// Atomically upsert `record` and mark it downloaded in one transaction.
+    ///
+    /// Used by `import-existing` so an interrupted scan never leaves a
+    /// `pending` row with `local_path = NULL` for the next sync to redownload.
+    async fn import_adopt(
+        &self,
+        record: &AssetRecord,
+        local_path: &Path,
+        local_checksum: &str,
+    ) -> Result<(), StateError>;
+
     /// Mark an asset as failed with an error message.
     async fn mark_failed(
         &self,
@@ -221,10 +232,6 @@ pub trait StateDb: Send + Sync {
         library: &str,
         asset_ids: &[&str],
     ) -> Result<(), StateError>;
-
-    /// Sample up to `limit` local paths of downloaded assets.
-    /// Used to spot-check that "downloaded" files still exist on disk.
-    async fn sample_downloaded_paths(&self, limit: usize) -> Result<Vec<PathBuf>, StateError>;
 
     // ── v5 metadata operations ──
 
@@ -479,6 +486,147 @@ impl SqliteStateDb {
     }
 }
 
+/// Execute the asset UPSERT on `conn` (works against either a `Connection`
+/// or a `Transaction`, since `Transaction: Deref<Target = Connection>`).
+/// Shared by `upsert_seen` and `import_adopt` so both write the same column
+/// set and conflict resolution.
+fn upsert_asset_row(
+    conn: &Connection,
+    record: &AssetRecord,
+    last_seen_at: i64,
+) -> Result<(), StateError> {
+    let meta = &record.metadata;
+    // Lazily compute metadata_hash if caller supplied metadata without one.
+    // Storing the hash alongside the metadata is what lets feature 5 detect
+    // metadata-only changes in O(1) during incremental sync. Computed only
+    // when missing (rare — extract() normally pre-populates it).
+    let computed_hash: Option<String> = if meta.metadata_hash.is_none() {
+        Some(meta.compute_hash())
+    } else {
+        None
+    };
+    let metadata_hash: Option<&str> = meta.metadata_hash.as_deref().or(computed_hash.as_deref());
+
+    let mut stmt = conn
+        .prepare_cached(
+            r"
+                INSERT INTO assets (
+                    library, id, version_size, checksum, filename, created_at, added_at,
+                    size_bytes, media_type, status, last_seen_at,
+                    source, is_favorite, rating, latitude, longitude, altitude,
+                    orientation, duration_secs, timezone_offset, width, height,
+                    title, keywords, description, media_subtype, burst_id,
+                    is_hidden, is_archived, modified_at, is_deleted, deleted_at,
+                    provider_data, metadata_hash
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10,
+                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                        ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                ON CONFLICT(library, id, version_size) DO UPDATE SET
+                    checksum = excluded.checksum,
+                    filename = excluded.filename,
+                    created_at = excluded.created_at,
+                    added_at = excluded.added_at,
+                    size_bytes = excluded.size_bytes,
+                    media_type = excluded.media_type,
+                    last_seen_at = excluded.last_seen_at,
+                    source = COALESCE(excluded.source, assets.source),
+                    is_favorite = excluded.is_favorite,
+                    rating = excluded.rating,
+                    latitude = excluded.latitude,
+                    longitude = excluded.longitude,
+                    altitude = excluded.altitude,
+                    orientation = excluded.orientation,
+                    duration_secs = excluded.duration_secs,
+                    timezone_offset = excluded.timezone_offset,
+                    width = excluded.width,
+                    height = excluded.height,
+                    title = excluded.title,
+                    keywords = excluded.keywords,
+                    description = excluded.description,
+                    media_subtype = excluded.media_subtype,
+                    burst_id = excluded.burst_id,
+                    is_hidden = excluded.is_hidden,
+                    is_archived = excluded.is_archived,
+                    modified_at = excluded.modified_at,
+                    is_deleted = excluded.is_deleted,
+                    deleted_at = excluded.deleted_at,
+                    provider_data = excluded.provider_data,
+                    metadata_hash = excluded.metadata_hash
+                ",
+        )
+        .map_err(|e| StateError::query("upsert_seen::prepare", e))?;
+    stmt.execute(rusqlite::params![
+        &record.library,
+        &record.id,
+        record.version_size.as_str(),
+        &record.checksum,
+        &record.filename,
+        record.created_at.timestamp(),
+        record.added_at.map(|dt| dt.timestamp()),
+        i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
+        record.media_type.as_str(),
+        last_seen_at,
+        meta.source.as_deref().unwrap_or(DEFAULT_SOURCE),
+        i64::from(meta.is_favorite),
+        meta.rating.map(i64::from),
+        meta.latitude,
+        meta.longitude,
+        meta.altitude,
+        meta.orientation.map(i64::from),
+        meta.duration_secs,
+        meta.timezone_offset.map(i64::from),
+        meta.width.map(i64::from),
+        meta.height.map(i64::from),
+        meta.title.as_deref(),
+        meta.keywords.as_deref(),
+        meta.description.as_deref(),
+        meta.media_subtype.as_deref(),
+        meta.burst_id.as_deref(),
+        i64::from(meta.is_hidden),
+        i64::from(meta.is_archived),
+        meta.modified_at.map(|dt| dt.timestamp()),
+        i64::from(meta.is_deleted),
+        meta.deleted_at.map(|dt| dt.timestamp()),
+        meta.provider_data.as_deref(),
+        metadata_hash,
+    ])
+    .map_err(|e| StateError::query("upsert_seen", e))?;
+
+    Ok(())
+}
+
+/// Execute the `mark_downloaded` UPDATE on `conn`. Returns rows affected;
+/// callers decide what zero rows means in their context.
+fn update_status_to_downloaded(
+    conn: &Connection,
+    library: &str,
+    id: &str,
+    version_size: &str,
+    local_path: &Path,
+    local_checksum: &str,
+    download_checksum: Option<&str>,
+    downloaded_at: i64,
+) -> Result<usize, StateError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
+             local_checksum = ?3, download_checksum = ?4, last_error = NULL \
+             WHERE library = ?5 AND id = ?6 AND version_size = ?7",
+        )
+        .map_err(|e| StateError::query("mark_downloaded::prepare", e))?;
+    stmt.execute(rusqlite::params![
+        downloaded_at,
+        local_path.to_string_lossy(),
+        local_checksum,
+        download_checksum,
+        library,
+        id,
+        version_size
+    ])
+    .map_err(|e| StateError::query("mark_downloaded", e))
+}
+
 /// Drain a rusqlite row iterator into `Vec<T>`, dropping parse failures but
 /// logging each at `debug!` and summarising the drop count at `warn!` so a
 /// corrupted row never silently disappears from a bulk loader.
@@ -583,108 +731,7 @@ impl StateDb for SqliteStateDb {
     async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
         let record = record.clone();
         self.with_conn("upsert_seen", move |conn| {
-            let last_seen_at = Utc::now().timestamp();
-
-            let meta = &record.metadata;
-            // Lazily compute metadata_hash if caller supplied metadata without one.
-            // Storing the hash alongside the metadata is what lets feature 5 detect
-            // metadata-only changes in O(1) during incremental sync. Computed only
-            // when missing (rare — extract() normally pre-populates it).
-            let computed_hash: Option<String> = if meta.metadata_hash.is_none() {
-                Some(meta.compute_hash())
-            } else {
-                None
-            };
-            let metadata_hash: Option<&str> =
-                meta.metadata_hash.as_deref().or(computed_hash.as_deref());
-
-            let mut stmt = conn
-                .prepare_cached(
-                    r"
-                INSERT INTO assets (
-                    library, id, version_size, checksum, filename, created_at, added_at,
-                    size_bytes, media_type, status, last_seen_at,
-                    source, is_favorite, rating, latitude, longitude, altitude,
-                    orientation, duration_secs, timezone_offset, width, height,
-                    title, keywords, description, media_subtype, burst_id,
-                    is_hidden, is_archived, modified_at, is_deleted, deleted_at,
-                    provider_data, metadata_hash
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10,
-                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                        ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
-                ON CONFLICT(library, id, version_size) DO UPDATE SET
-                    checksum = excluded.checksum,
-                    filename = excluded.filename,
-                    created_at = excluded.created_at,
-                    added_at = excluded.added_at,
-                    size_bytes = excluded.size_bytes,
-                    media_type = excluded.media_type,
-                    last_seen_at = excluded.last_seen_at,
-                    source = COALESCE(excluded.source, assets.source),
-                    is_favorite = excluded.is_favorite,
-                    rating = excluded.rating,
-                    latitude = excluded.latitude,
-                    longitude = excluded.longitude,
-                    altitude = excluded.altitude,
-                    orientation = excluded.orientation,
-                    duration_secs = excluded.duration_secs,
-                    timezone_offset = excluded.timezone_offset,
-                    width = excluded.width,
-                    height = excluded.height,
-                    title = excluded.title,
-                    keywords = excluded.keywords,
-                    description = excluded.description,
-                    media_subtype = excluded.media_subtype,
-                    burst_id = excluded.burst_id,
-                    is_hidden = excluded.is_hidden,
-                    is_archived = excluded.is_archived,
-                    modified_at = excluded.modified_at,
-                    is_deleted = excluded.is_deleted,
-                    deleted_at = excluded.deleted_at,
-                    provider_data = excluded.provider_data,
-                    metadata_hash = excluded.metadata_hash
-                ",
-                )
-                .map_err(|e| StateError::query("upsert_seen::prepare", e))?;
-            stmt.execute(rusqlite::params![
-                &record.library,
-                &record.id,
-                record.version_size.as_str(),
-                &record.checksum,
-                &record.filename,
-                record.created_at.timestamp(),
-                record.added_at.map(|dt| dt.timestamp()),
-                i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
-                record.media_type.as_str(),
-                last_seen_at,
-                meta.source.as_deref().unwrap_or(DEFAULT_SOURCE),
-                i64::from(meta.is_favorite),
-                meta.rating.map(i64::from),
-                meta.latitude,
-                meta.longitude,
-                meta.altitude,
-                meta.orientation.map(i64::from),
-                meta.duration_secs,
-                meta.timezone_offset.map(i64::from),
-                meta.width.map(i64::from),
-                meta.height.map(i64::from),
-                meta.title.as_deref(),
-                meta.keywords.as_deref(),
-                meta.description.as_deref(),
-                meta.media_subtype.as_deref(),
-                meta.burst_id.as_deref(),
-                i64::from(meta.is_hidden),
-                i64::from(meta.is_archived),
-                meta.modified_at.map(|dt| dt.timestamp()),
-                i64::from(meta.is_deleted),
-                meta.deleted_at.map(|dt| dt.timestamp()),
-                meta.provider_data.as_deref(),
-                metadata_hash,
-            ])
-            .map_err(|e| StateError::query("upsert_seen", e))?;
-
-            Ok(())
+            upsert_asset_row(conn, &record, Utc::now().timestamp())
         })
         .await
     }
@@ -707,32 +754,64 @@ impl StateDb for SqliteStateDb {
         let download_checksum = download_checksum.map(str::to_owned);
 
         self.with_conn("mark_downloaded", move |conn| {
-            let rows = conn
-                .execute(
-                    "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
-                     local_checksum = ?3, download_checksum = ?4, last_error = NULL \
-                     WHERE library = ?5 AND id = ?6 AND version_size = ?7",
-                    rusqlite::params![
-                        downloaded_at,
-                        local_path.to_string_lossy(),
-                        &local_checksum,
-                        download_checksum.as_deref(),
-                        &library,
-                        &id,
-                        &version_size
-                    ],
-                )
-                .map_err(|e| StateError::query("mark_downloaded", e))?;
+            let rows = update_status_to_downloaded(
+                conn,
+                &library,
+                &id,
+                &version_size,
+                &local_path,
+                &local_checksum,
+                download_checksum.as_deref(),
+                downloaded_at,
+            )?;
 
             if rows == 0 {
-                tracing::warn!(
-                    id = %id,
-                    version_size = %version_size,
-                    "mark_downloaded matched 0 rows — asset may not have been recorded via upsert_seen"
-                );
                 crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.inc();
+                return Err(StateError::AssetRowMissing {
+                    asset_id: id,
+                    version_size,
+                });
             }
 
+            Ok(())
+        })
+        .await
+    }
+
+    async fn import_adopt(
+        &self,
+        record: &AssetRecord,
+        local_path: &Path,
+        local_checksum: &str,
+    ) -> Result<(), StateError> {
+        let record = record.clone();
+        let local_path = local_path.to_path_buf();
+        let local_checksum = local_checksum.to_owned();
+
+        self.with_conn_mut("import_adopt", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("import_adopt::begin", e))?;
+
+            let now = Utc::now().timestamp();
+            upsert_asset_row(&tx, &record, now)?;
+            let rows = update_status_to_downloaded(
+                &tx,
+                &record.library,
+                &record.id,
+                record.version_size.as_str(),
+                &local_path,
+                &local_checksum,
+                None,
+                now,
+            )?;
+            debug_assert_eq!(
+                rows, 1,
+                "import_adopt UPDATE missed the row inserted by UPSERT in the same tx — SQL bug"
+            );
+
+            tx.commit()
+                .map_err(|e| StateError::query("import_adopt::commit", e))?;
             Ok(())
         })
         .await
@@ -1308,26 +1387,6 @@ impl StateDb for SqliteStateDb {
             tx.commit()
                 .map_err(|e| StateError::query("touch_last_seen_many::commit", e))?;
             Ok(())
-        })
-        .await
-    }
-
-    async fn sample_downloaded_paths(&self, limit: usize) -> Result<Vec<PathBuf>, StateError> {
-        self.with_conn("sample_downloaded_paths", move |conn| {
-            let mut stmt = conn
-                .prepare_cached(
-                    "SELECT local_path FROM assets WHERE status = 'downloaded' \
-                     AND local_path IS NOT NULL ORDER BY RANDOM() LIMIT ?1",
-                )
-                .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
-
-            let rows = stmt
-                .query_map(rusqlite::params![limit as i64], |row| {
-                    let p: String = row.get(0)?;
-                    Ok(PathBuf::from(p))
-                })
-                .map_err(|e| StateError::query("sample_downloaded_paths", e))?;
-            Ok(collect_rows_with_warn(rows, "sample_downloaded_paths"))
         })
         .await
     }
@@ -3679,13 +3738,13 @@ mod tests {
     // ── Gap: mark_downloaded on non-existent record (no upsert_seen) ──
 
     #[tokio::test]
-    async fn mark_downloaded_without_upsert_seen_succeeds_with_zero_rows() {
-        // mark_downloaded does an UPDATE, not an UPSERT. If the asset was
-        // never recorded via upsert_seen, it updates 0 rows and logs a
-        // warning. This should NOT return an error -- it's a graceful no-op.
+    async fn mark_downloaded_without_upsert_seen_returns_asset_row_missing() {
+        // The UPDATE matches zero rows when the asset wasn't recorded
+        // via upsert_seen. The caller must see this loudly so a missed
+        // dispatch step doesn't silently drop a downloaded file.
         let db = SqliteStateDb::open_in_memory().unwrap();
 
-        let result = db
+        let err = db
             .mark_downloaded(
                 "PrimarySync",
                 "NEVER_SEEN",
@@ -3694,39 +3753,40 @@ mod tests {
                 "abc123",
                 None,
             )
-            .await;
-        assert!(
-            result.is_ok(),
-            "mark_downloaded on unknown asset should succeed (0-row update)"
-        );
-
-        // Verify: the asset is NOT in the DB (it was never inserted)
-        let summary = db.get_summary().await.unwrap();
-        assert_eq!(summary.downloaded, 0);
-        assert_eq!(summary.total_assets, 0);
+            .await
+            .expect_err("mark_downloaded on unknown asset must err");
+        match err {
+            StateError::AssetRowMissing {
+                asset_id,
+                version_size,
+            } => {
+                assert_eq!(asset_id, "NEVER_SEEN");
+                assert_eq!(version_size, "original");
+            }
+            other => panic!("expected AssetRowMissing, got {other:?}"),
+        }
     }
 
-    /// A `mark_downloaded` call
-    /// without a prior `upsert_seen` is self-healing in 1 cycle, but a
-    /// regression that increases the rate (producer-dispatch invariant
-    /// quietly broken) needs to be visible in /metrics rather than only
-    /// in logs. Pin the counter increment so the wiring can't be silently
-    /// dropped on a future refactor.
+    /// A regression that increases the rate of zero-row `mark_downloaded`
+    /// calls (e.g. a producer-dispatch invariant quietly broken) needs to
+    /// be visible in /metrics, not only in logs / per-asset errors. Pin
+    /// the counter increment so the wiring can't be silently dropped on
+    /// a future refactor.
     #[tokio::test]
     async fn mark_downloaded_zero_rows_increments_metric_counter() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
         let before = crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.get();
-        db.mark_downloaded(
-            "PrimarySync",
-            "NEVER_SEEN_FOR_METRIC",
-            "original",
-            Path::new("/tmp/never_metric.jpg"),
-            "abc123",
-            None,
-        )
-        .await
-        .expect("mark_downloaded on unknown row should succeed");
+        let _ = db
+            .mark_downloaded(
+                "PrimarySync",
+                "NEVER_SEEN_FOR_METRIC",
+                "original",
+                Path::new("/tmp/never_metric.jpg"),
+                "abc123",
+                None,
+            )
+            .await;
         let after = crate::metrics::MARK_DOWNLOADED_ZERO_ROWS.get();
 
         assert!(
@@ -3777,6 +3837,99 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.total_assets, 0);
+    }
+
+    // ── import_adopt: atomic upsert + mark-downloaded ───────────────────
+
+    #[tokio::test]
+    async fn import_adopt_persists_downloaded_row_in_one_call() {
+        // The whole point of import_adopt: one transactional call that
+        // leaves the row fully `downloaded` with `local_path` set. No
+        // separate upsert_seen + mark_downloaded sequence at the call site.
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = TestAssetRecord::new("ADOPT_ONE")
+            .checksum("ck_adopt")
+            .filename("photo.jpg")
+            .size(2048)
+            .build();
+        let local_path = PathBuf::from("/tmp/photos/photo.jpg");
+
+        db.import_adopt(&record, &local_path, "local-ck-abc")
+            .await
+            .expect("import_adopt should succeed on a fresh row");
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 1);
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+
+        let pages = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(pages.len(), 1);
+        let row = &pages[0];
+        assert_eq!(&*row.id, "ADOPT_ONE");
+        assert_eq!(row.status, AssetStatus::Downloaded);
+        assert_eq!(row.local_path.as_deref(), Some(local_path.as_path()));
+        assert_eq!(row.local_checksum.as_deref(), Some("local-ck-abc"));
+    }
+
+    #[tokio::test]
+    async fn import_adopt_is_idempotent_on_repeat_calls() {
+        // Re-running an import scan over the same on-disk files must not
+        // duplicate rows or drop the downloaded state — the second adopt
+        // should see the existing downloaded row and leave it healthy.
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = TestAssetRecord::new("ADOPT_IDEMP")
+            .checksum("ck_idemp")
+            .filename("idemp.jpg")
+            .size(1024)
+            .build();
+        let local_path = PathBuf::from("/tmp/photos/idemp.jpg");
+
+        for _ in 0..2 {
+            db.import_adopt(&record, &local_path, "local-ck-idemp")
+                .await
+                .expect("import_adopt should be idempotent");
+        }
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.total_assets, 1, "no duplicate row");
+        assert_eq!(summary.downloaded, 1);
+    }
+
+    #[tokio::test]
+    async fn import_adopt_promotes_existing_pending_row_to_downloaded() {
+        // A prior interrupted scan may have left a pending row (pre-PR-5
+        // behavior). Re-running the import must recover by upserting the
+        // metadata and flipping the row to downloaded in one transaction.
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let record = TestAssetRecord::new("ADOPT_RESUME")
+            .checksum("ck_resume")
+            .filename("resume.jpg")
+            .size(4096)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+
+        // Sanity: row is pending with no local_path.
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.downloaded, 0);
+
+        let local_path = PathBuf::from("/tmp/photos/resume.jpg");
+        db.import_adopt(&record, &local_path, "local-ck-resume")
+            .await
+            .expect("import_adopt should promote pending → downloaded");
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.downloaded, 1);
+
+        let pages = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(pages[0].local_path.as_deref(), Some(local_path.as_path()));
+        assert_eq!(pages[0].local_checksum.as_deref(), Some("local-ck-resume"));
     }
 
     // ── Gap: mark_failed increments download_attempts cumulatively ────
@@ -4021,49 +4174,6 @@ mod tests {
             Some("local_sha256"),
             "local_checksum should be stored"
         );
-    }
-
-    // ── Gap: sample_downloaded_paths returns actual paths ─────────────
-
-    #[tokio::test]
-    async fn sample_downloaded_paths_returns_stored_paths() {
-        let db = SqliteStateDb::open_in_memory().unwrap();
-
-        for i in 0..5 {
-            let record = TestAssetRecord::new(&format!("SAMPLE_{i}"))
-                .checksum(&format!("ck_{i}"))
-                .filename(&format!("photo_{i}.jpg"))
-                .size(1000)
-                .build();
-            db.upsert_seen(&record).await.unwrap();
-            db.mark_downloaded(
-                "PrimarySync",
-                &format!("SAMPLE_{i}"),
-                "original",
-                Path::new(&format!("/photos/photo_{i}.jpg")),
-                &format!("hash_{i}"),
-                None,
-            )
-            .await
-            .unwrap();
-        }
-
-        let paths = db.sample_downloaded_paths(10).await.unwrap();
-        assert!(
-            !paths.is_empty(),
-            "should return at least some downloaded paths"
-        );
-        assert!(
-            paths.len() <= 5,
-            "should not return more than the number of downloaded assets"
-        );
-        for p in &paths {
-            assert!(
-                p.to_str().unwrap().starts_with("/photos/"),
-                "path should match what was stored: {:?}",
-                p
-            );
-        }
     }
 
     // ── v5 metadata round-trip ──────────────────────────────────────────
@@ -4681,8 +4791,7 @@ mod tests {
     /// Read-side counterpart to `upsert_seen_keeps_distinct_rows_per_library`
     /// and `mark_failed_is_library_scoped`: those tests already pin the write
     /// side, this one pins that the bulk-loader queries used by the download
-    /// hot path (`get_downloaded_checksums`, `sample_downloaded_paths`)
-    /// surface per-zone rows without collapsing them on the shared
+    /// hot path surface per-zone rows without collapsing them on the shared
     /// `(id, version_size)` pair the v8 PK split was created to disambiguate.
     #[tokio::test]
     async fn multi_library_read_queries_scope_per_zone() {
@@ -4726,17 +4835,118 @@ mod tests {
             checksums.get(&triple(SHARED)),
             Some(&"ck_shared".to_string())
         );
+    }
 
-        // local_path is per-row; if mark_downloaded had clobbered the column
-        // on a shared (id, version_size) we'd leak one of the on-disk files.
-        let paths = db.sample_downloaded_paths(10).await.unwrap();
+    #[tokio::test]
+    async fn mark_downloaded_fails_when_asset_row_missing() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let result = db
+            .mark_downloaded(
+                "PrimarySync",
+                "NONEXISTENT_42",
+                "original",
+                Path::new("/tmp/claude/photo.jpg"),
+                "abc123hash",
+                None,
+            )
+            .await;
+
         assert!(
-            paths.contains(&primary_path),
-            "primary path missing: {paths:?}"
+            result.is_err(),
+            "mark_downloaded on an absent row must fail"
         );
+        let err = result.unwrap_err();
         assert!(
-            paths.contains(&shared_path),
-            "shared path missing: {paths:?}"
+            matches!(
+                err,
+                StateError::AssetRowMissing {
+                    ref asset_id,
+                    ref version_size,
+                } if asset_id == "NONEXISTENT_42" && version_size == "original"
+            ),
+            "expected AssetRowMissing with correct ids, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_run_killed_mid_pass_preserves_downloaded_rows_on_next_open() {
+        let dir = test_dir();
+        let db_path = dir.path().join("crash_test.db");
+
+        let file_path_1 = dir.path().join("photo1.jpg");
+        let file_path_2 = dir.path().join("photo2.jpg");
+        std::fs::write(&file_path_1, b"photo 1 content").unwrap();
+        std::fs::write(&file_path_2, b"photo 2 content").unwrap();
+
+        {
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            let _run_id = db.start_sync_run().await.unwrap();
+
+            for (id, path) in [
+                ("A1", &file_path_1),
+                ("A2", &file_path_2),
+                ("A3", &file_path_1),
+            ] {
+                let record = TestAssetRecord::new(id).build();
+                db.upsert_seen(&record).await.unwrap();
+                if id != "A3" {
+                    db.mark_downloaded("PrimarySync", id, "original", path, "hash", None)
+                        .await
+                        .unwrap();
+                }
+            }
+            // Drop without calling complete_sync_run — simulates kill -9
+        }
+
+        let db2 = SqliteStateDb::open(&db_path).await.unwrap();
+        let promoted = db2.promote_orphaned_sync_runs().await.unwrap();
+        assert_eq!(
+            promoted, 1,
+            "the orphaned running sync_run must be promoted"
+        );
+
+        let summary = db2.get_summary().await.unwrap();
+        assert_eq!(
+            summary.downloaded, 2,
+            "the two downloaded assets must survive the crash"
+        );
+        assert_eq!(
+            summary.pending, 1,
+            "the one pending asset must still be pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_db_at_future_schema_version_returns_loud_error() {
+        let dir = test_dir();
+        let db_path = dir.path().join("future.db");
+
+        {
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            db.with_conn("bump_version", |conn| {
+                conn.pragma_update(
+                    None,
+                    "user_version",
+                    crate::state::schema::SCHEMA_VERSION + 1,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+
+        let result = SqliteStateDb::open(&db_path).await;
+        assert!(result.is_err(), "opening a future-version DB must fail");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StateError::UnsupportedSchemaVersion { found, expected }
+                    if found == crate::state::schema::SCHEMA_VERSION + 1
+                    && expected == crate::state::schema::SCHEMA_VERSION
+            ),
+            "expected UnsupportedSchemaVersion, got: {err:?}"
         );
     }
 }

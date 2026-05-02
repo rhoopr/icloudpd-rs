@@ -24,10 +24,7 @@ use pipeline::{
 
 pub(crate) use filter::determine_media_type;
 pub(crate) use filter::AssetGroupings;
-use filter::{
-    extract_skip_candidates, filter_asset_to_tasks, pre_ensure_asset_dir, DownloadTask,
-    NormalizedPath,
-};
+use filter::{filter_asset_to_tasks, pre_ensure_asset_dir, DownloadTask, NormalizedPath};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -563,6 +560,66 @@ impl DownloadConfig {
             || any_token(&self.folder_structure_smart_folders)
             || self.folder_structure_albums.as_ref() != self.folder_structure.as_str()
             || self.folder_structure_smart_folders.as_ref() != self.folder_structure.as_str()
+    }
+
+    /// Construct a `DownloadConfig` with only the path-derivation fields
+    /// populated. Used by `import-existing`, which calls
+    /// `expected_paths_for` against existing files but never runs the
+    /// download pipeline; the pipeline-only fields (state_db, retry,
+    /// concurrent_downloads, etc.) stay at inert defaults.
+    pub(crate) fn for_path_derivation_only(
+        directory: Arc<Path>,
+        fields: crate::config::PathDerivationFields,
+        dry_run: bool,
+        no_progress_bar: bool,
+    ) -> Self {
+        Self {
+            directory,
+            folder_structure: fields.folder_structure,
+            folder_structure_albums: Arc::from("{album}"),
+            folder_structure_smart_folders: Arc::from("{smart-folder}"),
+            library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
+            size: fields.size.into(),
+            skip_videos: false,
+            skip_photos: false,
+            skip_created_before: None,
+            skip_created_after: None,
+            #[cfg(feature = "xmp")]
+            set_exif_datetime: false,
+            #[cfg(feature = "xmp")]
+            set_exif_rating: false,
+            #[cfg(feature = "xmp")]
+            set_exif_gps: false,
+            #[cfg(feature = "xmp")]
+            set_exif_description: false,
+            #[cfg(feature = "xmp")]
+            embed_xmp: false,
+            #[cfg(feature = "xmp")]
+            xmp_sidecar: false,
+            dry_run,
+            concurrent_downloads: 1,
+            recent: None,
+            retry: RetryConfig::default(),
+            live_photo_mode: fields.live_photo_mode,
+            live_photo_size: fields.live_photo_size.to_asset_version_size(),
+            live_photo_mov_filename_policy: fields.live_photo_mov_filename_policy,
+            align_raw: fields.align_raw,
+            no_progress_bar,
+            only_print_filenames: false,
+            file_match_policy: fields.file_match_policy,
+            force_size: fields.force_size,
+            keep_unicode_in_filenames: fields.keep_unicode_in_filenames,
+            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
+            temp_suffix: Arc::from(".kei-tmp"),
+            state_db: None,
+            retry_only: false,
+            max_download_attempts: 0,
+            sync_mode: SyncMode::Full,
+            album_name: None,
+            exclude_asset_ids: Arc::new(FxHashSet::default()),
+            asset_groupings: Arc::new(AssetGroupings::default()),
+            bandwidth_limiter: None,
+        }
     }
 
     /// Clone this config for a single download pass: pick the per-category
@@ -1721,7 +1778,6 @@ async fn download_photos_incremental(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let needs_per_pass = config.requires_per_pass_paths();
 
     // Each asset is paired with its source pass index so both `{album}`
     // expansion and per-pass exclusion (notably, the unfiled pass's set
@@ -1854,14 +1910,7 @@ async fn download_photos_incremental(
         "Assets to download from incremental sync"
     );
 
-    // Pre-load download context for O(1) state DB skip decisions
-    let download_ctx = if let Some(db) = &config.state_db {
-        DownloadContext::load(db.as_ref(), false).await
-    } else {
-        DownloadContext::default()
-    };
-
-    // Convert assets to download tasks, using state DB fast-skip where possible.
+    // Convert assets to download tasks via path-aware on-disk verification.
     // Each pass (concrete album or unfiled) gets its own derived config so
     // that both album-specific path expansion and per-pass exclude sets are
     // applied. Configs are cached per pass index to avoid redundant
@@ -1891,32 +1940,8 @@ async fn download_photos_incremental(
             continue;
         }
 
-        // `should_download_fast` keys on (asset_id, version_size, checksum)
-        // and is path-blind. In `{album}` mode the same asset may target
-        // multiple album folders; a DB-only skip would leave later copies
-        // missing from disk. Fall through to the path-aware filesystem
-        // check in that case.
-        if !needs_per_pass {
-            let candidates = extract_skip_candidates(asset, effective_config);
-            if !candidates.is_empty()
-                && candidates.iter().all(|&(vs, cs)| {
-                    matches!(
-                        download_ctx.should_download_fast(
-                            &effective_config.library,
-                            asset.id(),
-                            vs,
-                            cs,
-                            true
-                        ),
-                        Some(false)
-                    )
-                })
-            {
-                skip_breakdown.by_state += 1;
-                continue;
-            }
-        }
-
+        // Path-aware on-disk verification only; a DB-only fast-skip would
+        // miss user-deleted files on the incremental path.
         pre_ensure_asset_dir(&mut dir_cache, asset, effective_config).await;
         let asset_tasks =
             filter_asset_to_tasks(asset, effective_config, &mut claimed_paths, &mut dir_cache);

@@ -1,0 +1,14 @@
+# cargo-audit advisory ignores. cargo-audit auto-loads this path
+# (`.cargo/audit.toml`) under both `just gate` and CI. Without `--deny`
+# cargo-audit exits 0 on informational findings (unmaintained, unsound,
+# yanked) regardless of this list, so callers must pass `--deny warnings`
+# for the ignores to be enforceable.
+
+[advisories]
+ignore = [
+    # `rand 0.9.2` unsound with a custom logger. kei's direct
+    # rand=0.10.1 is unaffected; the 0.9.2 copy reaches us only
+    # transitively via reqwest -> quinn -> quinn-proto.
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0097
+    "RUSTSEC-2026-0097",
+]

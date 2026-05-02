@@ -669,6 +669,47 @@ fn import_existing_recent_flag() {
         .success();
 }
 
+#[test]
+fn import_existing_file_match_policy_all_variants() {
+    for variant in ["name-size-dedup-with-suffix", "name-id7"] {
+        common::cmd()
+            .args([
+                "import-existing",
+                "--download-dir",
+                "/tmp",
+                "--file-match-policy",
+                variant,
+                "--help",
+            ])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn import_existing_file_match_policy_rejects_invalid() {
+    common::cmd()
+        .args([
+            "import-existing",
+            "--download-dir",
+            "/tmp",
+            "--file-match-policy",
+            "bogus",
+            "--help",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn import_existing_file_match_policy_from_env() {
+    common::cmd()
+        .env("KEI_FILE_MATCH_POLICY", "name-id7")
+        .args(["import-existing", "--download-dir", "/tmp", "--help"])
+        .assert()
+        .success();
+}
+
 // ── Env var credential passthrough ──────────────────────────────────────
 
 #[test]
@@ -877,6 +918,34 @@ fn import_existing_accepts_no_progress_bar() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--no-progress-bar"));
+}
+
+// ── import-existing path-derivation flags ───────────────────────────────
+//
+// The CLI-string -> enum mapping for each flag (--size, --live-photo-mode,
+// --live-photo-size, --live-photo-mov-filename-policy, --align-raw,
+// --force-size, --keep-unicode-in-filenames, --file-match-policy) is pinned
+// by `Cli::try_parse_from`-driven unit tests in src/cli.rs (search for
+// `import_existing_*_parses_to_correct_variant`). Those assert on parsed
+// variants -- which `--help`-driven subprocess tests cannot.
+//
+// The subprocess-level test below stays because it exercises one thing the
+// unit tests can't: that clap's value rejection produces a non-zero subprocess
+// exit code (the contract Docker / systemd consumers rely on).
+
+#[test]
+fn import_existing_file_match_policy_rejects_bogus_value() {
+    common::cmd()
+        .args([
+            "import-existing",
+            "--download-dir",
+            "/tmp",
+            "--file-match-policy",
+            "bogus",
+            "--help",
+        ])
+        .assert()
+        .failure();
 }
 
 // ── exit codes ────────────────────────────────────────────────────────

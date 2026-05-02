@@ -23,7 +23,7 @@ use super::DownloadConfig;
 
 /// Reason an asset was filtered out during content/metadata filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FilterReason {
+pub(crate) enum FilterReason {
     ExcludedAlbum,
     MediaType,
     LivePhoto,
@@ -254,19 +254,64 @@ pub(super) struct DownloadTask {
     pub(super) version_size: VersionSizeKey,
 }
 
-/// Apply the RAW alignment policy by swapping Original and Alternative versions
-/// when appropriate, matching Python's `apply_raw_policy()`.
-#[allow(
-    clippy::indexing_slicing,
-    reason = "orig_idx / alt_idx come from `enumerate()` over `versions`; indexing back \
-              into `versions` or its clone is in-bounds by construction"
-)]
-fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'_, VersionsMap> {
-    if policy == RawTreatmentPolicy::Unchanged {
-        return Cow::Borrowed(versions);
+/// Borrowed view over a `VersionsMap` with an optional virtual swap of
+/// the keys at two indices. Lets [`apply_raw_policy`] relabel the
+/// `Original` / `Alternative` slots without cloning the version list.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct VersionsView<'a> {
+    versions: &'a VersionsMap,
+    /// `(orig_idx, alt_idx)` when the keys at those indices should be
+    /// presented swapped; iteration yields `Alternative` at `orig_idx`
+    /// and `Original` at `alt_idx`. `None` means iterate as-is.
+    swap: Option<(usize, usize)>,
+}
+
+impl<'a> VersionsView<'a> {
+    fn borrowed(versions: &'a VersionsMap) -> Self {
+        Self {
+            versions,
+            swap: None,
+        }
     }
 
-    // Find indices for Original and Alternative in a single pass
+    fn swapped(versions: &'a VersionsMap, orig_idx: usize, alt_idx: usize) -> Self {
+        Self {
+            versions,
+            swap: Some((orig_idx, alt_idx)),
+        }
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (AssetVersionSize, &'a AssetVersion)> + 'a {
+        let swap = self.swap;
+        self.versions.iter().enumerate().map(move |(idx, (k, v))| {
+            let key = match swap {
+                Some((orig, _)) if idx == orig => AssetVersionSize::Alternative,
+                Some((_, alt)) if idx == alt => AssetVersionSize::Original,
+                _ => *k,
+            };
+            (key, v)
+        })
+    }
+
+    pub(super) fn get(&self, key: AssetVersionSize) -> Option<&'a AssetVersion> {
+        self.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+}
+
+/// Apply the RAW alignment policy by virtually swapping Original and
+/// Alternative versions when appropriate, matching Python's
+/// `apply_raw_policy()`. Returns a borrowed view over the original map
+/// regardless of swap outcome.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "orig_idx / alt_idx come from `enumerate()` over `versions`; \
+              indexing back into `versions` is in-bounds by construction"
+)]
+fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> VersionsView<'_> {
+    if policy == RawTreatmentPolicy::Unchanged {
+        return VersionsView::borrowed(versions);
+    }
+
     let (orig_idx, alt_idx) =
         versions
             .iter()
@@ -278,7 +323,7 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'
             });
 
     let Some(alt_idx) = alt_idx else {
-        return Cow::Borrowed(versions);
+        return VersionsView::borrowed(versions);
     };
 
     let should_swap = match policy {
@@ -289,17 +334,10 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'
         RawTreatmentPolicy::Unchanged => false,
     };
 
-    if !should_swap {
-        return Cow::Borrowed(versions);
+    match (should_swap, orig_idx) {
+        (true, Some(orig_idx)) => VersionsView::swapped(versions, orig_idx, alt_idx),
+        _ => VersionsView::borrowed(versions),
     }
-
-    // Swap by cloning and modifying the keys
-    let mut swapped = versions.clone();
-    if let Some(orig_idx) = orig_idx {
-        swapped[orig_idx].0 = AssetVersionSize::Alternative;
-        swapped[alt_idx].0 = AssetVersionSize::Original;
-    }
-    Cow::Owned(swapped)
 }
 
 /// Returns the reason this asset should be skipped by content/metadata
@@ -307,7 +345,7 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Cow<'
 ///
 /// Callers must invoke this before `extract_skip_candidates` or
 /// `filter_asset_to_tasks` to avoid redundant evaluation.
-pub(super) fn is_asset_filtered(
+pub(crate) fn is_asset_filtered(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> Option<FilterReason> {
@@ -410,6 +448,249 @@ pub(super) fn extract_skip_candidates<'a>(
     }
 
     result
+}
+
+/// One file sync would write for an asset, with the metadata `import-existing`
+/// needs to match it against the local filesystem.
+#[derive(Debug, Clone)]
+pub(crate) struct ExpectedAssetPath {
+    /// Absolute path the file would land at, before any collision/dedup suffix.
+    pub(crate) path: PathBuf,
+    /// Byte size iCloud reports for this version. Used as the strict-match key.
+    pub(crate) size: u64,
+    /// iCloud-side checksum (CloudKit format, not SHA256).
+    pub(crate) checksum: Box<str>,
+    /// Which version this is (Original, LiveOriginal, Medium, ...). Drives the
+    /// state-DB row key and `MediaType` classification.
+    pub(crate) version_size: VersionSizeKey,
+}
+
+/// Bare expected path for one version, before any on-disk / claimed-path
+/// collision resolution. The single source of truth shared by
+/// `expected_paths_for` (import) and `filter_asset_to_tasks` (sync).
+#[derive(Debug, Clone)]
+pub(super) struct DerivedPath {
+    /// Absolute path the file would land at, before any dedup suffix.
+    pub(super) path: PathBuf,
+    /// Basename of `path`. Sync's collision layer uses this as the input
+    /// to `add_dedup_suffix` / `insert_suffix` when colliding with an
+    /// existing different-size file.
+    pub(super) filename: String,
+    /// CDN URL for the version. Carried so sync can build a `DownloadTask`
+    /// without re-walking `asset.versions()`. Unused by import.
+    pub(super) url: Box<str>,
+    pub(super) checksum: Box<str>,
+    pub(super) size: u64,
+    pub(super) version_size: VersionSizeKey,
+    /// True for the primary photo (where AM/PM whitespace variants matter
+    /// when matching on disk), false for the MOV companion. Sync's
+    /// collision layer threads this into `resolve_download_path`.
+    pub(super) check_ampm_on_disk: bool,
+}
+
+/// Real filename if the asset has one, otherwise a deterministic
+/// fingerprint synthesized from the asset id + first-version UTI. Borrowed
+/// when real, owned when synthesized.
+fn raw_filename(asset: &crate::icloud::photos::PhotoAsset) -> Cow<'_, str> {
+    if let Some(f) = asset.filename() {
+        Cow::Borrowed(f)
+    } else {
+        let asset_type = asset
+            .versions()
+            .first()
+            .map_or("", |(_, v)| v.asset_type.as_ref());
+        Cow::Owned(paths::generate_fingerprint_filename(asset.id(), asset_type))
+    }
+}
+
+/// Per-asset inputs that don't change between primary and MOV companion
+/// derivation.
+pub(super) struct DerivationContext<'a> {
+    pub(super) base_filename: String,
+    pub(super) created_local: DateTime<Local>,
+    pub(super) versions: VersionsView<'a>,
+}
+
+impl<'a> DerivationContext<'a> {
+    pub(super) fn build(
+        asset: &'a crate::icloud::photos::PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Self {
+        let raw = raw_filename(asset);
+        let base_filename: String = if config.keep_unicode_in_filenames {
+            raw.into_owned()
+        } else {
+            paths::remove_unicode_chars(&raw).into_owned()
+        };
+        Self {
+            base_filename,
+            created_local: asset.created().with_timezone(&Local),
+            versions: apply_raw_policy(asset.versions(), config.align_raw),
+        }
+    }
+
+    fn get_version(&self, key: AssetVersionSize) -> Option<&AssetVersion> {
+        self.versions.get(key)
+    }
+}
+
+/// Build the primary `DerivedPath` (or `None` if no primary should be
+/// emitted under this config — Skip-mode live photo, VideoOnly mode,
+/// or no usable version under `force_size`).
+pub(super) fn derive_primary(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    ctx: &DerivationContext<'_>,
+) -> Option<DerivedPath> {
+    if matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Skip | LivePhotoMode::VideoOnly
+    ) && asset.is_live_photo()
+    {
+        return None;
+    }
+
+    let get_version = |key: &AssetVersionSize| ctx.get_version(*key);
+    let (version, effective_size) = version_with_fallback(
+        &get_version,
+        config.size,
+        AssetVersionSize::Original,
+        config.force_size,
+    )?;
+
+    let mapped = paths::map_filename_extension(&ctx.base_filename, &version.asset_type);
+    let sized = match effective_size {
+        AssetVersionSize::Medium => paths::insert_suffix(&mapped, "medium"),
+        AssetVersionSize::Thumb => paths::insert_suffix(&mapped, "thumb"),
+        _ => mapped,
+    };
+    let filename = match config.file_match_policy {
+        FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized, asset.id()),
+        FileMatchPolicy::NameSizeDedupWithSuffix => sized,
+    };
+    let path = paths::local_download_path(
+        &config.directory,
+        &config.folder_structure,
+        &ctx.created_local,
+        &filename,
+        config.album_name.as_deref(),
+    );
+
+    Some(DerivedPath {
+        path,
+        filename,
+        url: version.url.clone(),
+        checksum: version.checksum.clone(),
+        size: version.size,
+        version_size: VersionSizeKey::from(effective_size),
+        check_ampm_on_disk: true,
+    })
+}
+
+/// Build the live-photo MOV companion `DerivedPath` (or `None` when no
+/// MOV applies — non-image asset, Skip / ImageOnly mode, no live version
+/// available).
+///
+/// `primary_effective_filename` is the filename the primary lands at:
+/// import passes the *derived* primary filename (no collision yet);
+/// sync passes the *resolved* primary filename (after dedup suffix, if
+/// any), so a dedup'd primary keeps its MOV paired by filename stem.
+pub(super) fn derive_mov_companion(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    ctx: &DerivationContext<'_>,
+    primary_effective_filename: Option<&str>,
+) -> Option<DerivedPath> {
+    if !matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Both | LivePhotoMode::VideoOnly
+    ) {
+        return None;
+    }
+    if asset.item_type() != Some(AssetItemType::Image) {
+        return None;
+    }
+
+    let get_version = |key: &AssetVersionSize| ctx.get_version(*key);
+    let (live_version, effective_live_size) = version_with_fallback(
+        &get_version,
+        config.live_photo_size,
+        AssetVersionSize::LiveOriginal,
+        config.force_size,
+    )?;
+
+    let live_base = match config.file_match_policy {
+        FileMatchPolicy::NameId7 => paths::apply_name_id7(&ctx.base_filename, asset.id()),
+        FileMatchPolicy::NameSizeDedupWithSuffix => primary_effective_filename
+            .unwrap_or(&ctx.base_filename)
+            .to_string(),
+    };
+    let mov_filename = match config.live_photo_mov_filename_policy {
+        LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
+        LivePhotoMovFilenamePolicy::Original => paths::live_photo_mov_path_original(&live_base),
+    };
+    let mov_path = paths::local_download_path(
+        &config.directory,
+        &config.folder_structure,
+        &ctx.created_local,
+        &mov_filename,
+        config.album_name.as_deref(),
+    );
+
+    Some(DerivedPath {
+        path: mov_path,
+        filename: mov_filename,
+        url: live_version.url.clone(),
+        checksum: live_version.checksum.clone(),
+        size: live_version.size,
+        version_size: VersionSizeKey::from(effective_live_size),
+        check_ampm_on_disk: false,
+    })
+}
+
+/// Compute the bare expected paths sync would produce for an asset under
+/// the given config, without doing collision resolution or disk I/O.
+///
+/// Returns up to two entries: the primary version and an optional
+/// live-photo MOV companion. Empty result means no version applies
+/// (`force_size` + size unavailable, image-only asset under VideoOnly
+/// mode, or live-photo Skip mode).
+///
+/// Caller must invoke [`is_asset_filtered`] first to apply content/date
+/// filters; this function only handles version selection + filename
+/// derivation.
+pub(super) fn derive_expected_paths(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> SmallVec<[DerivedPath; 2]> {
+    let ctx = DerivationContext::build(asset, config);
+    let mut out = SmallVec::new();
+    if let Some(p) = derive_primary(asset, config, &ctx) {
+        out.push(p);
+    }
+    let primary_filename = out.first().map(|p: &DerivedPath| p.filename.as_str());
+    if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename) {
+        out.push(mov);
+    }
+    out
+}
+
+/// Compute the file paths sync would produce for an asset under the given
+/// config, mapped to the `ExpectedAssetPath` shape `import-existing`
+/// consumes. Thin wrapper over [`derive_expected_paths`].
+pub(crate) fn expected_paths_for(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> SmallVec<[ExpectedAssetPath; 2]> {
+    derive_expected_paths(asset, config)
+        .into_iter()
+        .map(|d| ExpectedAssetPath {
+            path: d.path,
+            size: d.size,
+            checksum: d.checksum,
+            version_size: d.version_size,
+        })
+        .collect()
 }
 
 /// Look up a version by key, falling back to `fallback_key` when the requested
@@ -624,107 +905,37 @@ pub(super) fn filter_asset_to_tasks(
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
 ) -> SmallVec<[DownloadTask; 2]> {
-    let is_live_photo = asset.is_live_photo();
-
-    let fallback_filename;
-    let raw_filename = if let Some(f) = asset.filename() {
-        f
-    } else {
-        // Generate fallback from asset ID fingerprint, matching Python behavior.
-        let asset_type = asset
-            .versions()
-            .first()
-            .map_or("", |(_, v)| v.asset_type.as_ref());
-        fallback_filename = paths::generate_fingerprint_filename(asset.id(), asset_type);
+    // Sync-only fingerprint-fallback exclusion: when `asset.filename()` is
+    // None, log the synthesized name and apply `filename_exclude` patterns
+    // to it (`is_asset_filtered` only sees real filenames). Import never
+    // populates `filename_exclude`.
+    if asset.filename().is_none() {
+        let fp = raw_filename(asset);
         tracing::info!(
             asset_id = %asset.id(),
-            filename = %fallback_filename,
+            filename = %fp,
             "Using fingerprint fallback filename"
         );
-        // is_asset_filtered only checks real filenames; check fallback against
-        // exclusion patterns here so fingerprint names are also filtered.
         if config
             .filename_exclude
             .iter()
-            .any(|p| p.matches_with(&fallback_filename, GLOB_CASE_INSENSITIVE))
+            .any(|p| p.matches_with(&fp, GLOB_CASE_INSENSITIVE))
         {
             tracing::debug!(
                 asset_id = %asset.id(),
-                filename = %fallback_filename,
+                filename = %fp,
                 "Skipping (filename_exclude match on fallback)"
             );
             return SmallVec::new();
         }
-        &fallback_filename
-    };
+    }
 
-    // Strip non-ASCII characters unless --keep-unicode-in-filenames is set.
-    // Matches Python's default behavior of calling remove_unicode_chars() on filenames.
-    let base_filename: String = if config.keep_unicode_in_filenames {
-        raw_filename.to_string()
-    } else {
-        paths::remove_unicode_chars(raw_filename).into_owned()
-    };
-
-    let created_local: DateTime<Local> = asset.created().with_timezone(&Local);
-    let versions = apply_raw_policy(asset.versions(), config.align_raw);
-    let mut tasks = SmallVec::new();
-    // Live-photo assets emit two DownloadTasks (primary + MOV companion)
-    // that share the same metadata; build the payload once and Arc::clone
-    // it onto each task.
+    let ctx = DerivationContext::build(asset, config);
     let payload = build_payload(asset, config);
-    // Track the effective primary filename (including any dedup suffix) so the
-    // live photo MOV companion is derived from the same name, keeping them paired.
+    let mut tasks = SmallVec::new();
     let mut effective_primary_filename: Option<String> = None;
 
-    // Helper closure to find a version by key in the SmallVec
-    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
-        versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
-    };
-
-    // Select requested version, falling back to Original when the requested size is
-    // unavailable (unless --force-size is set). Matches Python's behavior.
-    // Track the effective size so we only add "-medium"/"-thumb" suffix when
-    // the asset actually has that version (not on fallback to Original).
-    let (version, effective_size) = match version_with_fallback(
-        &get_version,
-        config.size,
-        AssetVersionSize::Original,
-        config.force_size,
-    ) {
-        Some((v, s)) => (Some(v), s),
-        None => (None, config.size),
-    };
-    // VideoOnly mode: skip the primary image for live photos, only emit MOV.
-    let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
-
-    if let Some(version) = version.filter(|_| !skip_primary) {
-        // Map the file extension based on the version's UTI asset_type
-        let mapped_filename = paths::map_filename_extension(&base_filename, &version.asset_type);
-
-        // Add size suffix for non-Original sizes (e.g., "-medium", "-thumb").
-        // Only when actually using that size, not on fallback to Original.
-        // Matches Python's VERSION_FILENAME_SUFFIX_LOOKUP.
-        let sized_filename = match effective_size {
-            AssetVersionSize::Medium => paths::insert_suffix(&mapped_filename, "medium"),
-            AssetVersionSize::Thumb => paths::insert_suffix(&mapped_filename, "thumb"),
-            _ => mapped_filename,
-        };
-
-        // Apply name-id7 policy: bake asset ID suffix into ALL filenames upfront
-        let filename = match config.file_match_policy {
-            FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized_filename, asset.id()),
-            FileMatchPolicy::NameSizeDedupWithSuffix => sized_filename,
-        };
-
-        let download_path = paths::local_download_path(
-            &config.directory,
-            &config.folder_structure,
-            &created_local,
-            &filename,
-            config.album_name.as_deref(),
-        );
-
+    if let Some(d) = derive_primary(asset, config, &ctx) {
         let strategy = match config.file_match_policy {
             FileMatchPolicy::NameId7 => CollisionStrategy::SkipIfExists,
             FileMatchPolicy::NameSizeDedupWithSuffix => CollisionStrategy::SizeDedup {
@@ -732,124 +943,100 @@ pub(super) fn filter_asset_to_tasks(
             },
         };
 
+        let DerivedPath {
+            path,
+            filename,
+            url,
+            checksum,
+            size,
+            version_size,
+            check_ampm_on_disk,
+        } = d;
         let final_path = {
-            let mut ctx = ResolveContext {
+            let mut rctx = ResolveContext {
                 config,
-                created_local: &created_local,
+                created_local: &ctx.created_local,
                 claimed_paths,
                 dir_cache,
             };
             resolve_download_path(
-                &download_path,
-                version.size,
+                &path,
+                size,
                 asset.id(),
                 strategy,
-                &mut ctx,
-                true, // check AM/PM variants for primary photos
-                || paths::add_dedup_suffix(&filename, version.size),
+                &mut rctx,
+                check_ampm_on_disk,
+                || paths::add_dedup_suffix(&filename, size),
                 "asset",
             )
         };
 
-        if let Some(path) = &final_path {
-            // Record the effective filename used for the primary download so the
-            // MOV companion is derived from it, keeping HEIC/MOV paired after dedup.
-            if let Some(stem) = path.file_name().and_then(|f| f.to_str()) {
+        if let Some(p) = &final_path {
+            if let Some(stem) = p.file_name().and_then(|f| f.to_str()) {
                 effective_primary_filename = Some(stem.to_string());
             }
         }
-        if let Some(path) = final_path {
-            claimed_paths.insert(NormalizedPath::new(&path), version.size);
+        if let Some(p) = final_path {
+            claimed_paths.insert(NormalizedPath::new(&p), size);
             tasks.push(DownloadTask {
-                url: version.url.clone(),
-                download_path: path,
-                checksum: version.checksum.clone(),
+                url,
+                download_path: p,
+                checksum,
                 asset_id: asset.id_arc(),
                 metadata: Arc::clone(&payload),
-                size: version.size,
-                created_local,
-                version_size: VersionSizeKey::from(effective_size),
+                size,
+                created_local: ctx.created_local,
+                version_size,
             });
         }
     }
 
-    // Live photo MOV companion -- only for images.
-    // Falls back from LiveAdjusted -> LiveOriginal when adjusted isn't available
-    // (mirrors the primary version fallback logic), unless --force-size is set.
-    if matches!(
-        config.live_photo_mode,
-        LivePhotoMode::Both | LivePhotoMode::VideoOnly
-    ) && asset.item_type() == Some(AssetItemType::Image)
+    if let Some(d) =
+        derive_mov_companion(asset, config, &ctx, effective_primary_filename.as_deref())
     {
-        let (live_version_opt, effective_live_size) = match version_with_fallback(
-            &get_version,
-            config.live_photo_size,
-            AssetVersionSize::LiveOriginal,
-            config.force_size,
-        ) {
-            Some((v, s)) => (Some(v), s),
-            None => (None, config.live_photo_size),
+        let DerivedPath {
+            path,
+            filename,
+            url,
+            checksum,
+            size,
+            version_size,
+            check_ampm_on_disk,
+        } = d;
+        let asset_id = asset.id();
+        let final_mov_path = {
+            let mut rctx = ResolveContext {
+                config,
+                created_local: &ctx.created_local,
+                claimed_paths,
+                dir_cache,
+            };
+            resolve_download_path(
+                &path,
+                size,
+                asset_id,
+                CollisionStrategy::SizeDedup {
+                    skip_zero_size: false,
+                },
+                &mut rctx,
+                check_ampm_on_disk,
+                || paths::insert_suffix(&filename, asset_id),
+                "live photo MOV",
+            )
         };
-        if let Some(live_version) = live_version_opt {
-            // Derive the MOV filename from the effective primary filename (which
-            // includes any dedup suffix) so the HEIC and MOV remain visually paired.
-            // Fall back to the base filename when no primary was produced (e.g. skipped).
-            let live_base = match config.file_match_policy {
-                FileMatchPolicy::NameId7 => paths::apply_name_id7(&base_filename, asset.id()),
-                FileMatchPolicy::NameSizeDedupWithSuffix => effective_primary_filename
-                    .as_deref()
-                    .unwrap_or(&base_filename)
-                    .to_string(),
-            };
-            let mov_filename = match config.live_photo_mov_filename_policy {
-                LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
-                LivePhotoMovFilenamePolicy::Original => {
-                    paths::live_photo_mov_path_original(&live_base)
-                }
-            };
-            let mov_path = paths::local_download_path(
-                &config.directory,
-                &config.folder_structure,
-                &created_local,
-                &mov_filename,
-                config.album_name.as_deref(),
-            );
 
-            let asset_id = asset.id();
-            let final_mov_path = {
-                let mut ctx = ResolveContext {
-                    config,
-                    created_local: &created_local,
-                    claimed_paths,
-                    dir_cache,
-                };
-                resolve_download_path(
-                    &mov_path,
-                    live_version.size,
-                    asset_id,
-                    CollisionStrategy::SizeDedup {
-                        skip_zero_size: false,
-                    },
-                    &mut ctx,
-                    false, // no AM/PM variants for MOV companions
-                    || paths::insert_suffix(&mov_filename, asset_id),
-                    "live photo MOV",
-                )
-            };
-
-            if let Some(path) = final_mov_path {
-                claimed_paths.insert(NormalizedPath::new(&path), live_version.size);
-                tasks.push(DownloadTask {
-                    url: live_version.url.clone(),
-                    download_path: path,
-                    checksum: live_version.checksum.clone(),
-                    asset_id: asset.id_arc(),
-                    metadata: Arc::clone(&payload),
-                    size: live_version.size,
-                    created_local,
-                    version_size: VersionSizeKey::from(effective_live_size),
-                });
-            }
+        if let Some(p) = final_mov_path {
+            claimed_paths.insert(NormalizedPath::new(&p), size);
+            tasks.push(DownloadTask {
+                url,
+                download_path: p,
+                checksum,
+                asset_id: asset.id_arc(),
+                metadata: Arc::clone(&payload),
+                size,
+                created_local: ctx.created_local,
+                version_size,
+            });
         }
     }
 
@@ -894,6 +1081,909 @@ mod tests {
         assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "abc123");
         assert_eq!(tasks[0].size, 1000);
+    }
+
+    // ── expected_paths_for tests ────────────────────────────────────────
+    //
+    // These cover `import-existing`'s view of sync's filename derivation:
+    // file_match_policy, size suffix, live photo MOV companion, raw alignment,
+    // force_size, keep_unicode. Sync's `filter_asset_to_tasks` is the source
+    // of truth; collision/dedup-suffix handling is intentionally NOT replayed
+    // here (callers don't have claimed_paths state to consult).
+
+    #[test]
+    fn expected_paths_default_returns_one_original_path() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].size, 1000);
+        assert_eq!(&*paths[0].checksum, "abc123");
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert!(
+            paths[0].path.to_string_lossy().ends_with("IMG_0001.JPG"),
+            "expected ...IMG_0001.JPG, got {}",
+            paths[0].path.display()
+        );
+    }
+
+    #[test]
+    fn expected_paths_apply_name_id7_suffix_to_primary() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("IMG_0001_") && name.ends_with(".JPG"),
+            "expected IMG_0001_<id7>.JPG, got {name}"
+        );
+        assert_ne!(name, "IMG_0001.JPG", "id7 suffix not applied");
+    }
+
+    #[test]
+    fn expected_paths_live_photo_yields_primary_and_mov() {
+        let asset = TestPhotoAsset::new("LIVE_1")
+            .filename("IMG_2000.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert_eq!(paths[1].version_size, VersionSizeKey::LiveOriginal);
+        assert_eq!(paths[1].size, 3000);
+        assert!(
+            paths[1]
+                .path
+                .to_string_lossy()
+                .ends_with("IMG_2000_HEVC.MOV"),
+            "expected ...IMG_2000_HEVC.MOV, got {}",
+            paths[1].path.display()
+        );
+    }
+
+    #[test]
+    fn expected_paths_video_only_skips_primary() {
+        let asset = TestPhotoAsset::new("LIVE_2")
+            .filename("IMG_2001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::LiveOriginal);
+    }
+
+    #[test]
+    fn expected_paths_image_only_skips_mov() {
+        let asset = TestPhotoAsset::new("LIVE_3")
+            .filename("IMG_2002.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+    }
+
+    /// `LivePhotoMode::Skip` is documented as "skip live photos entirely (both
+    /// image and MOV)." A live-photo asset under Skip must yield no paths so
+    /// import-existing doesn't scan for files sync never wrote.
+    #[test]
+    fn expected_paths_skip_mode_emits_nothing_for_live_photo() {
+        let asset = TestPhotoAsset::new("LIVE_4")
+            .filename("IMG_2003.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let paths = expected_paths_for(&asset, &config);
+        assert!(
+            paths.is_empty(),
+            "Skip + live photo must drop the asset, got {paths:?}"
+        );
+    }
+
+    /// Skip applies only to live photos: a non-live asset under Skip still
+    /// produces its primary path.
+    #[test]
+    fn expected_paths_skip_mode_keeps_non_live_primary() {
+        let asset = TestPhotoAsset::new("STILL_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::Skip;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+    }
+
+    #[test]
+    fn expected_paths_force_size_missing_returns_empty() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = true;
+        let paths = expected_paths_for(&asset, &config);
+        assert!(
+            paths.is_empty(),
+            "force_size + missing size should yield no paths, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_size_fallback_to_original_when_force_size_off() {
+        let asset = TestPhotoAsset::new("TEST_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = false;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains("-medium"),
+            "fallback to Original should not carry medium suffix, got {name}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_live_photo_with_name_id7_applies_suffix_to_both() {
+        let asset = TestPhotoAsset::new("LIVE_5")
+            .filename("IMG_3000.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        let primary = paths[0].path.file_name().unwrap().to_string_lossy();
+        let mov = paths[1].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            primary.starts_with("IMG_3000_") && primary.ends_with(".HEIC"),
+            "primary missing id7 suffix: {primary}"
+        );
+        assert!(
+            mov.starts_with("IMG_3000_") && mov.ends_with("_HEVC.MOV"),
+            "MOV companion missing id7 suffix: {mov}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_no_versions_returns_empty() {
+        // Build a minimal asset with no resOriginalRes — all version lookups
+        // fail, expected_paths_for returns empty (caller skips).
+        let master = json!({
+            "recordName": "EMPTY_1",
+            "fields": {
+                "filenameEnc": {"value": "x.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+            },
+        });
+        let asset_record = json!({
+            "fields": {"assetDate": {"value": 1736899200000.0_f64}},
+        });
+        let asset = PhotoAsset::new(master, asset_record);
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert!(paths.is_empty());
+    }
+
+    // ── expected_paths_for / filter_asset_to_tasks parity ────────────────
+    //
+    // expected_paths_for is import-existing's view of where sync would have
+    // written each asset. filter_asset_to_tasks is sync's source of truth
+    // for the same derivation. They must agree on the bare path (before
+    // collision-suffix resolution) so import-existing scans the file sync
+    // actually produces. These tests pin parity across the configurations
+    // most likely to drift apart (file_match_policy, size variants, live
+    // photo modes, raw alignment).
+
+    fn assert_path_parity(
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        which: VersionSizeKey,
+        label: &str,
+    ) {
+        let want_live = matches!(which, VersionSizeKey::LiveOriginal);
+        let expected = expected_paths_for(asset, config);
+        let tasks = filter_asset_fresh(asset, config);
+        let exp = expected
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveOriginal) == want_live)
+            .map(|p| p.path.clone())
+            .unwrap_or_default();
+        let got = tasks
+            .iter()
+            .find(|t| matches!(t.version_size, VersionSizeKey::LiveOriginal) == want_live)
+            .map(|t| t.download_path.to_path_buf())
+            .unwrap_or_default();
+        assert_eq!(
+            exp, got,
+            "{label}: expected_paths_for path drifted from filter_asset_to_tasks"
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_default_config() {
+        let asset = TestPhotoAsset::new("PAR_1")
+            .filename("IMG_5001.JPG")
+            .build();
+        let config = test_config();
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "default");
+    }
+
+    #[test]
+    fn expected_paths_parity_name_id7() {
+        let asset = TestPhotoAsset::new("PAR_2")
+            .filename("IMG_5002.JPG")
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "NameId7");
+    }
+
+    #[test]
+    fn expected_paths_parity_size_medium_with_fallback() {
+        // size=Medium but no medium version available; both call sites
+        // must fall back to Original consistently (force_size=false).
+        let asset = TestPhotoAsset::new("PAR_3")
+            .filename("IMG_5003.JPG")
+            .build();
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.force_size = false;
+        assert_path_parity(&asset, &config, VersionSizeKey::Original, "Medium fallback");
+    }
+
+    #[test]
+    fn expected_paths_parity_live_photo_both() {
+        let asset = TestPhotoAsset::new("PAR_4")
+            .filename("IMG_5004.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let config = test_config();
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "live both primary",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "live both mov",
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_live_photo_name_id7() {
+        let asset = TestPhotoAsset::new("PAR_5")
+            .filename("IMG_5005.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "live id7 primary",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "live id7 mov",
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_live_photo_video_only() {
+        // VideoOnly: primary path absent in both, MOV present in both.
+        let asset = TestPhotoAsset::new("PAR_6")
+            .filename("IMG_5006.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "video-only primary (absent)",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "video-only mov",
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_mov_filename_policy_original() {
+        // The non-default MOV filename policy is a known drift suspect:
+        // the live_photo_mov_path_original branch in expected_paths_for
+        // reuses a helper from paths.rs that filter_asset_to_tasks also
+        // calls; this pins them.
+        let asset = TestPhotoAsset::new("PAR_7")
+            .filename("IMG_5007.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mov_filename_policy = LivePhotoMovFilenamePolicy::Original;
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "mov policy=Original primary",
+        );
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::LiveOriginal,
+            "mov policy=Original mov",
+        );
+    }
+
+    #[test]
+    fn expected_paths_parity_custom_album_in_folder_template() {
+        let asset = TestPhotoAsset::new("PAR_8")
+            .filename("IMG_5008.JPG")
+            .build();
+        let mut config = test_config();
+        config.folder_structure = "{album}/%Y".to_string();
+        config.album_name = Some(Arc::from("Vacation 2025"));
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "album in template",
+        );
+    }
+
+    // ── size / live_photo_size matrix on present versions ───────────────
+    //
+    // The matrix expansion below pins behaviour for the import-existing
+    // CLI flags `--size` and `--live-photo-size` when the requested
+    // version *is* published. The pre-existing `expected_paths_size_*`
+    // tests cover the fallback (size missing) and force_size branches;
+    // these cover the "actually use the requested size" branch and the
+    // independence between primary and live-photo sizing.
+
+    /// Builds a primary photo with original + medium + thumb JPEG
+    /// resolutions. Mirrors `multi_size_photo_asset` (defined later in
+    /// this mod) but is independent so test reordering can't break it.
+    fn primary_multi_size_asset(record: &str, filename: &str) -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": record, "fields": {
+                "filenameEnc": {"value": filename, "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 5000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/orig",
+                    "fileChecksum": "orig_ck"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resJPEGMedRes": {"value": {
+                    "size": 2000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/med",
+                    "fileChecksum": "med_ck"
+                }},
+                "resJPEGMedFileType": {"value": "public.jpeg"},
+                "resJPEGThumbRes": {"value": {
+                    "size": 500_u64,
+                    "downloadURL": "https://p01.icloud-content.com/thumb",
+                    "fileChecksum": "thumb_ck"
+                }},
+                "resJPEGThumbFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
+        )
+    }
+
+    /// Live-photo HEIC primary with both LiveOriginal and LiveMedium MOV
+    /// companions. Covers the live_photo_size=Medium path.
+    fn live_photo_multi_size_asset(record: &str) -> PhotoAsset {
+        PhotoAsset::new(
+            json!({"recordName": record, "fields": {
+                "filenameEnc": {"value": "IMG_LIVE.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 4000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/heic_orig",
+                    "fileChecksum": "heic_ck"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/live_orig",
+                    "fileChecksum": "live_orig_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"},
+                "resVidMedRes": {"value": {
+                    "size": 1500_u64,
+                    "downloadURL": "https://p01.icloud-content.com/live_med",
+                    "fileChecksum": "live_med_ck"
+                }},
+                "resVidMedFileType": {"value": "com.apple.quicktime-movie"},
+            }}),
+            json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
+        )
+    }
+
+    /// CG-2: regression-guards `--size medium` actually-published path.
+    /// A bug in the size-suffix branch of `expected_paths_for` would emit
+    /// an unsuffixed path; sync would write `IMG-medium.JPG` while
+    /// import-existing scans for `IMG.JPG` (silent miss).
+    #[test]
+    fn expected_paths_size_medium_present_emits_medium_suffix() {
+        let asset = primary_multi_size_asset("MED_PRESENT", "IMG_6001.JPG");
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Medium);
+        assert_eq!(paths[0].size, 2000);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.contains("-medium"),
+            "size=Medium present should carry '-medium' suffix, got {name}"
+        );
+    }
+
+    /// CG-2 parity: when Medium is published and `--size medium` is set,
+    /// sync's path and import's path agree.
+    #[test]
+    fn expected_paths_parity_size_medium_present() {
+        let asset = primary_multi_size_asset("PAR_MED", "IMG_6002.JPG");
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        assert_path_parity(&asset, &config, VersionSizeKey::Medium, "Medium present");
+    }
+
+    /// CG-3: regression-guards `--size thumb` actually-published path.
+    #[test]
+    fn expected_paths_size_thumb_present_emits_thumb_suffix() {
+        let asset = primary_multi_size_asset("THUMB_PRESENT", "IMG_6003.JPG");
+        let mut config = test_config();
+        config.size = AssetVersionSize::Thumb;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Thumb);
+        assert_eq!(paths[0].size, 500);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.contains("-thumb"),
+            "size=Thumb present should carry '-thumb' suffix, got {name}"
+        );
+    }
+
+    /// CG-3 parity.
+    #[test]
+    fn expected_paths_parity_size_thumb_present() {
+        let asset = primary_multi_size_asset("PAR_THUMB", "IMG_6004.JPG");
+        let mut config = test_config();
+        config.size = AssetVersionSize::Thumb;
+        assert_path_parity(&asset, &config, VersionSizeKey::Thumb, "Thumb present");
+    }
+
+    /// CG-4: regression-guards `--live-photo-size medium`. A bug in the
+    /// `version_with_fallback` call inside the live branch would silently
+    /// land the LiveOriginal MOV at the LiveMedium config, producing the
+    /// wrong path.
+    #[test]
+    fn expected_paths_live_photo_size_medium_emits_live_medium_path() {
+        let asset = live_photo_multi_size_asset("LIVE_MED_1");
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveMedium;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2, "expected primary + MOV companion");
+        let mov = paths
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveMedium))
+            .expect("LiveMedium MOV path missing");
+        assert_eq!(mov.size, 1500);
+        assert_eq!(&*mov.checksum, "live_med_ck");
+        // The primary stays at Original and unaffected by live_photo_size.
+        let primary = paths
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::Original))
+            .expect("primary path missing");
+        assert_eq!(primary.version_size, VersionSizeKey::Original);
+        assert_eq!(primary.size, 4000);
+    }
+
+    /// CG-5: `--size` and `--live-photo-size` are independent. A
+    /// regression that couples them (e.g. live branch reading
+    /// `config.size` instead of `config.live_photo_size`) lands silently
+    /// without this assertion.
+    #[test]
+    fn expected_paths_size_medium_with_live_photo_size_thumb_independent() {
+        // Build a HEIC primary with original + medium res, and a live MOV
+        // companion at LiveOriginal + LiveMedium. We don't have a
+        // LiveThumb resolution to point to, so we use LiveMedium for the
+        // live size and Medium for the primary -- different non-default
+        // values across the two flags.
+        let asset = PhotoAsset::new(
+            json!({"recordName": "INDEP_1", "fields": {
+                "filenameEnc": {"value": "IMG_INDEP.HEIC", "type": "STRING"},
+                "itemType": {"value": "public.heic"},
+                "resOriginalRes": {"value": {
+                    "size": 4000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/heic_orig",
+                    "fileChecksum": "heic_ck"
+                }},
+                "resOriginalFileType": {"value": "public.heic"},
+                "resJPEGMedRes": {"value": {
+                    "size": 1800_u64,
+                    "downloadURL": "https://p01.icloud-content.com/heic_med",
+                    "fileChecksum": "heic_med_ck"
+                }},
+                "resJPEGMedFileType": {"value": "public.jpeg"},
+                "resOriginalVidComplRes": {"value": {
+                    "size": 3000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/live_orig",
+                    "fileChecksum": "live_orig_ck"
+                }},
+                "resOriginalVidComplFileType": {"value": "com.apple.quicktime-movie"},
+                "resVidMedRes": {"value": {
+                    "size": 1500_u64,
+                    "downloadURL": "https://p01.icloud-content.com/live_med",
+                    "fileChecksum": "live_med_ck"
+                }},
+                "resVidMedFileType": {"value": "com.apple.quicktime-movie"},
+            }}),
+            json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
+        );
+        let mut config = test_config();
+        config.size = AssetVersionSize::Medium;
+        config.live_photo_size = AssetVersionSize::LiveMedium;
+
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        let primary = paths
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::Medium))
+            .expect("primary at Medium missing");
+        assert_eq!(primary.size, 1800);
+        let mov = paths
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveMedium))
+            .expect("MOV at LiveMedium missing");
+        assert_eq!(mov.size, 1500);
+        // Crucially: primary did not key off live_photo_size, MOV did
+        // not key off size. (If the two flags were coupled, both would
+        // share one variant.)
+        assert_ne!(primary.version_size, VersionSizeKey::LiveMedium);
+        assert_ne!(mov.version_size, VersionSizeKey::Medium);
+    }
+
+    /// CG-6: `--align-raw original` + `--size medium`. apply_raw_policy
+    /// runs before size selection; this pins that the swap doesn't
+    /// silently re-key the size lookup off the wrong version.
+    #[test]
+    fn expected_paths_align_raw_prefer_original_with_size_medium_keys_correctly() {
+        // RAW + JPEG pair where the alt is the JPEG. With
+        // align_raw=PreferOriginal we want Original to remain the JPEG
+        // (the "user-visible" original) per the existing `align_raw_*`
+        // tests; the question here is whether `--size medium` then keys
+        // off the Medium version of that JPEG (the test's primary has no
+        // medium published, so we expect fallback to Original size with
+        // force_size=false).
+        let asset = TestPhotoAsset::new("ALIGN_MED")
+            .filename("IMG_RAW_MED.DNG")
+            .item_type("public.camera-raw-image")
+            .orig_file_type("public.camera-raw-image")
+            .alt_version(
+                "https://p01.icloud-content.com/jpeg",
+                "jpeg_ck",
+                2500,
+                "public.jpeg",
+            )
+            .build();
+        let mut config = test_config();
+        config.align_raw = RawTreatmentPolicy::PreferOriginal;
+        config.size = AssetVersionSize::Medium;
+        config.force_size = false;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        // No medium published in the swapped Original (which is the
+        // JPEG alt promoted to Original under PreferOriginal); the
+        // fallback should land on Original-without-suffix.
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains("-medium"),
+            "fallback to Original under align_raw must drop the medium suffix, got {name}"
+        );
+    }
+
+    /// CG-7: `--force-size` applied to the live-photo companion. With
+    /// force_size=true and live_photo_size=LiveMedium but only LiveOriginal
+    /// published, the MOV companion should drop entirely (not silently
+    /// land at LiveOriginal).
+    #[test]
+    fn expected_paths_force_size_drops_live_companion_when_live_size_missing() {
+        let asset = TestPhotoAsset::new("FORCE_LIVE")
+            .filename("IMG_FL.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/live_orig", "live_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_size = AssetVersionSize::LiveMedium;
+        config.force_size = true;
+        let paths = expected_paths_for(&asset, &config);
+        // Primary HEIC is still Original and kept (force_size applies to
+        // the requested primary `size` and to the requested
+        // `live_photo_size`; primary `size` is Original which is
+        // present).
+        assert!(
+            paths
+                .iter()
+                .any(|p| matches!(p.version_size, VersionSizeKey::Original)),
+            "primary should remain present when its requested size is published"
+        );
+        // The MOV companion should drop because LiveMedium is missing
+        // and force_size=true forbids fallback.
+        assert!(
+            !paths.iter().any(|p| matches!(
+                p.version_size,
+                VersionSizeKey::LiveOriginal | VersionSizeKey::LiveMedium
+            )),
+            "force_size + missing LiveMedium should drop the MOV companion entirely, got {paths:?}"
+        );
+    }
+
+    /// CG-8: `--live-photo-mov-filename-policy original` + `name-id7`.
+    /// The Original-policy branch must still apply the name-id7 suffix
+    /// to the MOV (otherwise id7 users on the non-default MOV policy
+    /// silently break).
+    #[test]
+    fn expected_paths_mov_policy_original_with_name_id7_carries_suffix() {
+        let asset = TestPhotoAsset::new("MOV_ID7_ORIG")
+            .filename("IMG_8001.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.file_match_policy = FileMatchPolicy::NameId7;
+        config.live_photo_mov_filename_policy = LivePhotoMovFilenamePolicy::Original;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        let mov = paths
+            .iter()
+            .find(|p| matches!(p.version_size, VersionSizeKey::LiveOriginal))
+            .expect("MOV companion missing");
+        let mov_name = mov.path.file_name().unwrap().to_string_lossy();
+        // Under Original policy the MOV reuses the primary's stem (no
+        // _HEVC suffix); under NameId7 the stem itself carries the id7
+        // marker, so the MOV path must carry it too. The HEIC->MOV
+        // extension map happens regardless of policy.
+        assert!(
+            mov_name.starts_with("IMG_8001_") && mov_name.ends_with(".MOV"),
+            "MOV under Original policy + id7 should be IMG_8001_<id7>.MOV, got {mov_name}"
+        );
+        assert!(
+            !mov_name.contains("_HEVC"),
+            "Original MOV policy should NOT add _HEVC suffix, got {mov_name}"
+        );
+    }
+
+    // ── expected_paths_for negative-space coverage ───────────────────────
+    //
+    // The 11 happy-path expected_paths_* tests above leave a lot of input
+    // surface untested. These pin behavior on the filename / album-name
+    // edges most likely to surprise: non-ASCII when keep_unicode is on vs
+    // off, traversal-style names, names that vanish after sanitization,
+    // separators inside filenames, and weird album names.
+
+    #[test]
+    fn expected_paths_keeps_unicode_when_flag_set() {
+        let asset = TestPhotoAsset::new("UNI_1")
+            .filename("héllo_wörld.JPG")
+            .build();
+        let mut config = test_config();
+        config.keep_unicode_in_filenames = true;
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.contains('é') && name.contains('ö'),
+            "keep_unicode=true should preserve non-ASCII, got {name}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_strips_unicode_when_flag_off() {
+        let asset = TestPhotoAsset::new("UNI_2")
+            .filename("héllo_wörld.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains('é') && !name.contains('ö') && name.contains("hllo_wrld"),
+            "keep_unicode=false should strip non-ASCII, got {name}"
+        );
+    }
+
+    /// Characterization test (current behavior, not desired behavior):
+    /// `日本語.jpg` with `keep_unicode_in_filenames=false` strips to a
+    /// dotfile-shaped `.JPG`. import-existing then scans for a literal
+    /// `.JPG` file, which is a hidden file on Unix and unlikely to
+    /// match anything sync wrote. The fingerprint-fallback only fires
+    /// when `filename()` returns `None`, not when the filename
+    /// degenerates after stripping. If a future change makes
+    /// `expected_paths_for` fall back to a fingerprint name in this
+    /// case, this test should be inverted; see TODO note.
+    // TODO: fall back to fingerprint name when post-strip filename is
+    // dotfile-only (`.<ext>`). Tracked separately from this test PR.
+    #[test]
+    fn expected_paths_filename_emptied_by_unicode_strip_characterization() {
+        let asset = TestPhotoAsset::new("UNI_3").filename("日本語.jpg").build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            name, ".JPG",
+            "current behavior: filename collapses to a dotfile after non-ASCII strip"
+        );
+    }
+
+    #[test]
+    fn expected_paths_keep_unicode_with_decomposed_form() {
+        // NFC "é" (U+00E9) vs NFD "e\u{0301}" — kei does no normalization,
+        // so both round-trip when keep_unicode=true. Pin that so a future
+        // unicode-normalization pass doesn't silently change matches.
+        let nfc = "ca\u{00e9}.JPG";
+        let nfd = "cae\u{0301}.JPG";
+        let mut config = test_config();
+        config.keep_unicode_in_filenames = true;
+        for (label, fname) in [("NFC", nfc), ("NFD", nfd)] {
+            let asset = TestPhotoAsset::new("UNI_4").filename(fname).build();
+            let paths = expected_paths_for(&asset, &config);
+            assert_eq!(paths.len(), 1, "{label}: expected one path");
+            let name = paths[0].path.file_name().unwrap().to_string_lossy();
+            assert_eq!(
+                name, fname,
+                "{label}: filename round-trip should be byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_paths_filename_with_path_separators_is_safe() {
+        // iCloud filenames shouldn't contain `/` but the wire format is
+        // a string, so a malformed asset could carry one. The path must
+        // still be confined to `directory` (no traversal out).
+        let asset = TestPhotoAsset::new("SEP_1")
+            .filename("evil/IMG.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let path_str = paths[0].path.to_string_lossy().into_owned();
+        // The directory prefix is stable; everything after must not
+        // re-introduce a `/IMG` segment that could escape into a sibling
+        // directory.
+        let dir_str = config.directory.to_string_lossy().into_owned();
+        assert!(
+            path_str.starts_with(&dir_str),
+            "path escaped directory: {path_str}"
+        );
+        let suffix = path_str.trim_start_matches(&*dir_str);
+        assert!(
+            !suffix.contains("/evil/") && !suffix.contains("evil/IMG.JPG"),
+            "raw `evil/IMG.JPG` survived sanitization: {suffix}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_filename_with_traversal_is_safe() {
+        // `../../etc/passwd.JPG` — the path-separator + traversal
+        // sequence has to land inside `directory`, not at /etc/passwd.
+        // Sanitization replaces `/` with `_`, so `..` substrings can
+        // survive *as part of one filename*, which is harmless. What
+        // must NOT happen: the path having extra segments that walk
+        // out of `directory`.
+        let asset = TestPhotoAsset::new("TRAV_1")
+            .filename("../../etc/passwd.JPG")
+            .build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0].path;
+        assert!(
+            path.starts_with(&*config.directory),
+            "path escaped configured directory: {}",
+            path.display()
+        );
+        // Folder template is `%Y/%m/%d` (3 dated dirs) + 1 filename
+        // = 4 components past `directory`. Anything more means a
+        // traversal segment leaked into the path tree.
+        let suffix = path.strip_prefix(&*config.directory).unwrap();
+        assert_eq!(
+            suffix.components().count(),
+            4,
+            "extra path segments (traversal leak): {}",
+            suffix.display()
+        );
+        // And the literal `/etc/passwd` must not appear as part of a
+        // path component sequence.
+        let path_str = path.to_string_lossy();
+        assert!(
+            !path_str.contains("/etc/") && !path_str.contains("/passwd."),
+            "raw traversal segments survived in the path: {path_str}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_album_name_with_separators_sanitized() {
+        let asset = TestPhotoAsset::new("ALB_1")
+            .filename("IMG_0001.JPG")
+            .build();
+        let mut config = test_config();
+        config.folder_structure = "{album}".to_string();
+        config.album_name = Some(Arc::from("evil/../escape"));
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let path_str = paths[0].path.to_string_lossy().into_owned();
+        assert!(
+            !path_str.contains("..") && !path_str.contains("/escape/"),
+            "album traversal survived: {path_str}"
+        );
+    }
+
+    #[test]
+    fn expected_paths_filename_only_dots_and_spaces() {
+        // "  ...  " trims to empty — filename derivation has to produce
+        // *some* name, not a literal "" segment.
+        let asset = TestPhotoAsset::new("DOTS_1").filename("  ...  ").build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.is_empty() && !name.trim_matches(|c: char| c == '.' || c == ' ').is_empty(),
+            "filename must not collapse to a dots/spaces-only name, got {name:?}"
+        );
     }
 
     #[test]
@@ -1263,14 +2353,14 @@ mod tests {
             .build()
     }
 
-    /// Helper to get a version from a SmallVec by key
-    fn get_ver(versions: &VersionsMap, key: AssetVersionSize) -> Option<&AssetVersion> {
-        versions.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    /// Helper to get a version from a `VersionsView` by key.
+    fn get_ver<'a>(view: &VersionsView<'a>, key: AssetVersionSize) -> Option<&'a AssetVersion> {
+        view.get(key)
     }
 
-    /// Helper to check if a version exists in a SmallVec
-    fn has_ver(versions: &VersionsMap, key: AssetVersionSize) -> bool {
-        versions.iter().any(|(k, _)| *k == key)
+    /// Helper to check whether a version exists in a `VersionsView`.
+    fn has_ver(view: &VersionsView<'_>, key: AssetVersionSize) -> bool {
+        view.iter().any(|(k, _)| k == key)
     }
 
     #[test]
@@ -1352,6 +2442,46 @@ mod tests {
             "https://p01.icloud-content.com/orig"
         );
         assert!(!has_ver(&versions, AssetVersionSize::Alternative));
+    }
+
+    /// On a swap, `iter()` must preserve the underlying `VersionsMap`
+    /// element order — only the keys at the two swap slots flip. If a
+    /// future refactor reorders elements (e.g. surfacing `Original`
+    /// first regardless of position), this fails loudly.
+    #[test]
+    fn raw_policy_view_iter_order_matches_underlying_map() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let view = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
+
+        let elements: Vec<(AssetVersionSize, &str)> =
+            view.iter().map(|(k, v)| (k, v.url.as_ref())).collect();
+        assert_eq!(elements.len(), 2);
+        // Slot 0 (originally Original) reads as Alternative, still
+        // pointing at orig_url.
+        assert_eq!(elements[0].0, AssetVersionSize::Alternative);
+        assert_eq!(elements[0].1, "https://p01.icloud-content.com/orig");
+        // Slot 1 (originally Alternative) reads as Original, still
+        // pointing at alt_url.
+        assert_eq!(elements[1].0, AssetVersionSize::Original);
+        assert_eq!(elements[1].1, "https://p01.icloud-content.com/alt");
+    }
+
+    /// `Unchanged` policy must yield the underlying map verbatim — same
+    /// keys, same order — so callers see identical data to bypassing
+    /// `apply_raw_policy` entirely.
+    #[test]
+    fn raw_policy_unchanged_yields_underlying_map_verbatim() {
+        let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
+        let view = apply_raw_policy(asset.versions(), RawTreatmentPolicy::Unchanged);
+
+        let got: Vec<(AssetVersionSize, &str)> =
+            view.iter().map(|(k, v)| (k, v.url.as_ref())).collect();
+        let want: Vec<(AssetVersionSize, &str)> = asset
+            .versions()
+            .iter()
+            .map(|(k, v)| (*k, v.url.as_ref()))
+            .collect();
+        assert_eq!(got, want);
     }
 
     #[test]
