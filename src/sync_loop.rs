@@ -654,6 +654,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         let zone_name = library.zone_name().to_string();
         let sync_token_key = format!("sync_token:{zone_name}");
         let plan = resolve_passes(library, &config.selection).await?;
+        let (album_passes, smart_folder_passes, unfiled) = count_passes(&plan);
+        tracing::info!(
+            zone = %zone_name,
+            album_passes,
+            smart_folder_passes,
+            unfiled,
+            "Sync plan for library"
+        );
         library_states.push(LibraryState {
             library: library.clone(),
             zone_name,
@@ -1549,6 +1557,24 @@ async fn check_changes_database(
 ///
 /// The check is per-pass-kind: each *active* template (one whose pass kind
 /// will actually run under the current Selection) must contain `{library}`.
+/// Tally the passes in an `AlbumPlan` by kind so the per-library startup log
+/// surfaces the API-call surface (one enumeration per album / smart-folder
+/// pass + one for unfiled). Used by the `Sync plan for library` info line.
+pub(crate) fn count_passes(plan: &crate::commands::AlbumPlan) -> (usize, usize, bool) {
+    use crate::commands::PassKind;
+    let mut album = 0;
+    let mut smart_folder = 0;
+    let mut unfiled = false;
+    for pass in &plan.passes {
+        match pass.kind {
+            PassKind::Album => album += 1,
+            PassKind::SmartFolder => smart_folder += 1,
+            PassKind::Unfiled => unfiled = true,
+        }
+    }
+    (album, smart_folder, unfiled)
+}
+
 /// Template strings whose pass is disabled (e.g. `folder_structure_smart_folders`
 /// when `--smart-folder none`) don't render any path so they don't need
 /// `{library}` to keep the sync safe.
@@ -2154,6 +2180,50 @@ mod tests {
                 .is_empty(),
             "no active passes - find_* must report empty"
         );
+    }
+
+    // ── count_passes ────────────────────────────────────────────────────
+    //
+    // Pass tally feeds the per-library `Sync plan for library` info line.
+    // The numbers map directly to API surface (one enumeration per album /
+    // smart-folder pass + one for unfiled), so a regression that drops a
+    // category would silently mislead the operator.
+
+    fn make_pass(name: &str, kind: crate::commands::PassKind) -> crate::commands::AlbumPass {
+        crate::commands::AlbumPass {
+            kind,
+            album: crate::icloud::photos::PhotoAlbum::stub_for_test(std::sync::Arc::from(name)),
+            exclude_ids: std::sync::Arc::new(rustc_hash::FxHashSet::default()),
+        }
+    }
+
+    #[test]
+    fn count_passes_empty_plan_is_all_zero() {
+        let plan = crate::commands::AlbumPlan { passes: Vec::new() };
+        assert_eq!(count_passes(&plan), (0, 0, false));
+    }
+
+    #[test]
+    fn count_passes_tallies_each_kind_independently() {
+        use crate::commands::PassKind;
+        let plan = crate::commands::AlbumPlan {
+            passes: vec![
+                make_pass("Vacation", PassKind::Album),
+                make_pass("Family", PassKind::Album),
+                make_pass("Favorites", PassKind::SmartFolder),
+                make_pass("PrimarySync", PassKind::Unfiled),
+            ],
+        };
+        assert_eq!(count_passes(&plan), (2, 1, true));
+    }
+
+    #[test]
+    fn count_passes_unfiled_only_returns_zero_album_zero_smart_folder() {
+        use crate::commands::PassKind;
+        let plan = crate::commands::AlbumPlan {
+            passes: vec![make_pass("PrimarySync", PassKind::Unfiled)],
+        };
+        assert_eq!(count_passes(&plan), (0, 0, true));
     }
 
     // ── should_retry_session_init ──────────────────────────────────────
