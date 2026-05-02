@@ -423,10 +423,9 @@ fn warn_deprecated(old: &str, replacement: &str) {
     }
 }
 
-/// Follow-up note that fires alongside the `--exclude-album` deprecation
-/// warning. The legacy flag splits on commas; the replacement `--album` flag
-/// does not, so a mechanical rewrite of `--exclude-album A,B` to
-/// `--album '!A,!B'` would silently produce one literal album name.
+/// `--exclude-album` accepts comma-separated values; `--album` does not, so a
+/// mechanical rewrite of `--exclude-album A,B` to `--album '!A,!B'` would
+/// silently produce one literal album name.
 fn warn_exclude_album_comma_split() {
     #[allow(
         clippy::print_stderr,
@@ -439,11 +438,9 @@ fn warn_exclude_album_comma_split() {
     }
 }
 
-/// True when the implicit-unfiled-pass warning should fire: the user did not
-/// pass `--unfiled` (or set `[filters].unfiled`), and at least one album pass
-/// is still in scope (`--album all` default or a named set). Album-`none`
-/// users explicitly opted out of album passes and aren't surprised when the
-/// unfiled pass runs.
+/// `--album none` callers explicitly opted out of album passes and aren't
+/// surprised when the unfiled pass runs alongside; carve them out of the
+/// warning even though `unfiled_override.is_none()`.
 pub(crate) fn should_warn_implicit_unfiled(
     unfiled_override: Option<bool>,
     albums: &crate::selection::AlbumSelector,
@@ -451,12 +448,6 @@ pub(crate) fn should_warn_implicit_unfiled(
     unfiled_override.is_none() && !matches!(albums, crate::selection::AlbumSelector::None)
 }
 
-/// One-shot warning when `--unfiled` is unset and at least one album pass is
-/// in scope (the `--album all` default or a named set). v0.13 changed the
-/// default so the unfiled pass runs independently of `--album`, which is a
-/// silent behavior shift for v0.12 users who scoped a sync with `-a NAME` to
-/// mean "only that album". Surface the implicit pass + the suppression flag at
-/// startup so the change is observable, not just documented.
 fn warn_implicit_unfiled_pass() {
     #[allow(
         clippy::print_stderr,

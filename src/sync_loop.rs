@@ -1557,9 +1557,6 @@ async fn check_changes_database(
 ///
 /// The check is per-pass-kind: each *active* template (one whose pass kind
 /// will actually run under the current Selection) must contain `{library}`.
-/// Tally the passes in an `AlbumPlan` by kind so the per-library startup log
-/// surfaces the API-call surface (one enumeration per album / smart-folder
-/// pass + one for unfiled). Used by the `Sync plan for library` info line.
 pub(crate) fn count_passes(plan: &crate::commands::AlbumPlan) -> (usize, usize, bool) {
     use crate::commands::PassKind;
     let mut album = 0;
