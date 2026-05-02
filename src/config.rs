@@ -439,6 +439,36 @@ fn warn_exclude_album_comma_split() {
     }
 }
 
+/// True when the implicit-unfiled-pass warning should fire: the user did not
+/// pass `--unfiled` (or set `[filters].unfiled`), and at least one album pass
+/// is still in scope (`--album all` default or a named set). Album-`none`
+/// users explicitly opted out of album passes and aren't surprised when the
+/// unfiled pass runs.
+pub(crate) fn should_warn_implicit_unfiled(
+    unfiled_override: Option<bool>,
+    albums: &crate::selection::AlbumSelector,
+) -> bool {
+    unfiled_override.is_none() && !matches!(albums, crate::selection::AlbumSelector::None)
+}
+
+/// One-shot warning when `--unfiled` is unset and at least one album pass is
+/// in scope (the `--album all` default or a named set). v0.13 changed the
+/// default so the unfiled pass runs independently of `--album`, which is a
+/// silent behavior shift for v0.12 users who scoped a sync with `-a NAME` to
+/// mean "only that album". Surface the implicit pass + the suppression flag at
+/// startup so the change is observable, not just documented.
+fn warn_implicit_unfiled_pass() {
+    #[allow(
+        clippy::print_stderr,
+        reason = "runs during config load, before tracing subscriber is installed"
+    )]
+    {
+        eprintln!(
+            "warning: --unfiled defaults to true in v0.13, so kei is also running an unfiled pass (every photo not in any user album) alongside the album pass(es). Pass `--unfiled false` (or `[filters] unfiled = false`) to restrict to just the album pass(es); pass `--unfiled true` to silence this warning."
+        );
+    }
+}
+
 /// Translate the legacy `(AlbumSelection, exclude_albums)` tuple plus the
 /// parsed library/smart-folder selectors into the v0.13
 /// [`crate::selection::Selection`]. Pure function so the truth table is
@@ -1545,6 +1575,9 @@ impl Config {
             &raw_smart_folders,
             unfiled_override,
         )?;
+        if should_warn_implicit_unfiled(unfiled_override, &selection.albums) {
+            warn_implicit_unfiled_pass();
+        }
         let filename_exclude_strs = resolve_vec(
             sync.filename_exclude,
             toml_filters.and_then(|f| f.filename_exclude.clone()),
@@ -6384,6 +6417,80 @@ mod tests {
     fn test_unfiled_cli_overrides_toml() {
         let cfg = build_with_unfiled(Some(true), Some("[filters]\nunfiled = false\n"));
         assert!(cfg.selection.unfiled);
+    }
+
+    // ── should_warn_implicit_unfiled ────────────────────────────────────
+    //
+    // Pin the predicate that drives the v0.13 implicit-unfiled-pass warning.
+    // Fires whenever the user did not pin `--unfiled` (CLI or TOML) and at
+    // least one album pass is still in scope, so the silent v0.12->v0.13
+    // behavior shift surfaces in the user's terminal.
+
+    fn empty_excludes() -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
+
+    #[test]
+    fn test_should_warn_implicit_unfiled_fires_on_default_all() {
+        // No --unfiled, --album defaults to All. The default no-flag sync
+        // path is the one most users hit, and it now runs an unfiled pass
+        // alongside every album pass: the warning must fire.
+        assert!(should_warn_implicit_unfiled(
+            None,
+            &crate::selection::AlbumSelector::All {
+                excluded: empty_excludes()
+            }
+        ));
+    }
+
+    #[test]
+    fn test_should_warn_implicit_unfiled_fires_on_named_set() {
+        // --album Vacation without --unfiled: the v0.12 user expected
+        // "Vacation only", v0.13 also runs unfiled. Warn.
+        let mut included = std::collections::BTreeSet::new();
+        included.insert("Vacation".to_string());
+        assert!(should_warn_implicit_unfiled(
+            None,
+            &crate::selection::AlbumSelector::Named {
+                included,
+                excluded: empty_excludes()
+            }
+        ));
+    }
+
+    #[test]
+    fn test_should_warn_implicit_unfiled_silent_when_album_none() {
+        // --album none explicitly opts out of album passes; the unfiled
+        // pass running is the user's clear intent, not a surprise.
+        assert!(!should_warn_implicit_unfiled(
+            None,
+            &crate::selection::AlbumSelector::None
+        ));
+    }
+
+    #[test]
+    fn test_should_warn_implicit_unfiled_silent_when_unfiled_explicit_true() {
+        // User explicitly opted in. No surprise to surface.
+        assert!(!should_warn_implicit_unfiled(
+            Some(true),
+            &crate::selection::AlbumSelector::All {
+                excluded: empty_excludes()
+            }
+        ));
+    }
+
+    #[test]
+    fn test_should_warn_implicit_unfiled_silent_when_unfiled_explicit_false() {
+        // User explicitly opted out. No surprise to surface.
+        let mut included = std::collections::BTreeSet::new();
+        included.insert("Vacation".to_string());
+        assert!(!should_warn_implicit_unfiled(
+            Some(false),
+            &crate::selection::AlbumSelector::Named {
+                included,
+                excluded: empty_excludes()
+            }
+        ));
     }
 
     #[test]
