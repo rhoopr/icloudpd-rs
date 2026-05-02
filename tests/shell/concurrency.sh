@@ -26,11 +26,16 @@ KEI="$(kei_release_bin)"
 kei_check_init
 
 kei_sync() {
+    # `--unfiled false` keeps the suite scoped to the test album. v0.13's
+    # default `--unfiled true` would also enumerate every unfiled photo in
+    # the live account on every concurrency-test sync, blowing wall time
+    # past the suite's expected cadence.
     "$KEI" sync \
         --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
         --data-dir "$COOKIES" \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --log-level info "$@" 2>&1
 }

@@ -214,20 +214,20 @@ pub(crate) fn resolve_library_selector(
 
 /// Which albums to sync.
 ///
-/// `All` is triggered by explicit `-a all` *or* the smart default: no `-a`
-/// flag passed *and* `{album}` appears in `--folder-structure`. In both
-/// cases, every discovered album is enumerated; an additional library-wide
-/// pass for "unfiled" photos is only added when `{album}` is in the template
-/// (decided at `resolve_albums` time, not stored here).
+/// v0.13 default is `All`. `-a all` (explicit), no `-a` flag, and the
+/// auto-promotion from `{album}` in `--folder-structure` (deprecated) all
+/// resolve here. The unfiled pass is independent of `AlbumSelection`: by
+/// default it always runs, and `--unfiled false` is the only way to disable
+/// it (see `unfiled_default`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AlbumSelection {
-    /// No `-a` filter; enumerate the library as a single stream (today's
-    /// default behaviour).
+    /// `-a none`: no album passes. Useful when paired with `--smart-folder`
+    /// or when the user wants only the unfiled pass.
     LibraryOnly,
     /// Explicit list of album names to sync.
     Named(Vec<String>),
-    /// `-a all` (explicit) or the smart default when `{album}` is in the
-    /// folder template: every discovered album.
+    /// `-a all` (explicit), no `-a` flag (v0.13 default), or the legacy
+    /// `{album}`-in-template auto-promotion: every discovered album.
     All,
 }
 
@@ -399,17 +399,12 @@ fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyho
 }
 
 /// Default for `Selection.unfiled` when the user did not pass `--unfiled`
-/// explicitly: derived from the legacy `(albums, folder_structure)` tuple
-/// so existing configs keep their pre-v0.13 pass set. `--unfiled` always
-/// wins when supplied.
-fn legacy_unfiled_default(albums: &AlbumSelection, folder_structure: &str) -> bool {
-    let template_has_album =
-        crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}");
-    match albums {
-        AlbumSelection::LibraryOnly => true,
-        AlbumSelection::All => template_has_album,
-        AlbumSelection::Named(_) => false,
-    }
+/// explicitly: always `true` in v0.13. The unfiled pass is independent of
+/// `--album`: `kei sync --album Vacation` runs the Vacation pass *and* the
+/// unfiled pass unless the user explicitly disables it with
+/// `--unfiled false`. `--unfiled` always wins when supplied.
+const fn unfiled_default() -> bool {
+    true
 }
 
 /// Stderr deprecation warning, scheduled for removal in v0.20.0. `old` is the
@@ -427,32 +422,29 @@ fn warn_deprecated(old: &str, replacement: &str) {
     }
 }
 
-/// Translate the legacy `(AlbumSelection, exclude_albums, folder_structure)`
-/// tuple plus the parsed library/smart-folder selectors into the v0.13
+/// Translate the legacy `(AlbumSelection, exclude_albums)` tuple plus the
+/// parsed library/smart-folder selectors into the v0.13
 /// [`crate::selection::Selection`]. Pure function so the truth table is
 /// testable without `Config::build`.
 ///
-/// Behaviour preserved for legacy album fields:
-/// - `AlbumSelection::LibraryOnly` (no-album-flag default) maps to
-///   `AlbumSelector::None`. The library is enumerated as one stream and the
-///   unfiled pass covers it.
-/// - `AlbumSelection::Named(v)` maps to `AlbumSelector::Named { v, exclude }`
-///   plus an unfiled pass only if `{album}` is in the template.
-/// - `AlbumSelection::All` maps to `AlbumSelector::All { exclude }` plus
-///   unfiled iff `{album}` appears in `--folder-structure`.
+/// Lowering for legacy album fields:
+/// - `AlbumSelection::LibraryOnly` maps to `AlbumSelector::None`. Set when
+///   the user passed `--album none`; produces no album passes (unfiled
+///   alone covers the library).
+/// - `AlbumSelection::Named(v)` maps to `AlbumSelector::Named { v, exclude }`.
+/// - `AlbumSelection::All` (the no-flag default and the `-a all` case) maps
+///   to `AlbumSelector::All { exclude }`.
 ///
 /// Library and smart-folder selectors are passed through directly — their
 /// new-grammar parsing already happened in `Config::build`.
 ///
 /// `unfiled_override` is `Some(b)` when the user passed `--unfiled` (or set
 /// `[filters].unfiled` in TOML) and `None` otherwise. When `None`, unfiled
-/// is computed from the legacy `albums` + `folder_structure` truth table so
-/// existing configs keep their current pass set.
+/// defaults to `true` regardless of `--album` (v0.13 semantics).
 pub(crate) fn derive_selection(
     albums: &AlbumSelection,
     exclude_albums: &[String],
     library: &crate::selection::LibrarySelector,
-    folder_structure: &str,
     raw_smart_folders: &[String],
     unfiled_override: Option<bool>,
 ) -> anyhow::Result<crate::selection::Selection> {
@@ -478,8 +470,7 @@ pub(crate) fn derive_selection(
             .collect(),
     };
 
-    let unfiled =
-        unfiled_override.unwrap_or_else(|| legacy_unfiled_default(albums, folder_structure));
+    let unfiled = unfiled_override.unwrap_or_else(unfiled_default);
 
     Ok(crate::selection::Selection {
         albums: crate::selection::parse_album_selector(&raw_albums, true)?,
@@ -575,18 +566,20 @@ fn resolve_album_selection(
     folder_structure: &str,
 ) -> anyhow::Result<(AlbumSelection, Vec<String>)> {
     if raw.is_empty() {
-        // Bare `{album}` in the folder template implies "every album, plus an
-        // unfiled pass" without the user having to also pass `--album all`.
-        // The selection model now defaults `--album` to `all`, so this
-        // implicit promotion is redundant; warn and remove later.
+        // v0.13 default: `--album all`. No-flag `kei sync` enumerates every
+        // user album and (with `unfiled = true`) runs an unfiled pass for
+        // photos in no album. The legacy auto-promotion from `{album}` in
+        // `--folder-structure` is now redundant -- the default already
+        // includes albums:all -- but we keep the deprecation warning until
+        // v0.20 so users with `{album}` in their unfiled template know to
+        // migrate to `--folder-structure-albums`.
         if crate::download::paths::strip_python_wrapper(folder_structure).contains("{album}") {
             warn_deprecated(
                 "implicit `--album all` from `{album}` in `--folder-structure`",
                 "an explicit `--album all` (now the default)",
             );
-            return Ok((AlbumSelection::All, Vec::new()));
         }
-        return Ok((AlbumSelection::LibraryOnly, Vec::new()));
+        return Ok((AlbumSelection::All, Vec::new()));
     }
 
     let selector = crate::selection::parse_album_selector(raw, true)?;
@@ -1528,7 +1521,6 @@ impl Config {
             &albums,
             &exclude_albums,
             &library_selector,
-            &folder_structure,
             &raw_smart_folders,
             unfiled_override,
         )?;
@@ -1909,8 +1901,12 @@ impl Config {
                 albums: {
                     // Round-trip via the new selector so the same string
                     // rendering used by `--album` echoes back into TOML.
+                    // Default `--album` is `all` in v0.13, so we omit the
+                    // `["all"]` shape (load resolves to All when missing)
+                    // and emit everything else (including the `["none"]`
+                    // shape that round-trips to LibraryOnly).
                     let raw = self.selection.albums.to_raw();
-                    if matches!(self.albums, AlbumSelection::LibraryOnly) {
+                    if raw == vec!["all".to_string()] {
                         None
                     } else {
                         Some(raw)
@@ -4026,7 +4022,8 @@ mod tests {
             cfg.selection.libraries.to_raw(),
             vec!["primary".to_string()]
         );
-        assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
+        assert_eq!(cfg.albums, AlbumSelection::All);
+        assert!(cfg.selection.unfiled, "v0.13 default: unfiled = true");
         assert!(!cfg.skip_videos);
         assert!(!cfg.skip_photos);
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::Both);
@@ -5179,6 +5176,8 @@ mod tests {
 
     #[test]
     fn test_build_albums_empty_toml_empty_cli() {
+        // Empty `albums = []` in TOML is equivalent to "no `--album` flag",
+        // which the v0.13 default resolves to `All`.
         let toml_str = r#"
             [filters]
             albums = []
@@ -5191,11 +5190,13 @@ mod tests {
             Some(&toml),
         )
         .unwrap();
-        assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
+        assert_eq!(cfg.albums, AlbumSelection::All);
+        assert!(cfg.selection.unfiled);
     }
 
     #[test]
     fn test_build_albums_no_toml_no_cli() {
+        // v0.13 no-flag default: every user album plus an unfiled pass.
         let cfg = Config::build(
             &default_globals(),
             &default_password(),
@@ -5203,7 +5204,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
+        assert_eq!(cfg.albums, AlbumSelection::All);
+        assert!(cfg.selection.unfiled);
     }
 
     #[test]
@@ -5279,12 +5281,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_album_smart_default_inactive_without_album_token() {
-        // No -a, no {album} -> LibraryOnly (today's default).
+    fn test_build_no_flag_default_is_all() {
+        // v0.13: no `-a`, default `--folder-structure` -> `All`. The legacy
+        // pre-v0.13 default was `LibraryOnly`; this test pins the new
+        // contract so a regression flips it back.
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/%d".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.albums, AlbumSelection::LibraryOnly);
+        assert_eq!(cfg.albums, AlbumSelection::All);
+        assert!(cfg.selection.unfiled);
     }
 
     #[test]
@@ -6306,20 +6311,21 @@ mod tests {
     #[test]
     fn test_unfiled_default_no_flags_is_true() {
         let cfg = build_with_unfiled(None, None);
-        assert!(
-            cfg.selection.unfiled,
-            "default LibraryOnly should preserve legacy unfiled = true"
-        );
+        assert!(cfg.selection.unfiled, "v0.13 default: unfiled = true");
     }
 
     #[test]
-    fn test_unfiled_default_with_named_albums_is_false() {
+    fn test_unfiled_default_with_named_albums_is_true() {
+        // v0.13: --unfiled defaults to true regardless of --album. Named
+        // albums get their own passes AND the unfiled pass runs alongside.
+        // Pre-v0.13 behaviour was unfiled=false for named-album syncs; this
+        // test pins the new contract.
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(
-            !cfg.selection.unfiled,
-            "named-album default should preserve legacy unfiled = false"
+            cfg.selection.unfiled,
+            "v0.13: --album Vacation alone should still default unfiled = true",
         );
     }
 
@@ -6336,15 +6342,15 @@ mod tests {
     }
 
     #[test]
-    fn test_unfiled_cli_overrides_named_album_legacy() {
+    fn test_unfiled_false_disables_named_album_unfiled_pass() {
+        // The user explicitly opts out of the unfiled pass when running a
+        // named-album sync. Without this opt-out, v0.13's default would
+        // run the Vacation pass AND the unfiled pass.
         let mut sync = default_sync();
         sync.albums = vec!["Vacation".to_string()];
-        sync.unfiled = Some(true);
+        sync.unfiled = Some(false);
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert!(
-            cfg.selection.unfiled,
-            "explicit --unfiled true should win over the named-album legacy default of false"
-        );
+        assert!(!cfg.selection.unfiled);
     }
 
     #[test]

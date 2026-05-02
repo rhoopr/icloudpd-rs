@@ -58,6 +58,7 @@ docker run --rm \
         --data-dir /config \
         --directory /photos \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --no-incremental \
     2>&1
@@ -115,6 +116,7 @@ docker run --rm \
         --data-dir /config \
         --directory /photos \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --log-level info \
     2>&1 | tee /dev/stderr | grep -qE "downloaded=0|No new photos"
@@ -133,6 +135,7 @@ docker run --rm \
         --data-dir /config \
         --directory /photos \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --dry-run \
     2>&1
@@ -171,6 +174,7 @@ docker run -d --name "$WATCH_NAME" \
         --data-dir /config \
         --directory /photos \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --watch-with-interval 60 \
         --log-level info >/dev/null
@@ -223,6 +227,7 @@ PWFILE_OUT=$(docker run --rm \
         --data-dir /config \
         --directory /photos \
         --album "$ALBUM" \
+        --unfiled false \
         --no-progress-bar \
         --dry-run \
     2>&1)

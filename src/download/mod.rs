@@ -3638,7 +3638,7 @@ mod tests {
         let config = build_config_with(tmp.path(), "/photos", |_| {});
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "aeb5bd16aec44dc6",
+            hash, "90467ca7a96e1e77",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3652,7 +3652,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "17970c39a2088aa1",
+            hash, "3c7e94d9830cb812",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3669,7 +3669,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "83355ac76044cebf",
+            hash, "1dd59701ae38f405",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3686,7 +3686,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "1e0fc1c46a9d0aca",
+            hash, "898b49b4a29fd1e8",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }

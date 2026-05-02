@@ -53,11 +53,19 @@ fn album_cmd(
     cookie_dir: &std::path::Path,
     download_dir: &std::path::Path,
 ) -> assert_cmd::Command {
+    // `--unfiled false` keeps these tests scoped to the album under test.
+    // v0.13's default is `--unfiled true` regardless of `--album`, which
+    // would also enumerate every unfiled photo in the live account on
+    // every test invocation -- both blowing up wall time and hitting Apple
+    // rate limits. Each individual test asserts album-specific behaviour;
+    // the unfiled pass is exercised separately by the no-flag tests.
     let mut cmd = common::cmd();
     cmd.args([
         "sync",
         "--album",
         album(),
+        "--unfiled",
+        "false",
         "--username",
         username,
         "--password",
@@ -1140,6 +1148,8 @@ fn sync_bare_invocation_works_like_sync() {
             .args([
                 "--album",
                 album(),
+                "--unfiled",
+                "false",
                 "--username",
                 &username,
                 "--password",
@@ -1356,6 +1366,8 @@ fn sync_incremental_second_run_skips_download() {
                 "sync",
                 "--album",
                 album(),
+                "--unfiled",
+                "false",
                 "--username",
                 &username,
                 "--password",
@@ -1415,6 +1427,8 @@ fn sync_watch_runs_multiple_cycles() {
                 "sync",
                 "--album",
                 album(),
+                "--unfiled",
+                "false",
                 "--username",
                 &username,
                 "--password",

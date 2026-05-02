@@ -1428,6 +1428,7 @@ dependencies = [
  "sha1",
  "sha2",
  "smallvec",
+ "strsim",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

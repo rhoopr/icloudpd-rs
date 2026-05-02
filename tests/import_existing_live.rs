@@ -236,6 +236,14 @@ fn count_downloaded_rows(data_dir: &Path) -> u64 {
 /// matches the same assets the fixture sync wrote. Constrains the scan
 /// to `--recent N` matching the fixture so the comparison is apples-to-
 /// apples — the user's full library can be far larger than the fixture.
+///
+/// Under v0.13's per-pass scan model, the same asset can be enumerated
+/// multiple times: once per album it belongs to, plus the unfiled pass
+/// (which excludes album-member assets, so an asset is never counted by
+/// both). `summary.matched` therefore counts version-enumerations, while
+/// the state DB has one row per unique `(library, id, version_size)`. The
+/// natural relation is `matched >= rows`, with the gap proportional to
+/// the average album-membership-per-asset.
 #[test]
 #[ignore]
 fn import_matches_default_layout_after_sync() {
@@ -276,19 +284,20 @@ fn import_matches_default_layout_after_sync() {
 
         let rows = count_downloaded_rows(test_data.path());
         assert!(rows > 0, "no rows written to state DB");
-        // Row count should track `matched` closely. A small drift is
-        // acceptable: some real-Apple metadata corner cases (e.g. an
-        // asset whose `mark_downloaded` UPDATE happens to race a stuck
-        // pending state) leave a row in `pending` instead of
-        // `downloaded`. We only count `downloaded` here. Caps the slop
-        // at 2% of matched, generous enough to soak up the rare drift
-        // without missing a regression that breaks DB writes wholesale.
-        let max_drift = (summary.matched / 50).max(1);
-        let drift = summary.matched.saturating_sub(rows);
+        // Multi-pass invariant: matched >= rows (each unique asset can be
+        // enumerated by multiple album passes, but writes one DB row).
+        // Generous upper bound (matched <= 10 * rows) catches a runaway
+        // duplicate write without false-firing on accounts where assets
+        // average several album memberships.
         assert!(
-            drift <= max_drift,
-            "DB downloaded rows ({rows}) drift from stdout matched ({}) by {drift} > tolerance {max_drift}",
-            summary.matched,
+            summary.matched >= rows,
+            "matched ({matched}) < rows ({rows}); per-pass model expects matched >= rows",
+            matched = summary.matched,
+        );
+        assert!(
+            summary.matched <= rows.saturating_mul(10),
+            "matched ({matched}) > 10x rows ({rows}); over-counting regression?",
+            matched = summary.matched,
         );
     });
 }
@@ -371,8 +380,14 @@ fn import_is_idempotent() {
     });
 }
 
-/// `--recent N` caps the scan -- with N << total, matched < total scanned
-/// against the full fixture, but greater than zero.
+/// `--recent N` caps the scan. Under v0.13's per-pass model the cap
+/// applies *per pass*, so this test pins both edges:
+/// - With `albums = ["none"]` + `unfiled = true` (one library-wide pass),
+///   `--recent 5` produces total <= 5 (the per-pass cap is the global cap).
+/// - The default no-flag selection (`-a all` + unfiled) runs many passes,
+///   each capped at 5, so total <= 5 * num_active_passes. We assert the
+///   loose upper bound there as a safety net against a regression that
+///   loses the cap entirely (total >> recent).
 #[test]
 #[ignore]
 fn import_recent_limit_caps_scan() {
@@ -380,13 +395,54 @@ fn import_recent_limit_caps_scan() {
     let (download_dir, _sync_data_dir) = fixture();
 
     common::with_auth_retry(|| {
+        // Single-pass scenario: TOML pins `albums = ["none"]` so only the
+        // unfiled pass runs; `--recent 5` -> total <= 5 globally.
         let test_data = tempdir().unwrap();
-        let output = import_cmd(
+        copy_auth_artifacts(&cookie_dir, test_data.path());
+        let toml_path = write_kei_toml(
+            test_data.path(),
+            download_dir,
+            "[filters]\nalbums = [\"none\"]\nunfiled = true\n",
+        );
+        let output = common::cmd()
+            .args([
+                "import-existing",
+                "--username",
+                &username,
+                "--password",
+                &password,
+                "--data-dir",
+                test_data.path().to_str().unwrap(),
+                "--config",
+                toml_path.to_str().unwrap(),
+                "--no-progress-bar",
+                "--recent",
+                "5",
+            ])
+            .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let summary = parse_summary(&stdout);
+        assert!(
+            summary.total <= 5,
+            "single-pass --recent 5 must scan at most 5 assets, got {summary:?}"
+        );
+
+        // Multi-pass scenario: default selection runs many passes, each
+        // capped at 5. Loose upper bound (5 * 200 = 1000) catches a
+        // regression where the cap is dropped entirely (the test account
+        // has thousands of photos), without false-firing on accounts with
+        // a moderate album count.
+        let test_data2 = tempdir().unwrap();
+        let output2 = import_cmd(
             &username,
             &password,
             &cookie_dir,
             download_dir,
-            test_data.path(),
+            test_data2.path(),
             &["--recent", "5"],
         )
         .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
@@ -394,11 +450,11 @@ fn import_recent_limit_caps_scan() {
         .success()
         .get_output()
         .clone();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let summary = parse_summary(&stdout);
+        let summary2 = parse_summary(&String::from_utf8_lossy(&output2.stdout));
         assert!(
-            summary.total <= 5,
-            "--recent 5 must scan at most 5 assets, got {summary:?}"
+            summary2.total <= 1000,
+            "multi-pass --recent 5 produced total={total}; cap appears to be dropped entirely",
+            total = summary2.total,
         );
     });
 }

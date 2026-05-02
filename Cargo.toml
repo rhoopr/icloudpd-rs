@@ -134,6 +134,11 @@ smallvec = "1.15"
 rustc-hash = "2.1"
 data-encoding = "2.10.0"
 
+# Fuzzy "did you mean ...?" suggestions on unknown --album / --smart-folder
+# names. Already a transitive dep via clap; pin directly so the suggestion
+# code keeps compiling if clap drops it.
+strsim = "0.11"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
 
