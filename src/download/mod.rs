@@ -634,7 +634,7 @@ impl DownloadConfig {
     /// The unfiled pass keeps the legacy `{album}` token so existing configs
     /// with `--folder-structure "{album}/..."` still produce the same
     /// on-disk tree.
-    fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
+    pub(crate) fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
         let template: &str = match pass.kind {
             crate::commands::PassKind::Album => &self.folder_structure_albums,
             crate::commands::PassKind::SmartFolder => &self.folder_structure_smart_folders,
@@ -690,14 +690,6 @@ impl DownloadConfig {
             library: Arc::from(library),
             ..*self
         }
-    }
-
-    /// Visibility shim so `commands::import` can call the per-pass cloner
-    /// outside the `download` module. `with_pass` itself stays private; this
-    /// wrapper makes the contract ("import iterates per pass, same as sync")
-    /// explicit at the call site.
-    pub(crate) fn with_pass_for_import(&self, pass: &crate::commands::AlbumPass) -> Self {
-        self.with_pass(pass)
     }
 
     /// Clone this config with a different `exclude_asset_ids` set. Used
@@ -1077,13 +1069,9 @@ impl DownloadContext {
     /// - `None` — downloaded with matching checksum but needs filesystem check
     ///   to confirm file is still on disk (when `trust_state` is false)
     ///
-    /// `trust_state=true` skips the filesystem stat — used by
-    /// `--only-print-filenames` (no on-disk side effects, the user just
-    /// wants to see what *would* download). `trust_state=false` is the
-    /// production path: PR #318 removed the trust-state shortcut from real
-    /// syncs because the startup sample-check could miss user-deleted files.
-    /// Don't add new callers with `trust_state=true` outside the
-    /// only-print-filenames path without re-reading that incident.
+    /// `trust_state=true` skips the filesystem stat: only `--only-print-filenames`
+    /// uses it (no side effects, the user just wants to preview). The real-sync
+    /// path uses `trust_state=false` — see PR #318 for why.
     ///
     /// Uses borrowed `&str` keys for zero-allocation lookups.
     fn should_download_fast(

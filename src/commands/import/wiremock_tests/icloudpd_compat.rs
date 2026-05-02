@@ -767,6 +767,7 @@ async fn kei_uses_fingerprint_filename_when_filename_missing() {
     let (tx, panic_rx) = tokio::sync::oneshot::channel::<bool>();
     drop(tx);
     let db = open_db(&tmp).await;
+    let mut dir_cache = crate::download::paths::DirCache::new();
     let stats = import_assets(
         stream,
         panic_rx,
@@ -775,6 +776,7 @@ async fn kei_uses_fingerprint_filename_when_filename_missing() {
         "test-all",
         false,
         false,
+        &mut dir_cache,
     )
     .await
     .expect("import_assets ok");

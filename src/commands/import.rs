@@ -133,6 +133,7 @@ pub(crate) async fn import_assets<S>(
     library_label: &str,
     dry_run: bool,
     show_progress: bool,
+    dir_cache: &mut DirCache,
 ) -> anyhow::Result<ImportStats>
 where
     S: futures_util::Stream<Item = anyhow::Result<PhotoAsset>>,
@@ -141,9 +142,6 @@ where
 
     tokio::pin!(stream);
     let mut stats = ImportStats::default();
-    // One cache per library scan: each parent directory is read_dir'd at
-    // most once across all sibling probes.
-    let mut dir_cache = DirCache::new();
     let mut scan_started_emitted = false;
 
     while let Some(result) = stream.next().await {
@@ -225,7 +223,7 @@ where
                 &primary_path,
                 expected_size,
                 download_config.file_match_policy,
-                &mut dir_cache,
+                dir_cache,
             )
             .await
             {
@@ -422,26 +420,23 @@ pub(crate) async fn run_import_existing(
     }
 
     let mut totals = ImportStats::default();
+    // Hoisted across passes: a multi-album asset's parent dir is read_dir'd
+    // once per library scan, not once per pass.
+    let mut dir_cache = DirCache::new();
 
     for library in &libraries {
         let zone = library.zone_name();
         tracing::debug!(zone = %zone, "Scanning library");
-
-        // Pin the library on the per-library config so `with_pass` expands
-        // `{library}` to the right zone for each pass.
         let library_config = download_config.with_library(zone);
 
         let plan = resolve_passes(library, &selection).await?;
         if plan.passes.is_empty() {
-            tracing::debug!(
-                zone = %zone,
-                "No passes resolved for library; nothing to import"
-            );
+            tracing::debug!(zone = %zone, "No passes resolved; nothing to import");
             continue;
         }
 
         for pass in &plan.passes {
-            let pass_config = library_config.with_pass_for_import(pass);
+            let pass_config = library_config.with_pass(pass);
             tracing::debug!(
                 zone = %zone,
                 kind = ?pass.kind,
@@ -457,6 +452,7 @@ pub(crate) async fn run_import_existing(
                 zone,
                 args.dry_run,
                 !args.no_progress_bar,
+                &mut dir_cache,
             )
             .await?;
             totals += stats;
@@ -478,13 +474,6 @@ pub(crate) async fn run_import_existing(
     Ok(())
 }
 
-/// Refuse to scan when one or more selected libraries returned zero assets
-/// while the state DB has prior asset rows. `prior_db_total` is global, not
-/// per-zone (the assets table has no zone column), so a brand-new SharedSync
-/// joining an account with a populated PrimarySync also trips this guard --
-/// `--force-empty` is the documented escape hatch for that case. Caller
-/// short-circuits when `prior_db_total == 0` or `--force-empty` is set, so
-/// this function only runs when a guard is wanted.
 /// Build the [`Selection`] that `resolve_passes` consumes for import.
 ///
 /// `import-existing` has no `--album` / `--smart-folder` / `--unfiled` CLI
@@ -517,6 +506,13 @@ fn build_import_selection(
     })
 }
 
+/// Refuse to scan when one or more selected libraries returned zero assets
+/// while the state DB has prior asset rows. `prior_db_total` is global, not
+/// per-zone (the assets table has no zone column), so a brand-new SharedSync
+/// joining an account with a populated PrimarySync also trips this guard --
+/// `--force-empty` is the documented escape hatch for that case. Caller
+/// short-circuits when `prior_db_total == 0` or `--force-empty` is set, so
+/// this function only runs when a guard is wanted.
 fn validate_non_empty_libraries(empty_zones: &[&str], prior_db_total: u64) -> anyhow::Result<()> {
     let [head, tail @ ..] = empty_zones else {
         return Ok(());
@@ -632,6 +628,7 @@ mod wiremock_tests {
 
     use super::{import_assets, ImportStats};
     use crate::download::filter::expected_paths_for;
+    use crate::download::paths::DirCache;
     use crate::download::{AssetGroupings, DownloadConfig, SyncMode};
     use crate::icloud::photos::session::PhotosSession;
     use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotoAsset};
@@ -948,9 +945,19 @@ mod wiremock_tests {
         stub_records_query(server, assets).await;
         let album = album_pointed_at(server);
         let (stream, panic_rx) = album.photo_stream(None, None, 1);
-        import_assets(stream, panic_rx, db, config, "test-all", dry_run, false)
-            .await
-            .expect("import_assets")
+        let mut dir_cache = DirCache::new();
+        import_assets(
+            stream,
+            panic_rx,
+            db,
+            config,
+            "test-all",
+            dry_run,
+            false,
+            &mut dir_cache,
+        )
+        .await
+        .expect("import_assets")
     }
 
     // ── Tests: default flow ───────────────────────────────────────────
@@ -2081,9 +2088,19 @@ mod wiremock_tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
         drop(tx);
 
-        let stats = import_assets(stream, rx, db.as_ref(), &config, "test-all", false, false)
-            .await
-            .expect("clean exit must be Ok");
+        let mut dir_cache = DirCache::new();
+        let stats = import_assets(
+            stream,
+            rx,
+            db.as_ref(),
+            &config,
+            "test-all",
+            false,
+            false,
+            &mut dir_cache,
+        )
+        .await
+        .expect("clean exit must be Ok");
         assert_eq!(stats.total, 0);
         assert_eq!(stats.matched, 0);
         assert_eq!(stats.unmatched, 0);
@@ -2104,9 +2121,19 @@ mod wiremock_tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
         tx.send(true).expect("send panic signal");
 
-        let err = import_assets(stream, rx, db.as_ref(), &config, "test-all", false, false)
-            .await
-            .expect_err("must bail on fetcher panic");
+        let mut dir_cache = DirCache::new();
+        let err = import_assets(
+            stream,
+            rx,
+            db.as_ref(),
+            &config,
+            "test-all",
+            false,
+            false,
+            &mut dir_cache,
+        )
+        .await
+        .expect_err("must bail on fetcher panic");
         let msg = format!("{err}");
         assert!(
             msg.contains("import scan aborted") && msg.contains("test-all"),
@@ -2172,6 +2199,7 @@ mod wiremock_tests {
 
         let album = album_pointed_at(&server);
         let (stream, panic_rx) = album.photo_stream(None, None, 1);
+        let mut dir_cache = DirCache::new();
         let err = import_assets(
             stream,
             panic_rx,
@@ -2180,6 +2208,7 @@ mod wiremock_tests {
             "test-all",
             true,
             false,
+            &mut dir_cache,
         )
         .await
         .expect_err("must bail on fetcher Err");
@@ -2299,6 +2328,7 @@ mod wiremock_tests {
         let (stream, panic_rx) = album.photo_stream(None, None, 1);
         let db = open_db(&tmp).await;
         let config = base_config(tmp.path());
+        let mut dir_cache = DirCache::new();
         import_assets(
             stream,
             panic_rx,
@@ -2307,6 +2337,7 @@ mod wiremock_tests {
             "PrimarySync",
             true,
             false,
+            &mut dir_cache,
         )
         .await
         .expect("import_assets");
@@ -2335,6 +2366,7 @@ mod wiremock_tests {
         let (stream, panic_rx) = album.photo_stream(None, None, 1);
         let db = open_db(&tmp).await;
         let config = base_config(tmp.path());
+        let mut dir_cache = DirCache::new();
         import_assets(
             stream,
             panic_rx,
@@ -2343,6 +2375,7 @@ mod wiremock_tests {
             "PrimarySync",
             true,
             false,
+            &mut dir_cache,
         )
         .await
         .expect("import_assets");

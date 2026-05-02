@@ -421,13 +421,7 @@ fn migrate_to_version(
             }
         }
         9 => {
-            // Per-zone scope on the asset_albums and asset_people PKs.
-            // The v8 migration scoped `assets` per library but left the
-            // join tables keyed only on `asset_id`, so a multi-library
-            // account with the same asset in PrimarySync and a SharedSync
-            // zone would have its album/person memberships cross-attributed.
-            // Same backfill rationale as v8: pre-v9 writes only ever
-            // targeted PrimarySync.
+            // Idempotent: re-running on a v9 DB skips the recreate-table dance.
             if !column_exists(conn, "asset_albums", "library")? {
                 conn.execute_batch(schema_v9())?;
             }

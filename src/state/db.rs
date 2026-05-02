@@ -1674,16 +1674,10 @@ impl SqliteStateDb {
     /// prior sync. Callable from any test module in the crate so
     /// cross-module state tests (e.g. pipeline-level ghost-loop regression)
     /// don't have to reach for raw `rusqlite::Connection` plumbing.
-    ///
-    /// Library-scoped wrapper around the v8 PK; tests covering shared
-    /// libraries should use [`SqliteStateDb::backdate_last_seen_in`].
     pub(crate) fn backdate_last_seen(&self, asset_id: &str, ts: i64) {
         self.backdate_last_seen_in(crate::icloud::photos::PRIMARY_ZONE_NAME, asset_id, ts);
     }
 
-    /// Library-aware variant of [`Self::backdate_last_seen`]. The v8 PK
-    /// makes `(library, id, version_size)` distinct, so a same-id asset in
-    /// a shared library has its own row that this helper can address.
     pub(crate) fn backdate_last_seen_in(&self, library: &str, asset_id: &str, ts: i64) {
         let conn = self.acquire_lock("test_backdate_last_seen").unwrap();
         conn.execute(
