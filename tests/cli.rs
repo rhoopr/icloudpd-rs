@@ -650,6 +650,29 @@ fn import_existing_folder_structure_flag() {
 }
 
 #[test]
+fn import_existing_library_flag_accepts_repeatable_sentinels() {
+    // --library on import-existing was added on the selection-flags-redesign
+    // branch (commit bcbd5b6) but had no parse test of its own. The flag
+    // shares the v0.13 grammar with `kei sync --library`: bare sentinels,
+    // raw zone names, and `!name` exclusions, all repeatable.
+    common::cmd()
+        .args([
+            "import-existing",
+            "--library",
+            "primary",
+            "--library",
+            "shared",
+            "--library",
+            "SharedSync-A1B2C3D4",
+            "--library",
+            "!SharedSync-AAAAAAAA",
+            "--help",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
 fn import_existing_dry_run_flag_parses() {
     // Covers the new --dry-run flag on import-existing. Must parse; actual
     // DB-skip behavior is covered by the handler-level integration.

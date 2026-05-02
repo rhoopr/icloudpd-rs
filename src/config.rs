@@ -2711,6 +2711,391 @@ mod tests {
         );
     }
 
+    // ── Selection-flags-redesign runtime coverage ─────────────────────
+    //
+    // Each new CLI flag introduced on this branch (--smart-folder, repeatable
+    // --library, --folder-structure-albums, --folder-structure-smart-folders,
+    // --unfiled) had a parse test in tests/cli.rs but no test asserting the
+    // *runtime effect* through `Config::build`. The tests below drive every
+    // flag through `Cli::try_parse_from` -> `effective_command()` ->
+    // `Config::build` so a regression in the resolution chain surfaces here
+    // before anything reaches CloudKit.
+
+    #[test]
+    fn config_build_smart_folder_resolves_to_named_selector() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["kei", "sync", "--smart-folder", "Favorites"]).unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(
+            cfg.selection.smart_folders.to_raw(),
+            vec!["Favorites".to_string()]
+        );
+    }
+
+    #[test]
+    fn config_build_smart_folder_all_with_sensitive_resolves() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "kei",
+            "sync",
+            "--smart-folder",
+            "all-with-sensitive",
+            "--smart-folder",
+            "!Hidden",
+        ])
+        .unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        match cfg.selection.smart_folders {
+            crate::selection::SmartFolderSelector::All {
+                include_sensitive,
+                ref excluded,
+            } => {
+                assert!(
+                    include_sensitive,
+                    "all-with-sensitive must set include_sensitive = true"
+                );
+                assert!(
+                    excluded.contains("Hidden"),
+                    "!Hidden must land in excluded set"
+                );
+            }
+            other => panic!("expected All variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_build_library_repeatable_primary_plus_shared() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        let cli =
+            Cli::try_parse_from(["kei", "sync", "--library", "primary", "--library", "shared"])
+                .unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert!(
+            cfg.selection.libraries.primary,
+            "--library primary must set primary = true"
+        );
+        assert!(
+            cfg.selection.libraries.shared_all,
+            "--library shared must set shared_all = true"
+        );
+        // Both sentinels collapse to "all" in `to_raw()`.
+        assert_eq!(
+            cfg.selection.libraries.to_raw(),
+            vec!["all".to_string()],
+            "primary + shared must round-trip through `all`"
+        );
+    }
+
+    #[test]
+    fn config_build_library_repeatable_named_zone_with_primary() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "kei",
+            "sync",
+            "--library",
+            "primary",
+            "--library",
+            "SharedSync-A1B2C3D4",
+        ])
+        .unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let lib = &cfg.selection.libraries;
+        assert!(lib.primary, "primary must remain set");
+        assert!(!lib.shared_all, "no `shared` sentinel was passed");
+        assert!(
+            lib.named.contains("SharedSync-A1B2C3D4"),
+            "named zone must land in selector.named, got {:?}",
+            lib.named
+        );
+    }
+
+    #[test]
+    fn config_build_folder_structure_albums_resolves_through_cli() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "kei",
+            "sync",
+            "--folder-structure-albums",
+            "{album}/%Y/%m/%d",
+        ])
+        .unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m/%d");
+        // Default unfiled / smart-folder templates are untouched.
+        assert_eq!(cfg.folder_structure_smart_folders, "{smart-folder}");
+    }
+
+    #[test]
+    fn config_build_folder_structure_smart_folders_resolves_through_cli() {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "kei",
+            "sync",
+            "--folder-structure-smart-folders",
+            "{smart-folder}/%Y",
+        ])
+        .unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.folder_structure_smart_folders, "{smart-folder}/%Y");
+        assert_eq!(cfg.folder_structure_albums, "{album}");
+    }
+
+    #[test]
+    fn config_build_folder_structure_albums_default_is_documented_value() {
+        // Per `feedback_default_value_change_test`: pin the *documented*
+        // default, not the value Config::build happens to return. The
+        // documentation in cli.rs / wiki claims the default is `{album}`;
+        // a regression that ships any other default must fail this test.
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.folder_structure_albums, DEFAULT_FOLDER_STRUCTURE_ALBUMS,
+            "documented default for --folder-structure-albums is `{{album}}`"
+        );
+        assert_eq!(
+            cfg.folder_structure_smart_folders, DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
+            "documented default for --folder-structure-smart-folders is `{{smart-folder}}`"
+        );
+    }
+
+    #[test]
+    fn config_build_filters_section_end_to_end_through_toml() {
+        // Every new key in `[filters]` -- libraries, smart_folders, unfiled,
+        // and the v0.13 `albums` array -- must flow through TomlConfig +
+        // Config::build into Config.selection. Pinning all four together
+        // catches drop-throughs where one key is read but another is
+        // silently ignored.
+        let toml_str = r#"
+            [filters]
+            albums = ["Vacation", "!Drafts"]
+            smart_folders = ["Favorites"]
+            unfiled = false
+            libraries = ["primary", "shared"]
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+
+        // Albums round-trip via the new selector grammar.
+        let raw_albums = cfg.selection.albums.to_raw();
+        assert!(
+            raw_albums.contains(&"Vacation".to_string()),
+            "albums must include Vacation, got {raw_albums:?}"
+        );
+        assert!(
+            raw_albums.contains(&"!Drafts".to_string()),
+            "albums must include !Drafts, got {raw_albums:?}"
+        );
+
+        // Smart folders.
+        assert_eq!(
+            cfg.selection.smart_folders.to_raw(),
+            vec!["Favorites".to_string()]
+        );
+
+        // Unfiled disabled.
+        assert!(
+            !cfg.selection.unfiled,
+            "[filters].unfiled = false must reach Selection.unfiled"
+        );
+
+        // Libraries: primary + shared collapses to all.
+        assert!(cfg.selection.libraries.primary);
+        assert!(cfg.selection.libraries.shared_all);
+    }
+
+    #[test]
+    fn config_build_toml_folder_structure_keys_resolved() {
+        // [download].folder_structure_albums and
+        // [download].folder_structure_smart_folders are new TOML keys with
+        // no prior runtime test. Pin the read so a serde rename / typo lands
+        // red here.
+        let toml_str = r#"
+            [download]
+            folder_structure_albums = "{album}/%Y"
+            folder_structure_smart_folders = "{smart-folder}/by-year/%Y"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.folder_structure_albums, "{album}/%Y");
+        assert_eq!(
+            cfg.folder_structure_smart_folders,
+            "{smart-folder}/by-year/%Y"
+        );
+    }
+
+    #[test]
+    fn config_build_cli_overrides_toml_folder_structure_keys() {
+        // CLI > TOML precedence on the new per-category template keys.
+        let toml_str = r#"
+            [download]
+            folder_structure_albums = "{album}/from-toml"
+            folder_structure_smart_folders = "{smart-folder}/from-toml"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "kei",
+            "sync",
+            "--folder-structure-albums",
+            "{album}/from-cli",
+            "--folder-structure-smart-folders",
+            "{smart-folder}/from-cli",
+        ])
+        .unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        assert_eq!(cfg.folder_structure_albums, "{album}/from-cli");
+        assert_eq!(
+            cfg.folder_structure_smart_folders,
+            "{smart-folder}/from-cli"
+        );
+    }
+
+    // ── auto_migrate_legacy_album_token ────────────────────────────────
+    //
+    // The legacy `{album}` auto-migration is the only path by which a
+    // pre-v0.13 user's existing `--folder-structure "{album}/..."` keeps
+    // working. A regression that drops the migration silently moves every
+    // album pass back to the unfiled date hierarchy. Pin every shape the
+    // function declares it handles.
+
+    #[test]
+    fn auto_migrate_album_token_with_date_hierarchy_lifts_segment() {
+        let m = auto_migrate_legacy_album_token(
+            "{album}/%Y/%m".to_string(),
+            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+            false,
+        );
+        assert_eq!(m.folder_structure, "%Y/%m");
+        assert_eq!(m.folder_structure_albums, "{album}/%Y/%m");
+        assert!(
+            m.suggestion.is_some(),
+            "migration must surface a suggestion to warn the user"
+        );
+    }
+
+    #[test]
+    fn auto_migrate_bare_album_token_emits_none_unfiled_template() {
+        let m = auto_migrate_legacy_album_token(
+            "{album}".to_string(),
+            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+            false,
+        );
+        assert_eq!(
+            m.folder_structure,
+            crate::download::paths::NO_DATE_STRUCTURE,
+            "bare {{album}} must collapse the unfiled template to `none`"
+        );
+        assert_eq!(m.folder_structure_albums, "{album}");
+        assert!(m.suggestion.is_some());
+    }
+
+    #[test]
+    fn auto_migrate_no_album_token_is_noop() {
+        let m = auto_migrate_legacy_album_token(
+            "%Y/%m/%d".to_string(),
+            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+            false,
+        );
+        assert_eq!(m.folder_structure, "%Y/%m/%d");
+        assert_eq!(m.folder_structure_albums, DEFAULT_FOLDER_STRUCTURE_ALBUMS);
+        assert!(
+            m.suggestion.is_none(),
+            "no-token input must not surface a deprecation suggestion"
+        );
+    }
+
+    #[test]
+    fn auto_migrate_preserves_user_set_albums_template() {
+        // When the user already supplied --folder-structure-albums, the
+        // legacy template's segments should NOT clobber it.
+        let m = auto_migrate_legacy_album_token(
+            "{album}/%Y".to_string(),
+            "{album}/by-day/%Y/%m/%d".to_string(),
+            true,
+        );
+        assert_eq!(m.folder_structure, "%Y");
+        assert_eq!(
+            m.folder_structure_albums, "{album}/by-day/%Y/%m/%d",
+            "user-set per-category template must survive migration"
+        );
+        assert!(m.suggestion.is_some());
+    }
+
+    #[test]
+    fn config_build_legacy_album_token_warns_and_migrates() {
+        // End-to-end: --folder-structure "{album}/%Y/%m" through Config::build
+        // applies the migration and leaves the resolved fields in the new shape.
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(["kei", "sync", "--folder-structure", "{album}/%Y/%m"]).unwrap();
+        let Command::Sync { sync, .. } = cli.effective_command() else {
+            panic!("expected Sync subcommand");
+        };
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(
+            cfg.folder_structure, "%Y/%m",
+            "unfiled template must be the post-migration base"
+        );
+        assert_eq!(
+            cfg.folder_structure_albums, "{album}/%Y/%m",
+            "album template must inherit the legacy segment"
+        );
+    }
+
     #[test]
     fn test_build_hardcoded_default_when_both_absent() {
         let cfg = Config::build(

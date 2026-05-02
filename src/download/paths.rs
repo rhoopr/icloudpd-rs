@@ -695,6 +695,63 @@ mod tests {
         assert_eq!(truncate_library_zone(zone_a), truncate_library_zone(zone_b));
     }
 
+    /// Pin the positive case of `expand_named_token` for the `{album}`
+    /// token: a typical `--folder-structure-albums "{album}/%Y/%m/%d"`
+    /// template plus a real album name must place the sanitized name in
+    /// the leading segment with the chrono format string preserved
+    /// verbatim. The renderer composes `expand_named_token` with chrono's
+    /// `strftime` afterwards; if the token gets dropped here the chrono
+    /// pass would emit dated paths under the *download root* (not under
+    /// the album folder), silently flattening every album.
+    #[test]
+    fn expand_named_token_album_replaces_token_with_sanitized_name() {
+        assert_eq!(
+            expand_named_token("{album}/%Y/%m/%d", TOKEN_ALBUM, Some("Vacation")),
+            "Vacation/%Y/%m/%d",
+        );
+        // Embedded position with surrounding strftime tokens preserved.
+        assert_eq!(
+            expand_named_token("by-album/{album}/%B", TOKEN_ALBUM, Some("Family")),
+            "by-album/Family/%B",
+        );
+    }
+
+    /// Symmetric pin for `{smart-folder}`: the
+    /// `--folder-structure-smart-folders` template renders through the
+    /// same `expand_named_token` helper. A regression that hard-coded
+    /// the helper to the album token alone would silently break every
+    /// smart-folder pass.
+    #[test]
+    fn expand_named_token_smart_folder_replaces_token_with_sanitized_name() {
+        assert_eq!(
+            expand_named_token("{smart-folder}/%Y", TOKEN_SMART_FOLDER, Some("Favorites")),
+            "Favorites/%Y",
+        );
+        assert_eq!(
+            expand_named_token("{smart-folder}", TOKEN_SMART_FOLDER, Some("Videos")),
+            "Videos",
+        );
+    }
+
+    /// `expand_named_token` runs `sanitize_path_component` on the name,
+    /// which collapses `..` to `_`. A user album literally named `..`
+    /// (legal in Apple Photos) must land at a non-traversing segment
+    /// rather than escaping the download root. The other path-component
+    /// rules (replace `/` with `_`, etc.) cascade through the same
+    /// sanitizer, so this one assertion guards the whole class.
+    #[test]
+    fn expand_named_token_album_sanitizes_traversal_segment() {
+        let out = expand_named_token("{album}/%Y", TOKEN_ALBUM, Some(".."));
+        assert!(
+            !out.starts_with(".."),
+            "album-name traversal must not escape: got {out:?}"
+        );
+        assert!(
+            out.ends_with("/%Y"),
+            "rest of template must survive sanitization: got {out:?}"
+        );
+    }
+
     /// Adversarial, refined: `expand_named_token` with
     /// `{library}` and an empty zone name must collapse to the empty
     /// segment branch. Pin the **exact** resulting string so a
@@ -725,6 +782,27 @@ mod tests {
             "photos//by-date",
             "empty zone in mid-template must leave adjacent separators intact",
         );
+    }
+
+    /// End-to-end pin for the legacy `local_download_dir`: combining the
+    /// `{album}` token with a chrono strftime template against a fixed
+    /// date must produce the exact `<download-dir>/<album>/<date>` path
+    /// the docs promise. The function has unit tests for the empty-album
+    /// branch via `expand_album_token` callers, but no fixed-output
+    /// assertion against a real (album, date) pair.
+    #[test]
+    fn local_download_dir_renders_album_with_date_hierarchy() {
+        let dt = Local
+            .with_ymd_and_hms(2025, 1, 2, 12, 0, 0)
+            .single()
+            .unwrap();
+        let path = local_download_dir(
+            Path::new("/photos"),
+            "{album}/%Y/%m/%d",
+            &dt,
+            Some("Vacation"),
+        );
+        assert_eq!(path, PathBuf::from("/photos/Vacation/2025/01/02"));
     }
 
     #[test]

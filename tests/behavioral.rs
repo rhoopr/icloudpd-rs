@@ -4282,3 +4282,110 @@ fn config_show_emits_libraries_when_non_default() {
     let (stdout, _) = run_config_show("\n[filters]\nlibraries = [\"all\"]\n");
     assert!(stdout.contains("libraries = [\"all\"]"), "stdout: {stdout}");
 }
+
+#[test]
+fn config_show_emits_libraries_when_repeatable_named_zone() {
+    // Pin the multi-zone case at the binary boundary: a zone-truncated
+    // alias plus `primary` must round-trip into a libraries array that
+    // contains both. A regression in `LibrarySelector::to_raw()` that
+    // dropped the named zone (or collapsed multiple inputs to a single
+    // sentinel) lands red here.
+    let (stdout, _) =
+        run_config_show("\n[filters]\nlibraries = [\"primary\", \"SharedSync-A1B2C3D4\"]\n");
+    assert!(
+        stdout.contains("libraries"),
+        "stdout must include a libraries key:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("primary"),
+        "stdout must include primary:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("SharedSync-A1B2C3D4"),
+        "stdout must include the named zone:\n{stdout}"
+    );
+}
+
+// ── Deprecation warnings: legacy CLI / TOML selection keys ────────
+//
+// These pin the user-visible warning emission for every deprecated
+// selection surface. The `[migration_legacy_album_*]` block above
+// covers `{album}` in --folder-structure (gap 10 of the audit). The
+// tests below cover the remaining deprecation surfaces flagged by the
+// branch audit (gaps 9 and 11): `--exclude-album` CLI, `[filters].album`
+// singular TOML, `[filters].exclude_albums` TOML, and the parallel
+// `[filters].library` singular TOML key. A regression that drops any
+// of these warnings would silently break the v0.20 removal contract:
+// users running on the deprecated surface would never learn to migrate.
+
+#[test]
+fn deprecation_exclude_album_cli_warns_and_names_v0_20_0() {
+    // `--exclude-album` is hidden from --help (cli.rs::sync_help_hides_deprecated_exclude_album_flag)
+    // but the user-visible deprecation warning was untested at the binary
+    // boundary. Pin the `eprintln!` that fires at config-build time, plus
+    // the accompanying "splits on commas" note that warns about the
+    // semantic gap between --exclude-album and --album.
+    sync_cmd_for_validation()
+        .args(["--exclude-album", "Family", "--only-print-filenames"])
+        .assert()
+        .stderr(predicate::str::contains("`--exclude-album`"))
+        .stderr(predicate::str::contains("deprecated"))
+        .stderr(predicate::str::contains("v0.20.0"))
+        .stderr(predicate::str::contains("--album '!NAME'"))
+        .stderr(predicate::str::contains("splits on commas"));
+}
+
+#[test]
+fn deprecation_toml_filters_album_singular_warns() {
+    // `[filters].album = "name"` (singular string) was the v0.12 spelling;
+    // v0.13 introduces `[filters].albums = ["name"]`. The deprecated key
+    // must emit a `warn_deprecated` message at config-load time before
+    // it gets lifted into the array form. Drives the warning through the
+    // real `kei config show` entry point so a regression that removes the
+    // emit-site (or moves it inside a branch never reached by config show)
+    // surfaces here.
+    let (_, stderr) = run_config_show("\n[filters]\nalbum = \"Vacation\"\n");
+    assert!(
+        stderr.contains("[filters].album") && stderr.contains("deprecated"),
+        "expected `[filters].album` deprecation warning; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("v0.20.0"),
+        "deprecation warning must name v0.20.0 as removal target; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn deprecation_toml_filters_exclude_albums_warns() {
+    // `[filters].exclude_albums` mirrors `--exclude-album` in TOML; the
+    // v0.13 replacement is `!name` entries inside `[filters].albums`.
+    let (_, stderr) = run_config_show("\n[filters]\nexclude_albums = [\"Drafts\", \"Family\"]\n");
+    assert!(
+        stderr.contains("[filters].exclude_albums") && stderr.contains("deprecated"),
+        "expected `[filters].exclude_albums` deprecation warning; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("!name"),
+        "warning must point at the new `!name` shape; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("v0.20.0"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn deprecation_toml_filters_library_singular_warns() {
+    // `[filters].library = "Foo"` (singular) was the v0.12 spelling; v0.13
+    // accepts `[filters].libraries = ["Foo"]`. The unit test
+    // `test_library_all_from_toml` (config.rs::tests) pins that the legacy
+    // value still loads, but the user-visible warning emission was not
+    // tested at the binary boundary -- a silent removal of the warning
+    // would let users keep running on the deprecated key past v0.20.
+    let (_, stderr) = run_config_show("\n[filters]\nlibrary = \"PrimarySync\"\n");
+    assert!(
+        stderr.contains("[filters].library") && stderr.contains("deprecated"),
+        "expected `[filters].library` deprecation warning; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[filters].libraries"),
+        "warning must name the new array form; stderr:\n{stderr}"
+    );
+}
