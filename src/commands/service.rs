@@ -658,8 +658,9 @@ pub(crate) async fn resolve_passes(
 }
 
 /// Pick the user-album names selected by `albums`. Bails on missing
-/// `Named` entries; missing `excluded` entries warn (excluding nothing is
-/// harmless and the typo is usually obvious from the warn-line context).
+/// `Named` includes and on missing `excluded` entries (a typo'd exclusion
+/// would silently match nothing; better to fail loudly so the user can
+/// correct it).
 fn pick_album_names(
     selector: &crate::selection::AlbumSelector,
     album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
@@ -669,7 +670,7 @@ fn pick_album_names(
     match selector {
         AlbumSelector::None => Ok(Vec::new()),
         AlbumSelector::All { excluded } => {
-            warn_unknown_excluded_albums(excluded, album_map);
+            bail_unknown_excluded_albums(excluded, album_map, smart_names)?;
             Ok(album_map
                 .keys()
                 .filter(|name| {
@@ -700,33 +701,37 @@ fn pick_album_names(
                     anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
                 }
             }
-            warn_unknown_excluded_albums(excluded, album_map);
+            bail_unknown_excluded_albums(excluded, album_map, smart_names)?;
             Ok(chosen)
         }
     }
 }
 
-/// Warn (don't bail) on excluded album names that don't exist. A typo in
-/// `--album '!Family'` is harmless at runtime — the exclusion just doesn't
-/// match anything. The warning surfaces the typo so the user can fix it
-/// next sync without the run failing.
-fn warn_unknown_excluded_albums(
+/// Bail on excluded album names that don't exist. A typo in `--album '!Family'`
+/// would silently match nothing under the otherwise-default `all` selector;
+/// surfacing it as a hard error keeps the user's intent honest.
+fn bail_unknown_excluded_albums(
     excluded: &std::collections::BTreeSet<String>,
     album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
-) {
+    smart_names: &rustc_hash::FxHashSet<&'static str>,
+) -> anyhow::Result<()> {
     for name in excluded {
         if !album_map.contains_key(name.as_str()) {
-            tracing::warn!(
-                excluded = %name,
-                "Excluded album not found; the exclusion will match nothing."
-            );
+            let mut available: Vec<&String> = album_map
+                .keys()
+                .filter(|k| !smart_names.contains(k.as_str()))
+                .collect();
+            available.sort();
+            anyhow::bail!("Excluded album '{name}' not found. Available albums: {available:?}");
         }
     }
+    Ok(())
 }
 
 /// Pick the smart-folder names selected by `smart_folders`. Bails on
-/// `Named` entries that aren't smart folders; warns on missing
-/// `excluded` entries.
+/// `Named` entries that aren't smart folders and on excluded entries
+/// that aren't smart folders (a typo'd exclusion would silently match
+/// nothing).
 fn pick_smart_folder_names(
     selector: &crate::selection::SmartFolderSelector,
     album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
@@ -743,7 +748,7 @@ fn pick_smart_folder_names(
             excluded,
         } => {
             for name in excluded {
-                warn_excluded_not_a_smart_folder(name, smart_names);
+                bail_excluded_not_a_smart_folder(name, smart_names)?;
             }
             Ok(album_map
                 .keys()
@@ -776,20 +781,23 @@ fn pick_smart_folder_names(
                 }
             }
             for name in excluded {
-                warn_excluded_not_a_smart_folder(name, smart_names);
+                bail_excluded_not_a_smart_folder(name, smart_names)?;
             }
             Ok(chosen)
         }
     }
 }
 
-fn warn_excluded_not_a_smart_folder(name: &str, smart_names: &rustc_hash::FxHashSet<&'static str>) {
+fn bail_excluded_not_a_smart_folder(
+    name: &str,
+    smart_names: &rustc_hash::FxHashSet<&'static str>,
+) -> anyhow::Result<()> {
     if !smart_names.contains(name) {
-        tracing::warn!(
-            smart_folder = %name,
-            "Excluded smart folder is not an Apple smart folder, ignoring"
-        );
+        let mut available: Vec<&str> = smart_names.iter().copied().collect();
+        available.sort();
+        anyhow::bail!("Excluded '{name}' is not an Apple smart folder. Available: {available:?}");
     }
+    Ok(())
 }
 
 /// Fetch every selected album's member IDs in parallel. The PhotoAlbums
@@ -1233,12 +1241,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_passes_all_albums_excluded_typo_does_not_bail() {
-        // v0.13 (per migration doc): a typo'd exclusion (`!Vacationn`) is
-        // harmless - the exclusion just doesn't match any album. The pass
-        // resolver should not fail. The warn line surfaces the typo for
-        // the user; that path is exercised in `warn_unknown_excluded_albums`'s
-        // own tests.
+    async fn resolve_passes_all_albums_excluded_typo_bails() {
+        // A typo'd exclusion (`!Vacationn`) under the `all` selector is
+        // ambiguous: the user intended to exclude something but nothing
+        // matches. Bail so they fix the spelling rather than silently
+        // sync every album.
         let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
             folder_record("FOLDER_1", "Vacation"),
             folder_record("FOLDER_2", "Family")
@@ -1251,26 +1258,19 @@ mod tests {
             false,
         );
 
-        let plan = resolve_passes(&library, &sel)
-            .await
-            .expect("typo'd exclusion must not fail resolve_passes");
-        let pass_names: std::collections::BTreeSet<&str> = plan
-            .passes
-            .iter()
-            .filter(|p| p.kind == PassKind::Album)
-            .map(|p| p.album.name.as_ref())
-            .collect();
+        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let msg = err.to_string();
         assert!(
-            pass_names.contains("Vacation") && pass_names.contains("Family"),
-            "typo'd `!Vacationn` should leave both real albums in the plan; got {pass_names:?}",
+            msg.contains("Vacationn") && msg.contains("Vacation") && msg.contains("Family"),
+            "bail must name the typo and the available albums; got {msg}",
         );
     }
 
     #[tokio::test]
-    async fn resolve_passes_named_albums_excluded_typo_does_not_bail() {
-        // v0.13 paired case: Named selector with a typo'd exclude. The
-        // included album still produces its pass; the typo'd exclusion
-        // is a no-op.
+    async fn resolve_passes_named_albums_excluded_typo_bails() {
+        // Same rule under Named: even though the typo'd exclusion can't
+        // affect the included album, surface it so the user knows their
+        // exclusion list is broken.
         let mock = MockPhotosSession::new().ok(serde_json::json!({"records": [
             folder_record("FOLDER_1", "Vacation"),
             folder_record("FOLDER_2", "Family")
@@ -1284,19 +1284,11 @@ mod tests {
             false,
         );
 
-        let plan = resolve_passes(&library, &sel)
-            .await
-            .expect("typo'd exclusion must not fail resolve_passes");
-        let album_pass_names: Vec<&str> = plan
-            .passes
-            .iter()
-            .filter(|p| p.kind == PassKind::Album)
-            .map(|p| p.album.name.as_ref())
-            .collect();
-        assert_eq!(
-            album_pass_names,
-            vec!["Vacation"],
-            "typo'd `!Vacationn` shouldn't affect inclusion of `Vacation`",
+        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Vacationn"),
+            "bail must name the typo'd exclusion; got {msg}",
         );
     }
 
