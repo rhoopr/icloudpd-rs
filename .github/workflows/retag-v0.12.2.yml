@@ -1,0 +1,56 @@
+name: Retag v0.12.2 on ghcr (one-shot)
+
+# One-shot remediation for issue #325. The v0.12.2 docker.yml run produced only
+# :main and the per-commit :6a37560 tag (the underlying release: published trigger
+# never fired -- see PR #327 for the permanent fix). This workflow republishes the
+# already-built :6a37560 manifest under the missing :0.12.2 / :0.12 / :latest tags.
+#
+# Runs entirely registry-side via docker buildx imagetools create; no rebuild,
+# no pull/push of layers, multi-arch manifest preserved.
+#
+# DELETE THIS FILE after a successful run -- it is intentionally workflow_dispatch
+# only and has no other purpose.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show source manifest (:6a37560 = v0.12.2 commit)
+        run: docker buildx imagetools inspect ghcr.io/rhoopr/kei:6a37560
+
+      - name: Retag :6a37560 as :0.12.2 / :0.12 / :latest
+        run: |
+          docker buildx imagetools create \
+            --tag ghcr.io/rhoopr/kei:0.12.2 \
+            --tag ghcr.io/rhoopr/kei:0.12 \
+            --tag ghcr.io/rhoopr/kei:latest \
+            ghcr.io/rhoopr/kei:6a37560
+
+      - name: Verify all four tags resolve to the same multi-arch manifest
+        run: |
+          for tag in 0.12.2 0.12 latest 6a37560; do
+            echo "::group::ghcr.io/rhoopr/kei:$tag"
+            docker buildx imagetools inspect "ghcr.io/rhoopr/kei:$tag"
+            echo "::endgroup::"
+          done
+
+      - name: Smoke test :0.12.2 prints kei 0.12.2
+        run: |
+          OUT=$(docker run --rm ghcr.io/rhoopr/kei:0.12.2 --version)
+          echo "$OUT"
+          echo "$OUT" | grep -q "0.12.2" || { echo "::error::version smoke test failed: $OUT"; exit 1; }
