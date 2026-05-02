@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.13.0] - 2026-05-02
 
-Selection and folder-structure flag redesign. `--exclude-album` becomes `--album '!NAME'`. New `--smart-folder` and `--unfiled` per-category flags. `--library` now repeatable. Per-category `--folder-structure-{albums,smart-folders}` templates with their own defaults. Multi-library scope with `{library}` in any template. State DB schema migrates to v9 (per-zone primary key on `assets`, `asset_albums`, and `asset_people`) on first sync. Old shapes keep working with deprecation warnings until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md). ([#215])
+Selection and folder-structure flag redesign. `--exclude-album` becomes `--album '!NAME'`. New `--smart-folder` and `--unfiled` per-category flags. `--library` now repeatable. Per-category `--folder-structure-{albums,smart-folders}` templates with their own defaults. Multi-library scope with `{library}` in any template. State DB schema migrates to v9 (per-zone primary key on `assets`, `asset_albums`, and `asset_people`) on first sync. Old shapes keep working with deprecation warnings until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md). ([#215], [#288])
 
 ### Added
 
@@ -37,6 +37,8 @@ Selection and folder-structure flag redesign. `--exclude-album` becomes `--album
 - **`[filters].exclude_albums` TOML key.** Merge into `[filters].albums` as `"!name"` entries. The new selector grammar validates contradictions (`"Foo"` and `"!Foo"` together) in one place. Removed in v0.20.0. ([#215])
 - **`[filters].library` (single-string) TOML key.** Use `[filters].libraries = ["name"]` (array). Removed in v0.20.0. ([#215])
 - **Implicit `--album all` from `{album}` token in template.** v0.12 promoted the legacy template-driven shape to "every album" when `--album` was unset; v0.13's new `--album all` default makes the promotion redundant. The compat path still fires but logs a deprecation warning. Removed in v0.20.0. ([#215])
+
+[#288]: https://github.com/rhoopr/kei/pull/288
 
 ---
 
