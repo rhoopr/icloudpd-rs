@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "kei"
-version = "0.12.1-dev"
+version = "0.12.3-dev"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1290,6 +1290,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "bitflags",
  "bytes",
  "chrono",
  "clap",
