@@ -229,7 +229,7 @@ pub struct SyncArgs {
     #[arg(long = "exclude-album", env = "KEI_EXCLUDE_ALBUM", value_delimiter = ',', value_parser = non_empty_string, hide = true)]
     pub exclude_albums: Vec<String>,
 
-    /// Smart folder(s) to download. Repeatable; default empty (smart folders
+    /// Smart folder(s) to download. Repeatable; default `none` (smart folders
     /// are skipped unless opted in). Accepts the same value grammar as
     /// `--album`: a name, the sentinel `all` (every smart folder except
     /// Hidden / Recently Deleted), `all-with-sensitive` (include those two),

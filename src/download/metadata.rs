@@ -474,20 +474,27 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
     tmp_name.push(".meta-tmp");
     let tmp_path = path.with_file_name(&tmp_name);
 
-    // Stream the rewrite straight to disk: the old Vec<u8> output from
-    // insert_xmp was one full-file-sized copy we didn't need.
-    {
-        let file = std::fs::File::create(&tmp_path)
-            .with_context(|| format!("Creating {}", tmp_path.display()))?;
-        let mut writer = std::io::BufWriter::new(file);
-        heif::insert_xmp(&input, &xmp_bytes, &mut writer)
-            .with_context(|| format!("Inserting XMP into HEIC {}", path.display()))?;
-        writer
-            .into_inner()
-            .with_context(|| format!("Flushing patched HEIC to {}", tmp_path.display()))?
-            .sync_all()
-            .with_context(|| format!("fsync for {}", tmp_path.display()))?;
-    }
+    // Stream the rewrite straight to disk and keep the descriptor open
+    // through the post-rewrite validation: the old Vec<u8> output from
+    // insert_xmp was one full-file-sized copy we didn't need, and
+    // reusing the same fd for the magic-byte probe (below) avoids a
+    // second `open()` and the race with whatever interleaves with it.
+    // `read(true)` is required because `File::create` opens write-only.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)
+        .with_context(|| format!("Creating {}", tmp_path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    heif::insert_xmp(&input, &xmp_bytes, &mut writer)
+        .with_context(|| format!("Inserting XMP into HEIC {}", path.display()))?;
+    let mut file = writer
+        .into_inner()
+        .with_context(|| format!("Flushing patched HEIC to {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("fsync for {}", tmp_path.display()))?;
 
     // MS-6: Defense-in-depth — read the first 12 bytes back and confirm
     // the rewritten file still starts with a HEIF `ftyp` brand before
@@ -496,7 +503,8 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
     // ftyp, wrong magic, truncated header) before the corrupt file
     // becomes visible.
     let validate_guard = TmpGuard::new(&tmp_path);
-    validate_heif_post_rewrite(&tmp_path)?;
+    validate_heif_post_rewrite(&mut file, &tmp_path)?;
+    drop(file);
     std::fs::rename(&tmp_path, path)
         .with_context(|| format!("Renaming {} -> {}", tmp_path.display(), path.display()))?;
     validate_guard.disarm();
@@ -504,17 +512,18 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
     Ok(())
 }
 
-/// Read the first 12 bytes of `tmp_path` and verify the file starts with
-/// an ISO-BMFF `ftyp` box whose major brand is in the HEIF family. Used
-/// as a sanity check between `insert_xmp` and the atomic rename so a
-/// malformed rewrite never lands on disk.
-fn validate_heif_post_rewrite(tmp_path: &Path) -> Result<()> {
-    use std::io::Read;
-    let mut probe = std::fs::File::open(tmp_path)
-        .with_context(|| format!("Reopening {} for magic-byte probe", tmp_path.display()))?;
+/// Read the first 12 bytes of `file` and verify it starts with an
+/// ISO-BMFF `ftyp` box whose major brand is in the HEIF family. Used as
+/// a sanity check between `insert_xmp` and the atomic rename so a
+/// malformed rewrite never lands on disk. Reads from the still-open
+/// rewrite handle (seeks back to 0) to avoid reopening `tmp_path`
+/// immediately after `sync_all`; the path is only used for diagnostics.
+fn validate_heif_post_rewrite(file: &mut std::fs::File, tmp_path: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("Rewinding {} for magic-byte probe", tmp_path.display()))?;
     let mut head = [0u8; 12];
-    probe
-        .read_exact(&mut head)
+    file.read_exact(&mut head)
         .with_context(|| format!("Reading magic bytes of {}", tmp_path.display()))?;
     if !heif::is_heif_content(&head) {
         anyhow::bail!(
@@ -652,7 +661,8 @@ mod tests {
         bytes.extend_from_slice(b"heic");
         bytes.extend_from_slice(b"mif1");
         fs::write(&path, &bytes).unwrap();
-        validate_heif_post_rewrite(&path).expect("known-good heic head must validate");
+        let mut f = fs::File::open(&path).unwrap();
+        validate_heif_post_rewrite(&mut f, &path).expect("known-good heic head must validate");
         fs::remove_file(&path).ok();
     }
 
@@ -669,7 +679,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let err = validate_heif_post_rewrite(&path).unwrap_err();
+        let mut f = fs::File::open(&path).unwrap();
+        let err = validate_heif_post_rewrite(&mut f, &path).unwrap_err();
         assert!(err.to_string().contains("ftyp/HEIF brand"), "msg: {err}");
         fs::remove_file(&path).ok();
     }
@@ -688,7 +699,8 @@ mod tests {
         bytes.extend_from_slice(b"mp42");
         bytes.extend_from_slice(b"isom");
         fs::write(&path, &bytes).unwrap();
-        let err = validate_heif_post_rewrite(&path).unwrap_err();
+        let mut f = fs::File::open(&path).unwrap();
+        let err = validate_heif_post_rewrite(&mut f, &path).unwrap_err();
         assert!(err.to_string().contains("ftyp/HEIF brand"), "msg: {err}");
         fs::remove_file(&path).ok();
     }

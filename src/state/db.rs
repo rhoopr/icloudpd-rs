@@ -4358,7 +4358,9 @@ mod tests {
 
     /// v9 PK adds `library`: same `(asset_id, album_name, source)` triple
     /// in two libraries must round-trip as two distinct rows. Pre-v9 this
-    /// silently collapsed via `INSERT OR IGNORE`.
+    /// silently collapsed via `INSERT OR IGNORE`. Assertions filter by
+    /// `library` so a regression that wrote both rows under the same zone
+    /// (the exact bug v9 prevents) cannot pass with COUNT(*) = 2.
     #[tokio::test]
     async fn add_asset_album_keeps_distinct_rows_per_library() {
         let db = SqliteStateDb::open_in_memory().unwrap();
@@ -4369,16 +4371,29 @@ mod tests {
             .await
             .unwrap();
         let conn = db.acquire_lock("test").unwrap();
-        let count: i64 = conn
+        let primary_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM asset_albums WHERE asset_id = 'SHARED_ID'",
+                "SELECT COUNT(*) FROM asset_albums \
+                 WHERE asset_id = 'SHARED_ID' AND library = 'PrimarySync'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let shared_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_albums \
+                 WHERE asset_id = 'SHARED_ID' AND library = 'SharedSync-A1B2C3D4'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
-            count, 2,
-            "v9 PK must keep per-library rows distinct on the same asset_id"
+            primary_count, 1,
+            "PrimarySync must hold exactly one row for SHARED_ID"
+        );
+        assert_eq!(
+            shared_count, 1,
+            "SharedSync-A1B2C3D4 must hold exactly one row for SHARED_ID"
         );
     }
 
