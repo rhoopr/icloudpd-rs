@@ -59,6 +59,28 @@ pub(crate) fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Async wrapper around [`fsync_parent_dir`] that runs the blocking
+/// syscall on the blocking pool and swallows every error class with a
+/// warn. Use when the caller has already committed to the rename
+/// being durable enough on its own (the bytes are at `path`, the
+/// metadata flush is best-effort).
+pub(crate) async fn fsync_parent_dir_async_best_effort(path: &Path) {
+    let path_buf = path.to_path_buf();
+    match tokio::task::spawn_blocking(move || fsync_parent_dir(&path_buf)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "parent-dir fsync failed; durability of rename not guaranteed"
+        ),
+        Err(join_err) => tracing::warn!(
+            path = %path.display(),
+            error = %join_err,
+            "parent-dir fsync task panicked; durability of rename not guaranteed"
+        ),
+    }
+}
+
 /// Install `src` at `dst` atomically.
 ///
 /// Prefers `rename` (atomic on the same device); on EXDEV, copies to a

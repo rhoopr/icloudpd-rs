@@ -54,7 +54,7 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match — preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 9;
+const HELPER_SCHEMA_VERSION: i32 = 10;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the v9 schema from `src/state/schema.rs` (the
@@ -127,7 +127,8 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             assets_downloaded INTEGER DEFAULT 0,
             assets_failed INTEGER DEFAULT 0,
             interrupted INTEGER DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'running'
+            status TEXT NOT NULL DEFAULT 'running',
+            enumeration_errors INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS metadata (
@@ -204,7 +205,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 9;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 10;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -3984,6 +3985,10 @@ fn behavioral_helper_carries_every_migrated_column() {
     assert!(
         has_column(&conn, "asset_people", "library"),
         "v9 column asset_people.library must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "sync_runs", "enumeration_errors"),
+        "v10 column sync_runs.enumeration_errors must exist in the behavioral helper's DDL"
     );
 
     let has_asset_albums: bool = conn

@@ -1055,6 +1055,7 @@ impl StateDb for SqliteStateDb {
         let assets_seen = i64::try_from(stats.assets_seen).unwrap_or(i64::MAX);
         let assets_downloaded = i64::try_from(stats.assets_downloaded).unwrap_or(i64::MAX);
         let assets_failed = i64::try_from(stats.assets_failed).unwrap_or(i64::MAX);
+        let enumeration_errors = i64::try_from(stats.enumeration_errors).unwrap_or(i64::MAX);
         let interrupted_i32 = i32::from(stats.interrupted);
         let status = if stats.interrupted {
             "interrupted"
@@ -1065,7 +1066,8 @@ impl StateDb for SqliteStateDb {
         self.with_conn("complete_sync_run", move |conn| {
             conn.execute(
                 "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, \
-                 assets_failed = ?4, interrupted = ?5, status = ?6 WHERE id = ?7",
+                 assets_failed = ?4, interrupted = ?5, status = ?6, enumeration_errors = ?7 \
+                 WHERE id = ?8",
                 rusqlite::params![
                     completed_at,
                     assets_seen,
@@ -1073,6 +1075,7 @@ impl StateDb for SqliteStateDb {
                     assets_failed,
                     interrupted_i32,
                     status,
+                    enumeration_errors,
                     run_id
                 ],
             )
@@ -2235,6 +2238,7 @@ mod tests {
             assets_seen: 100,
             assets_downloaded: 95,
             assets_failed: 5,
+            enumeration_errors: 0,
             interrupted: false,
         };
 
@@ -2272,10 +2276,40 @@ mod tests {
             assets_seen: 1,
             assets_downloaded: 1,
             assets_failed: 0,
+            enumeration_errors: 0,
             interrupted: false,
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
         assert_eq!(status_of(&db, run_id), "complete");
+    }
+
+    /// `enumeration_errors` must round-trip from `SyncRunStats` into the
+    /// on-disk `sync_runs.enumeration_errors` column.
+    #[tokio::test]
+    async fn complete_sync_run_persists_enumeration_errors_column() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let stats = SyncRunStats {
+            assets_seen: 0,
+            assets_downloaded: 0,
+            assets_failed: 0,
+            enumeration_errors: 17,
+            interrupted: false,
+        };
+        db.complete_sync_run(run_id, &stats).await.unwrap();
+
+        let conn = db.acquire_lock("test_enum_errors_column").unwrap();
+        let stored: i64 = conn
+            .query_row(
+                "SELECT enumeration_errors FROM sync_runs WHERE id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, 17,
+            "enumeration_errors must round-trip from SyncRunStats to sync_runs row"
+        );
     }
 
     #[tokio::test]
@@ -2286,6 +2320,7 @@ mod tests {
             assets_seen: 1,
             assets_downloaded: 0,
             assets_failed: 0,
+            enumeration_errors: 0,
             interrupted: true,
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
@@ -2303,6 +2338,7 @@ mod tests {
             assets_seen: 0,
             assets_downloaded: 0,
             assets_failed: 0,
+            enumeration_errors: 0,
             interrupted: false,
         };
         db.complete_sync_run(c, &clean).await.unwrap();
@@ -2323,6 +2359,7 @@ mod tests {
             assets_seen: 0,
             assets_downloaded: 0,
             assets_failed: 0,
+            enumeration_errors: 0,
             interrupted: false,
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
@@ -2404,6 +2441,7 @@ mod tests {
             assets_seen: 1,
             assets_downloaded: 1,
             assets_failed: 0,
+            enumeration_errors: 0,
             interrupted: false,
         };
         db.complete_sync_run(r1, &stats).await.unwrap();
@@ -3290,6 +3328,7 @@ mod tests {
             assets_seen: 0,
             assets_downloaded: 0,
             assets_failed: 0,
+            enumeration_errors: 0,
             interrupted: false,
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();

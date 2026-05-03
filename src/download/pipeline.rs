@@ -1645,6 +1645,10 @@ where
             assets_seen: assets_seen_count,
             assets_downloaded: downloaded as u64,
             assets_failed: failed.len() as u64,
+            enumeration_errors: u64::try_from(
+                enum_errors.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .unwrap_or(u64::MAX),
             interrupted: shutdown_token.is_cancelled()
                 || auth_errors >= AUTH_ERROR_THRESHOLD
                 || producer_panicked,
@@ -2471,12 +2475,15 @@ pub(super) fn log_sync_summary(title: &str, stats: &super::SyncStats) {
         );
     }
 
-    // Line 2: error details (only if any)
-    if stats.exif_failures > 0 || stats.state_write_failures > 0 {
+    // Line 2: error details (only if any). `enumeration_errors` can
+    // gate `PartialFailure` on its own, so an operator chasing exit
+    // code 2 with no other failure counts needs to see it here.
+    if stats.exif_failures > 0 || stats.state_write_failures > 0 || stats.enumeration_errors > 0 {
         tracing::info!(
-            "  {} EXIF write failure(s), {} state write failure(s)",
+            "  {} EXIF write failure(s), {} state write failure(s), {} enumeration error(s)",
             stats.exif_failures,
-            stats.state_write_failures
+            stats.state_write_failures,
+            stats.enumeration_errors
         );
     }
 
@@ -3809,6 +3816,50 @@ mod tests {
         assert!(
             logs_contain("Skipped:"),
             "skipped breakdown line expected when stats.skipped.total() > 0"
+        );
+    }
+
+    /// When only `enumeration_errors` is non-zero, the line-2 conditional
+    /// must still fire. Otherwise an enumeration-error-driven
+    /// `PartialFailure` would produce an empty failure line and an
+    /// operator chasing exit code 2 has no count.
+    #[tracing_test::traced_test]
+    #[test]
+    fn log_sync_summary_emits_enumeration_errors_when_only_enum_errs() {
+        let stats = super::super::SyncStats {
+            downloaded: 0,
+            failed: 0,
+            enumeration_errors: 4,
+            ..Default::default()
+        };
+
+        super::log_sync_summary("── Test Summary ──", &stats);
+
+        assert!(
+            logs_contain("4 enumeration error(s)"),
+            "line 2 must surface enumeration_errors when nonzero"
+        );
+    }
+
+    /// Inverse of the above: when every error counter is zero, the
+    /// line-2 conditional must not fire.
+    #[tracing_test::traced_test]
+    #[test]
+    fn log_sync_summary_no_error_line_when_all_counters_zero() {
+        let stats = super::super::SyncStats {
+            downloaded: 5,
+            ..Default::default()
+        };
+
+        super::log_sync_summary("── Test Summary ──", &stats);
+
+        assert!(
+            !logs_contain("EXIF write failure"),
+            "line 2 must not fire when exif/state/enum counters are all zero"
+        );
+        assert!(
+            !logs_contain("enumeration error"),
+            "line 2 must not fire when exif/state/enum counters are all zero"
         );
     }
 

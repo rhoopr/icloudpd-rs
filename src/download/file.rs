@@ -440,7 +440,16 @@ pub(super) async fn rename_part_to_final(
     final_path: &Path,
 ) -> anyhow::Result<()> {
     match fs::rename(part_path, final_path).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // ext4 default `data=ordered` does not guarantee directory
+            // entry durability after `rename` returns Ok: a power loss
+            // between rename and the kernel committing the dir block
+            // can leave `final_path` absent on reboot. Best-effort
+            // fsync the parent so the worst case is one redundant
+            // re-download next sync, not silent loss.
+            crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
+            Ok(())
+        }
         Err(rename_err) if fs::try_exists(final_path).await.unwrap_or(false) => {
             // Another task won the race — clean up our .part file.
             tracing::debug!(
