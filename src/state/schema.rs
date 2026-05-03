@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 9;
+pub(crate) const SCHEMA_VERSION: i32 = 10;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -424,6 +424,21 @@ fn migrate_to_version(
             // Idempotent: re-running on a v9 DB skips the recreate-table dance.
             if !column_exists(conn, "asset_albums", "library")? {
                 conn.execute_batch(schema_v9())?;
+            }
+        }
+        10 => {
+            // sync_runs.enumeration_errors: per-run count of records the
+            // producer could not enumerate. Pre-v10 the only signals were
+            // `tracing::error!` log lines and the in-memory
+            // `SyncStats.enumeration_errors`; nothing landed in
+            // `sync_runs`, so `kei status` could not surface a
+            // PartialFailure driven purely by enumeration errors. Default
+            // 0 is the correct backfill: every existing row predates this
+            // counter and never recorded the value.
+            if !column_exists(conn, "sync_runs", "enumeration_errors")? {
+                conn.execute_batch(
+                    "ALTER TABLE sync_runs ADD COLUMN enumeration_errors INTEGER NOT NULL DEFAULT 0;",
+                )?;
             }
         }
         other => {
@@ -1377,5 +1392,55 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "v9 must (re)create {idx}");
         }
+    }
+
+    /// MS-1 (2026-05-03 robustness review): v10 adds
+    /// `sync_runs.enumeration_errors`. Verify the column lands on a fresh
+    /// migrate and is back-filled to 0 on existing rows. Defends against a
+    /// future migration that forgets to add the column or picks a wrong
+    /// default that breaks the NOT NULL constraint on backfill.
+    #[test]
+    fn test_v10_adds_enumeration_errors_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Pre-seed at v9 with the v9 schema, plus one sync_runs row to
+        // exercise the backfill default.
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+        migrate(&conn).unwrap();
+
+        // Column must exist after migration to current.
+        let has_col = column_exists(&conn, "sync_runs", "enumeration_errors").unwrap();
+        assert!(has_col, "v10 must add `enumeration_errors` to sync_runs");
+
+        // Default 0 must apply to a fresh insert that omits the column.
+        conn.execute(
+            "INSERT INTO sync_runs (started_at) VALUES (?1)",
+            [1700000000_i64],
+        )
+        .unwrap();
+        let stored: i64 = conn
+            .query_row(
+                "SELECT enumeration_errors FROM sync_runs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, 0,
+            "default 0 must apply to inserts that omit the column"
+        );
+    }
+
+    /// MS-1 idempotent re-entry: applying v10 to a DB that already has the
+    /// column (e.g. crash recovery, partial migration) must not error.
+    #[test]
+    fn test_v10_idempotent_when_column_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        // Reset version backwards and re-run the v10 step. This simulates
+        // an unusual recovery path; the migration must not fail.
+        set_schema_version(&conn, 9).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 }

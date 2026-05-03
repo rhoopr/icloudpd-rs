@@ -429,6 +429,12 @@ pub struct SyncRunStats {
     pub assets_downloaded: u64,
     /// Number of assets that failed to download.
     pub assets_failed: u64,
+    /// Number of records the producer could not enumerate (CloudKit error
+    /// per-record, transient API failures past retry budget). Drives
+    /// `PartialFailure` in the zero-download branch even when
+    /// `assets_failed == 0`; recorded in `sync_runs` so `kei status` can
+    /// surface it without grepping logs.
+    pub enumeration_errors: u64,
     /// Whether the sync was interrupted (shutdown, re-auth, etc.).
     pub interrupted: bool,
 }
