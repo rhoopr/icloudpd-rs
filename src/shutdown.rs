@@ -24,14 +24,8 @@ const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const FORCE_EXIT_CODE: i32 = 130;
 
 /// Wait `timeout`, then invoke `on_timeout` with [`FORCE_EXIT_CODE`].
-/// Extracted from the inline shutdown task so tests can swap the
-/// real `std::process::exit` for a recording callback and use
-/// `tokio::time::pause` + `advance` to fire the timeout deterministically
-/// without terminating the test binary.
-///
-/// The warn line is part of the contract: a future regression that
-/// drops it would silently change shutdown behaviour and an operator
-/// chasing a SIGKILL'd run would have nothing to grep for.
+/// The warn line is part of the contract: an operator chasing a
+/// SIGKILL'd run greps for it.
 pub(crate) async fn wait_then_force_exit<F>(timeout: Duration, on_timeout: F)
 where
     F: FnOnce(i32),
@@ -136,66 +130,46 @@ mod tests {
         assert!(!token.is_cancelled());
     }
 
-    /// CG-4 (2026-05-03 test review): the timeout branch of
-    /// `install_signal_handler` (which fires when in-flight downloads
-    /// fail to drain inside `GRACEFUL_SHUTDOWN_TIMEOUT`) was previously
-    /// unexercised because it called `std::process::exit(130)` directly
-    /// and would terminate the test binary. After extracting
-    /// `wait_then_force_exit` with an injectable callback, the timeout
-    /// arm is testable: pause the runtime clock, await the helper, and
-    /// observe that the callback fired with code 130. A regression that
-    /// changed the timeout constant or dropped the warn line is now
-    /// loud.
+    /// `start_paused = true` lets tokio auto-advance the clock when
+    /// nothing else can make progress, so awaiting the helper runs the
+    /// sleep to completion without wall-clock delay.
     #[tracing_test::traced_test]
     #[tokio::test(start_paused = true)]
     async fn shutdown_grace_period_elapses_invokes_exit_callback() {
-        let exited = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+        let exited: Arc<std::sync::Mutex<Option<i32>>> = Arc::new(std::sync::Mutex::new(None));
         let exited_clone = Arc::clone(&exited);
 
-        // With `start_paused = true`, tokio auto-advances the clock when
-        // nothing else can make progress. Awaiting the future runs the
-        // sleep to completion without wall-clock delay.
         wait_then_force_exit(Duration::from_secs(30), move |code| {
-            exited_clone.store(code, Ordering::SeqCst);
+            *exited_clone.lock().unwrap() = Some(code);
         })
         .await;
 
-        assert_eq!(
-            exited.load(Ordering::SeqCst),
-            FORCE_EXIT_CODE,
-            "callback must fire with FORCE_EXIT_CODE (130) after the timeout elapses"
-        );
+        assert_eq!(*exited.lock().unwrap(), Some(FORCE_EXIT_CODE));
         assert!(
             logs_contain("Graceful shutdown timed out"),
             "warn line must accompany the timeout fire so operators can grep for it"
         );
     }
 
-    /// CG-4 negative: if `on_timeout` never gets called, the callback's
-    /// `i32` slot stays at the sentinel. Catches a regression that
-    /// fires the callback before the sleep elapses (e.g. swapping the
-    /// order of statements).
     #[tokio::test(start_paused = true)]
     async fn wait_then_force_exit_does_not_fire_before_timeout() {
-        let exited = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+        let exited: Arc<std::sync::Mutex<Option<i32>>> = Arc::new(std::sync::Mutex::new(None));
         let exited_clone = Arc::clone(&exited);
 
         let handle = tokio::spawn(wait_then_force_exit(Duration::from_secs(30), move |code| {
-            exited_clone.store(code, Ordering::SeqCst);
+            *exited_clone.lock().unwrap() = Some(code);
         }));
 
-        // Advance only halfway. The sleep has not elapsed; the callback
-        // must not have fired.
         tokio::time::advance(Duration::from_secs(15)).await;
         assert_eq!(
-            exited.load(Ordering::SeqCst),
-            -1,
+            *exited.lock().unwrap(),
+            None,
             "callback must not fire before the configured timeout elapses"
         );
 
         // Drain the rest so the spawned task completes cleanly.
         tokio::time::advance(Duration::from_secs(20)).await;
         handle.await.unwrap();
-        assert_eq!(exited.load(Ordering::SeqCst), FORCE_EXIT_CODE);
+        assert_eq!(*exited.lock().unwrap(), Some(FORCE_EXIT_CODE));
     }
 }
