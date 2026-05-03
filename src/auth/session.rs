@@ -170,17 +170,7 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     fs::rename(&tmp, path)
         .await
         .with_context(|| format!("Failed to rename {} to {}", tmp.display(), path.display()))?;
-    let path_buf = path.to_path_buf();
-    if let Err(e) = tokio::task::spawn_blocking(move || crate::fs_util::fsync_parent_dir(&path_buf))
-        .await
-        .map_err(|e| anyhow::anyhow!("parent fsync join error: {e}"))?
-    {
-        tracing::warn!(
-            path = %path.display(),
-            error = %e,
-            "fsync of parent directory failed after atomic_write"
-        );
-    }
+    crate::fs_util::fsync_parent_dir_async_best_effort(path).await;
     Ok(())
 }
 

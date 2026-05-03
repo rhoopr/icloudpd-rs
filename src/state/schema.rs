@@ -427,14 +427,9 @@ fn migrate_to_version(
             }
         }
         10 => {
-            // sync_runs.enumeration_errors: per-run count of records the
-            // producer could not enumerate. Pre-v10 the only signals were
-            // `tracing::error!` log lines and the in-memory
-            // `SyncStats.enumeration_errors`; nothing landed in
-            // `sync_runs`, so `kei status` could not surface a
-            // PartialFailure driven purely by enumeration errors. Default
-            // 0 is the correct backfill: every existing row predates this
-            // counter and never recorded the value.
+            // sync_runs.enumeration_errors: per-run count of records
+            // the producer could not enumerate. Default 0 is the
+            // correct backfill -- existing rows predate the counter.
             if !column_exists(conn, "sync_runs", "enumeration_errors")? {
                 conn.execute_batch(
                     "ALTER TABLE sync_runs ADD COLUMN enumeration_errors INTEGER NOT NULL DEFAULT 0;",
@@ -1394,11 +1389,9 @@ mod tests {
         }
     }
 
-    /// MS-1 (2026-05-03 robustness review): v10 adds
-    /// `sync_runs.enumeration_errors`. Verify the column lands on a fresh
-    /// migrate and is back-filled to 0 on existing rows. Defends against a
-    /// future migration that forgets to add the column or picks a wrong
-    /// default that breaks the NOT NULL constraint on backfill.
+    /// v10 must add `sync_runs.enumeration_errors` and back-fill to 0
+    /// on existing rows. Catches a future migration that forgets the
+    /// column or picks a wrong default that breaks NOT NULL on backfill.
     #[test]
     fn test_v10_adds_enumeration_errors_column() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1431,8 +1424,8 @@ mod tests {
         );
     }
 
-    /// MS-1 idempotent re-entry: applying v10 to a DB that already has the
-    /// column (e.g. crash recovery, partial migration) must not error.
+    /// Idempotent re-entry: applying v10 to a DB that already has the
+    /// column (crash recovery, partial migration) must not error.
     #[test]
     fn test_v10_idempotent_when_column_exists() {
         let conn = Connection::open_in_memory().unwrap();

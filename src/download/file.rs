@@ -442,33 +442,12 @@ pub(super) async fn rename_part_to_final(
     match fs::rename(part_path, final_path).await {
         Ok(()) => {
             // ext4 default `data=ordered` does not guarantee directory
-            // entry durability after `rename` returns Ok — a power loss
-            // between rename and the kernel committing the dir block can
-            // leave `final_path` absent on reboot. Mirrors the post-rename
-            // fsync that `atomic_install` already does for credentials and
-            // session files; the data path was previously weaker than the
-            // credential path. Best-effort: a parent-dir fsync failure is
-            // warned but doesn't fail the download (the bytes are on disk
-            // and the rename returned Ok; the worst case is one redundant
-            // re-download next sync).
-            let parent_for_fsync = final_path.to_path_buf();
-            let fsync_result = tokio::task::spawn_blocking(move || {
-                crate::fs_util::fsync_parent_dir(&parent_for_fsync)
-            })
-            .await;
-            match fsync_result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    path = %final_path.display(),
-                    error = %e,
-                    "parent-dir fsync after rename failed; durability not guaranteed for this file"
-                ),
-                Err(join_err) => tracing::warn!(
-                    path = %final_path.display(),
-                    error = %join_err,
-                    "parent-dir fsync task panicked; durability not guaranteed for this file"
-                ),
-            }
+            // entry durability after `rename` returns Ok: a power loss
+            // between rename and the kernel committing the dir block
+            // can leave `final_path` absent on reboot. Best-effort
+            // fsync the parent so the worst case is one redundant
+            // re-download next sync, not silent loss.
+            crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
             Ok(())
         }
         Err(rename_err) if fs::try_exists(final_path).await.unwrap_or(false) => {

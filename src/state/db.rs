@@ -2283,13 +2283,8 @@ mod tests {
         assert_eq!(status_of(&db, run_id), "complete");
     }
 
-    /// MS-1 (2026-05-03 robustness review): the new `enumeration_errors`
-    /// column on `sync_runs` (schema v10) carries the per-run count of
-    /// records the producer could not enumerate. Pre-v10 the only signals
-    /// were tracing logs and the in-memory `SyncStats.enumeration_errors`,
-    /// so `kei status` could not surface a `PartialFailure` driven purely
-    /// by enumeration errors. This test pins the round-trip from
-    /// `SyncRunStats.enumeration_errors` to the on-disk column.
+    /// `enumeration_errors` must round-trip from `SyncRunStats` into the
+    /// on-disk `sync_runs.enumeration_errors` column.
     #[tokio::test]
     async fn complete_sync_run_persists_enumeration_errors_column() {
         let db = SqliteStateDb::open_in_memory().unwrap();
