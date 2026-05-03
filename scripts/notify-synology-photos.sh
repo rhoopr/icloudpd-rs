@@ -44,13 +44,16 @@ fi
 : "${SYNOLOGY_USERNAME:?SYNOLOGY_USERNAME must be set}"
 : "${SYNOLOGY_PASSWORD:?SYNOLOGY_PASSWORD must be set}"
 
-CURL_OPTS="-s --max-time 30"
+# Use `set --` to build curl opts as positional params; unquoted string
+# expansion (CURL_OPTS=...; curl $CURL_OPTS) word-splits incorrectly on
+# values containing spaces (shellcheck SC2086).
+set -- -s --max-time 30
 if [ "${SYNOLOGY_INSECURE:-0}" = "1" ]; then
-    CURL_OPTS="$CURL_OPTS -k"
+    set -- "$@" -k
 fi
 
 # 1. Login -> session id (DSM Auth API is stable since DSM 6).
-LOGIN=$(curl $CURL_OPTS -G "$SYNOLOGY_URL/webapi/entry.cgi" \
+LOGIN=$(curl "$@" -G "$SYNOLOGY_URL/webapi/entry.cgi" \
     --data-urlencode "api=SYNO.API.Auth" \
     --data-urlencode "version=6" \
     --data-urlencode "method=login" \
@@ -59,7 +62,9 @@ LOGIN=$(curl $CURL_OPTS -G "$SYNOLOGY_URL/webapi/entry.cgi" \
     --data-urlencode "session=DSM" \
     --data-urlencode "format=sid")
 
-SID=$(printf '%s' "$LOGIN" | sed -n 's/.*"sid":"\([^"]*\)".*/\1/p')
+# Extract the sid via grep -o so an unrelated earlier "sid" field in an
+# error envelope can't match. The first "sid":"..." occurrence wins.
+SID=$(printf '%s' "$LOGIN" | grep -o '"sid":"[^"]*"' | head -1 | sed 's/.*"sid":"\([^"]*\)"/\1/')
 
 if [ -z "$SID" ]; then
     echo "kei-notify-synology: login failed: $LOGIN" >&2
@@ -71,7 +76,7 @@ fi
 # user has configured in DSM (email, push, etc).
 MSG="kei sync complete: ${KEI_DOWNLOADED} downloaded, ${KEI_FAILED:-0} failed, ${KEI_SKIPPED:-0} skipped"
 
-curl $CURL_OPTS "$SYNOLOGY_URL/webapi/entry.cgi" \
+curl "$@" "$SYNOLOGY_URL/webapi/entry.cgi" \
     --data-urlencode "api=SYNO.Core.Notification.Mail" \
     --data-urlencode "version=1" \
     --data-urlencode "method=send" \
@@ -92,7 +97,7 @@ curl $CURL_OPTS "$SYNOLOGY_URL/webapi/entry.cgi" \
 # fi
 
 # 4. Logout (best-effort).
-curl $CURL_OPTS -G "$SYNOLOGY_URL/webapi/entry.cgi" \
+curl "$@" -G "$SYNOLOGY_URL/webapi/entry.cgi" \
     --data-urlencode "api=SYNO.API.Auth" \
     --data-urlencode "version=6" \
     --data-urlencode "method=logout" \

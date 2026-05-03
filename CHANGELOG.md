@@ -11,9 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Docker image now honors `PUID` and `PGID` environment variables.** When set, the container's entrypoint creates a user with those IDs, chowns `/config` and `/photos` to them, and drops privileges via `gosu` before running kei. Without them, the container runs as root (preserves prior default). This unblocks NAS deployments (Synology Container Manager, Unraid, TrueNAS Scale) where downstream indexers like Synology Photos can't see root-owned files. The recursive chown is gated on the top-level UID already matching, so subsequent restarts are fast even on large `/photos` volumes.
-- **Synology deployment guide.** New wiki page covers Container Manager setup, the typical Synology UID/GID values (`PUID=1026 PGID=100`), Synology Photos library paths, first-run 2FA via DSM terminal, and port-conflict handling.
-- **`scripts/notify-synology-photos.sh` example.** Reference notification script that pings Synology DSM with sync stats after a completed cycle (using the documented `SYNO.Core.Notification.Mail` API), with a commented-out section for explicit reindex via SSH + `synoindex`. Wired into kei via the existing `--notification-script` hook; no kei code knows about Synology. Synology Photos's universal scanner already picks up new files via inotify within seconds, so the notification path is informational rather than required.
+- **Docker image now honors `PUID` and `PGID` environment variables.** When both are set, the container's entrypoint chowns ownership-mismatched files in `/config` and `/photos` to that UID:GID and drops privileges via `gosu` before running kei. Setting only one is rejected; setting neither preserves the prior root-default. The chown uses `find -not -uid` so a multi-TB volume only pays for stragglers, not the full tree, on every restart. Unblocks NAS deployments (Synology Container Manager, Unraid, TrueNAS Scale) where downstream indexers like Synology Photos can't see root-owned files. ([Synology wiki](https://github.com/rhoopr/kei/wiki/Synology), [Docker wiki](https://github.com/rhoopr/kei/wiki/Docker))
 
 ---
 
