@@ -45,6 +45,8 @@ pub(crate) struct TomlAuth {
     pub password_file: Option<String>,
     pub password_command: Option<String>,
     pub domain: Option<Domain>,
+    /// Deprecated v0.13: use top-level `data_dir` (which also stores
+    /// sessions, state DB, credentials, and health). Removed in v0.20.
     pub cookie_directory: Option<String>,
 }
 
@@ -59,6 +61,7 @@ pub(crate) struct TomlDownload {
     /// `{smart-folder}`.
     pub folder_structure_smart_folders: Option<String>,
     pub threads: Option<u16>,
+    /// Deprecated v0.13: use `threads`. Removed in v0.20.
     pub threads_num: Option<u16>,
     pub bandwidth_limit: Option<String>,
     pub temp_suffix: Option<String>,
@@ -82,6 +85,8 @@ pub(crate) struct TomlDownload {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlRetry {
     pub max_retries: Option<u32>,
+    /// Deprecated v0.13: initial retry delay is now derived from
+    /// `max_retries` via a smart table. Removed in v0.20.
     pub delay: Option<u64>,
 }
 
@@ -106,6 +111,8 @@ pub(crate) struct TomlFilters {
     pub filename_exclude: Option<Vec<String>>,
     pub skip_videos: Option<bool>,
     pub skip_photos: Option<bool>,
+    /// Deprecated v0.13: use `[photos] live_photo_mode = "skip"`. Removed
+    /// in v0.20.
     pub skip_live_photos: Option<bool>,
     pub recent: Option<crate::cli::RecentLimit>,
     pub skip_created_before: Option<String>,
@@ -1686,11 +1693,14 @@ impl Config {
                 .and_then(|w| w.pid_file.as_ref())
                 .map(PathBuf::from)
         });
-        // [watch] reconcile_every_n_cycles is TOML-only (no CLI flag yet).
-        // Treat `Some(0)` and absence identically — both disable the walk.
-        // The watch loop also short-circuits when not in watch mode.
-        let reconcile_every_n_cycles = toml_watch
-            .and_then(|w| w.reconcile_every_n_cycles)
+        // CLI `--reconcile-every-n-cycles` (also `KEI_RECONCILE_EVERY_N_CYCLES`
+        // via clap's `env =`) overrides `[watch] reconcile_every_n_cycles`
+        // in TOML. The CLI value parser already rejects 0; the `.filter` keeps
+        // the TOML "0 = off" semantic (and the watch loop short-circuits in
+        // single-shot mode regardless).
+        let reconcile_every_n_cycles = sync
+            .reconcile_every_n_cycles
+            .or_else(|| toml_watch.and_then(|w| w.reconcile_every_n_cycles))
             .filter(|n| *n > 0);
 
         // Notifications
@@ -5141,6 +5151,70 @@ mod tests {
                 "unexpected error for env={bad}: {err}"
             );
         }
+    }
+
+    // ── Config::build: reconcile_every_n_cycles ────────────────────
+
+    #[test]
+    fn test_build_reconcile_cli_overrides_toml() {
+        let toml_str = r#"
+            [watch]
+            reconcile_every_n_cycles = 24
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.reconcile_every_n_cycles = Some(6);
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        assert_eq!(cfg.reconcile_every_n_cycles, Some(6));
+    }
+
+    #[test]
+    fn test_build_reconcile_toml_only() {
+        let toml_str = r#"
+            [watch]
+            reconcile_every_n_cycles = 12
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.reconcile_every_n_cycles, Some(12));
+    }
+
+    // TOML accepts `reconcile_every_n_cycles = 0` as "off"; the resolved
+    // config collapses it to `None` so the watch loop short-circuits.
+    #[test]
+    fn test_build_reconcile_toml_zero_is_off() {
+        let toml_str = r#"
+            [watch]
+            reconcile_every_n_cycles = 0
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert!(cfg.reconcile_every_n_cycles.is_none());
+    }
+
+    #[test]
+    fn test_build_reconcile_default_unset() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert!(cfg.reconcile_every_n_cycles.is_none());
     }
 
     // Pure parser tests use synthetic `Result<String, VarError>` inputs to

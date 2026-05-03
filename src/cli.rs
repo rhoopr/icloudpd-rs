@@ -371,6 +371,13 @@ pub struct SyncArgs {
     /// Run continuously, waiting N seconds between runs (60..=86400).
     /// Resolution order: this flag > `[watch] interval` in TOML >
     /// `KEI_WATCH_WITH_INTERVAL` env > unset (single-shot).
+    //
+    // Deliberately omits clap's `env =` attribute. `env =` collapses the
+    // env value into the CLI tier, which would override TOML — but the
+    // docker image bakes `KEI_WATCH_WITH_INTERVAL=86400` as a default and
+    // we want a user's TOML `[watch] interval` to win. The env value is
+    // parsed manually in `Config::build` (see `parse_env_watch_interval`
+    // in src/config.rs); regression tested by #293.
     #[arg(long, value_parser = clap::value_parser!(u64).range(60..=86400))]
     pub watch_with_interval: Option<u64>,
 
@@ -434,6 +441,15 @@ pub struct SyncArgs {
     /// Write PID to file (for service managers).
     #[arg(long, env = "KEI_PID_FILE")]
     pub pid_file: Option<std::path::PathBuf>,
+
+    /// Run a periodic local-vs-state reconciliation walk every Nth watch
+    /// cycle (1 = every cycle, 24 = daily on hourly cycles). Read-only:
+    /// reports missing files via `tracing::warn!` and never auto-marks
+    /// failed in the state DB. Only meaningful with `--watch-with-interval`;
+    /// ignored in single-shot mode. Also configurable via
+    /// `[watch] reconcile_every_n_cycles` in TOML (CLI takes precedence).
+    #[arg(long, env = "KEI_RECONCILE_EVERY_N_CYCLES", value_parser = clap::value_parser!(u64).range(1..))]
+    pub reconcile_every_n_cycles: Option<u64>,
 
     /// Script to run on events: 2FA required, sync started/complete/failed, session expired.
     /// Called with `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars.
@@ -997,6 +1013,9 @@ impl SyncArgs {
         }
         if self.pid_file.is_none() {
             self.pid_file.clone_from(&fallback.pid_file);
+        }
+        if self.reconcile_every_n_cycles.is_none() {
+            self.reconcile_every_n_cycles = fallback.reconcile_every_n_cycles;
         }
         if self.notification_script.is_none() {
             self.notification_script
@@ -2232,6 +2251,36 @@ mod tests {
         assert_eq!(
             cli.sync.pid_file,
             Some(std::path::PathBuf::from("/tmp/claude/test.pid"))
+        );
+    }
+
+    #[test]
+    fn test_reconcile_every_n_cycles_flag() {
+        let mut args = base_args();
+        args.extend(["--reconcile-every-n-cycles", "24"]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.reconcile_every_n_cycles, Some(24));
+    }
+
+    #[test]
+    fn test_reconcile_every_n_cycles_default_unset() {
+        let cli = parse(&base_args());
+        assert!(cli.sync.reconcile_every_n_cycles.is_none());
+    }
+
+    // 0 is "off" via TOML (or absence); the CLI flag rejects it so users
+    // omit the flag instead of passing a magic value. Anything else <0 or
+    // non-numeric also fails clap's range parser.
+    #[test]
+    fn test_reconcile_every_n_cycles_rejects_zero() {
+        let mut args = base_args();
+        args.extend(["--reconcile-every-n-cycles", "0"]);
+        let err = Cli::try_parse_from(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("not in")
+                || err.to_string().contains("range")
+                || err.to_string().contains("invalid value"),
+            "expected range/parse error, got: {err}"
         );
     }
 

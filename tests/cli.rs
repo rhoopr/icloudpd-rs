@@ -1345,6 +1345,15 @@ fn kei_log_level_env_var_accepted() {
         .success();
 }
 
+#[test]
+fn kei_reconcile_every_n_cycles_env_var_accepted() {
+    common::cmd()
+        .env("KEI_RECONCILE_EVERY_N_CYCLES", "24")
+        .args(["sync", "--help"])
+        .assert()
+        .success();
+}
+
 // ── config show produces TOML ─────────────────────────────────────────
 
 #[test]

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`--reconcile-every-n-cycles N` CLI flag and `KEI_RECONCILE_EVERY_N_CYCLES` env var.** Mirror the existing `[watch] reconcile_every_n_cycles` TOML key so docker and systemd users can enable the periodic local-vs-state reconciliation walk without editing a config file. Resolution order: CLI > TOML > unset. The walk is read-only and only meaningful in watch mode; single-shot runs ignore it.
+- **`kei config setup` covers smart folders, bandwidth limit, filename excludes, XMP, and periodic reconcile.** The "additional options" branch now prompts for `[filters] smart_folders`, `[download] bandwidth_limit` (validated live), `[filters] filename_exclude`, `[download] embed_xmp` / `xmp_sidecar` (under the `xmp` feature), and `[watch] reconcile_every_n_cycles`. The Live Photos prompt is a 4-way `LivePhotoMode` select (`both` / `image-only` / `video-only` / `skip`) instead of a yes/no toggle.
+
+### Fixed
+
+- **`kei config setup` no longer generates v0.13-deprecated TOML.** The wizard was emitting `[filters] library` (singular), `[filters] skip_live_photos`, and `[auth] cookie_directory`, so every fresh config tripped deprecation warnings on its first sync. It now writes `[filters] libraries = [...]` (array form), `[photos] live_photo_mode = "skip"`, and top-level `data_dir`. The "specific albums" branch asks whether to enable the unfiled pass and always emits `unfiled` explicitly, so the v0.13 implicit-unfiled warning never fires for wizard-generated configs. Album input loops per line instead of comma-splitting (an album literally named "Foo, Inc." was being silently broken into two filters). The deprecated `[metrics]` section is gone from wizard output and replaced by `[server]`. Existing configs keep working unchanged.
+
+---
+
 ## [0.13.0] - 2026-05-02
 
 Selection and folder-structure flag redesign. `--exclude-album` becomes `--album '!NAME'`. New `--smart-folder` and `--unfiled` per-category flags. `--library` now repeatable. Per-category `--folder-structure-{albums,smart-folders}` templates with their own defaults. Multi-library scope with `{library}` in any template. State DB schema migrates to v9 (per-zone primary key on `assets`, `asset_albums`, and `asset_people`) on first sync. Old shapes keep working with deprecation warnings until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md). ([#215], [#288])
