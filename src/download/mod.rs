@@ -2651,6 +2651,7 @@ mod tests {
             reconcile_every_n_cycles: None,
             recent: dl_config.recent,
             max_retries: 3,
+            max_download_attempts: 10,
             bandwidth_limit: None,
             threads_num: 1,
             size: VersionSize::Original,

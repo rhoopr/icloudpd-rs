@@ -88,6 +88,12 @@ pub(crate) struct TomlRetry {
     /// Deprecated v0.13: initial retry delay is now derived from
     /// `max_retries` via a smart table. Removed in v0.20.
     pub delay: Option<u64>,
+    /// Lifetime cap on download attempts per asset across syncs (default
+    /// `10`). The same value as the `--max-download-attempts` CLI flag /
+    /// `KEI_MAX_DOWNLOAD_ATTEMPTS` env var; CLI > TOML > default. Distinct
+    /// from `max_retries`, which only caps retries within a single
+    /// download. `0` disables the cap.
+    pub max_download_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -697,6 +703,11 @@ pub struct Config {
     // 4-byte primitives
     pub recent: Option<u32>,
     pub max_retries: u32,
+    /// Lifetime cap on download attempts per asset across syncs. `0`
+    /// disables the cap. Resolved CLI > TOML `[download.retry]
+    /// max_download_attempts` > 10. Distinct from `max_retries`, which
+    /// only caps retries within a single download.
+    pub max_download_attempts: u32,
 
     // 8-byte primitives (cont.)
     pub bandwidth_limit: Option<u64>,
@@ -1427,6 +1438,15 @@ impl Config {
             max_retries <= 100,
             "retry max_retries must be <= 100, got {max_retries}"
         );
+        // Lifetime cap on download attempts per asset (0 disables). CLI >
+        // TOML > 10, matching every other resolved value. The runtime
+        // skip check in download::pipeline::process_asset short-circuits
+        // when this is 0, so 0 is a valid (cap-off) sentinel.
+        let max_download_attempts = resolve(
+            sync.max_download_attempts,
+            toml_retry.and_then(|r| r.max_download_attempts),
+            10,
+        );
         // Retry delay is now derived from `max_retries` via a smart table
         // (higher max => more patient initial delay). `--retry-delay` and
         // `[download.retry] delay` are deprecated; setting either still
@@ -1808,6 +1828,7 @@ impl Config {
             reconcile_every_n_cycles,
             recent,
             max_retries,
+            max_download_attempts,
             bandwidth_limit,
             threads_num,
             size,
@@ -1934,6 +1955,15 @@ impl Config {
                         None
                     } else {
                         Some(self.retry_delay_secs)
+                    },
+                    // Emit `max_download_attempts` only when the user has
+                    // overridden the default of 10. Keeps the round-trip
+                    // clean for the common case and surfaces explicit
+                    // overrides in `kei config show`.
+                    max_download_attempts: if self.max_download_attempts == 10 {
+                        None
+                    } else {
+                        Some(self.max_download_attempts)
                     },
                 }),
             }),
@@ -4653,6 +4683,99 @@ mod tests {
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.max_retries, 10);
+    }
+
+    #[test]
+    fn test_build_max_download_attempts_default() {
+        // Neither CLI nor TOML set: hardcoded fallback of 10 fires.
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.max_download_attempts, 10);
+    }
+
+    #[test]
+    fn test_build_max_download_attempts_from_toml() {
+        // TOML-only: resolved value matches the TOML setting.
+        let toml_str = r#"
+            [download.retry]
+            max_download_attempts = 25
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.max_download_attempts, 25);
+    }
+
+    #[test]
+    fn test_build_max_download_attempts_cli_overrides_toml() {
+        // CLI flag wins over TOML, mirroring every other resolved value.
+        let toml_str = r#"
+            [download.retry]
+            max_download_attempts = 25
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.max_download_attempts = Some(7);
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        assert_eq!(cfg.max_download_attempts, 7);
+    }
+
+    #[test]
+    fn test_build_max_download_attempts_zero_disables_cap() {
+        // `0` is the documented "disable the cap" sentinel; resolution
+        // must accept it through TOML the same as through CLI.
+        let toml_str = r#"
+            [download.retry]
+            max_download_attempts = 0
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.max_download_attempts, 0);
+    }
+
+    #[test]
+    fn test_to_toml_omits_default_max_download_attempts() {
+        // Default 10 is elided from the round-trip so config dumps stay
+        // clean for the common case.
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.max_download_attempts, 10);
+        let toml = cfg.to_toml();
+        let retry = toml.download.unwrap().retry.unwrap();
+        assert_eq!(retry.max_download_attempts, None);
+    }
+
+    #[test]
+    fn test_to_toml_includes_non_default_max_download_attempts() {
+        // User overrides round-trip back into the dump.
+        let mut sync = default_sync();
+        sync.max_download_attempts = Some(42);
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let retry = toml.download.unwrap().retry.unwrap();
+        assert_eq!(retry.max_download_attempts, Some(42));
     }
 
     #[test]

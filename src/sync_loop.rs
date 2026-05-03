@@ -211,7 +211,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     } = args;
 
     let is_retry_failed = sync.retry_failed;
-    let max_download_attempts = sync.max_download_attempts.unwrap_or(10);
     let reset_sync_token = sync.reset_sync_token;
     if reset_sync_token {
         crate::cli::deprecation_warning("--reset-sync-token", "kei reset sync-token");
@@ -649,7 +648,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             temp_suffix: Arc::clone(&cfg_temp_suffix),
             state_db: state_db.clone(),
             retry_only: is_retry_failed,
-            max_download_attempts,
+            max_download_attempts: config.max_download_attempts,
             sync_mode,
             album_name: None,
             exclude_asset_ids,
