@@ -149,6 +149,18 @@ impl Default for SetupAnswers {
     }
 }
 
+/// Print the generated TOML between two horizontal rules. Extracted so the
+/// preview loop in `run_setup` can re-print on demand.
+fn print_toml_preview(toml_content: &str) {
+    println!();
+    println!("Here's your configuration:");
+    println!();
+    println!("───────────────────────────────────────────────────────");
+    print!("{toml_content}");
+    println!("───────────────────────────────────────────────────────");
+    println!();
+}
+
 pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     if !std::io::stdin().is_terminal() {
         bail!("The setup wizard requires an interactive terminal.");
@@ -196,24 +208,31 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     // returns an error in practice.
     let toml_content: String = generate_toml(&answers);
 
-    // Preview
-    println!();
-    println!("Here's your configuration:");
-    println!();
-    println!("───────────────────────────────────────────────────────");
-    print!("{toml_content}");
-    println!("───────────────────────────────────────────────────────");
-    println!();
-
-    // Confirm write
-    let write = Confirm::new()
-        .with_prompt(format!("Write to {}?", config_path.display()))
-        .default(true)
-        .interact()?;
-
-    if !write {
-        println!("Setup cancelled.");
-        return Ok(SetupResult::Done);
+    // Preview + confirm. The TOML can run 100+ lines, which scrolls past
+    // the visible area on small terminals (Docker, serial consoles) before
+    // the user can read it. The Select gives an explicit "Show again" so a
+    // user who scrolled past can re-read without restarting the wizard.
+    let line_count = toml_content.lines().count();
+    print_toml_preview(&toml_content);
+    loop {
+        let action_items = [
+            format!("Write to {}", config_path.display()),
+            format!("Show full configuration again ({line_count} lines)"),
+            "Cancel and exit without writing".to_string(),
+        ];
+        let action = Select::new()
+            .with_prompt("What now?")
+            .items(&action_items)
+            .default(0)
+            .interact()?;
+        match action {
+            0 => break,
+            1 => print_toml_preview(&toml_content),
+            _ => {
+                println!("Setup cancelled.");
+                return Ok(SetupResult::Done);
+            }
+        }
     }
 
     // Ensure parent directory exists
@@ -274,10 +293,38 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
         println!();
         println!("To sync later, run:");
         println!();
-        println!("  set -a; source {}; set +a", env_path.display());
+        print_load_env_snippet(&env_path);
         println!("  kei sync");
         println!();
         Ok(SetupResult::Done)
+    }
+}
+
+/// Print the right "load .env into this shell" command for the user's shell.
+/// Detects the shell from `$SHELL`. Defaults to the bash/zsh form because
+/// it's the most common on Linux and macOS; calls out fish explicitly because
+/// `set -a` doesn't exist there and the bash snippet would silently no-op.
+fn print_load_env_snippet(env_path: &Path) {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let shell_name = Path::new(&shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let env_display = env_path.display();
+    match shell_name {
+        "fish" => {
+            // fish doesn't have `set -a`, and the .env file's single-quoted
+            // values would be passed through verbatim by a naive
+            // `(cat | string split)` loop. Cleanest reliable one-liner: have
+            // bash do the parsing, then exec fish so the inherited env
+            // carries through.
+            println!("  # fish: load .env via a bash subshell, then continue in fish");
+            println!("  bash -c 'set -a; source {env_display}; set +a; exec fish'");
+        }
+        _ => {
+            // bash / zsh / sh / dash / ksh: POSIX `set -a` + source.
+            println!("  set -a; source {env_display}; set +a");
+        }
     }
 }
 
@@ -303,8 +350,17 @@ fn ask_account(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         })
         .interact_text()?;
 
-    answers.password =
-        secrecy::SecretString::from(Password::new().with_prompt("iCloud password").interact()?);
+    // `with_confirmation` re-prompts on mismatch in-place, so a typo costs
+    // one extra round, not a broken config that fails the next sync.
+    answers.password = secrecy::SecretString::from(
+        Password::new()
+            .with_prompt("iCloud password")
+            .with_confirmation(
+                "Re-enter password to confirm",
+                "Passwords didn't match, try again",
+            )
+            .interact()?,
+    );
 
     println!();
     let region_items = ["iCloud.com", "iCloud.com.cn (China)"];
@@ -330,6 +386,17 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .with_prompt("Where should photos be saved?")
         .default("~/Photos/iCloud".to_string())
         .interact_text()?;
+
+    // Data directory for sessions, state DB, credentials, health. The default
+    // is right for almost everyone, so it's offered here as a single line with
+    // an obvious skip, not gated behind the "additional options?" extras prompt.
+    let data_dir: String = Input::new()
+        .with_prompt("Data directory (sessions, state DB, credentials)")
+        .default("~/.config/kei".to_string())
+        .interact_text()?;
+    if data_dir != "~/.config/kei" {
+        answers.data_dir = Some(data_dir);
+    }
 
     println!();
     let folder_items = [
@@ -402,7 +469,8 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         // (v0.13), so a single comma-separated entry would silently break any
         // album whose name contains a comma.
         println!("  Enter one album per line. Press Enter on a blank line to finish.");
-        println!("  Tip: run `kei list albums` to see available album names.");
+        println!("  Names are case-sensitive and must match iCloud exactly. If you're unsure,");
+        println!("  cancel now (Ctrl+C), run `kei list albums`, and re-run `kei config setup`.");
         loop {
             let prompt = if answers.albums.is_empty() {
                 "Album name".to_string()
@@ -589,38 +657,83 @@ fn ask_date_range(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Same parser the runtime uses (`config::parse_date_or_interval`) so a
+    // typo here surfaces immediately, not on the next sync.
     let after: String = Input::new()
-        .with_prompt("Only sync photos created after (e.g. 2024-01-01 or 30d, blank = no limit)")
+        .with_prompt(
+            "Only sync photos created after (ISO date, datetime, or Nd interval; blank = no limit)",
+        )
         .default(String::new())
         .show_default(false)
+        .allow_empty(true)
+        .validate_with(|s: &String| validate_date_or_blank(s))
         .interact_text()?;
-    if !after.is_empty() {
-        answers.skip_created_before = Some(after);
+    if !after.trim().is_empty() {
+        answers.skip_created_before = Some(after.trim().to_string());
     }
 
     let before: String = Input::new()
-        .with_prompt("Only sync photos created before (blank = no limit)")
+        .with_prompt(
+            "Only sync photos created before (ISO date, datetime, or Nd interval; blank = no limit)",
+        )
         .default(String::new())
         .show_default(false)
+        .allow_empty(true)
+        .validate_with(|s: &String| validate_date_or_blank(s))
         .interact_text()?;
-    if !before.is_empty() {
-        answers.skip_created_after = Some(before);
+    if !before.trim().is_empty() {
+        answers.skip_created_after = Some(before.trim().to_string());
     }
 
     let recent: String = Input::new()
-        .with_prompt("Only sync the N most recent photos (blank = all)")
+        .with_prompt("Only sync the N most-recently-created photos (blank = all)")
         .default(String::new())
         .show_default(false)
+        .allow_empty(true)
+        .validate_with(|s: &String| validate_positive_u32_or_blank(s))
         .interact_text()?;
-    if !recent.is_empty() {
-        if let Ok(n) = recent.parse::<u32>() {
-            answers.recent = Some(n);
-        } else {
-            println!("  Invalid number, skipping.");
-        }
+    if let Some(n) = parse_positive_u32_opt(&recent) {
+        answers.recent = Some(n);
     }
 
     Ok(())
+}
+
+/// Accept blank or anything `config::parse_date_or_interval` parses cleanly.
+/// Used by the `skip_created_{before,after}` prompts so users see the same
+/// error message at wizard time that the runtime would print on sync.
+fn validate_date_or_blank(s: &str) -> Result<(), String> {
+    if s.trim().is_empty() {
+        return Ok(());
+    }
+    crate::config::parse_date_or_interval(s.trim())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Accept blank or a positive `u32` (1 or greater). Empty string maps to
+/// `None`; `"0"` is rejected with a clear error, since 0 is meaningless for
+/// `recent` (the user should leave it blank for "all").
+fn validate_positive_u32_or_blank(s: &str) -> Result<(), String> {
+    if s.trim().is_empty() {
+        return Ok(());
+    }
+    match s.trim().parse::<u32>() {
+        Ok(0) => Err("must be greater than zero (or leave blank for no limit)".to_string()),
+        Ok(_) => Ok(()),
+        Err(_) => Err("must be a positive integer or blank".to_string()),
+    }
+}
+
+/// Parse the validated string into `Option<u32>`. Pre-validated by
+/// [`validate_positive_u32_or_blank`] so the parse cannot fail here.
+fn parse_positive_u32_opt(s: &str) -> Option<u32> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.parse::<u32>().ok().filter(|n| *n > 0)
+    }
 }
 
 // ── Step 7: Running mode ───────────────────────────────────────────
@@ -638,9 +751,19 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .interact()?;
 
     if mode == 1 {
+        // Mirror the runtime range from `--watch-with-interval`
+        // (`src/cli.rs`); rejecting out-of-range here means the user sees
+        // the error before the file is written.
         let interval: u64 = Input::new()
-            .with_prompt("Re-sync every how many seconds?")
+            .with_prompt("Re-sync every how many seconds (60..=86400)")
             .default(3600u64)
+            .validate_with(|n: &u64| -> Result<(), String> {
+                if (60..=86400).contains(n) {
+                    Ok(())
+                } else {
+                    Err("must be between 60 and 86400 seconds".to_string())
+                }
+            })
             .interact_text()?;
         answers.watch_interval = Some(interval);
 
@@ -656,9 +779,10 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
                 .with_prompt("PID file path (blank = skip)")
                 .default(String::new())
                 .show_default(false)
+                .allow_empty(true)
                 .interact_text()?;
-            if !pid.is_empty() {
-                answers.pid_file = Some(pid);
+            if !pid.trim().is_empty() {
+                answers.pid_file = Some(pid.trim().to_string());
             }
         }
 
@@ -671,11 +795,21 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             )
             .default(String::new())
             .show_default(false)
+            .allow_empty(true)
+            .validate_with(|s: &String| -> Result<(), String> {
+                if s.trim().is_empty() {
+                    return Ok(());
+                }
+                match s.trim().parse::<u64>() {
+                    Ok(0) => Err("must be greater than zero (or blank to disable)".to_string()),
+                    Ok(_) => Ok(()),
+                    Err(_) => Err("must be a positive integer or blank".to_string()),
+                }
+            })
             .interact_text()?;
-        if !reconcile.is_empty() {
-            match reconcile.parse::<u64>() {
-                Ok(n) if n > 0 => answers.reconcile_every_n_cycles = Some(n),
-                _ => println!("  Invalid number, skipping."),
+        if let Ok(n) = reconcile.trim().parse::<u64>() {
+            if n > 0 {
+                answers.reconcile_every_n_cycles = Some(n);
             }
         }
     }
@@ -723,7 +857,17 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             0 => answers.smart_folders = vec!["all".to_string()],
             1 => answers.smart_folders = vec!["all-with-sensitive".to_string()],
             _ => {
+                // Pull the literal names kei recognises so this stays in
+                // sync with `icloud::photos::smart_folders` if a name is ever
+                // added or renamed. Names are case-sensitive at parse time.
+                let known: Vec<&'static str> =
+                    crate::icloud::photos::smart_folders::smart_folders()
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect();
                 println!("  Enter one smart-folder name per line. Press Enter on a blank line to finish.");
+                println!("  Names are case-sensitive. Available smart folders:");
+                println!("  {}.", known.join(", "));
                 loop {
                     let name: String = Input::new()
                         .with_prompt("Smart folder name (blank to finish)")
@@ -754,19 +898,35 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         }
     }
 
-    // Performance
+    // Performance. Ranges mirror clap's runtime parsers in `src/cli.rs`
+    // (`--threads` is `1..=64`, `--max-retries` is `0..=100`) so the wizard
+    // rejects values the runtime would also reject.
     println!();
     let threads: u16 = Input::new()
-        .with_prompt("Concurrent download threads")
+        .with_prompt("Concurrent download threads (1..=64)")
         .default(10u16)
+        .validate_with(|n: &u16| -> Result<(), String> {
+            if (1..=64).contains(n) {
+                Ok(())
+            } else {
+                Err("must be between 1 and 64".to_string())
+            }
+        })
         .interact_text()?;
     if threads != 10 {
         answers.threads_num = Some(threads);
     }
 
     let retries: u32 = Input::new()
-        .with_prompt("Max retries per failed download (0 = disable)")
+        .with_prompt("Max retries per failed download (0..=100, 0 = disable)")
         .default(3u32)
+        .validate_with(|n: &u32| -> Result<(), String> {
+            if (0..=100).contains(n) {
+                Ok(())
+            } else {
+                Err("must be between 0 and 100".to_string())
+            }
+        })
         .interact_text()?;
     if retries != 3 {
         answers.max_retries = Some(retries);
@@ -849,19 +1009,8 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         answers.file_match_policy = Some(FileMatchPolicy::NameId7);
     }
 
-    // Data directory (sessions, state DB, credentials, health). Replaces
-    // the v0.12 cookie-directory prompt; `[auth].cookie_directory` and
-    // `--cookie-directory` were deprecated in v0.13.
-    println!();
-    let data_dir: String = Input::new()
-        .with_prompt("Data directory (sessions, state, credentials)")
-        .default("~/.config/kei".to_string())
-        .interact_text()?;
-    if data_dir != "~/.config/kei" {
-        answers.data_dir = Some(data_dir);
-    }
-
     // Log level
+    println!();
     let log_items = ["info", "debug", "warn", "error"];
     let log = Select::new()
         .with_prompt("Log level")
@@ -1860,5 +2009,89 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Numeric / date wizard-input validators ──────────────────────
+
+    #[test]
+    fn validate_date_or_blank_accepts_empty() {
+        assert!(validate_date_or_blank("").is_ok());
+        assert!(validate_date_or_blank("   ").is_ok());
+    }
+
+    #[test]
+    fn validate_date_or_blank_accepts_iso_date() {
+        assert!(validate_date_or_blank("2025-01-02").is_ok());
+        assert!(validate_date_or_blank("2025-01-02T14:30:00").is_ok());
+    }
+
+    #[test]
+    fn validate_date_or_blank_accepts_relative_interval() {
+        assert!(validate_date_or_blank("30d").is_ok());
+        assert!(validate_date_or_blank("1d").is_ok());
+    }
+
+    /// Same garbage strings the runtime would reject at sync time.
+    /// Catching them at wizard time means a user with a typo doesn't
+    /// write a config that fails the next morning.
+    #[test]
+    fn validate_date_or_blank_rejects_garbage() {
+        for bad in ["2024-13-99", "tomorrow", "30dx", "abc", "999"] {
+            let err = validate_date_or_blank(bad).unwrap_err();
+            assert!(
+                err.to_lowercase().contains("cannot parse")
+                    || err.to_lowercase().contains("expected"),
+                "bad input {bad:?} produced unhelpful error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_positive_u32_or_blank_accepts_empty() {
+        assert!(validate_positive_u32_or_blank("").is_ok());
+        assert!(validate_positive_u32_or_blank("  ").is_ok());
+    }
+
+    #[test]
+    fn validate_positive_u32_or_blank_accepts_positive() {
+        assert!(validate_positive_u32_or_blank("1").is_ok());
+        assert!(validate_positive_u32_or_blank("100").is_ok());
+        assert!(validate_positive_u32_or_blank("4294967295").is_ok()); // u32::MAX
+    }
+
+    #[test]
+    fn validate_positive_u32_or_blank_rejects_zero() {
+        let err = validate_positive_u32_or_blank("0").unwrap_err();
+        assert!(err.contains("greater than zero"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_positive_u32_or_blank_rejects_garbage() {
+        for bad in ["abc", "-1", "1.5", "100000000000"] {
+            assert!(
+                validate_positive_u32_or_blank(bad).is_err(),
+                "bad input {bad:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_positive_u32_opt_returns_none_for_blank() {
+        assert_eq!(parse_positive_u32_opt(""), None);
+        assert_eq!(parse_positive_u32_opt("  "), None);
+    }
+
+    #[test]
+    fn parse_positive_u32_opt_returns_value() {
+        assert_eq!(parse_positive_u32_opt("42"), Some(42));
+        assert_eq!(parse_positive_u32_opt("  42  "), Some(42));
+    }
+
+    #[test]
+    fn parse_positive_u32_opt_drops_zero() {
+        // Zero is rejected by validate_positive_u32_or_blank, so the parse
+        // helper should never see it; but if it does, we want None, not
+        // Some(0).
+        assert_eq!(parse_positive_u32_opt("0"), None);
     }
 }
