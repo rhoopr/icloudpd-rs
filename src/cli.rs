@@ -1177,6 +1177,256 @@ impl Cli {
     }
 }
 
+impl Cli {
+    /// Validate that sync-only top-level flags are not combined with a
+    /// non-sync subcommand.
+    ///
+    /// `kei` accepts a bare invocation as shorthand for `kei sync`, so flags
+    /// like `--skip-videos` are wired at the top level. clap by itself will
+    /// happily parse `kei --skip-videos status`: the top-level flag is
+    /// consumed and silently dropped because `Status` carries no sync args.
+    /// The user thinks they ran a status check with their flag honoured;
+    /// they actually ran something different from what they typed.
+    ///
+    /// This validator runs after `Cli::parse()` and rejects any such
+    /// combination, naming every offending flag in the error message.
+    /// Bare invocation (no subcommand) and the `sync` / `retry-failed`
+    /// subcommands legitimately use these flags and pass.
+    pub fn validate(&self) -> Result<(), String> {
+        // Bare invocation = sync alias; flags are valid.
+        let Some(cmd) = &self.command else {
+            return Ok(());
+        };
+        // Sync (and the legacy `retry-failed` alias that maps to sync) carry
+        // sync args directly; top-level merge into them is intended.
+        if matches!(cmd, Command::Sync { .. } | Command::RetryFailed { .. }) {
+            return Ok(());
+        }
+        let offenders = top_level_sync_flags_present(&self.sync);
+        if offenders.is_empty() {
+            return Ok(());
+        }
+        let cmd_name = subcommand_display_name(cmd);
+        let flag_list = offenders.join(", ");
+        Err(format!(
+            "the following sync-only flag{plural} cannot be combined with `kei {cmd_name}`: {flag_list}\n\
+             bare-kei (no subcommand) is shorthand for `kei sync`; sync-only flags are only valid there or under `kei sync`",
+            plural = if offenders.len() == 1 { "" } else { "s" },
+        ))
+    }
+}
+
+/// Human-readable subcommand name for error messages.
+fn subcommand_display_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Sync { .. } => "sync",
+        Command::Login { .. } => "login",
+        Command::List { .. } => "list",
+        Command::Password { .. } => "password",
+        Command::Reset { .. } => "reset",
+        Command::Config { .. } => "config",
+        Command::Status(_) => "status",
+        Command::ImportExisting(_) => "import-existing",
+        Command::Verify(_) => "verify",
+        Command::Reconcile(_) => "reconcile",
+        Command::GetCode { .. } => "get-code",
+        Command::SubmitCode { .. } => "submit-code",
+        Command::Credential { .. } => "credential",
+        Command::RetryFailed { .. } => "retry-failed",
+        Command::ResetState { .. } => "reset-state",
+        Command::ResetSyncToken => "reset-sync-token",
+        Command::Setup { .. } => "setup",
+    }
+}
+
+/// Return the set of sync-only top-level flags that the user actually
+/// provided. An empty Vec means every field is at its `SyncArgs::default()`
+/// value.
+///
+/// Used by [`Cli::validate`] to name every offending flag when the user
+/// combines a non-sync subcommand with bare-kei sync flags. Each branch
+/// corresponds 1:1 to a `SyncArgs` field; when adding a new sync flag,
+/// extend this function so it shows up in the rejection message.
+fn top_level_sync_flags_present(s: &SyncArgs) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    if s.download_dir.is_some() {
+        out.push("--download-dir");
+    }
+    if s.directory.is_some() {
+        out.push("--directory");
+    }
+    if !s.albums.is_empty() {
+        out.push("--album");
+    }
+    if !s.exclude_albums.is_empty() {
+        out.push("--exclude-album");
+    }
+    if !s.smart_folders.is_empty() {
+        out.push("--smart-folder");
+    }
+    if s.unfiled.is_some() {
+        out.push("--unfiled");
+    }
+    if !s.filename_exclude.is_empty() {
+        out.push("--filename-exclude");
+    }
+    if !s.libraries.is_empty() {
+        out.push("--library");
+    }
+    if s.size.is_some() {
+        out.push("--size");
+    }
+    if s.live_photo_size.is_some() {
+        out.push("--live-photo-size");
+    }
+    if s.recent.is_some() {
+        out.push("--recent");
+    }
+    if s.threads.is_some() {
+        out.push("--threads");
+    }
+    if s.threads_num.is_some() {
+        out.push("--threads-num");
+    }
+    if s.bandwidth_limit.is_some() {
+        out.push("--bandwidth-limit");
+    }
+    if s.skip_videos.is_some() {
+        out.push("--skip-videos");
+    }
+    if s.skip_photos.is_some() {
+        out.push("--skip-photos");
+    }
+    if s.live_photo_mode.is_some() {
+        out.push("--live-photo-mode");
+    }
+    if s.skip_live_photos.is_some() {
+        out.push("--skip-live-photos");
+    }
+    if s.force_size.is_some() {
+        out.push("--force-size");
+    }
+    if s.folder_structure.is_some() {
+        out.push("--folder-structure");
+    }
+    if s.folder_structure_albums.is_some() {
+        out.push("--folder-structure-albums");
+    }
+    if s.folder_structure_smart_folders.is_some() {
+        out.push("--folder-structure-smart-folders");
+    }
+    #[cfg(feature = "xmp")]
+    {
+        if s.set_exif_datetime.is_some() {
+            out.push("--set-exif-datetime");
+        }
+        if s.set_exif_rating.is_some() {
+            out.push("--set-exif-rating");
+        }
+        if s.set_exif_gps.is_some() {
+            out.push("--set-exif-gps");
+        }
+        if s.set_exif_description.is_some() {
+            out.push("--set-exif-description");
+        }
+        if s.embed_xmp.is_some() {
+            out.push("--embed-xmp");
+        }
+        if s.xmp_sidecar.is_some() {
+            out.push("--xmp-sidecar");
+        }
+    }
+    if s.dry_run {
+        out.push("--dry-run");
+    }
+    if s.watch_with_interval.is_some() {
+        out.push("--watch-with-interval");
+    }
+    if s.no_progress_bar.is_some() {
+        out.push("--no-progress-bar");
+    }
+    if s.keep_unicode_in_filenames.is_some() {
+        out.push("--keep-unicode-in-filenames");
+    }
+    if s.live_photo_mov_filename_policy.is_some() {
+        out.push("--live-photo-mov-filename-policy");
+    }
+    if s.align_raw.is_some() {
+        out.push("--align-raw");
+    }
+    if s.file_match_policy.is_some() {
+        out.push("--file-match-policy");
+    }
+    if s.skip_created_before.is_some() {
+        out.push("--skip-created-before");
+    }
+    if s.skip_created_after.is_some() {
+        out.push("--skip-created-after");
+    }
+    if s.only_print_filenames {
+        out.push("--only-print-filenames");
+    }
+    if s.max_retries.is_some() {
+        out.push("--max-retries");
+    }
+    if s.retry_delay.is_some() {
+        out.push("--retry-delay");
+    }
+    if s.temp_suffix.is_some() {
+        out.push("--temp-suffix");
+    }
+    if s.no_incremental {
+        out.push("--no-incremental");
+    }
+    if s.notify_systemd.is_some() {
+        out.push("--notify-systemd");
+    }
+    if s.pid_file.is_some() {
+        out.push("--pid-file");
+    }
+    if s.reconcile_every_n_cycles.is_some() {
+        out.push("--reconcile-every-n-cycles");
+    }
+    if s.notification_script.is_some() {
+        out.push("--notification-script");
+    }
+    if s.report_json.is_some() {
+        out.push("--report-json");
+    }
+    if s.http_port.is_some() {
+        out.push("--http-port");
+    }
+    if s.http_bind.is_some() {
+        out.push("--http-bind");
+    }
+    if s.save_password {
+        out.push("--save-password");
+    }
+    if s.retry_failed {
+        out.push("--retry-failed");
+    }
+    if s.max_download_attempts.is_some() {
+        out.push("--max-download-attempts");
+    }
+    // Hidden compat flags. `--auth-only`, `--list-albums`, `--list-libraries`,
+    // and `--reset-sync-token` only resolve to a remapped command when the
+    // bare-kei alias is in play; combining them with an explicit subcommand
+    // is the same silent-swallow class of bug we're guarding against.
+    if s.auth_only {
+        out.push("--auth-only");
+    }
+    if s.list_albums {
+        out.push("--list-albums");
+    }
+    if s.list_libraries {
+        out.push("--list-libraries");
+    }
+    if s.reset_sync_token {
+        out.push("--reset-sync-token");
+    }
+    out
+}
+
 impl Command {
     /// Merge top-level CLI password/sync args as fallbacks into the
     /// subcommand's own args.
@@ -3105,5 +3355,262 @@ mod tests {
         args.extend(["--exclude-album", "Hidden", "--exclude-album", "Trash"]);
         let cli = parse(&args);
         assert_eq!(cli.sync.exclude_albums, vec!["Hidden", "Trash"]);
+    }
+
+    // ── Cli::validate: bare-kei sync flags + non-sync subcommand ──
+    //
+    // Regression: clap silently consumed a top-level sync flag and ran
+    // whatever subcommand the user named. `kei --skip-videos status`
+    // looked like `kei status`; the user thought their flag was honoured
+    // and saw a different action than they typed.
+
+    #[test]
+    fn validate_rejects_skip_videos_with_status() {
+        // `--skip-videos` uses `num_args = 0..=1`, so the value must be
+        // explicit (`=true`) before a subcommand follows. Both forms exhibit
+        // the underlying bug — clap was happy to swallow it under `status`.
+        let cli = Cli::try_parse_from(["kei", "--skip-videos=true", "status"]).unwrap();
+        let err = cli.validate().expect_err("validation must reject");
+        assert!(err.contains("--skip-videos"), "got: {err}");
+        assert!(err.contains("status"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_skip_photos_with_list_albums() {
+        let cli = Cli::try_parse_from(["kei", "--skip-photos=true", "list", "albums"]).unwrap();
+        let err = cli.validate().expect_err("validation must reject");
+        assert!(err.contains("--skip-photos"), "got: {err}");
+        assert!(err.contains("list"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_live_photo_mode_with_reset_state() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "--live-photo-mode",
+            "skip",
+            "reset",
+            "state",
+            "--yes",
+        ])
+        .unwrap();
+        let err = cli.validate().expect_err("validation must reject");
+        assert!(err.contains("--live-photo-mode"), "got: {err}");
+        assert!(err.contains("reset"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_value_flag_with_verify() {
+        let cli = Cli::try_parse_from(["kei", "--download-dir", "/photos", "verify"]).unwrap();
+        let err = cli.validate().expect_err("validation must reject");
+        assert!(err.contains("--download-dir"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_threads_with_reconcile() {
+        let cli = Cli::try_parse_from(["kei", "--threads", "4", "reconcile"]).unwrap();
+        let err = cli.validate().expect_err("validation must reject");
+        assert!(err.contains("--threads"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_dry_run_with_status() {
+        let cli = Cli::try_parse_from(["kei", "--dry-run", "status"]).unwrap();
+        let err = cli.validate().expect_err("validation must reject");
+        assert!(err.contains("--dry-run"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_album_with_password_set() {
+        let cli = Cli::try_parse_from(["kei", "--album", "Vacation", "password", "set"]).unwrap();
+        let err = cli.validate().expect_err("validation must reject");
+        assert!(err.contains("--album"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_legacy_compat_flag_with_subcommand() {
+        // `--auth-only` is a hidden bare-kei alias that maps to `kei login`.
+        // Combining it with an explicit subcommand is the same silent-swallow
+        // class of bug.
+        let cli = Cli::try_parse_from(["kei", "--auth-only", "status"]).unwrap();
+        let err = cli.validate().expect_err("validation must reject");
+        assert!(err.contains("--auth-only"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_lists_every_offending_flag() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "--skip-videos",
+            "--skip-photos",
+            "--threads",
+            "4",
+            "status",
+        ])
+        .unwrap();
+        let err = cli.validate().expect_err("validation must reject");
+        assert!(err.contains("--skip-videos"), "got: {err}");
+        assert!(err.contains("--skip-photos"), "got: {err}");
+        assert!(err.contains("--threads"), "got: {err}");
+    }
+
+    // ── Validator must NOT fire on legitimate uses ─────────────────
+
+    #[test]
+    fn validate_allows_bare_kei_with_sync_flags() {
+        // Bare invocation = sync alias; the flag is honoured and validation
+        // must pass.
+        let cli = Cli::try_parse_from(["kei", "--skip-videos"]).unwrap();
+        cli.validate()
+            .expect("bare-kei with sync flag must validate");
+    }
+
+    #[test]
+    fn validate_allows_sync_subcommand_with_sync_flags() {
+        let cli = Cli::try_parse_from(["kei", "sync", "--skip-videos", "--threads", "4"]).unwrap();
+        cli.validate()
+            .expect("explicit sync subcommand with sync flags must validate");
+    }
+
+    #[test]
+    fn validate_allows_top_level_sync_flag_then_sync_subcommand() {
+        // `kei --skip-videos=true sync` is also valid: top-level flags merge
+        // into sync via `Command::merge_top_level_args`. Need the explicit
+        // value because `--skip-videos` is `num_args = 0..=1`.
+        let cli = Cli::try_parse_from(["kei", "--skip-videos=true", "sync"]).unwrap();
+        cli.validate()
+            .expect("top-level sync flag with sync subcommand must validate");
+    }
+
+    #[test]
+    fn validate_allows_retry_failed_with_sync_flag() {
+        // `retry-failed` is a legacy alias that maps to `sync --retry-failed`
+        // and accepts SyncArgs. Top-level sync flags are merged in.
+        let cli = Cli::try_parse_from(["kei", "--threads", "4", "retry-failed"]).unwrap();
+        cli.validate()
+            .expect("retry-failed accepts sync flags via merge");
+    }
+
+    #[test]
+    fn validate_allows_global_flags_with_non_sync_subcommand() {
+        // Global flags (--username, --domain, --data-dir, --log-level,
+        // --config) are NOT sync-only and must remain valid with any
+        // subcommand.
+        let cli = Cli::try_parse_from([
+            "kei",
+            "--username",
+            "u@e.com",
+            "--log-level",
+            "debug",
+            "status",
+        ])
+        .unwrap();
+        cli.validate()
+            .expect("global flags must validate with any subcommand");
+    }
+
+    #[test]
+    fn validate_allows_status_with_no_top_level_flags() {
+        let cli = Cli::try_parse_from(["kei", "status"]).unwrap();
+        cli.validate().expect("plain `kei status` must validate");
+    }
+
+    // Parametric coverage so this stays green when new sync-only flags
+    // are added: every flag in this list must (a) be parseable at the
+    // top level, and (b) be rejected when combined with `status`.
+    //
+    // Boolean flags declared with `num_args = 0..=1` must use the `=value`
+    // form when followed by a subcommand, otherwise clap eats the
+    // subcommand name as the flag's value.
+    #[test]
+    fn validate_rejects_each_sync_only_flag_with_status() {
+        let cases: &[(&str, &[&str])] = &[
+            ("skip_videos", &["--skip-videos=true"]),
+            ("skip_photos", &["--skip-photos=true"]),
+            ("unfiled", &["--unfiled=true"]),
+            ("force_size", &["--force-size=true"]),
+            ("no_progress_bar", &["--no-progress-bar=true"]),
+            ("keep_unicode", &["--keep-unicode-in-filenames=true"]),
+            ("notify_systemd", &["--notify-systemd=true"]),
+            ("skip_live_photos", &["--skip-live-photos=true"]),
+            ("dry_run", &["--dry-run"]),
+            ("only_print_filenames", &["--only-print-filenames"]),
+            ("save_password", &["--save-password"]),
+            ("retry_failed", &["--retry-failed"]),
+            ("no_incremental", &["--no-incremental"]),
+            ("reset_sync_token", &["--reset-sync-token"]),
+            ("auth_only", &["--auth-only"]),
+            ("list_albums", &["--list-albums"]),
+            ("list_libraries", &["--list-libraries"]),
+            ("download_dir", &["--download-dir", "/photos"]),
+            ("directory", &["--directory", "/photos"]),
+            ("album", &["--album", "Vacation"]),
+            ("exclude_album", &["--exclude-album", "Hidden"]),
+            ("smart_folder", &["--smart-folder", "Favorites"]),
+            ("filename_exclude", &["--filename-exclude", "*.AAE"]),
+            ("library", &["--library", "primary"]),
+            ("size", &["--size", "original"]),
+            ("live_photo_size", &["--live-photo-size", "original"]),
+            ("recent", &["--recent", "100"]),
+            ("threads", &["--threads", "4"]),
+            ("threads_num", &["--threads-num", "8"]),
+            ("bandwidth_limit", &["--bandwidth-limit", "10M"]),
+            ("live_photo_mode", &["--live-photo-mode", "skip"]),
+            ("folder_structure", &["--folder-structure", "%Y/%m"]),
+            (
+                "folder_structure_albums",
+                &["--folder-structure-albums", "{album}"],
+            ),
+            (
+                "folder_structure_smart_folders",
+                &["--folder-structure-smart-folders", "{smart-folder}"],
+            ),
+            ("watch_with_interval", &["--watch-with-interval", "3600"]),
+            (
+                "live_photo_mov_filename_policy",
+                &["--live-photo-mov-filename-policy", "original"],
+            ),
+            ("align_raw", &["--align-raw", "original"]),
+            (
+                "file_match_policy",
+                &["--file-match-policy", "name-size-dedup-with-suffix"],
+            ),
+            (
+                "skip_created_before",
+                &["--skip-created-before", "2025-01-01"],
+            ),
+            (
+                "skip_created_after",
+                &["--skip-created-after", "2025-12-31"],
+            ),
+            ("max_retries", &["--max-retries", "3"]),
+            ("retry_delay", &["--retry-delay", "10"]),
+            ("temp_suffix", &["--temp-suffix", ".part"]),
+            ("pid_file", &["--pid-file", "/tmp/kei.pid"]),
+            (
+                "reconcile_every_n_cycles",
+                &["--reconcile-every-n-cycles", "24"],
+            ),
+            (
+                "notification_script",
+                &["--notification-script", "/tmp/notify.sh"],
+            ),
+            ("report_json", &["--report-json", "/tmp/report.json"]),
+            ("http_port", &["--http-port", "9090"]),
+            ("http_bind", &["--http-bind", "127.0.0.1"]),
+            ("max_download_attempts", &["--max-download-attempts", "5"]),
+        ];
+        for (name, args) in cases {
+            let mut argv: Vec<&str> = vec!["kei"];
+            argv.extend_from_slice(args);
+            argv.push("status");
+            let cli = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("parse failed for `{name}` ({args:?}): {e}"));
+            let result = cli.validate();
+            assert!(
+                result.is_err(),
+                "validate() must reject sync-only flag `{name}` ({args:?}) with status; got {result:?}"
+            );
+        }
     }
 }

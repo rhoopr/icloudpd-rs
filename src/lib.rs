@@ -425,6 +425,13 @@ pub fn main_inner() -> ExitCode {
 async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
+    // Reject `kei --skip-videos status` and friends, where a sync-only
+    // top-level flag is silently swallowed under a non-sync subcommand.
+    // See `Cli::validate` for the full rationale.
+    if let Err(msg) = cli.validate() {
+        anyhow::bail!("{msg}");
+    }
+
     // Migrate legacy icloudpd-rs paths before loading config, so the
     // copied config.toml is found at the new location.
     let migration_report = migration::migrate_legacy_paths();
