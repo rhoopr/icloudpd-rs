@@ -11,7 +11,8 @@ use anyhow::{bail, Context};
 use dialoguer::{Confirm, Input, Password, Select};
 
 use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMovFilenamePolicy, LogLevel, RawTreatmentPolicy, VersionSize,
+    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LogLevel,
+    RawTreatmentPolicy, VersionSize,
 };
 
 /// Result of the setup wizard — either the user wants to sync now or just exit.
@@ -34,17 +35,35 @@ struct SetupAnswers {
     password: secrecy::SecretString,
     domain: Option<Domain>,
 
-    // Destination
+    // Destination. `folder_structure` is the unfiled-pass template;
+    // `folder_structure_albums` is the v0.13 per-album template. The wizard
+    // sets both together when the user picks a date hierarchy so album passes
+    // get the same layout as the unfiled pass (matches v0.12 behavior).
     directory: String,
     folder_structure: Option<String>,
+    folder_structure_albums: Option<String>,
 
     // What to download
     albums: Vec<String>,
-    library: Option<String>, // None = default, Some("all") = all libraries
+    /// v0.13+ array form. Empty = use kei's default (`primary`).
+    /// `["all"]` = every library (PrimarySync + every shared zone).
+    libraries: Vec<String>,
+    /// v0.13+ smart-folder selector (Favorites, Hidden, etc.). Empty = default
+    /// (`none`); non-empty = emit `[filters].smart_folders`.
+    smart_folders: Vec<String>,
+    /// `Some(false)` emits `[filters].unfiled = false` (used when the user
+    /// picks specific albums and doesn't also want every other photo).
+    /// `None` keeps the v0.13 default (`true`).
+    unfiled: Option<bool>,
+    /// v0.13 `[filters].filename_exclude` patterns; empty = don't emit.
+    filename_exclude: Vec<String>,
 
     // Media types
     skip_videos: bool,
-    skip_live_photos: bool,
+    /// `Some(_)` emits `[photos].live_photo_mode = "..."`; `None` keeps the
+    /// `Both` default. Replaces the wizard's old binary skip prompt and the
+    /// deprecated `[filters].skip_live_photos` emission.
+    live_photo_mode: Option<LivePhotoMode>,
     live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
     // Quality
@@ -61,16 +80,27 @@ struct SetupAnswers {
     watch_interval: Option<u64>,
     notify_systemd: bool,
     pid_file: Option<String>,
+    /// `[watch].reconcile_every_n_cycles`; only meaningful in watch mode.
+    reconcile_every_n_cycles: Option<u64>,
 
     // Extras
     notification_script: Option<String>,
     threads_num: Option<u16>,
     max_retries: Option<u32>,
+    /// Raw user input string (e.g. `"10MB"`); validated by the config layer's
+    /// `parse_bandwidth_limit` on next sync. Empty = no limit.
+    bandwidth_limit: Option<String>,
     keep_unicode_in_filenames: bool,
     #[cfg(feature = "xmp")]
     set_exif_datetime: bool,
+    #[cfg(feature = "xmp")]
+    embed_xmp: bool,
+    #[cfg(feature = "xmp")]
+    xmp_sidecar: bool,
     file_match_policy: Option<FileMatchPolicy>,
-    cookie_directory: Option<String>,
+    /// Top-level `data_dir` in the emitted TOML (replaces the deprecated
+    /// `[auth].cookie_directory`).
+    data_dir: Option<String>,
     log_level: Option<LogLevel>,
 }
 
@@ -82,10 +112,14 @@ impl Default for SetupAnswers {
             domain: None,
             directory: "~/Photos/iCloud".to_string(),
             folder_structure: None,
+            folder_structure_albums: None,
             albums: Vec::new(),
-            library: Some("all".to_string()),
+            libraries: vec!["all".to_string()],
+            smart_folders: Vec::new(),
+            unfiled: None,
+            filename_exclude: Vec::new(),
             skip_videos: false,
-            skip_live_photos: false,
+            live_photo_mode: None,
             live_photo_mov_filename_policy: None,
             size: None,
             force_size: false,
@@ -96,14 +130,20 @@ impl Default for SetupAnswers {
             watch_interval: None,
             notify_systemd: false,
             pid_file: None,
+            reconcile_every_n_cycles: None,
             notification_script: None,
             threads_num: None,
             max_retries: None,
+            bandwidth_limit: None,
             keep_unicode_in_filenames: false,
             #[cfg(feature = "xmp")]
             set_exif_datetime: false,
+            #[cfg(feature = "xmp")]
+            embed_xmp: false,
+            #[cfg(feature = "xmp")]
+            xmp_sidecar: false,
             file_match_policy: None,
-            cookie_directory: None,
+            data_dir: None,
             log_level: None,
         }
     }
@@ -305,7 +345,16 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .default(0)
         .interact()?;
 
-    answers.folder_structure = match folder {
+    // The unfiled-pass template (`folder_structure`) and the per-album
+    // template (`folder_structure_albums`) are independent in v0.13.
+    // To match user intent ("organize photos by date") and v0.12 layout
+    // behavior, when the user picks a date hierarchy we apply the same
+    // template under each album folder by setting
+    // `folder_structure_albums = "{album}/<template>"`. The default
+    // `{album}` (flat per-album folder) stays for "All in one folder",
+    // since collapsing the date hierarchy to nothing inside per-album
+    // folders is what the user implicitly asked for.
+    let unfiled_template: Option<String> = match folder {
         1 => Some("%Y/%m".to_string()),
         2 => Some("%Y".to_string()),
         3 => Some(String::new()),
@@ -319,6 +368,19 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         // %Y/%m/%d is the default
         _ => None,
     };
+
+    let date_template_for_albums: Option<&str> = match folder {
+        0 => Some("%Y/%m/%d"),
+        1 => Some("%Y/%m"),
+        2 => Some("%Y"),
+        // 3 ("all in one folder") and 4 (custom) intentionally leave the
+        // album template at the v0.13 default `{album}`. For 4 the user
+        // can edit the generated TOML if they want a custom album layout
+        // too; offering yet another wizard prompt here clutters the flow.
+        _ => None,
+    };
+    answers.folder_structure_albums = date_template_for_albums.map(|t| format!("{{album}}/{t}"));
+    answers.folder_structure = unfiled_template;
 
     Ok(())
 }
@@ -335,17 +397,55 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .interact()?;
 
     if scope == 1 {
-        let album_input: String = Input::new()
-            .with_prompt("Album names (comma-separated)")
-            .interact_text()?;
-        answers.albums = album_input
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !answers.albums.is_empty() {
-            println!("  Tip: run `kei list albums` to see available album names.");
+        // One album per prompt; blank input ends the loop. We can't comma-split
+        // the input because `--album` / `[filters].albums` no longer split
+        // (v0.13), so a single comma-separated entry would silently break any
+        // album whose name contains a comma.
+        println!("  Enter one album per line. Press Enter on a blank line to finish.");
+        println!("  Tip: run `kei list albums` to see available album names.");
+        loop {
+            let prompt = if answers.albums.is_empty() {
+                "Album name".to_string()
+            } else {
+                format!(
+                    "Album name ({} so far, blank to finish)",
+                    answers.albums.len()
+                )
+            };
+            let name: String = Input::new()
+                .with_prompt(prompt)
+                .default(String::new())
+                .show_default(false)
+                .allow_empty(true)
+                .interact_text()?;
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            answers.albums.push(trimmed.to_string());
         }
+
+        // v0.13's `[filters].unfiled` defaults to `true`, which means a user
+        // who picked "specific albums" still gets a separate pass that
+        // downloads every photo not in any of those albums. That's almost
+        // never what someone selecting albums by name wants. Ask explicitly.
+        if !answers.albums.is_empty() {
+            println!();
+            let also_unfiled = Confirm::new()
+                .with_prompt("Also download photos that aren't in any of these albums?")
+                .default(false)
+                .interact()?;
+            // Always set explicitly so the runtime "--unfiled defaults to
+            // true" warning never fires for wizard-generated configs (the
+            // warning only fires when `unfiled` is implicit and the album
+            // selector isn't `none`).
+            answers.unfiled = Some(also_unfiled);
+        }
+    } else {
+        // scope == 0 ("entire library") -- albums default to `all`. Set
+        // unfiled explicitly so the wizard output silences the implicit-
+        // unfiled warning that would otherwise fire on every sync.
+        answers.unfiled = Some(true);
     }
 
     println!();
@@ -359,9 +459,9 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .default(0)
         .interact()?;
 
-    answers.library = match library {
-        0 => Some("all".to_string()),
-        _ => None, // PrimarySync default
+    answers.libraries = match library {
+        0 => vec!["all".to_string()],
+        _ => Vec::new(), // empty = use kei's default (`primary`)
     };
 
     Ok(())
@@ -377,13 +477,34 @@ fn ask_media_types(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .interact()?;
     answers.skip_videos = !include_videos;
 
-    let include_live = Confirm::new()
-        .with_prompt("Include live photos?")
-        .default(true)
+    // Four-way choice (matches the runtime `LivePhotoMode` enum). The old
+    // wizard only exposed Both vs Skip, hiding the image-only / video-only
+    // modes that the CLI surface and TOML accept.
+    let live_items = [
+        "Both: image + video (default)",
+        "Image only: skip the .mov video file",
+        "Video only: skip the still image",
+        "Skip live photos entirely",
+    ];
+    let live_choice = Select::new()
+        .with_prompt("How should live photos be downloaded?")
+        .items(live_items)
+        .default(0)
         .interact()?;
-    answers.skip_live_photos = !include_live;
+    answers.live_photo_mode = match live_choice {
+        1 => Some(LivePhotoMode::ImageOnly),
+        2 => Some(LivePhotoMode::VideoOnly),
+        3 => Some(LivePhotoMode::Skip),
+        // `Both` is the default; leave as None so the emitted TOML keeps the
+        // commented hint instead of an explicit assignment.
+        _ => None,
+    };
 
-    if include_live {
+    // The .mov filename policy only matters when both image and video land
+    // on disk together. Image-only / video-only / skip leave the .mov on its
+    // own (or absent), so the suffix-vs-original choice is moot.
+    let download_both_parts = matches!(live_choice, 0);
+    if download_both_parts {
         let mov_items = [
             "Add -live suffix (IMG_1234-live.mov)",
             "Same name as the photo (IMG_1234.mov)",
@@ -540,6 +661,23 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
                 answers.pid_file = Some(pid);
             }
         }
+
+        // Periodic local-vs-state reconciliation walk. Read-only (it only
+        // logs missing files; never re-downloads or marks failed), so the
+        // floor is "off" and opt-in is intentional.
+        let reconcile: String = Input::new()
+            .with_prompt(
+                "Reconcile (read-only walk for missing local files) every N watch cycles (blank = off)",
+            )
+            .default(String::new())
+            .show_default(false)
+            .interact_text()?;
+        if !reconcile.is_empty() {
+            match reconcile.parse::<u64>() {
+                Ok(n) if n > 0 => answers.reconcile_every_n_cycles = Some(n),
+                _ => println!("  Invalid number, skipping."),
+            }
+        }
     }
 
     Ok(())
@@ -552,7 +690,7 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     let configure = Confirm::new()
         .with_prompt(
             "Want to configure additional options\n  \
-             (threads, retries, filenames, EXIF, dedup, notifications, logging)?",
+             (smart folders, bandwidth, exclusions, EXIF, dedup, threads, notifications, logging)?",
         )
         .default(false)
         .interact()?;
@@ -563,7 +701,48 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
     println!();
 
+    // Smart folders (Favorites, Hidden, Recently Deleted, etc.). v0.13 added
+    // these as a first-class selector; default is `none`. One name per prompt
+    // line for the same reason as the album loop.
+    let include_smart = Confirm::new()
+        .with_prompt("Include smart folders (Favorites, Hidden, Recently Deleted, etc.)?")
+        .default(false)
+        .interact()?;
+    if include_smart {
+        let smart_scope_items = [
+            "All visible smart folders (Favorites, etc., excludes Hidden + Recently Deleted)",
+            "All including Hidden + Recently Deleted",
+            "Specific smart folders by name",
+        ];
+        let smart_scope = Select::new()
+            .with_prompt("Which smart folders?")
+            .items(smart_scope_items)
+            .default(0)
+            .interact()?;
+        match smart_scope {
+            0 => answers.smart_folders = vec!["all".to_string()],
+            1 => answers.smart_folders = vec!["all-with-sensitive".to_string()],
+            _ => {
+                println!("  Enter one smart-folder name per line. Press Enter on a blank line to finish.");
+                loop {
+                    let name: String = Input::new()
+                        .with_prompt("Smart folder name (blank to finish)")
+                        .default(String::new())
+                        .show_default(false)
+                        .allow_empty(true)
+                        .interact_text()?;
+                    let trimmed = name.trim();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    answers.smart_folders.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
     // Notifications
+    println!();
     let notify = Confirm::new()
         .with_prompt("Run a notification script on events (2FA needed, sync complete, errors)?")
         .default(false)
@@ -593,6 +772,43 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         answers.max_retries = Some(retries);
     }
 
+    let bandwidth: String = Input::new()
+        .with_prompt("Bandwidth limit (e.g. 10MB, 500K; blank = no limit)")
+        .default(String::new())
+        .show_default(false)
+        .interact_text()?;
+    if !bandwidth.trim().is_empty() {
+        // Validate at the same place the runtime config does, so a typo here
+        // surfaces immediately instead of on the next sync.
+        match crate::cli::parse_bandwidth_limit(bandwidth.trim()) {
+            Ok(_) => answers.bandwidth_limit = Some(bandwidth.trim().to_string()),
+            Err(e) => println!("  Invalid bandwidth limit ({e}), skipping."),
+        }
+    }
+
+    // Exclusions: filename glob patterns applied across every pass.
+    println!();
+    let exclude = Confirm::new()
+        .with_prompt("Exclude files matching glob patterns (e.g. IMG_screenshot*.png)?")
+        .default(false)
+        .interact()?;
+    if exclude {
+        println!("  Enter one pattern per line. Press Enter on a blank line to finish.");
+        loop {
+            let pat: String = Input::new()
+                .with_prompt("Pattern (blank to finish)")
+                .default(String::new())
+                .show_default(false)
+                .allow_empty(true)
+                .interact_text()?;
+            let trimmed = pat.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            answers.filename_exclude.push(trimmed.to_string());
+        }
+    }
+
     // Filenames
     println!();
     answers.keep_unicode_in_filenames = Confirm::new()
@@ -604,6 +820,16 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     {
         answers.set_exif_datetime = Confirm::new()
             .with_prompt("Write EXIF date tag if missing from photo?")
+            .default(false)
+            .interact()?;
+
+        answers.embed_xmp = Confirm::new()
+            .with_prompt("Embed XMP metadata (rating, GPS, description) into photos?")
+            .default(false)
+            .interact()?;
+
+        answers.xmp_sidecar = Confirm::new()
+            .with_prompt("Write a sidecar `.xmp` file alongside each photo?")
             .default(false)
             .interact()?;
     }
@@ -623,14 +849,16 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         answers.file_match_policy = Some(FileMatchPolicy::NameId7);
     }
 
-    // Cookie directory
+    // Data directory (sessions, state DB, credentials, health). Replaces
+    // the v0.12 cookie-directory prompt; `[auth].cookie_directory` and
+    // `--cookie-directory` were deprecated in v0.13.
     println!();
-    let cookie: String = Input::new()
-        .with_prompt("Cookie/session directory")
-        .default("~/.config/kei/cookies".to_string())
+    let data_dir: String = Input::new()
+        .with_prompt("Data directory (sessions, state, credentials)")
+        .default("~/.config/kei".to_string())
         .interact_text()?;
-    if cookie != "~/.config/kei/cookies" {
-        answers.cookie_directory = Some(cookie);
+    if data_dir != "~/.config/kei" {
+        answers.data_dir = Some(data_dir);
     }
 
     // Log level
@@ -668,7 +896,11 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         writeln!(out, "# Generated by: kei setup")?;
         writeln!(out)?;
 
-        // Log level
+        // Top-level keys (data_dir, log_level)
+        match &answers.data_dir {
+            Some(dir) => writeln!(out, "data_dir = \"{}\"", escape_toml_string(dir))?,
+            None => writeln!(out, "# data_dir = \"~/.config/kei\"")?,
+        };
         match answers.log_level {
             Some(level) => writeln!(out, "log_level = \"{}\"", log_level_str(level))?,
             None => writeln!(out, "# log_level = \"warn\"")?,
@@ -690,10 +922,6 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             Some(domain) => writeln!(out, "domain = \"{}\"", domain.as_str())?,
             None => writeln!(out, "# domain = \"com\"")?,
         };
-        match &answers.cookie_directory {
-            Some(dir) => writeln!(out, "cookie_directory = \"{}\"", escape_toml_string(dir))?,
-            None => writeln!(out, "# cookie_directory = \"~/.config/kei/cookies\"")?,
-        };
 
         // [download]
         writeln!(out)?;
@@ -703,13 +931,37 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             "directory = \"{}\"",
             escape_toml_string(&answers.directory)
         )?;
+        // `folder_structure` is the unfiled-pass template (every photo not in
+        // any user album / smart folder). The two per-category templates
+        // below default to flat per-category folders; the wizard sets
+        // `folder_structure_albums` to mirror the chosen date hierarchy when
+        // appropriate (see ask_destination).
         match &answers.folder_structure {
             Some(fs) => writeln!(out, "folder_structure = \"{}\"", escape_toml_string(fs))?,
             None => writeln!(out, "# folder_structure = \"%Y/%m/%d\"")?,
         };
+        match &answers.folder_structure_albums {
+            Some(fs) => writeln!(
+                out,
+                "folder_structure_albums = \"{}\"",
+                escape_toml_string(fs)
+            )?,
+            None => writeln!(out, "# folder_structure_albums = \"{{album}}\"")?,
+        };
+        writeln!(
+            out,
+            "# folder_structure_smart_folders = \"{{smart-folder}}\""
+        )?;
         match answers.threads_num {
             Some(n) => writeln!(out, "threads = {n}")?,
             None => writeln!(out, "# threads = 10")?,
+        };
+        match &answers.bandwidth_limit {
+            Some(b) => writeln!(out, "bandwidth_limit = \"{}\"", escape_toml_string(b))?,
+            None => writeln!(
+                out,
+                "# bandwidth_limit = \"10MB\"  # blank/comment = no limit"
+            )?,
         };
         #[cfg(feature = "xmp")]
         {
@@ -721,6 +973,16 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             writeln!(out, "# set_exif_rating = false")?;
             writeln!(out, "# set_exif_gps = false")?;
             writeln!(out, "# set_exif_description = false")?;
+            if answers.embed_xmp {
+                writeln!(out, "embed_xmp = true")?;
+            } else {
+                writeln!(out, "# embed_xmp = false")?;
+            }
+            if answers.xmp_sidecar {
+                writeln!(out, "xmp_sidecar = true")?;
+            } else {
+                writeln!(out, "# xmp_sidecar = false")?;
+            }
         }
         writeln!(out, "# temp_suffix = \".kei-tmp\"")?;
         writeln!(out, "# no_progress_bar = false")?;
@@ -736,12 +998,18 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         // [filters]
         writeln!(out)?;
         writeln!(out, "[filters]")?;
-        match &answers.library {
-            Some(lib) => writeln!(out, "library = \"{}\"", escape_toml_string(lib))?,
-            None => writeln!(out, "# library = \"PrimarySync\"")?,
-        };
+        if answers.libraries.is_empty() {
+            writeln!(out, "# libraries = [\"primary\"]")?;
+        } else {
+            let library_strs: Vec<String> = answers
+                .libraries
+                .iter()
+                .map(|l| format!("\"{}\"", escape_toml_string(l)))
+                .collect();
+            writeln!(out, "libraries = [{}]", library_strs.join(", "))?;
+        }
         if answers.albums.is_empty() {
-            writeln!(out, "# albums = []")?;
+            writeln!(out, "# albums = [\"all\"]")?;
         } else {
             let album_strs: Vec<String> = answers
                 .albums
@@ -750,17 +1018,39 @@ fn generate_toml(answers: &SetupAnswers) -> String {
                 .collect();
             writeln!(out, "albums = [{}]", album_strs.join(", "))?;
         }
+        if answers.smart_folders.is_empty() {
+            writeln!(out, "# smart_folders = [\"none\"]")?;
+        } else {
+            let sf_strs: Vec<String> = answers
+                .smart_folders
+                .iter()
+                .map(|s| format!("\"{}\"", escape_toml_string(s)))
+                .collect();
+            writeln!(out, "smart_folders = [{}]", sf_strs.join(", "))?;
+        }
+        match answers.unfiled {
+            Some(false) => writeln!(out, "unfiled = false")?,
+            Some(true) => writeln!(out, "unfiled = true")?,
+            None => writeln!(out, "# unfiled = true")?,
+        };
+        if answers.filename_exclude.is_empty() {
+            writeln!(out, "# filename_exclude = []")?;
+        } else {
+            let pat_strs: Vec<String> = answers
+                .filename_exclude
+                .iter()
+                .map(|p| format!("\"{}\"", escape_toml_string(p)))
+                .collect();
+            writeln!(out, "filename_exclude = [{}]", pat_strs.join(", "))?;
+        }
         if answers.skip_videos {
             writeln!(out, "skip_videos = true")?;
         } else {
             writeln!(out, "# skip_videos = false")?;
         }
         writeln!(out, "# skip_photos = false")?;
-        if answers.skip_live_photos {
-            writeln!(out, "skip_live_photos = true")?;
-        } else {
-            writeln!(out, "# skip_live_photos = false")?;
-        }
+        // `[filters].skip_live_photos` was deprecated in v0.13; the
+        // `live_photo_mode` setting is emitted in the [photos] section below.
         match answers.recent {
             Some(n) => writeln!(out, "recent = {n}")?,
             None => writeln!(out, "# recent = 0  (0 = all)")?,
@@ -782,6 +1072,10 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             None => writeln!(out, "# size = \"original\"")?,
         };
         writeln!(out, "# live_photo_size = \"original\"")?;
+        match answers.live_photo_mode {
+            Some(mode) => writeln!(out, "live_photo_mode = \"{}\"", live_photo_mode_str(mode))?,
+            None => writeln!(out, "# live_photo_mode = \"both\"")?,
+        };
         match answers.live_photo_mov_filename_policy {
             Some(p) => writeln!(
                 out,
@@ -825,6 +1119,10 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             Some(p) => writeln!(out, "pid_file = \"{}\"", escape_toml_string(p))?,
             None => writeln!(out, "# pid_file = \"\"")?,
         };
+        match answers.reconcile_every_n_cycles {
+            Some(n) => writeln!(out, "reconcile_every_n_cycles = {n}")?,
+            None => writeln!(out, "# reconcile_every_n_cycles = 0  # 0/unset = off")?,
+        };
 
         // [notifications]
         writeln!(out)?;
@@ -833,6 +1131,18 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             Some(s) => writeln!(out, "script = \"{}\"", escape_toml_string(s))?,
             None => writeln!(out, "# script = \"/path/to/script.sh\"")?,
         }
+
+        // [server] - HTTP/Prometheus metrics endpoint. Replaces the
+        // deprecated [metrics] section. Hint-only; no wizard prompt.
+        writeln!(out)?;
+        writeln!(out, "[server]")?;
+        writeln!(out, "# port = 9090")?;
+        writeln!(out, "# bind = \"127.0.0.1\"")?;
+
+        // [report] - per-run JSON report destination. Hint-only.
+        writeln!(out)?;
+        writeln!(out, "[report]")?;
+        writeln!(out, "# json = \"/path/to/last-run.json\"")?;
 
         Ok(out)
     })()
@@ -869,6 +1179,17 @@ fn mov_policy_str(policy: LivePhotoMovFilenamePolicy) -> &'static str {
     }
 }
 
+fn live_photo_mode_str(mode: LivePhotoMode) -> &'static str {
+    // Must match the kebab-case rename in `LivePhotoMode`'s `Deserialize`
+    // (`#[serde(rename_all = "kebab-case")]`).
+    match mode {
+        LivePhotoMode::Both => "both",
+        LivePhotoMode::ImageOnly => "image-only",
+        LivePhotoMode::VideoOnly => "video-only",
+        LivePhotoMode::Skip => "skip",
+    }
+}
+
 fn raw_policy_str(policy: RawTreatmentPolicy) -> &'static str {
     match policy {
         RawTreatmentPolicy::Unchanged => "as-is",
@@ -888,6 +1209,7 @@ fn file_match_str(policy: FileMatchPolicy) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::TomlConfig;
+    use crate::types::LivePhotoMode;
 
     #[test]
     fn test_generate_toml_defaults_only() {
@@ -903,14 +1225,21 @@ mod tests {
         assert!(toml.contains("username = \"user@example.com\""));
         // Must contain directory uncommented
         assert!(toml.contains("directory = \"~/Photos/iCloud\""));
-        // Library should be set to "all"
-        assert!(toml.contains("library = \"all\""));
+        // Libraries should be set to ["all"] (v0.13 array form, not the
+        // deprecated singular `library` key).
+        assert!(toml.contains("libraries = [\"all\"]"));
+        assert!(!toml.contains("library = \"all\""));
         // Password should NOT be in the TOML
         assert!(!toml.contains("secret"));
         // Defaults should be commented out
         assert!(toml.contains("# size = \"original\""));
         assert!(toml.contains("# threads = 10"));
         assert!(toml.contains("# log_level = \"warn\""));
+        assert!(toml.contains("# data_dir = \"~/.config/kei\""));
+        // The deprecated `cookie_directory` and `skip_live_photos` keys
+        // must not appear in the generated config.
+        assert!(!toml.contains("cookie_directory"));
+        assert!(!toml.contains("skip_live_photos"));
     }
 
     #[test]
@@ -931,12 +1260,24 @@ mod tests {
         let auth = parsed.auth.expect("auth section missing");
         assert_eq!(auth.username.as_deref(), Some("user@example.com"));
         assert!(auth.password.is_none());
+        assert!(
+            auth.cookie_directory.is_none(),
+            "wizard must not emit deprecated [auth].cookie_directory"
+        );
 
         let download = parsed.download.expect("download section missing");
         assert_eq!(download.directory.as_deref(), Some("~/Photos/iCloud"));
 
         let filters = parsed.filters.expect("filters section missing");
-        assert_eq!(filters.library.as_deref(), Some("all"));
+        assert!(
+            filters.library.is_none(),
+            "wizard must not emit deprecated [filters].library (singular)"
+        );
+        assert_eq!(filters.libraries.as_deref(), Some(&["all".to_string()][..]));
+        assert!(
+            filters.skip_live_photos.is_none(),
+            "wizard must not emit deprecated [filters].skip_live_photos"
+        );
     }
 
     #[test]
@@ -947,10 +1288,14 @@ mod tests {
             domain: Some(Domain::Cn),
             directory: "~/photos".to_string(),
             folder_structure: Some("%Y/%m".to_string()),
+            folder_structure_albums: Some("{album}/%Y/%m".to_string()),
             albums: vec!["Favorites".to_string(), "Vacation".to_string()],
-            library: Some("all".to_string()),
+            libraries: vec!["all".to_string()],
+            smart_folders: vec!["all".to_string()],
+            unfiled: Some(false),
+            filename_exclude: vec!["IMG_screenshot*.png".to_string()],
             skip_videos: true,
-            skip_live_photos: false,
+            live_photo_mode: Some(LivePhotoMode::Both),
             live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
             size: Some(VersionSize::Medium),
             force_size: true,
@@ -961,14 +1306,20 @@ mod tests {
             watch_interval: Some(1800),
             notify_systemd: true,
             pid_file: Some("/var/run/kei.pid".to_string()),
+            reconcile_every_n_cycles: Some(24),
             notification_script: Some("/usr/local/bin/notify.sh".to_string()),
             threads_num: Some(4),
             max_retries: Some(5),
+            bandwidth_limit: Some("10MB".to_string()),
             keep_unicode_in_filenames: true,
             #[cfg(feature = "xmp")]
             set_exif_datetime: true,
+            #[cfg(feature = "xmp")]
+            embed_xmp: true,
+            #[cfg(feature = "xmp")]
+            xmp_sidecar: false,
             file_match_policy: Some(FileMatchPolicy::NameId7),
-            cookie_directory: Some("~/.cookies".to_string()),
+            data_dir: Some("~/.kei".to_string()),
             log_level: Some(LogLevel::Debug),
         };
         let toml_str = generate_toml(&answers);
@@ -976,21 +1327,36 @@ mod tests {
         // All user-set values should be uncommented
         assert!(toml_str.contains("domain = \"cn\""));
         assert!(toml_str.contains("folder_structure = \"%Y/%m\""));
+        assert!(toml_str.contains("folder_structure_albums = \"{album}/%Y/%m\""));
         assert!(toml_str.contains("albums = [\"Favorites\", \"Vacation\"]"));
+        assert!(toml_str.contains("libraries = [\"all\"]"));
+        assert!(toml_str.contains("smart_folders = [\"all\"]"));
+        assert!(toml_str.contains("unfiled = false"));
+        assert!(toml_str.contains("filename_exclude = [\"IMG_screenshot*.png\"]"));
         assert!(toml_str.contains("skip_videos = true"));
         assert!(toml_str.contains("size = \"medium\""));
+        // live_photo_mode = "both" is the default; emitting it explicitly is
+        // also fine, but the test above sets `Some(Both)` so we expect it.
+        assert!(toml_str.contains("live_photo_mode = \"both\""));
         assert!(toml_str.contains("force_size = true"));
         assert!(toml_str.contains("align_raw = \"original\""));
         assert!(toml_str.contains("recent = 100"));
         assert!(toml_str.contains("interval = 1800"));
         assert!(toml_str.contains("notify_systemd = true"));
+        assert!(toml_str.contains("reconcile_every_n_cycles = 24"));
         assert!(toml_str.contains("threads = 4"));
+        assert!(toml_str.contains("bandwidth_limit = \"10MB\""));
         assert!(toml_str.contains("file_match_policy = \"name-id7\""));
         assert!(toml_str.contains("log_level = \"debug\""));
         #[cfg(feature = "xmp")]
-        assert!(toml_str.contains("set_exif_datetime = true"));
+        {
+            assert!(toml_str.contains("set_exif_datetime = true"));
+            assert!(toml_str.contains("embed_xmp = true"));
+            // `xmp_sidecar = false` here means it's commented out, not active.
+            assert!(toml_str.contains("# xmp_sidecar = false"));
+        }
         assert!(toml_str.contains("keep_unicode_in_filenames = true"));
-        assert!(toml_str.contains("cookie_directory = \"~/.cookies\""));
+        assert!(toml_str.contains("data_dir = \"~/.kei\""));
         assert!(toml_str.contains("script = \"/usr/local/bin/notify.sh\""));
 
         // Must still parse
@@ -1006,10 +1372,14 @@ mod tests {
             domain: Some(Domain::Cn),
             directory: "/data/photos".to_string(),
             folder_structure: Some("%Y-%m".to_string()),
+            folder_structure_albums: Some("{album}/%Y-%m".to_string()),
             albums: vec!["A".to_string()],
-            library: None,
+            libraries: Vec::new(),
+            smart_folders: vec!["Favorites".to_string()],
+            unfiled: Some(false),
+            filename_exclude: vec!["*.tmp".to_string()],
             skip_videos: true,
-            skip_live_photos: true,
+            live_photo_mode: Some(LivePhotoMode::Skip),
             live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
             size: Some(VersionSize::Thumb),
             force_size: true,
@@ -1020,40 +1390,77 @@ mod tests {
             watch_interval: Some(600),
             notify_systemd: true,
             pid_file: Some("/tmp/pid".to_string()),
+            reconcile_every_n_cycles: Some(48),
             notification_script: Some("/bin/notify".to_string()),
             threads_num: Some(2),
             max_retries: Some(0),
+            bandwidth_limit: Some("1Mi".to_string()),
             keep_unicode_in_filenames: true,
             #[cfg(feature = "xmp")]
             set_exif_datetime: true,
+            #[cfg(feature = "xmp")]
+            embed_xmp: true,
+            #[cfg(feature = "xmp")]
+            xmp_sidecar: true,
             file_match_policy: Some(FileMatchPolicy::NameId7),
-            cookie_directory: Some("/tmp/cookies".to_string()),
+            data_dir: Some("/var/lib/kei".to_string()),
             log_level: Some(LogLevel::Error),
         };
         let toml_str = generate_toml(&answers);
         let parsed: TomlConfig = toml::from_str(&toml_str)
             .unwrap_or_else(|e| panic!("Failed to parse: {e}\n\n{toml_str}"));
 
+        assert_eq!(parsed.data_dir.as_deref(), Some("/var/lib/kei"));
+
         let auth = parsed.auth.unwrap();
         assert_eq!(auth.username.as_deref(), Some("test@icloud.com"));
         assert_eq!(auth.domain, Some(Domain::Cn));
-        assert_eq!(auth.cookie_directory.as_deref(), Some("/tmp/cookies"));
+        assert!(
+            auth.cookie_directory.is_none(),
+            "deprecated [auth].cookie_directory must not be emitted"
+        );
 
         let dl = parsed.download.unwrap();
         assert_eq!(dl.directory.as_deref(), Some("/data/photos"));
         assert_eq!(dl.folder_structure.as_deref(), Some("%Y-%m"));
+        assert_eq!(dl.folder_structure_albums.as_deref(), Some("{album}/%Y-%m"));
         assert_eq!(dl.threads, Some(2));
         assert_eq!(dl.threads_num, None);
+        assert_eq!(dl.bandwidth_limit.as_deref(), Some("1Mi"));
         #[cfg(feature = "xmp")]
-        assert_eq!(dl.set_exif_datetime, Some(true));
+        {
+            assert_eq!(dl.set_exif_datetime, Some(true));
+            assert_eq!(dl.embed_xmp, Some(true));
+            assert_eq!(dl.xmp_sidecar, Some(true));
+        }
         let retry = dl.retry.unwrap();
         assert_eq!(retry.max_retries, Some(0));
         assert_eq!(retry.delay, None);
 
         let filters = parsed.filters.unwrap();
         assert_eq!(filters.albums.as_deref(), Some(&["A".to_string()][..]));
+        assert_eq!(
+            filters.smart_folders.as_deref(),
+            Some(&["Favorites".to_string()][..])
+        );
+        assert_eq!(filters.unfiled, Some(false));
+        assert_eq!(
+            filters.filename_exclude.as_deref(),
+            Some(&["*.tmp".to_string()][..])
+        );
         assert_eq!(filters.skip_videos, Some(true));
-        assert_eq!(filters.skip_live_photos, Some(true));
+        assert!(
+            filters.skip_live_photos.is_none(),
+            "deprecated [filters].skip_live_photos must not be emitted; live_photo_mode in [photos] is canonical"
+        );
+        assert!(
+            filters.library.is_none(),
+            "deprecated [filters].library (singular) must not be emitted"
+        );
+        assert!(
+            filters.libraries.is_none(),
+            "empty libraries vec must produce a comment, not an array"
+        );
         assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(50)));
         assert_eq!(filters.skip_created_before.as_deref(), Some("30d"));
         assert_eq!(filters.skip_created_after.as_deref(), Some("2025-06-01"));
@@ -1069,6 +1476,7 @@ mod tests {
             photos.live_photo_mov_filename_policy,
             Some(LivePhotoMovFilenamePolicy::Original)
         );
+        assert_eq!(photos.live_photo_mode, Some(LivePhotoMode::Skip));
         assert_eq!(photos.file_match_policy, Some(FileMatchPolicy::NameId7));
         assert_eq!(photos.keep_unicode_in_filenames, Some(true));
 
@@ -1076,6 +1484,7 @@ mod tests {
         assert_eq!(watch.interval, Some(600));
         assert_eq!(watch.notify_systemd, Some(true));
         assert_eq!(watch.pid_file.as_deref(), Some("/tmp/pid"));
+        assert_eq!(watch.reconcile_every_n_cycles, Some(48));
 
         let notif = parsed.notifications.unwrap();
         assert_eq!(notif.script.as_deref(), Some("/bin/notify"));
@@ -1100,6 +1509,270 @@ mod tests {
             .unwrap_or_else(|e| panic!("Failed to parse: {e}\n\n{toml_str}"));
         let albums = parsed.filters.unwrap().albums.unwrap();
         assert_eq!(albums, vec!["My Album", "Vacation \"2024\""]);
+    }
+
+    /// Single source of truth: the wizard must never emit any TOML key that
+    /// `Config::build` would warn about as deprecated. If a future v0.X
+    /// adds another deprecation, add a substring to `DEPRECATED_KEYS` and the
+    /// wizard authors get a CI failure pointing them at the right field.
+    #[test]
+    fn test_wizard_never_emits_deprecated_keys() {
+        // Cover both "default" answers (most users) and "every option set"
+        // answers (everything the wizard can possibly emit).
+        let cases: Vec<SetupAnswers> = vec![
+            SetupAnswers {
+                username: "u@e.com".to_string(),
+                password: secrecy::SecretString::from("p"),
+                directory: "~/Photos".to_string(),
+                ..Default::default()
+            },
+            SetupAnswers {
+                username: "u@e.com".to_string(),
+                password: secrecy::SecretString::from("p"),
+                directory: "/photos".to_string(),
+                albums: vec!["A".to_string()],
+                libraries: Vec::new(),
+                smart_folders: vec!["all".to_string()],
+                unfiled: Some(false),
+                filename_exclude: vec!["*.tmp".to_string()],
+                skip_videos: true,
+                live_photo_mode: Some(LivePhotoMode::Skip),
+                live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
+                size: Some(VersionSize::Thumb),
+                force_size: true,
+                align_raw: Some(RawTreatmentPolicy::PreferAlternative),
+                bandwidth_limit: Some("10MB".to_string()),
+                reconcile_every_n_cycles: Some(24),
+                #[cfg(feature = "xmp")]
+                set_exif_datetime: true,
+                #[cfg(feature = "xmp")]
+                embed_xmp: true,
+                #[cfg(feature = "xmp")]
+                xmp_sidecar: true,
+                file_match_policy: Some(FileMatchPolicy::NameId7),
+                data_dir: Some("/var/lib/kei".to_string()),
+                log_level: Some(LogLevel::Error),
+                ..Default::default()
+            },
+        ];
+
+        // Substrings the v0.13 deprecation paths in `Config::build` warn on.
+        // Match `key = ` (with the equals sign) so we don't false-positive on
+        // comment hints or substring matches inside a non-deprecated key.
+        const DEPRECATED_KEYS: &[(&str, &str)] = &[
+            (
+                "cookie_directory =",
+                "[auth].cookie_directory -> top-level data_dir",
+            ),
+            (
+                "library =",
+                "[filters].library (singular) -> [filters].libraries (array)",
+            ),
+            (
+                "album =",
+                "[filters].album (singular) -> [filters].albums (array)",
+            ),
+            (
+                "exclude_albums =",
+                "[filters].exclude_albums -> [filters].albums with !name entries",
+            ),
+            (
+                "skip_live_photos =",
+                "[filters].skip_live_photos -> [photos].live_photo_mode",
+            ),
+            (
+                "threads_num =",
+                "[download].threads_num -> [download].threads",
+            ),
+        ];
+
+        for answers in &cases {
+            let toml_str = generate_toml(answers);
+            // Strip comment lines so the substring search only inspects
+            // active assignments, not the `# foo = ...` hint comments.
+            let active: String = toml_str
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for (needle, msg) in DEPRECATED_KEYS {
+                assert!(
+                    !active.contains(needle),
+                    "wizard emitted deprecated key `{needle}` ({msg}); full output:\n{toml_str}"
+                );
+            }
+        }
+    }
+
+    /// "Specific albums" + the user wants only those albums (declined the
+    /// "also download photos not in any of these albums?" prompt) -> wizard
+    /// must emit `unfiled = false`. The pre-fix wizard implicitly relied on
+    /// v0.13's `unfiled = true` default and pulled every other photo into
+    /// the unfiled pass.
+    #[test]
+    fn test_specific_albums_with_unfiled_disabled_emits_unfiled_false() {
+        let answers = SetupAnswers {
+            username: "u@e.com".to_string(),
+            password: secrecy::SecretString::from("p"),
+            directory: "/d".to_string(),
+            albums: vec!["Vacation".to_string()],
+            unfiled: Some(false),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        assert!(toml_str.contains("unfiled = false"));
+
+        let parsed: TomlConfig =
+            toml::from_str(&toml_str).expect("generated TOML must parse cleanly");
+        assert_eq!(parsed.filters.unwrap().unfiled, Some(false));
+    }
+
+    /// "Specific albums" + the user wants those AND every other photo
+    /// (accepted the unfiled prompt) -> wizard emits `unfiled = true`
+    /// explicitly so the runtime's implicit-unfiled warning never fires.
+    /// (That warning's text says "pass `--unfiled true` to silence", so
+    /// always-explicit emission is load-bearing for a clean first sync.)
+    #[test]
+    fn test_specific_albums_with_unfiled_enabled_emits_unfiled_true() {
+        let answers = SetupAnswers {
+            username: "u@e.com".to_string(),
+            password: secrecy::SecretString::from("p"),
+            directory: "/d".to_string(),
+            albums: vec!["Vacation".to_string()],
+            unfiled: Some(true),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        assert!(toml_str.contains("unfiled = true"));
+
+        let parsed: TomlConfig =
+            toml::from_str(&toml_str).expect("generated TOML must parse cleanly");
+        assert_eq!(parsed.filters.unwrap().unfiled, Some(true));
+    }
+
+    /// When the user picks a date hierarchy, the wizard must emit a
+    /// `folder_structure_albums = "{album}/<template>"` so album passes share
+    /// the same date layout as the unfiled pass. The v0.13 default for the
+    /// per-album template is the flat `{album}` (no date), which silently
+    /// changes the on-disk layout for v0.12 users who only set
+    /// `--folder-structure %Y/%m/%d`.
+    #[test]
+    fn test_date_template_lifts_into_folder_structure_albums() {
+        let answers = SetupAnswers {
+            username: "u@e.com".to_string(),
+            password: secrecy::SecretString::from("p"),
+            directory: "/d".to_string(),
+            // Match what ask_destination sets for the "By month" choice.
+            folder_structure: Some("%Y/%m".to_string()),
+            folder_structure_albums: Some("{album}/%Y/%m".to_string()),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        assert!(toml_str.contains("folder_structure = \"%Y/%m\""));
+        assert!(toml_str.contains("folder_structure_albums = \"{album}/%Y/%m\""));
+
+        let parsed: TomlConfig = toml::from_str(&toml_str).expect("must parse");
+        let dl = parsed.download.unwrap();
+        assert_eq!(dl.folder_structure.as_deref(), Some("%Y/%m"));
+        assert_eq!(dl.folder_structure_albums.as_deref(), Some("{album}/%Y/%m"));
+    }
+
+    /// When the user picks "All in one folder", the wizard emits
+    /// `folder_structure = ""` (empty unfiled template) and intentionally
+    /// leaves `folder_structure_albums` unset so albums keep their flat
+    /// per-album folder default. Collapsing per-album folders into a single
+    /// flat directory is rarely what the user wanted from "all in one".
+    #[test]
+    fn test_all_in_one_folder_does_not_set_folder_structure_albums() {
+        let answers = SetupAnswers {
+            username: "u@e.com".to_string(),
+            password: secrecy::SecretString::from("p"),
+            directory: "/d".to_string(),
+            folder_structure: Some(String::new()),
+            folder_structure_albums: None,
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        // Empty template emits as `folder_structure = ""`, not `none`.
+        assert!(toml_str.contains("folder_structure = \"\""));
+        let active: String = toml_str
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!active.contains("folder_structure_albums ="));
+        assert!(toml_str.contains("# folder_structure_albums = \"{album}\""));
+    }
+
+    /// The wizard must be able to emit every `LivePhotoMode` value the
+    /// runtime accepts. The pre-fix wizard only exposed Both vs Skip, hiding
+    /// `image-only` and `video-only` from interactive setup.
+    #[test]
+    fn test_live_photo_mode_emits_every_runtime_variant() {
+        for (mode, expected) in [
+            (LivePhotoMode::Both, "live_photo_mode = \"both\""),
+            (LivePhotoMode::ImageOnly, "live_photo_mode = \"image-only\""),
+            (LivePhotoMode::VideoOnly, "live_photo_mode = \"video-only\""),
+            (LivePhotoMode::Skip, "live_photo_mode = \"skip\""),
+        ] {
+            let answers = SetupAnswers {
+                username: "u@e.com".to_string(),
+                password: secrecy::SecretString::from("p"),
+                directory: "/d".to_string(),
+                live_photo_mode: Some(mode),
+                ..Default::default()
+            };
+            let toml_str = generate_toml(&answers);
+            assert!(
+                toml_str.contains(expected),
+                "expected `{expected}` for mode {mode:?}; got:\n{toml_str}"
+            );
+            let parsed: TomlConfig = toml::from_str(&toml_str).expect("must parse");
+            assert_eq!(parsed.photos.unwrap().live_photo_mode, Some(mode));
+        }
+    }
+
+    /// Smart-folder selector emission, including the v0.13 grammar
+    /// (`all`, `all-with-sensitive`, named entries, `!exclusion`).
+    #[test]
+    fn test_smart_folders_emission() {
+        let answers = SetupAnswers {
+            username: "u@e.com".to_string(),
+            password: secrecy::SecretString::from("p"),
+            directory: "/d".to_string(),
+            smart_folders: vec![
+                "all".to_string(),
+                "!Hidden".to_string(),
+                "Recently Saved".to_string(),
+            ],
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        assert!(toml_str.contains("smart_folders = [\"all\", \"!Hidden\", \"Recently Saved\"]"));
+        let parsed: TomlConfig = toml::from_str(&toml_str).expect("must parse");
+        let sf = parsed.filters.unwrap().smart_folders.unwrap();
+        assert_eq!(sf, vec!["all", "!Hidden", "Recently Saved"]);
+    }
+
+    /// `[metrics]` is the deprecated-since-0.11 section. The wizard must
+    /// emit the v0.13 replacement `[server]` instead and never name
+    /// `[metrics]` (even as a hint), since that would steer copy-pasters
+    /// straight back into the deprecation warning.
+    #[test]
+    fn test_wizard_emits_server_section_not_metrics() {
+        let answers = SetupAnswers {
+            username: "u@e.com".to_string(),
+            password: secrecy::SecretString::from("p"),
+            directory: "/d".to_string(),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        assert!(toml_str.contains("[server]"));
+        assert!(toml_str.contains("# port = 9090"));
+        assert!(
+            !toml_str.contains("[metrics]"),
+            "wizard must not name the deprecated [metrics] section; got:\n{toml_str}"
+        );
     }
 
     #[test]
@@ -1133,6 +1806,11 @@ mod tests {
             mov_policy_str(LivePhotoMovFilenamePolicy::Original),
             "original"
         );
+
+        assert_eq!(live_photo_mode_str(LivePhotoMode::Both), "both");
+        assert_eq!(live_photo_mode_str(LivePhotoMode::ImageOnly), "image-only");
+        assert_eq!(live_photo_mode_str(LivePhotoMode::VideoOnly), "video-only");
+        assert_eq!(live_photo_mode_str(LivePhotoMode::Skip), "skip");
 
         assert_eq!(log_level_str(LogLevel::Debug), "debug");
         assert_eq!(log_level_str(LogLevel::Info), "info");
