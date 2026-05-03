@@ -737,9 +737,16 @@ pub enum Command {
         #[command(flatten)]
         password: PasswordArgs,
 
-        /// Library to list albums from (default: PrimarySync, use "all" for all)
-        #[arg(long, env = "KEI_LIBRARY")]
-        library: Option<String>,
+        /// Library/libraries to list albums from. Repeatable; default
+        /// `primary` (the PrimarySync zone). Same value grammar as
+        /// `kei sync --library`: a CloudKit zone name (full UUID or the
+        /// truncated 8-char `SharedSync-` prefix that `{library}` renders
+        /// into paths), the sentinels `primary` / `shared` / `all` /
+        /// `none`, or `!name` to exclude. Only consulted by
+        /// `kei list albums`; `kei list libraries` always lists every
+        /// library on the account.
+        #[arg(long = "library", env = "KEI_LIBRARY", value_parser = non_empty_string)]
+        libraries: Vec<String>,
 
         #[command(subcommand)]
         what: ListCommand,
@@ -1070,7 +1077,7 @@ impl Cli {
                 deprecation_warning("--list-albums", "kei list albums");
                 return Command::List {
                     password: self.password.clone(),
-                    library: self.sync.libraries.first().cloned(),
+                    libraries: self.sync.libraries.clone(),
                     what: ListCommand::Albums,
                 };
             }
@@ -1078,7 +1085,7 @@ impl Cli {
                 deprecation_warning("--list-libraries", "kei list libraries");
                 return Command::List {
                     password: self.password.clone(),
-                    library: self.sync.libraries.first().cloned(),
+                    libraries: self.sync.libraries.clone(),
                     what: ListCommand::Libraries,
                 };
             }
@@ -1157,7 +1164,7 @@ impl Cli {
                 deprecation_warning("--list-albums", "kei list albums");
                 Command::List {
                     password: password.clone(),
-                    library: sync.libraries.first().cloned(),
+                    libraries: sync.libraries.clone(),
                     what: ListCommand::Albums,
                 }
             }
@@ -1168,7 +1175,7 @@ impl Cli {
                 deprecation_warning("--list-libraries", "kei list libraries");
                 Command::List {
                     password: password.clone(),
-                    library: sync.libraries.first().cloned(),
+                    libraries: sync.libraries.clone(),
                     what: ListCommand::Libraries,
                 }
             }
@@ -3008,11 +3015,97 @@ mod tests {
         assert!(matches!(
             cli.effective_command(),
             Command::List {
-                library: Some(ref l),
+                ref libraries,
                 what: ListCommand::Albums,
                 ..
-            } if l == "all"
+            } if libraries == &vec!["all".to_string()]
         ));
+    }
+
+    /// Parity check with `kei sync --library`: list's flag is also
+    /// repeatable. Pre-fix it was `Option<String>` and a second
+    /// `--library` silently won, so multi-value users had no way to
+    /// list across both primary and a specific shared library.
+    #[test]
+    fn test_list_albums_library_flag_repeatable() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "list",
+            "--library",
+            "primary",
+            "--library",
+            "SharedSync-ABCD1234",
+            "albums",
+        ])
+        .unwrap();
+        match cli.effective_command() {
+            Command::List {
+                libraries,
+                what: ListCommand::Albums,
+                ..
+            } => {
+                assert_eq!(
+                    libraries,
+                    vec!["primary".to_string(), "SharedSync-ABCD1234".to_string()]
+                );
+            }
+            other => panic!("expected Command::List, got {other:?}"),
+        }
+    }
+
+    /// `--library` accepts the v0.13 `!name` exclusion sentinel.
+    #[test]
+    fn test_list_albums_library_flag_exclusion() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "list",
+            "--library",
+            "all",
+            "--library",
+            "!SharedSync-ABCD1234",
+            "albums",
+        ])
+        .unwrap();
+        match cli.effective_command() {
+            Command::List {
+                libraries,
+                what: ListCommand::Albums,
+                ..
+            } => {
+                assert_eq!(
+                    libraries,
+                    vec!["all".to_string(), "!SharedSync-ABCD1234".to_string()]
+                );
+            }
+            other => panic!("expected Command::List, got {other:?}"),
+        }
+    }
+
+    /// `kei list libraries` also accepts the same flag grammar; the
+    /// flag is parsed regardless of subcommand and is ignored on the
+    /// libraries side (it's documented as albums-only).
+    #[test]
+    fn test_list_libraries_library_flag_repeatable() {
+        let cli = Cli::try_parse_from([
+            "kei",
+            "list",
+            "--library",
+            "primary",
+            "--library",
+            "shared",
+            "libraries",
+        ])
+        .unwrap();
+        match cli.effective_command() {
+            Command::List {
+                libraries,
+                what: ListCommand::Libraries,
+                ..
+            } => {
+                assert_eq!(libraries, vec!["primary".to_string(), "shared".to_string()]);
+            }
+            other => panic!("expected Command::List, got {other:?}"),
+        }
     }
 
     #[test]

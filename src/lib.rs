@@ -548,10 +548,10 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         }
         Command::List {
             password,
-            library,
+            libraries,
             what,
         } => {
-            return run_list(what, &password, library, &globals, toml_config.as_ref()).await;
+            return run_list(what, &password, libraries, &globals, toml_config.as_ref()).await;
         }
         Command::Config { action } => match action {
             cli::ConfigAction::Show => {

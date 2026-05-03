@@ -14,7 +14,7 @@ use super::service::{init_photos_service, resolve_libraries, retry_on_lock_conte
 pub(crate) async fn run_list(
     what: cli::ListCommand,
     pw: &cli::PasswordArgs,
-    library: Option<String>,
+    cli_libraries: Vec<String>,
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<()> {
@@ -58,7 +58,6 @@ pub(crate) async fn run_list(
             }
         }
         cli::ListCommand::Albums => {
-            let cli_libraries = library.into_iter().collect();
             let selector = config::resolve_library_selector(
                 cli_libraries,
                 toml.and_then(|t| t.filters.as_ref()),
