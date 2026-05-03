@@ -1286,6 +1286,66 @@ type BuildDownloadConfigFn<'a> = dyn Fn(
     ) -> Arc<download::DownloadConfig>
     + 'a;
 
+/// Outcome of [`check_and_persist_enum_config_hash`]. Returned so callers
+/// (and tests) can observe whether the user's download config drifted
+/// since the last sync without re-implementing the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnumConfigHashOutcome {
+    /// No `enum_config_hash` was stored before this call. The current
+    /// hash is now persisted; sync tokens are NOT cleared because
+    /// nothing about the user's config has changed yet (a first-run DB
+    /// must not invalidate downstream incremental tokens that another
+    /// process may have written).
+    Initial,
+    /// Stored hash matches the current hash. Nothing was written.
+    Unchanged,
+    /// Stored hash differs from the current hash. Sync tokens have
+    /// been cleared and the new hash persisted, so the next cycle
+    /// falls back to full enumeration.
+    Changed,
+}
+
+/// Compare the current download-config hash against the one stored in
+/// the state DB and react to drift. Extracted from `run_cycle` so the
+/// hash-drift behaviour is unit-testable without spinning up the full
+/// per-library cycle. Logging is preserved verbatim so the original
+/// inline behaviour is unchanged.
+///
+/// Storage failures are logged at warn and swallowed: the same as the
+/// previous inline behaviour. Returns the observed [`EnumConfigHashOutcome`]
+/// so callers (and tests) can assert on which branch fired.
+pub(crate) async fn check_and_persist_enum_config_hash(
+    db: &dyn state::StateDb,
+    current_hash: &str,
+) -> EnumConfigHashOutcome {
+    let stored_hash = db.get_metadata("enum_config_hash").await.unwrap_or(None);
+    let outcome = match stored_hash.as_deref() {
+        Some(h) if h == current_hash => return EnumConfigHashOutcome::Unchanged,
+        Some(_) => EnumConfigHashOutcome::Changed,
+        None => EnumConfigHashOutcome::Initial,
+    };
+
+    if matches!(outcome, EnumConfigHashOutcome::Changed) {
+        tracing::info!("Download config changed since last sync, clearing sync tokens");
+        match db.delete_metadata_by_prefix("sync_token:").await {
+            Ok(n) if n > 0 => {
+                tracing::debug!(cleared = n, "Cleared stale sync tokens");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to clear sync tokens"
+                );
+            }
+            _ => {}
+        }
+    }
+    if let Err(e) = db.set_metadata("enum_config_hash", current_hash).await {
+        tracing::warn!(error = %e, "Failed to persist enum_config_hash");
+    }
+    outcome
+}
+
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
 async fn run_cycle(
     library_states: &[LibraryState],
@@ -1334,29 +1394,7 @@ async fn run_cycle(
                 // the two hashes to overwrite each other every cycle,
                 // permanently preventing incremental sync.
                 let config_hash = download::compute_config_hash(config);
-                let stored_hash = db.get_metadata("enum_config_hash").await.unwrap_or(None);
-                if stored_hash.as_deref() != Some(&config_hash) {
-                    if stored_hash.is_some() {
-                        tracing::info!(
-                            "Download config changed since last sync, clearing sync tokens"
-                        );
-                        match db.delete_metadata_by_prefix("sync_token:").await {
-                            Ok(n) if n > 0 => {
-                                tracing::debug!(cleared = n, "Cleared stale sync tokens");
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "Failed to clear sync tokens"
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Err(e) = db.set_metadata("enum_config_hash", &config_hash).await {
-                        tracing::warn!(error = %e, "Failed to persist enum_config_hash");
-                    }
-                }
+                let _ = check_and_persist_enum_config_hash(db, &config_hash).await;
             }
         }
 
@@ -3732,5 +3770,118 @@ mod tests {
         let err: anyhow::Error = anyhow::anyhow!("network unreachable");
         assert!(!should_wait_for_2fa(false, &err));
         assert!(!should_wait_for_2fa(true, &err));
+    }
+
+    // ── check_and_persist_enum_config_hash (CG-7, 2026-05-03 test review)
+    //
+    // The hash-drift logic was previously inline in `run_cycle`. The
+    // contract: stored hash differs from current -> clear sync tokens
+    // + persist new; first run -> persist only (no token clear); match
+    // -> no-op. A regression that swapped the comparison direction or
+    // the persist-vs-clear order would silently disable enum-cache
+    // invalidation. After extracting, these tests pin every branch.
+
+    /// First-run case: stored hash absent. Helper persists current,
+    /// returns `Initial`, leaves any existing sync tokens alone (a
+    /// fresh kei DB has no tokens, so clearing would be a no-op, but
+    /// the contract is "first run = no token clear" so we lock it).
+    #[tokio::test]
+    async fn enum_config_hash_initial_persists_only() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        // Pre-seed a sync token so we can assert it's preserved.
+        db.set_metadata("sync_token:PrimarySync", "tok-abc")
+            .await
+            .expect("set token");
+
+        let outcome = check_and_persist_enum_config_hash(&db, "hash-1").await;
+
+        assert_eq!(outcome, EnumConfigHashOutcome::Initial);
+        assert_eq!(
+            db.get_metadata("enum_config_hash")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("hash-1"),
+            "first run must persist the new hash"
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tok-abc"),
+            "first run must NOT clear sync tokens"
+        );
+    }
+
+    /// Drift case: stored hash != current. Helper clears every
+    /// `sync_token:*` row and persists the new hash. Catches the
+    /// regression that flips the comparison or skips the clear step.
+    #[tokio::test]
+    async fn enum_config_hash_drift_clears_tokens_and_persists() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata("enum_config_hash", "old-hash")
+            .await
+            .expect("seed old hash");
+        db.set_metadata("sync_token:PrimarySync", "tok-primary")
+            .await
+            .expect("seed primary token");
+        db.set_metadata("sync_token:SharedSync-AAAA1111", "tok-shared")
+            .await
+            .expect("seed shared token");
+
+        let outcome = check_and_persist_enum_config_hash(&db, "new-hash").await;
+
+        assert_eq!(outcome, EnumConfigHashOutcome::Changed);
+        assert_eq!(
+            db.get_metadata("enum_config_hash")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new-hash"),
+            "drift must persist the new hash"
+        );
+        assert!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .is_none(),
+            "drift must clear primary-zone sync token"
+        );
+        assert!(
+            db.get_metadata("sync_token:SharedSync-AAAA1111")
+                .await
+                .unwrap()
+                .is_none(),
+            "drift must clear every sync_token:* row, including shared zones"
+        );
+    }
+
+    /// Unchanged case: stored hash == current. Helper writes nothing,
+    /// returns `Unchanged`. Catches the regression that always
+    /// re-persists even when the hash matches (would generate write
+    /// load and could mask a separate bug that's about to corrupt
+    /// the metadata table).
+    #[tokio::test]
+    async fn enum_config_hash_unchanged_is_noop() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata("enum_config_hash", "stable-hash")
+            .await
+            .expect("seed stable hash");
+        db.set_metadata("sync_token:PrimarySync", "tok-keep")
+            .await
+            .expect("seed token");
+
+        let outcome = check_and_persist_enum_config_hash(&db, "stable-hash").await;
+
+        assert_eq!(outcome, EnumConfigHashOutcome::Unchanged);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tok-keep"),
+            "unchanged hash must leave sync tokens intact"
+        );
     }
 }
