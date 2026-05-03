@@ -2179,6 +2179,64 @@ mod tests {
         );
     }
 
+    /// CG-6 (2026-05-03 test review): the existing suite asserts the
+    /// *return value* of `find_multi_library_commingle_flags`, but
+    /// nothing pins the contract that `warn_if_multi_library_paths_commingle`
+    /// emits the `library_count` and `missing` lists as structured tracing
+    /// fields. A future refactor that drops the named args (or replaces
+    /// them with a positional message) would silently lose operator
+    /// visibility into commingle scenarios. Pin the field shape so the
+    /// regression is loud.
+    #[tracing_test::traced_test]
+    #[test]
+    fn warn_if_multi_library_paths_commingle_emits_structured_fields() {
+        let sel = selection_all_passes_active();
+        warn_if_multi_library_paths_commingle(3, "%Y/%m/%d", "{album}", "{smart-folder}", &sel);
+        assert!(
+            logs_contain("library_count=3"),
+            "structured library_count field expected on warn line"
+        );
+        // `missing = ?missing` debug-formats the Vec; the rendered output
+        // contains the bare flag names. Pin at least the unfiled-related
+        // root flag and the album-template flag.
+        assert!(
+            logs_contain("missing="),
+            "structured `missing` field expected on warn line"
+        );
+        assert!(
+            logs_contain("--folder-structure"),
+            "missing list should include the root --folder-structure flag"
+        );
+        assert!(
+            logs_contain("--folder-structure-albums"),
+            "missing list should include the album-template flag"
+        );
+        assert!(
+            logs_contain("--folder-structure-smart-folders"),
+            "missing list should include the smart-folder-template flag"
+        );
+    }
+
+    /// CG-6 negative: when `{library}` is present in every active
+    /// template, the warn must NOT fire. Catches the inverse mutation
+    /// (warn fires unconditionally).
+    #[tracing_test::traced_test]
+    #[test]
+    fn warn_if_multi_library_paths_commingle_silent_when_no_commingle() {
+        let sel = selection_all_passes_active();
+        warn_if_multi_library_paths_commingle(
+            3,
+            "{library}/%Y/%m/%d",
+            "{library}/{album}",
+            "{library}/{smart-folder}",
+            &sel,
+        );
+        assert!(
+            !logs_contain("library_count="),
+            "warn must not fire when every active template carries `{{library}}`"
+        );
+    }
+
     // ── count_passes ────────────────────────────────────────────────────
     //
     // Pass tally feeds the per-library `Sync plan for library` info line.

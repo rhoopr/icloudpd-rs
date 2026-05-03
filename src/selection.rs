@@ -652,6 +652,63 @@ mod tests {
         assert!(err.to_string().contains("'!all'"));
     }
 
+    /// CG-8 (2026-05-03 test review): cross-category sentinel collision.
+    /// `primary` and `shared` are sentinels in `--library`, not `--album`.
+    /// A user with an iCloud album literally named `Primary` (or `primary`,
+    /// or `shared`) must have it parsed as a literal album, not silently
+    /// hijacked into a library sentinel. Similarly, `all-with-sensitive`
+    /// is a smart-folder sentinel and must round-trip as a literal album
+    /// name when supplied to `parse_album_selector`.
+    ///
+    /// The mutation this catches: a future "smart" refactor that consults
+    /// a single shared sentinel-word list across selectors would silently
+    /// match `primary` (and friends) and drop the user's real album.
+    #[test]
+    fn parse_album_selector_treats_other_categories_sentinels_as_literal_names() {
+        for word in [
+            "Primary",
+            "primary",
+            "Shared",
+            "shared",
+            "all-with-sensitive",
+        ] {
+            let r = parse_album_selector(&s(&[word]), false).unwrap();
+            assert_eq!(
+                r,
+                AlbumSelector::Named {
+                    included: set(&[word]),
+                    excluded: BTreeSet::new(),
+                },
+                "album value `{word}` must round-trip as a literal album name, \
+                 not as a cross-category sentinel"
+            );
+        }
+    }
+
+    /// CG-8 sibling: pin the documented case-insensitivity boundary —
+    /// only `all` and `none` are case-insensitive sentinels for albums.
+    /// Lowercase `primary` / `shared` are NOT album sentinels.
+    #[test]
+    fn parse_album_selector_only_all_and_none_are_album_sentinels() {
+        // `all` family -> AlbumSelector::All
+        for word in ["all", "All", "ALL"] {
+            let r = parse_album_selector(&s(&[word]), false).unwrap();
+            assert!(
+                matches!(r, AlbumSelector::All { .. }),
+                "album `{word}` must resolve to AlbumSelector::All"
+            );
+        }
+        // `none` family -> AlbumSelector::None
+        for word in ["none", "None", "NONE"] {
+            let r = parse_album_selector(&s(&[word]), false).unwrap();
+            assert_eq!(
+                r,
+                AlbumSelector::None,
+                "album `{word}` must resolve to AlbumSelector::None"
+            );
+        }
+    }
+
     // ── SmartFolderSelector ────────────────────────────────────────────
 
     #[test]
