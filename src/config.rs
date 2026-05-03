@@ -6837,6 +6837,43 @@ mod tests {
         assert!(!content.contains("secret123"));
     }
 
+    /// Regression guard: even when the resolved Config got its
+    /// `cookie_directory` from the deprecated `[auth] cookie_directory`
+    /// TOML key, `persist_first_run_config` (and `Config::to_toml` under
+    /// it) must never echo the deprecated key back out. Pairs with
+    /// `setup::tests::test_generate_toml_*` to cover both wizard-generated
+    /// and auto-persisted first-run configs.
+    #[test]
+    fn test_persist_first_run_never_emits_deprecated_cookie_directory() {
+        let (td, config_path) = persist_test_dir("no_cookie_directory");
+
+        // Build a config with cookie_directory explicitly set, the way
+        // `--cookie-directory /some/path` or `[auth] cookie_directory`
+        // would land it in the resolved Config. Use a writable temp dir
+        // because `Config::build` actually creates `cookie_directory`.
+        let cookie_dir = td.path().join("legacy_cookies");
+        let mut globals = default_globals();
+        globals.username = Some("test@example.com".to_string());
+        globals.cookie_directory = Some(cookie_dir.to_string_lossy().to_string());
+        let mut sync = default_sync();
+        sync.directory = Some("/photos".to_string());
+        let config = Config::build(&globals, &default_password(), sync, None).unwrap();
+
+        persist_first_run_config(&config_path, &config, None).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        // Strip comment lines to avoid false positives on hint comments.
+        let active: String = content
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !active.contains("cookie_directory"),
+            "persisted config must not emit deprecated [auth].cookie_directory; got:\n{content}"
+        );
+    }
+
     #[test]
     fn test_persist_first_run_does_not_overwrite_existing() {
         let (_td, config_path) = persist_test_dir("no_overwrite");
