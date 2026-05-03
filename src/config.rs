@@ -4302,12 +4302,15 @@ mod tests {
 
     impl Drop for MetricsPortEnvGuard {
         fn drop(&mut self) {
-            // SAFETY: still holding the static mutex; restoration is
-            // exclusive under the same "no cross-thread readers" rule.
-            unsafe {
-                if let Some(v) = self.prev.take() {
+            if let Some(v) = self.prev.take() {
+                // SAFETY: still holding the static mutex; restoration is
+                // exclusive under the same "no cross-thread readers" rule.
+                unsafe {
                     std::env::set_var("KEI_METRICS_PORT", v);
-                } else {
+                }
+            } else {
+                // SAFETY: same as above.
+                unsafe {
                     std::env::remove_var("KEI_METRICS_PORT");
                 }
             }
@@ -4359,6 +4362,8 @@ mod tests {
         // warning. Confirms the migration path stays usable for one minor
         // cycle while users move to KEI_HTTP_PORT.
         let _guard = scrub_metrics_port_env();
+        // SAFETY: the guard above holds the static lock for the duration
+        // of this test, so no other thread is reading the env var.
         unsafe {
             std::env::set_var("KEI_METRICS_PORT", "8765");
         }
