@@ -3763,6 +3763,55 @@ mod tests {
         );
     }
 
+    /// CG-2 (broadened from adversarial pass, 2026-05-03): `log_sync_summary`
+    /// had no test coverage at all. The mutation experiment showed that
+    /// dropping every `tracing::info!()` from the body would land green —
+    /// silently disabling sync-completion reporting in production logs.
+    /// This test is a baseline contract: at least one info event must fire
+    /// per call, the structured `title` field must be captured, and the
+    /// `downloaded` / `failed` counts must reach the captured output.
+    #[tracing_test::traced_test]
+    #[test]
+    fn log_sync_summary_emits_sync_counts_via_tracing() {
+        let stats = super::super::SyncStats {
+            downloaded: 3,
+            failed: 1,
+            skipped: super::super::SkipBreakdown {
+                by_state: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        super::log_sync_summary("── Test Summary ──", &stats);
+
+        // Title-line: structured `title` field must be present.
+        // Note: tracing renders `title = %title` (Display) unquoted.
+        assert!(
+            logs_contain("title=── Test Summary ──"),
+            "structured title field expected on first event"
+        );
+        // Title-line: message text must be present.
+        assert!(
+            logs_contain("Sync summary"),
+            "title-line event message expected"
+        );
+        // Count line: every count must reach the captured stream.
+        assert!(
+            logs_contain("3 downloaded"),
+            "downloaded count missing from summary line"
+        );
+        assert!(
+            logs_contain("1 failed"),
+            "failed count missing from summary line"
+        );
+        // Skipped breakdown line: when skipped > 0, a Skipped: line fires.
+        assert!(
+            logs_contain("Skipped:"),
+            "skipped breakdown line expected when stats.skipped.total() > 0"
+        );
+    }
+
     #[tokio::test]
     async fn flush_pending_state_writes_succeeds_on_first_try() {
         let db = FailingStateDb::new(0);

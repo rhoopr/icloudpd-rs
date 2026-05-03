@@ -2190,6 +2190,64 @@ fn verify_checksums_mismatch() {
     assert!(stdout.contains("CORRUPTED"), "stdout: {stdout}");
 }
 
+/// CG-1 (2026-05-03 test review): if a future refactor of the
+/// `CORRUPTED:` line in `run_verify` drops the asset id from the
+/// printed output, operators can see "1 corrupted" without any way
+/// to find which asset. This test pins the contract that the asset
+/// id reaches stdout for every corrupted entry. Sibling to
+/// `verify_checksums_mismatch` so the existing test stays focused
+/// on exit-code + summary text and this one stays focused on the
+/// per-asset trace.
+#[test]
+fn verify_checksums_mismatch_emits_asset_id_in_output() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+
+    let file_path = dir.path().join("bad.jpg");
+    {
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        f.write_all(b"actual content").unwrap();
+    }
+
+    let asset_id = "ASSET_FOR_CG1_VERIFY";
+    insert_asset(
+        &conn,
+        asset_id,
+        "downloaded",
+        "bad.jpg",
+        Some(file_path.to_str().unwrap()),
+        None,
+        Some("0000000000000000000000000000000000000000000000000000000000000000"),
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .args([
+            "verify",
+            "--checksums",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("CORRUPTED"),
+        "expected CORRUPTED line, stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(asset_id),
+        "expected asset id {asset_id} in CORRUPTED line, stdout: {stdout}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // State DB pre-seeded tests: reset
 // ═══════════════════════════════════════════════════════════════════════
