@@ -109,6 +109,34 @@ pub trait StateDb: Send + Sync {
     /// Get all pending assets.
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
 
+    /// Get a page of failed assets, ordered by `last_seen_at` DESC.
+    ///
+    /// Returns up to `limit` records starting from `offset`.
+    /// Returns an empty `Vec` when no more records remain.
+    /// Default impl falls back to `get_failed` + slice for non-SQLite mocks;
+    /// production `SqliteStateDb` overrides with a real LIMIT/OFFSET query.
+    async fn get_failed_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        page_from_full(self.get_failed().await?, offset, limit)
+    }
+
+    /// Get a page of pending assets, ordered by `last_seen_at` DESC.
+    ///
+    /// Returns up to `limit` records starting from `offset`.
+    /// Returns an empty `Vec` when no more records remain.
+    /// Default impl falls back to `get_pending` + slice for non-SQLite mocks;
+    /// production `SqliteStateDb` overrides with a real LIMIT/OFFSET query.
+    async fn get_pending_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        page_from_full(self.get_pending().await?, offset, limit)
+    }
+
     /// Get a summary of the database state.
     async fn get_summary(&self) -> Result<SyncSummary, StateError>;
 
@@ -493,6 +521,24 @@ impl SqliteStateDb {
         })
         .await?
     }
+}
+
+/// Slice a `Vec<AssetRecord>` into a page using the same `(offset, limit)`
+/// semantics as `SqliteStateDb::get_downloaded_page`. Used as the default
+/// `get_failed_page` / `get_pending_page` body so trait mocks that only
+/// implement the unbounded `get_failed` / `get_pending` keep compiling. The
+/// production `SqliteStateDb` impl overrides with a real LIMIT/OFFSET query
+/// and never materializes the full vector.
+fn page_from_full(
+    full: Vec<AssetRecord>,
+    offset: u64,
+    limit: u32,
+) -> Result<Vec<AssetRecord>, StateError> {
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(full.len());
+    let take = usize::try_from(limit).unwrap_or(usize::MAX);
+    Ok(full.into_iter().skip(start).take(take).collect())
 }
 
 /// Execute the asset UPSERT on `conn` (works against either a `Connection`
@@ -939,6 +985,72 @@ impl StateDb for SqliteStateDb {
                 .map_err(|e| StateError::query("get_pending", e))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| StateError::query("get_pending", e))?;
+
+            Ok(records)
+        })
+        .await
+    }
+
+    async fn get_failed_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        self.with_conn("get_failed_page", move |conn| {
+            let sql = format!(
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
+                 ORDER BY last_seen_at DESC LIMIT ?1 OFFSET ?2",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| StateError::query("get_failed_page", e))?;
+
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "offset is bounded by the failed-row count and well below i64::MAX"
+            )]
+            let offset_i = offset as i64;
+            let records = stmt
+                .query_map(
+                    rusqlite::params![i64::from(limit), offset_i],
+                    row_to_asset_record,
+                )
+                .map_err(|e| StateError::query("get_failed_page", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_failed_page", e))?;
+
+            Ok(records)
+        })
+        .await
+    }
+
+    async fn get_pending_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        self.with_conn("get_pending_page", move |conn| {
+            let sql = format!(
+                "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'pending' \
+                 ORDER BY last_seen_at DESC LIMIT ?1 OFFSET ?2",
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| StateError::query("get_pending_page", e))?;
+
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "offset is bounded by the pending-row count and well below i64::MAX"
+            )]
+            let offset_i = offset as i64;
+            let records = stmt
+                .query_map(
+                    rusqlite::params![i64::from(limit), offset_i],
+                    row_to_asset_record,
+                )
+                .map_err(|e| StateError::query("get_pending_page", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StateError::query("get_pending_page", e))?;
 
             Ok(records)
         })
@@ -2650,6 +2762,162 @@ mod tests {
         assert_eq!(second.len(), 1);
         let third = db.get_downloaded_page(4, 2).await.unwrap();
         assert!(third.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_failed_page() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for i in 0..3 {
+            let id = format!("FAIL_{i}");
+            let record = TestAssetRecord::new(&id)
+                .checksum(&format!("checksum_{i}"))
+                .filename(&format!("photo_{i}.jpg"))
+                .size(1000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_failed("PrimarySync", &id, "original", "boom")
+                .await
+                .unwrap();
+        }
+        // Newest-first ordering: FAIL_2 > FAIL_1 > FAIL_0
+        for i in 0..3i64 {
+            db.backdate_last_seen(&format!("FAIL_{i}"), 1_000 + i);
+        }
+
+        // Fetch all in one page
+        let page = db.get_failed_page(0, 100).await.unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(&*page[0].id, "FAIL_2");
+        assert_eq!(&*page[2].id, "FAIL_0");
+
+        // Paginate: page of 2, then remainder
+        let first = db.get_failed_page(0, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(&*first[0].id, "FAIL_2");
+        assert_eq!(&*first[1].id, "FAIL_1");
+        let second = db.get_failed_page(2, 2).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(&*second[0].id, "FAIL_0");
+        let third = db.get_failed_page(4, 2).await.unwrap();
+        assert!(third.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_pending_page() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        for i in 0..3 {
+            let id = format!("PEND_{i}");
+            let record = TestAssetRecord::new(&id)
+                .checksum(&format!("checksum_{i}"))
+                .filename(&format!("photo_{i}.jpg"))
+                .size(1000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+        }
+        // Newest-first ordering: PEND_2 > PEND_1 > PEND_0
+        for i in 0..3i64 {
+            db.backdate_last_seen(&format!("PEND_{i}"), 1_000 + i);
+        }
+
+        // Fetch all in one page
+        let page = db.get_pending_page(0, 100).await.unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(&*page[0].id, "PEND_2");
+        assert_eq!(&*page[2].id, "PEND_0");
+
+        // Paginate: page of 2, then remainder
+        let first = db.get_pending_page(0, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(&*first[0].id, "PEND_2");
+        assert_eq!(&*first[1].id, "PEND_1");
+        let second = db.get_pending_page(2, 2).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(&*second[0].id, "PEND_0");
+        let third = db.get_pending_page(4, 2).await.unwrap();
+        assert!(third.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_failed_pending_page_scales_to_large_count() {
+        // Mirror of `test_get_downloaded_page_scales_to_large_count` for the
+        // failed and pending lists. Bulk-insert 10k rows, paginate through,
+        // assert we never need to materialize more than `page_size` at once
+        // and the total count matches.
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let count: usize = 10_000;
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO assets (library, id, version_size, checksum, filename, created_at, size_bytes, media_type, status, last_seen_at, download_attempts, last_error)
+                     VALUES ('PrimarySync', ?1, 'original', ?2, ?3, ?4, ?5, 'photo', ?6, ?4, 1, ?7)",
+                )
+                .unwrap();
+            let now = Utc::now().timestamp();
+            for i in 0..count {
+                let id = format!("ASSET_{i:05}");
+                let checksum = format!("cksum_{i:05}");
+                let filename = format!("IMG_{i:05}.jpg");
+                let status = if i % 2 == 0 { "failed" } else { "pending" };
+                let err = if status == "failed" {
+                    Some("boom")
+                } else {
+                    None
+                };
+                stmt.execute(rusqlite::params![
+                    id,
+                    checksum,
+                    filename,
+                    now + i as i64,
+                    4096,
+                    status,
+                    err
+                ])
+                .unwrap();
+            }
+            conn.execute_batch("COMMIT").unwrap();
+        }
+
+        let page_size: u32 = 1000;
+
+        // Failed: 5000 rows
+        let mut total = 0usize;
+        let mut offset = 0u64;
+        loop {
+            let page = db.get_failed_page(offset, page_size).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(
+                page.len() <= page_size as usize,
+                "get_failed_page must respect the requested limit"
+            );
+            assert!(page.iter().all(|r| r.status == AssetStatus::Failed));
+            total += page.len();
+            offset += page.len() as u64;
+        }
+        assert_eq!(total, count / 2);
+
+        // Pending: 5000 rows
+        let mut total = 0usize;
+        let mut offset = 0u64;
+        loop {
+            let page = db.get_pending_page(offset, page_size).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(
+                page.len() <= page_size as usize,
+                "get_pending_page must respect the requested limit"
+            );
+            assert!(page.iter().all(|r| r.status == AssetStatus::Pending));
+            total += page.len();
+            offset += page.len() as u64;
+        }
+        assert_eq!(total, count / 2);
     }
 
     // ── Batch operation tests ──

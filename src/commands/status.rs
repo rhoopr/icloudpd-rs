@@ -52,60 +52,91 @@ pub(crate) async fn run_status(
     if args.failed && summary.failed > 0 {
         println!();
         println!("Failed assets:");
-        let failed = db.get_failed().await?;
-        let shown = failed.len().min(LISTING_CAP);
-        for asset in failed.iter().take(LISTING_CAP) {
-            print_failed(asset);
-        }
-        print_truncation_tail(failed.len(), shown);
+        let printed = paginate_print(&db, summary.failed, Section::Failed).await?;
+        let total = summary_count_to_usize(summary.failed);
+        print_truncation_tail(total, printed);
     }
 
     if args.pending && summary.pending > 0 {
         println!();
         println!("Pending assets:");
-        let pending = db.get_pending().await?;
-        let shown = pending.len().min(LISTING_CAP);
-        for asset in pending.iter().take(LISTING_CAP) {
-            print_pending(asset);
-        }
-        print_truncation_tail(pending.len(), shown);
+        let printed = paginate_print(&db, summary.pending, Section::Pending).await?;
+        let total = summary_count_to_usize(summary.pending);
+        print_truncation_tail(total, printed);
     }
 
     if args.downloaded && summary.downloaded > 0 {
         println!();
         println!("Downloaded assets:");
-        // page_size is smaller than LISTING_CAP so pagination is still
-        // exercised before the cap kicks in — the post-cap rows are
-        // skipped via an early break, not by narrowing the SQL query.
-        let page_size: u32 = 100;
-        let mut offset: u64 = 0;
-        let mut printed: usize = 0;
-        'outer: loop {
-            let page = db.get_downloaded_page(offset, page_size).await?;
-            if page.is_empty() {
-                break;
-            }
-            for asset in &page {
-                if printed >= LISTING_CAP {
-                    break 'outer;
-                }
-                print_downloaded(asset);
-                printed += 1;
-            }
-            offset += page.len() as u64;
-        }
-        // summary.downloaded is a u64 from the state DB count query; the
-        // cap is well under u32::MAX, so `as usize` is lossless on any
-        // 32-bit-or-wider target kei runs on.
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "downloaded count from SQLite; cap-to-usize is safe on supported targets"
-        )]
-        let total = summary.downloaded as usize;
+        let printed = paginate_print(&db, summary.downloaded, Section::Downloaded).await?;
+        let total = summary_count_to_usize(summary.downloaded);
         print_truncation_tail(total, printed);
     }
 
     Ok(())
+}
+
+/// Which `kei status` listing is being paginated. Picks the state-DB page
+/// fetcher and the per-row print fn.
+#[derive(Clone, Copy)]
+enum Section {
+    Failed,
+    Pending,
+    Downloaded,
+}
+
+/// Stream a status listing through the state-DB pagination primitive,
+/// printing up to [`LISTING_CAP`] rows. Returns the number of rows printed
+/// so the caller can decide whether to emit the "... and N more" tail.
+///
+/// The page size is smaller than `LISTING_CAP` so pagination is exercised
+/// before the cap kicks in; post-cap rows are skipped via an early break,
+/// not by narrowing the SQL query.
+async fn paginate_print(
+    db: &state::SqliteStateDb,
+    total: u64,
+    section: Section,
+) -> anyhow::Result<usize> {
+    let page_size: u32 = 100;
+    let mut offset: u64 = 0;
+    let mut printed: usize = 0;
+    if total == 0 {
+        return Ok(0);
+    }
+    'outer: loop {
+        let page = match section {
+            Section::Failed => db.get_failed_page(offset, page_size).await?,
+            Section::Pending => db.get_pending_page(offset, page_size).await?,
+            Section::Downloaded => db.get_downloaded_page(offset, page_size).await?,
+        };
+        if page.is_empty() {
+            break;
+        }
+        for asset in &page {
+            if printed >= LISTING_CAP {
+                break 'outer;
+            }
+            match section {
+                Section::Failed => print_failed(asset),
+                Section::Pending => print_pending(asset),
+                Section::Downloaded => print_downloaded(asset),
+            }
+            printed += 1;
+        }
+        offset += page.len() as u64;
+    }
+    Ok(printed)
+}
+
+/// Convert a `summary.{failed,pending,downloaded}` count (u64 from SQLite
+/// `COUNT(*)`) to `usize` for `print_truncation_tail`. Counts are well under
+/// `u32::MAX` on any supported target, so the cast is lossless.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "asset counts from SQLite; cap-to-usize is safe on supported targets"
+)]
+fn summary_count_to_usize(count: u64) -> usize {
+    count as usize
 }
 
 fn print_failed(asset: &AssetRecord) {
