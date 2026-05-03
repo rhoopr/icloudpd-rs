@@ -663,11 +663,14 @@ fn reset_sync_token_forces_full_enumeration() {
             .assert()
             .success();
 
-        // Reset sync tokens
+        // Reset sync tokens. `--yes` is required under non-interactive use
+        // (and in CI), since the next sync re-enumerates every asset and we
+        // ship a confirmation prompt by default.
         common::cmd()
             .args([
                 "reset",
                 "sync-token",
+                "--yes",
                 "--username",
                 &username,
                 "--data-dir",

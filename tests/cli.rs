@@ -292,6 +292,34 @@ fn short_y_flag_on_reset_state() {
         .success();
 }
 
+#[test]
+fn reset_sync_token_help_advertises_yes_flag() {
+    // The new canonical `kei reset sync-token` ships with `--yes` to skip
+    // the confirmation prompt, matching `reset state`. Help text must
+    // surface it so users discover the safe non-interactive form.
+    common::cmd()
+        .args(["reset", "sync-token", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--yes"));
+}
+
+#[test]
+fn reset_sync_token_yes_flag_parses() {
+    common::cmd()
+        .args(["reset", "sync-token", "--yes", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn reset_sync_token_short_y_flag_parses() {
+    common::cmd()
+        .args(["reset", "sync-token", "-y", "--help"])
+        .assert()
+        .success();
+}
+
 // ── Enum validation (rejection only — acceptance covered by unit tests) ─
 
 #[test]

@@ -49,7 +49,15 @@ pub(crate) async fn run_reset_state(
 }
 
 /// Run the reset-sync-token command.
+///
+/// `yes` skips the confirmation prompt. Without it, prompts on a TTY and
+/// errors under non-interactive use, mirroring `reset state`. Clearing the
+/// sync token forces the next sync to do a full enumeration of every asset,
+/// which on a 100k-asset library is slow and chats up Apple's API; the
+/// confirmation is here to keep a typo (or muscle memory after `reset state`)
+/// from triggering that work by accident.
 pub(crate) async fn run_reset_sync_token(
+    yes: bool,
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<()> {
@@ -58,6 +66,31 @@ pub(crate) async fn run_reset_sync_token(
     if !db_path.exists() {
         println!("No state database found at {}", db_path.display());
         return Ok(());
+    }
+
+    if !yes {
+        use std::io::IsTerminal;
+        use std::io::Write;
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "reset sync-token needs `--yes` when stdin is not a terminal. \
+                 Next sync will re-enumerate every asset, which can take a long \
+                 time on a large library; pass `--yes` to confirm."
+            );
+        }
+        println!("This will clear stored sync tokens at:");
+        println!("  {}", db_path.display());
+        println!();
+        println!("Next sync will re-enumerate every asset.");
+        print!("Are you sure? [y/N] ");
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Cancelled.");
+            return Ok(());
+        }
     }
 
     let db = state::SqliteStateDb::open(&db_path).await?;
