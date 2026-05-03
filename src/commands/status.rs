@@ -52,25 +52,22 @@ pub(crate) async fn run_status(
     if args.failed && summary.failed > 0 {
         println!();
         println!("Failed assets:");
-        let printed = paginate_print(&db, summary.failed, Section::Failed).await?;
-        let total = summary_count_to_usize(summary.failed);
-        print_truncation_tail(total, printed);
+        let printed = paginate_print(&db, Section::Failed).await?;
+        print_truncation_tail(summary_count_to_usize(summary.failed), printed);
     }
 
     if args.pending && summary.pending > 0 {
         println!();
         println!("Pending assets:");
-        let printed = paginate_print(&db, summary.pending, Section::Pending).await?;
-        let total = summary_count_to_usize(summary.pending);
-        print_truncation_tail(total, printed);
+        let printed = paginate_print(&db, Section::Pending).await?;
+        print_truncation_tail(summary_count_to_usize(summary.pending), printed);
     }
 
     if args.downloaded && summary.downloaded > 0 {
         println!();
         println!("Downloaded assets:");
-        let printed = paginate_print(&db, summary.downloaded, Section::Downloaded).await?;
-        let total = summary_count_to_usize(summary.downloaded);
-        print_truncation_tail(total, printed);
+        let printed = paginate_print(&db, Section::Downloaded).await?;
+        print_truncation_tail(summary_count_to_usize(summary.downloaded), printed);
     }
 
     Ok(())
@@ -92,17 +89,10 @@ enum Section {
 /// The page size is smaller than `LISTING_CAP` so pagination is exercised
 /// before the cap kicks in; post-cap rows are skipped via an early break,
 /// not by narrowing the SQL query.
-async fn paginate_print(
-    db: &state::SqliteStateDb,
-    total: u64,
-    section: Section,
-) -> anyhow::Result<usize> {
+async fn paginate_print(db: &state::SqliteStateDb, section: Section) -> anyhow::Result<usize> {
     let page_size: u32 = 100;
     let mut offset: u64 = 0;
     let mut printed: usize = 0;
-    if total == 0 {
-        return Ok(0);
-    }
     'outer: loop {
         let page = match section {
             Section::Failed => db.get_failed_page(offset, page_size).await?,
