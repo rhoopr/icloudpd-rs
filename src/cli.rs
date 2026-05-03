@@ -372,12 +372,11 @@ pub struct SyncArgs {
     /// Resolution order: this flag > `[watch] interval` in TOML >
     /// `KEI_WATCH_WITH_INTERVAL` env > unset (single-shot).
     //
-    // Deliberately omits clap's `env =` attribute. `env =` collapses the
-    // env value into the CLI tier, which would override TOML — but the
-    // docker image bakes `KEI_WATCH_WITH_INTERVAL=86400` as a default and
-    // we want a user's TOML `[watch] interval` to win. The env value is
-    // parsed manually in `Config::build` (see `parse_env_watch_interval`
-    // in src/config.rs); regression tested by #293.
+    // No clap `env =` attribute on purpose. clap collapses env into the
+    // CLI tier, which would override TOML, but the docker image bakes
+    // `KEI_WATCH_WITH_INTERVAL=86400` as a default and we want a user's
+    // TOML to win. The env is parsed manually in `Config::build`.
+    // Regression: #293.
     #[arg(long, value_parser = clap::value_parser!(u64).range(60..=86400))]
     pub watch_with_interval: Option<u64>,
 

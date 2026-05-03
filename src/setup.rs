@@ -149,8 +149,7 @@ impl Default for SetupAnswers {
     }
 }
 
-/// Print the generated TOML between two horizontal rules. Extracted so the
-/// preview loop in `run_setup` can re-print on demand.
+/// Print the generated TOML between two horizontal rules.
 fn print_toml_preview(toml_content: &str) {
     println!();
     println!("Here's your configuration:");
@@ -208,10 +207,8 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     // returns an error in practice.
     let toml_content: String = generate_toml(&answers);
 
-    // Preview + confirm. The TOML can run 100+ lines, which scrolls past
-    // the visible area on small terminals (Docker, serial consoles) before
-    // the user can read it. The Select gives an explicit "Show again" so a
-    // user who scrolled past can re-read without restarting the wizard.
+    // The Select offers "Show again" so users on small terminals can
+    // re-read the config after it scrolled past.
     let line_count = toml_content.lines().count();
     print_toml_preview(&toml_content);
     loop {
@@ -493,13 +490,9 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             answers.albums.push(trimmed.to_string());
         }
 
-        // Mirror the runtime default so a user who hits Enter here gets the
-        // same behavior the CLI gives them when no flag is set. Sourced from
-        // `config::unfiled_default()` rather than hardcoded `true` so a
-        // future change to the runtime default propagates to the wizard
-        // automatically. We always emit `unfiled` explicitly (rather than
-        // relying on the default) so the runtime's implicit-unfiled warning
-        // never fires for wizard-generated configs.
+        // Default sourced from runtime so the wizard stays truthful if
+        // `unfiled_default()` ever changes. Always emit explicitly to
+        // silence the runtime's implicit-unfiled warning.
         if !answers.albums.is_empty() {
             println!();
             let also_unfiled = Confirm::new()
@@ -656,51 +649,45 @@ fn ask_date_range(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Same parser the runtime uses (`config::parse_date_or_interval`) so a
-    // typo here surfaces immediately, not on the next sync.
-    let after: String = Input::new()
-        .with_prompt(
-            "Only sync photos created after (ISO date, datetime, or Nd interval; blank = no limit)",
-        )
-        .default(String::new())
-        .show_default(false)
-        .allow_empty(true)
-        .validate_with(|s: &String| validate_date_or_blank(s))
-        .interact_text()?;
-    if !after.trim().is_empty() {
-        answers.skip_created_before = Some(after.trim().to_string());
-    }
-
-    let before: String = Input::new()
-        .with_prompt(
-            "Only sync photos created before (ISO date, datetime, or Nd interval; blank = no limit)",
-        )
-        .default(String::new())
-        .show_default(false)
-        .allow_empty(true)
-        .validate_with(|s: &String| validate_date_or_blank(s))
-        .interact_text()?;
-    if !before.trim().is_empty() {
-        answers.skip_created_after = Some(before.trim().to_string());
-    }
+    answers.skip_created_before = date_prompt("Only sync photos created after")?;
+    answers.skip_created_after = date_prompt("Only sync photos created before")?;
 
     let recent: String = Input::new()
         .with_prompt("Only sync the N most-recently-created photos (blank = all)")
         .default(String::new())
         .show_default(false)
         .allow_empty(true)
-        .validate_with(|s: &String| validate_positive_u32_or_blank(s))
+        .validate_with(|s: &String| parse_positive_or_blank::<u32>(s).map(|_| ()))
         .interact_text()?;
-    if let Some(n) = parse_positive_u32_opt(&recent) {
+    if let Ok(Some(n)) = parse_positive_or_blank::<u32>(&recent) {
         answers.recent = Some(n);
     }
 
     Ok(())
 }
 
-/// Accept blank or anything `config::parse_date_or_interval` parses cleanly.
-/// Used by the `skip_created_{before,after}` prompts so users see the same
-/// error message at wizard time that the runtime would print on sync.
+/// One of the two date-range prompts (`skip_created_before` /
+/// `skip_created_after`). Returns the trimmed value or `None` for blank.
+/// The `(ISO date ...)` suffix is uniform across both prompts.
+fn date_prompt(label: &str) -> anyhow::Result<Option<String>> {
+    let prompt = format!("{label} (ISO date, datetime, or Nd interval; blank = no limit)");
+    let raw: String = Input::new()
+        .with_prompt(prompt)
+        .default(String::new())
+        .show_default(false)
+        .allow_empty(true)
+        .validate_with(|s: &String| validate_date_or_blank(s))
+        .interact_text()?;
+    let trimmed = raw.trim();
+    Ok(if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    })
+}
+
+/// Accept blank or anything `config::parse_date_or_interval` parses cleanly,
+/// so a typo here surfaces with the same error the runtime would print.
 fn validate_date_or_blank(s: &str) -> Result<(), String> {
     if s.trim().is_empty() {
         return Ok(());
@@ -710,29 +697,22 @@ fn validate_date_or_blank(s: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Accept blank or a positive `u32` (1 or greater). Empty string maps to
-/// `None`; `"0"` is rejected with a clear error, since 0 is meaningless for
-/// `recent` (the user should leave it blank for "all").
-fn validate_positive_u32_or_blank(s: &str) -> Result<(), String> {
-    if s.trim().is_empty() {
-        return Ok(());
-    }
-    match s.trim().parse::<u32>() {
-        Ok(0) => Err("must be greater than zero (or leave blank for no limit)".to_string()),
-        Ok(_) => Ok(()),
-        Err(_) => Err("must be a positive integer or blank".to_string()),
-    }
-}
-
-/// Parse the validated string into `Option<u32>`. Pre-validated by
-/// [`validate_positive_u32_or_blank`] so the parse cannot fail here.
-fn parse_positive_u32_opt(s: &str) -> Option<u32> {
+/// Parse a wizard input that should be either blank or a strictly-positive
+/// integer. Returns the parsed value (or `None` for blank), so callers don't
+/// re-parse what dialoguer's `validate_with` already validated. `"0"` is
+/// rejected because every caller treats blank (not zero) as "off".
+fn parse_positive_or_blank<T: std::str::FromStr>(s: &str) -> Result<Option<T>, String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
-        None
-    } else {
-        trimmed.parse::<u32>().ok().filter(|n| *n > 0)
+        return Ok(None);
     }
+    if trimmed == "0" {
+        return Err("must be greater than zero (or leave blank to disable)".to_string());
+    }
+    trimmed
+        .parse::<T>()
+        .map(Some)
+        .map_err(|_e| "must be a positive integer or blank".to_string())
 }
 
 // ── Step 7: Running mode ───────────────────────────────────────────
@@ -750,9 +730,7 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .interact()?;
 
     if mode == 1 {
-        // Mirror the runtime range from `--watch-with-interval`
-        // (`src/cli.rs`); rejecting out-of-range here means the user sees
-        // the error before the file is written.
+        // Range mirrors the runtime parser at `src/cli.rs::SyncArgs::watch_with_interval`.
         let interval: u64 = Input::new()
             .with_prompt("Re-sync every how many seconds (60..=86400)")
             .default(3600u64)
@@ -785,9 +763,8 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             }
         }
 
-        // Periodic local-vs-state reconciliation walk. Read-only (it only
-        // logs missing files; never re-downloads or marks failed), so the
-        // floor is "off" and opt-in is intentional.
+        // Read-only walk: logs missing files, never re-downloads or marks
+        // failed. Blank/0 = off; opt-in is intentional.
         let reconcile: String = Input::new()
             .with_prompt(
                 "Reconcile (read-only walk for missing local files) every N watch cycles (blank = off)",
@@ -795,21 +772,10 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             .default(String::new())
             .show_default(false)
             .allow_empty(true)
-            .validate_with(|s: &String| -> Result<(), String> {
-                if s.trim().is_empty() {
-                    return Ok(());
-                }
-                match s.trim().parse::<u64>() {
-                    Ok(0) => Err("must be greater than zero (or blank to disable)".to_string()),
-                    Ok(_) => Ok(()),
-                    Err(_) => Err("must be a positive integer or blank".to_string()),
-                }
-            })
+            .validate_with(|s: &String| parse_positive_or_blank::<u64>(s).map(|_| ()))
             .interact_text()?;
-        if let Ok(n) = reconcile.trim().parse::<u64>() {
-            if n > 0 {
-                answers.reconcile_every_n_cycles = Some(n);
-            }
+        if let Ok(Some(n)) = parse_positive_or_blank::<u64>(&reconcile) {
+            answers.reconcile_every_n_cycles = Some(n);
         }
     }
 
@@ -856,14 +822,10 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             0 => answers.smart_folders = vec!["all".to_string()],
             1 => answers.smart_folders = vec!["all-with-sensitive".to_string()],
             _ => {
-                // Pull the literal names kei recognises so this stays in
-                // sync with `icloud::photos::smart_folders` if a name is ever
-                // added or renamed. Names are case-sensitive at parse time.
+                // Source-of-truth for the available names; stays in sync if
+                // any are added or renamed.
                 let known: Vec<&'static str> =
-                    crate::icloud::photos::smart_folders::smart_folders()
-                        .into_iter()
-                        .map(|(name, _)| name)
-                        .collect();
+                    crate::icloud::photos::smart_folders::smart_folder_names().collect();
                 println!("  Enter one smart-folder name per line. Press Enter on a blank line to finish.");
                 println!("  Names are case-sensitive. Available smart folders:");
                 println!("  {}.", known.join(", "));
@@ -2030,67 +1992,46 @@ mod tests {
         assert!(validate_date_or_blank("1d").is_ok());
     }
 
-    /// Same garbage strings the runtime would reject at sync time.
-    /// Catching them at wizard time means a user with a typo doesn't
-    /// write a config that fails the next morning.
     #[test]
     fn validate_date_or_blank_rejects_garbage() {
         for bad in ["2024-13-99", "tomorrow", "30dx", "abc", "999"] {
-            let err = validate_date_or_blank(bad).unwrap_err();
             assert!(
-                err.to_lowercase().contains("cannot parse")
-                    || err.to_lowercase().contains("expected"),
-                "bad input {bad:?} produced unhelpful error: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_positive_u32_or_blank_accepts_empty() {
-        assert!(validate_positive_u32_or_blank("").is_ok());
-        assert!(validate_positive_u32_or_blank("  ").is_ok());
-    }
-
-    #[test]
-    fn validate_positive_u32_or_blank_accepts_positive() {
-        assert!(validate_positive_u32_or_blank("1").is_ok());
-        assert!(validate_positive_u32_or_blank("100").is_ok());
-        assert!(validate_positive_u32_or_blank("4294967295").is_ok()); // u32::MAX
-    }
-
-    #[test]
-    fn validate_positive_u32_or_blank_rejects_zero() {
-        let err = validate_positive_u32_or_blank("0").unwrap_err();
-        assert!(err.contains("greater than zero"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_positive_u32_or_blank_rejects_garbage() {
-        for bad in ["abc", "-1", "1.5", "100000000000"] {
-            assert!(
-                validate_positive_u32_or_blank(bad).is_err(),
+                validate_date_or_blank(bad).is_err(),
                 "bad input {bad:?} should have been rejected"
             );
         }
     }
 
     #[test]
-    fn parse_positive_u32_opt_returns_none_for_blank() {
-        assert_eq!(parse_positive_u32_opt(""), None);
-        assert_eq!(parse_positive_u32_opt("  "), None);
+    fn parse_positive_or_blank_blank_is_none() {
+        assert_eq!(parse_positive_or_blank::<u32>("").unwrap(), None);
+        assert_eq!(parse_positive_or_blank::<u64>("   ").unwrap(), None);
     }
 
     #[test]
-    fn parse_positive_u32_opt_returns_value() {
-        assert_eq!(parse_positive_u32_opt("42"), Some(42));
-        assert_eq!(parse_positive_u32_opt("  42  "), Some(42));
+    fn parse_positive_or_blank_accepts_positive() {
+        assert_eq!(parse_positive_or_blank::<u32>("1").unwrap(), Some(1));
+        assert_eq!(parse_positive_or_blank::<u32>("100").unwrap(), Some(100));
+        assert_eq!(
+            parse_positive_or_blank::<u32>("4294967295").unwrap(),
+            Some(u32::MAX)
+        );
+        assert_eq!(parse_positive_or_blank::<u64>("3600").unwrap(), Some(3600));
     }
 
     #[test]
-    fn parse_positive_u32_opt_drops_zero() {
-        // Zero is rejected by validate_positive_u32_or_blank, so the parse
-        // helper should never see it; but if it does, we want None, not
-        // Some(0).
-        assert_eq!(parse_positive_u32_opt("0"), None);
+    fn parse_positive_or_blank_rejects_zero() {
+        let err = parse_positive_or_blank::<u32>("0").unwrap_err();
+        assert!(err.contains("greater than zero"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_positive_or_blank_rejects_garbage() {
+        for bad in ["abc", "-1", "1.5", "100000000000"] {
+            assert!(
+                parse_positive_or_blank::<u32>(bad).is_err(),
+                "bad input {bad:?} should have been rejected"
+            );
+        }
     }
 }

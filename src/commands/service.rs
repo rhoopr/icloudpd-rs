@@ -565,10 +565,7 @@ async fn collect_album_asset_ids(
 /// the same map `PhotoLibrary::albums` returns; used to split user albums
 /// vs smart folders for the v0.13 selection model.
 fn smart_folder_name_set() -> rustc_hash::FxHashSet<&'static str> {
-    icloud::photos::smart_folders::smart_folders()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect()
+    icloud::photos::smart_folders::smart_folder_names().collect()
 }
 
 /// Resolve the v0.13 [`crate::selection::Selection`] into concrete download

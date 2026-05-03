@@ -25,6 +25,13 @@ pub(crate) fn smart_folder_filter(field: &str, value: &str) -> Value {
     }])
 }
 
+/// Names of every smart folder kei recognises (10 entries, in
+/// declaration order). Used by the wizard's "specific smart folders"
+/// hint and by the selection layer's user-vs-smart split.
+pub(crate) fn smart_folder_names() -> impl Iterator<Item = &'static str> {
+    smart_folders().into_iter().map(|(name, _)| name)
+}
+
 /// Names of the smart folders that the iOS Photos app gates behind a
 /// separate UI. `--smart-folder all` skips these unless the user opts in
 /// via `--smart-folder all-with-sensitive`.

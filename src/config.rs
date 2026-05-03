@@ -1693,11 +1693,9 @@ impl Config {
                 .and_then(|w| w.pid_file.as_ref())
                 .map(PathBuf::from)
         });
-        // CLI `--reconcile-every-n-cycles` (also `KEI_RECONCILE_EVERY_N_CYCLES`
-        // via clap's `env =`) overrides `[watch] reconcile_every_n_cycles`
-        // in TOML. The CLI value parser already rejects 0; the `.filter` keeps
-        // the TOML "0 = off" semantic (and the watch loop short-circuits in
-        // single-shot mode regardless).
+        // `.filter` collapses TOML's `reconcile_every_n_cycles = 0` to None,
+        // matching the documented "0 = off" semantic. The CLI parser already
+        // rejects 0, so the filter only fires for the TOML path.
         let reconcile_every_n_cycles = sync
             .reconcile_every_n_cycles
             .or_else(|| toml_watch.and_then(|w| w.reconcile_every_n_cycles))
