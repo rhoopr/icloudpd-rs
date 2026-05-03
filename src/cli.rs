@@ -683,8 +683,16 @@ pub enum ResetCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Clear stored sync tokens so the next sync does a full enumeration
-    SyncToken,
+    /// Clear stored sync tokens so the next sync does a full enumeration.
+    ///
+    /// Without `--yes`, prompts for confirmation on a TTY (the next sync will
+    /// re-enumerate every asset, which can be expensive on large libraries)
+    /// and errors out under non-interactive use, matching `reset state`.
+    SyncToken {
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 /// Config management actions.
@@ -1129,8 +1137,10 @@ impl Cli {
             }
             Command::ResetSyncToken => {
                 deprecation_warning("kei reset-sync-token", "kei reset sync-token");
+                // Legacy alias never prompted; preserve that for shell scripts
+                // and docker callers that have been shipping this form.
                 Command::Reset {
-                    what: ResetCommand::SyncToken,
+                    what: ResetCommand::SyncToken { yes: true },
                 }
             }
             Command::Setup { output } => {
@@ -1845,7 +1855,29 @@ mod tests {
         assert!(matches!(
             cli.effective_command(),
             Command::Reset {
-                what: ResetCommand::SyncToken,
+                what: ResetCommand::SyncToken { yes: false },
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reset_sync_token_with_yes() {
+        let cli = Cli::try_parse_from(["kei", "reset", "sync-token", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Reset {
+                what: ResetCommand::SyncToken { yes: true },
+            }
+        ));
+    }
+
+    #[test]
+    fn test_reset_sync_token_with_short_y() {
+        let cli = Cli::try_parse_from(["kei", "reset", "sync-token", "-y"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Reset {
+                what: ResetCommand::SyncToken { yes: true },
             }
         ));
     }
@@ -1989,11 +2021,13 @@ mod tests {
 
     #[test]
     fn test_legacy_reset_sync_token_maps_to_reset() {
+        // Legacy alias preserves auto-confirm; the new canonical
+        // `kei reset sync-token` is the form that prompts.
         let cli = Cli::try_parse_from(["kei", "reset-sync-token"]).unwrap();
         assert!(matches!(
             cli.effective_command(),
             Command::Reset {
-                what: ResetCommand::SyncToken,
+                what: ResetCommand::SyncToken { yes: true },
             }
         ));
     }

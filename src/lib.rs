@@ -531,8 +531,8 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             cli::ResetCommand::State { yes } => {
                 return run_reset_state(yes, &globals, toml_config.as_ref()).await;
             }
-            cli::ResetCommand::SyncToken => {
-                return run_reset_sync_token(&globals, toml_config.as_ref()).await;
+            cli::ResetCommand::SyncToken { yes } => {
+                return run_reset_sync_token(yes, &globals, toml_config.as_ref()).await;
             }
         },
         Command::Verify(args) => {

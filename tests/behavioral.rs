@@ -2319,6 +2319,7 @@ fn reset_sync_token_clears_tokens() {
         .args([
             "reset",
             "sync-token",
+            "--yes",
             "--username",
             username,
             "--data-dir",
@@ -2397,6 +2398,165 @@ fn reset_state_without_yes_on_non_tty() {
         "non-interactive should print 'Cancelled', stdout: {stdout}"
     );
     assert!(db_path.exists(), "DB should NOT be deleted without --yes");
+}
+
+#[test]
+fn reset_sync_token_without_yes_on_non_tty_errors() {
+    // `kei reset sync-token` ships a confirmation guard. Under non-TTY use
+    // (CI, scripts, docker exec without -t), running without `--yes` errors
+    // out instead of silently re-enumerating every asset on the next sync.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('sync_token:PrimarySync', 'tok-abc')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let db_path = dir
+        .path()
+        .join(format!("{}.db", sanitize_username(username)));
+
+    let out = clean_cmd()
+        .args([
+            "reset",
+            "sync-token",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--yes"),
+        "non-tty error must mention --yes; stderr: {stderr}"
+    );
+
+    // Tokens must remain untouched.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let zone_token: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        zone_token.as_deref(),
+        Some("tok-abc"),
+        "zone token must not be cleared without --yes"
+    );
+}
+
+#[test]
+fn reset_sync_token_with_yes_clears_under_non_tty() {
+    // Mirror of the test above with `--yes`: the same non-TTY context now
+    // succeeds and clears tokens. Confirms the safety guard only fires on
+    // the missing-flag path, not in legitimate scripted use.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('sync_token:PrimarySync', 'tok-abc')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('db_sync_token', 'db-tok-123')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let db_path = dir
+        .path()
+        .join(format!("{}.db", sanitize_username(username)));
+
+    let out = clean_cmd()
+        .args([
+            "reset",
+            "sync-token",
+            "--yes",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Cleared sync tokens"),
+        "stdout should report Cleared sync tokens: {stdout}"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let zone_token: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(
+        zone_token.is_none(),
+        "zone token must be cleared with --yes"
+    );
+}
+
+#[test]
+fn legacy_reset_sync_token_alias_still_clears_without_yes() {
+    // The hidden compat command `kei reset-sync-token` (deprecated, no
+    // subcommand) historically auto-confirmed. Preserve that behavior so
+    // existing shell scripts and docker callers keep working until v0.20.
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('sync_token:PrimarySync', 'tok-legacy')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let db_path = dir
+        .path()
+        .join(format!("{}.db", sanitize_username(username)));
+
+    clean_cmd()
+        .args([
+            "reset-sync-token",
+            "--username",
+            username,
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let zone_token: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert!(
+        zone_token.is_none(),
+        "legacy alias must still auto-confirm and clear the token"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2947,6 +3107,7 @@ fn reset_sync_token_empty_metadata() {
         .args([
             "reset",
             "sync-token",
+            "--yes",
             "--username",
             username,
             "--data-dir",
