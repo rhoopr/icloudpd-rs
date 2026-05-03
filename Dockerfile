@@ -57,10 +57,12 @@ RUN export TARGET=$(cat /tmp/target) && \
 FROM debian:bookworm-20250428-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends bash curl ca-certificates libdbus-1-3 && \
+    apt-get install -y --no-install-recommends bash curl ca-certificates libdbus-1-3 gosu && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /kei /usr/local/bin/kei
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 VOLUME ["/config", "/photos"]
 
@@ -75,5 +77,9 @@ HEALTHCHECK --interval=60s --timeout=5s --start-period=15m --retries=3 \
 # in TOML so users can shorten the cycle without overriding `command:` (#293).
 ENV KEI_WATCH_WITH_INTERVAL=86400
 
-ENTRYPOINT ["kei"]
+# entrypoint.sh drops to PUID:PGID when those env vars are set; otherwise
+# exec's kei as root (preserves prior behavior). Required for NAS
+# deployments where files must be host-user-owned (Synology Photos,
+# Unraid, TrueNAS Scale).
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["sync", "--config", "/config/config.toml", "--data-dir", "/config", "--download-dir", "/photos"]

@@ -11,6 +11,15 @@ services:
       # `docker inspect`). Removed by kei from the process environment after
       # reading.
       # - ICLOUD_PASSWORD=${ICLOUD_PASSWORD}
+      #
+      # PUID/PGID: drop privileges to the host user that owns ./config
+      # and /path/to/photos. Required for NAS deployments (Synology
+      # Container Manager, Unraid, TrueNAS Scale) so downstream
+      # indexers (e.g. Synology Photos) can read kei's output. On
+      # Synology, the typical values are PUID=1026 PGID=100. Without
+      # these the container runs as root.
+      # - PUID=1000
+      # - PGID=1000
     volumes:
       - ./config:/config
       - /path/to/photos:/photos

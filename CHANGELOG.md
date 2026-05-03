@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Docker image now honors `PUID` and `PGID` environment variables.** When set, the container's entrypoint creates a user with those IDs, chowns `/config` and `/photos` to them, and drops privileges via `gosu` before running kei. Without them, the container runs as root (preserves prior default). This unblocks NAS deployments (Synology Container Manager, Unraid, TrueNAS Scale) where downstream indexers like Synology Photos can't see root-owned files. The recursive chown is gated on the top-level UID already matching, so subsequent restarts are fast even on large `/photos` volumes.
+- **Synology deployment guide.** New wiki page covers Container Manager setup, the typical Synology UID/GID values (`PUID=1026 PGID=100`), Synology Photos library paths, first-run 2FA via DSM terminal, and port-conflict handling.
+- **`scripts/notify-synology-photos.sh` example.** Reference notification script that pings Synology DSM with sync stats after a completed cycle (using the documented `SYNO.Core.Notification.Mail` API), with a commented-out section for explicit reindex via SSH + `synoindex`. Wired into kei via the existing `--notification-script` hook; no kei code knows about Synology. Synology Photos's universal scanner already picks up new files via inotify within seconds, so the notification path is informational rather than required.
+
 ---
 
 ## [0.13.2] - 2026-05-03

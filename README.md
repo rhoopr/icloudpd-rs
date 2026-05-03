@@ -76,6 +76,7 @@ Everything lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CLI ref
 - [Commands](https://github.com/rhoopr/kei/wiki/Home#commands) - `sync`, `login`, `list`, `password`, `config`, `reset`, `status`, `verify`, `import-existing`
 - [Configuration](https://github.com/rhoopr/kei/wiki/Configuration) - TOML file, env vars, precedence
 - [Docker](https://github.com/rhoopr/kei/wiki/Docker) - Compose files and headless 2FA
+- [Synology](https://github.com/rhoopr/kei/wiki/Synology) - Container Manager setup, PUID/PGID, Synology Photos integration
 - [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) - keyring, encrypted file, password files and commands
 - [Changelog](CHANGELOG.md)
 - [How iCloud's Incremental Sync Works](https://robhooper.xyz/blog-synctoken) - deep dive on CloudKit syncTokens

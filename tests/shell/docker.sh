@@ -250,7 +250,67 @@ echo "$STATUS_OUT" | grep -q "Downloaded assets:"
 kei_check "--downloaded listing renders inside container"
 
 echo ""
-echo "--- 14. kei status --pending --failed --downloaded combined ---"
+echo "--- 14a. PUID/PGID drops privileges and chowns volumes ---"
+PUID_CONFIG=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-puid-config-XXXXX")
+PUID_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-puid-photos-XXXXX")
+# Pick UIDs unlikely to collide with the host (don't shadow real users
+# in the container's /etc/passwd).
+TEST_PUID=4321
+TEST_PGID=4322
+PUID_OUT=$(docker run --rm \
+    "${ONESHOT_ENV[@]}" \
+    -e PUID="$TEST_PUID" \
+    -e PGID="$TEST_PGID" \
+    -v "$PUID_CONFIG:/config" \
+    -v "$PUID_PHOTOS:/photos" \
+    --entrypoint /usr/local/bin/entrypoint.sh \
+    "$IMAGE" sh -c 'id -u; id -g; stat -c %u /config; stat -c %u /photos' \
+    2>&1)
+echo "  Output (uid, gid, /config uid, /photos uid):"
+echo "$PUID_OUT" | sed 's/^/    /'
+EXPECTED=$(printf '%s\n%s\n%s\n%s' "$TEST_PUID" "$TEST_PGID" "$TEST_PUID" "$TEST_PUID")
+[ "$PUID_OUT" = "$EXPECTED" ]
+kei_check "process runs as PUID:PGID and volumes are chowned"
+# Subsequent runs must skip the recursive chown (top-level uid already matches)
+# and still drop to the requested UID.
+SECOND_OUT=$(docker run --rm \
+    "${ONESHOT_ENV[@]}" \
+    -e PUID="$TEST_PUID" \
+    -e PGID="$TEST_PGID" \
+    -v "$PUID_CONFIG:/config" \
+    -v "$PUID_PHOTOS:/photos" \
+    --entrypoint /usr/local/bin/entrypoint.sh \
+    "$IMAGE" id -u 2>&1)
+[ "$SECOND_OUT" = "$TEST_PUID" ]
+kei_check "second run still drops to PUID after chown is a no-op"
+# Chown back to the host user before rm; the dirs were chown'd to
+# TEST_PUID inside the container and the host user can't `rm -rf` them
+# directly.
+docker run --rm -v "$PUID_CONFIG:/c" "$IMAGE" chown -R "$(id -u):$(id -g)" /c >/dev/null 2>&1
+docker run --rm -v "$PUID_PHOTOS:/p" "$IMAGE" chown -R "$(id -u):$(id -g)" /p >/dev/null 2>&1
+rm -rf "$PUID_CONFIG" "$PUID_PHOTOS"
+
+echo ""
+echo "--- 14b. No PUID/PGID = runs as root (backward compat) ---"
+ROOT_OUT=$(docker run --rm \
+    "${ONESHOT_ENV[@]}" \
+    --entrypoint /usr/local/bin/entrypoint.sh \
+    "$IMAGE" id -u 2>&1)
+[ "$ROOT_OUT" = "0" ]
+kei_check "default (no PUID/PGID) still runs as root"
+
+echo ""
+echo "--- 14c. Non-numeric PUID is rejected ---"
+BAD_OUT=$(docker run --rm \
+    "${ONESHOT_ENV[@]}" \
+    -e PUID="notanumber" \
+    --entrypoint /usr/local/bin/entrypoint.sh \
+    "$IMAGE" id 2>&1 || true)
+echo "$BAD_OUT" | grep -q "PUID/PGID must be numeric"
+kei_check "non-numeric PUID is rejected with clear error"
+
+echo ""
+echo "--- 15. kei status --pending --failed --downloaded combined ---"
 COMBINED_OUT=$(docker run --rm \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" status \
