@@ -411,7 +411,7 @@ fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyho
 /// `--album`: `kei sync --album Vacation` runs the Vacation pass *and* the
 /// unfiled pass unless the user explicitly disables it with
 /// `--unfiled false`. `--unfiled` always wins when supplied.
-const fn unfiled_default() -> bool {
+pub(crate) const fn unfiled_default() -> bool {
     true
 }
 

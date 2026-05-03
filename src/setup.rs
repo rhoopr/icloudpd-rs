@@ -493,20 +493,19 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             answers.albums.push(trimmed.to_string());
         }
 
-        // v0.13's `[filters].unfiled` defaults to `true`, which means a user
-        // who picked "specific albums" still gets a separate pass that
-        // downloads every photo not in any of those albums. That's almost
-        // never what someone selecting albums by name wants. Ask explicitly.
+        // Mirror the runtime default so a user who hits Enter here gets the
+        // same behavior the CLI gives them when no flag is set. Sourced from
+        // `config::unfiled_default()` rather than hardcoded `true` so a
+        // future change to the runtime default propagates to the wizard
+        // automatically. We always emit `unfiled` explicitly (rather than
+        // relying on the default) so the runtime's implicit-unfiled warning
+        // never fires for wizard-generated configs.
         if !answers.albums.is_empty() {
             println!();
             let also_unfiled = Confirm::new()
                 .with_prompt("Also download photos that aren't in any of these albums?")
-                .default(false)
+                .default(crate::config::unfiled_default())
                 .interact()?;
-            // Always set explicitly so the runtime "--unfiled defaults to
-            // true" warning never fires for wizard-generated configs (the
-            // warning only fires when `unfiled` is implicit and the album
-            // selector isn't `none`).
             answers.unfiled = Some(also_unfiled);
         }
     } else {
