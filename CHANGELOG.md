@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- **`[metrics]` TOML section and `KEI_METRICS_PORT` env var.** Both are folded into `[server]` (TOML) and `KEI_HTTP_PORT` (env). The deprecation warning for `[metrics]` has shipped since v0.13.0; pre-fix it only fired when `[metrics] port` was actually being used to resolve `http_port`, so a config with both `[server]` and `[metrics]` set kept `[metrics]` silently around. The `KEI_METRICS_PORT` env var has the same problem and now warns whenever it is set, even if a higher-precedence value (CLI / `[server]` TOML / `KEI_HTTP_PORT`) wins. Both surfaces are scheduled for removal in v0.20.0; rename `[metrics]` to `[server]` and `KEI_METRICS_PORT` to `KEI_HTTP_PORT` to clear the warnings.
+
 ---
 
 ## [0.13.1] - 2026-05-03

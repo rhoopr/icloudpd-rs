@@ -1739,27 +1739,34 @@ impl Config {
         // HTTP server port — CLI > [server] TOML > [metrics] TOML (deprecated) > KEI_METRICS_PORT
         // env (deprecated) > default 9090.
         const DEFAULT_HTTP_PORT: u16 = 9090;
+        // Warn early when the deprecated env var is set, regardless of
+        // whether a higher-precedence value shadows it. Pre-fix the
+        // warning only fired in the env-var arm of the `or_else` chain,
+        // so a user who set both `KEI_HTTP_PORT` and `KEI_METRICS_PORT`
+        // got no signal that their `KEI_METRICS_PORT` was being silently
+        // ignored. Same pattern we use for the `[metrics]` TOML section
+        // below.
+        let kei_metrics_port_env = std::env::var("KEI_METRICS_PORT").ok();
+        if kei_metrics_port_env.is_some() {
+            tracing::warn!(
+                "KEI_METRICS_PORT is deprecated and will be removed in v0.20.0; \
+                 use KEI_HTTP_PORT instead"
+            );
+        }
+        if toml_metrics.and_then(|m| m.port).is_some() {
+            tracing::warn!(
+                "[metrics] port in TOML is deprecated and will be removed in v0.20.0; \
+                 rename the section to [server]"
+            );
+        }
         let http_port = sync
             .http_port
             .or_else(|| toml_server.and_then(|s| s.port))
+            .or_else(|| toml_metrics.and_then(|m| m.port))
             .or_else(|| {
-                toml_metrics.and_then(|m| m.port).inspect(|_port| {
-                    tracing::warn!(
-                        "[metrics] port in TOML is deprecated and will be removed in v0.20.0; \
-                         rename the section to [server]"
-                    );
-                })
-            })
-            .or_else(|| {
-                std::env::var("KEI_METRICS_PORT")
-                    .ok()
+                kei_metrics_port_env
+                    .as_deref()
                     .and_then(|v| v.parse::<u16>().ok())
-                    .inspect(|_port| {
-                        tracing::warn!(
-                            "KEI_METRICS_PORT is deprecated and will be removed in v0.20.0; \
-                             use KEI_HTTP_PORT instead"
-                        );
-                    })
             })
             .unwrap_or(DEFAULT_HTTP_PORT);
 
@@ -4269,6 +4276,133 @@ mod tests {
         let config =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(config.http_port, 8080);
+    }
+
+    /// Serialize KEI_METRICS_PORT env var across the deprecation tests so
+    /// they don't race each other or leak state. Mirrors the
+    /// `scrub_auth_env` pattern in `cli.rs`.
+    fn scrub_metrics_port_env() -> MetricsPortEnvGuard {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("KEI_METRICS_PORT").ok();
+        // SAFETY: the static mutex serializes every other caller of
+        // scrub_metrics_port_env; the suite does not read this env var
+        // from a separate thread.
+        unsafe {
+            std::env::remove_var("KEI_METRICS_PORT");
+        }
+        MetricsPortEnvGuard { _lock: guard, prev }
+    }
+
+    struct MetricsPortEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl Drop for MetricsPortEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still holding the static mutex; restoration is
+            // exclusive under the same "no cross-thread readers" rule.
+            unsafe {
+                if let Some(v) = self.prev.take() {
+                    std::env::set_var("KEI_METRICS_PORT", v);
+                } else {
+                    std::env::remove_var("KEI_METRICS_PORT");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_kei_metrics_port_env_warns_when_set_even_if_shadowed() {
+        // KEI_METRICS_PORT is set, but [server] port wins. Pre-fix the
+        // warning was inside the env-var arm of the or_else chain so it
+        // never fired in this case; users had no signal that their
+        // KEI_METRICS_PORT was being silently ignored.
+        let _guard = scrub_metrics_port_env();
+        // SAFETY: the guard above holds the static lock for the duration
+        // of this test, so no other thread is reading the env var.
+        unsafe {
+            std::env::set_var("KEI_METRICS_PORT", "9999");
+        }
+        let toml_str = r#"
+            [auth]
+            username = "user@example.com"
+            [download]
+            directory = "/photos"
+            [server]
+            port = 9090
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        // [server] port still wins.
+        assert_eq!(config.http_port, 9090);
+        // ...but the deprecation warning fires anyway.
+        assert!(
+            logs_contain("KEI_METRICS_PORT is deprecated"),
+            "deprecation warning should fire whenever KEI_METRICS_PORT is set"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_kei_metrics_port_env_resolves_when_no_higher_value() {
+        // No CLI / [server] / [metrics] value: env var still wins, with a
+        // warning. Confirms the migration path stays usable for one minor
+        // cycle while users move to KEI_HTTP_PORT.
+        let _guard = scrub_metrics_port_env();
+        unsafe {
+            std::env::set_var("KEI_METRICS_PORT", "8765");
+        }
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.http_port, 8765);
+        assert!(logs_contain("KEI_METRICS_PORT is deprecated"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_metrics_toml_warns_even_when_shadowed_by_server() {
+        // [metrics] port is shadowed by [server] port; the deprecation
+        // warning still fires so config-driven users learn that the
+        // section is on its way out.
+        let _guard = scrub_metrics_port_env();
+        let toml_str = r#"
+            [auth]
+            username = "user@example.com"
+            [download]
+            directory = "/photos"
+            [server]
+            port = 9090
+            [metrics]
+            port = 9999
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(config.http_port, 9090);
+        assert!(
+            logs_contain("[metrics] port in TOML is deprecated"),
+            "deprecation warning should fire whenever [metrics] port is set"
+        );
     }
 
     #[test]
