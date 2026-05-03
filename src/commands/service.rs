@@ -480,6 +480,45 @@ fn library_entry_matches_zone(entry: &str, zone: &str, truncated: &str) -> bool 
     entry.eq_ignore_ascii_case(zone) || entry.eq_ignore_ascii_case(truncated)
 }
 
+/// Pre-flight: bail when the resolved library set cannot fulfill the
+/// requested smart-folder selection. Apple's CloudKit shared zones don't
+/// expose smart folders (`library.albums()` skips smart-folder injection
+/// for `SharedSync-*` zones), so a `--library shared --smart-folder X`
+/// configuration produces zero smart-folder passes and exit 0 — silent
+/// failure. Detect that at startup, before per-library `resolve_passes`
+/// runs, so the user gets an actionable message instead of a
+/// successful-looking sync that quietly skipped what they asked for.
+///
+/// Mixed library sets (primary + shared) pass: smart folders apply to the
+/// primary library, and the shared zones' lack of smart-folder passes is
+/// expected behavior.
+pub(crate) fn validate_smart_folder_fulfillability(
+    libraries: &[icloud::photos::PhotoLibrary],
+    selection: &crate::selection::Selection,
+) -> anyhow::Result<()> {
+    use crate::selection::SmartFolderSelector;
+    if matches!(selection.smart_folders, SmartFolderSelector::None) {
+        return Ok(());
+    }
+    let any_supports = libraries
+        .iter()
+        .any(|l| !icloud::photos::is_shared_zone(l.zone_name()));
+    if any_supports {
+        return Ok(());
+    }
+    let zones: Vec<&str> = libraries
+        .iter()
+        .map(icloud::photos::PhotoLibrary::zone_name)
+        .collect();
+    anyhow::bail!(
+        "--smart-folder requires a library that supports smart folders, but \
+         --library resolved to only shared zones: {zones:?}. Apple does not \
+         expose smart folders on shared libraries. Either include the primary \
+         library (e.g. `--library all` or `--library primary`) or drop \
+         `--smart-folder` (`--smart-folder none`)."
+    )
+}
+
 /// Category of a download pass: a named user album, an Apple-defined smart
 /// folder, or the library-wide unfiled pseudo-pass. Drives template/token
 /// selection in the path renderer.
@@ -1188,6 +1227,95 @@ mod tests {
             err.to_string().contains("not an Apple smart folder"),
             "msg: {err}"
         );
+    }
+
+    // ── validate_smart_folder_fulfillability (CF-2, 2026-05-03) ─────────
+    //
+    // Apple's CloudKit shared zones don't have smart folders. Before the
+    // fix, `--library shared --smart-folder Favorites` (or any shared-only
+    // library set with a smart-folder selection) silently warn-and-skipped
+    // every smart-folder pass and exited 0. The user looked at their
+    // primary-library Favorites and assumed shared-Favorites came along.
+    //
+    // The fix is a pre-flight check that bails at startup when the
+    // selected library set cannot fulfill the smart-folder selection.
+
+    fn shared_lib_stub(zone: &str) -> PhotoLibrary {
+        PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), zone)
+    }
+
+    #[test]
+    fn validate_smart_folder_named_against_shared_only_libraries_bails() {
+        let libs = vec![shared_lib_stub("SharedSync-AAAA1111")];
+        let sel = Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::Named {
+                included: names(&["Favorites"]),
+                excluded: BTreeSet::new(),
+            },
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: false,
+        };
+        let err = validate_smart_folder_fulfillability(&libs, &sel).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--smart-folder"),
+            "error must name the offending flag, got: {msg}"
+        );
+        assert!(
+            msg.contains("primary"),
+            "error must guide the user toward the primary library, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_smart_folder_all_against_shared_only_libraries_bails() {
+        let libs = vec![shared_lib_stub("SharedSync-BBBB2222")];
+        let sel = Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::All {
+                include_sensitive: false,
+                excluded: BTreeSet::new(),
+            },
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: false,
+        };
+        let err = validate_smart_folder_fulfillability(&libs, &sel).unwrap_err();
+        assert!(err.to_string().contains("--smart-folder"));
+    }
+
+    #[test]
+    fn validate_smart_folder_named_against_mixed_libraries_passes() {
+        // Primary in the set fulfills smart folders; shared zones simply
+        // get no smart-folder passes (expected and documented).
+        let primary =
+            PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), "PrimarySync");
+        let shared = shared_lib_stub("SharedSync-CCCC3333");
+        let sel = Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::Named {
+                included: names(&["Favorites"]),
+                excluded: BTreeSet::new(),
+            },
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: false,
+        };
+        validate_smart_folder_fulfillability(&[primary, shared], &sel)
+            .expect("primary in mix fulfills smart folders");
+    }
+
+    #[test]
+    fn validate_smart_folder_none_passes_even_on_shared_only() {
+        // No smart-folder pass requested -> nothing to validate.
+        let libs = vec![shared_lib_stub("SharedSync-DDDD4444")];
+        let sel = Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::None,
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: false,
+        };
+        validate_smart_folder_fulfillability(&libs, &sel)
+            .expect("smart-folder None imposes no constraint on the library set");
     }
 
     #[tokio::test]

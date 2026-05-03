@@ -40,6 +40,13 @@ pub(crate) struct QueryResponse {
     pub records: Vec<Record>,
     #[serde(default, rename = "syncToken")]
     pub sync_token: Option<String>,
+    /// CloudKit pagination cursor. Present iff there are more records;
+    /// callers must echo it in the next request body to fetch the next
+    /// page. Apple's `records/query` defaults to `resultsLimit=200`, so
+    /// a caller that ignores this field silently truncates any query
+    /// whose result set exceeds 200 rows.
+    #[serde(default, rename = "continuationMarker")]
+    pub continuation_marker: Option<String>,
 }
 
 /// Response from `/internal/records/query/batch`.
@@ -209,6 +216,11 @@ mod tests {
         let resp: QueryResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.records.len(), 1);
         assert_eq!(resp.sync_token.as_deref(), Some("st-abc-123"));
+        assert_eq!(
+            resp.continuation_marker.as_deref(),
+            Some("cm-xyz-456"),
+            "continuationMarker must surface so paginated record queries can loop"
+        );
     }
 
     #[test]
@@ -216,6 +228,10 @@ mod tests {
         let json = r#"{"records": []}"#;
         let resp: QueryResponse = serde_json::from_str(json).unwrap();
         assert!(resp.sync_token.is_none());
+        assert!(
+            resp.continuation_marker.is_none(),
+            "missing continuationMarker means single-page response — must be None"
+        );
     }
 
     #[test]

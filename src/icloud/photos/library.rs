@@ -302,22 +302,73 @@ impl PhotoLibrary {
             self.service_endpoint,
             encode_params(&self.params)
         );
-        let body = json!({
-            "query": {"recordType": "CPLAlbumByPositionLive"},
-            "zoneID": &*self.zone_id,
-        });
-        let response = super::session::retry_post(
-            self.session.as_ref(),
-            &url,
-            &body.to_string(),
-            &[("Content-type", "text/plain")],
-            &self.retry_config,
-        )
-        .await?;
 
-        let query: super::cloudkit::QueryResponse =
-            serde_json::from_value(response).context("failed to parse library query response")?;
-        Ok(query.records)
+        // Apple's `records/query` defaults to resultsLimit=200 and returns
+        // a `continuationMarker` when more records are available. Loop
+        // until the marker is absent. Cap defensively at FOLDER_PAGE_CAP
+        // pages so a server bug or pathological account can't spin
+        // forever — at 200 records/page the cap is well past any
+        // plausible real iCloud library.
+        const FOLDER_PAGE_CAP: usize = 64;
+        let mut all_records = Vec::new();
+        let mut continuation: Option<String> = None;
+
+        for page in 0..FOLDER_PAGE_CAP {
+            let body = match &continuation {
+                Some(marker) => json!({
+                    "query": {"recordType": "CPLAlbumByPositionLive"},
+                    "zoneID": &*self.zone_id,
+                    "continuationMarker": marker,
+                }),
+                None => json!({
+                    "query": {"recordType": "CPLAlbumByPositionLive"},
+                    "zoneID": &*self.zone_id,
+                }),
+            };
+
+            let response = super::session::retry_post(
+                self.session.as_ref(),
+                &url,
+                &body.to_string(),
+                &[("Content-type", "text/plain")],
+                &self.retry_config,
+            )
+            .await?;
+
+            let query: super::cloudkit::QueryResponse = serde_json::from_value(response)
+                .context("failed to parse library query response")?;
+
+            let page_size = query.records.len();
+            all_records.extend(query.records);
+
+            match query.continuation_marker {
+                Some(marker) if !marker.is_empty() => {
+                    tracing::debug!(
+                        page = page,
+                        page_size,
+                        running_total = all_records.len(),
+                        "fetch_folders: continuationMarker present, fetching next page"
+                    );
+                    continuation = Some(marker);
+                }
+                _ => return Ok(all_records),
+            }
+        }
+
+        // Fell through the cap with the marker still set. Surface loudly
+        // so a regression that loosens the cap or a server pathology is
+        // visible in routine logs. Return what we have rather than an
+        // Err — partial results are more useful than a hard failure on
+        // the album-discovery path, and downstream consumers
+        // (`pick_album_names`) already bail loudly on missing names.
+        tracing::warn!(
+            cap = FOLDER_PAGE_CAP,
+            running_total = all_records.len(),
+            "fetch_folders: hit pagination cap with more pages still indicated; \
+             returning truncated album list. If you genuinely have >12,000 albums \
+             please file an issue."
+        );
+        Ok(all_records)
     }
 
     /// Returns the zone name (e.g., "`PrimarySync`", "SharedSync-{UUID}").
@@ -779,6 +830,189 @@ mod tests {
             matches!(err, ICloudError::MisdirectedRequest),
             "expected MisdirectedRequest so sync_loop can invalidate cache and \
              force SRP re-auth, got: {err:?}"
+        );
+    }
+
+    // ── fetch_folders pagination (CF-1, 2026-05-03 robustness review) ────
+    //
+    // Apple's CloudKit `records/query` endpoint defaults to
+    // resultsLimit=200 and returns a `continuationMarker` when more
+    // records exist. Before the fix, `fetch_folders` issued a single
+    // POST and trusted the response was complete — users with >200 user
+    // albums silently lost the tail. Tail-album members would route
+    // into the unfiled pass instead of `{album}` paths, and
+    // `--album all !TailAlbum` would bail "Excluded album not found"
+    // even though the album exists in iCloud.
+
+    /// Mock session that returns a queue of canned responses on
+    /// successive POSTs and records every body it received. Used to
+    /// exercise the pagination loop in `fetch_folders` without a real
+    /// HTTP server.
+    struct PaginatingFolderSession {
+        responses: std::sync::Mutex<Vec<Value>>,
+        received_bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl PaginatingFolderSession {
+        fn new(responses: Vec<Value>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses),
+                received_bodies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn body_log(&self) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+            std::sync::Arc::clone(&self.received_bodies)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for PaginatingFolderSession {
+        async fn post(
+            &self,
+            _url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            self.received_bodies.lock().unwrap().push(body);
+            let mut responses = self.responses.lock().unwrap();
+            if responses.is_empty() {
+                anyhow::bail!("PaginatingFolderSession: out of canned responses");
+            }
+            Ok(responses.remove(0))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            unimplemented!(
+                "PaginatingFolderSession::clone_box is not exercised by \
+                 fetch_folders; if a future test needs it, share Arcs over \
+                 the response queue and body log"
+            )
+        }
+    }
+
+    fn make_folder_records(count: usize, prefix: &str) -> Vec<Value> {
+        use base64::engine::general_purpose::STANDARD;
+        (0..count)
+            .map(|i| {
+                let name = format!("Album-{prefix}-{i}");
+                let enc = STANDARD.encode(name.as_bytes());
+                json!({
+                    "recordName": format!("{prefix}-{i}"),
+                    "recordType": "CPLAlbum",
+                    "fields": {
+                        "albumNameEnc": {"value": enc},
+                    },
+                })
+            })
+            .collect()
+    }
+
+    fn make_library_with_session(session: Box<dyn PhotosSession>) -> PhotoLibrary {
+        PhotoLibrary {
+            service_endpoint: Arc::from("https://example.com"),
+            params: Arc::new(HashMap::new()),
+            session,
+            zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
+            library_type: Arc::from("private"),
+            retry_config: RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        }
+    }
+
+    /// CF-1: with >200 albums, the second page must be fetched and
+    /// merged. Pre-fix, fetch_folders returned only the first page.
+    #[tokio::test]
+    async fn fetch_folders_follows_continuation_marker_until_exhausted() {
+        let page1 = make_folder_records(200, "p1");
+        let page2 = make_folder_records(100, "p2");
+        let session = PaginatingFolderSession::new(vec![
+            json!({"records": page1, "continuationMarker": "ck-p1"}),
+            json!({"records": page2}),
+        ]);
+        let body_log = session.body_log();
+        let lib = make_library_with_session(Box::new(session));
+
+        let folders = lib.fetch_folders().await.unwrap();
+        assert_eq!(
+            folders.len(),
+            300,
+            "fetch_folders must follow continuationMarker until the \
+             response omits it; got {} records, expected 300",
+            folders.len()
+        );
+
+        let bodies = body_log.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "expected exactly two POSTs (one per page), got {}",
+            bodies.len()
+        );
+        assert!(
+            !bodies[0].contains("continuationMarker"),
+            "first POST must not include a continuationMarker"
+        );
+        assert!(
+            bodies[1].contains("ck-p1"),
+            "second POST must echo the prior page's continuationMarker; \
+             body was: {}",
+            bodies[1]
+        );
+    }
+
+    /// CF-1 negative: a single-page response (no marker) must short-circuit
+    /// after one POST. Catches a regression that always sends a second
+    /// request.
+    #[tokio::test]
+    async fn fetch_folders_single_page_response_does_not_paginate() {
+        let page1 = make_folder_records(50, "only");
+        let session = PaginatingFolderSession::new(vec![json!({"records": page1})]);
+        let body_log = session.body_log();
+        let lib = make_library_with_session(Box::new(session));
+
+        let folders = lib.fetch_folders().await.unwrap();
+        assert_eq!(folders.len(), 50);
+        assert_eq!(
+            body_log.lock().unwrap().len(),
+            1,
+            "no continuationMarker means no second POST"
+        );
+    }
+
+    /// CF-1 defensive cap: if the server keeps returning a marker forever
+    /// (server bug or pathological account), fetch_folders must bail
+    /// rather than loop unbounded. The cap and warn message are part of
+    /// the contract — a future refactor that drops them would silently
+    /// allow infinite loops.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn fetch_folders_caps_iteration_when_continuation_never_clears() {
+        // Far more responses than the cap; every one carries a marker.
+        let mut responses = Vec::new();
+        for i in 0..200 {
+            responses.push(json!({
+                "records": make_folder_records(1, &format!("page-{i}")),
+                "continuationMarker": format!("marker-{i}"),
+            }));
+        }
+        let session = PaginatingFolderSession::new(responses);
+        let body_log = session.body_log();
+        let lib = make_library_with_session(Box::new(session));
+
+        let _ = lib.fetch_folders().await;
+
+        let post_count = body_log.lock().unwrap().len();
+        assert!(
+            post_count <= 64,
+            "fetch_folders must stop within the documented cap; made {post_count} POSTs"
+        );
+        assert!(
+            logs_contain("fetch_folders") && logs_contain("cap"),
+            "the cap-fired event must surface in logs so a future regression \
+             that silently loosens the cap is loud"
         );
     }
 }

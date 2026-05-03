@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use crate::auth;
 use crate::cli;
 use crate::commands::{
-    attempt_reauth, init_photos_service, resolve_libraries, resolve_passes, wait_and_retry_2fa,
-    MAX_REAUTH_ATTEMPTS,
+    attempt_reauth, init_photos_service, resolve_libraries, resolve_passes,
+    validate_smart_folder_fulfillability, wait_and_retry_2fa, MAX_REAUTH_ATTEMPTS,
 };
 use crate::config;
 use crate::credential;
@@ -444,6 +444,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),
         "Resolved libraries"
     );
+
+    // CloudKit shared zones don't expose smart folders. Catch the
+    // impossible-config case (e.g. `--library shared --smart-folder X`)
+    // here, before any per-library work, so the user gets a clear error
+    // instead of a silent zero-pass run with exit code 0.
+    validate_smart_folder_fulfillability(&libraries, &config.selection)?;
 
     // Initialize state database.
     // Skip for --dry-run so a preview doesn't create the DB or poison
