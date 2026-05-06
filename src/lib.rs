@@ -107,13 +107,6 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
     }
 }
 
-/// Process-lifetime hold for the `tracing_appender::non_blocking` worker
-/// guard. The guard's `Drop` joins the background flush thread; we install
-/// it once at startup and keep it alive until process exit so log events
-/// emitted from shutdown handlers don't race against guard teardown.
-static TRACING_WRITER_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
-    std::sync::OnceLock::new();
-
 /// A `MakeWriter` implementation that produces `RedactingWriter` instances
 /// fronting the non-blocking channel that wraps stderr.
 struct RedactingMakeWriter {
@@ -512,10 +505,17 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // synchronous `Stderr::write_all` and the runtime wedges while
     // spawn-blocking workers continue. Silent log loss under saturation is
     // strictly preferable to a hung scan loop.
-    let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-        .lossy(true)
-        .finish(std::io::stderr());
-    let _ = TRACING_WRITER_GUARD.set(guard);
+    //
+    // `_writer_guard` MUST live until `run` returns: the guard's `Drop`
+    // signals the background worker to flush remaining events before the
+    // process exits. A `static`-stored guard would never drop (Rust skips
+    // static destructors), so subprocess tests that read stderr after
+    // kei exits would race against unflushed events on fast process
+    // teardown (observed on macOS CI).
+    let (non_blocking, _writer_guard) =
+        tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .lossy(true)
+            .finish(std::io::stderr());
 
     let make_writer = RedactingMakeWriter {
         password: Arc::clone(&redact_password),
