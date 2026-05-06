@@ -28,13 +28,22 @@ use super::service::{init_photos_service, resolve_libraries, resolve_passes};
 /// work has started, distinct from process-spawn or auth completion.
 pub(crate) const SCAN_STARTED_STAGE: &str = "scan_started";
 
+/// Value of the `stage` field on the periodic heartbeat tracing event
+/// emitted by the import scan task. Operators tailing logs use this to
+/// distinguish heartbeat lines (running counters, last-seen asset id)
+/// from per-asset debug/warn lines.
+const HEARTBEAT_STAGE: &str = "heartbeat";
+
 /// Per-library counters returned by [`import_assets`].
 ///
 /// Counters span asset- and expected-path levels so that divergent
 /// totals in the summary surface silently dropped work instead of
 /// masquerading as a clean run. `total` and `filtered` tick per asset;
-/// `matched`, `unmatched`, and `hash_errors` tick per expected path
-/// (one asset can yield multiple paths, e.g. live photos).
+/// `matched`, `unmatched`, `hash_errors`, and `skipped_already_imported`
+/// tick per expected path (one asset can yield multiple paths, e.g.
+/// live photos). `skipped_already_imported` is a subset of `matched`:
+/// the file matched, but the DB had a prior adopt with the same size +
+/// mtime so the SHA-256 re-read was skipped.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ImportStats {
     pub total: u64,
@@ -42,6 +51,7 @@ pub(crate) struct ImportStats {
     pub unmatched: u64,
     pub filtered: u64,
     pub hash_errors: u64,
+    pub skipped_already_imported: u64,
 }
 
 impl std::ops::AddAssign for ImportStats {
@@ -51,6 +61,132 @@ impl std::ops::AddAssign for ImportStats {
         self.unmatched += rhs.unmatched;
         self.filtered += rhs.filtered;
         self.hash_errors += rhs.hash_errors;
+        self.skipped_already_imported += rhs.skipped_already_imported;
+    }
+}
+
+/// Default cadence for the `import-existing` heartbeat log line.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Live counters shared between the scan loop and the heartbeat task.
+///
+/// Atomics are cheaper than wrapping `ImportStats` in a lock because the
+/// scan loop bumps these on every asset; the heartbeat task only ever
+/// reads them. `last_seen_id` is kept under a `std::sync::Mutex` -- it's
+/// touched once per asset and read every 30s, so contention is irrelevant
+/// and a `Mutex<Option<String>>` avoids the ABA dance an atomic pointer
+/// would require.
+#[derive(Debug, Default)]
+struct HeartbeatState {
+    total: std::sync::atomic::AtomicU64,
+    matched: std::sync::atomic::AtomicU64,
+    unmatched: std::sync::atomic::AtomicU64,
+    filtered: std::sync::atomic::AtomicU64,
+    hash_errors: std::sync::atomic::AtomicU64,
+    skipped_already_imported: std::sync::atomic::AtomicU64,
+    last_seen_id: std::sync::Mutex<Option<String>>,
+}
+
+impl HeartbeatState {
+    fn snapshot(&self) -> HeartbeatSnapshot {
+        use std::sync::atomic::Ordering;
+        HeartbeatSnapshot {
+            total: self.total.load(Ordering::Relaxed),
+            matched: self.matched.load(Ordering::Relaxed),
+            unmatched: self.unmatched.load(Ordering::Relaxed),
+            filtered: self.filtered.load(Ordering::Relaxed),
+            hash_errors: self.hash_errors.load(Ordering::Relaxed),
+            skipped_already_imported: self.skipped_already_imported.load(Ordering::Relaxed),
+            last_seen_id: self.last_seen_id.lock().ok().and_then(|g| g.clone()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HeartbeatSnapshot {
+    total: u64,
+    matched: u64,
+    unmatched: u64,
+    filtered: u64,
+    hash_errors: u64,
+    skipped_already_imported: u64,
+    last_seen_id: Option<String>,
+}
+
+/// RAII handle for the heartbeat task spawned by [`import_assets`].
+///
+/// On drop, cancels the cancellation token so the task exits even if the
+/// scan loop bails early. The task itself is fire-and-forget; we don't
+/// `await` its `JoinHandle` in Drop because Drop is sync and the task
+/// will race-to-exit promptly once the token flips.
+struct HeartbeatGuard {
+    token: tokio_util::sync::CancellationToken,
+}
+
+impl HeartbeatGuard {
+    fn spawn(
+        state: Arc<HeartbeatState>,
+        library_label: String,
+        interval: std::time::Duration,
+    ) -> Self {
+        let token = tokio_util::sync::CancellationToken::new();
+        let task_token = token.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the immediate-fire so the first heartbeat lands ~interval
+            // after spawn rather than at t=0 (avoids a noisy log line before
+            // any work has happened).
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    () = task_token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let snap = state.snapshot();
+                        tracing::info!(
+                            library = %library_label,
+                            stage = HEARTBEAT_STAGE,
+                            total = snap.total,
+                            matched = snap.matched,
+                            unmatched = snap.unmatched,
+                            filtered = snap.filtered,
+                            hash_errors = snap.hash_errors,
+                            skipped_already_imported = snap.skipped_already_imported,
+                            last_seen_id = snap.last_seen_id.as_deref().unwrap_or("(none)"),
+                            "import scan heartbeat",
+                        );
+                    }
+                }
+            }
+        });
+        Self { token }
+    }
+}
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
+/// Convert a [`std::fs::Metadata`] modified time into an epoch-second `i64`.
+///
+/// Returns `None` when the host filesystem doesn't expose a usable mtime
+/// or when the value falls outside `i64` range; callers treat `None` as
+/// "no mtime, can't trust skip-rehash" rather than as an error.
+fn file_mtime_epoch(metadata: &std::fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|st| st.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+}
+
+/// Print the every-100-matches progress milestone if `show_progress` is set.
+/// Hoisted out of the scan loop so the skip-rehash arm and the hash-and-adopt
+/// arm can't drift in their formatting or cadence.
+fn log_progress_milestone(library_label: &str, matched: u64, show_progress: bool) {
+    if show_progress && matched.is_multiple_of(100) {
+        println!("  [{library_label}] Matched {matched} files so far...");
     }
 }
 
@@ -139,10 +275,36 @@ where
     S: futures_util::Stream<Item = anyhow::Result<PhotoAsset>>,
 {
     use futures_util::StreamExt;
+    use std::sync::atomic::Ordering;
 
     tokio::pin!(stream);
     let mut stats = ImportStats::default();
     let mut scan_started_emitted = false;
+
+    let heartbeat_state = Arc::new(HeartbeatState::default());
+    let _heartbeat = HeartbeatGuard::spawn(
+        Arc::clone(&heartbeat_state),
+        library_label.to_owned(),
+        HEARTBEAT_INTERVAL,
+    );
+
+    // Bulk-load every prior import-time snapshot for this library once so
+    // the per-asset path is an O(1) HashMap probe instead of a DB round-trip
+    // per match candidate. On a fresh DB the map is empty and the lookup
+    // path falls straight through to the real hash, so this costs one
+    // single-row no-op query for first-time imports and saves N queries
+    // (and N SHA-256 reads) on every subsequent pass.
+    let imported_index = match db.get_all_imported_records(library_label).await {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(
+                library = %library_label,
+                error = %e,
+                "get_all_imported_records failed; skip-rehash optimization disabled this pass",
+            );
+            std::collections::HashMap::new()
+        }
+    };
 
     while let Some(result) = stream.next().await {
         // Emit a one-shot marker as soon as the first asset is dequeued so
@@ -170,10 +332,15 @@ where
         };
 
         stats.total += 1;
+        heartbeat_state.total.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last) = heartbeat_state.last_seen_id.lock() {
+            *last = Some(asset.id().to_string());
+        }
 
         if asset.versions().is_empty() {
             tracing::debug!(id = %asset.id(), "Skipping asset with no versions");
             stats.filtered += 1;
+            heartbeat_state.filtered.fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
@@ -186,6 +353,7 @@ where
         if let Some(reason) = is_asset_filtered(&asset, download_config) {
             tracing::debug!(id = %asset.id(), ?reason, "Skipping (is_asset_filtered)");
             stats.filtered += 1;
+            heartbeat_state.filtered.fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
@@ -200,6 +368,7 @@ where
                 "Skipping asset with no expected paths from path-derivation",
             );
             stats.filtered += 1;
+            heartbeat_state.filtered.fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
@@ -219,7 +388,7 @@ where
             // unmatched on import even though it's what kei would also
             // have written under the same collision. Try the suffix
             // shape as a fallback.
-            let (expected_path, _metadata) = match resolve_match_path(
+            let (expected_path, metadata) = match resolve_match_path(
                 &primary_path,
                 expected_size,
                 download_config.file_match_policy,
@@ -230,11 +399,46 @@ where
                 Some(found) => found,
                 None => {
                     stats.unmatched += 1;
+                    heartbeat_state.unmatched.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             };
 
             if !dry_run {
+                // Skip-rehash short-circuit: if a prior adopt left a row
+                // for this (library, id, version_size) at the same path
+                // with the same on-disk size + mtime, the file hasn't
+                // changed and re-hashing buys nothing. Skipping is what
+                // makes restart-after-interrupt tolerable on slow storage
+                // (e.g. /photos on HDD).
+                let mtime_epoch = file_mtime_epoch(&metadata);
+                let already_imported = imported_index
+                    .get(&(asset.id().to_string(), version_size.as_str().to_string()))
+                    .filter(|rec| {
+                        rec.local_path == expected_path
+                            && rec.imported_size == Some(metadata.len())
+                            && rec.imported_mtime.is_some()
+                            && rec.imported_mtime == mtime_epoch
+                    });
+
+                if let Some(rec) = already_imported {
+                    tracing::debug!(
+                        asset_id = %asset.id(),
+                        version = ?version_size,
+                        path = %expected_path.display(),
+                        prior_checksum = %rec.local_checksum,
+                        "Skipping re-hash: file unchanged since last import",
+                    );
+                    stats.matched += 1;
+                    stats.skipped_already_imported += 1;
+                    heartbeat_state.matched.fetch_add(1, Ordering::Relaxed);
+                    heartbeat_state
+                        .skipped_already_imported
+                        .fetch_add(1, Ordering::Relaxed);
+                    log_progress_milestone(library_label, stats.matched, show_progress);
+                    continue;
+                }
+
                 // Hash the file BEFORE creating the pending row. If the read
                 // fails (permissions, vanished file, I/O error), bailing
                 // here leaves no orphan `pending` row that a future sync
@@ -244,6 +448,7 @@ where
                     Err(e) => {
                         tracing::warn!(path = %expected_path.display(), error = %e, "Failed to hash file");
                         stats.hash_errors += 1;
+                        heartbeat_state.hash_errors.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                 };
@@ -274,7 +479,13 @@ where
                     media_type,
                 );
                 if let Err(e) = db
-                    .import_adopt(&record, &expected_path, &local_checksum)
+                    .import_adopt(
+                        &record,
+                        &expected_path,
+                        &local_checksum,
+                        metadata.len(),
+                        mtime_epoch,
+                    )
                     .await
                 {
                     tracing::warn!(asset_id = %asset.id(), version = ?version_size, error = %e, "Failed to adopt asset");
@@ -283,13 +494,8 @@ where
             }
 
             stats.matched += 1;
-            if show_progress && stats.matched.is_multiple_of(100) {
-                println!(
-                    "  [{label}] Matched {matched} files so far...",
-                    label = library_label,
-                    matched = stats.matched,
-                );
-            }
+            heartbeat_state.matched.fetch_add(1, Ordering::Relaxed);
+            log_progress_milestone(library_label, stats.matched, show_progress);
         }
     }
 
@@ -466,6 +672,10 @@ pub(crate) async fn run_import_existing(
     }
     println!("  Total assets scanned: {}", totals.total);
     println!("  Files matched:        {}", totals.matched);
+    println!(
+        "  ... skipped re-hash:  {}",
+        totals.skipped_already_imported
+    );
     println!("  Unmatched versions:   {}", totals.unmatched);
     println!("  Filtered (no path):   {}", totals.filtered);
     println!("  Hash errors:          {}", totals.hash_errors);
@@ -2567,6 +2777,107 @@ mod wiremock_tests {
         );
     }
 
+    // ── Skip-rehash optimization (issue #347) ─────────────────────────
+
+    /// Skip-rehash optimization: a second `import_assets` pass over the
+    /// same on-disk tree must increment `skipped_already_imported` for
+    /// every match. The counter sits in the same arm of the loop where
+    /// the SHA-256 read and `import_adopt` call are skipped, so a tick
+    /// proves the optimization engaged. Without this, every restart
+    /// re-pays the SHA-256 cost on every already-imported file (#347).
+    #[tokio::test]
+    async fn second_pass_skips_rehash_on_unchanged_files() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("REHASH1", "IMG_REH1.JPG", "public.jpeg").orig(
+            2048,
+            "ck_reh1",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+        stage_expected(&asset.to_photo_asset(), &config);
+
+        let db = open_db(&tmp).await;
+
+        let stats1 = run_import(
+            &server,
+            std::slice::from_ref(&asset),
+            db.as_ref(),
+            &config,
+            false,
+        )
+        .await;
+        assert_eq!(stats1.matched, 1);
+        assert_eq!(
+            stats1.skipped_already_imported, 0,
+            "fresh DB has nothing to skip",
+        );
+
+        // wiremock keeps every mount; the first pass's stub has served its
+        // single page and would now return empty if we just re-mounted on
+        // top. Reset clears the server so the new stub serves fresh.
+        server.reset().await;
+        let stats2 = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats2.matched, 1, "match still tallies on skip path");
+        assert_eq!(
+            stats2.skipped_already_imported, 1,
+            "skip-rehash counter must tick on the second pass",
+        );
+    }
+
+    /// If the on-disk file's mtime jumps between passes, the skip path
+    /// must NOT engage — we re-hash and re-adopt. Otherwise a silent
+    /// content change goes undetected forever once the row is adopted.
+    #[tokio::test]
+    async fn second_pass_rehashes_when_file_mtime_changes() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("REHASH2", "IMG_REH2.JPG", "public.jpeg").orig(
+            2048,
+            "ck_reh2",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+        let staged = stage_expected(&asset.to_photo_asset(), &config);
+
+        let db = open_db(&tmp).await;
+
+        let _ = run_import(
+            &server,
+            std::slice::from_ref(&asset),
+            db.as_ref(),
+            &config,
+            false,
+        )
+        .await;
+
+        // Bump mtime on every staged file. Keep size identical (to stay
+        // matched) and touch the file to force a fresh mtime. The 1.1s
+        // sleep covers filesystems with second-granularity mtime.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        for path in &staged {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .expect("open for mtime bump");
+            f.set_len(2048).expect("set_len same size");
+            drop(f);
+        }
+
+        // See sibling test for why reset() is necessary between passes.
+        server.reset().await;
+        let stats2 = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+        assert_eq!(stats2.matched, 1);
+        assert_eq!(
+            stats2.skipped_already_imported, 0,
+            "mtime change must invalidate the skip path",
+        );
+    }
+
     // ── icloudpd compat baseline ──────────────────────────────────────
     //
     // Scenario-driven tests that stage on-disk layouts using icloudpd's
@@ -2999,6 +3310,59 @@ mod build_config_tests {
         assert!(
             msg.contains("--directory") && (msg.contains("deprecated") || msg.contains("pick one")),
             "error must name the deprecation conflict, got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    //! Heartbeat-task unit tests. The skip-rehash + heartbeat-firing
+    //! end-to-end tests live in `wiremock_tests` because they need the
+    //! full wiremock + on-disk staging setup; this module covers the
+    //! snapshot + guard behaviour in isolation.
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    /// `HeartbeatState::snapshot` must mirror the live atomics so the
+    /// emitted log line reflects whatever the scan loop has counted up
+    /// to that instant.
+    #[tokio::test]
+    async fn heartbeat_state_snapshot_reflects_loop_progress() {
+        let state = Arc::new(super::HeartbeatState::default());
+        state.total.fetch_add(7, Ordering::Relaxed);
+        state.matched.fetch_add(3, Ordering::Relaxed);
+        state.filtered.fetch_add(2, Ordering::Relaxed);
+        state
+            .skipped_already_imported
+            .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last) = state.last_seen_id.lock() {
+            *last = Some("ASSET-XYZ".to_string());
+        }
+
+        let snap = state.snapshot();
+        assert_eq!(snap.total, 7);
+        assert_eq!(snap.matched, 3);
+        assert_eq!(snap.filtered, 2);
+        assert_eq!(snap.skipped_already_imported, 1);
+        assert_eq!(snap.last_seen_id.as_deref(), Some("ASSET-XYZ"));
+    }
+
+    /// `HeartbeatGuard::drop` must cancel the spawned task so a bailing
+    /// scan loop doesn't leak a periodic logger.
+    #[tokio::test]
+    async fn heartbeat_guard_cancels_task_on_drop() {
+        let state = Arc::new(super::HeartbeatState::default());
+        let guard = super::HeartbeatGuard::spawn(
+            Arc::clone(&state),
+            "test-lib".to_string(),
+            std::time::Duration::from_millis(50),
+        );
+        let token = guard.token.clone();
+        assert!(!token.is_cancelled(), "fresh guard is not cancelled");
+        drop(guard);
+        assert!(
+            token.is_cancelled(),
+            "Drop must flip the cancellation token",
         );
     }
 }

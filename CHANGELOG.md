@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`import-existing` 30-second heartbeat log line.** The existing `Matched N files so far...` progress only ticked every 100 *matches*, so a long ExcludedAlbum or filtered run left INFO-level output silent for many minutes and users (#347) read silence as a hang. The heartbeat prints total scanned, matched, skipped-re-hash, filtered, unmatched, hash errors, and the last-seen asset id. ([#347])
+
+### Changed
+
+- **`import-existing` skips the SHA-256 re-read on files already adopted at the same path with unchanged size + mtime.** Previously every restart paid the full hash cost on every already-adopted file (there's no resume checkpoint), which turned into hours per restart on HDD-backed photo trees. The check is mtime-keyed, so any size or mtime change still forces a real re-hash and silent content drift stays caught. ([#347])
+- **State DB schema migrates v10 -> v11 on first run.** Adds nullable `imported_size INTEGER` and `imported_mtime INTEGER` columns to `assets`. Pre-v11 rows survive with NULL values (the import path treats those as "no snapshot, re-hash" on the first post-upgrade pass), so the upgrade is one-way and idempotent on re-entry. ([#347])
+
+[#347]: https://github.com/rhoopr/kei/pull/347
+
 ---
 
 ## [0.13.2] - 2026-05-03

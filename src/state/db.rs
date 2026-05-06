@@ -23,6 +23,23 @@ use super::types::{
 /// this fallback is a safety net, not the intended write path.
 const DEFAULT_SOURCE: &str = "icloud";
 
+/// Snapshot of an already-imported asset, returned by
+/// [`StateDb::get_imported_record`].
+///
+/// `import-existing` consults this on every match candidate to decide whether
+/// the on-disk file can be trusted as unchanged since the last adopt. If
+/// `local_path`, `imported_size`, and `imported_mtime` all match what the
+/// filesystem reports right now, the SHA-256 re-read is skipped. Pre-v11
+/// rows have `imported_size`/`imported_mtime` of `None`, which forces a real
+/// hash on the first post-upgrade pass.
+#[derive(Debug, Clone)]
+pub struct ImportedRecord {
+    pub local_path: PathBuf,
+    pub local_checksum: String,
+    pub imported_size: Option<u64>,
+    pub imported_mtime: Option<i64>,
+}
+
 /// Trait for state database operations.
 ///
 /// This trait is object-safe and can be used with `Arc<dyn StateDb>` for
@@ -82,12 +99,37 @@ pub trait StateDb: Send + Sync {
     ///
     /// Used by `import-existing` so an interrupted scan never leaves a
     /// `pending` row with `local_path = NULL` for the next sync to redownload.
+    ///
+    /// `imported_size` and `imported_mtime` snapshot the on-disk file's size
+    /// (bytes) and modification time (epoch seconds) at adopt time. Subsequent
+    /// `import-existing` runs read these via `get_imported_record` and skip
+    /// the SHA-256 re-read when the file is unchanged. `imported_mtime` is
+    /// `None` only when the host filesystem doesn't expose a usable mtime.
     async fn import_adopt(
         &self,
         record: &AssetRecord,
         local_path: &Path,
         local_checksum: &str,
+        imported_size: u64,
+        imported_mtime: Option<i64>,
     ) -> Result<(), StateError>;
+
+    /// Bulk-load every import-time snapshot for `library`, keyed by
+    /// `(asset_id, version_size)`.
+    ///
+    /// Used by `import-existing` to short-circuit the SHA-256 re-read on
+    /// subsequent runs when the on-disk file is unchanged. Bulk-loaded once
+    /// at scan start (mirroring `get_downloaded_ids` /
+    /// `get_downloaded_checksums`) so the scan loop's per-asset path is an
+    /// O(1) HashMap probe rather than a DB round-trip per file. The default
+    /// impl returns an empty map so test stubs that don't exercise the
+    /// optimization don't have to reimplement it.
+    async fn get_all_imported_records(
+        &self,
+        _library: &str,
+    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
+        Ok(HashMap::new())
+    }
 
     /// Mark an asset as failed with an error message.
     async fn mark_failed(
@@ -838,6 +880,8 @@ impl StateDb for SqliteStateDb {
         record: &AssetRecord,
         local_path: &Path,
         local_checksum: &str,
+        imported_size: u64,
+        imported_mtime: Option<i64>,
     ) -> Result<(), StateError> {
         let record = record.clone();
         let local_path = local_path.to_path_buf();
@@ -865,9 +909,72 @@ impl StateDb for SqliteStateDb {
                 "import_adopt UPDATE missed the row inserted by UPSERT in the same tx — SQL bug"
             );
 
+            // Snapshot on-disk size + mtime so the next import-existing run
+            // can short-circuit the SHA-256 re-read when the file is
+            // unchanged. Done as a separate UPDATE (rather than rolled into
+            // `update_status_to_downloaded`) because the production download
+            // path doesn't have these values and shouldn't carry them.
+            tx.execute(
+                "UPDATE assets SET imported_size = ?1, imported_mtime = ?2 \
+                 WHERE library = ?3 AND id = ?4 AND version_size = ?5",
+                rusqlite::params![
+                    i64::try_from(imported_size).unwrap_or(i64::MAX),
+                    imported_mtime,
+                    &record.library,
+                    &record.id,
+                    record.version_size.as_str(),
+                ],
+            )
+            .map_err(|e| StateError::query("import_adopt::imported_meta", e))?;
+
             tx.commit()
                 .map_err(|e| StateError::query("import_adopt::commit", e))?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn get_all_imported_records(
+        &self,
+        library: &str,
+    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
+        let library = library.to_owned();
+
+        self.with_conn("get_all_imported_records", move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, version_size, local_path, local_checksum, \
+                            imported_size, imported_mtime \
+                     FROM assets \
+                     WHERE library = ?1 AND status = 'downloaded'",
+                )
+                .map_err(|e| StateError::query("get_all_imported_records::prepare", e))?;
+            let rows = stmt
+                .query_map([&library], |row| {
+                    let id: String = row.get(0)?;
+                    let version_size: String = row.get(1)?;
+                    let local_path: String = row.get(2)?;
+                    let local_checksum: String = row.get(3)?;
+                    let imported_size: Option<i64> = row.get(4)?;
+                    let imported_mtime: Option<i64> = row.get(5)?;
+                    Ok((
+                        (id, version_size),
+                        ImportedRecord {
+                            local_path: PathBuf::from(local_path),
+                            local_checksum,
+                            imported_size: imported_size.and_then(|v| u64::try_from(v).ok()),
+                            imported_mtime,
+                        },
+                    ))
+                })
+                .map_err(|e| StateError::query("get_all_imported_records::query", e))?;
+            let mut out = HashMap::new();
+            for r in rows {
+                let (k, v) =
+                    r.map_err(|e| StateError::query("get_all_imported_records::row", e))?;
+                out.insert(k, v);
+            }
+            Ok(out)
         })
         .await
     }
@@ -4185,9 +4292,15 @@ mod tests {
             .build();
         let local_path = PathBuf::from("/tmp/photos/photo.jpg");
 
-        db.import_adopt(&record, &local_path, "local-ck-abc")
-            .await
-            .expect("import_adopt should succeed on a fresh row");
+        db.import_adopt(
+            &record,
+            &local_path,
+            "local-ck-abc",
+            2048,
+            Some(1_700_000_000),
+        )
+        .await
+        .expect("import_adopt should succeed on a fresh row");
 
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.total_assets, 1);
@@ -4219,9 +4332,15 @@ mod tests {
         let local_path = PathBuf::from("/tmp/photos/idemp.jpg");
 
         for _ in 0..2 {
-            db.import_adopt(&record, &local_path, "local-ck-idemp")
-                .await
-                .expect("import_adopt should be idempotent");
+            db.import_adopt(
+                &record,
+                &local_path,
+                "local-ck-idemp",
+                1024,
+                Some(1_700_000_001),
+            )
+            .await
+            .expect("import_adopt should be idempotent");
         }
 
         let summary = db.get_summary().await.unwrap();
@@ -4249,9 +4368,15 @@ mod tests {
         assert_eq!(summary.downloaded, 0);
 
         let local_path = PathBuf::from("/tmp/photos/resume.jpg");
-        db.import_adopt(&record, &local_path, "local-ck-resume")
-            .await
-            .expect("import_adopt should promote pending → downloaded");
+        db.import_adopt(
+            &record,
+            &local_path,
+            "local-ck-resume",
+            4096,
+            Some(1_700_000_002),
+        )
+        .await
+        .expect("import_adopt should promote pending → downloaded");
 
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.pending, 0);
