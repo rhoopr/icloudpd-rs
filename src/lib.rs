@@ -125,6 +125,39 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
     }
 }
 
+/// Assemble the redacting log-writer pipeline that `run` installs.
+///
+/// Returns `(MakeWriter, WorkerGuard, password slot)`. Caller keeps the
+/// guard alive until events should be flushed; on drop it joins the
+/// background worker so the channel drains before teardown. The password
+/// slot starts empty and is populated once the password is known.
+///
+/// Sharing this assembly between `run` and tests is what lets a regression
+/// in the back-pressure shape (someone removes `lossy(true)`, swaps the
+/// non-blocking channel for the raw sink, hoists the guard back into a
+/// `static`) get caught: the `tests` module exercises this exact builder.
+pub(crate) fn build_redacting_writer<W>(
+    sink: W,
+) -> (
+    impl for<'a> tracing_subscriber::fmt::MakeWriter<'a> + 'static,
+    tracing_appender::non_blocking::WorkerGuard,
+    Arc<std::sync::Mutex<Option<SecretString>>>,
+)
+where
+    W: std::io::Write + Send + 'static,
+{
+    let password: Arc<std::sync::Mutex<Option<SecretString>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .finish(sink);
+    let make_writer = RedactingMakeWriter {
+        password: Arc::clone(&password),
+        inner: non_blocking,
+    };
+    (make_writer, guard, password)
+}
+
 use cli::Command;
 use config::TomlConfig;
 
@@ -492,35 +525,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         types::LogLevel::Warn => "warn",
         types::LogLevel::Error => "error",
     };
-    // Password redaction: the password is set after config parsing,
-    // but tracing must be initialized earlier. Use a shared slot that
-    // starts as None and is populated once the password is known.
-    let redact_password: Arc<std::sync::Mutex<Option<SecretString>>> =
-        Arc::new(std::sync::Mutex::new(None));
-
-    // Non-blocking writer with `lossy(true)`: when the consumer of stderr
-    // (Docker stdout pipe, screen PTY, journald) drains slower than events
-    // are emitted, drop events instead of blocking the producing task.
-    // Without this, every tracing call parks on the writer mutex behind a
-    // synchronous `Stderr::write_all` and the runtime wedges while
-    // spawn-blocking workers continue. Silent log loss under saturation is
-    // strictly preferable to a hung scan loop.
-    //
     // `_writer_guard` MUST live until `run` returns: the guard's `Drop`
     // signals the background worker to flush remaining events before the
     // process exits. A `static`-stored guard would never drop (Rust skips
     // static destructors), so subprocess tests that read stderr after
     // kei exits would race against unflushed events on fast process
-    // teardown (observed on macOS CI).
-    let (non_blocking, _writer_guard) =
-        tracing_appender::non_blocking::NonBlockingBuilder::default()
-            .lossy(true)
-            .finish(std::io::stderr());
-
-    let make_writer = RedactingMakeWriter {
-        password: Arc::clone(&redact_password),
-        inner: non_blocking,
-    };
+    // teardown (observed on macOS CI). See `build_redacting_writer`
+    // for the back-pressure shape.
+    let (make_writer, _writer_guard, redact_password) = build_redacting_writer(std::io::stderr());
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -909,6 +921,131 @@ mod tests {
         let output = String::from_utf8_lossy(&buf).into_owned();
         assert!(!output.contains("s3cret"));
         assert!(output.contains("********"));
+    }
+
+    /// Reproduces the failure mode of issue #347: the producer must not
+    /// park on the sink mutex when the consumer drains slow. Without the
+    /// `tracing_appender::non_blocking` lossy channel that
+    /// `build_redacting_writer` installs, 200 events at 50 ms per write
+    /// would block the emitting task for ~10 s. With it, the bounded
+    /// channel absorbs the saturation and the producer returns in
+    /// milliseconds. A regression that drops the non-blocking layer or
+    /// swaps `lossy(true)` for the blocking variant fails this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_pipeline_does_not_back_pressure_producer() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct SlowSink {
+            delay: Duration,
+            bytes: Arc<AtomicUsize>,
+        }
+        impl Write for SlowSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(self.delay);
+                self.bytes.fetch_add(buf.len(), Ordering::Relaxed);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let sink = SlowSink {
+            delay: Duration::from_millis(50),
+            bytes: Arc::clone(&bytes),
+        };
+        let (make_writer, _guard, _pw) = build_redacting_writer(sink);
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(make_writer)
+            .finish();
+        let _g = tracing::subscriber::set_default(subscriber);
+
+        let start = Instant::now();
+        for i in 0..200 {
+            tracing::info!(i, "back-pressure test event");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "producer blocked {elapsed:?} emitting 200 events through a 50ms-per-write sink; \
+             expected the lossy non-blocking channel to absorb the saturation",
+        );
+    }
+
+    /// Companion to issue #347's macOS CI flake: the `WorkerGuard` must
+    /// drop before the test asserts on captured output. With the guard
+    /// bound locally (rather than held in a `static OnceLock` whose
+    /// destructor never runs), drop joins the background worker and
+    /// drains the channel deterministically. A regression that hoists the
+    /// guard back into static storage races against the sink and loses
+    /// events on fast teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_pipeline_flushes_all_events_before_guard_drops() {
+        use std::io::Write;
+
+        struct CollectingSink {
+            buf: Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl Write for CollectingSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.buf
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = CollectingSink {
+            buf: Arc::clone(&buf),
+        };
+        let (make_writer, guard, _pw) = build_redacting_writer(sink);
+
+        // Disable ANSI so the assertion can match `seq=N` against a stable
+        // byte boundary. Default `tracing_subscriber::fmt()` emits color
+        // codes between fields, which would defeat a literal-substring
+        // assertion.
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+        {
+            let _g = tracing::subscriber::set_default(subscriber);
+            for i in 0..50 {
+                tracing::info!(seq = i, "completeness test event");
+            }
+        }
+        // Drop the guard explicitly (mirrors `run` returning) so the
+        // background flush thread drains before we read the sink.
+        drop(guard);
+
+        let captured = buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !captured.is_empty(),
+            "guard drop completed but sink received no bytes; \
+             the non-blocking worker did not flush before drop returned",
+        );
+        let captured_str = String::from_utf8_lossy(&captured);
+        for i in 0..50 {
+            // `seq=N\n` anchors at end-of-line so seq=5 doesn't match seq=50.
+            assert!(
+                captured_str.contains(&format!("seq={i}\n")),
+                "event seq={i} missing from captured output after guard drop; \
+                 captured was: {captured_str}",
+            );
+        }
     }
 
     #[test]

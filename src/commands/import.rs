@@ -3365,4 +3365,99 @@ mod heartbeat_tests {
             "Drop must flip the cancellation token",
         );
     }
+
+    /// The watchdog and the data plane must not share a chokepoint.
+    /// Issue #347's #348 heartbeat parked on the same `Stderr::write_all`
+    /// mutex as the scan loop, so a slow stderr consumer wedged both at
+    /// once and the heartbeat couldn't disambiguate "stuck" from "alive
+    /// but slow". The fix in #349 routed both through
+    /// `tracing_appender::non_blocking` in lossy mode so producers don't
+    /// park on the writer mutex.
+    ///
+    /// This test holds the writer behind a 5 ms-per-write sink (a
+    /// realistic stderr-pipe latency, not pathological saturation —
+    /// pathological loads exhaust the lossy buffer before the worker can
+    /// drain on shutdown, which conflates the bug under test with
+    /// shutdown drop). A fake scan loop emits at 200 events/s and the
+    /// heartbeat task ticks every 50 ms. With the non-blocking pipeline,
+    /// both make forward progress and the heartbeat events land in the
+    /// captured sink. A regression that re-introduces a synchronous
+    /// `Stderr::write_all` mutex on the data path would serialize emits:
+    /// the scan task's stream alone exceeds the sink's drain rate, so
+    /// the heartbeat task would park behind it and produce 0 emits in
+    /// the captured output.
+    #[tokio::test]
+    async fn heartbeat_fires_under_writer_load() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct PipeSink {
+            buf: Arc<std::sync::Mutex<Vec<u8>>>,
+            delay: std::time::Duration,
+        }
+        impl Write for PipeSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(self.delay);
+                self.buf
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = PipeSink {
+            buf: Arc::clone(&buf),
+            delay: std::time::Duration::from_millis(5),
+        };
+        let (make_writer, writer_guard, _pw) = crate::build_redacting_writer(sink);
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+        let _dispatch_guard = tracing::subscriber::set_default(subscriber);
+
+        let state = Arc::new(super::HeartbeatState::default());
+        let hb = super::HeartbeatGuard::spawn(
+            Arc::clone(&state),
+            "test-lib".to_string(),
+            std::time::Duration::from_millis(50),
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop);
+        let scan = tokio::spawn(async move {
+            while !stop_c.load(Ordering::Relaxed) {
+                tracing::info!(target: "kei::scan_test", "scan loop fake event");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        // 300 ms covers ~5 heartbeat intervals (the first tick is skipped,
+        // so emits land at t≈50, 100, 150, 200, 250 ms).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        stop.store(true, Ordering::Relaxed);
+        scan.await.unwrap();
+
+        drop(hb);
+        drop(_dispatch_guard);
+        drop(writer_guard);
+
+        let captured = buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let captured_str = String::from_utf8_lossy(&captured);
+        let heartbeat_count = captured_str.matches("import scan heartbeat").count();
+        assert!(
+            heartbeat_count >= 2,
+            "heartbeat fired {heartbeat_count} times in 300 ms under concurrent \
+             scan-loop traffic (expected >= 2); the watchdog is sharing the data \
+             plane's chokepoint or otherwise stalled. Captured: {captured_str}",
+        );
+    }
 }

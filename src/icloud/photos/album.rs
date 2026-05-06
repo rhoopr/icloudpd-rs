@@ -63,6 +63,22 @@ fn determine_fetcher_count(total_items: u64, page_size: usize, concurrency: usiz
     pages_as_usize.min(concurrency).max(1)
 }
 
+/// Log a per-page Fetcher response. The metadata is at DEBUG; the raw
+/// body is gated behind TRACE because pretty-printing it at DEBUG ran a
+/// `to_string_pretty(&response)` per page (~MB allocation per page on
+/// busy libraries — issue #347). The function exists so the cost shape
+/// is testable without exercising the full fetcher: a regression that
+/// hoists the response body back into the DEBUG event would be caught
+/// by the unit test next to this definition rather than only at scale.
+fn log_fetcher_response(album: &str, response: &Value) {
+    tracing::debug!(album = %album, "Fetcher response");
+    tracing::trace!(
+        album = %album,
+        response = %response,
+        "Fetcher response body",
+    );
+}
+
 /// Configuration for creating a `PhotoAlbum`, bundling all non-session fields.
 #[derive(Debug)]
 pub struct PhotoAlbumConfig {
@@ -588,15 +604,7 @@ impl PhotoAlbum {
                         return;
                     }
                 };
-                // Body emitted at TRACE only -- pretty-printing it at DEBUG
-                // ran `serde_json::to_string_pretty` per page (~MB allocation)
-                // because tracing field expressions are evaluated eagerly.
-                tracing::debug!(album = %name, "Fetcher response");
-                tracing::trace!(
-                    album = %name,
-                    response = %response,
-                    "Fetcher response body",
-                );
+                log_fetcher_response(&name, &response);
 
                 let query: super::cloudkit::QueryResponse = match serde_json::from_value(response) {
                     Ok(q) => q,
@@ -1754,5 +1762,103 @@ mod tests {
             }
             other => panic!("expected InvalidToken variant, got: {other:?}"),
         }
+    }
+
+    /// `log_fetcher_response` must not emit the raw CloudKit response
+    /// body at DEBUG. Issue #347's regression was a per-page
+    /// `tracing::debug!` whose field expression eagerly built a
+    /// pretty-printed string of the full response (~MB per page on
+    /// busy libraries). Operators set `--log-level debug` to see what
+    /// the fetcher was doing and got 1 MB of allocation per page in
+    /// return, on the same writer mutex everything else used. This
+    /// test asserts the body only appears at TRACE.
+    #[test]
+    fn fetcher_response_body_only_logs_at_trace() {
+        use std::io::Write;
+        use std::sync::Arc;
+
+        struct VecMakeWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        struct VecWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for VecWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecMakeWriter {
+            type Writer = VecWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                VecWriter(Arc::clone(&self.0))
+            }
+        }
+
+        // A unique marker buried in the response. If anything in the
+        // event includes the response value via Display/Debug, the
+        // marker leaks into the formatted output and the assertion
+        // fires.
+        const MARKER: &str = "FETCHER_RESPONSE_BODY_TEST_MARKER_xyz123";
+        let response = serde_json::json!({
+            "records": [{"recordName": "abc", "fields": {"value": MARKER}}],
+            "continuationMarker": MARKER,
+        });
+
+        let buf_debug = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub_debug = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("debug"))
+            .with_writer(VecMakeWriter(Arc::clone(&buf_debug)))
+            .with_ansi(false)
+            .finish();
+        {
+            let _g = tracing::subscriber::set_default(sub_debug);
+            log_fetcher_response("TestAlbum", &response);
+        }
+        let out_debug = String::from_utf8_lossy(
+            &buf_debug
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned();
+        assert!(
+            out_debug.contains("Fetcher response"),
+            "DEBUG-level log should produce a Fetcher response event; got: {out_debug}",
+        );
+        assert!(
+            !out_debug.contains(MARKER),
+            "DEBUG-level log MUST NOT include the response body. The marker \
+             leaked into captured output, indicating the per-page log carries \
+             the full response value at DEBUG (issue #347 regression). \
+             Captured: {out_debug}",
+        );
+
+        let buf_trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub_trace = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("trace"))
+            .with_writer(VecMakeWriter(Arc::clone(&buf_trace)))
+            .with_ansi(false)
+            .finish();
+        {
+            let _g = tracing::subscriber::set_default(sub_trace);
+            log_fetcher_response("TestAlbum", &response);
+        }
+        let out_trace = String::from_utf8_lossy(
+            &buf_trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned();
+        assert!(
+            out_trace.contains("Fetcher response body"),
+            "TRACE level should produce a 'Fetcher response body' event; got: {out_trace}",
+        );
+        assert!(
+            out_trace.contains(MARKER),
+            "TRACE level should include the response body in the event; got: {out_trace}",
+        );
     }
 }
