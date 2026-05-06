@@ -79,13 +79,9 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Fast path: no password configured, or buf can't contain it. Avoids
-        // the `String::from_utf8_lossy` allocation that the redaction path
-        // unconditionally triggers — under trace-level logging the original
-        // implementation allocated a fresh String per event, which compounds
-        // with `tracing_appender::non_blocking`'s per-event channel handoff
-        // and shows up as the dominant heap churn for `import-existing`
-        // (issue #347).
+        // Fast path: short-circuit before allocating a `String`. Under
+        // trace-level logging the redaction path runs on every event,
+        // and `String::from_utf8_lossy` per event dominates the heap churn.
         let Some(pw) = &*password else {
             self.inner.write_all(buf)?;
             return Ok(buf.len());
@@ -95,14 +91,7 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
             self.inner.write_all(buf)?;
             return Ok(buf.len());
         }
-
-        // Byte-level scan: if the password isn't in this buffer there's
-        // nothing to redact and we can write through without allocating.
-        // For the typical case (rare or never matches) this collapses to
-        // an O(n*m) scan over a few hundred bytes against an 8-30 byte
-        // password — much cheaper than UTF-8 lossy conversion of every
-        // event.
-        if !buf.windows(pw_bytes.len()).any(|w| w == pw_bytes) {
+        if memchr::memmem::find(buf, pw_bytes).is_none() {
             self.inner.write_all(buf)?;
             return Ok(buf.len());
         }
@@ -126,18 +115,14 @@ static TRACING_WRITER_GUARD: std::sync::OnceLock<tracing_appender::non_blocking:
     std::sync::OnceLock::new();
 
 /// A `MakeWriter` implementation that produces `RedactingWriter` instances
-/// wrapping the configured inner writer (typically a non-blocking channel
-/// fronting stderr).
-struct RedactingMakeWriter<W> {
+/// fronting the non-blocking channel that wraps stderr.
+struct RedactingMakeWriter {
     password: Arc<std::sync::Mutex<Option<SecretString>>>,
-    inner: W,
+    inner: tracing_appender::non_blocking::NonBlocking,
 }
 
-impl<'a, W> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter<W>
-where
-    W: std::io::Write + Clone + 'a,
-{
-    type Writer = RedactingWriter<W>;
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
+    type Writer = RedactingWriter<tracing_appender::non_blocking::NonBlocking>;
 
     fn make_writer(&'a self) -> Self::Writer {
         RedactingWriter {
@@ -523,20 +508,13 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // Non-blocking writer with `lossy(true)`: when the consumer of stderr
     // (Docker stdout pipe, screen PTY, journald) drains slower than events
     // are emitted, drop events instead of blocking the producing task.
-    // Without this, every `tracing::info!` / `tracing::debug!` call parks
-    // on the writer mutex behind a synchronous `Stderr::write_all`, which
-    // wedges the heartbeat task and the import-scan loop while spawn-blocking
-    // workers continue churning -- the failure signature reporters see in
-    // issue #347. The trade is silent log loss under saturation, which is
-    // strictly preferable to a hung scan.
+    // Without this, every tracing call parks on the writer mutex behind a
+    // synchronous `Stderr::write_all` and the runtime wedges while
+    // spawn-blocking workers continue. Silent log loss under saturation is
+    // strictly preferable to a hung scan loop.
     let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
         .lossy(true)
         .finish(std::io::stderr());
-    // The guard's `Drop` flushes pending events; storing it in a process-
-    // lifetime `OnceLock` keeps the background flush thread alive for the
-    // duration of the program. Clippy's `mem_forget` lint blocks the
-    // simpler leak; `OnceLock` is the idiomatic alternative and gives us
-    // the same outcome without the lint suppression.
     let _ = TRACING_WRITER_GUARD.set(guard);
 
     let make_writer = RedactingMakeWriter {
@@ -862,10 +840,8 @@ mod tests {
     /// Password set but the buffer doesn't contain it. The pre-redaction
     /// byte-level scan must short-circuit and pass the buffer through
     /// unchanged, without allocating a `String` for UTF-8 lossy
-    /// conversion. Verifies the issue #347 fast path: under heavy
-    /// trace-level logging, most events do NOT contain the password,
-    /// and avoiding the per-event allocation is what keeps the writer
-    /// off the slow path.
+    /// conversion -- under heavy trace-level logging most events do NOT
+    /// contain the password, so the no-allocation path is the hot one.
     #[test]
     fn redacting_writer_password_absent_passthrough() {
         use std::io::Write;

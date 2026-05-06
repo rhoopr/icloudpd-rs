@@ -588,23 +588,15 @@ impl PhotoAlbum {
                         return;
                     }
                 };
-                // Compact JSON only at TRACE; pretty-print is an O(MB) per-
-                // page allocation that fires on every fetch even at INFO
+                // Body emitted at TRACE only -- pretty-printing it at DEBUG
+                // ran `serde_json::to_string_pretty` per page (~MB allocation)
                 // because tracing field expressions are evaluated eagerly.
-                // For 35k+ libraries this dominates the fetcher's heap
-                // churn (issue #347). Operators that need the raw payload
-                // can opt in with `RUST_LOG=...=trace`.
-                tracing::debug!(
+                tracing::debug!(album = %name, "Fetcher response");
+                tracing::trace!(
                     album = %name,
-                    "Fetcher response"
+                    response = %response,
+                    "Fetcher response body",
                 );
-                if tracing::enabled!(tracing::Level::TRACE) {
-                    tracing::trace!(
-                        album = %name,
-                        response = %response,
-                        "Fetcher response body",
-                    );
-                }
 
                 let query: super::cloudkit::QueryResponse = match serde_json::from_value(response) {
                     Ok(q) => q,

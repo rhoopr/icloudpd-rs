@@ -1425,6 +1425,7 @@ dependencies = [
  "indicatif",
  "keyring",
  "libc",
+ "memchr",
  "mp4-atom",
  "num-bigint",
  "pbkdf2",
