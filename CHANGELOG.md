@@ -18,7 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`import-existing` skips the SHA-256 re-read on files already adopted at the same path with unchanged size + mtime.** Previously every restart paid the full hash cost on every already-adopted file (there's no resume checkpoint), which turned into hours per restart on HDD-backed photo trees. The check is mtime-keyed, so any size or mtime change still forces a real re-hash and silent content drift stays caught. ([#348])
 - **State DB schema migrates v10 -> v11 on first run.** Adds nullable `imported_size INTEGER` and `imported_mtime INTEGER` columns to `assets`. Pre-v11 rows survive with NULL values (the import path treats those as "no snapshot, re-hash" on the first post-upgrade pass), so the upgrade is one-way and idempotent on re-entry. ([#348])
 
+### Fixed
+
+- **Tracing writer no longer back-pressures the runtime under heavy log volume.** When the consumer of stderr (Docker stdout pipe, screen PTY, journald) drained slower than events were emitted, every `tracing::info!` / `tracing::debug!` call parked on the writer mutex behind a synchronous `Stderr::write_all`. The `import-existing` heartbeat task and the scan loop both wedged while spawn-blocking workers continued churning -- the failure signature reporters saw in #347 (heartbeats fired twice then stopped, but file-read counters kept growing). Wraps the writer with `tracing_appender::non_blocking` in lossy mode so events drop instead of stall under saturation. ([#349])
+- **`RedactingWriter::write` no longer allocates a `String` per event when the password is unset or absent from the buffer.** Under trace-level logging the previous implementation triggered `String::from_utf8_lossy` on every event whose buffer was at least the password length, which compounded with the back-pressure above as the dominant heap churn for `import-existing`. Adds a byte-level pre-scan that short-circuits when no match is possible. ([#349])
+- **`import-existing` per-page `Fetcher response` log line no longer pretty-prints the full CloudKit JSON at DEBUG.** Tracing field expressions are evaluated eagerly, so `serde_json::to_string_pretty(&response)` allocated ~500 KB - 1 MB every page even when DEBUG was not actually being emitted. Now logs the metadata at DEBUG and gates the raw body behind TRACE. ([#349])
+
 [#348]: https://github.com/rhoopr/kei/pull/348
+[#349]: https://github.com/rhoopr/kei/pull/349
 
 ---
 
