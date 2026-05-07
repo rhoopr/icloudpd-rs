@@ -24,7 +24,6 @@ use anyhow::{Context, Result};
 /// Marker file Docker creates inside every container.
 const DEFAULT_DOCKERENV_PATH: &str = "/.dockerenv";
 
-/// PID 1's cgroup membership listing.
 const DEFAULT_CGROUP_PATH: &str = "/proc/1/cgroup";
 
 /// Substrings in `/proc/1/cgroup` that signal a container runtime.
@@ -40,16 +39,11 @@ pub(crate) const SERVICE_DESCRIPTION: &str = "kei Media Sync Engine";
 ///
 /// Reverse-DNS form on macOS (launchd `Label`) and Windows (SCM service
 /// name); plain `kei` on Linux (systemd unit file basename).
-pub(crate) fn service_identifier() -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
-        "kei"
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        "com.rhoopr.kei"
-    }
-}
+pub(crate) const SERVICE_IDENTIFIER: &str = if cfg!(target_os = "linux") {
+    "kei"
+} else {
+    "com.rhoopr.kei"
+};
 
 /// Returns `true` when the current process is running inside a container.
 ///
@@ -114,16 +108,15 @@ mod tests {
 
     #[test]
     fn service_identifier_matches_platform_branding() {
-        let id = service_identifier();
         if cfg!(target_os = "linux") {
-            assert_eq!(id, "kei");
+            assert_eq!(SERVICE_IDENTIFIER, "kei");
         } else {
-            assert_eq!(id, "com.rhoopr.kei");
+            assert_eq!(SERVICE_IDENTIFIER, "com.rhoopr.kei");
         }
     }
 
     #[test]
-    fn description_is_locked_branding_string() {
+    fn service_description_is_pinned() {
         // Phase-1 plan locked this string. Regression-guard so a casual
         // rename doesn't slip past review and orphan every installed
         // service entry on user machines.
@@ -131,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn dockerenv_marker_present_returns_true_on_every_platform() {
+    fn dockerenv_marker_short_circuits_cgroup_check() {
         let tmp = TempDir::new().unwrap();
         let dockerenv = tmp.path().join("dockerenv");
         fs::write(&dockerenv, "").unwrap();
@@ -145,79 +138,47 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dockerenv = tmp.path().join("dockerenv-missing");
         let cgroup = tmp.path().join("cgroup");
-        // Bare-metal cgroup contents have no container markers.
         fs::write(&cgroup, "0::/user.slice/user-1000.slice\n").unwrap();
         assert!(!is_in_container_at(&dockerenv, &cgroup));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cgroup_with_docker_marker_returns_true() {
-        let tmp = TempDir::new().unwrap();
-        let dockerenv = tmp.path().join("dockerenv-missing");
-        let cgroup = tmp.path().join("cgroup");
-        fs::write(
-            &cgroup,
-            "0::/docker/abc123def456\n12:cpu:/docker/abc123def456\n",
-        )
-        .unwrap();
-        assert!(is_in_container_at(&dockerenv, &cgroup));
+    fn cgroup_with_container_marker_returns_true() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "docker",
+                "0::/docker/abc123def456\n12:cpu:/docker/abc123def456\n",
+            ),
+            ("containerd", "0::/system.slice/containerd.service\n"),
+            (
+                "kubepods",
+                "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podabc.slice\n",
+            ),
+            (
+                "podman",
+                "0::/user.slice/user-1000.slice/user@1000.service/podman-1234.scope\n",
+            ),
+            ("lxc", "0::/lxc/container-name\n"),
+        ];
+
+        for (name, contents) in cases {
+            let tmp = TempDir::new().unwrap();
+            let dockerenv = tmp.path().join("dockerenv-missing");
+            let cgroup = tmp.path().join("cgroup");
+            fs::write(&cgroup, contents).unwrap();
+            assert!(
+                is_in_container_at(&dockerenv, &cgroup),
+                "expected container detection for {name} cgroup contents",
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cgroup_with_containerd_marker_returns_true() {
-        let tmp = TempDir::new().unwrap();
-        let dockerenv = tmp.path().join("dockerenv-missing");
-        let cgroup = tmp.path().join("cgroup");
-        fs::write(&cgroup, "0::/system.slice/containerd.service\n").unwrap();
-        assert!(is_in_container_at(&dockerenv, &cgroup));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cgroup_with_kubepods_marker_returns_true() {
-        let tmp = TempDir::new().unwrap();
-        let dockerenv = tmp.path().join("dockerenv-missing");
-        let cgroup = tmp.path().join("cgroup");
-        fs::write(
-            &cgroup,
-            "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podabc.slice\n",
-        )
-        .unwrap();
-        assert!(is_in_container_at(&dockerenv, &cgroup));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cgroup_with_podman_marker_returns_true() {
-        let tmp = TempDir::new().unwrap();
-        let dockerenv = tmp.path().join("dockerenv-missing");
-        let cgroup = tmp.path().join("cgroup");
-        fs::write(
-            &cgroup,
-            "0::/user.slice/user-1000.slice/user@1000.service/podman-1234.scope\n",
-        )
-        .unwrap();
-        assert!(is_in_container_at(&dockerenv, &cgroup));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cgroup_with_lxc_marker_returns_true() {
-        let tmp = TempDir::new().unwrap();
-        let dockerenv = tmp.path().join("dockerenv-missing");
-        let cgroup = tmp.path().join("cgroup");
-        fs::write(&cgroup, "0::/lxc/container-name\n").unwrap();
-        assert!(is_in_container_at(&dockerenv, &cgroup));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cgroup_unreadable_returns_false_not_error() {
-        // Cgroup file genuinely missing must not propagate an error;
-        // bare-metal hosts without /proc/1/cgroup (some sandboxes,
-        // chroots) should answer "not in a container".
+    fn missing_cgroup_file_is_not_a_container() {
+        // Bare-metal hosts without /proc/1/cgroup (some sandboxes, chroots)
+        // must answer "not in a container" rather than propagate an error.
         let tmp = TempDir::new().unwrap();
         let dockerenv = tmp.path().join("dockerenv-missing");
         let cgroup = tmp.path().join("cgroup-does-not-exist");
