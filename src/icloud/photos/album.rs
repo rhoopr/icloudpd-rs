@@ -63,13 +63,9 @@ fn determine_fetcher_count(total_items: u64, page_size: usize, concurrency: usiz
     pages_as_usize.min(concurrency).max(1)
 }
 
-/// Log a per-page Fetcher response. The metadata is at DEBUG; the raw
-/// body is gated behind TRACE because pretty-printing it at DEBUG ran a
-/// `to_string_pretty(&response)` per page (~MB allocation per page on
-/// busy libraries — issue #347). The function exists so the cost shape
-/// is testable without exercising the full fetcher: a regression that
-/// hoists the response body back into the DEBUG event would be caught
-/// by the unit test next to this definition rather than only at scale.
+/// Metadata at DEBUG; raw body only at TRACE. Including the body in
+/// the DEBUG event allocates ~MB per page on busy libraries (every
+/// fetched page formats the full response value).
 fn log_fetcher_response(album: &str, response: &Value) {
     tracing::debug!(album = %album, "Fetcher response");
     tracing::trace!(
@@ -1764,14 +1760,6 @@ mod tests {
         }
     }
 
-    /// `log_fetcher_response` must not emit the raw CloudKit response
-    /// body at DEBUG. Issue #347's regression was a per-page
-    /// `tracing::debug!` whose field expression eagerly built a
-    /// pretty-printed string of the full response (~MB per page on
-    /// busy libraries). Operators set `--log-level debug` to see what
-    /// the fetcher was doing and got 1 MB of allocation per page in
-    /// return, on the same writer mutex everything else used. This
-    /// test asserts the body only appears at TRACE.
     #[test]
     fn fetcher_response_body_only_logs_at_trace() {
         use std::io::Write;

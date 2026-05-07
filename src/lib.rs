@@ -125,17 +125,13 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
     }
 }
 
-/// Assemble the redacting log-writer pipeline that `run` installs.
+/// Build the redacting log-writer pipeline `run` installs.
 ///
-/// Returns `(MakeWriter, WorkerGuard, password slot)`. Caller keeps the
-/// guard alive until events should be flushed; on drop it joins the
-/// background worker so the channel drains before teardown. The password
-/// slot starts empty and is populated once the password is known.
-///
-/// Sharing this assembly between `run` and tests is what lets a regression
-/// in the back-pressure shape (someone removes `lossy(true)`, swaps the
-/// non-blocking channel for the raw sink, hoists the guard back into a
-/// `static`) get caught: the `tests` module exercises this exact builder.
+/// `lossy(true)` so producers never park on the background writer; the
+/// returned `WorkerGuard` must outlive every `tracing::*` call so its
+/// `Drop` can join the worker and drain the channel before teardown.
+/// The password slot starts empty and is populated once the password
+/// is known.
 pub(crate) fn build_redacting_writer<W>(
     sink: W,
 ) -> (
@@ -197,25 +193,16 @@ const EXIT_AUTH: u8 = 3;
 #[error("{0} downloads failed")]
 struct PartialSyncError(usize);
 
-/// How a fatal `Err` from `run` maps to an exit code and whether kei
-/// should emit a final `tracing::error!` + stderr line for it.
-///
-/// Kept as a typed dispatch table (rather than inline match arms in
-/// `main_inner`) so the policy is unit-testable without owning a tokio
-/// runtime, and so the non-obvious `TwoFactorRequired -> exit 0, no log`
-/// rule can't drift silently.
+/// Maps a fatal `Err` from `run` to an exit code and decides whether to
+/// log it. `TwoFactorRequired` is the non-obvious case: exit 0, no log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitClassification {
-    /// 2FA required: exit 0, suppress error log. kei already told the
-    /// user how to proceed; logging "kei exited with error" here would
-    /// be misleading and `restart: on-failure` would loop the auth
-    /// endpoint.
+    /// Exit 0 with no error log: kei already told the user how to
+    /// proceed, and `restart: on-failure` would loop Apple's auth
+    /// endpoint if 2FA were treated as a failure.
     TwoFactorRequired,
-    /// Some downloads failed but the run was not a total failure.
     Partial,
-    /// Auth failure other than 2FA-required.
     Auth,
-    /// Any other error.
     Other,
 }
 
@@ -564,13 +551,10 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         types::LogLevel::Warn => "warn",
         types::LogLevel::Error => "error",
     };
-    // `_writer_guard` MUST live until `run` returns: the guard's `Drop`
-    // signals the background worker to flush remaining events before the
-    // process exits. A `static`-stored guard would never drop (Rust skips
-    // static destructors), so subprocess tests that read stderr after
-    // kei exits would race against unflushed events on fast process
-    // teardown (observed on macOS CI). See `build_redacting_writer`
-    // for the back-pressure shape.
+    // `_writer_guard` MUST live until `run` returns. A `static`-stored
+    // guard never drops (Rust skips static destructors), so subprocess
+    // tests reading stderr after kei exits race against unflushed events
+    // on fast teardown (observed on macOS CI).
     let (make_writer, _writer_guard, redact_password) = build_redacting_writer(std::io::stderr());
 
     tracing_subscriber::fmt()
@@ -962,14 +946,8 @@ mod tests {
         assert!(output.contains("********"));
     }
 
-    /// Reproduces the failure mode of issue #347: the producer must not
-    /// park on the sink mutex when the consumer drains slow. Without the
-    /// `tracing_appender::non_blocking` lossy channel that
-    /// `build_redacting_writer` installs, 200 events at 50 ms per write
-    /// would block the emitting task for ~10 s. With it, the bounded
-    /// channel absorbs the saturation and the producer returns in
-    /// milliseconds. A regression that drops the non-blocking layer or
-    /// swaps `lossy(true)` for the blocking variant fails this test.
+    /// 200 events at 50 ms per write would synchronously block the
+    /// producer for ~10 s without the lossy non-blocking channel.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writer_pipeline_does_not_back_pressure_producer() {
         use std::io::Write;
@@ -1016,13 +994,9 @@ mod tests {
         );
     }
 
-    /// Companion to issue #347's macOS CI flake: the `WorkerGuard` must
-    /// drop before the test asserts on captured output. With the guard
-    /// bound locally (rather than held in a `static OnceLock` whose
-    /// destructor never runs), drop joins the background worker and
-    /// drains the channel deterministically. A regression that hoists the
-    /// guard back into static storage races against the sink and loses
-    /// events on fast teardown.
+    /// `WorkerGuard::drop` must flush every emitted event before
+    /// returning. Hoisting the guard into a `static` (whose destructor
+    /// never runs) silently re-introduces the race.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writer_pipeline_flushes_all_events_before_guard_drops() {
         use std::io::Write;
@@ -1241,18 +1215,6 @@ mod tests {
         assert_eq!(MIN_FREE_BYTES, 1024 * 1024 * 1024);
     }
 
-    /// `classify_exit_error` is the dispatch table that decides what kei's
-    /// exit code is and whether it logs a final "kei exited with error"
-    /// line. The mapping is non-obvious in two places:
-    ///
-    /// 1. `AuthError::TwoFactorRequired` is *not* a failure — kei has
-    ///    already told the user how to proceed, exit 0 keeps `restart:
-    ///    on-failure` from looping the auth endpoint.
-    /// 2. `AuthError` (non-2FA) and `PartialSyncError` get distinct exit
-    ///    codes (3 and 2) so operators / supervisors can branch on them.
-    ///
-    /// A refactor that flips any of those mappings should fail one of these
-    /// tests rather than silently change operator-visible behavior.
     #[test]
     fn classify_exit_error_two_factor_required_is_suppressed_success() {
         let e: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
@@ -1294,9 +1256,6 @@ mod tests {
         assert!(c.should_log());
     }
 
-    /// `PartialSyncError` and `AuthError` both downcast cleanly even when
-    /// wrapped in additional `anyhow` context — the dispatch must look
-    /// through `.context(...)` chains, not just at the leaf error.
     #[test]
     fn classify_exit_error_walks_anyhow_context() {
         let e: anyhow::Error = anyhow::Error::from(auth::error::AuthError::TwoFactorRequired)
@@ -1314,8 +1273,6 @@ mod tests {
         assert_eq!(classify_exit_error(&e), ExitClassification::Partial);
     }
 
-    /// All four classifications must produce distinct exit codes — if two
-    /// collapse, operators lose the ability to branch on the cause.
     #[test]
     fn classify_exit_error_codes_are_distinct() {
         let codes = [

@@ -3366,26 +3366,10 @@ mod heartbeat_tests {
         );
     }
 
-    /// The watchdog and the data plane must not share a chokepoint.
-    /// Issue #347's #348 heartbeat parked on the same `Stderr::write_all`
-    /// mutex as the scan loop, so a slow stderr consumer wedged both at
-    /// once and the heartbeat couldn't disambiguate "stuck" from "alive
-    /// but slow". The fix in #349 routed both through
-    /// `tracing_appender::non_blocking` in lossy mode so producers don't
-    /// park on the writer mutex.
-    ///
-    /// This test holds the writer behind a 5 ms-per-write sink (a
-    /// realistic stderr-pipe latency, not pathological saturation —
-    /// pathological loads exhaust the lossy buffer before the worker can
-    /// drain on shutdown, which conflates the bug under test with
-    /// shutdown drop). A fake scan loop emits at 200 events/s and the
-    /// heartbeat task ticks every 50 ms. With the non-blocking pipeline,
-    /// both make forward progress and the heartbeat events land in the
-    /// captured sink. A regression that re-introduces a synchronous
-    /// `Stderr::write_all` mutex on the data path would serialize emits:
-    /// the scan task's stream alone exceeds the sink's drain rate, so
-    /// the heartbeat task would park behind it and produce 0 emits in
-    /// the captured output.
+    /// 5 ms-per-write sink is realistic stderr-pipe latency, not
+    /// pathological saturation: pathological loads exhaust the lossy
+    /// buffer before the worker drains on shutdown, conflating the bug
+    /// under test with teardown timing.
     #[tokio::test]
     async fn heartbeat_fires_under_writer_load() {
         use std::io::Write;
@@ -3438,8 +3422,10 @@ mod heartbeat_tests {
             }
         });
 
-        // 300 ms covers ~5 heartbeat intervals (the first tick is skipped,
-        // so emits land at t≈50, 100, 150, 200, 250 ms).
+        // 300 ms covers 5 heartbeat intervals (first tick skipped; emits
+        // land at t≈50, 100, 150, 200, 250 ms). Asserting >= 3 still
+        // survives one missed tick from CI jitter without giving a real
+        // chokepoint regression a way through.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         stop.store(true, Ordering::Relaxed);
         scan.await.unwrap();
@@ -3454,9 +3440,9 @@ mod heartbeat_tests {
         let captured_str = String::from_utf8_lossy(&captured);
         let heartbeat_count = captured_str.matches("import scan heartbeat").count();
         assert!(
-            heartbeat_count >= 2,
+            heartbeat_count >= 3,
             "heartbeat fired {heartbeat_count} times in 300 ms under concurrent \
-             scan-loop traffic (expected >= 2); the watchdog is sharing the data \
+             scan-loop traffic (expected >= 3); the watchdog is sharing the data \
              plane's chokepoint or otherwise stalled. Captured: {captured_str}",
         );
     }
