@@ -30,7 +30,7 @@ fn cmd() -> assert_cmd::Command {
 // ── Help output ─────────────────────────────────────────────────────────
 
 #[test]
-fn install_help_succeeds() {
+fn install_help_lists_user_and_system_flags() {
     cmd()
         .args(["install", "--help"])
         .assert()
@@ -39,7 +39,7 @@ fn install_help_succeeds() {
 }
 
 #[test]
-fn uninstall_help_succeeds() {
+fn uninstall_help_lists_purge_flag() {
     cmd()
         .args(["uninstall", "--help"])
         .assert()
@@ -72,7 +72,10 @@ fn service_run_help_inherits_sync_flags() {
 }
 
 #[test]
-fn service_status_help_succeeds() {
+fn service_status_help_renders_without_panic() {
+    // `Status` is a unit variant with no flags of its own. The assertion
+    // is just "clap renders help and exits 0" -- defends against an
+    // accidental enum-shape change that would break help generation.
     cmd()
         .args(["service", "status", "--help"])
         .assert()

@@ -683,7 +683,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             }
         },
         Command::Install(args) => {
-            return service::install::run(args, &cli.config).await;
+            return service::install::run(args, &config_path).await;
         }
         Command::Uninstall(args) => {
             return service::uninstall::run(args).await;

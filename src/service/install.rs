@@ -10,6 +10,8 @@
 //! or systemd unit on the container's rootfs would never be invoked. The
 //! existing `docker-compose.yml` workflow stays the supported path.
 
+use std::path::Path;
+
 use anyhow::{anyhow, Result};
 
 use crate::cli::InstallArgs;
@@ -17,7 +19,7 @@ use crate::service::env::{
     current_executable, is_in_container, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER,
 };
 
-pub(crate) async fn run(args: InstallArgs, config_path: &str) -> Result<()> {
+pub(crate) async fn run(args: InstallArgs, config_path: &Path) -> Result<()> {
     if is_in_container() {
         tracing::info!(
             "kei install is a no-op inside containers; \
@@ -31,7 +33,7 @@ pub(crate) async fn run(args: InstallArgs, config_path: &str) -> Result<()> {
         service = SERVICE_IDENTIFIER,
         description = SERVICE_DESCRIPTION,
         executable = %exe.display(),
-        config = config_path,
+        config = %config_path.display(),
         user = args.user,
         system = args.system,
         "preparing to install kei service",

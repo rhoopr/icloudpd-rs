@@ -1323,7 +1323,7 @@ fn subcommand_display_name(cmd: &Command) -> &'static str {
         Command::Install(_) => "install",
         Command::Uninstall(_) => "uninstall",
         Command::Service { action } => match action {
-            ServiceAction::Run { .. } => "service run",
+            ServiceAction::Run(_) => "service run",
             ServiceAction::Status => "service status",
         },
         Command::GetCode { .. } => "get-code",
