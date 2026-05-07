@@ -315,6 +315,42 @@ echo "$PARTIAL_OUT" | grep -q "must be set together"
 kei_check "PUID without PGID is rejected with clear error"
 
 echo ""
+echo "--- 14e. kei subcommand routes through kei and runs as dropped user under PUID ---"
+# 14a-14d cover dispatch + drop via /usr/bin binaries (sh, id) and the reject
+# paths; none exercise the kei-subcommand branch of entrypoint.sh under PUID.
+# This step invokes `status --downloaded` against a fresh /config so the
+# dispatcher prepends `kei`, gosu drops to TEST_PUID, and the kei binary
+# actually executes as the dropped user. With no DB present, status bails
+# with the "No state database found" message and exits 0; that response is
+# only reachable if kei started, parsed args, and read /config as PUID.
+SUB_CONFIG=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-puid-sub-config-XXXXX")
+SUB_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-puid-sub-photos-XXXXX")
+SUB_OUT=$(docker run --rm \
+    "${ONESHOT_ENV[@]}" \
+    -e PUID="$TEST_PUID" \
+    -e PGID="$TEST_PGID" \
+    -v "$SUB_CONFIG:/config" \
+    -v "$SUB_PHOTOS:/photos" \
+    "$IMAGE" status \
+        --username "$ICLOUD_USERNAME" \
+        --data-dir /config \
+        --downloaded \
+    2>&1)
+SUB_EC=$?
+echo "$SUB_OUT" | tail -5
+kei_check "kei status under PUID exits 0" "$SUB_EC"
+echo "$SUB_OUT" | grep -q "No state database found"
+kei_check "kei status under PUID reached the no-DB branch (proves kei subcommand ran)"
+# The chown step in the entrypoint must leave /config owned by PUID even
+# when the kei subcommand does no writes itself.
+SUB_CONFIG_OWNER=$(stat -c %u "$SUB_CONFIG" 2>/dev/null || echo "")
+[ "$SUB_CONFIG_OWNER" = "$TEST_PUID" ]
+kei_check "/config is owned by PUID after kei-subcommand run"
+docker run --rm -v "$SUB_CONFIG:/c" -v "$SUB_PHOTOS:/p" "$IMAGE" \
+    chown -R "$(id -u):$(id -g)" /c /p >/dev/null 2>&1
+rm -rf "$SUB_CONFIG" "$SUB_PHOTOS"
+
+echo ""
 echo "--- 15. kei status --pending --failed --downloaded combined ---"
 COMBINED_OUT=$(docker run --rm \
     -v "$DOCKER_CONFIG:/config" \
