@@ -10,13 +10,6 @@
 //! shifts (Windows SCM starts services in `C:\Windows\System32`), and
 //! symlinked installs (Homebrew Cellar -> /usr/local/bin).
 
-// PR 2 (CLI surface for `kei install` / `kei uninstall` / `kei service run`)
-// is what wires these helpers into actual call sites. Until that lands,
-// every item below has no production consumer in the lib build and would
-// trip `dead_code`. The unit tests at the bottom of this file exercise
-// each item; the allow can come off as soon as PR 2 merges.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

@@ -2,7 +2,7 @@ use crate::types::{
     Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
     RawTreatmentPolicy, VersionSize,
 };
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// Reject empty strings at CLI parse time.
 fn non_empty_string(s: &str) -> Result<String, String> {
@@ -719,6 +719,62 @@ pub(crate) enum CredentialAction {
     Backend,
 }
 
+/// Arguments for `kei install`.
+///
+/// Per-platform defaults: Linux installs a per-user systemd unit unless
+/// `--system` is passed; macOS installs a per-user launchd agent (system
+/// daemons require root and are out of scope for v0.14); Windows registers
+/// a system service via the Service Control Manager (per-user services
+/// are not a Windows concept).
+#[derive(Args, Debug, Clone)]
+pub struct InstallArgs {
+    /// Install per-user (Linux/macOS default; ignored on Windows).
+    #[arg(long, conflicts_with = "system")]
+    pub user: bool,
+
+    /// Install system-wide (Linux only; requires root). On macOS and
+    /// Windows the per-platform default is used regardless of this flag.
+    #[arg(long, conflicts_with = "user")]
+    pub system: bool,
+}
+
+/// Arguments for `kei uninstall`.
+#[derive(Args, Debug, Clone)]
+pub struct UninstallArgs {
+    /// Also remove the state database, configuration, and stored
+    /// credentials. Default off: data is sacred, removal is opt-in.
+    #[arg(long)]
+    pub purge: bool,
+}
+
+/// Arguments for `kei service run`.
+///
+/// Identical to `kei sync` arguments; carried as its own struct so the
+/// surrounding [`ServiceAction`] enum does not balloon by ~600 bytes
+/// (the size of `SyncArgs`) on the unrelated `Status` variant.
+#[derive(Args, Debug, Clone)]
+pub struct ServiceRunArgs {
+    #[command(flatten)]
+    pub password: PasswordArgs,
+
+    #[command(flatten)]
+    pub sync: SyncArgs,
+}
+
+/// Subcommands under `kei service`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum ServiceAction {
+    /// Run the service worker (invoked by launchd / systemd / Windows SCM,
+    /// or directly for testing). Equivalent to `kei sync` with service-mode
+    /// defaults: when no other source provides a watch interval, defaults
+    /// to 86400 seconds so the daemon polls once per day.
+    Run(Box<ServiceRunArgs>),
+
+    /// Show whether kei is registered as a service on this host and when
+    /// it last started.
+    Status,
+}
+
 /// Subcommands for kei.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
@@ -794,6 +850,24 @@ pub enum Command {
     /// failed when their local file is missing, so the next sync
     /// re-downloads them.
     Reconcile(ReconcileArgs),
+
+    /// Register kei as a system service (launchd on macOS, systemd on
+    /// Linux, Service Control Manager on Windows). Inside a Docker
+    /// container the command logs that compose-managed deployments are
+    /// already supervised and exits without writing anything.
+    Install(InstallArgs),
+
+    /// Remove the kei service registered by `kei install`. Pass `--purge`
+    /// to also delete the state database, configuration, and stored
+    /// credentials.
+    Uninstall(UninstallArgs),
+
+    /// Service-mode operations: run the long-lived worker, or query
+    /// service registration status.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
 
     // ── Hidden legacy aliases (deprecated, still parse) ──────────
     /// Deprecated: use `kei login get-code`
@@ -1246,6 +1320,12 @@ fn subcommand_display_name(cmd: &Command) -> &'static str {
         Command::ImportExisting(_) => "import-existing",
         Command::Verify(_) => "verify",
         Command::Reconcile(_) => "reconcile",
+        Command::Install(_) => "install",
+        Command::Uninstall(_) => "uninstall",
+        Command::Service { action } => match action {
+            ServiceAction::Run { .. } => "service run",
+            ServiceAction::Status => "service status",
+        },
         Command::GetCode { .. } => "get-code",
         Command::SubmitCode { .. } => "submit-code",
         Command::Credential { .. } => "credential",
@@ -1453,6 +1533,11 @@ impl Command {
             Self::Sync { sync, .. } | Self::RetryFailed { sync, .. } => {
                 sync.merge_from(top_sync);
             }
+            Self::Service {
+                action: ServiceAction::Run(args),
+            } => {
+                args.sync.merge_from(top_sync);
+            }
             _ => {}
         }
         // Merge password args for commands that carry them
@@ -1488,11 +1573,19 @@ impl Command {
             | Self::Credential { password, .. }
             | Self::RetryFailed { password, .. } => Some(password),
             Self::ImportExisting(args) => Some(&mut args.password),
+            Self::Service {
+                action: ServiceAction::Run(args),
+            } => Some(&mut args.password),
             Self::Reset { .. }
             | Self::Config { .. }
             | Self::Status(_)
             | Self::Verify(_)
             | Self::Reconcile(_)
+            | Self::Install(_)
+            | Self::Uninstall(_)
+            | Self::Service {
+                action: ServiceAction::Status,
+            }
             | Self::ResetState { .. }
             | Self::ResetSyncToken
             | Self::Setup { .. } => None,

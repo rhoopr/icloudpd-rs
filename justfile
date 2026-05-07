@@ -14,7 +14,7 @@ _default:
 gate:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
-    cargo test --lib --test cli --test behavioral
+    cargo test --lib --test cli --test behavioral --test service_cli
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
     cargo fetch --locked
     cargo audit --deny warnings
@@ -41,7 +41,7 @@ test MODE="":
             cargo test --all-features
             ;;
         fast)
-            cargo test --lib --test cli --test behavioral
+            cargo test --lib --test cli --test behavioral --test service_cli
             ;;
         live)
             _live_env

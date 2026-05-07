@@ -682,6 +682,32 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 }
             }
         },
+        Command::Install(args) => {
+            return service::install::run(args, &cli.config).await;
+        }
+        Command::Uninstall(args) => {
+            return service::uninstall::run(args).await;
+        }
+        Command::Service { action } => match action {
+            cli::ServiceAction::Status => return service::status::run().await,
+            cli::ServiceAction::Run(args) => {
+                let cli::ServiceRunArgs { password, sync } = *args;
+                return service::run::run(
+                    &globals,
+                    sync_loop::SyncArgs {
+                        is_one_shot: false,
+                        service_mode: true,
+                        pw: password,
+                        sync,
+                        toml_config,
+                        config_explicitly_set,
+                        config_path: config_path.clone(),
+                        redact_password: Arc::clone(&redact_password),
+                    },
+                )
+                .await;
+            }
+        },
         Command::Sync { password, sync } => (sync.retry_failed, password, sync),
         // Legacy variants should never reach here (effective_command maps them)
         #[allow(
@@ -694,6 +720,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         &globals,
         sync_loop::SyncArgs {
             is_one_shot,
+            service_mode: false,
             pw,
             sync,
             toml_config,

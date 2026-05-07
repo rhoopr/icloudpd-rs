@@ -186,9 +186,35 @@ async fn maybe_notify_shared_libraries(
     }
 }
 
+/// Default watch interval applied when `kei service run` enters with no
+/// CLI / TOML / env value set. 24 hours, matching the value baked into
+/// the Docker image's `KEI_WATCH_WITH_INTERVAL`.
+pub(crate) const SERVICE_MODE_DEFAULT_WATCH_INTERVAL: u64 = 86400;
+
+/// Decide whether to apply the service-mode watch-interval fallback.
+///
+/// Returns `Some(interval)` only when `service_mode` is true AND the
+/// existing layered resolution (CLI > TOML > env) produced no value,
+/// signaling that the daemon would otherwise run once and exit.
+pub(crate) fn service_mode_default_interval(
+    current: Option<u64>,
+    service_mode: bool,
+) -> Option<u64> {
+    if service_mode && current.is_none() {
+        Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL)
+    } else {
+        None
+    }
+}
+
 /// Arguments that [`run_sync`] needs from the CLI dispatch layer.
 pub(crate) struct SyncArgs {
     pub is_one_shot: bool,
+    /// True when invoked via `kei service run`. After [`Config::build`]
+    /// resolves CLI > TOML > env, a still-unset watch interval falls
+    /// through to [`SERVICE_MODE_DEFAULT_WATCH_INTERVAL`] so the daemon
+    /// always polls (single-shot service-mode is meaningless).
+    pub service_mode: bool,
     pub pw: cli::PasswordArgs,
     pub sync: cli::SyncArgs,
     pub toml_config: Option<config::TomlConfig>,
@@ -202,6 +228,7 @@ pub(crate) struct SyncArgs {
 pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> anyhow::Result<()> {
     let SyncArgs {
         is_one_shot,
+        service_mode,
         pw,
         sync,
         toml_config,
@@ -240,6 +267,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // setup → "sync now": initial test sync, not a daemon.
     if is_one_shot {
         config.watch_with_interval = None;
+    }
+
+    // Service-mode contract: the daemon must poll. If neither CLI, TOML,
+    // nor env supplied an interval, fall through to the canonical 24h
+    // default so a launchd/systemd/SCM unit still has a heartbeat.
+    if let Some(applied) = service_mode_default_interval(config.watch_with_interval, service_mode) {
+        config.watch_with_interval = Some(applied);
+        tracing::info!(
+            interval_secs = applied,
+            "service mode: applied default watch interval"
+        );
     }
 
     // Install password redaction now that we know the password
@@ -1772,6 +1810,37 @@ async fn reacquire_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_mode_default_locked_at_one_day() {
+        // The roadmap promises the kei daemon polls every 24h out of the
+        // box. Regression-guard the constant so a casual rename doesn't
+        // silently shorten the interval and 10x the API call rate.
+        assert_eq!(SERVICE_MODE_DEFAULT_WATCH_INTERVAL, 86_400);
+    }
+
+    #[test]
+    fn service_mode_default_applied_when_no_other_source_set_interval() {
+        assert_eq!(
+            service_mode_default_interval(None, true),
+            Some(SERVICE_MODE_DEFAULT_WATCH_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn service_mode_default_skipped_when_cli_or_toml_already_set_interval() {
+        // A user-provided interval (CLI / TOML / env) must always win;
+        // service mode never silently overrides an explicit choice.
+        assert_eq!(service_mode_default_interval(Some(60), true), None);
+        assert_eq!(service_mode_default_interval(Some(3600), true), None);
+    }
+
+    #[test]
+    fn service_mode_default_skipped_outside_service_mode() {
+        // Plain `kei sync` must remain single-shot when no interval is
+        // configured. Only the service entry point applies the fallback.
+        assert_eq!(service_mode_default_interval(None, false), None);
+    }
 
     fn primary() -> crate::selection::LibrarySelector {
         crate::selection::LibrarySelector::default()
