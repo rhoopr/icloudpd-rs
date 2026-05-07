@@ -18,9 +18,12 @@
 - Parallel downloads with incremental sync (seconds on large libraries after the first run)
 - Resumable transfers verified by size and content hash
 - Watch mode, systemd integration, headless 2FA, Docker-ready
-- iCloud Photos supported today. Google Takeout and Immich next.
+- iCloud Photos supported today. NextCloud, Immich, Ente, and Google Takeout next.
 
 ---
+
+> [!CAUTION]
+> kei is pre-release software under active development, and minor versions may contain breaking changes. We follow a deprecate-then-remove practice, but always check CHANGELOG when updating.
 
 > [!IMPORTANT]
 > v0.13 reshapes selection and folder-structure flags. `--exclude-album NAME` becomes `--album '!NAME'`. `--library` accepts multiple values. `kei sync` with no flags now runs per-album passes plus an unfiled pass. Legacy `{album}` in `--folder-structure` auto-migrates with a warning until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md).
@@ -35,8 +38,6 @@
 > | `--folder-structure-albums` | `{album}` |
 > | `--folder-structure-smart-folders` | `{smart-folder}` |
 
-> [!TIP]
-> Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) shows how to `kei sync` without re-downloading.
 
 ---
 
@@ -66,6 +67,9 @@ kei sync -u you@example.com -d ~/Photos/iCloud --save-password
 You'll be prompted for your password, then asked to approve 2FA on a trusted device. Downloads start right after. After the first run, just `kei sync` - username, directory, and password are all remembered.
 
 For a guided walkthrough, run `kei config setup` instead.
+
+> [!TIP]
+> Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) shows how to `kei sync` without re-downloading.
 
 ---
 

@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 10;
+pub(crate) const SCHEMA_VERSION: i32 = 11;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -434,6 +434,19 @@ fn migrate_to_version(
                 conn.execute_batch(
                     "ALTER TABLE sync_runs ADD COLUMN enumeration_errors INTEGER NOT NULL DEFAULT 0;",
                 )?;
+            }
+        }
+        11 => {
+            // imported_size / imported_mtime: snapshot of the on-disk file
+            // metadata at adopt time. import-existing reads these on
+            // subsequent runs to skip the SHA-256 re-read when size + mtime
+            // are unchanged (fresh DBs and rows imported pre-v11 leave
+            // these NULL, which forces a real hash).
+            if !column_exists(conn, "assets", "imported_size")? {
+                conn.execute_batch("ALTER TABLE assets ADD COLUMN imported_size INTEGER;")?;
+            }
+            if !column_exists(conn, "assets", "imported_mtime")? {
+                conn.execute_batch("ALTER TABLE assets ADD COLUMN imported_mtime INTEGER;")?;
             }
         }
         other => {
@@ -1433,6 +1446,38 @@ mod tests {
         // Reset version backwards and re-run the v10 step. This simulates
         // an unusual recovery path; the migration must not fail.
         set_schema_version(&conn, 9).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// v11 introduces `imported_size` and `imported_mtime` on `assets`.
+    /// Both are nullable so pre-v11 rows survive the upgrade with NULL,
+    /// which the import-existing skip-rehash path treats as "no snapshot,
+    /// re-hash" rather than as an error.
+    #[test]
+    fn test_v11_adds_imported_size_and_mtime_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+        migrate(&conn).unwrap();
+
+        assert!(
+            column_exists(&conn, "assets", "imported_size").unwrap(),
+            "v11 must add `imported_size` to assets",
+        );
+        assert!(
+            column_exists(&conn, "assets", "imported_mtime").unwrap(),
+            "v11 must add `imported_mtime` to assets",
+        );
+    }
+
+    /// v11 must be re-runnable on a DB that already has both columns
+    /// (crash mid-migration, replay through migrate()).
+    #[test]
+    fn test_v11_idempotent_when_columns_exist() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        set_schema_version(&conn, 10).unwrap();
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }

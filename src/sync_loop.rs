@@ -2526,6 +2526,8 @@ mod tests {
                 _: &state::types::AssetRecord,
                 _: &std::path::Path,
                 _: &str,
+                _: u64,
+                _: Option<i64>,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
@@ -2973,6 +2975,8 @@ mod tests {
                 _: &state::types::AssetRecord,
                 _: &std::path::Path,
                 _: &str,
+                _: u64,
+                _: Option<i64>,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }
@@ -3280,6 +3284,8 @@ mod tests {
                 _: &state::types::AssetRecord,
                 _: &std::path::Path,
                 _: &str,
+                _: u64,
+                _: Option<i64>,
             ) -> Result<(), state::error::StateError> {
                 unimplemented!()
             }

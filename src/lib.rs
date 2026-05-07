@@ -78,22 +78,27 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
             .password
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pw) = &*password {
-            let pw_str = pw.expose_secret();
-            if !pw_str.is_empty() {
-                // A buffer shorter than the password can't contain it,
-                // avoiding the lossy UTF-8 conversion for short log fragments.
-                if buf.len() >= pw_str.len() {
-                    let s = String::from_utf8_lossy(buf);
-                    if s.contains(pw_str) {
-                        let redacted = s.replace(pw_str, "********");
-                        self.inner.write_all(redacted.as_bytes())?;
-                        return Ok(buf.len());
-                    }
-                }
-            }
+
+        // Fast path: short-circuit before allocating a `String`. Under
+        // trace-level logging the redaction path runs on every event,
+        // and `String::from_utf8_lossy` per event dominates the heap churn.
+        let Some(pw) = &*password else {
+            self.inner.write_all(buf)?;
+            return Ok(buf.len());
+        };
+        let pw_bytes = pw.expose_secret().as_bytes();
+        if pw_bytes.is_empty() || buf.len() < pw_bytes.len() {
+            self.inner.write_all(buf)?;
+            return Ok(buf.len());
         }
-        self.inner.write_all(buf)?;
+        if memchr::memmem::find(buf, pw_bytes).is_none() {
+            self.inner.write_all(buf)?;
+            return Ok(buf.len());
+        }
+
+        let s = String::from_utf8_lossy(buf);
+        let redacted = s.replace(pw.expose_secret(), "********");
+        self.inner.write_all(redacted.as_bytes())?;
         Ok(buf.len())
     }
 
@@ -102,20 +107,51 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
     }
 }
 
-/// A `MakeWriter` implementation that produces `RedactingWriter` instances.
+/// A `MakeWriter` implementation that produces `RedactingWriter` instances
+/// fronting the non-blocking channel that wraps stderr.
 struct RedactingMakeWriter {
     password: Arc<std::sync::Mutex<Option<SecretString>>>,
+    inner: tracing_appender::non_blocking::NonBlocking,
 }
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
-    type Writer = RedactingWriter<std::io::Stderr>;
+    type Writer = RedactingWriter<tracing_appender::non_blocking::NonBlocking>;
 
     fn make_writer(&'a self) -> Self::Writer {
         RedactingWriter {
-            inner: std::io::stderr(),
+            inner: self.inner.clone(),
             password: Arc::clone(&self.password),
         }
     }
+}
+
+/// Build the redacting log-writer pipeline `run` installs.
+///
+/// `lossy(true)` so producers never park on the background writer; the
+/// returned `WorkerGuard` must outlive every `tracing::*` call so its
+/// `Drop` can join the worker and drain the channel before teardown.
+/// The password slot starts empty and is populated once the password
+/// is known.
+pub(crate) fn build_redacting_writer<W>(
+    sink: W,
+) -> (
+    impl for<'a> tracing_subscriber::fmt::MakeWriter<'a> + 'static,
+    tracing_appender::non_blocking::WorkerGuard,
+    Arc<std::sync::Mutex<Option<SecretString>>>,
+)
+where
+    W: std::io::Write + Send + 'static,
+{
+    let password: Arc<std::sync::Mutex<Option<SecretString>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .finish(sink);
+    let make_writer = RedactingMakeWriter {
+        password: Arc::clone(&password),
+        inner: non_blocking,
+    };
+    (make_writer, guard, password)
 }
 
 use cli::Command;
@@ -156,6 +192,48 @@ const EXIT_AUTH: u8 = 3;
 #[derive(Debug, thiserror::Error)]
 #[error("{0} downloads failed")]
 struct PartialSyncError(usize);
+
+/// Maps a fatal `Err` from `run` to an exit code and decides whether to
+/// log it. `TwoFactorRequired` is the non-obvious case: exit 0, no log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitClassification {
+    /// Exit 0 with no error log: kei already told the user how to
+    /// proceed, and `restart: on-failure` would loop Apple's auth
+    /// endpoint if 2FA were treated as a failure.
+    TwoFactorRequired,
+    Partial,
+    Auth,
+    Other,
+}
+
+impl ExitClassification {
+    const fn exit_code(self) -> u8 {
+        match self {
+            Self::TwoFactorRequired => 0,
+            Self::Partial => EXIT_PARTIAL,
+            Self::Auth => EXIT_AUTH,
+            Self::Other => 1,
+        }
+    }
+
+    const fn should_log(self) -> bool {
+        !matches!(self, Self::TwoFactorRequired)
+    }
+}
+
+fn classify_exit_error(e: &anyhow::Error) -> ExitClassification {
+    if e.downcast_ref::<auth::error::AuthError>()
+        .is_some_and(auth::error::AuthError::is_two_factor_required)
+    {
+        ExitClassification::TwoFactorRequired
+    } else if e.downcast_ref::<PartialSyncError>().is_some() {
+        ExitClassification::Partial
+    } else if e.downcast_ref::<auth::error::AuthError>().is_some() {
+        ExitClassification::Auth
+    } else {
+        ExitClassification::Other
+    }
+}
 
 #[expect(
     clippy::string_slice,
@@ -389,14 +467,8 @@ pub fn main_inner() -> ExitCode {
     match rt.block_on(run(env_password)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            // 2FA required is not a failure — kei checked auth, told the user
-            // what to do, and is done. Exit 0 so `restart: on-failure` won't
-            // restart into a loop that hammers Apple's auth endpoints.
-            if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(auth::error::AuthError::is_two_factor_required)
-            {
-                ExitCode::SUCCESS
-            } else {
+            let classification = classify_exit_error(&e);
+            if classification.should_log() {
                 // Route the final error through tracing so it carries the same
                 // timestamp + level prefix as the rest of the logs; makes
                 // `docker logs` / `journalctl` output correlate cleanly.
@@ -410,14 +482,8 @@ pub fn main_inner() -> ExitCode {
                 {
                     eprintln!("Error: {e:#}");
                 }
-                if e.downcast_ref::<PartialSyncError>().is_some() {
-                    ExitCode::from(EXIT_PARTIAL)
-                } else if e.downcast_ref::<auth::error::AuthError>().is_some() {
-                    ExitCode::from(EXIT_AUTH)
-                } else {
-                    ExitCode::FAILURE
-                }
             }
+            ExitCode::from(classification.exit_code())
         }
     }
 }
@@ -485,18 +551,17 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         types::LogLevel::Warn => "warn",
         types::LogLevel::Error => "error",
     };
-    // Password redaction: the password is set after config parsing,
-    // but tracing must be initialized earlier. Use a shared slot that
-    // starts as None and is populated once the password is known.
-    let redact_password: Arc<std::sync::Mutex<Option<SecretString>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    // `_writer_guard` MUST live until `run` returns. A `static`-stored
+    // guard never drops (Rust skips static destructors), so subprocess
+    // tests reading stderr after kei exits race against unflushed events
+    // on fast teardown (observed on macOS CI).
+    let (make_writer, _writer_guard, redact_password) = build_redacting_writer(std::io::stderr());
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )
-        .with_writer(RedactingMakeWriter {
-            password: Arc::clone(&redact_password),
-        })
+        .with_writer(make_writer)
         .init();
 
     // Log migration warnings now that tracing is initialized.
@@ -807,6 +872,195 @@ mod tests {
         writer.flush().unwrap();
     }
 
+    /// Password set but the buffer doesn't contain it. The pre-redaction
+    /// byte-level scan must short-circuit and pass the buffer through
+    /// unchanged, without allocating a `String` for UTF-8 lossy
+    /// conversion -- under heavy trace-level logging most events do NOT
+    /// contain the password, so the no-allocation path is the hot one.
+    #[test]
+    fn redacting_writer_password_absent_passthrough() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from("s3cret"))));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer
+                .write_all(b"long line of trace output without any sensitive value")
+                .unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            output,
+            "long line of trace output without any sensitive value"
+        );
+    }
+
+    /// A buffer containing arbitrary non-UTF-8 bytes (e.g. binary protocol
+    /// trace output from `hyper`) and no password match must pass through
+    /// byte-for-byte. The original implementation forced `from_utf8_lossy`
+    /// on every event, which would have replaced invalid sequences with
+    /// U+FFFD even when no redaction was needed.
+    #[test]
+    fn redacting_writer_non_utf8_passthrough_preserves_bytes() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from("s3cret"))));
+        let bytes: Vec<u8> = vec![0xff, 0xfe, 0xfd, b'o', b'k', 0x00, 0x80];
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(&bytes).unwrap();
+        }
+        assert_eq!(buf, bytes);
+    }
+
+    /// Password match in a non-UTF-8 buffer: the slow path is taken,
+    /// `from_utf8_lossy` runs, and the password substring is redacted.
+    /// Trailing invalid bytes get the U+FFFD replacement, but that is
+    /// the same behavior as the original implementation when redaction
+    /// fires.
+    #[test]
+    fn redacting_writer_non_utf8_with_password_redacts() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from("s3cret"))));
+        let mut bytes: Vec<u8> = b"prefix s3cret suffix ".to_vec();
+        bytes.push(0xff);
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(&bytes).unwrap();
+        }
+        let output = String::from_utf8_lossy(&buf).into_owned();
+        assert!(!output.contains("s3cret"));
+        assert!(output.contains("********"));
+    }
+
+    /// 200 events at 50 ms per write would synchronously block the
+    /// producer for ~10 s without the lossy non-blocking channel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_pipeline_does_not_back_pressure_producer() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct SlowSink {
+            delay: Duration,
+            bytes: Arc<AtomicUsize>,
+        }
+        impl Write for SlowSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(self.delay);
+                self.bytes.fetch_add(buf.len(), Ordering::Relaxed);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let sink = SlowSink {
+            delay: Duration::from_millis(50),
+            bytes: Arc::clone(&bytes),
+        };
+        let (make_writer, _guard, _pw) = build_redacting_writer(sink);
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(make_writer)
+            .finish();
+        let _g = tracing::subscriber::set_default(subscriber);
+
+        let start = Instant::now();
+        for i in 0..200 {
+            tracing::info!(i, "back-pressure test event");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "producer blocked {elapsed:?} emitting 200 events through a 50ms-per-write sink; \
+             expected the lossy non-blocking channel to absorb the saturation",
+        );
+    }
+
+    /// `WorkerGuard::drop` must flush every emitted event before
+    /// returning. Hoisting the guard into a `static` (whose destructor
+    /// never runs) silently re-introduces the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_pipeline_flushes_all_events_before_guard_drops() {
+        use std::io::Write;
+
+        struct CollectingSink {
+            buf: Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl Write for CollectingSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.buf
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = CollectingSink {
+            buf: Arc::clone(&buf),
+        };
+        let (make_writer, guard, _pw) = build_redacting_writer(sink);
+
+        // Disable ANSI so the assertion can match `seq=N` against a stable
+        // byte boundary. Default `tracing_subscriber::fmt()` emits color
+        // codes between fields, which would defeat a literal-substring
+        // assertion.
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+        {
+            let _g = tracing::subscriber::set_default(subscriber);
+            for i in 0..50 {
+                tracing::info!(seq = i, "completeness test event");
+            }
+        }
+        // Drop the guard explicitly (mirrors `run` returning) so the
+        // background flush thread drains before we read the sink.
+        drop(guard);
+
+        let captured = buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !captured.is_empty(),
+            "guard drop completed but sink received no bytes; \
+             the non-blocking worker did not flush before drop returned",
+        );
+        let captured_str = String::from_utf8_lossy(&captured);
+        for i in 0..50 {
+            // `seq=N\n` anchors at end-of-line so seq=5 doesn't match seq=50.
+            assert!(
+                captured_str.contains(&format!("seq={i}\n")),
+                "event seq={i} missing from captured output after guard drop; \
+                 captured was: {captured_str}",
+            );
+        }
+    }
+
     #[test]
     fn make_password_provider_with_direct_source() {
         let source = password::PasswordSource::Direct(Arc::new(SecretString::from("mypass")));
@@ -959,6 +1213,82 @@ mod tests {
     fn check_min_disk_space_threshold_is_one_gib() {
         assert_eq!(MIN_FREE_BYTES, 1_073_741_824);
         assert_eq!(MIN_FREE_BYTES, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn classify_exit_error_two_factor_required_is_suppressed_success() {
+        let e: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
+        let c = classify_exit_error(&e);
+        assert_eq!(c, ExitClassification::TwoFactorRequired);
+        assert_eq!(c.exit_code(), 0);
+        assert!(
+            !c.should_log(),
+            "2FA-required must not emit a final error log; that path is the success branch"
+        );
+    }
+
+    #[test]
+    fn classify_exit_error_partial_sync_uses_exit_partial() {
+        let e: anyhow::Error = PartialSyncError(7).into();
+        let c = classify_exit_error(&e);
+        assert_eq!(c, ExitClassification::Partial);
+        assert_eq!(c.exit_code(), EXIT_PARTIAL);
+        assert_eq!(c.exit_code(), 2);
+        assert!(c.should_log());
+    }
+
+    #[test]
+    fn classify_exit_error_auth_non_2fa_uses_exit_auth() {
+        let e: anyhow::Error = auth::error::AuthError::FailedLogin("bad password".into()).into();
+        let c = classify_exit_error(&e);
+        assert_eq!(c, ExitClassification::Auth);
+        assert_eq!(c.exit_code(), EXIT_AUTH);
+        assert_eq!(c.exit_code(), 3);
+        assert!(c.should_log());
+    }
+
+    #[test]
+    fn classify_exit_error_generic_uses_failure() {
+        let e = anyhow::anyhow!("disk on fire");
+        let c = classify_exit_error(&e);
+        assert_eq!(c, ExitClassification::Other);
+        assert_eq!(c.exit_code(), 1);
+        assert!(c.should_log());
+    }
+
+    #[test]
+    fn classify_exit_error_walks_anyhow_context() {
+        let e: anyhow::Error = anyhow::Error::from(auth::error::AuthError::TwoFactorRequired)
+            .context("while validating session")
+            .context("during startup");
+        assert_eq!(
+            classify_exit_error(&e),
+            ExitClassification::TwoFactorRequired,
+            "AuthError wrapped in .context() must still classify as 2FA-required; \
+             otherwise context-wrapping at any call site silently flips exit 0 -> exit 1"
+        );
+
+        let e: anyhow::Error =
+            anyhow::Error::from(PartialSyncError(3)).context("after final retry pass");
+        assert_eq!(classify_exit_error(&e), ExitClassification::Partial);
+    }
+
+    #[test]
+    fn classify_exit_error_codes_are_distinct() {
+        let codes = [
+            ExitClassification::TwoFactorRequired.exit_code(),
+            ExitClassification::Partial.exit_code(),
+            ExitClassification::Auth.exit_code(),
+            ExitClassification::Other.exit_code(),
+        ];
+        let mut sorted: Vec<u8> = codes.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            codes.len(),
+            "every exit classification must map to a distinct code; got {codes:?}"
+        );
     }
 }
 
