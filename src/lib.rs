@@ -197,6 +197,57 @@ const EXIT_AUTH: u8 = 3;
 #[error("{0} downloads failed")]
 struct PartialSyncError(usize);
 
+/// How a fatal `Err` from `run` maps to an exit code and whether kei
+/// should emit a final `tracing::error!` + stderr line for it.
+///
+/// Kept as a typed dispatch table (rather than inline match arms in
+/// `main_inner`) so the policy is unit-testable without owning a tokio
+/// runtime, and so the non-obvious `TwoFactorRequired -> exit 0, no log`
+/// rule can't drift silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitClassification {
+    /// 2FA required: exit 0, suppress error log. kei already told the
+    /// user how to proceed; logging "kei exited with error" here would
+    /// be misleading and `restart: on-failure` would loop the auth
+    /// endpoint.
+    TwoFactorRequired,
+    /// Some downloads failed but the run was not a total failure.
+    Partial,
+    /// Auth failure other than 2FA-required.
+    Auth,
+    /// Any other error.
+    Other,
+}
+
+impl ExitClassification {
+    const fn exit_code(self) -> u8 {
+        match self {
+            Self::TwoFactorRequired => 0,
+            Self::Partial => EXIT_PARTIAL,
+            Self::Auth => EXIT_AUTH,
+            Self::Other => 1,
+        }
+    }
+
+    const fn should_log(self) -> bool {
+        !matches!(self, Self::TwoFactorRequired)
+    }
+}
+
+fn classify_exit_error(e: &anyhow::Error) -> ExitClassification {
+    if e.downcast_ref::<auth::error::AuthError>()
+        .is_some_and(auth::error::AuthError::is_two_factor_required)
+    {
+        ExitClassification::TwoFactorRequired
+    } else if e.downcast_ref::<PartialSyncError>().is_some() {
+        ExitClassification::Partial
+    } else if e.downcast_ref::<auth::error::AuthError>().is_some() {
+        ExitClassification::Auth
+    } else {
+        ExitClassification::Other
+    }
+}
+
 #[expect(
     clippy::string_slice,
     reason = "floor_char_boundary guarantees a valid char boundary"
@@ -429,14 +480,8 @@ pub fn main_inner() -> ExitCode {
     match rt.block_on(run(env_password)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            // 2FA required is not a failure — kei checked auth, told the user
-            // what to do, and is done. Exit 0 so `restart: on-failure` won't
-            // restart into a loop that hammers Apple's auth endpoints.
-            if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(auth::error::AuthError::is_two_factor_required)
-            {
-                ExitCode::SUCCESS
-            } else {
+            let classification = classify_exit_error(&e);
+            if classification.should_log() {
                 // Route the final error through tracing so it carries the same
                 // timestamp + level prefix as the rest of the logs; makes
                 // `docker logs` / `journalctl` output correlate cleanly.
@@ -450,14 +495,8 @@ pub fn main_inner() -> ExitCode {
                 {
                     eprintln!("Error: {e:#}");
                 }
-                if e.downcast_ref::<PartialSyncError>().is_some() {
-                    ExitCode::from(EXIT_PARTIAL)
-                } else if e.downcast_ref::<auth::error::AuthError>().is_some() {
-                    ExitCode::from(EXIT_AUTH)
-                } else {
-                    ExitCode::FAILURE
-                }
             }
+            ExitCode::from(classification.exit_code())
         }
     }
 }
@@ -1200,6 +1239,99 @@ mod tests {
     fn check_min_disk_space_threshold_is_one_gib() {
         assert_eq!(MIN_FREE_BYTES, 1_073_741_824);
         assert_eq!(MIN_FREE_BYTES, 1024 * 1024 * 1024);
+    }
+
+    /// `classify_exit_error` is the dispatch table that decides what kei's
+    /// exit code is and whether it logs a final "kei exited with error"
+    /// line. The mapping is non-obvious in two places:
+    ///
+    /// 1. `AuthError::TwoFactorRequired` is *not* a failure — kei has
+    ///    already told the user how to proceed, exit 0 keeps `restart:
+    ///    on-failure` from looping the auth endpoint.
+    /// 2. `AuthError` (non-2FA) and `PartialSyncError` get distinct exit
+    ///    codes (3 and 2) so operators / supervisors can branch on them.
+    ///
+    /// A refactor that flips any of those mappings should fail one of these
+    /// tests rather than silently change operator-visible behavior.
+    #[test]
+    fn classify_exit_error_two_factor_required_is_suppressed_success() {
+        let e: anyhow::Error = auth::error::AuthError::TwoFactorRequired.into();
+        let c = classify_exit_error(&e);
+        assert_eq!(c, ExitClassification::TwoFactorRequired);
+        assert_eq!(c.exit_code(), 0);
+        assert!(
+            !c.should_log(),
+            "2FA-required must not emit a final error log; that path is the success branch"
+        );
+    }
+
+    #[test]
+    fn classify_exit_error_partial_sync_uses_exit_partial() {
+        let e: anyhow::Error = PartialSyncError(7).into();
+        let c = classify_exit_error(&e);
+        assert_eq!(c, ExitClassification::Partial);
+        assert_eq!(c.exit_code(), EXIT_PARTIAL);
+        assert_eq!(c.exit_code(), 2);
+        assert!(c.should_log());
+    }
+
+    #[test]
+    fn classify_exit_error_auth_non_2fa_uses_exit_auth() {
+        let e: anyhow::Error = auth::error::AuthError::FailedLogin("bad password".into()).into();
+        let c = classify_exit_error(&e);
+        assert_eq!(c, ExitClassification::Auth);
+        assert_eq!(c.exit_code(), EXIT_AUTH);
+        assert_eq!(c.exit_code(), 3);
+        assert!(c.should_log());
+    }
+
+    #[test]
+    fn classify_exit_error_generic_uses_failure() {
+        let e = anyhow::anyhow!("disk on fire");
+        let c = classify_exit_error(&e);
+        assert_eq!(c, ExitClassification::Other);
+        assert_eq!(c.exit_code(), 1);
+        assert!(c.should_log());
+    }
+
+    /// `PartialSyncError` and `AuthError` both downcast cleanly even when
+    /// wrapped in additional `anyhow` context — the dispatch must look
+    /// through `.context(...)` chains, not just at the leaf error.
+    #[test]
+    fn classify_exit_error_walks_anyhow_context() {
+        let e: anyhow::Error = anyhow::Error::from(auth::error::AuthError::TwoFactorRequired)
+            .context("while validating session")
+            .context("during startup");
+        assert_eq!(
+            classify_exit_error(&e),
+            ExitClassification::TwoFactorRequired,
+            "AuthError wrapped in .context() must still classify as 2FA-required; \
+             otherwise context-wrapping at any call site silently flips exit 0 -> exit 1"
+        );
+
+        let e: anyhow::Error =
+            anyhow::Error::from(PartialSyncError(3)).context("after final retry pass");
+        assert_eq!(classify_exit_error(&e), ExitClassification::Partial);
+    }
+
+    /// All four classifications must produce distinct exit codes — if two
+    /// collapse, operators lose the ability to branch on the cause.
+    #[test]
+    fn classify_exit_error_codes_are_distinct() {
+        let codes = [
+            ExitClassification::TwoFactorRequired.exit_code(),
+            ExitClassification::Partial.exit_code(),
+            ExitClassification::Auth.exit_code(),
+            ExitClassification::Other.exit_code(),
+        ];
+        let mut sorted: Vec<u8> = codes.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            codes.len(),
+            "every exit classification must map to a distinct code; got {codes:?}"
+        );
     }
 }
 
