@@ -25,10 +25,14 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 fn cmd_with_home(home: &TempDir) -> assert_cmd::Command {
     let mut cmd = common::cmd();
     cmd.timeout(TIMEOUT);
-    // Scrub inherited XDG_/HOME so the test is deterministic regardless
-    // of the developer's shell environment, then point at the tempdir.
+    // Scrub inherited environment so the test can't reach the developer's
+    // real systemd user session: XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS
+    // are how `systemctl --user` finds the live user-bus, so removing them
+    // makes the (best-effort) disable / daemon-reload calls fail fast in
+    // the tempdir instead of touching the host's running services.
     cmd.env_remove("XDG_CONFIG_HOME");
     cmd.env_remove("XDG_RUNTIME_DIR");
+    cmd.env_remove("DBUS_SESSION_BUS_ADDRESS");
     cmd.env_remove("SUDO_USER");
     cmd.env("HOME", home.path());
     cmd.env("XDG_CONFIG_HOME", home.path().join(".config"));
@@ -96,6 +100,8 @@ fn dry_run_install_user_writes_to_xdg_config_home_override() {
     let xdg = TempDir::new().unwrap();
     let mut cmd = common::cmd();
     cmd.timeout(TIMEOUT);
+    cmd.env_remove("XDG_RUNTIME_DIR");
+    cmd.env_remove("DBUS_SESSION_BUS_ADDRESS");
     cmd.env_remove("SUDO_USER");
     cmd.env("HOME", home.path());
     cmd.env("XDG_CONFIG_HOME", xdg.path());
@@ -185,6 +191,41 @@ fn uninstall_purge_removes_kei_state_dir_when_present() {
         !kei_dir.exists(),
         "--purge should remove ~/.config/kei (was at {})",
         kei_dir.display()
+    );
+}
+
+#[test]
+fn uninstall_purge_clears_encrypted_credential_file() {
+    // --purge must wipe stored credentials, not just the on-disk state.
+    // The encrypted-file backend is the only one we can exercise
+    // hermetically: the keyring backend would otherwise dispatch through
+    // libsecret to the dev's real OS keyring. cmd_with_home scrubs
+    // DBUS_SESSION_BUS_ADDRESS specifically so that backend can't reach
+    // anything live, leaving CredentialStore::delete to land its
+    // file-side cleanup inside the tempdir.
+    let home = TempDir::new().unwrap();
+    let kei_dir = home.path().join(".config/kei");
+    std::fs::create_dir_all(&kei_dir).unwrap();
+    std::fs::write(
+        kei_dir.join("config.toml"),
+        "[auth]\nusername = \"kei-purge-test@example.invalid\"\n",
+    )
+    .unwrap();
+    let cred_file = kei_dir.join("credentials.enc");
+    std::fs::write(&cred_file, b"opaque-ciphertext-bytes").unwrap();
+
+    cmd_with_home(&home)
+        .args(["uninstall", "--purge"])
+        .assert()
+        .success();
+
+    assert!(
+        !cred_file.exists(),
+        "--purge should remove the encrypted credential file"
+    );
+    assert!(
+        !kei_dir.exists(),
+        "--purge should also remove the kei state directory"
     );
 }
 

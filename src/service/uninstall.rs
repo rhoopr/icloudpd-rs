@@ -37,6 +37,6 @@ async fn dispatch(args: UninstallArgs) -> Result<()> {
     );
     Err(anyhow::anyhow!(
         "`kei uninstall` is not yet implemented on this platform; \
-         macOS launchd lands in PR 4 and Windows SCM in PR 5"
+         macOS launchd and Windows SCM backends are still in flight"
     ))
 }

@@ -1957,6 +1957,35 @@ mod tests {
     }
 
     #[test]
+    fn install_dry_run_parses_with_user_flag() {
+        let cli = Cli::try_parse_from(["kei", "install", "--user", "--dry-run"]).unwrap();
+        let args = match cli.effective_command() {
+            Command::Install(a) => a.clone(),
+            other => panic!("expected Install, got {other:?}"),
+        };
+        assert!(args.user);
+        assert!(args.dry_run);
+        assert!(!args.system);
+    }
+
+    #[test]
+    fn install_user_and_system_conflict_at_parse_time() {
+        // clap rejects mutually exclusive flags during parse; this guards
+        // the `conflicts_with` annotation on InstallArgs.
+        let err = Cli::try_parse_from(["kei", "install", "--user", "--system"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn uninstall_purge_parses_to_struct_field() {
+        let cli = Cli::try_parse_from(["kei", "uninstall", "--purge"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Uninstall(UninstallArgs { purge: true })
+        ));
+    }
+
+    #[test]
     fn test_reset_sync_token() {
         let cli = Cli::try_parse_from(["kei", "reset", "sync-token"]).unwrap();
         assert!(matches!(

@@ -2,11 +2,11 @@
 //! and `kei service {run,status}`.
 //!
 //! Tests in this file must hold on every target. Platform-specific
-//! behavior — actually writing a unit file or invoking systemctl — lives
-//! in `tests/service_linux.rs` (and analogous suites for macOS / Windows
-//! once PRs 4-5 land). The "not yet implemented" assertions for macOS /
-//! Windows are gated to those targets so PR 3's Linux backend doesn't
-//! make them lie.
+//! behavior (actually writing a unit file or invoking systemctl) lives
+//! in `tests/service_linux.rs` and analogous suites for the other
+//! platforms. The "not yet implemented" assertions are gated to
+//! targets without a backend so they auto-deactivate as each platform
+//! ships.
 
 #![allow(
     clippy::unwrap_used,
@@ -103,37 +103,11 @@ fn install_user_and_system_are_mutually_exclusive() {
         .stderr(predicate::str::contains("cannot be used with"));
 }
 
-#[test]
-fn uninstall_accepts_purge_flag_via_clap() {
-    // Cross-platform check: clap parses `--purge` as a known flag (no
-    // exit-2 parse error). The actual uninstall behavior is asserted
-    // per-platform; here we just confirm the surface accepts the flag
-    // without flagging it as unknown.
-    cmd()
-        .args(["uninstall", "--purge", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--purge"));
-}
-
-#[test]
-fn install_accepts_dry_run_flag_via_clap() {
-    // Same shape as --purge: assert clap recognizes `--dry-run` rather
-    // than executing the install. The Linux backend exercises the
-    // dry-run end-to-end in tests/service_linux.rs.
-    cmd()
-        .args(["install", "--dry-run", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--dry-run"));
-}
-
 // ── Stub error contract (non-Linux only) ────────────────────────────────
 //
-// PR 3 lands the Linux backend, so on Linux these no longer return a
-// "not yet implemented" error. PRs 4 (macOS) and 5 (Windows) replace
-// the stubs on those targets too — the cfg gate auto-deactivates each
-// test as its platform's backend lands.
+// On targets where the platform backend has shipped, these tests
+// auto-deactivate via cfg. They guard the macOS / Windows stubs until
+// those backends land.
 
 #[cfg(not(target_os = "linux"))]
 #[test]

@@ -2,8 +2,8 @@
 //!
 //! Routes to a per-platform backend (launchd on macOS, systemd on Linux,
 //! Windows SCM on Windows) that registers kei to start at boot and run
-//! continuously. PR 3 lands the Linux backend, PR 4 macOS, PR 5 Windows;
-//! until then every platform returns a clean "not yet implemented" error.
+//! continuously. Linux is wired up; macOS and Windows currently return
+//! a clean "not yet implemented" error.
 //!
 //! Inside containers the command short-circuits: Docker / Kubernetes /
 //! Podman supervise the process themselves, and writing a launchd plist
@@ -55,6 +55,6 @@ async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
     );
     Err(anyhow::anyhow!(
         "`kei install` is not yet implemented on this platform; \
-         macOS launchd lands in PR 4 and Windows SCM in PR 5"
+         macOS launchd and Windows SCM backends are still in flight"
     ))
 }
