@@ -98,7 +98,10 @@ pub(crate) fn effective_uid() -> u32 {
 ///
 /// Returns `None` when the file is missing, malformed, or has no
 /// non-empty username — `--purge` callers treat any of those as "no
-/// credential to clear" and proceed.
+/// credential to clear" and proceed. `cfg(unix)` until the Windows SCM
+/// backend (PR 5) wires up `kei uninstall --purge`; the function itself
+/// uses no unix-only APIs.
+#[cfg(unix)]
 pub(crate) fn read_config_username(kei_dir: &Path) -> Option<String> {
     let config_path = kei_dir.join("config.toml");
     let toml = crate::config::load_toml_config(&config_path, false).ok()??;
@@ -109,7 +112,9 @@ pub(crate) fn read_config_username(kei_dir: &Path) -> Option<String> {
 /// stored credential. Each platform's `--purge` path resolves the kei
 /// state directory however it wants (linux honours `XDG_CONFIG_HOME`;
 /// macOS hard-codes `~/.config/kei` rather than `~/Library/Application
-/// Support`) and passes the resolved path here.
+/// Support`) and passes the resolved path here. Same `cfg(unix)` story
+/// as [`read_config_username`].
+#[cfg(unix)]
 pub(crate) fn purge_kei_state(kei_dir: &Path, extra_dirs: &[PathBuf]) -> Result<()> {
     if let Some(username) = read_config_username(kei_dir) {
         let store = crate::credential::CredentialStore::new(&username, kei_dir);
