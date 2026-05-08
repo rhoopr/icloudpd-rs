@@ -1,0 +1,178 @@
+name: Service smoke
+
+# Per-platform smoke for `kei install` / `kei uninstall`. Builds the
+# release binary on each runner OS, exercises the dry-run install path
+# (which renders the platform artifact without invoking the service
+# manager so no credentials or elevated bus is required), validates
+# artifact syntax with the platform-native linter, then runs
+# `kei uninstall` and asserts the artifact is gone.
+#
+# What this catches:
+#   - regressions that produce malformed unit/plist/SCM-preview output
+#   - artifact path changes (uninstall must find what install wrote)
+#   - cross-platform regressions in the shared install/uninstall
+#     dispatcher
+#
+# What this does NOT catch (out of scope, would need credentials):
+#   - the service actually starts and reaches `Service: running`
+#   - launchctl bootstrap / systemctl --now / SCM CreateService glue
+#
+# That deeper exercise lives in the Rust integration suites
+# (tests/service_linux.rs etc.) and the maintainer's manual real-install
+# flow against the icloudpd-test album.
+
+on:
+  pull_request:
+    paths:
+      - 'src/service/**'
+      - 'src/cli.rs'
+      - 'src/commands/status.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/service-smoke.yml'
+
+concurrency:
+  group: service-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+  # `kei status` derives its state-DB path from the username; pin a
+  # placeholder so the smoke does not require a real Apple ID.
+  ICLOUD_USERNAME: service-smoke@example.invalid
+
+jobs:
+  smoke:
+    name: Smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Linux smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          KEI="$PWD/target/release/kei"
+          UNIT="$HOME/.config/systemd/user/kei.service"
+
+          # Pre-state: nothing installed.
+          test ! -e "$UNIT"
+          "$KEI" status | tee /tmp/kei-status-pre.txt
+          grep -q '^Service: not installed' /tmp/kei-status-pre.txt
+
+          # Dry-run install renders the unit on disk and skips
+          # daemon-reload / enable / loginctl enable-linger. The runner
+          # user has no active systemd --user bus on hosted runners, so
+          # the non-dry path would fail at daemon-reload regardless.
+          "$KEI" install --user --dry-run
+
+          test -f "$UNIT"
+
+          # Validate the unit syntax. systemd-analyze verify works
+          # without an active bus and catches malformed [Unit] / [Service]
+          # / [Install] sections, unknown directives, and bad ExecStart
+          # paths. It expects the unit to be reachable from the
+          # systemd unit search path; --user mode plus the standard
+          # ~/.config/systemd/user location works without sudo.
+          systemd-analyze --user verify "$UNIT"
+
+          # Uninstall removes the unit even when the bus is unreachable
+          # (the platform branch logs and continues on best-effort
+          # daemon-reload failure).
+          "$KEI" uninstall
+
+          test ! -e "$UNIT"
+          "$KEI" status | tee /tmp/kei-status-post.txt
+          grep -q '^Service: not installed' /tmp/kei-status-post.txt
+
+      - name: macOS smoke
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          KEI="$PWD/target/release/kei"
+          PLIST="$HOME/Library/LaunchAgents/com.rhoopr.kei.plist"
+
+          test ! -e "$PLIST"
+          "$KEI" status | tee /tmp/kei-status-pre.txt
+          grep -q '^Service: not installed' /tmp/kei-status-pre.txt
+
+          # Dry-run renders the plist and skips launchctl bootstrap.
+          # GitHub-hosted macOS runners have a GUI session, but we
+          # avoid the bootstrap step because the worker would fail to
+          # auth without credentials and KeepAlive would loop with
+          # backoff for the lifetime of the job.
+          "$KEI" install --dry-run
+
+          test -f "$PLIST"
+
+          # plutil -lint checks the plist parses as well-formed XML
+          # and that every key has a recognized value type. It does
+          # not validate launchd-specific keys (that's launchctl's
+          # job at bootstrap), but it catches the most common
+          # template-rendering regressions.
+          plutil -lint "$PLIST"
+
+          "$KEI" uninstall
+
+          test ! -e "$PLIST"
+          "$KEI" status | tee /tmp/kei-status-post.txt
+          grep -q '^Service: not installed' /tmp/kei-status-post.txt
+
+      - name: Windows smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kei = Join-Path $PWD 'target\release\kei.exe'
+
+          # Pre-state: SCM service must not exist.
+          $svc = Get-Service com.rhoopr.kei -ErrorAction SilentlyContinue
+          if ($null -ne $svc) { throw "service already registered before smoke install" }
+
+          $statusPre = & $kei status
+          $statusPre | Out-File /tmp/kei-status-pre.txt
+          if ($statusPre[0] -ne 'Service: not installed') {
+              throw "expected 'Service: not installed', got: $($statusPre[0])"
+          }
+
+          # Windows dry-run prints the full SCM call preview (executable
+          # path, account, launch arguments, failure-action policy)
+          # without prompting for the account password and without
+          # invoking CreateServiceW. A real install requires the
+          # operator's plain-text password to be passed to LSA, which
+          # has no clean CI-secret story today; that path is exercised
+          # manually.
+          & $kei install --dry-run
+          if ($LASTEXITCODE -ne 0) { throw "kei install --dry-run failed" }
+
+          # Confirm the dry-run was truly a no-op against SCM.
+          $svc = Get-Service com.rhoopr.kei -ErrorAction SilentlyContinue
+          if ($null -ne $svc) { throw "dry-run unexpectedly registered the service" }
+
+          # Uninstall against a clean host should report "nothing to
+          # remove" and exit 0.
+          & $kei uninstall
+          if ($LASTEXITCODE -ne 0) { throw "kei uninstall on clean host failed" }
+
+          $statusPost = & $kei status
+          $statusPost | Out-File /tmp/kei-status-post.txt
+          if ($statusPost[0] -ne 'Service: not installed') {
+              throw "expected 'Service: not installed', got: $($statusPost[0])"
+          }

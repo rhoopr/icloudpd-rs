@@ -36,6 +36,7 @@ tests/
 | `tests/shell/concurrency.sh` | 8 | yes | `just test concurrency` |
 | `tests/shell/state-machine.sh` | 20 | yes | `just test state` |
 | `tests/shell/docker.sh` | 16 | yes | `just test docker` |
+| `.github/workflows/service-smoke.yml` | 3 (linux/macos/windows) | no | `just service-smoke` (linux/macOS) |
 
 Counts are approximate and drift as tests are added.
 
@@ -173,3 +174,15 @@ happens:
   multiple kei invocations with DB mutation in between.
 - **`shell/docker.sh`** - anything that requires `docker run`, watch
   mode + SIGTERM, healthcheck probes inside the container.
+- **`service-smoke` workflow** - per-platform CI smoke for `kei install`
+  / `kei uninstall`. Builds the release binary on
+  `ubuntu-latest`/`macos-latest`/`windows-latest`, runs `kei install
+  --dry-run` to render the platform artifact (systemd unit, launchd
+  plist, or Windows SCM preview) without invoking the service manager,
+  validates the artifact with the platform-native linter
+  (`systemd-analyze verify`, `plutil -lint`, or `Get-Service`), then
+  runs `kei uninstall` and asserts the artifact is gone. Catches
+  rendering and path-resolution regressions; doesn't exercise the
+  actual service-manager handoff (that needs credentials and is left
+  to manual real-install testing). Mirrored by `just service-smoke` on
+  Linux and macOS.

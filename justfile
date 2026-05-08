@@ -262,6 +262,50 @@ fuzz MODE="list" *ARGS="":
             ;;
     esac
 
+# Service-install smoke: builds release, dry-run install, validates artifact, uninstall, asserts clean.
+# Mirrors .github/workflows/service-smoke.yml. Linux + macOS only.
+service-smoke:
+    #!/usr/bin/env bash
+    set -euxo pipefail
+    cargo build --release
+    KEI="$PWD/target/release/kei"
+    # `kei status` derives its state-DB path from the username; pin a
+    # placeholder so the smoke does not depend on the operator's .env
+    # or saved config.
+    export ICLOUD_USERNAME="service-smoke@example.invalid"
+    case "$(uname -s)" in
+        Linux)
+            UNIT="$HOME/.config/systemd/user/kei.service"
+            # Clean any leftover from a previous failed run so the
+            # pre-state assertion is meaningful.
+            rm -f "$UNIT"
+            test ! -e "$UNIT"
+            "$KEI" status | grep -q '^Service: not installed'
+            "$KEI" install --user --dry-run
+            test -f "$UNIT"
+            systemd-analyze --user verify "$UNIT"
+            "$KEI" uninstall
+            test ! -e "$UNIT"
+            "$KEI" status | grep -q '^Service: not installed'
+            ;;
+        Darwin)
+            PLIST="$HOME/Library/LaunchAgents/com.rhoopr.kei.plist"
+            rm -f "$PLIST"
+            test ! -e "$PLIST"
+            "$KEI" status | grep -q '^Service: not installed'
+            "$KEI" install --dry-run
+            test -f "$PLIST"
+            plutil -lint "$PLIST"
+            "$KEI" uninstall
+            test ! -e "$PLIST"
+            "$KEI" status | grep -q '^Service: not installed'
+            ;;
+        *)
+            echo "service-smoke is Linux/macOS only; Windows runs in CI" >&2
+            exit 2
+            ;;
+    esac
+
 # Create branch NAME off a freshly fetched origin/main (CLAUDE.md branch-from-fresh-main rule).
 branch NAME:
     #!/usr/bin/env bash
