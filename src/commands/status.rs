@@ -5,7 +5,7 @@
 
 use crate::cli;
 use crate::config;
-use crate::service::status as service_status;
+use crate::service::status::{render_oneline, service_state};
 use crate::state;
 use crate::state::{AssetRecord, StateDb};
 
@@ -81,7 +81,7 @@ pub(crate) async fn run_status(
 /// are absorbed so a probe failure never poisons the rest of the status
 /// command -- the state DB summary is the load-bearing output.
 async fn print_service_section() {
-    let state = match service_status::service_state().await {
+    let state = match service_state().await {
         Ok(state) => state,
         Err(e) => {
             tracing::debug!(error = %e, "service_state probe failed; rendering placeholder");
@@ -90,7 +90,7 @@ async fn print_service_section() {
             return;
         }
     };
-    println!("{}", service_status::render_oneline(&state));
+    println!("{}", render_oneline(&state));
     println!();
 }
 

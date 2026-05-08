@@ -1,7 +1,7 @@
-//! Integration coverage for the new `Service:` section in `kei status`.
+//! Integration coverage for the `Service:` section in `kei status`.
 //!
 //! These tests run on every host the rest of the suite runs on (linux,
-//! macOS, Windows) because the Service line is now the *first* line of
+//! macOS, Windows) because the Service line is the first line of
 //! `kei status` output regardless of platform. The platform-native
 //! detail (`systemd user`, `launchd user`, `windows scm`,
 //! `running in container (...)`) is determined at runtime by the
@@ -17,18 +17,24 @@
 //! - The Service line is emitted even when no state DB exists, so
 //!   `kei install` followed by `kei status` works on a fresh host.
 
+// `mod common` pulls in tests/common/mod.rs which uses eprintln!, unwrap,
+// expect, and panic; the file-level allow propagates into that module so
+// the shared test harness keeps compiling without per-call attributes.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::print_stderr,
-    reason = "test harness; permissive lints accepted to keep assertions readable"
+    clippy::print_stderr
 )]
 
 mod common;
 
+use std::time::Duration;
+
 use predicates::prelude::*;
 use tempfile::TempDir;
+
+const TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Returns a `kei status` command bound to a fresh tempdir, with the
 /// username pinned to a placeholder so the resolver doesn't fail.
@@ -36,7 +42,8 @@ use tempfile::TempDir;
 /// DB path -- no network call is made -- so any non-empty value works.
 fn status_cmd(tmp: &TempDir) -> assert_cmd::Command {
     let mut cmd = common::cmd();
-    cmd.env("ICLOUD_USERNAME", "service-status-test@example.invalid")
+    cmd.timeout(TIMEOUT)
+        .env("ICLOUD_USERNAME", "service-status-test@example.invalid")
         .args(["--data-dir"])
         .arg(tmp.path())
         .arg("status");

@@ -133,11 +133,10 @@ pub(crate) async fn status() -> Result<()> {
     Ok(())
 }
 
-/// Cross-platform `service_state()` for the new `Service:` section in
-/// `kei status`. SCM does not expose a service-start timestamp via
-/// `QueryServiceStatusEx`, so `since` is always `None` on Windows in
-/// v0.14; the running flag and PID are sufficient signal for the
-/// status line.
+/// `service_state()` for the `Service:` section in `kei status`. SCM
+/// does not expose a service-start timestamp via `QueryServiceStatusEx`,
+/// so `since` is always `None`; the lifecycle label and PID are
+/// sufficient signal for the status line.
 pub(crate) async fn service_state() -> Result<ServiceState> {
     Ok(match scm_impl::probe().await? {
         StatusInputs::NotInstalled => ServiceState::NotInstalled,
@@ -147,7 +146,6 @@ pub(crate) async fn service_state() -> Result<ServiceState> {
         },
         StatusInputs::Probed { state, pid } => ServiceState::Installed {
             backend: "windows scm",
-            running: state == ServiceStateView::Running,
             state_label: state.label(),
             since: None,
             pid,

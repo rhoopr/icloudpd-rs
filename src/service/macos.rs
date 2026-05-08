@@ -272,9 +272,9 @@ fn render_status(inputs: StatusInputs) -> String {
     }
 }
 
-/// Cross-platform `service_state()` for the new `Service:` section in
-/// `kei status`. `launchctl print` exposes state and pid but no start
-/// time, so `since` is always `None` on macOS in v0.14.
+/// `service_state()` for the `Service:` section in `kei status`.
+/// `launchctl print` exposes state and pid but no start time, so
+/// `since` is always `None` on macOS.
 pub(crate) async fn service_state() -> Result<ServiceState> {
     Ok(match probe_status_inputs().await? {
         StatusInputs::NotInstalled => ServiceState::NotInstalled,
@@ -287,14 +287,16 @@ pub(crate) async fn service_state() -> Result<ServiceState> {
 }
 
 fn probed_to_state(state: &str, pid: Option<&str>) -> ServiceState {
-    let running = state == LAUNCHD_STATE_RUNNING;
-    let state_label: &'static str = if running { "running" } else { "stopped" };
+    let state_label: &'static str = if state == LAUNCHD_STATE_RUNNING {
+        crate::service::status::RUNNING_LABEL
+    } else {
+        "stopped"
+    };
     let pid = pid
         .filter(|p| !p.is_empty() && *p != LAUNCHD_PID_NONE)
         .and_then(|p| p.parse::<u32>().ok());
     ServiceState::Installed {
         backend: "launchd user",
-        running,
         state_label,
         since: None,
         pid,
@@ -702,13 +704,11 @@ com.rhoopr.kei = {
         match probed_to_state(LAUNCHD_STATE_RUNNING, Some("4321")) {
             ServiceState::Installed {
                 backend,
-                running,
                 state_label,
                 since,
                 pid,
             } => {
                 assert_eq!(backend, "launchd user");
-                assert!(running);
                 assert_eq!(state_label, "running");
                 assert_eq!(since, None);
                 assert_eq!(pid, Some(4321));
@@ -728,12 +728,7 @@ com.rhoopr.kei = {
     #[test]
     fn probed_to_state_non_running_label() {
         match probed_to_state("not running", None) {
-            ServiceState::Installed {
-                running,
-                state_label,
-                ..
-            } => {
-                assert!(!running);
+            ServiceState::Installed { state_label, .. } => {
                 assert_eq!(state_label, "stopped");
             }
             other => panic!("expected Installed, got {other:?}"),

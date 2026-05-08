@@ -308,9 +308,9 @@ fn render_status(inputs: StatusInputs) -> String {
     }
 }
 
-/// Cross-platform `service_state()` for the new `Service:` section in
-/// `kei status`. Reuses [`probe_status_inputs`] and converts the raw
-/// systemctl key/value map into the platform-agnostic [`ServiceState`].
+/// `service_state()` for the `Service:` section in `kei status`. Reuses
+/// [`probe_status_inputs`] and converts the raw systemctl key/value map
+/// into the platform-agnostic [`ServiceState`].
 pub(crate) async fn service_state() -> Result<ServiceState> {
     Ok(match probe_status_inputs().await? {
         StatusInputs::NotInstalled => ServiceState::NotInstalled,
@@ -322,11 +322,18 @@ pub(crate) async fn service_state() -> Result<ServiceState> {
     })
 }
 
+// probe_status_inputs only ever passes "user" or "system"; the unreachable!
+// arm is a refactor tripwire, not a runtime concern, hence the allow.
+#[allow(
+    clippy::unreachable,
+    reason = "scope strings are produced by probe_status_inputs; \
+              third value would be a refactor bug worth panicking on"
+)]
 fn backend_label(scope: &'static str) -> &'static str {
     match scope {
         "user" => "systemd user",
         "system" => "systemd system",
-        _ => "systemd",
+        other => unreachable!("unexpected systemd scope: {other:?}"),
     }
 }
 
@@ -335,9 +342,8 @@ fn probe_to_state(
     probe: &std::collections::BTreeMap<String, String>,
 ) -> ServiceState {
     let active = probe.get("ActiveState").map(String::as_str).unwrap_or("?");
-    let running = active == "active";
     let state_label: &'static str = match active {
-        "active" => "running",
+        "active" => crate::service::status::RUNNING_LABEL,
         "inactive" => "stopped",
         "failed" => "failed",
         "activating" => "starting",
@@ -354,7 +360,6 @@ fn probe_to_state(
         .filter(|&p| p != 0);
     ServiceState::Installed {
         backend: backend_label(scope),
-        running,
         state_label,
         since,
         pid,
@@ -711,13 +716,11 @@ mod tests {
         match probe_to_state("user", &probe) {
             ServiceState::Installed {
                 backend,
-                running,
                 state_label,
                 since,
                 pid,
             } => {
                 assert_eq!(backend, "systemd user");
-                assert!(running);
                 assert_eq!(state_label, "running");
                 assert!(since.is_some());
                 assert_eq!(pid, Some(12345));
@@ -737,13 +740,11 @@ mod tests {
         probe.insert("MainPID".to_string(), "0".to_string());
         match probe_to_state("user", &probe) {
             ServiceState::Installed {
-                running,
                 state_label,
                 pid,
                 since,
                 ..
             } => {
-                assert!(!running);
                 assert_eq!(state_label, "stopped");
                 assert_eq!(pid, None);
                 assert_eq!(since, None);
@@ -756,7 +757,15 @@ mod tests {
     fn backend_label_distinguishes_user_and_system_scopes() {
         assert_eq!(backend_label("user"), "systemd user");
         assert_eq!(backend_label("system"), "systemd system");
-        assert_eq!(backend_label("other"), "systemd");
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected systemd scope")]
+    fn backend_label_panics_on_unknown_scope() {
+        // probe_status_inputs only emits "user" or "system" today; if a
+        // future refactor adds a third scope without updating
+        // backend_label, the panic surfaces it loud.
+        let _ = backend_label("other");
     }
 
     #[test]

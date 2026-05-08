@@ -1,9 +1,9 @@
 //! `kei service status` dispatcher and the cross-platform `ServiceState`
-//! data type that backs the new `Service:` section in `kei status`.
+//! data type that backs the `Service:` section in `kei status`.
 //!
-//! `run()` continues to power `kei service status`: it delegates to the
-//! per-platform `status()` function, which prints a single line tuned to
-//! that platform's vocabulary (`systemctl --user`, `launchctl print`,
+//! `run()` powers `kei service status`: it delegates to the per-platform
+//! `status()` function, which prints a single line tuned to that
+//! platform's vocabulary (`systemctl --user`, `launchctl print`,
 //! `sc.exe query`).
 //!
 //! [`service_state`] is the data-only counterpart used by `kei status`:
@@ -51,14 +51,12 @@ async fn dispatch() -> Result<()> {
 pub(crate) enum ServiceState {
     /// No service file / SCM entry / launchd plist registered for kei.
     NotInstalled,
-    /// Service is registered. `running` distinguishes the running case
-    /// from any non-running state (stopped, paused, failed, etc.). The
-    /// `state_label` carries the platform-native verdict so we can print
-    /// `Service: stopped (...)` rather than collapsing every non-running
-    /// case to a single string.
+    /// Service is registered. `state_label` carries the lifecycle
+    /// verdict (`"running"`, `"stopped"`, `"failed"`, ...); `since`
+    /// renders only when the label is `"running"` so a stale
+    /// activation timestamp on a stopped unit cannot mislead.
     Installed {
         backend: &'static str,
-        running: bool,
         state_label: &'static str,
         since: Option<DateTime<Utc>>,
         pid: Option<u32>,
@@ -76,6 +74,12 @@ pub(crate) enum ServiceState {
     /// process supervisor is what restarts kei.
     InContainer { supervisor: &'static str },
 }
+
+/// Lifecycle label used by [`ServiceState::Installed`] for a running
+/// service. The renderer compares against this constant to decide
+/// whether to attach the `since` clause; per-platform adapters set
+/// `state_label` to this string when the service is actively running.
+pub(crate) const RUNNING_LABEL: &str = "running";
 
 /// Cross-platform `service_state()` dispatcher used by `kei status`.
 ///
@@ -122,7 +126,6 @@ pub(crate) fn render_oneline(state: &ServiceState) -> String {
         }
         ServiceState::Installed {
             backend,
-            running,
             state_label,
             since,
             pid,
@@ -131,10 +134,7 @@ pub(crate) fn render_oneline(state: &ServiceState) -> String {
             if let Some(pid) = pid {
                 detail.push_str(&format!(", pid {pid}"));
             }
-            // `since` only renders for the running state. A stopped
-            // service may still have ActiveEnterTimestamp populated from
-            // its last activation; printing it would mislead.
-            if *running {
+            if *state_label == RUNNING_LABEL {
                 if let Some(since) = since {
                     detail.push_str(&format!(", since {}", since.format("%Y-%m-%d %H:%M UTC")));
                 }
@@ -187,8 +187,7 @@ mod tests {
     fn renders_running_with_pid_and_since() {
         let line = render_oneline(&ServiceState::Installed {
             backend: "systemd user",
-            running: true,
-            state_label: "running",
+            state_label: RUNNING_LABEL,
             since: Some(fixed_since()),
             pid: Some(12345),
         });
@@ -202,8 +201,7 @@ mod tests {
     fn renders_running_without_since_or_pid() {
         let line = render_oneline(&ServiceState::Installed {
             backend: "windows scm",
-            running: true,
-            state_label: "running",
+            state_label: RUNNING_LABEL,
             since: None,
             pid: None,
         });
@@ -215,8 +213,7 @@ mod tests {
         // macOS path: launchctl print exposes the PID but no start time.
         let line = render_oneline(&ServiceState::Installed {
             backend: "launchd user",
-            running: true,
-            state_label: "running",
+            state_label: RUNNING_LABEL,
             since: None,
             pid: Some(4321),
         });
@@ -225,13 +222,11 @@ mod tests {
 
     #[test]
     fn renders_stopped_state_without_since() {
-        // Even when ActiveEnterTimestamp is populated by an older run,
-        // we don't dangle "since X" off a stopped service line -- the
-        // timestamp would refer to the previous activation, not the
-        // current state.
+        // ActiveEnterTimestamp may carry over from an earlier activation
+        // on a now-stopped unit; the renderer must not dangle "since X"
+        // off the stopped line.
         let line = render_oneline(&ServiceState::Installed {
             backend: "systemd user",
-            running: false,
             state_label: "stopped",
             since: Some(fixed_since()),
             pid: None,
