@@ -40,26 +40,35 @@ pub(crate) const SERVICE_IDENTIFIER: &str = if cfg!(target_os = "linux") {
 
 /// Returns `true` when the current process is running inside a container.
 ///
-/// Two-signal probe: the marker file Docker drops at `/.dockerenv`, then
-/// the cgroup membership of PID 1 (covers Podman, containerd, Kubernetes,
-/// LXC). Cgroup parsing is Linux-only; on macOS and Windows only the
-/// marker-file check runs, which catches Docker Desktop edge cases
-/// without needing platform-specific container APIs.
+/// Thin wrapper over [`container_supervisor`] for the boolean callers
+/// (`kei install` no-op gate). Returns the same answer as
+/// `container_supervisor().is_some()`.
 pub(crate) fn is_in_container() -> bool {
-    is_in_container_at(
+    container_supervisor().is_some()
+}
+
+/// Returns the name of the container supervisor when running inside a
+/// container, or `None` on the bare host.
+///
+/// Used by `kei status` to render `Service: running in container
+/// (process supervisor: docker)` instead of `not installed`, which would
+/// mislead operators on a Docker / Kubernetes host where service
+/// management is the host's job. Two-signal probe: the marker file
+/// Docker drops at `/.dockerenv` (always reads as "docker"), then the
+/// cgroup membership of PID 1 (returns the matched marker). Cgroup
+/// parsing is Linux-only; on macOS/Windows only the marker-file check
+/// runs.
+pub(crate) fn container_supervisor() -> Option<&'static str> {
+    container_supervisor_at(
         Path::new(DEFAULT_DOCKERENV_PATH),
         Path::new(DEFAULT_CGROUP_PATH),
     )
 }
 
-/// Path-injecting form of [`is_in_container`] used by unit tests.
-///
-/// Production callers go through [`is_in_container`]; tests pass tempdir
-/// paths so the result is deterministic regardless of where the test
-/// binary runs.
-pub(crate) fn is_in_container_at(dockerenv: &Path, cgroup: &Path) -> bool {
+/// Path-injecting form of [`container_supervisor`].
+pub(crate) fn container_supervisor_at(dockerenv: &Path, cgroup: &Path) -> Option<&'static str> {
     if dockerenv.exists() {
-        return true;
+        return Some("docker");
     }
 
     #[cfg(target_os = "linux")]
@@ -67,15 +76,16 @@ pub(crate) fn is_in_container_at(dockerenv: &Path, cgroup: &Path) -> bool {
         match std::fs::read_to_string(cgroup) {
             Ok(contents) => CONTAINER_CGROUP_MARKERS
                 .iter()
-                .any(|marker| contents.contains(marker)),
-            Err(_) => false,
+                .find(|marker| contents.contains(*marker))
+                .copied(),
+            Err(_) => None,
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = cgroup;
-        false
+        None
     }
 }
 
@@ -205,7 +215,7 @@ mod tests {
         fs::write(&dockerenv, "").unwrap();
         let cgroup = tmp.path().join("cgroup");
         fs::write(&cgroup, "").unwrap();
-        assert!(is_in_container_at(&dockerenv, &cgroup));
+        assert!(container_supervisor_at(&dockerenv, &cgroup).is_some());
     }
 
     #[test]
@@ -214,7 +224,7 @@ mod tests {
         let dockerenv = tmp.path().join("dockerenv-missing");
         let cgroup = tmp.path().join("cgroup");
         fs::write(&cgroup, "0::/user.slice/user-1000.slice\n").unwrap();
-        assert!(!is_in_container_at(&dockerenv, &cgroup));
+        assert!(container_supervisor_at(&dockerenv, &cgroup).is_none());
     }
 
     #[cfg(target_os = "linux")]
@@ -242,11 +252,31 @@ mod tests {
             let dockerenv = tmp.path().join("dockerenv-missing");
             let cgroup = tmp.path().join("cgroup");
             fs::write(&cgroup, contents).unwrap();
-            assert!(
-                is_in_container_at(&dockerenv, &cgroup),
-                "expected container detection for {name} cgroup contents",
+            assert_eq!(
+                container_supervisor_at(&dockerenv, &cgroup),
+                Some(*name),
+                "expected supervisor {name} from cgroup contents",
             );
         }
+    }
+
+    #[test]
+    fn container_supervisor_dockerenv_marker_returns_docker() {
+        let tmp = TempDir::new().unwrap();
+        let dockerenv = tmp.path().join("dockerenv");
+        fs::write(&dockerenv, "").unwrap();
+        let cgroup = tmp.path().join("cgroup");
+        fs::write(&cgroup, "").unwrap();
+        assert_eq!(container_supervisor_at(&dockerenv, &cgroup), Some("docker"),);
+    }
+
+    #[test]
+    fn container_supervisor_returns_none_on_clean_host() {
+        let tmp = TempDir::new().unwrap();
+        let dockerenv = tmp.path().join("dockerenv-missing");
+        let cgroup = tmp.path().join("cgroup");
+        fs::write(&cgroup, "0::/user.slice/user-1000.slice\n").unwrap();
+        assert_eq!(container_supervisor_at(&dockerenv, &cgroup), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -257,7 +287,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dockerenv = tmp.path().join("dockerenv-missing");
         let cgroup = tmp.path().join("cgroup-does-not-exist");
-        assert!(!is_in_container_at(&dockerenv, &cgroup));
+        assert!(container_supervisor_at(&dockerenv, &cgroup).is_none());
     }
 
     #[test]

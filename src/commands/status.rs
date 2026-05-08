@@ -5,6 +5,7 @@
 
 use crate::cli;
 use crate::config;
+use crate::service::status as service_status;
 use crate::state;
 use crate::state::{AssetRecord, StateDb};
 
@@ -16,6 +17,8 @@ pub(crate) async fn run_status(
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<()> {
+    print_service_section().await;
+
     let db_path = super::super::get_db_path(globals, toml)?;
 
     if !db_path.exists() {
@@ -71,6 +74,24 @@ pub(crate) async fn run_status(
     }
 
     Ok(())
+}
+
+/// Prints the `Service:` line at the top of `kei status`. Errors from
+/// the per-platform probe (no systemd, headless macOS, locked-down SCM)
+/// are absorbed so a probe failure never poisons the rest of the status
+/// command -- the state DB summary is the load-bearing output.
+async fn print_service_section() {
+    let state = match service_status::service_state().await {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::debug!(error = %e, "service_state probe failed; rendering placeholder");
+            println!("Service: status unavailable");
+            println!();
+            return;
+        }
+    };
+    println!("{}", service_status::render_oneline(&state));
+    println!();
 }
 
 /// Which `kei status` listing is being paginated. Picks the state-DB page

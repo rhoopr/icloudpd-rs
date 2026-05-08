@@ -28,12 +28,14 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
 use tokio::process::Command;
 
 use crate::cli::{InstallArgs, UninstallArgs};
 use crate::service::env::{
     current_executable, effective_uid, purge_kei_state, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER,
 };
+use crate::service::status::ServiceState;
 
 const UNIT_FILE_NAME: &str = "kei.service";
 
@@ -306,6 +308,80 @@ fn render_status(inputs: StatusInputs) -> String {
     }
 }
 
+/// Cross-platform `service_state()` for the new `Service:` section in
+/// `kei status`. Reuses [`probe_status_inputs`] and converts the raw
+/// systemctl key/value map into the platform-agnostic [`ServiceState`].
+pub(crate) async fn service_state() -> Result<ServiceState> {
+    Ok(match probe_status_inputs().await? {
+        StatusInputs::NotInstalled => ServiceState::NotInstalled,
+        StatusInputs::BusUnavailable { scope } => ServiceState::BackendUnavailable {
+            backend: backend_label(scope),
+            reason: "bus unavailable",
+        },
+        StatusInputs::Probed { scope, probe } => probe_to_state(scope, &probe),
+    })
+}
+
+fn backend_label(scope: &'static str) -> &'static str {
+    match scope {
+        "user" => "systemd user",
+        "system" => "systemd system",
+        _ => "systemd",
+    }
+}
+
+fn probe_to_state(
+    scope: &'static str,
+    probe: &std::collections::BTreeMap<String, String>,
+) -> ServiceState {
+    let active = probe.get("ActiveState").map(String::as_str).unwrap_or("?");
+    let running = active == "active";
+    let state_label: &'static str = match active {
+        "active" => "running",
+        "inactive" => "stopped",
+        "failed" => "failed",
+        "activating" => "starting",
+        "deactivating" => "stopping",
+        "reloading" => "reloading",
+        _ => "unknown",
+    };
+    let since = probe
+        .get("ActiveEnterTimestamp")
+        .and_then(|s| parse_systemd_timestamp(s));
+    let pid = probe
+        .get("MainPID")
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&p| p != 0);
+    ServiceState::Installed {
+        backend: backend_label(scope),
+        running,
+        state_label,
+        since,
+        pid,
+    }
+}
+
+/// Parses systemd's `ActiveEnterTimestamp` into a UTC `DateTime`.
+///
+/// systemd formats the timestamp as `<weekday-abbrev> YYYY-MM-DD
+/// HH:MM:SS <TZ>` where the timezone defaults to the host's local zone
+/// unless `LC_ALL=C` or similar is in effect. Service units run with
+/// the host's tzdata, so the value is usually `UTC` on servers and the
+/// local zone on workstations. Only the UTC form is parsed here -- other
+/// zones return `None` so the renderer omits the `since` clause rather
+/// than guessing wrong. The returned timestamp is informational; missing
+/// it is preferable to misleading the operator.
+fn parse_systemd_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // `Thu 2026-05-07 14:32:01 UTC` -- weekday is decorative; chrono
+    // matches `%a` against any 3-letter abbrev.
+    let parsed = chrono::NaiveDateTime::parse_from_str(trimmed, "%a %Y-%m-%d %H:%M:%S UTC").ok()?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc))
+}
+
 // ── Internals ───────────────────────────────────────────────────────────
 
 fn write_unit(path: &Path, contents: &str) -> Result<()> {
@@ -430,7 +506,7 @@ async fn show_unit(scope: &[&str]) -> Result<ProbeOutcome> {
     argv.extend([
         "show",
         UNIT_FILE_NAME,
-        "--property=ActiveState,SubState,ActiveEnterTimestamp",
+        "--property=ActiveState,SubState,ActiveEnterTimestamp,MainPID",
     ]);
     let output = Command::new("systemctl")
         .args(&argv)
@@ -601,6 +677,86 @@ mod tests {
             probe,
         });
         assert_eq!(line, "Service: inactive (systemd user, dead)");
+    }
+
+    #[test]
+    fn parse_systemd_timestamp_accepts_utc_form() {
+        let parsed = parse_systemd_timestamp("Thu 2026-05-07 14:32:01 UTC")
+            .expect("UTC-form timestamp must parse");
+        assert_eq!(
+            parsed,
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 5, 7, 14, 32, 1).unwrap(),
+        );
+    }
+
+    #[test]
+    fn parse_systemd_timestamp_rejects_local_tz_and_blank() {
+        // Anything other than "UTC" returns None so we don't render a
+        // misleading "since X UTC" against a local-zone wall clock.
+        assert_eq!(parse_systemd_timestamp(""), None);
+        assert_eq!(parse_systemd_timestamp("Thu 2026-05-07 14:32:01 EDT"), None);
+        assert_eq!(parse_systemd_timestamp("not a timestamp"), None);
+    }
+
+    #[test]
+    fn probe_to_state_running_with_main_pid() {
+        let mut probe = std::collections::BTreeMap::new();
+        probe.insert("ActiveState".to_string(), "active".to_string());
+        probe.insert("SubState".to_string(), "running".to_string());
+        probe.insert(
+            "ActiveEnterTimestamp".to_string(),
+            "Thu 2026-05-07 14:32:01 UTC".to_string(),
+        );
+        probe.insert("MainPID".to_string(), "12345".to_string());
+        match probe_to_state("user", &probe) {
+            ServiceState::Installed {
+                backend,
+                running,
+                state_label,
+                since,
+                pid,
+            } => {
+                assert_eq!(backend, "systemd user");
+                assert!(running);
+                assert_eq!(state_label, "running");
+                assert!(since.is_some());
+                assert_eq!(pid, Some(12345));
+            }
+            other => panic!("expected Installed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_to_state_inactive_drops_zero_main_pid() {
+        // systemd reports `MainPID=0` for inactive units; do not
+        // surface that as a real PID in the rendered status line.
+        let mut probe = std::collections::BTreeMap::new();
+        probe.insert("ActiveState".to_string(), "inactive".to_string());
+        probe.insert("SubState".to_string(), "dead".to_string());
+        probe.insert("ActiveEnterTimestamp".to_string(), String::new());
+        probe.insert("MainPID".to_string(), "0".to_string());
+        match probe_to_state("user", &probe) {
+            ServiceState::Installed {
+                running,
+                state_label,
+                pid,
+                since,
+                ..
+            } => {
+                assert!(!running);
+                assert_eq!(state_label, "stopped");
+                assert_eq!(pid, None);
+                assert_eq!(since, None);
+            }
+            other => panic!("expected Installed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backend_label_distinguishes_user_and_system_scopes() {
+        assert_eq!(backend_label("user"), "systemd user");
+        assert_eq!(backend_label("system"), "systemd system");
+        assert_eq!(backend_label("other"), "systemd");
     }
 
     #[test]
