@@ -40,7 +40,7 @@ systemctl --user restart kei.service
 
 Drop the `--user` for system-wide installs.
 
-The unit notifies systemd of readiness and watchdog pings via `sd_notify`, so `Type=notify` and `WatchdogSec=` work out of the box. The PID file is `~/.config/kei/kei.pid` (or `/run/kei.pid` for system installs).
+The unit is `Type=notify` with `WatchdogSec=120`, so kei sends `sd_notify` readiness and watchdog pings; systemd manages the PID directly and no `PIDFile=` is set. `Restart=on-failure` with `RestartSec=10s` keeps the worker alive across crashes.
 
 ### macOS (launchd)
 
@@ -77,11 +77,13 @@ sc.exe qc com.rhoopr.kei
 Start-Service com.rhoopr.kei
 Stop-Service  com.rhoopr.kei
 
-# Logs go to the Windows Event Log under "Application"; filter by source name `kei`
-Get-EventLog -LogName Application -Source kei -Newest 50
+# SCM lifecycle events (start, stop, crash) under source "Service Control Manager"
+Get-EventLog -LogName System -Source "Service Control Manager" -Newest 50 | Where-Object { $_.Message -like "*com.rhoopr.kei*" }
 ```
 
-The service is configured `start= auto` so it runs at every boot.
+The service is configured `start= auto` so it runs at every boot. Failure actions: SCM restarts the worker up to three times with a 10-second delay between attempts; the failure counter resets after 24 hours of clean uptime.
+
+kei's own log output (the `tracing` lines you see when running `kei sync` in a terminal) goes to stderr, which SCM discards. There is no first-class log-file destination configured by `kei install` on Windows in v0.14. To inspect kei's runtime behavior, run `kei sync` directly from PowerShell with the same flags rather than relying on the SCM-managed worker.
 
 ## Checking status
 

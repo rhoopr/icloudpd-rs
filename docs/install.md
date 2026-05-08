@@ -38,7 +38,9 @@ Linux supports both per-user (default) and system-wide installs.
 kei install --user
 ```
 
-Writes `~/.config/systemd/user/kei.service`, runs `systemctl --user daemon-reload`, and enables the unit so it starts immediately and on every login. kei also tries `loginctl enable-linger $USER` so the service keeps running when you log out; this step needs polkit and is best-effort. If linger fails, the service runs only while you're logged in.
+Writes `~/.config/systemd/user/kei.service`, runs `systemctl --user daemon-reload`, and enables the unit so it starts immediately and on every login.
+
+kei also attempts `loginctl enable-linger $USER` so the service keeps running after you log out. That call goes through polkit and may be denied; if it fails, the unit still works while you're logged in but stops when your session ends. Re-run `sudo loginctl enable-linger $USER` manually to enable lingering, or accept the per-session lifetime.
 
 Verify with:
 
@@ -79,7 +81,7 @@ kei install
 
 Run this from an **elevated** PowerShell prompt (right-click PowerShell -> Run as administrator). Service Control Manager `CreateService` requires admin rights, and a non-elevated install fails with `Access is denied`.
 
-`kei install` registers `com.rhoopr.kei` with SCM, set to run as your Windows user account. You'll be prompted for your account password during install: SCM stores it in LSA so the service can start under your identity at boot, and so it can read your Credential Manager vault for the iCloud password.
+`kei install` registers `com.rhoopr.kei` with SCM, set to run as your Windows user account. You'll be prompted for your account password during install: SCM stores it in the Local Security Authority (LSA) so the service can start under your identity at boot, and so it can read your iCloud password from Credential Manager. See [credential-storage.md](credential-storage.md) for how kei stores the iCloud password itself.
 
 Per-user services aren't a Windows concept; `--user` and `--system` are both ignored. There is one install per machine.
 
