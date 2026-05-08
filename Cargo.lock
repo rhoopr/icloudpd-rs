@@ -1458,6 +1458,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "windows-service",
+ "windows-sys 0.52.0",
  "wiremock",
  "xmp_toolkit",
 ]

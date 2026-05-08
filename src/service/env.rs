@@ -149,6 +149,18 @@ pub(crate) fn purge_kei_state(kei_dir: &Path, extra_dirs: &[PathBuf]) -> Result<
     }
 }
 
+/// kei state directory at the dotted-config convention.
+///
+/// macOS and Windows both bypass `dirs::config_dir()` (which returns
+/// `~/Library/Application Support` and `%APPDATA%\Roaming` respectively)
+/// so the data dir matches the rest of the codebase, where
+/// `~/.config/kei` is hard-coded in `setup.rs` and `migration.rs`.
+/// Linux honours XDG via `dirs::config_dir().join("kei")` and resolves
+/// its own path -- this helper is for the platforms that don't.
+pub(crate) fn kei_state_dir_dotted() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".config/kei"))
+}
+
 /// Canonical absolute path to the running `kei` executable.
 ///
 /// Service unit files / launchd plists / SCM entries reference an

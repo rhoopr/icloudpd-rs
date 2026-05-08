@@ -1,9 +1,8 @@
 //! Windows-only integration tests for `kei install` / `kei uninstall` /
-//! `kei service status`. The full SCM round-trip lands in PR 8's smoke
-//! matrix (which runs on a real elevated Windows runner). What this file
-//! covers is the surface the smoke matrix can't easily probe: dry-run
-//! preview output, `--system` rejection, friendly error when running
-//! non-elevated, and `kei uninstall` on a host with no kei service.
+//! `kei service status`. Covers the surface the cross-platform smoke
+//! matrix cannot easily probe: dry-run preview output, `--system`
+//! rejection, and clean no-op behaviour on a host with no kei service
+//! registered.
 //!
 //! Gated to Windows so the file is a no-op on linux/macOS hosts. The
 //! cross-platform CLI parsing is covered separately in `service_cli.rs`.

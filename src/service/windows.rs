@@ -7,23 +7,17 @@
 //! login password via rpassword and pass it to `CreateServiceW` as the
 //! LSA secret; SCM launches the daemon under that user's profile so the
 //! Credential Manager vault and `~/.config/kei` data dir match the
-//! interactive login. Same convention as the macOS / linux backends.
+//! interactive login.
 //!
-//! Domain users / roaming profiles are documented as a v0.14 limitation
-//! (the `.\<user>` LSA-secret form covers local-machine accounts only).
+//! Domain-user / roaming-profile accounts are out of scope: the
+//! `.\<user>` LSA-secret form covers local-machine accounts only.
 //!
-//! `kei service run` on Windows does double duty: when SCM launches the
-//! binary it must call `StartServiceCtrlDispatcher` within 30s or SCM
-//! kills the process. [`run_under_scm_or_foreground`] tries the
+//! `kei service run` on Windows double-dispatches: when SCM launches
+//! the binary, `StartServiceCtrlDispatcher` must be called within 30s
+//! or SCM kills the process. [`run_under_scm_or_foreground`] tries the
 //! dispatcher first; on `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` it
 //! falls through to a foreground sync-loop run for `kei service run`
 //! invoked from a terminal.
-//!
-//! The PR 8 smoke matrix is what exercises a full install -> stop ->
-//! uninstall round-trip on a real Windows runner. Locally on linux/macOS
-//! only the renderer + status-formatter helpers compile and run; those
-//! carry inline unit tests so a regression in their shape is caught
-//! before the windows-latest job ever sees the change.
 
 #![allow(
     clippy::print_stdout,
@@ -38,7 +32,8 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::cli::{InstallArgs, UninstallArgs};
 use crate::service::env::{
-    current_executable, purge_kei_state, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER,
+    current_executable, kei_state_dir_dotted, purge_kei_state, SERVICE_DESCRIPTION,
+    SERVICE_IDENTIFIER,
 };
 
 /// SCM service name (matches `SERVICE_IDENTIFIER` so `sc.exe query
@@ -48,14 +43,11 @@ pub(crate) const SERVICE_NAME: &str = SERVICE_IDENTIFIER;
 /// Restart-on-failure cadence applied via `ChangeServiceConfig2W`.
 const RESTART_DELAY: Duration = Duration::from_secs(10);
 
+/// Number of times SCM should restart kei after a crash before giving up.
+const RESTART_COUNT: usize = 3;
+
 /// Window over which SCM counts crashes against the failure action list.
 const FAILURE_RESET_PERIOD: Duration = Duration::from_secs(86_400);
-
-/// Subdirectory used everywhere: linux honours XDG, macOS hard-codes
-/// `~/.config/kei`, Windows mirrors macOS so the operator sees a
-/// consistent path across platforms (and so `kei uninstall --purge`
-/// removes the same tree `kei sync` populated).
-const KEI_STATE_SUBDIR: &str = ".config/kei";
 
 // ── Public surface ──────────────────────────────────────────────────────
 
@@ -101,11 +93,10 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
     Ok(())
 }
 
-/// `--system` is rejected here for the same reason as macOS: a true
-/// system-wide install would mean LocalSystem (no user keyring) or a
-/// virtual `NT SERVICE\kei` account (no Credential Manager). Both
-/// would break the cross-platform "credentials follow the operator"
-/// promise from the v0.14 phase-1 plan.
+/// `--system` is rejected: a system-wide install would mean LocalSystem
+/// (no user keyring) or a virtual `NT SERVICE\kei` account (no
+/// Credential Manager). Both break the "credentials follow the
+/// operator" contract the per-user form provides.
 pub(crate) async fn install_system(_args: &InstallArgs, _config_path: &Path) -> Result<()> {
     bail!(
         "`kei install --system` is not supported on Windows; \
@@ -203,12 +194,42 @@ fn render_service_info_preview(inputs: &ServiceInfoInputs<'_>) -> String {
          Service type        : OWN_PROCESS\n\
          Start type          : AUTO_START\n\
          Error control       : NORMAL\n\
-         Failure actions     : restart x3, delay {delay}s, reset after {reset}s\n\
+         Failure actions     : restart x{count}, delay {delay}s, reset after {reset}s\n\
          Binary path         : {argv}",
         account = inputs.account_name(),
+        count = RESTART_COUNT,
         delay = RESTART_DELAY.as_secs(),
         reset = FAILURE_RESET_PERIOD.as_secs(),
     )
+}
+
+/// Mirror of `windows_service::service::ServiceState` that compiles on
+/// every target. The runtime arm in `scm_impl` maps the windows-service
+/// enum into this view so the renderer + its tests stay reachable from
+/// linux/macOS hosts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceStateView {
+    Running,
+    Stopped,
+    StartPending,
+    StopPending,
+    ContinuePending,
+    PausePending,
+    Paused,
+}
+
+impl ServiceStateView {
+    fn label(self) -> &'static str {
+        match self {
+            ServiceStateView::Running => "running",
+            ServiceStateView::Stopped => "stopped",
+            ServiceStateView::StartPending => "start-pending",
+            ServiceStateView::StopPending => "stop-pending",
+            ServiceStateView::ContinuePending => "continue-pending",
+            ServiceStateView::PausePending => "pause-pending",
+            ServiceStateView::Paused => "paused",
+        }
+    }
 }
 
 /// Inputs the status renderer accepts. Decoupled from the
@@ -219,7 +240,7 @@ enum StatusInputs {
     NotInstalled,
     ScmUnavailable,
     Probed {
-        state: &'static str,
+        state: ServiceStateView,
         pid: Option<u32>,
     },
 }
@@ -227,17 +248,21 @@ enum StatusInputs {
 fn render_status(inputs: StatusInputs) -> String {
     match inputs {
         StatusInputs::NotInstalled => "Service: not installed".to_string(),
+        // SCM is unavailable when called from a non-elevated shell or
+        // (rare) when the Service Control Manager itself is down.
+        // Surface the cause; "not installed" would lie.
         StatusInputs::ScmUnavailable => {
-            // SCM is unavailable when called from a non-elevated shell or
-            // (rare) when the Service Control Manager itself is down.
-            // Either way, surface the cause; "not installed" would lie.
             "Service: SCM unavailable (run from an elevated PowerShell to query state)".to_string()
         }
-        StatusInputs::Probed { state, pid } => match (state, pid) {
-            ("running", Some(pid)) => format!("Service: running (windows scm, pid {pid})"),
-            ("running", None) => "Service: running (windows scm)".to_string(),
-            (state, _) => format!("Service: {state} (windows scm)"),
-        },
+        StatusInputs::Probed {
+            state: ServiceStateView::Running,
+            pid: Some(pid),
+        } => format!("Service: running (windows scm, pid {pid})"),
+        StatusInputs::Probed {
+            state: ServiceStateView::Running,
+            pid: None,
+        } => "Service: running (windows scm)".to_string(),
+        StatusInputs::Probed { state, .. } => format!("Service: {} (windows scm)", state.label()),
     }
 }
 
@@ -257,7 +282,7 @@ fn current_user_name() -> Option<String> {
 }
 
 fn kei_state_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(KEI_STATE_SUBDIR))
+    kei_state_dir_dotted()
 }
 
 fn prompt_windows_password(user: &str) -> Result<String> {
@@ -278,7 +303,7 @@ fn prompt_windows_password(user: &str) -> Result<String> {
 #[cfg(target_os = "windows")]
 mod scm_impl {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use windows_service::{
         define_windows_service,
         service::{
@@ -290,75 +315,77 @@ mod scm_impl {
         service_dispatcher,
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
-
-    /// 1060 = ERROR_SERVICE_DOES_NOT_EXIST.
-    const WINAPI_SERVICE_DOES_NOT_EXIST: i32 = 1060;
-    /// 1063 = ERROR_FAILED_SERVICE_CONTROLLER_CONNECT — what
-    /// `StartServiceCtrlDispatcher` returns when the binary is run from a
-    /// terminal instead of by SCM.
-    const WINAPI_NOT_RUNNING_AS_SERVICE: i32 = 1063;
+    use windows_sys::Win32::Foundation::{
+        ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_SERVICE_DOES_NOT_EXIST,
+    };
 
     /// Bridge between the async caller in `service::run::run` and the
     /// SCM service-main callback that runs on a thread spawned by the
     /// windows-service dispatcher. The OS thread that `kei_service_main`
     /// runs on cannot capture our async-context payload by closure (the
     /// callback signature is fixed by the FFI contract), so we stash it
-    /// in this static, take it inside the callback, and the foreground
-    /// fall-through path takes it back when the dispatcher refuses.
-    static SCM_PAYLOAD: OnceLock<Mutex<Option<ScmPayload>>> = OnceLock::new();
+    /// here, the callback takes it, and the foreground fall-through
+    /// path takes it back when the dispatcher refuses.
+    static SCM_PAYLOAD: Mutex<Option<ScmPayload>> = Mutex::new(None);
 
-    /// Channel sender published by the service-main thread once it has
-    /// registered its event handler. The SCM stop event is delivered on
-    /// a separate OS thread, so the handler signals shutdown by sending
-    /// on this channel which the sync-loop runtime observes via select!.
-    static SCM_SHUTDOWN_TX: OnceLock<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> =
-        OnceLock::new();
+    /// SCM stop is delivered on a thread separate from the one running
+    /// `service_main_inner`; the handler signals shutdown by sending
+    /// on this oneshot which the sync-loop runtime observes via select!.
+    static SCM_SHUTDOWN_TX: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
 
     struct ScmPayload {
         globals: crate::config::GlobalArgs,
         sync: crate::sync_loop::SyncArgs,
     }
 
-    fn payload_slot() -> &'static Mutex<Option<ScmPayload>> {
-        SCM_PAYLOAD.get_or_init(|| Mutex::new(None))
+    /// Owned form of [`ServiceInfoInputs`] -- crosses the spawn_blocking
+    /// boundary, so cannot borrow from the async caller.
+    struct OwnedServiceInfoInputs {
+        exec: PathBuf,
+        config: PathBuf,
+        account_user: String,
     }
 
-    fn shutdown_slot() -> &'static Mutex<Option<tokio::sync::oneshot::Sender<()>>> {
-        SCM_SHUTDOWN_TX.get_or_init(|| Mutex::new(None))
+    impl OwnedServiceInfoInputs {
+        fn as_borrowed(&self) -> ServiceInfoInputs<'_> {
+            ServiceInfoInputs {
+                exec: &self.exec,
+                config: &self.config,
+                account_user: &self.account_user,
+            }
+        }
+    }
+
+    fn raw_os_error(e: &windows_service::Error) -> Option<u32> {
+        match e {
+            windows_service::Error::Winapi(io) => io.raw_os_error().map(|n| n as u32),
+            _ => None,
+        }
     }
 
     pub(super) async fn install(inputs: &ServiceInfoInputs<'_>, password: &str) -> Result<()> {
-        let exec = inputs.exec.to_path_buf();
-        let config = inputs.config.to_path_buf();
-        let account_user = inputs.account_user.to_string();
+        let owned = OwnedServiceInfoInputs {
+            exec: inputs.exec.to_path_buf(),
+            config: inputs.config.to_path_buf(),
+            account_user: inputs.account_user.to_string(),
+        };
         let password = password.to_owned();
-        tokio::task::spawn_blocking(move || {
-            install_blocking(&exec, &config, &account_user, &password)
-        })
-        .await
-        .context("install task panicked")?
+        tokio::task::spawn_blocking(move || install_blocking(&owned, &password))
+            .await
+            .context("install task panicked")?
     }
 
-    fn install_blocking(
-        exec: &Path,
-        config: &Path,
-        account_user: &str,
-        password: &str,
-    ) -> Result<()> {
+    fn install_blocking(owned: &OwnedServiceInfoInputs, password: &str) -> Result<()> {
         let manager =
             open_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-        let inputs = ServiceInfoInputs {
-            exec,
-            config,
-            account_user,
-        };
+        let inputs = owned.as_borrowed();
         let info = ServiceInfo {
             name: OsString::from(SERVICE_NAME),
             display_name: OsString::from(SERVICE_DESCRIPTION),
             service_type: ServiceType::OWN_PROCESS,
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
-            executable_path: exec.to_path_buf(),
+            executable_path: owned.exec.clone(),
             launch_arguments: inputs.launch_arguments(),
             dependencies: Vec::new(),
             account_name: Some(OsString::from(inputs.account_name())),
@@ -383,7 +410,7 @@ mod scm_impl {
                         action_type: ServiceActionType::Restart,
                         delay: RESTART_DELAY,
                     };
-                    3
+                    RESTART_COUNT
                 ]),
             })
             .context("ChangeServiceConfig2W (failure actions) failed")?;
@@ -403,9 +430,7 @@ mod scm_impl {
         let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
         let service = match manager.open_service(SERVICE_NAME, access) {
             Ok(s) => s,
-            Err(windows_service::Error::Winapi(ref e))
-                if e.raw_os_error() == Some(WINAPI_SERVICE_DOES_NOT_EXIST) =>
-            {
+            Err(ref e) if raw_os_error(e) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
                 return Ok(false);
             }
             Err(e) => return Err(anyhow!("OpenServiceW failed: {e}")),
@@ -445,9 +470,7 @@ mod scm_impl {
         };
         let service = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
             Ok(s) => s,
-            Err(windows_service::Error::Winapi(ref e))
-                if e.raw_os_error() == Some(WINAPI_SERVICE_DOES_NOT_EXIST) =>
-            {
+            Err(ref e) if raw_os_error(e) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
                 return Ok(StatusInputs::NotInstalled);
             }
             Err(e) => return Err(anyhow!("OpenServiceW failed: {e}")),
@@ -456,7 +479,7 @@ mod scm_impl {
             .query_status()
             .context("QueryServiceStatusEx failed")?;
         Ok(StatusInputs::Probed {
-            state: scm_state_label(status.current_state),
+            state: service_state_view(status.current_state),
             pid: status.process_id,
         })
     }
@@ -468,15 +491,15 @@ mod scm_impl {
         )
     }
 
-    fn scm_state_label(state: ServiceState) -> &'static str {
+    fn service_state_view(state: ServiceState) -> ServiceStateView {
         match state {
-            ServiceState::Running => "running",
-            ServiceState::Stopped => "stopped",
-            ServiceState::StartPending => "start-pending",
-            ServiceState::StopPending => "stop-pending",
-            ServiceState::ContinuePending => "continue-pending",
-            ServiceState::PausePending => "pause-pending",
-            ServiceState::Paused => "paused",
+            ServiceState::Running => ServiceStateView::Running,
+            ServiceState::Stopped => ServiceStateView::Stopped,
+            ServiceState::StartPending => ServiceStateView::StartPending,
+            ServiceState::StopPending => ServiceStateView::StopPending,
+            ServiceState::ContinuePending => ServiceStateView::ContinuePending,
+            ServiceState::PausePending => ServiceStateView::PausePending,
+            ServiceState::Paused => ServiceStateView::Paused,
         }
     }
 
@@ -488,10 +511,9 @@ mod scm_impl {
         globals: crate::config::GlobalArgs,
         sync: crate::sync_loop::SyncArgs,
     ) -> Result<()> {
-        // Stash payload so the SCM-spawned service-main thread can take
-        // it; this happens *before* the dispatcher attempt so the OS
-        // thread can never observe an empty slot.
-        *payload_slot().lock().unwrap() = Some(ScmPayload { globals, sync });
+        // Stash payload before the dispatcher attempt so the SCM-spawned
+        // service-main thread cannot observe an empty slot.
+        *SCM_PAYLOAD.lock().unwrap() = Some(ScmPayload { globals, sync });
 
         let dispatcher_result = tokio::task::spawn_blocking(|| {
             service_dispatcher::start(SERVICE_NAME, ffi_service_main)
@@ -501,22 +523,16 @@ mod scm_impl {
 
         match dispatcher_result {
             Ok(()) => {
-                // SCM took over and the service ran to completion.
                 tracing::info!(service = SERVICE_NAME, "SCM-managed service exited cleanly");
                 Ok(())
             }
-            Err(windows_service::Error::Winapi(ref e))
-                if e.raw_os_error() == Some(WINAPI_NOT_RUNNING_AS_SERVICE) =>
-            {
-                // Foreground invocation -- e.g. operator running
-                // `kei service run` from PowerShell. Recover the
-                // payload and run the sync loop directly.
+            Err(ref e) if raw_os_error(e) == Some(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) => {
                 tracing::info!(
                     service = SERVICE_NAME,
                     "kei service run invoked outside SCM; running in foreground"
                 );
                 let payload =
-                    payload_slot().lock().unwrap().take().ok_or_else(|| {
+                    SCM_PAYLOAD.lock().unwrap().take().ok_or_else(|| {
                         anyhow!("internal: SCM payload missing on foreground path")
                     })?;
                 crate::sync_loop::run_sync(&payload.globals, payload.sync).await
@@ -533,12 +549,12 @@ mod scm_impl {
 
     fn service_main_inner() -> Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        *shutdown_slot().lock().unwrap() = Some(shutdown_tx);
+        *SCM_SHUTDOWN_TX.lock().unwrap() = Some(shutdown_tx);
 
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
             match control_event {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
-                    if let Some(tx) = shutdown_slot().lock().unwrap().take() {
+                    if let Some(tx) = SCM_SHUTDOWN_TX.lock().unwrap().take() {
                         let _ = tx.send(());
                     }
                     ServiceControlHandlerResult::NoError
@@ -552,33 +568,34 @@ mod scm_impl {
             .context("RegisterServiceCtrlHandlerExW failed")?;
 
         status_handle
-            .set_service_status(running_status())
+            .set_service_status(service_status(ServiceState::Running, 0))
             .context("set_service_status(running) failed")?;
 
         let outcome = run_payload_under_scm(shutdown_rx);
 
         // Always report Stopped, even on error -- otherwise SCM keeps
-        // the service in StartPending until the wait_hint elapses and
-        // then force-kills the process, which is a worse signal than a
-        // clean stop with a non-zero exit code.
-        let report_result = status_handle.set_service_status(stopped_status(outcome.is_ok()));
-        if let Err(e) = report_result {
+        // the service in StartPending until wait_hint elapses and then
+        // force-kills the process, which is a worse signal than a clean
+        // stop with a non-zero exit code.
+        let exit_code = if outcome.is_ok() { 0 } else { 1 };
+        let report =
+            status_handle.set_service_status(service_status(ServiceState::Stopped, exit_code));
+        if let Err(e) = report {
             tracing::error!(error = %e, "failed to report Stopped to SCM");
         }
         outcome
     }
 
     fn run_payload_under_scm(mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
-        let payload = payload_slot()
+        let payload = SCM_PAYLOAD
             .lock()
             .unwrap()
             .take()
             .ok_or_else(|| anyhow!("kei service main started without a stashed payload"))?;
 
         // Dedicated single-thread runtime for the sync loop. Lives on
-        // this OS thread (the one SCM spawned for service main); the
-        // foreground caller's runtime, if any, is on a different thread
-        // and unaffected.
+        // the OS thread SCM spawned for service main; the foreground
+        // caller's runtime, if any, is on a different thread.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -595,24 +612,21 @@ mod scm_impl {
         })
     }
 
-    fn running_status() -> ServiceStatus {
+    /// Builds a `ServiceStatus` for the two states this backend reports.
+    /// `Running` accepts STOP/SHUTDOWN; `Stopped` accepts nothing and
+    /// carries the exit code. Other states (StartPending, etc.) would
+    /// need additional shape (`checkpoint`, `wait_hint`) so they are
+    /// not built here.
+    fn service_status(state: ServiceState, exit_code: u32) -> ServiceStatus {
+        let controls_accepted = match state {
+            ServiceState::Running => ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            _ => ServiceControlAccept::empty(),
+        };
         ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
-            current_state: ServiceState::Running,
-            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-            exit_code: ServiceExitCode::Win32(0),
-            checkpoint: 0,
-            wait_hint: Duration::default(),
-            process_id: None,
-        }
-    }
-
-    fn stopped_status(success: bool) -> ServiceStatus {
-        ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: ServiceState::Stopped,
-            controls_accepted: ServiceControlAccept::empty(),
-            exit_code: ServiceExitCode::Win32(if success { 0 } else { 1 }),
+            current_state: state,
+            controls_accepted,
+            exit_code: ServiceExitCode::Win32(exit_code),
             checkpoint: 0,
             wait_hint: Duration::default(),
             process_id: None,
@@ -632,11 +646,17 @@ mod scm_impl {
     }
 
     pub(super) async fn uninstall_existing() -> Result<bool> {
-        Ok(false)
+        bail!(
+            "internal error: Windows uninstall path reached on a non-Windows target; \
+             this is a build configuration bug"
+        )
     }
 
     pub(super) async fn probe() -> Result<StatusInputs> {
-        Ok(StatusInputs::NotInstalled)
+        bail!(
+            "internal error: Windows status path reached on a non-Windows target; \
+             this is a build configuration bug"
+        )
     }
 }
 
@@ -651,21 +671,32 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn sample_inputs() -> ServiceInfoInputs<'static> {
-        static EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        static CFG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        let exe = EXE.get_or_init(|| PathBuf::from(r"C:\Program Files\kei\kei.exe"));
-        let cfg = CFG.get_or_init(|| PathBuf::from(r"C:\Users\Alice\.config\kei\config.toml"));
-        ServiceInfoInputs {
-            exec: exe.as_path(),
-            config: cfg.as_path(),
-            account_user: "Alice",
+    struct SampleFixture {
+        exe: PathBuf,
+        cfg: PathBuf,
+    }
+
+    impl SampleFixture {
+        fn new() -> Self {
+            Self {
+                exe: PathBuf::from(r"C:\Program Files\kei\kei.exe"),
+                cfg: PathBuf::from(r"C:\Users\Alice\.config\kei\config.toml"),
+            }
+        }
+
+        fn inputs(&self) -> ServiceInfoInputs<'_> {
+            ServiceInfoInputs {
+                exec: &self.exe,
+                config: &self.cfg,
+                account_user: "Alice",
+            }
         }
     }
 
     #[test]
     fn launch_arguments_pass_service_run_with_config() {
-        let argv = sample_inputs().launch_arguments();
+        let fixture = SampleFixture::new();
+        let argv = fixture.inputs().launch_arguments();
         let strs: Vec<String> = argv
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -678,20 +709,20 @@ mod tests {
 
     #[test]
     fn account_name_uses_local_machine_prefix() {
-        // `.\Alice` is the SCM "local machine, account Alice" form.
-        // Domain users (`DOMAIN\Alice`) are out of scope for v0.14.
-        assert_eq!(sample_inputs().account_name(), r".\Alice");
+        // `.\Alice` is the SCM "local machine, account Alice" form;
+        // domain accounts (`DOMAIN\Alice`) are out of scope.
+        let fixture = SampleFixture::new();
+        assert_eq!(fixture.inputs().account_name(), r".\Alice");
     }
 
     #[test]
     fn render_service_info_preview_lists_every_field() {
         // SERVICE_NAME / SERVICE_DESCRIPTION are platform-resolved
         // constants -- on linux SERVICE_IDENTIFIER is "kei", on
-        // macOS/Windows it is "com.rhoopr.kei". Reference the constant
-        // in the assertion so the test passes on every host that runs
-        // it (linux + macOS + windows; the Windows-resolved string is
-        // what the smoke matrix verifies against `sc.exe qc`).
-        let preview = render_service_info_preview(&sample_inputs());
+        // macOS/Windows it is "com.rhoopr.kei". Reference the constants
+        // in the assertion so the test passes on every host.
+        let fixture = SampleFixture::new();
+        let preview = render_service_info_preview(&fixture.inputs());
         for needle in [
             format!("Service name        : {SERVICE_NAME}"),
             format!("Display name        : {SERVICE_DESCRIPTION}"),
@@ -700,7 +731,11 @@ mod tests {
             "Service type        : OWN_PROCESS".to_string(),
             "Start type          : AUTO_START".to_string(),
             "Error control       : NORMAL".to_string(),
-            "Failure actions     : restart x3, delay 10s, reset after 86400s".to_string(),
+            format!(
+                "Failure actions     : restart x{RESTART_COUNT}, delay {}s, reset after {}s",
+                RESTART_DELAY.as_secs(),
+                FAILURE_RESET_PERIOD.as_secs(),
+            ),
             r"Binary path         : C:\Program Files\kei\kei.exe service run --config C:\Users\Alice\.config\kei\config.toml".to_string(),
         ] {
             assert!(
@@ -723,14 +758,14 @@ mod tests {
         let line = render_status(StatusInputs::ScmUnavailable);
         assert!(line.starts_with("Service: SCM unavailable"));
         // Operator hint about elevation belongs in the same line so a
-        // tail -f / log-collector picks it up alongside the verdict.
+        // tail -f / log collector picks it up alongside the verdict.
         assert!(line.contains("elevated PowerShell"));
     }
 
     #[test]
     fn render_status_includes_pid_when_running() {
         let line = render_status(StatusInputs::Probed {
-            state: "running",
+            state: ServiceStateView::Running,
             pid: Some(4321),
         });
         assert_eq!(line, "Service: running (windows scm, pid 4321)");
@@ -742,7 +777,7 @@ mod tests {
         // start-pending -> running transition; we should not lose the
         // "running" verdict just because the pid was racing.
         let line = render_status(StatusInputs::Probed {
-            state: "running",
+            state: ServiceStateView::Running,
             pid: None,
         });
         assert_eq!(line, "Service: running (windows scm)");
@@ -750,42 +785,20 @@ mod tests {
 
     #[test]
     fn render_status_renders_non_running_states() {
-        for state in [
-            "stopped",
-            "start-pending",
-            "stop-pending",
-            "paused",
-            "continue-pending",
-            "pause-pending",
-        ] {
+        let cases = [
+            (ServiceStateView::Stopped, "stopped"),
+            (ServiceStateView::StartPending, "start-pending"),
+            (ServiceStateView::StopPending, "stop-pending"),
+            (ServiceStateView::Paused, "paused"),
+            (ServiceStateView::ContinuePending, "continue-pending"),
+            (ServiceStateView::PausePending, "pause-pending"),
+        ];
+        for (state, expected) in cases {
             let line = render_status(StatusInputs::Probed {
                 state,
                 pid: Some(1),
             });
-            assert_eq!(line, format!("Service: {state} (windows scm)"));
+            assert_eq!(line, format!("Service: {expected} (windows scm)"));
         }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn current_user_falls_back_to_userprofile_basename() {
-        // Direct unit test of the parsing shape used by the fallback
-        // path. We don't mutate process env on every CI host; this
-        // covers the basename extraction independently. Gated to
-        // Windows because `Path::file_name` only treats '\' as a
-        // separator on Windows targets -- on linux the same input
-        // round-trips as a single filename.
-        let basename = Path::new(r"C:\Users\Alice")
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned());
-        assert_eq!(basename.as_deref(), Some("Alice"));
-    }
-
-    #[test]
-    fn kei_state_subdir_matches_macos_and_linux_convention() {
-        // The other backends hard-code `~/.config/kei`. Regression-guard
-        // against a casual edit that would split Windows off into
-        // `%APPDATA%\kei`.
-        assert_eq!(KEI_STATE_SUBDIR, ".config/kei");
     }
 }

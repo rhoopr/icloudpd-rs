@@ -126,12 +126,11 @@ fn user_log_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(LOG_SUBDIR))
 }
 
-/// kei state directory on macOS: `~/.config/kei`, matching linux. This
-/// deliberately does *not* use `dirs::config_dir()` because that resolves
-/// to `~/Library/Application Support` on macOS, which conflicts with the
-/// rest of the codebase (config.rs / setup.rs hard-code the dotted path).
+/// kei state directory on macOS: `~/.config/kei`, matching linux. Just
+/// re-exports `env::kei_state_dir_dotted` so the macOS uninstall path
+/// reads the same way the Windows one does.
 fn kei_state_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".config/kei"))
+    crate::service::env::kei_state_dir_dotted()
 }
 
 pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Result<()> {
