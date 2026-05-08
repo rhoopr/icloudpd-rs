@@ -1,11 +1,12 @@
-//! CLI parsing + container-guard tests for `kei install`, `kei uninstall`,
+//! Cross-platform CLI parsing tests for `kei install`, `kei uninstall`,
 //! and `kei service {run,status}`.
 //!
-//! The per-platform install backends (launchd, systemd, Windows SCM) land
-//! in PRs 3-5; until then `install` / `uninstall` / `service status`
-//! return a clean "not yet implemented" error and the tests below assert
-//! the contract: subcommand parsing, `--help` rendering, mutually
-//! exclusive flags, and a friendly stub error rather than a panic.
+//! Tests in this file must hold on every target. Platform-specific
+//! behavior — actually writing a unit file or invoking systemctl — lives
+//! in `tests/service_linux.rs` (and analogous suites for macOS / Windows
+//! once PRs 4-5 land). The "not yet implemented" assertions for macOS /
+//! Windows are gated to those targets so PR 3's Linux backend doesn't
+//! make them lie.
 
 #![allow(
     clippy::unwrap_used,
@@ -103,19 +104,38 @@ fn install_user_and_system_are_mutually_exclusive() {
 }
 
 #[test]
-fn uninstall_accepts_purge_flag() {
-    // Stub returns NotImplemented (exit 1); the relevant assertion is
-    // that --purge parses cleanly, which the failure mode at exit 1
-    // (vs. a clap parse error at exit 2) confirms.
+fn uninstall_accepts_purge_flag_via_clap() {
+    // Cross-platform check: clap parses `--purge` as a known flag (no
+    // exit-2 parse error). The actual uninstall behavior is asserted
+    // per-platform; here we just confirm the surface accepts the flag
+    // without flagging it as unknown.
     cmd()
-        .args(["uninstall", "--purge"])
+        .args(["uninstall", "--purge", "--help"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
+        .success()
+        .stdout(predicate::str::contains("--purge"));
 }
 
-// ── Stub error contract ─────────────────────────────────────────────────
+#[test]
+fn install_accepts_dry_run_flag_via_clap() {
+    // Same shape as --purge: assert clap recognizes `--dry-run` rather
+    // than executing the install. The Linux backend exercises the
+    // dry-run end-to-end in tests/service_linux.rs.
+    cmd()
+        .args(["install", "--dry-run", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dry-run"));
+}
 
+// ── Stub error contract (non-Linux only) ────────────────────────────────
+//
+// PR 3 lands the Linux backend, so on Linux these no longer return a
+// "not yet implemented" error. PRs 4 (macOS) and 5 (Windows) replace
+// the stubs on those targets too — the cfg gate auto-deactivates each
+// test as its platform's backend lands.
+
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn install_returns_clean_not_implemented_error() {
     cmd()
@@ -125,6 +145,7 @@ fn install_returns_clean_not_implemented_error() {
         .stderr(predicate::str::contains("not yet implemented"));
 }
 
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn uninstall_returns_clean_not_implemented_error() {
     cmd()
@@ -134,6 +155,7 @@ fn uninstall_returns_clean_not_implemented_error() {
         .stderr(predicate::str::contains("not yet implemented"));
 }
 
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn service_status_returns_clean_not_implemented_error() {
     cmd()

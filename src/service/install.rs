@@ -12,12 +12,10 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 use crate::cli::InstallArgs;
-use crate::service::env::{
-    current_executable, is_in_container, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER,
-};
+use crate::service::env::is_in_container;
 
 pub(crate) async fn run(args: InstallArgs, config_path: &Path) -> Result<()> {
     if is_in_container() {
@@ -28,6 +26,22 @@ pub(crate) async fn run(args: InstallArgs, config_path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    dispatch(args, config_path).await
+}
+
+#[cfg(target_os = "linux")]
+async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
+    use crate::service::linux;
+    if args.system {
+        linux::install_system(&args, config_path).await
+    } else {
+        linux::install_user(&args, config_path).await
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
+    use crate::service::env::{current_executable, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER};
     let exe = current_executable()?;
     tracing::info!(
         service = SERVICE_IDENTIFIER,
@@ -36,11 +50,11 @@ pub(crate) async fn run(args: InstallArgs, config_path: &Path) -> Result<()> {
         config = %config_path.display(),
         user = args.user,
         system = args.system,
+        dry_run = args.dry_run,
         "preparing to install kei service",
     );
-
-    Err(anyhow!(
+    Err(anyhow::anyhow!(
         "`kei install` is not yet implemented on this platform; \
-         per-platform installers land in follow-up PRs (Linux first)"
+         macOS launchd lands in PR 4 and Windows SCM in PR 5"
     ))
 }

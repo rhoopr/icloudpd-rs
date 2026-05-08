@@ -736,6 +736,13 @@ pub struct InstallArgs {
     /// Windows the per-platform default is used regardless of this flag.
     #[arg(long, conflicts_with = "user")]
     pub system: bool,
+
+    /// Render the service file and report what would happen, without
+    /// invoking the platform service manager (no `systemctl daemon-reload`,
+    /// no `launchctl bootstrap`, no SCM `CreateService`). The unit file is
+    /// still written to disk so it can be inspected.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Arguments for `kei uninstall`.

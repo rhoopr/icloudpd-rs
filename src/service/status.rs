@@ -6,11 +6,21 @@
 //! backend modules introduced by PR 3+; until those land this command
 //! returns a placeholder error rather than a misleading "not installed".
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 pub(crate) async fn run() -> Result<()> {
-    Err(anyhow!(
-        "`kei service status` is not yet implemented; \
-         status reporting lands alongside the per-platform install backends"
+    dispatch().await
+}
+
+#[cfg(target_os = "linux")]
+async fn dispatch() -> Result<()> {
+    crate::service::linux::status().await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn dispatch() -> Result<()> {
+    Err(anyhow::anyhow!(
+        "`kei service status` is not yet implemented on this platform; \
+         macOS launchd lands in PR 4 and Windows SCM in PR 5"
     ))
 }

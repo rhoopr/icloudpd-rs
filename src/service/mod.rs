@@ -13,3 +13,6 @@ pub(crate) mod install;
 pub(crate) mod run;
 pub(crate) mod status;
 pub(crate) mod uninstall;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;

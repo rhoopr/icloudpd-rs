@@ -5,10 +5,10 @@
 //! configuration, and stored credentials. Container short-circuit
 //! matches install — compose-managed deployments aren't touched.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 use crate::cli::UninstallArgs;
-use crate::service::env::{is_in_container, SERVICE_IDENTIFIER};
+use crate::service::env::is_in_container;
 
 pub(crate) async fn run(args: UninstallArgs) -> Result<()> {
     if is_in_container() {
@@ -19,14 +19,24 @@ pub(crate) async fn run(args: UninstallArgs) -> Result<()> {
         return Ok(());
     }
 
+    dispatch(args).await
+}
+
+#[cfg(target_os = "linux")]
+async fn dispatch(args: UninstallArgs) -> Result<()> {
+    crate::service::linux::uninstall(&args).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn dispatch(args: UninstallArgs) -> Result<()> {
+    use crate::service::env::SERVICE_IDENTIFIER;
     tracing::info!(
         service = SERVICE_IDENTIFIER,
         purge = args.purge,
         "preparing to uninstall kei service",
     );
-
-    Err(anyhow!(
+    Err(anyhow::anyhow!(
         "`kei uninstall` is not yet implemented on this platform; \
-         per-platform support lands alongside `kei install` in follow-up PRs"
+         macOS launchd lands in PR 4 and Windows SCM in PR 5"
     ))
 }
