@@ -10,6 +10,11 @@
 //! - The canonical executable path is logged on entry. Service files
 //!   reference an absolute exec path; surfacing it in the log lets
 //!   operators confirm the registered binary is the one running.
+//! - On Windows the entry double-dispatches: SCM-launched invocations
+//!   route through [`crate::service::windows::run_under_scm_or_foreground`]
+//!   so `StartServiceCtrlDispatcher` fires within the 30s SCM watchdog;
+//!   foreground invocations fall through to the same `sync_loop::run_sync`
+//!   path other platforms use.
 
 use anyhow::Result;
 
@@ -24,5 +29,12 @@ pub(crate) async fn run(globals: &config::GlobalArgs, args: sync_loop::SyncArgs)
         executable = %exe.display(),
         "starting kei service worker",
     );
+
+    #[cfg(target_os = "windows")]
+    {
+        return crate::service::windows::run_under_scm_or_foreground(globals.clone(), args).await;
+    }
+
+    #[cfg(not(target_os = "windows"))]
     sync_loop::run_sync(globals, args).await
 }

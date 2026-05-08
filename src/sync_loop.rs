@@ -208,6 +208,7 @@ pub(crate) fn service_mode_default_interval(
 }
 
 /// Arguments that [`run_sync`] needs from the CLI dispatch layer.
+#[derive(Clone)]
 pub(crate) struct SyncArgs {
     pub is_one_shot: bool,
     /// True when invoked via `kei service run`. After [`Config::build`]

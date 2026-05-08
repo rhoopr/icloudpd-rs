@@ -22,10 +22,14 @@ async fn dispatch() -> Result<()> {
     crate::service::macos::status().await
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+async fn dispatch() -> Result<()> {
+    crate::service::windows::status().await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn dispatch() -> Result<()> {
     Err(anyhow::anyhow!(
-        "`kei service status` is not yet implemented on this platform; \
-         the Windows SCM backend is still in flight"
+        "`kei service status` is not implemented on this platform"
     ))
 }

@@ -109,7 +109,7 @@ fn install_user_and_system_are_mutually_exclusive() {
 // auto-deactivate via cfg. They guard the macOS / Windows stubs until
 // those backends land.
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[test]
 fn install_returns_clean_not_implemented_error() {
     cmd()
@@ -119,7 +119,7 @@ fn install_returns_clean_not_implemented_error() {
         .stderr(predicate::str::contains("not yet implemented"));
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[test]
 fn uninstall_returns_clean_not_implemented_error() {
     cmd()
@@ -129,7 +129,7 @@ fn uninstall_returns_clean_not_implemented_error() {
         .stderr(predicate::str::contains("not yet implemented"));
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[test]
 fn service_status_returns_clean_not_implemented_error() {
     cmd()

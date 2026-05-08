@@ -32,7 +32,12 @@ async fn dispatch(args: UninstallArgs) -> Result<()> {
     crate::service::macos::uninstall(&args).await
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+async fn dispatch(args: UninstallArgs) -> Result<()> {
+    crate::service::windows::uninstall(&args).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn dispatch(args: UninstallArgs) -> Result<()> {
     use crate::service::env::SERVICE_IDENTIFIER;
     tracing::info!(
@@ -41,7 +46,6 @@ async fn dispatch(args: UninstallArgs) -> Result<()> {
         "preparing to uninstall kei service",
     );
     Err(anyhow::anyhow!(
-        "`kei uninstall` is not yet implemented on this platform; \
-         the Windows SCM backend is still in flight"
+        "`kei uninstall` is not implemented on this platform"
     ))
 }

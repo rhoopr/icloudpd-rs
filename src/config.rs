@@ -948,7 +948,7 @@ pub(crate) fn resolve_path_derivation_fields(
 ///
 /// Bundles the fields that moved from per-command `AuthArgs` to
 /// global options on `Cli`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct GlobalArgs {
     pub username: Option<String>,
     pub domain: Option<Domain>,

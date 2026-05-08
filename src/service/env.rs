@@ -83,7 +83,7 @@ pub(crate) fn is_in_container_at(dockerenv: &Path, cgroup: &Path) -> bool {
 ///
 /// Centralises the one `unsafe` block per backend that wraps
 /// `libc::geteuid` so each platform module doesn't carry its own copy
-/// with a duplicated SAFETY comment. POSIX-only — Windows uses access
+/// with a duplicated SAFETY comment. POSIX-only -- Windows uses access
 /// tokens rather than UIDs, and the linux + macOS service backends are
 /// the only callers.
 #[cfg(unix)]
@@ -97,11 +97,9 @@ pub(crate) fn effective_uid() -> u32 {
 /// Reads `auth.username` out of `kei_dir/config.toml`.
 ///
 /// Returns `None` when the file is missing, malformed, or has no
-/// non-empty username — `--purge` callers treat any of those as "no
-/// credential to clear" and proceed. `cfg(unix)` until the Windows SCM
-/// backend (PR 5) wires up `kei uninstall --purge`; the function itself
-/// uses no unix-only APIs.
-#[cfg(unix)]
+/// non-empty username -- `--purge` callers treat any of those as "no
+/// credential to clear" and proceed. Cross-platform: Linux + macOS +
+/// Windows backends all share this helper.
 pub(crate) fn read_config_username(kei_dir: &Path) -> Option<String> {
     let config_path = kei_dir.join("config.toml");
     let toml = crate::config::load_toml_config(&config_path, false).ok()??;
@@ -111,10 +109,8 @@ pub(crate) fn read_config_username(kei_dir: &Path) -> Option<String> {
 /// Wipes `kei_dir` plus any platform-specific extras after clearing the
 /// stored credential. Each platform's `--purge` path resolves the kei
 /// state directory however it wants (linux honours `XDG_CONFIG_HOME`;
-/// macOS hard-codes `~/.config/kei` rather than `~/Library/Application
-/// Support`) and passes the resolved path here. Same `cfg(unix)` story
-/// as [`read_config_username`].
-#[cfg(unix)]
+/// macOS and Windows hard-code `~/.config/kei` rather than the platform
+/// default config dir) and passes the resolved path here.
 pub(crate) fn purge_kei_state(kei_dir: &Path, extra_dirs: &[PathBuf]) -> Result<()> {
     if let Some(username) = read_config_username(kei_dir) {
         let store = crate::credential::CredentialStore::new(&username, kei_dir);

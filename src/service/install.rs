@@ -1,9 +1,8 @@
 //! `kei install` dispatcher.
 //!
-//! Routes to a per-platform backend (launchd on macOS, systemd on Linux,
+//! Routes to a per-platform backend (systemd on Linux, launchd on macOS,
 //! Windows SCM on Windows) that registers kei to start at boot and run
-//! continuously. Linux and macOS are wired up; Windows currently returns
-//! a clean "not yet implemented" error.
+//! continuously.
 //!
 //! Inside containers the command short-circuits: Docker / Kubernetes /
 //! Podman supervise the process themselves, and writing a launchd plist
@@ -49,7 +48,17 @@ async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
+    use crate::service::windows;
+    if args.system {
+        windows::install_system(&args, config_path).await
+    } else {
+        windows::install_user(&args, config_path).await
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
     use crate::service::env::{current_executable, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER};
     let exe = current_executable()?;
@@ -64,7 +73,6 @@ async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
         "preparing to install kei service",
     );
     Err(anyhow::anyhow!(
-        "`kei install` is not yet implemented on this platform; \
-         the Windows SCM backend is still in flight"
+        "`kei install` is not implemented on this platform"
     ))
 }
