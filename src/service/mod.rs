@@ -17,9 +17,13 @@ pub(crate) mod uninstall;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
 
-// Compiled on every target (renderer + parser are pure, deps are
-// cross-platform) so the inline unit tests run on every host. Only the
-// `kei install` / `kei uninstall` / `kei service status` dispatchers are
-// runtime-gated to macOS — see install.rs / uninstall.rs / status.rs.
+// Compiled on every unix target (linux + macOS) — the renderer + parser
+// are pure and their inline unit tests pick up regressions on linux CI
+// before macos-latest ever sees them. Windows is excluded because
+// `effective_uid` (POSIX `geteuid`) and `tokio::process::Command` calls
+// to `launchctl` have no analogue there. Only the `kei install` /
+// `kei uninstall` / `kei service status` dispatchers are runtime-gated
+// to macOS — see install.rs / uninstall.rs / status.rs.
+#[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod macos;

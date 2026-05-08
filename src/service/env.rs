@@ -83,7 +83,10 @@ pub(crate) fn is_in_container_at(dockerenv: &Path, cgroup: &Path) -> bool {
 ///
 /// Centralises the one `unsafe` block per backend that wraps
 /// `libc::geteuid` so each platform module doesn't carry its own copy
-/// with a duplicated SAFETY comment.
+/// with a duplicated SAFETY comment. POSIX-only — Windows uses access
+/// tokens rather than UIDs, and the linux + macOS service backends are
+/// the only callers.
+#[cfg(unix)]
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: libc::geteuid is a stateless POSIX FFI call with no
     // memory-safety preconditions, no side effects, and a uid_t return
