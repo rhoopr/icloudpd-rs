@@ -72,8 +72,14 @@ jobs:
           UNIT="$HOME/.config/systemd/user/kei.service"
 
           # Pre-state: nothing installed.
+          # Capture status output to a variable instead of piping into
+          # `grep -q`: -q closes its end of the pipe on the first match,
+          # which delivers SIGPIPE to kei's later writes (`State
+          # Database`, `Assets`, etc.) and Rust's default stdout panics
+          # on EPIPE.
           test ! -e "$UNIT"
-          "$KEI" status | grep -q '^Service: not installed'
+          status_pre=$("$KEI" status)
+          printf '%s\n' "$status_pre" | grep -q '^Service: not installed'
 
           # Dry-run install renders the unit on disk and skips
           # daemon-reload / enable / loginctl enable-linger. The runner
@@ -97,7 +103,8 @@ jobs:
           "$KEI" uninstall
 
           test ! -e "$UNIT"
-          "$KEI" status | grep -q '^Service: not installed'
+          status_post=$("$KEI" status)
+          printf '%s\n' "$status_post" | grep -q '^Service: not installed'
 
       - name: macOS smoke
         if: runner.os == 'macOS'
@@ -108,7 +115,8 @@ jobs:
           PLIST="$HOME/Library/LaunchAgents/com.rhoopr.kei.plist"
 
           test ! -e "$PLIST"
-          "$KEI" status | grep -q '^Service: not installed'
+          status_pre=$("$KEI" status)
+          printf '%s\n' "$status_pre" | grep -q '^Service: not installed'
 
           # Dry-run renders the plist and skips launchctl bootstrap.
           # GitHub-hosted macOS runners have a GUI session, but we
@@ -129,7 +137,8 @@ jobs:
           "$KEI" uninstall
 
           test ! -e "$PLIST"
-          "$KEI" status | grep -q '^Service: not installed'
+          status_post=$("$KEI" status)
+          printf '%s\n' "$status_post" | grep -q '^Service: not installed'
 
       - name: Windows smoke
         if: runner.os == 'Windows'

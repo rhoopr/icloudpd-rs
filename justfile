@@ -280,25 +280,25 @@ service-smoke:
             # pre-state assertion is meaningful.
             rm -f "$UNIT"
             test ! -e "$UNIT"
-            "$KEI" status | grep -q '^Service: not installed'
+            status_pre=$("$KEI" status); printf '%s\n' "$status_pre" | grep -q '^Service: not installed'
             "$KEI" install --user --dry-run
             test -f "$UNIT"
             systemd-analyze --user verify "$UNIT"
             "$KEI" uninstall
             test ! -e "$UNIT"
-            "$KEI" status | grep -q '^Service: not installed'
+            status_post=$("$KEI" status); printf '%s\n' "$status_post" | grep -q '^Service: not installed'
             ;;
         Darwin)
             PLIST="$HOME/Library/LaunchAgents/com.rhoopr.kei.plist"
             rm -f "$PLIST"
             test ! -e "$PLIST"
-            "$KEI" status | grep -q '^Service: not installed'
+            status_pre=$("$KEI" status); printf '%s\n' "$status_pre" | grep -q '^Service: not installed'
             "$KEI" install --dry-run
             test -f "$PLIST"
             plutil -lint "$PLIST"
             "$KEI" uninstall
             test ! -e "$PLIST"
-            "$KEI" status | grep -q '^Service: not installed'
+            status_post=$("$KEI" status); printf '%s\n' "$status_post" | grep -q '^Service: not installed'
             ;;
         *)
             echo "service-smoke is Linux/macOS only; Windows runs in CI" >&2
