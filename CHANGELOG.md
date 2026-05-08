@@ -12,6 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Docker image now honors `PUID` and `PGID` environment variables.** When both are set, the container's entrypoint chowns ownership-mismatched files in `/config` and `/photos` to that UID:GID and drops privileges via `gosu` before running kei. Setting only one is rejected; setting neither preserves the prior root-default. The chown uses `find -not -uid` so a multi-TB volume only pays for stragglers, not the full tree, on every restart. Unblocks NAS deployments (Synology Container Manager, Unraid, TrueNAS Scale) where downstream indexers like Synology Photos can't see root-owned files. ([Synology wiki](https://github.com/rhoopr/kei/wiki/Synology), [Docker wiki](https://github.com/rhoopr/kei/wiki/Docker))
+- **`kei install` registers kei as a long-running service on Linux, macOS, and Windows.** Renders the platform-native artifact (systemd unit, launchd plist, or Service Control Manager entry) and hands it to the platform's service manager. Defaults to per-user on Linux and macOS; Windows is per-user only and needs an elevated prompt. Inside Docker / Kubernetes / Podman the command is a no-op so existing compose workflows are unchanged. The service runs `kei service run`, which is `kei sync` with a once-per-day watch interval default. ([#351], [#352], [#355], [#356], [#358])
+- **`kei uninstall` removes the service.** Reverses `kei install` on every platform. Pass `--purge` to also delete the state database, configuration, and stored credentials; default keeps your data. ([#352], [#355], [#356], [#358])
+- **`kei service status` reports per-platform service state.** Surfaces the systemd `SubState`, launchd lifecycle, or SCM `current_state` in the platform's own terms for finer-grained debugging than the cross-platform line in `kei status`. ([#352], [#355], [#356], [#358])
+- **`kei status` leads with a `Service:` summary line.** Cross-platform one-liner (`Service: running (systemd user, pid 12345, since 2026-05-08 14:32 UTC)`, `Service: not installed`, `Service: running in container (process supervisor: docker)`, etc.) so you can script against a single output regardless of host. ([#359])
+
+[#351]: https://github.com/rhoopr/kei/pull/351
+[#352]: https://github.com/rhoopr/kei/pull/352
+[#355]: https://github.com/rhoopr/kei/pull/355
+[#356]: https://github.com/rhoopr/kei/pull/356
+[#358]: https://github.com/rhoopr/kei/pull/358
+[#359]: https://github.com/rhoopr/kei/pull/359
 
 ---
 

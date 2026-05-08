@@ -73,11 +73,29 @@ For a guided walkthrough, run `kei config setup` instead.
 
 ---
 
+## Run as a service
+
+Register kei to start at boot and keep syncing in the background. One command per platform:
+
+```sh
+kei install --user            # Linux (systemd user unit)
+kei install                   # macOS (launchd agent)
+kei install                   # Windows (run from elevated PowerShell)
+```
+
+Inside Docker the command is a no-op; the container runtime is the supervisor. Keep using `docker compose up -d`.
+
+Verify with `kei status` (the first line reports the service state) or `kei service status` for the platform-tuned view. To remove: `kei uninstall` (add `--purge` to also wipe state, config, and credentials).
+
+Full per-platform guide including troubleshooting: [docs/install.md](docs/install.md). What the service runs once registered: [docs/service.md](docs/service.md).
+
+---
+
 ## Docs
 
 Everything lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CLI reference, filtering and folder templates, watch mode, Docker Compose, credentials, troubleshooting, and more.
 
-- [Commands](https://github.com/rhoopr/kei/wiki/Home#commands) - `sync`, `login`, `list`, `password`, `config`, `reset`, `status`, `verify`, `import-existing`
+- [Commands](https://github.com/rhoopr/kei/wiki/Home#commands) - `sync`, `install`, `uninstall`, `service`, `login`, `list`, `password`, `config`, `reset`, `status`, `verify`, `import-existing`
 - [Configuration](https://github.com/rhoopr/kei/wiki/Configuration) - TOML file, env vars, precedence
 - [Docker](https://github.com/rhoopr/kei/wiki/Docker) - Compose files and headless 2FA
 - [Synology](https://github.com/rhoopr/kei/wiki/Synology) - Container Manager setup, PUID/PGID, Synology Photos integration
