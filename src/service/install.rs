@@ -2,7 +2,7 @@
 //!
 //! Routes to a per-platform backend (launchd on macOS, systemd on Linux,
 //! Windows SCM on Windows) that registers kei to start at boot and run
-//! continuously. Linux is wired up; macOS and Windows currently return
+//! continuously. Linux and macOS are wired up; Windows currently returns
 //! a clean "not yet implemented" error.
 //!
 //! Inside containers the command short-circuits: Docker / Kubernetes /
@@ -39,7 +39,17 @@ async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
+    use crate::service::macos;
+    if args.system {
+        macos::install_system(&args, config_path).await
+    } else {
+        macos::install_user(&args, config_path).await
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
     use crate::service::env::{current_executable, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER};
     let exe = current_executable()?;
@@ -55,6 +65,6 @@ async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
     );
     Err(anyhow::anyhow!(
         "`kei install` is not yet implemented on this platform; \
-         macOS launchd and Windows SCM backends are still in flight"
+         the Windows SCM backend is still in flight"
     ))
 }
