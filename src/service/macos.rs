@@ -35,29 +35,33 @@ use plist::{Dictionary, Value as PlistValue};
 use tokio::process::Command;
 
 use crate::cli::{InstallArgs, UninstallArgs};
-use crate::service::env::{current_executable, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER};
+use crate::service::env::{
+    current_executable, effective_uid, purge_kei_state, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER,
+};
 
 const PLIST_FILE_NAME: &str = "com.rhoopr.kei.plist";
 
 const LAUNCH_AGENTS_SUBDIR: &str = "Library/LaunchAgents";
 const LOG_SUBDIR: &str = "Library/Logs/kei";
 
-/// Renders the launchd property list as a `plist::Dictionary`.
-///
-/// Returned as a `Dictionary` rather than serialized XML so tests can
-/// assert individual keys via `plist`'s typed accessors instead of
-/// substring-matching free-form XML. The orchestrator passes the dict
-/// through `plist::to_writer_xml` once.
-///
+/// State the `kei service status` line is rendered from.
+const LAUNCHD_STATE_RUNNING: &str = "running";
+
+/// `launchctl print` reports `pid = -` when a service is loaded but
+/// hasn't (yet) spawned a process. Treat that as "no PID to surface".
+const LAUNCHD_PID_NONE: &str = "-";
+
+struct PlistInputs<'a> {
+    exec: &'a Path,
+    config: &'a Path,
+    log_dir: &'a Path,
+    home: &'a Path,
+}
+
 /// `KeepAlive` uses the `NetworkState` predicate so launchd brings the
 /// daemon back when network connectivity returns (post sleep/wake, VPN
 /// toggle, Wi-Fi handoff). `RunAtLoad=true` covers the boot path.
-fn render_user_plist(
-    exec_path: &Path,
-    config_path: &Path,
-    log_dir: &Path,
-    home_dir: &Path,
-) -> Dictionary {
+fn render_user_plist(inputs: PlistInputs<'_>) -> Dictionary {
     let mut dict = Dictionary::new();
     dict.insert(
         "Label".to_string(),
@@ -65,11 +69,11 @@ fn render_user_plist(
     );
 
     let program_args = vec![
-        PlistValue::String(exec_path.display().to_string()),
+        PlistValue::String(inputs.exec.display().to_string()),
         PlistValue::String("service".to_string()),
         PlistValue::String("run".to_string()),
         PlistValue::String("--config".to_string()),
-        PlistValue::String(config_path.display().to_string()),
+        PlistValue::String(inputs.config.display().to_string()),
     ];
     dict.insert(
         "ProgramArguments".to_string(),
@@ -84,15 +88,15 @@ fn render_user_plist(
 
     dict.insert(
         "StandardOutPath".to_string(),
-        PlistValue::String(log_dir.join("stdout.log").display().to_string()),
+        PlistValue::String(inputs.log_dir.join("stdout.log").display().to_string()),
     );
     dict.insert(
         "StandardErrorPath".to_string(),
-        PlistValue::String(log_dir.join("stderr.log").display().to_string()),
+        PlistValue::String(inputs.log_dir.join("stderr.log").display().to_string()),
     );
     dict.insert(
         "WorkingDirectory".to_string(),
-        PlistValue::String(home_dir.display().to_string()),
+        PlistValue::String(inputs.home.display().to_string()),
     );
 
     // Description isn't part of launchd's documented schema, but several
@@ -114,9 +118,6 @@ fn render_user_plist(
     dict
 }
 
-/// Where the per-user plist lives. Returns `None` when `$HOME` is unset,
-/// which is the right answer because there is no reasonable place to
-/// write the file in that case.
 fn user_plist_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(LAUNCH_AGENTS_SUBDIR).join(PLIST_FILE_NAME))
 }
@@ -133,21 +134,23 @@ fn kei_state_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".config/kei"))
 }
 
-/// Top-level entry for `kei install --user` (and the bare `kei install`
-/// default on macOS).
 pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Result<()> {
     let exe = current_executable()?;
-    let plist_path = user_plist_path()
-        .ok_or_else(|| anyhow!("could not resolve $HOME; cannot locate ~/Library/LaunchAgents"))?;
-    let log_dir = user_log_dir()
-        .ok_or_else(|| anyhow!("could not resolve $HOME; cannot locate ~/Library/Logs/kei"))?;
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow!("could not resolve $HOME; required for plist WorkingDirectory"))?;
+    let home = dirs::home_dir().ok_or_else(|| {
+        anyhow!("could not resolve $HOME; required for plist + LaunchAgents path")
+    })?;
+    let plist_path = home.join(LAUNCH_AGENTS_SUBDIR).join(PLIST_FILE_NAME);
+    let log_dir = home.join(LOG_SUBDIR);
 
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
 
-    let dict = render_user_plist(&exe, config_path, &log_dir, &home);
+    let dict = render_user_plist(PlistInputs {
+        exec: &exe,
+        config: config_path,
+        log_dir: &log_dir,
+        home: &home,
+    });
     let xml = serialize_plist(&dict)?;
     write_plist(&plist_path, &xml)?;
     tracing::info!(
@@ -189,7 +192,6 @@ pub(crate) async fn install_system(_args: &InstallArgs, _config_path: &Path) -> 
     )
 }
 
-/// Top-level entry for `kei uninstall` on macOS.
 pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
     let plist_path = user_plist_path().filter(|p| p.exists());
 
@@ -211,18 +213,19 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
     }
 
     if args.purge {
-        purge_user_data().await?;
+        let Some(kei_dir) = kei_state_dir() else {
+            bail!("--purge requested but $HOME does not resolve; cannot locate kei state");
+        };
+        let extras: Vec<PathBuf> = user_log_dir().into_iter().collect();
+        purge_kei_state(&kei_dir, &extras)?;
     }
 
     Ok(())
 }
 
-/// Implementation for `kei service status` on macOS.
-///
-/// Calls `launchctl print gui/<uid>/com.rhoopr.kei` and parses the
-/// `state = ...` line. `print` is the modern replacement for `list`
-/// and returns enough structure to recover both running-state and the
-/// last spawn time across recent macOS versions.
+/// `print` is the modern replacement for `launchctl list` and returns
+/// enough structure to recover both running-state and the spawned PID
+/// across recent macOS versions.
 pub(crate) async fn status() -> Result<()> {
     let line = render_status(probe_status_inputs().await?);
     println!("{line}");
@@ -237,38 +240,30 @@ enum StatusInputs {
 }
 
 async fn probe_status_inputs() -> Result<StatusInputs> {
-    let plist_present = user_plist_path().is_some_and(|p| p.exists());
-    if !plist_present {
+    if !user_plist_path().is_some_and(|p| p.exists()) {
         return Ok(StatusInputs::NotInstalled);
     }
-
-    match launchctl_print().await? {
-        ProbeOutcome::DomainUnavailable => Ok(StatusInputs::DomainUnavailable),
-        ProbeOutcome::Properties { state, pid } => Ok(StatusInputs::Probed { state, pid }),
-    }
+    launchctl_print().await
 }
 
 fn render_status(inputs: StatusInputs) -> String {
     match inputs {
         StatusInputs::NotInstalled => "Service: not installed".to_string(),
+        // Plist exists but launchctl can't talk to the GUI domain
+        // (typical of an SSH session into a headless mac without an
+        // active console user). Same shape as the linux BusUnavailable
+        // branch so consumers see a consistent "installed but
+        // unprobeable" signal across platforms.
         StatusInputs::DomainUnavailable => {
-            // Plist exists but launchctl can't talk to the GUI domain
-            // (typical of an SSH session into a headless mac without an
-            // active console user). Same shape as the linux
-            // BusUnavailable branch so consumers see a consistent
-            // "installed but unprobeable" signal across platforms.
             "Service: installed (launchd user, domain unavailable)".to_string()
         }
         StatusInputs::Probed { state, pid } => {
-            // launchctl reports `state = running` for healthy services.
-            // Anything else (`not running`, `exited`, `waiting`) is
-            // surfaced verbatim so the operator can grep `man launchd.plist`.
             let pid_suffix = pid
                 .as_deref()
-                .filter(|p| !p.is_empty() && *p != "-")
+                .filter(|p| !p.is_empty() && *p != LAUNCHD_PID_NONE)
                 .map(|p| format!(", pid {p}"))
                 .unwrap_or_default();
-            if state == "running" {
+            if state == LAUNCHD_STATE_RUNNING {
                 format!("Service: running (launchd user{pid_suffix})")
             } else {
                 format!("Service: {state} (launchd user{pid_suffix})")
@@ -306,73 +301,29 @@ fn serialize_plist(dict: &Dictionary) -> Result<String> {
     String::from_utf8(buf).context("plist serializer emitted non-UTF-8 bytes")
 }
 
-async fn purge_user_data() -> Result<()> {
-    let Some(kei_dir) = kei_state_dir() else {
-        bail!("--purge requested but $HOME does not resolve; cannot locate kei state");
-    };
-
-    if let Some(username) = read_config_username(&kei_dir).await {
-        let store = crate::credential::CredentialStore::new(&username, &kei_dir);
-        if let Err(e) = store.delete() {
-            tracing::debug!(error = %e, "credential delete during purge: nothing to remove");
-        } else {
-            tracing::info!(username, "cleared stored credential");
-        }
-    }
-
-    if let Some(log_dir) = user_log_dir() {
-        match std::fs::remove_dir_all(&log_dir) {
-            Ok(()) => tracing::info!(path = %log_dir.display(), "removed kei log directory"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(error = %e, path = %log_dir.display(), "failed to remove log directory")
-            }
-        }
-    }
-
-    match std::fs::remove_dir_all(&kei_dir) {
-        Ok(()) => {
-            tracing::info!(path = %kei_dir.display(), "purged kei state directory");
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(path = %kei_dir.display(), "no kei state directory to purge");
-            Ok(())
-        }
-        Err(e) => Err(e)
-            .with_context(|| format!("failed to remove state directory {}", kei_dir.display())),
-    }
-}
-
-async fn read_config_username(kei_dir: &Path) -> Option<String> {
-    let config_path = kei_dir.join("config.toml");
-    let toml = crate::config::load_toml_config(&config_path, false).ok()??;
-    toml.auth?.username.filter(|u| !u.is_empty())
-}
-
 /// Tries `launchctl bootstrap gui/<uid>` first; falls back to the legacy
 /// `launchctl load -w` path on hosts where the GUI domain is unavailable
 /// (headless CI runners, screen-locked hosts without an active session).
 async fn bootstrap_or_load(plist_path: &Path) -> Result<()> {
-    let domain = gui_domain()?;
-    let bootstrap = run_launchctl(&["bootstrap", &domain, &plist_path.display().to_string()]).await;
-    match bootstrap {
+    let domain = gui_domain();
+    let plist_arg = path_to_str(plist_path, "plist")?;
+    match run_launchctl(&["bootstrap", &domain, plist_arg]).await {
         Ok(()) => Ok(()),
         Err(e) if is_domain_unavailable(&e.to_string()) => {
             tracing::warn!(
                 error = %e,
                 "launchctl bootstrap failed (no GUI domain); falling back to legacy `load -w`"
             );
-            run_launchctl(&["load", "-w", &plist_path.display().to_string()]).await
+            run_launchctl(&["load", "-w", plist_arg]).await
         }
         Err(e) => Err(e),
     }
 }
 
 async fn bootout_or_unload(plist_path: &Path) -> Result<()> {
-    let target = format!("{}/{SERVICE_IDENTIFIER}", gui_domain()?);
-    let bootout = run_launchctl(&["bootout", &target]).await;
-    match bootout {
+    let target = gui_service_target();
+    let plist_arg = path_to_str(plist_path, "plist")?;
+    match run_launchctl(&["bootout", &target]).await {
         Ok(()) => Ok(()),
         Err(e) if is_domain_unavailable(&e.to_string()) || is_not_loaded(&e.to_string()) => {
             // Either no GUI domain, or already booted out. Try the
@@ -381,17 +332,30 @@ async fn bootout_or_unload(plist_path: &Path) -> Result<()> {
                 error = %e,
                 "launchctl bootout fell through; running legacy `unload`"
             );
-            run_launchctl(&["unload", &plist_path.display().to_string()]).await
+            run_launchctl(&["unload", plist_arg]).await
         }
         Err(e) => Err(e),
     }
 }
 
-fn gui_domain() -> Result<String> {
-    // SAFETY: libc::geteuid is a stateless POSIX FFI call with no
-    // memory-safety preconditions; same pattern as src/service/linux.rs.
-    let uid = unsafe { libc::geteuid() };
-    Ok(format!("gui/{uid}"))
+fn gui_domain() -> String {
+    gui_domain_for(effective_uid())
+}
+
+fn gui_domain_for(uid: u32) -> String {
+    format!("gui/{uid}")
+}
+
+fn gui_service_target() -> String {
+    format!("{}/{SERVICE_IDENTIFIER}", gui_domain())
+}
+
+/// macOS paths are UTF-8 in practice (HFS+ / APFS enforce normalization
+/// over UTF-8 code units). Bail loudly rather than silently corrupting
+/// the launchctl invocation if a non-UTF-8 path slips through.
+fn path_to_str<'a>(p: &'a Path, label: &str) -> Result<&'a str> {
+    p.to_str()
+        .ok_or_else(|| anyhow!("{label} path is not valid UTF-8: {}", p.display()))
 }
 
 fn is_domain_unavailable(stderr: &str) -> bool {
@@ -429,14 +393,8 @@ async fn run_launchctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-enum ProbeOutcome {
-    DomainUnavailable,
-    Properties { state: String, pid: Option<String> },
-}
-
-async fn launchctl_print() -> Result<ProbeOutcome> {
-    let target = format!("{}/{SERVICE_IDENTIFIER}", gui_domain()?);
+async fn launchctl_print() -> Result<StatusInputs> {
+    let target = gui_service_target();
     let output = Command::new("launchctl")
         .args(["print", &target])
         .output()
@@ -445,13 +403,13 @@ async fn launchctl_print() -> Result<ProbeOutcome> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if is_domain_unavailable(&stderr) || is_not_loaded(&stderr) {
-            return Ok(ProbeOutcome::DomainUnavailable);
+            return Ok(StatusInputs::DomainUnavailable);
         }
         bail!("`launchctl print {target}` failed: {}", stderr.trim());
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed = parse_launchctl_print(&stdout);
-    Ok(ProbeOutcome::Properties {
+    Ok(StatusInputs::Probed {
         state: parsed.state.unwrap_or_else(|| "unknown".to_string()),
         pid: parsed.pid,
     })
@@ -463,12 +421,8 @@ struct LaunchctlPrint {
     pid: Option<String>,
 }
 
-/// Parses `launchctl print` stdout for the `state` and `pid` fields.
-///
-/// `launchctl print` output is loosely structured `key = value`-ish
-/// indented blocks. We pull only the two fields kei surfaces; the rest
-/// is left for an operator to read directly. Whitespace and `=`
-/// alignment vary between macOS releases, so the parser is forgiving.
+/// Whitespace and `=` alignment vary between macOS releases, so the
+/// parser trims every line and only matches `key = value` after that.
 fn parse_launchctl_print(stdout: &str) -> LaunchctlPrint {
     let mut out = LaunchctlPrint::default();
     for line in stdout.lines() {
@@ -494,14 +448,28 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn sample_inputs() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        (
+            PathBuf::from("/usr/local/bin/kei"),
+            PathBuf::from("/Users/alice/.config/kei/config.toml"),
+            PathBuf::from("/Users/alice/Library/Logs/kei"),
+            PathBuf::from("/Users/alice"),
+        )
+    }
+
+    fn render_with(exec: &Path, config: &Path, log_dir: &Path, home: &Path) -> Dictionary {
+        render_user_plist(PlistInputs {
+            exec,
+            config,
+            log_dir,
+            home,
+        })
+    }
+
     #[test]
     fn user_plist_contains_required_keys() {
-        let dict = render_user_plist(
-            &PathBuf::from("/usr/local/bin/kei"),
-            &PathBuf::from("/Users/alice/.config/kei/config.toml"),
-            &PathBuf::from("/Users/alice/Library/Logs/kei"),
-            &PathBuf::from("/Users/alice"),
-        );
+        let (exec, config, log_dir, home) = sample_inputs();
+        let dict = render_with(&exec, &config, &log_dir, &home);
         assert_eq!(
             dict.get("Label").and_then(|v| v.as_string()),
             Some(SERVICE_IDENTIFIER),
@@ -530,7 +498,7 @@ mod tests {
 
     #[test]
     fn program_arguments_are_absolute_and_carry_config_flag() {
-        let dict = render_user_plist(
+        let dict = render_with(
             &PathBuf::from("/opt/homebrew/bin/kei"),
             &PathBuf::from("/Users/bob/.config/kei/config.toml"),
             &PathBuf::from("/Users/bob/Library/Logs/kei"),
@@ -555,7 +523,7 @@ mod tests {
 
     #[test]
     fn keep_alive_uses_network_state_predicate() {
-        let dict = render_user_plist(
+        let dict = render_with(
             &PathBuf::from("/usr/local/bin/kei"),
             &PathBuf::from("/tmp/config.toml"),
             &PathBuf::from("/tmp/logs"),
@@ -577,12 +545,8 @@ mod tests {
         // closest local check to what launchctl will see at install
         // time. If the dict has an invalid type or unsupported value
         // shape, this test fails before the user does.
-        let dict = render_user_plist(
-            &PathBuf::from("/usr/local/bin/kei"),
-            &PathBuf::from("/Users/carol/.config/kei/config.toml"),
-            &PathBuf::from("/Users/carol/Library/Logs/kei"),
-            &PathBuf::from("/Users/carol"),
-        );
+        let (exec, config, log_dir, home) = sample_inputs();
+        let dict = render_with(&exec, &config, &log_dir, &home);
         let xml = serialize_plist(&dict).expect("serialize");
         let reparsed: Dictionary = plist::from_bytes(xml.as_bytes())
             .expect("plist must round-trip through XML serializer");
@@ -632,7 +596,7 @@ mod tests {
         assert_eq!(
             render_status(StatusInputs::Probed {
                 state: "running".to_string(),
-                pid: Some("-".to_string()),
+                pid: Some(LAUNCHD_PID_NONE.to_string()),
             }),
             "Service: running (launchd user)",
         );
@@ -729,5 +693,20 @@ com.rhoopr.kei = {
                 p.display(),
             );
         }
+    }
+
+    #[test]
+    fn gui_domain_for_renders_uid() {
+        assert_eq!(gui_domain_for(0), "gui/0");
+        assert_eq!(gui_domain_for(501), "gui/501");
+        assert_eq!(gui_domain_for(u32::MAX), format!("gui/{}", u32::MAX));
+    }
+
+    #[test]
+    fn path_to_str_accepts_utf8() {
+        assert_eq!(
+            path_to_str(Path::new("/Users/alice/file.txt"), "test").unwrap(),
+            "/Users/alice/file.txt",
+        );
     }
 }

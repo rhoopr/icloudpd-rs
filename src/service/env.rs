@@ -79,6 +79,72 @@ pub(crate) fn is_in_container_at(dockerenv: &Path, cgroup: &Path) -> bool {
     }
 }
 
+/// Effective UID of the current process.
+///
+/// Centralises the one `unsafe` block per backend that wraps
+/// `libc::geteuid` so each platform module doesn't carry its own copy
+/// with a duplicated SAFETY comment.
+pub(crate) fn effective_uid() -> u32 {
+    // SAFETY: libc::geteuid is a stateless POSIX FFI call with no
+    // memory-safety preconditions, no side effects, and a uid_t return
+    // value that cannot violate Rust memory safety.
+    unsafe { libc::geteuid() }
+}
+
+/// Reads `auth.username` out of `kei_dir/config.toml`.
+///
+/// Returns `None` when the file is missing, malformed, or has no
+/// non-empty username — `--purge` callers treat any of those as "no
+/// credential to clear" and proceed.
+pub(crate) fn read_config_username(kei_dir: &Path) -> Option<String> {
+    let config_path = kei_dir.join("config.toml");
+    let toml = crate::config::load_toml_config(&config_path, false).ok()??;
+    toml.auth?.username.filter(|u| !u.is_empty())
+}
+
+/// Wipes `kei_dir` plus any platform-specific extras after clearing the
+/// stored credential. Each platform's `--purge` path resolves the kei
+/// state directory however it wants (linux honours `XDG_CONFIG_HOME`;
+/// macOS hard-codes `~/.config/kei` rather than `~/Library/Application
+/// Support`) and passes the resolved path here.
+pub(crate) fn purge_kei_state(kei_dir: &Path, extra_dirs: &[PathBuf]) -> Result<()> {
+    if let Some(username) = read_config_username(kei_dir) {
+        let store = crate::credential::CredentialStore::new(&username, kei_dir);
+        if let Err(e) = store.delete() {
+            // delete() bails when neither backend has anything to remove,
+            // which is fine for purge — we're cleaning up regardless.
+            tracing::debug!(error = %e, "credential delete during purge: nothing to remove");
+        } else {
+            tracing::info!(username, "cleared stored credential");
+        }
+    }
+
+    for dir in extra_dirs {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => tracing::info!(path = %dir.display(), "removed auxiliary purge directory"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                path = %dir.display(),
+                "failed to remove auxiliary purge directory",
+            ),
+        }
+    }
+
+    match std::fs::remove_dir_all(kei_dir) {
+        Ok(()) => {
+            tracing::info!(path = %kei_dir.display(), "purged kei state directory");
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(path = %kei_dir.display(), "no kei state directory to purge");
+            Ok(())
+        }
+        Err(e) => Err(e)
+            .with_context(|| format!("failed to remove state directory {}", kei_dir.display())),
+    }
+}
+
 /// Canonical absolute path to the running `kei` executable.
 ///
 /// Service unit files / launchd plists / SCM entries reference an

@@ -31,7 +31,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::process::Command;
 
 use crate::cli::{InstallArgs, UninstallArgs};
-use crate::service::env::{current_executable, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER};
+use crate::service::env::{
+    current_executable, effective_uid, purge_kei_state, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER,
+};
 
 const UNIT_FILE_NAME: &str = "kei.service";
 
@@ -228,7 +230,10 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
     }
 
     if args.purge {
-        purge_user_data().await?;
+        let Some(config_dir) = dirs::config_dir() else {
+            bail!("--purge requested but no XDG config dir resolves; cannot locate kei state");
+        };
+        purge_kei_state(&config_dir.join("kei"), &[])?;
     }
 
     Ok(())
@@ -320,52 +325,8 @@ fn remove_unit_file(path: &Path) -> Result<()> {
     }
 }
 
-async fn purge_user_data() -> Result<()> {
-    let Some(config_dir) = dirs::config_dir() else {
-        bail!("--purge requested but no XDG config dir resolves; cannot locate kei state");
-    };
-    let kei_dir = config_dir.join("kei");
-
-    // Read username out of the config before deleting, so the OS keyring
-    // entry kept by `CredentialStore` can be cleared too. Without this the
-    // credential survives `--purge`, contradicting the docs and leaving a
-    // password the user thinks they removed.
-    if let Some(username) = read_config_username(&kei_dir).await {
-        let store = crate::credential::CredentialStore::new(&username, &kei_dir);
-        if let Err(e) = store.delete() {
-            // delete() bails when neither backend has anything to remove,
-            // which is fine for purge (we're cleaning up regardless).
-            tracing::debug!(error = %e, "credential delete during purge: nothing to remove");
-        } else {
-            tracing::info!(username, "cleared stored credential");
-        }
-    }
-
-    match std::fs::remove_dir_all(&kei_dir) {
-        Ok(()) => {
-            tracing::info!(path = %kei_dir.display(), "purged kei state directory");
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(path = %kei_dir.display(), "no kei state directory to purge");
-            Ok(())
-        }
-        Err(e) => Err(e)
-            .with_context(|| format!("failed to remove state directory {}", kei_dir.display())),
-    }
-}
-
-async fn read_config_username(kei_dir: &Path) -> Option<String> {
-    let config_path = kei_dir.join("config.toml");
-    let toml = crate::config::load_toml_config(&config_path, false).ok()??;
-    toml.auth?.username.filter(|u| !u.is_empty())
-}
-
 fn is_root() -> bool {
-    // SAFETY: libc::geteuid() is a stateless POSIX FFI call with no
-    // preconditions, no side effects, and a uid_t return value; it cannot
-    // violate Rust memory safety. Same pattern as src/state/db.rs.
-    unsafe { libc::geteuid() == 0 }
+    effective_uid() == 0
 }
 
 fn sudo_user_or_bail() -> Result<String> {
