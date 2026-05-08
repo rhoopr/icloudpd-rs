@@ -73,8 +73,7 @@ jobs:
 
           # Pre-state: nothing installed.
           test ! -e "$UNIT"
-          "$KEI" status | tee /tmp/kei-status-pre.txt
-          grep -q '^Service: not installed' /tmp/kei-status-pre.txt
+          "$KEI" status | grep -q '^Service: not installed'
 
           # Dry-run install renders the unit on disk and skips
           # daemon-reload / enable / loginctl enable-linger. The runner
@@ -98,8 +97,7 @@ jobs:
           "$KEI" uninstall
 
           test ! -e "$UNIT"
-          "$KEI" status | tee /tmp/kei-status-post.txt
-          grep -q '^Service: not installed' /tmp/kei-status-post.txt
+          "$KEI" status | grep -q '^Service: not installed'
 
       - name: macOS smoke
         if: runner.os == 'macOS'
@@ -110,8 +108,7 @@ jobs:
           PLIST="$HOME/Library/LaunchAgents/com.rhoopr.kei.plist"
 
           test ! -e "$PLIST"
-          "$KEI" status | tee /tmp/kei-status-pre.txt
-          grep -q '^Service: not installed' /tmp/kei-status-pre.txt
+          "$KEI" status | grep -q '^Service: not installed'
 
           # Dry-run renders the plist and skips launchctl bootstrap.
           # GitHub-hosted macOS runners have a GUI session, but we
@@ -132,8 +129,7 @@ jobs:
           "$KEI" uninstall
 
           test ! -e "$PLIST"
-          "$KEI" status | tee /tmp/kei-status-post.txt
-          grep -q '^Service: not installed' /tmp/kei-status-post.txt
+          "$KEI" status | grep -q '^Service: not installed'
 
       - name: Windows smoke
         if: runner.os == 'Windows'
@@ -147,7 +143,6 @@ jobs:
           if ($null -ne $svc) { throw "service already registered before smoke install" }
 
           $statusPre = & $kei status
-          $statusPre | Out-File /tmp/kei-status-pre.txt
           if ($statusPre[0] -ne 'Service: not installed') {
               throw "expected 'Service: not installed', got: $($statusPre[0])"
           }
@@ -172,7 +167,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "kei uninstall on clean host failed" }
 
           $statusPost = & $kei status
-          $statusPost | Out-File /tmp/kei-status-post.txt
           if ($statusPost[0] -ne 'Service: not installed') {
               throw "expected 'Service: not installed', got: $($statusPost[0])"
           }
