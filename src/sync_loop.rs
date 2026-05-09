@@ -258,16 +258,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .data_dir
         .clone()
         .or_else(|| globals.cookie_directory.clone());
-    let mut config = config::Config::build(globals, &pw, sync, toml_config.as_ref())?;
-    // Stamp the resolved Mode onto Config so build_download_config below picks
-    // it up via `config.personality_mode`. Config::build defaults to Off; the
-    // CLI flag and gate logic live up in lib.rs.
-    config.personality_mode = personality_mode;
-    // Same story for the user-stated preference: Config::build pulled the
-    // TOML value (if any), and lib.rs has already merged the CLI flag on
-    // top. Stamp the merged result so `to_toml` and any downstream consumer
-    // sees the canonical post-resolution intent.
-    config.friendly_request = friendly_request;
+    let mut config = config::Config::build_inner(
+        globals,
+        &pw,
+        sync,
+        toml_config.as_ref(),
+        config::parse_env_watch_interval(
+            std::env::var(config::ENV_WATCH_INTERVAL),
+        )?,
+        personality_mode,
+        friendly_request,
+    )?;
 
     // On first run (no config file), persist CLI-provided values so
     // subsequent runs don't need the same flags again. Only when the

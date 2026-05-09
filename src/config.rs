@@ -1142,13 +1142,13 @@ pub(crate) fn resolve_password_command(
         .or_else(|| toml_auth.and_then(|a| a.password_command.clone()))
 }
 
-const ENV_WATCH_INTERVAL: &str = "KEI_WATCH_WITH_INTERVAL";
+pub(crate) const ENV_WATCH_INTERVAL: &str = "KEI_WATCH_WITH_INTERVAL";
 
 /// Parse `KEI_WATCH_WITH_INTERVAL` into an `Option<u64>`. Takes the raw
 /// `Result` so tests can exercise it without mutating the process env (which
 /// would race other `Config::build` callers under `--test-threads > 1`).
 /// Range validation lives in `Config::build_inner` so CLI/TOML/env share it.
-fn parse_env_watch_interval(
+pub(crate) fn parse_env_watch_interval(
     raw: Result<String, std::env::VarError>,
 ) -> anyhow::Result<Option<u64>> {
     match raw {
@@ -1175,7 +1175,15 @@ impl Config {
         toml: Option<&TomlConfig>,
     ) -> anyhow::Result<Self> {
         let env_watch_interval = parse_env_watch_interval(std::env::var(ENV_WATCH_INTERVAL))?;
-        Self::build_inner(globals, pw, sync, toml, env_watch_interval)
+        Self::build_inner(
+            globals,
+            pw,
+            sync,
+            toml,
+            env_watch_interval,
+            crate::personality::Mode::Off,
+            None,
+        )
     }
 
     pub(crate) fn build_inner(
@@ -1184,6 +1192,8 @@ impl Config {
         sync: crate::cli::SyncArgs,
         toml: Option<&TomlConfig>,
         env_watch_interval: Option<u64>,
+        personality_mode: crate::personality::Mode,
+        friendly_request: Option<bool>,
     ) -> anyhow::Result<Self> {
         let toml_auth = toml.and_then(|t| t.auth.as_ref());
 
@@ -1879,14 +1889,13 @@ impl Config {
             xmp_sidecar,
             dry_run: sync.dry_run,
             no_progress_bar,
-            // Resolved at startup in lib.rs and threaded into Config via the
-            // `friendly` flag. Defaults to Off here; lib.rs overwrites with
-            // the resolved Mode after Config::build returns. The TOML
-            // preference (when present) is captured here so `kei config show`
-            // round-trips the user's intent without seeing the CLI; lib.rs
-            // overrides this when `--friendly` / `--no-friendly` is passed.
-            personality_mode: crate::personality::Mode::Off,
-            friendly_request: toml.and_then(|t| t.ui.as_ref()).and_then(|u| u.friendly),
+            // Supplied by the caller. Config::build() (used by tests and
+            // non-sync commands) defaults to Off/None; sync_loop::run_sync
+            // calls build_inner() directly with the resolved Mode from
+            // lib.rs's gate (CLI > TOML > default-on-for-TTY, then
+            // environmental hard-off check).
+            personality_mode,
+            friendly_request,
             keep_unicode_in_filenames,
             only_print_filenames: sync.only_print_filenames,
             no_incremental: sync.no_incremental,
@@ -5384,6 +5393,8 @@ mod tests {
             sync,
             toml.as_ref(),
             env_watch_interval,
+            crate::personality::Mode::Off,
+            None,
         )
     }
 
