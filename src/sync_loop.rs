@@ -858,25 +858,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 None,
             );
 
-            // Snapshot the library size before the cycle so the post-cycle
-            // phase line can render `Downloaded N new (X → Y)`. Only fetched
-            // in friendly mode; the single SQL aggregate is cheap
-            // (microseconds for any realistic DB) and runs once per cycle.
-            let library_before_bytes: Option<u64> = if config.personality_mode.is_friendly() {
-                match state_db.as_deref() {
-                    Some(db) => match db.get_summary().await {
-                        Ok(s) => Some(s.downloaded_bytes),
-                        Err(e) => {
-                            tracing::debug!(error = %e, "pre-cycle summary unavailable; skipping library-size delta in phase line");
-                            None
-                        }
-                    },
-                    None => None,
-                }
-            } else {
-                None
-            };
-
             let cycle_started_at = std::time::Instant::now();
             let cycle_result = run_cycle(
                 &library_states,
@@ -889,32 +870,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             )
             .await?;
 
-            // Friendly-mode phase ✓ lines: scrollback-stable narration that
-            // survives after the bar clears. Each line corresponds to a
-            // completed pipeline step (download, verify) and is no-op when
-            // the cycle had nothing to download. Off mode is silent;
-            // log_sync_summary still fires its tracing events for journals.
-            let downloaded_u64 = u64::try_from(cycle_result.stats.downloaded).unwrap_or(u64::MAX);
-            if let Some(before) = library_before_bytes {
-                let after = before.saturating_add(cycle_result.stats.bytes_downloaded);
-                crate::personality::narration::downloaded_phase_to_stderr(
-                    config.personality_mode,
-                    downloaded_u64,
-                    before,
-                    after,
-                );
-            }
-            crate::personality::narration::verified_phase_to_stderr(
-                config.personality_mode,
-                downloaded_u64,
-            );
-
-            // Friendly-mode summary card + recap. Fetched once here when
-            // friendly is on so the card has library totals; the metrics
-            // path below reuses the same `library_after` value if the
-            // server is enabled, avoiding a redundant get_summary call.
-            // Off mode skips the card entirely; the existing
-            // log_sync_summary still fires its tracing events for journals.
+            // One state-DB summary per cycle (friendly mode only). Powers
+            // the `Downloaded N new (X → Y)` phase line, the summary
+            // card's library totals, and the metrics gauges below; all
+            // three reuse the same fetch. Off mode skips it entirely so
+            // the v0.13 cycle path stays free of friendly-only DB calls.
             let library_after_summary = if config.personality_mode.is_friendly() {
                 match state_db.as_deref() {
                     Some(db) => match db.get_summary().await {
@@ -929,6 +889,29 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             } else {
                 None
             };
+
+            // Friendly-mode phase ✓ lines: scrollback-stable narration that
+            // survives after the bar clears. The Downloaded line derives
+            // `before` by subtracting this cycle's bytes from the
+            // post-cycle library total — saves a second SQL aggregate per
+            // cycle and is exact unless a concurrent reconcile rewrote
+            // the table mid-cycle. Off mode is silent; log_sync_summary
+            // still fires its tracing events for journals.
+            let downloaded_u64 = u64::try_from(cycle_result.stats.downloaded).unwrap_or(u64::MAX);
+            if let Some(library_after) = library_after_summary.as_ref() {
+                let after = library_after.downloaded_bytes;
+                let before = after.saturating_sub(cycle_result.stats.bytes_downloaded);
+                crate::personality::narration::downloaded_phase_to_stderr(
+                    config.personality_mode,
+                    downloaded_u64,
+                    before,
+                    after,
+                );
+            }
+            crate::personality::narration::verified_phase_to_stderr(
+                config.personality_mode,
+                downloaded_u64,
+            );
             if let Some(library_after) = library_after_summary.as_ref() {
                 let cycle_elapsed = cycle_started_at.elapsed();
                 let stats = &cycle_result.stats;

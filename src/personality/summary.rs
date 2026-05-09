@@ -22,6 +22,7 @@
 use std::time::Duration;
 
 use crate::download::recap::RunRecap;
+use crate::personality::format::format_bytes;
 use crate::personality::Mode;
 
 /// Inputs for the summary card. All fields are already on `SyncStats` /
@@ -205,36 +206,6 @@ fn format_speed(bytes: u64, elapsed: Duration) -> String {
         format!("{:.1} KB/s", per_sec / 1024.0)
     } else {
         format!("{per_sec:.0} B/s")
-    }
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "display-only byte formatting; precision loss at exabyte scale is fine"
-)]
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1_024;
-    const MB: u64 = KB * 1_024;
-    const GB: u64 = MB * 1_024;
-    const TB: u64 = GB * 1_024;
-    // Integer when >= 10 of the unit (the digit count is enough on its
-    // own); one decimal below 10 of the unit so 8.4 GB stays distinct
-    // from 8 GB. KB and MB use integer always — sub-GB precision rarely
-    // matters for library totals or asset sizes the user tracks by eye.
-    if bytes >= 10 * TB {
-        format!("{} TB", bytes / TB)
-    } else if bytes >= TB {
-        format!("{:.1} TB", bytes as f64 / TB as f64)
-    } else if bytes >= 10 * GB {
-        format!("{} GB", bytes / GB)
-    } else if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{bytes} B")
     }
 }
 

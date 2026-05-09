@@ -95,8 +95,8 @@ pub fn downloaded_phase_to_stderr(
     if !mode.is_friendly() || downloaded == 0 {
         return;
     }
-    let before = format_bytes(library_before_bytes);
-    let after = format_bytes(library_after_bytes);
+    let before = crate::personality::format::format_bytes(library_before_bytes);
+    let after = crate::personality::format::format_bytes(library_after_bytes);
     let plural = if downloaded == 1 { "" } else { "s" };
     line_to_stderr(
         mode,
@@ -118,36 +118,6 @@ pub fn verified_phase_to_stderr(mode: Mode, downloaded: u64) {
         mode,
         &format!("✓ Verified {downloaded} file{plural} ({downloaded} of {downloaded} matched)"),
     );
-}
-
-/// Format byte counts for friendly-mode narration. Mirrors the
-/// summary-card formatter: integer at >= 10 of a unit, one decimal
-/// below 10. 1024-based units displayed as `GB` to match the
-/// user-facing mock.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "display-only byte formatting; precision loss at exabyte scale is fine"
-)]
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1_024;
-    const MB: u64 = KB * 1_024;
-    const GB: u64 = MB * 1_024;
-    const TB: u64 = GB * 1_024;
-    if bytes >= 10 * TB {
-        format!("{} TB", bytes / TB)
-    } else if bytes >= TB {
-        format!("{:.1} TB", bytes as f64 / TB as f64)
-    } else if bytes >= 10 * GB {
-        format!("{} GB", bytes / GB)
-    } else if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// First-Ctrl+C acknowledgement. Friendly mode filters `tracing::info` to
@@ -425,21 +395,6 @@ mod tests {
             line(&mut buf, Mode::Friendly, &text).unwrap();
             assert_eq!(String::from_utf8(buf).unwrap(), expected);
         }
-    }
-
-    #[test]
-    fn format_bytes_uses_integer_at_or_above_ten_units() {
-        // Pins the per-unit threshold the summary card and downloaded-phase
-        // narration share. Drift would change "412 GB" to "412.0 GB" and
-        // break the user-facing mock.
-        assert_eq!(format_bytes(412_u64 * 1024 * 1024 * 1024), "412 GB");
-        assert_eq!(
-            format_bytes(8_u64 * 1024 * 1024 * 1024 + 400 * 1024 * 1024),
-            "8.4 GB"
-        );
-        assert_eq!(format_bytes(500 * 1024 * 1024), "500 MB");
-        assert_eq!(format_bytes(1024), "1 KB");
-        assert_eq!(format_bytes(0), "0 B");
     }
 
     #[test]

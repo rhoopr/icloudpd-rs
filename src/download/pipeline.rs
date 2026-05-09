@@ -1779,31 +1779,18 @@ where
             Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
                 downloaded += 1;
                 bytes_downloaded_total += bytes_dl;
-                // Friendly-mode counters: split downloaded by media type
-                // for the summary card and observe one entry into the
-                // recap fold. No-op cost in off mode (counters are usize
-                // increments, recap.observe is a couple of comparisons).
-                match task.media_type {
-                    crate::state::MediaType::Photo | crate::state::MediaType::LivePhotoImage => {
-                        photos_downloaded += 1
-                    }
-                    crate::state::MediaType::Video | crate::state::MediaType::LivePhotoVideo => {
-                        videos_downloaded += 1
-                    }
+                // Photos / videos fire in both modes (SyncStats serialises
+                // them into the JSON report); the recap fold is
+                // friendly-only so off-mode skips the per-success String
+                // allocation `to_recap_asset` does for the filename.
+                if task.media_type.is_photo_like() {
+                    photos_downloaded += 1;
+                } else if task.media_type.is_video_like() {
+                    videos_downloaded += 1;
                 }
-                recap.observe(
-                    config.pass_label(),
-                    super::recap::RecapAsset {
-                        filename: task
-                            .download_path
-                            .file_name()
-                            .and_then(|f| f.to_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        bytes: task.size,
-                        created_local: task.created_local,
-                    },
-                );
+                if mode.is_friendly() {
+                    recap.observe(config.pass_label(), task.to_recap_asset());
+                }
                 // Feed the friendly bar's bandwidth sparkline / rate display.
                 // Atomic+Relaxed is fine: the bar reads it on each redraw,
                 // doesn't depend on it for correctness, and a missed update
@@ -2361,27 +2348,14 @@ pub(super) async fn run_download_pass(
                 bytes_downloaded_total += bytes_dl;
                 cleanup_bytes_counter.fetch_add(*bytes_dl, std::sync::atomic::Ordering::Relaxed);
                 disk_bytes_total += disk_bytes;
-                match task.media_type {
-                    crate::state::MediaType::Photo | crate::state::MediaType::LivePhotoImage => {
-                        photos_downloaded += 1
-                    }
-                    crate::state::MediaType::Video | crate::state::MediaType::LivePhotoVideo => {
-                        videos_downloaded += 1
-                    }
+                if task.media_type.is_photo_like() {
+                    photos_downloaded += 1;
+                } else if task.media_type.is_video_like() {
+                    videos_downloaded += 1;
                 }
-                recap.observe(
-                    pass_label,
-                    super::recap::RecapAsset {
-                        filename: task
-                            .download_path
-                            .file_name()
-                            .and_then(|f| f.to_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        bytes: task.size,
-                        created_local: task.created_local,
-                    },
-                );
+                if mode.is_friendly() {
+                    recap.observe(pass_label, task.to_recap_asset());
+                }
                 if !*exif_ok {
                     exif_failures += 1;
                     pb.suspend(|| {

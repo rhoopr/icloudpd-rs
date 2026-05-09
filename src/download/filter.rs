@@ -260,6 +260,25 @@ pub(super) struct DownloadTask {
     pub(super) media_type: MediaType,
 }
 
+impl DownloadTask {
+    /// Project the task fields the recap renderer needs (basename of the
+    /// download path, byte size, capture timestamp). Lives here because
+    /// the path-to-filename and `created_local` source are private to
+    /// this struct; keeps the success-arm call site a one-liner.
+    pub(super) fn to_recap_asset(&self) -> super::recap::RecapAsset {
+        super::recap::RecapAsset {
+            filename: self
+                .download_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("")
+                .to_string(),
+            bytes: self.size,
+            created_local: self.created_local,
+        }
+    }
+}
+
 /// Borrowed view over a `VersionsMap` with an optional virtual swap of
 /// the keys at two indices. Lets [`apply_raw_policy`] relabel the
 /// `Original` / `Alternative` slots without cloning the version list.

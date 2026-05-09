@@ -12,6 +12,7 @@
 pub mod active_bar;
 pub mod bar_render;
 pub mod cycler;
+pub mod format;
 pub mod narration;
 pub mod pace;
 pub mod sparkline;

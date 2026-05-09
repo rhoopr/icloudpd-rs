@@ -13,6 +13,7 @@
 //! the dead-code path in off mode allocates only a handful of bytes per
 //! cycle (Default::default()).
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Local};
@@ -46,10 +47,12 @@ pub struct RunRecap {
 }
 
 impl RunRecap {
-    /// Record one successful download under the given pass label.
-    /// `pass_label` is the album / smart-folder name (or "unfiled");
-    /// `RunRecap` keeps it as-is so the rendered line preserves the
-    /// user's own naming.
+    /// Record one successful download under the given pass label. Takes
+    /// ownership of `asset` so the final move into the album map avoids
+    /// the dead clone the `entry(..).and_modify(..).or_insert(asset)`
+    /// shape would force (or_insert consumes its arg even when the entry
+    /// existed). At most two clones per call (biggest, oldest); typical
+    /// case is one or zero.
     pub fn observe(&mut self, pass_label: &str, asset: RecapAsset) {
         if self
             .biggest
@@ -65,14 +68,16 @@ impl RunRecap {
         {
             self.oldest = Some(asset.clone());
         }
-        self.albums
-            .entry(pass_label.to_string())
-            .and_modify(|cur| {
-                if asset.created_local > cur.created_local {
-                    *cur = asset.clone();
+        match self.albums.entry(pass_label.to_string()) {
+            Entry::Occupied(mut e) => {
+                if asset.created_local > e.get().created_local {
+                    *e.get_mut() = asset;
                 }
-            })
-            .or_insert(asset);
+            }
+            Entry::Vacant(e) => {
+                e.insert(asset);
+            }
+        }
     }
 
     /// Combine two recaps (e.g. streaming pass result + cleanup pass
