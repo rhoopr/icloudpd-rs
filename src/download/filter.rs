@@ -252,6 +252,12 @@ pub(super) struct DownloadTask {
     // 1-byte enum
     /// Version size key for state tracking.
     pub(super) version_size: VersionSizeKey,
+    /// Resolved media type at task-creation time. Carried on the task so
+    /// the post-success site can split the run's downloaded count by
+    /// photos vs videos for the friendly summary card without re-running
+    /// `determine_media_type` (and without holding the heavier
+    /// `PhotoAsset` reference past the filter stage).
+    pub(super) media_type: MediaType,
 }
 
 /// Borrowed view over a `VersionsMap` with an optional virtual swap of
@@ -987,6 +993,7 @@ pub(super) fn filter_asset_to_tasks(
                 size,
                 created_local: ctx.created_local,
                 version_size,
+                media_type: determine_media_type(version_size, asset),
             });
         }
     }
@@ -1036,6 +1043,7 @@ pub(super) fn filter_asset_to_tasks(
                 size,
                 created_local: ctx.created_local,
                 version_size,
+                media_type: determine_media_type(version_size, asset),
             });
         }
     }

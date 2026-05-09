@@ -15,6 +15,7 @@ pub mod cycler;
 pub mod narration;
 pub mod pace;
 pub mod sparkline;
+pub mod summary;
 pub mod theme;
 pub mod tracing;
 pub mod tty_echo;

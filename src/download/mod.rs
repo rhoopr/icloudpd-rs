@@ -13,6 +13,7 @@ pub(crate) mod limiter;
 pub mod metadata;
 pub mod paths;
 pub(crate) mod pipeline;
+pub(crate) mod recap;
 
 pub(crate) use limiter::BandwidthLimiter;
 
@@ -102,6 +103,21 @@ pub struct SyncStats {
     /// sync is running against a back-pressured account; operators should
     /// either raise --watch-with-interval or lower --threads-num.
     pub rate_limited: usize,
+    /// Photos downloaded this run (`MediaType::Photo` and
+    /// `MediaType::LivePhotoImage`). Sums to `downloaded` together with
+    /// `videos_downloaded` for any pure-asset run; multi-version downloads
+    /// (a Live Photo's image + MOV) count both sides.
+    pub photos_downloaded: usize,
+    /// Videos downloaded this run (`MediaType::Video` and
+    /// `MediaType::LivePhotoVideo`).
+    pub videos_downloaded: usize,
+    /// Per-cycle highlights for the friendly recap (biggest / oldest /
+    /// newest-album). Empty when no downloads succeeded; consumers must
+    /// guard on `is_empty()` before rendering. Skipped for serialisation
+    /// because it carries `chrono::DateTime<Local>` and the JSON report
+    /// contract is owned by the existing scalar fields above.
+    #[serde(skip)]
+    pub recap: recap::RunRecap,
 }
 
 impl SyncStats {
@@ -129,6 +145,9 @@ impl SyncStats {
         self.elapsed_secs += other.elapsed_secs;
         self.interrupted = self.interrupted || other.interrupted;
         self.rate_limited += other.rate_limited;
+        self.photos_downloaded += other.photos_downloaded;
+        self.videos_downloaded += other.videos_downloaded;
+        self.recap.merge(other.recap.clone());
     }
 }
 
@@ -2166,6 +2185,9 @@ async fn download_photos_incremental(
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
         rate_limited: pass_result.rate_limit_observations,
+        photos_downloaded: pass_result.photos_downloaded,
+        videos_downloaded: pass_result.videos_downloaded,
+        recap: pass_result.recap.clone(),
     };
     log_sync_summary(
         "\u{2500}\u{2500} Incremental Sync Summary \u{2500}\u{2500}",
@@ -3987,6 +4009,9 @@ mod tests {
             elapsed_secs: 1.5,
             interrupted: false,
             rate_limited: 7,
+            photos_downloaded: 3,
+            videos_downloaded: 1,
+            recap: recap::RunRecap::default(),
         };
 
         let lib_b = SyncStats {
@@ -4014,6 +4039,9 @@ mod tests {
             elapsed_secs: 0.75,
             interrupted: true,
             rate_limited: 3,
+            photos_downloaded: 8,
+            videos_downloaded: 3,
+            recap: recap::RunRecap::default(),
         };
 
         let mut acc = SyncStats::default();
