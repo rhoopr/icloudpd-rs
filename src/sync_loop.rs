@@ -263,9 +263,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         &pw,
         sync,
         toml_config.as_ref(),
-        config::parse_env_watch_interval(
-            std::env::var(config::ENV_WATCH_INTERVAL),
-        )?,
+        config::parse_env_watch_interval(std::env::var(config::ENV_WATCH_INTERVAL))?,
         personality_mode,
         friendly_request,
     )?;
