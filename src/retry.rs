@@ -112,11 +112,45 @@ where
     C: Fn(&E) -> RetryAction,
     E: std::fmt::Display,
 {
+    retry_with_backoff_with_mode(config, classifier, operation, crate::personality::Mode::Off).await
+}
+
+/// Retry an async operation with friendly-mode narration around each
+/// pause. Identical to `retry_with_backoff` except `mode` controls
+/// whether `iCloud hiccup. Retrying in Ns...` / `Back on track.` /
+/// `That one is being stubborn...` lines fire above the active bar.
+/// Off-mode is a strict no-op on the narration side - tracing events
+/// are unchanged either way.
+/// # Errors
+///
+/// Returns the last error if all retry attempts are exhausted or the
+/// classifier returns `Abort` for a non-retryable error.
+pub async fn retry_with_backoff_with_mode<F, Fut, T, E, C>(
+    config: &RetryConfig,
+    classifier: C,
+    operation: F,
+    mode: crate::personality::Mode,
+) -> Result<T, E>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    C: Fn(&E) -> RetryAction,
+    E: std::fmt::Display,
+{
     let total_attempts = config.max_retries.saturating_add(1);
+    // Bookend lines ("Back on track." / "That one is being stubborn...")
+    // only make sense if there was a prior retry-pause line for them to
+    // close out. One-shot failures stay silent.
+    let mut paused_at_least_once = false;
 
     for attempt in 0..total_attempts {
         match operation().await {
-            Ok(val) => return Ok(val),
+            Ok(val) => {
+                if paused_at_least_once {
+                    crate::personality::narration::back_on_track_to_stderr(mode);
+                }
+                return Ok(val);
+            }
             Err(e) => {
                 let action = classifier(&e);
                 if action == RetryAction::Abort {
@@ -124,6 +158,9 @@ where
                 }
                 let is_last = attempt + 1 >= total_attempts;
                 if is_last {
+                    if paused_at_least_once {
+                        crate::personality::narration::giving_up_to_stderr(mode);
+                    }
                     return Err(e);
                 }
                 let delay = match action {
@@ -140,6 +177,8 @@ where
                     error = %e,
                     "Retryable error, retrying"
                 );
+                crate::personality::narration::retry_pause_to_stderr(mode, delay);
+                paused_at_least_once = true;
                 tokio::time::sleep(delay).await;
             }
         }
@@ -490,6 +529,39 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "expected max_delay_secs clamp, took {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_with_backoff_with_mode_off_matches_default_wrapper() {
+        // The default wrapper just delegates to the with_mode form with
+        // Mode::Off; this exercises the with_mode entry point so a future
+        // refactor that diverges the two paths breaks here.
+        let config = RetryConfig {
+            max_retries: 2,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+        let result: Result<i32, String> = retry_with_backoff_with_mode(
+            &config,
+            |_| RetryAction::Retry,
+            || {
+                let cc = cc.clone();
+                async move {
+                    let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < 1 {
+                        Err("transient".to_string())
+                    } else {
+                        Ok(7)
+                    }
+                }
+            },
+            crate::personality::Mode::Off,
+        )
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

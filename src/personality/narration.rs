@@ -104,22 +104,48 @@ pub fn wobble_to_stderr(mode: Mode) {
     line_to_stderr(mode, WOBBLE_LINE);
 }
 
-/// Confirms the 421 retry succeeded, so the wobble line doesn't sit in
-/// scrollback as the last thing the user saw before downloads resumed.
-/// Off mode is silent.
+/// Pre-sleep narration before a retry. The existing `tracing::warn!` in
+/// `retry_with_backoff` carries the structured fields (attempt, delay,
+/// error) for journals; this is the human-shaped reminder that the pause
+/// is intentional. Off mode is silent.
+pub fn retry_pause_to_stderr(mode: Mode, delay: std::time::Duration) {
+    line_to_stderr(mode, &render_retry_pause(delay));
+}
+
+/// Confirms a 421 retry, retry-with-backoff sequence, or other
+/// recoverable hiccup actually recovered, so the prior framing line
+/// (wobble / retry pause) doesn't sit in scrollback as the last thing
+/// the user saw before downloads resumed. Off mode is silent.
 pub fn back_on_track_to_stderr(mode: Mode) {
     line_to_stderr(mode, BACK_ON_TRACK_LINE);
+}
+
+/// Final-attempt narration when retries are exhausted. Tells the user the
+/// failure is recorded and the next sync will pick the asset back up,
+/// rather than letting the surfaced error stand alone. Only fires after
+/// at least one `retry_pause_to_stderr`; one-shot failures are silent.
+pub fn giving_up_to_stderr(mode: Mode) {
+    line_to_stderr(mode, GIVING_UP_LINE);
 }
 
 const FAREWELL_LINE: &str = "Done. See you next time.";
 const WOBBLE_LINE: &str = "iCloud connection wobbled. Resetting...";
 const BACK_ON_TRACK_LINE: &str = "Back on track.";
+const GIVING_UP_LINE: &str = "That one is being stubborn. Skipping for now, will retry next sync.";
 
 fn render_sleeping_until(wake_at: chrono::DateTime<chrono::Local>) -> String {
     format!(
         "Sleeping until {}. Press Ctrl+C to stop.",
         wake_at.format("%H:%M"),
     )
+}
+
+fn render_retry_pause(delay: std::time::Duration) -> String {
+    // Sub-second delays still surface as "1s" so the user has a concrete
+    // number rather than "0s" (which reads as "no pause" and undermines
+    // the friendly framing).
+    let secs = delay.as_secs().max(1);
+    format!("iCloud hiccup. Retrying in {secs}s...")
 }
 
 /// Post-cycle sign-off summarising what the cycle did. Friendly-only;
@@ -264,10 +290,40 @@ mod tests {
     }
 
     #[test]
-    fn wobble_and_back_on_track_lines_are_stable_text() {
-        // Pin the user-visible strings so accidental rewording goes through review.
+    fn wobble_back_on_track_and_giving_up_lines_are_stable_text() {
+        // Pin user-visible strings; reword behind a deliberate diff.
         assert_eq!(WOBBLE_LINE, "iCloud connection wobbled. Resetting...");
         assert_eq!(BACK_ON_TRACK_LINE, "Back on track.");
+        assert_eq!(
+            GIVING_UP_LINE,
+            "That one is being stubborn. Skipping for now, will retry next sync.",
+        );
+    }
+
+    #[test]
+    fn render_retry_pause_with_seconds() {
+        assert_eq!(
+            render_retry_pause(Duration::from_secs(4)),
+            "iCloud hiccup. Retrying in 4s...",
+        );
+        assert_eq!(
+            render_retry_pause(Duration::from_secs(60)),
+            "iCloud hiccup. Retrying in 60s...",
+        );
+    }
+
+    #[test]
+    fn render_retry_pause_subsecond_floors_to_one_second() {
+        // Duration::from_millis(500).as_secs() == 0; render must promote to "1s"
+        // so the user gets a concrete number rather than "0s".
+        assert_eq!(
+            render_retry_pause(Duration::from_millis(500)),
+            "iCloud hiccup. Retrying in 1s...",
+        );
+        assert_eq!(
+            render_retry_pause(Duration::from_secs(0)),
+            "iCloud hiccup. Retrying in 1s...",
+        );
     }
 
     #[test]

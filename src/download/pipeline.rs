@@ -1145,6 +1145,7 @@ where
     let metadata_flags = MetadataFlags::from(config.as_ref());
     let concurrency = config.concurrent_downloads;
     let state_db = config.state_db.clone();
+    let mode = config.personality_mode;
 
     // Pre-load download context for O(1) skip decisions
     let download_ctx = if let Some(db) = &state_db {
@@ -1723,6 +1724,7 @@ where
                     &temp_suffix,
                     Some(rate_limit_counter.as_ref()),
                     bandwidth_limiter.as_ref(),
+                    mode,
                 ))
                 .await;
                 (task, result)
@@ -2246,6 +2248,7 @@ pub(super) async fn run_download_pass(
     let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
     let library: Arc<str> = Arc::clone(&config.library);
+    let mode = config.personality_mode;
 
     let mut download_stream = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
@@ -2263,6 +2266,7 @@ pub(super) async fn run_download_pass(
                     &temp_suffix,
                     Some(rate_limit_counter.as_ref()),
                     bandwidth_limiter.as_ref(),
+                    mode,
                 ))
                 .await;
                 (task, result)
@@ -2512,6 +2516,7 @@ async fn download_single_task(
     temp_suffix: &str,
     rate_limit_counter: Option<&std::sync::atomic::AtomicUsize>,
     bandwidth_limiter: Option<&super::BandwidthLimiter>,
+    mode: crate::personality::Mode,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -2535,7 +2540,7 @@ async fn download_single_task(
     #[cfg(not(feature = "xmp"))]
     let needs_exif = false;
 
-    let bytes_downloaded = Box::pin(super::file::download_file(
+    let bytes_downloaded = Box::pin(super::file::download_file_with_mode(
         client,
         &task.url,
         &task.download_path,
@@ -2550,6 +2555,7 @@ async fn download_single_task(
             rate_limit_counter,
             bandwidth_limiter,
         },
+        mode,
     ))
     .await?;
 

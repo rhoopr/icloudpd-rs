@@ -116,7 +116,10 @@ pub(super) struct DownloadLimits<'a> {
     pub bandwidth_limiter: Option<&'a BandwidthLimiter>,
 }
 
-/// Download a file with retry support and optional expected-size verification.
+/// Test-only off-mode wrapper. Production calls `download_file_with_mode`
+/// directly; this kept the existing test sites stable when the friendly
+/// retry-pause narration parameter was added.
+#[cfg(test)]
 pub(super) async fn download_file<C: DownloadClient>(
     client: &C,
     url: &str,
@@ -127,10 +130,42 @@ pub(super) async fn download_file<C: DownloadClient>(
     opts: DownloadOpts,
     limits: DownloadLimits<'_>,
 ) -> Result<u64, DownloadError> {
+    download_file_with_mode(
+        client,
+        url,
+        download_path,
+        checksum,
+        retry_config,
+        temp_suffix,
+        opts,
+        limits,
+        crate::personality::Mode::Off,
+    )
+    .await
+}
+
+/// Friendly-mode variant of `download_file`. Identical except `mode`
+/// controls the `iCloud hiccup. Retrying in Ns...` / `Back on track.` /
+/// `That one is being stubborn...` narration around retry pauses.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mode is a UX gate, not a behavior knob, so folding it into DownloadOpts/DownloadLimits would muddy those types' semantics"
+)]
+pub(super) async fn download_file_with_mode<C: DownloadClient>(
+    client: &C,
+    url: &str,
+    download_path: &Path,
+    checksum: &str,
+    retry_config: &RetryConfig,
+    temp_suffix: &str,
+    opts: DownloadOpts,
+    limits: DownloadLimits<'_>,
+    mode: crate::personality::Mode,
+) -> Result<u64, DownloadError> {
     let part_path =
         temp_download_path(download_path, checksum, temp_suffix).map_err(DownloadError::Other)?;
 
-    Box::pin(retry::retry_with_backoff(
+    Box::pin(retry::retry_with_backoff_with_mode(
         retry_config,
         |e: &DownloadError| {
             if e.is_rate_limited() {
@@ -156,6 +191,7 @@ pub(super) async fn download_file<C: DownloadClient>(
             ))
             .await
         },
+        mode,
     ))
     .await
 }

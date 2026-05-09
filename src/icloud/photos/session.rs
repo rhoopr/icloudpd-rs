@@ -391,6 +391,13 @@ pub async fn retry_post(
     headers: &[(&str, &str)],
     retry_config: &RetryConfig,
 ) -> anyhow::Result<Value> {
+    // CloudKit API retries (album listing, query, sync-token paging) typically
+    // run before or alongside a download bar but resolve in well under a
+    // second; the friendly retry-pause narration ("iCloud hiccup. Retrying in
+    // Ns...") would flicker on every transient 503 / CAS_OP_LOCK and add
+    // noise without adding signal. Calling the no-mode variant pins to Off;
+    // download retries (where the user is actively watching) get the friendly
+    // framing via `retry_with_backoff_with_mode`.
     retry::retry_with_backoff(retry_config, classify_api_error, || async {
         let response = session.post(url, body.to_owned(), headers).await?;
         check_cloudkit_errors(response)
