@@ -91,6 +91,23 @@ Full per-platform guide including troubleshooting: [docs/install.md](docs/instal
 
 ---
 
+## Friendly output
+
+By default, `kei sync` on a plain terminal shows verb-cycling spinners, a summary card, and lifecycle narration ("Bringing them home...", "Done. 12 new files in 3 minutes."). Pipe the output, set `--report-json`, run under systemd or Docker, or set `--log-level` and kei automatically reverts to the structured `target+timestamp` log format that journals and shell scripts expect.
+
+Per-invocation override: `--no-friendly` forces the structured format; `--friendly` forces the friendly UX (subject to the auto-off rules above).
+
+Persist the choice in `config.toml`:
+
+```toml
+[ui]
+friendly = false   # or omit entirely to take the default
+```
+
+`kei config setup` includes a "Show friendly progress messages?" question that writes the same key.
+
+---
+
 ## Docs
 
 Everything lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CLI reference, filtering and folder templates, watch mode, Docker Compose, credentials, troubleshooting, and more.

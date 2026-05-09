@@ -123,6 +123,23 @@ impl Context {
     }
 }
 
+/// Resolve friendly mode from layered preferences and environmental gates.
+///
+/// Resolution chain: `cli_pref` > `toml_pref` > default-on-for-TTY. The
+/// default of `true` means a user installing kei on a plain terminal sees
+/// friendly UX without flipping any switches; the gate then clamps to Off
+/// in any environment that can't or shouldn't render it. This is the only
+/// call site that encodes the policy: lib.rs and tests both go through it.
+#[must_use]
+pub fn resolve_with_request(
+    cli_pref: Option<bool>,
+    toml_pref: Option<bool>,
+    ctx: &Context,
+) -> Mode {
+    let want = cli_pref.or(toml_pref).unwrap_or(true);
+    resolve_mode(want, ctx)
+}
+
 /// Resolve friendly mode given the user's preference and environmental gates.
 ///
 /// `want_friendly` is the user-facing toggle (`--friendly` / TOML / future
@@ -251,5 +268,67 @@ mod tests {
     fn mode_is_friendly_helper() {
         assert!(Mode::Friendly.is_friendly());
         assert!(!Mode::Off.is_friendly());
+    }
+
+    // ── resolve_with_request layered tests ──────────────────────────
+    //
+    // These cover the CLI > TOML > default-on-for-TTY policy so the
+    // "default flipped to on" behaviour is locked in by an assertion
+    // that exercises the same resolver `lib.rs` calls.
+
+    #[test]
+    fn default_on_when_no_preference_and_tty() {
+        let ctx = Context::permissive();
+        assert_eq!(
+            resolve_with_request(None, None, &ctx),
+            Mode::Friendly,
+            "no CLI flag, no TOML preference, plain TTY -> friendly on"
+        );
+    }
+
+    #[test]
+    fn toml_off_overrides_default_on() {
+        let ctx = Context::permissive();
+        assert_eq!(resolve_with_request(None, Some(false), &ctx), Mode::Off);
+    }
+
+    #[test]
+    fn cli_off_overrides_toml_on() {
+        let ctx = Context::permissive();
+        assert_eq!(
+            resolve_with_request(Some(false), Some(true), &ctx),
+            Mode::Off
+        );
+    }
+
+    #[test]
+    fn cli_on_overrides_toml_off() {
+        let ctx = Context::permissive();
+        assert_eq!(
+            resolve_with_request(Some(true), Some(false), &ctx),
+            Mode::Friendly
+        );
+    }
+
+    #[test]
+    fn hard_off_context_wins_over_cli_on() {
+        let mut ctx = Context::permissive();
+        ctx.service_run = true;
+        assert_eq!(
+            resolve_with_request(Some(true), Some(true), &ctx),
+            Mode::Off,
+            "service context is hard-off and survives an explicit --friendly"
+        );
+    }
+
+    #[test]
+    fn default_off_when_no_preference_and_non_tty() {
+        let mut ctx = Context::permissive();
+        ctx.stdout_is_tty = false;
+        assert_eq!(
+            resolve_with_request(None, None, &ctx),
+            Mode::Off,
+            "non-TTY default falls back to off via the gate, not via the request layer"
+        );
     }
 }

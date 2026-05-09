@@ -23,6 +23,18 @@ pub(crate) struct TomlConfig {
     pub metrics: Option<TomlMetrics>,
     pub server: Option<TomlServer>,
     pub report: Option<TomlReport>,
+    pub ui: Option<TomlUi>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TomlUi {
+    /// Friendly progress UX: verb-cycling spinners, summary card, curated
+    /// phase narration. Defaults to `true` on a plain TTY; auto-disabled in
+    /// non-TTY, service, container, systemd, machine-output, or explicit
+    /// `--log-level` / `RUST_LOG` contexts. The CLI flags `--friendly` and
+    /// `--no-friendly` override this value for one invocation.
+    pub friendly: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -746,6 +758,11 @@ pub struct Config {
     /// Resolved friendly UX mode: drives bar / spinner / tracing format.
     /// `Mode::Off` reproduces v0.13 behaviour byte-for-byte.
     pub personality_mode: crate::personality::Mode,
+    /// User-stated preference for friendly mode (CLI > TOML). `None` means
+    /// neither was set, so the default-on-for-TTY policy applies. Preserved
+    /// alongside `personality_mode` so `to_toml` can round-trip the user's
+    /// intent independent of environment-driven gate decisions.
+    pub friendly_request: Option<bool>,
     pub keep_unicode_in_filenames: bool,
     pub only_print_filenames: bool,
     pub no_incremental: bool,
@@ -1864,8 +1881,12 @@ impl Config {
             no_progress_bar,
             // Resolved at startup in lib.rs and threaded into Config via the
             // `friendly` flag. Defaults to Off here; lib.rs overwrites with
-            // the resolved Mode after Config::build returns.
+            // the resolved Mode after Config::build returns. The TOML
+            // preference (when present) is captured here so `kei config show`
+            // round-trips the user's intent without seeing the CLI; lib.rs
+            // overrides this when `--friendly` / `--no-friendly` is passed.
             personality_mode: crate::personality::Mode::Off,
+            friendly_request: toml.and_then(|t| t.ui.as_ref()).and_then(|u| u.friendly),
             keep_unicode_in_filenames,
             only_print_filenames: sync.only_print_filenames,
             no_incremental: sync.no_incremental,
@@ -2121,6 +2142,13 @@ impl Config {
             report: self.report_json.as_ref().map(|p| TomlReport {
                 json: Some(p.display().to_string()),
             }),
+            // Only emit `[ui]` when the user actually expressed a preference.
+            // Omitting the section when `friendly_request` is `None` keeps
+            // `kei config show` output unchanged for users who never opted
+            // in or out, and lets the default-on-for-TTY policy apply.
+            ui: self.friendly_request.map(|friendly| TomlUi {
+                friendly: Some(friendly),
+            }),
         }
     }
 }
@@ -2208,6 +2236,7 @@ pub(crate) fn persist_first_run_config(
         metrics: None,
         server: None,
         report: None,
+        ui: None,
     };
 
     // Don't write if there's nothing meaningful to persist
@@ -6458,6 +6487,121 @@ mod tests {
         assert!(toml.download.as_ref().unwrap().temp_suffix.is_none());
     }
 
+    // ── [ui] TOML section round-trip ─────────────────────────────────
+    //
+    // The friendly toggle has three observable states from the TOML's
+    // perspective: absent (None), `friendly = true`, `friendly = false`.
+    // Together with the CLI tristate this is the contract `lib.rs` and
+    // `kei config show` rely on, so each state gets its own assertion.
+
+    #[test]
+    fn test_to_toml_omits_ui_section_when_no_preference() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        let toml = cfg.to_toml();
+        assert!(
+            toml.ui.is_none(),
+            "config show must not invent a [ui] section for users who never set one"
+        );
+    }
+
+    #[test]
+    fn test_config_build_captures_toml_friendly_true() {
+        let toml_input = TomlConfig {
+            data_dir: None,
+            log_level: None,
+            auth: None,
+            download: None,
+            filters: None,
+            photos: None,
+            watch: None,
+            notifications: None,
+            metrics: None,
+            server: None,
+            report: None,
+            ui: Some(TomlUi {
+                friendly: Some(true),
+            }),
+        };
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml_input),
+        )
+        .unwrap();
+        assert_eq!(cfg.friendly_request, Some(true));
+        let round_tripped = cfg.to_toml();
+        assert_eq!(
+            round_tripped.ui.and_then(|u| u.friendly),
+            Some(true),
+            "to_toml must preserve the user's friendly = true preference"
+        );
+    }
+
+    #[test]
+    fn test_config_build_captures_toml_friendly_false() {
+        let toml_input = TomlConfig {
+            data_dir: None,
+            log_level: None,
+            auth: None,
+            download: None,
+            filters: None,
+            photos: None,
+            watch: None,
+            notifications: None,
+            metrics: None,
+            server: None,
+            report: None,
+            ui: Some(TomlUi {
+                friendly: Some(false),
+            }),
+        };
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml_input),
+        )
+        .unwrap();
+        assert_eq!(cfg.friendly_request, Some(false));
+        assert_eq!(
+            cfg.to_toml().ui.and_then(|u| u.friendly),
+            Some(false),
+            "to_toml must preserve the user's friendly = false opt-out"
+        );
+    }
+
+    #[test]
+    fn test_toml_ui_parses_friendly_key() {
+        let parsed: TomlConfig = toml::from_str("[ui]\nfriendly = false\n").unwrap();
+        assert_eq!(parsed.ui.unwrap().friendly, Some(false));
+
+        let parsed: TomlConfig = toml::from_str("[ui]\nfriendly = true\n").unwrap();
+        assert_eq!(parsed.ui.unwrap().friendly, Some(true));
+
+        let empty: TomlConfig = toml::from_str("").unwrap();
+        assert!(empty.ui.is_none());
+    }
+
+    #[test]
+    fn test_toml_ui_rejects_unknown_keys() {
+        // `deny_unknown_fields` is the standard guard against typos like
+        // `friendlly`. Lock the behaviour in so a future refactor can't
+        // silently drop it.
+        let err = toml::from_str::<TomlConfig>("[ui]\nfriend = true\n")
+            .expect_err("unknown key in [ui] must error");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "error must mention unknown field, got: {err}"
+        );
+    }
+
     #[test]
     fn test_to_toml_includes_non_default_values() {
         let mut globals = default_globals();
@@ -6726,6 +6870,7 @@ mod tests {
             metrics: None,
             server: None,
             report: None,
+            ui: None,
         };
         let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/toml/data"));
@@ -6752,6 +6897,7 @@ mod tests {
             metrics: None,
             server: None,
             report: None,
+            ui: None,
         };
         let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/toml/cookies"));
@@ -6777,6 +6923,7 @@ mod tests {
             metrics: None,
             server: None,
             report: None,
+            ui: None,
         };
         let result = resolve_data_dir(
             Some("/cli/data"),

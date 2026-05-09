@@ -2719,6 +2719,7 @@ mod tests {
             dry_run: false,
             no_progress_bar: true,
             personality_mode: crate::personality::Mode::Off,
+            friendly_request: None,
             keep_unicode_in_filenames: false,
             only_print_filenames: false,
             no_incremental: false,

@@ -2937,6 +2937,7 @@ mod build_config_tests {
             metrics: None,
             server: None,
             report: None,
+            ui: None,
         }
     }
 

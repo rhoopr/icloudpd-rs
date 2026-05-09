@@ -102,6 +102,10 @@ struct SetupAnswers {
     /// `[auth].cookie_directory`).
     data_dir: Option<String>,
     log_level: Option<LogLevel>,
+    /// `[ui].friendly`. `None` keeps the section out of the emitted TOML so
+    /// the runtime default-on-for-TTY policy applies. `Some(false)` lets a
+    /// user opt out at setup time without having to remember the flag later.
+    ui_friendly: Option<bool>,
 }
 
 impl Default for SetupAnswers {
@@ -145,6 +149,7 @@ impl Default for SetupAnswers {
             file_match_policy: None,
             data_dir: None,
             log_level: None,
+            ui_friendly: None,
         }
     }
 }
@@ -200,7 +205,12 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     // Step 7: Running mode
     ask_running_mode(&mut answers)?;
 
-    // Step 8: Extras
+    // Step 8: Friendly UX. Defaults to on at runtime; the wizard only
+    // writes `[ui] friendly = false` when the user opts out, so existing
+    // configs and skipped setup runs both fall through to the default.
+    ask_friendly(&mut answers)?;
+
+    // Step 9: Extras
     ask_extras(&mut answers)?;
 
     // Generate TOML. `fmt::Write for String` is infallible, so this never
@@ -784,6 +794,22 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
 // ── Step 8: Extras ─────────────────────────────────────────────────
 
+fn ask_friendly(answers: &mut SetupAnswers) -> anyhow::Result<()> {
+    println!();
+    let friendly = Confirm::new()
+        .with_prompt(
+            "Show friendly progress messages\n  \
+             (verb-cycling spinners, summary card, sign-off)?",
+        )
+        .default(true)
+        .interact()?;
+    // Only persist an explicit opt-out. Storing `Some(true)` would freeze
+    // the default into the config; leaving it `None` keeps the runtime
+    // free to flip the default later without rewriting users' files.
+    answers.ui_friendly = if friendly { None } else { Some(false) };
+    Ok(())
+}
+
 fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     println!();
     let configure = Confirm::new()
@@ -1254,6 +1280,17 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         writeln!(out, "[report]")?;
         writeln!(out, "# json = \"/path/to/last-run.json\"")?;
 
+        // [ui] - friendly progress UX. Default-on-for-TTY at runtime, so
+        // we only emit an active line when the user explicitly opted out;
+        // otherwise the section is hint-only.
+        writeln!(out)?;
+        writeln!(out, "[ui]")?;
+        match answers.ui_friendly {
+            Some(false) => writeln!(out, "friendly = false")?,
+            Some(true) => writeln!(out, "friendly = true")?,
+            None => writeln!(out, "# friendly = true  # default on TTY")?,
+        }
+
         Ok(out)
     })()
     .expect("formatting into a String is infallible")
@@ -1352,6 +1389,57 @@ mod tests {
         assert!(!toml.contains("skip_live_photos"));
     }
 
+    // ── [ui] section emission ───────────────────────────────────────
+    //
+    // The wizard's friendly question is the only opt-out path baked into
+    // the TOML. Default answers (skipped or "yes") leave `[ui].friendly`
+    // commented so the runtime keeps freedom to flip the default; an
+    // explicit "no" must persist as `friendly = false`.
+
+    #[test]
+    fn test_generate_toml_default_leaves_ui_friendly_commented() {
+        let answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("secret"),
+            directory: "~/Photos/iCloud".to_string(),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        assert!(
+            toml_str.contains("[ui]"),
+            "[ui] section header must always render so users see the option"
+        );
+        assert!(
+            toml_str.contains("# friendly = true"),
+            "default-yes answer must leave the friendly key commented; got:\n{toml_str}"
+        );
+        // Round-trip: parser sees no preference.
+        let parsed: TomlConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.ui.and_then(|u| u.friendly), None);
+    }
+
+    #[test]
+    fn test_generate_toml_opt_out_emits_friendly_false() {
+        let answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("secret"),
+            directory: "~/Photos/iCloud".to_string(),
+            ui_friendly: Some(false),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        assert!(
+            toml_str.contains("\nfriendly = false"),
+            "explicit opt-out must emit an active `friendly = false` line; got:\n{toml_str}"
+        );
+        let parsed: TomlConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            parsed.ui.and_then(|u| u.friendly),
+            Some(false),
+            "round-trip parse must preserve the opt-out"
+        );
+    }
+
     #[test]
     fn test_generate_toml_roundtrip() {
         let answers = SetupAnswers {
@@ -1431,6 +1519,7 @@ mod tests {
             file_match_policy: Some(FileMatchPolicy::NameId7),
             data_dir: Some("~/.kei".to_string()),
             log_level: Some(LogLevel::Debug),
+            ui_friendly: Some(false),
         };
         let toml_str = generate_toml(&answers);
 
@@ -1515,6 +1604,7 @@ mod tests {
             file_match_policy: Some(FileMatchPolicy::NameId7),
             data_dir: Some("/var/lib/kei".to_string()),
             log_level: Some(LogLevel::Error),
+            ui_friendly: Some(false),
         };
         let toml_str = generate_toml(&answers);
         let parsed: TomlConfig = toml::from_str(&toml_str)

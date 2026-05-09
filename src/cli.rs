@@ -948,11 +948,26 @@ pub struct Cli {
     #[arg(long, short = 'v', global = true)]
     pub verbose: bool,
 
-    /// Enable friendly progress messages, verb-cycling spinners, and curated phase narration.
-    /// Off by default while the surface stabilises; flip on with `--friendly` to preview.
-    /// Auto-disabled in service/container/journal contexts and when machine-output flags are set.
-    #[arg(long, global = true, env = "KEI_FRIENDLY")]
+    /// Force friendly progress messages on (verb-cycling spinners, curated phase narration,
+    /// summary card, sign-off). Default: on for plain TTYs, off in service/container/journal
+    /// contexts and whenever a machine-output flag (`--report-json`, `--only-print-filenames`)
+    /// or an explicit `--log-level` / `RUST_LOG` is in play. `--friendly` overrides the TOML
+    /// `[ui] friendly` setting and the auto-detected default; environmental hard-off contexts
+    /// still win.
+    #[arg(
+        long,
+        global = true,
+        overrides_with = "no_friendly",
+        env = "KEI_FRIENDLY"
+    )]
     pub friendly: bool,
+
+    /// Force friendly progress messages off (preserves v0.13 scrollback byte-for-byte).
+    /// Overrides `--friendly`, the TOML `[ui] friendly` setting, and the auto-detected
+    /// default. Use this when piping kei output to a log aggregator on an interactive TTY
+    /// where auto-detection would otherwise enable friendly mode.
+    #[arg(long, global = true, overrides_with = "friendly")]
+    pub no_friendly: bool,
 
     /// Path to TOML config file
     #[arg(
@@ -1150,6 +1165,27 @@ impl PasswordArgs {
 }
 
 impl Cli {
+    /// User-stated friendly-mode preference, distilled from the
+    /// `--friendly` / `--no-friendly` pair (with `KEI_FRIENDLY` feeding the
+    /// former). `Some(true)` and `Some(false)` are explicit user requests
+    /// that override the TOML and the auto-detected default; `None` means
+    /// neither flag was set, so the resolution chain falls through to TOML
+    /// then to the default-on-for-TTY policy.
+    ///
+    /// Clap's `overrides_with` makes the two flags mutually exclusive at the
+    /// argument level: when both appear, the last one wins, so the
+    /// post-parse state has at most one of `friendly` / `no_friendly` set.
+    #[must_use]
+    pub fn friendly_request(&self) -> Option<bool> {
+        if self.no_friendly {
+            Some(false)
+        } else if self.friendly {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     /// Get the effective command, treating bare invocation as sync.
     ///
     /// When a subcommand is present, top-level password/sync args are merged
@@ -3878,5 +3914,50 @@ mod tests {
                 "validate() must reject sync-only flag `{name}` ({args:?}) with status; got {result:?}"
             );
         }
+    }
+
+    // ── friendly_request() resolution ───────────────────────────────────
+    //
+    // The helper distils the `--friendly` / `--no-friendly` pair into the
+    // tristate `lib.rs` actually consumes. Tests here prove clap's
+    // `overrides_with` wiring matches the documented behaviour: last flag
+    // wins when both appear, neither set yields `None`.
+
+    #[test]
+    fn friendly_request_none_when_neither_flag() {
+        let cli = parse(&["kei", "status"]);
+        assert_eq!(cli.friendly_request(), None);
+    }
+
+    #[test]
+    fn friendly_request_some_true_with_friendly() {
+        let cli = parse(&["kei", "--friendly", "status"]);
+        assert_eq!(cli.friendly_request(), Some(true));
+    }
+
+    #[test]
+    fn friendly_request_some_false_with_no_friendly() {
+        let cli = parse(&["kei", "--no-friendly", "status"]);
+        assert_eq!(cli.friendly_request(), Some(false));
+    }
+
+    #[test]
+    fn friendly_request_last_wins_no_friendly_after_friendly() {
+        let cli = parse(&["kei", "--friendly", "--no-friendly", "status"]);
+        assert_eq!(
+            cli.friendly_request(),
+            Some(false),
+            "--no-friendly after --friendly must win via overrides_with"
+        );
+    }
+
+    #[test]
+    fn friendly_request_last_wins_friendly_after_no_friendly() {
+        let cli = parse(&["kei", "--no-friendly", "--friendly", "status"]);
+        assert_eq!(
+            cli.friendly_request(),
+            Some(true),
+            "--friendly after --no-friendly must win via overrides_with"
+        );
     }
 }

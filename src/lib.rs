@@ -583,8 +583,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     };
 
     // Resolve friendly mode. The gate has multiple short-circuits (service
-    // context, non-TTY, RUST_LOG, --report-json, ...) so `--friendly` is a
-    // request, not a guarantee.
+    // context, non-TTY, RUST_LOG, --report-json, ...) so the user-stated
+    // preference is a request, not a guarantee.
+    //
+    // Resolution chain: CLI > TOML > default-on-for-TTY. The gate then
+    // clamps to Off in any environment that can't render or shouldn't
+    // (non-TTY, journals, machine-output flags). Default-on means the
+    // setup wizard's question and the TOML key are opt-out levers; first
+    // contact with kei on a plain terminal already gets the friendly UX.
     //
     // `effective_command()` clones SyncArgs, but it's run once here and once
     // at dispatch below. The clone cost is one-shot at startup and the only
@@ -609,7 +615,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         log_level_explicit,
         cmd_service_run,
     );
-    let personality_mode = personality::resolve_mode(cli.friendly, &personality_ctx);
+    let toml_friendly = toml_config
+        .as_ref()
+        .and_then(|t| t.ui.as_ref())
+        .and_then(|u| u.friendly);
+    let cli_friendly = cli.friendly_request();
+    let friendly_request = cli_friendly.or(toml_friendly);
+    let personality_mode =
+        personality::resolve_with_request(cli_friendly, toml_friendly, &personality_ctx);
     let default_filter = personality::tracing::default_filter_for(personality_mode, off_filter);
 
     // `_writer_guard` MUST live until `run` returns. A `static`-stored
@@ -781,6 +794,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         // service run is hard-off per gate; resolved mode is
                         // already Off here, but pass through for symmetry.
                         personality_mode,
+                        friendly_request,
                     },
                 )
                 .await;
@@ -806,6 +820,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             config_path: config_path.clone(),
             redact_password: Arc::clone(&redact_password),
             personality_mode,
+            friendly_request,
         },
     )
     .await

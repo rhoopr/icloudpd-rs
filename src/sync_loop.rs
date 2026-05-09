@@ -225,6 +225,11 @@ pub(crate) struct SyncArgs {
     /// Resolved friendly UX mode from lib.rs startup. Threaded into Config so
     /// the download pipeline picks the right bar template.
     pub personality_mode: crate::personality::Mode,
+    /// User-stated friendly preference (CLI > TOML; `None` means neither was
+    /// set, so the default-on-for-TTY policy is active). Threaded so the
+    /// resolved Config exposes the same intent the gate saw, useful for
+    /// downstream code that wants to know whether the user opted in.
+    pub friendly_request: Option<bool>,
 }
 
 /// Run the sync command: authenticate, enumerate photos, download, and
@@ -240,6 +245,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         config_path,
         redact_password,
         personality_mode,
+        friendly_request,
     } = args;
 
     let is_retry_failed = sync.retry_failed;
@@ -257,6 +263,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // it up via `config.personality_mode`. Config::build defaults to Off; the
     // CLI flag and gate logic live up in lib.rs.
     config.personality_mode = personality_mode;
+    // Same story for the user-stated preference: Config::build pulled the
+    // TOML value (if any), and lib.rs has already merged the CLI flag on
+    // top. Stamp the merged result so `to_toml` and any downstream consumer
+    // sees the canonical post-resolution intent.
+    config.friendly_request = friendly_request;
 
     // On first run (no config file), persist CLI-provided values so
     // subsequent runs don't need the same flags again. Only when the
