@@ -944,6 +944,16 @@ pub struct Cli {
     #[arg(long, value_enum, global = true, env = "KEI_LOG_LEVEL")]
     pub log_level: Option<LogLevel>,
 
+    /// Verbose output (alias for --log-level info, restores full target+timestamp format)
+    #[arg(long, short = 'v', global = true)]
+    pub verbose: bool,
+
+    /// Enable friendly progress messages, verb-cycling spinners, and curated phase narration.
+    /// Off by default while the surface stabilises; flip on with `--friendly` to preview.
+    /// Auto-disabled in service/container/journal contexts and when machine-output flags are set.
+    #[arg(long, global = true, env = "KEI_FRIENDLY")]
+    pub friendly: bool,
+
     /// Path to TOML config file
     #[arg(
         long,

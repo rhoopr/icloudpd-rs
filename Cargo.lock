@@ -1413,6 +1413,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "console",
  "cookie",
  "data-encoding",
  "dialoguer",

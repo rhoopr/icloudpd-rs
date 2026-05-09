@@ -1,0 +1,70 @@
+//! Process-wide bar/tracing coordination via a singleton `MultiProgress`.
+//!
+//! Indicatif redraws progress bars by emitting ANSI cursor escapes that
+//! assume nothing else has written to the terminal between draws. Tracing
+//! writes to stderr break that assumption: a WARN/ERROR event lands mid-
+//! redraw and the bar's lines duplicate or get partially overwritten.
+//!
+//! `MultiProgress` provides `suspend(f)` which clears the bars, runs `f`
+//! (where stderr writes happen), and redraws. We register every bar with the
+//! singleton and wrap stderr writes in `with_suspended` so tracing events
+//! cleanly print above an intact bar.
+
+use std::sync::OnceLock;
+
+use indicatif::{MultiProgress, ProgressBar};
+
+/// Process-wide MultiProgress. Lazily initialised so test binaries that never
+/// touch the bar surface don't pay the cost.
+static MULTI: OnceLock<MultiProgress> = OnceLock::new();
+
+/// Return the singleton MultiProgress, initialising on first call.
+pub fn multi() -> &'static MultiProgress {
+    MULTI.get_or_init(MultiProgress::new)
+}
+
+/// Register a freshly-built bar with the singleton MultiProgress and return
+/// the registered handle. The returned bar shares the multi's draw target,
+/// so its updates serialise with `with_suspended` calls from tracing writes.
+#[must_use]
+pub fn register(pb: ProgressBar) -> ProgressBar {
+    multi().add(pb)
+}
+
+/// Run `f` with all registered bars temporarily hidden. Used by the stderr
+/// writer wrapper so tracing events print above the bar block without
+/// colliding with an in-flight redraw.
+///
+/// Cheap when no bars are registered: indicatif's `suspend` short-circuits
+/// to a direct call. Safe to invoke on every stderr write.
+pub fn with_suspended<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    multi().suspend(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_returns_same_instance() {
+        let a = multi() as *const MultiProgress;
+        let b = multi() as *const MultiProgress;
+        assert_eq!(a, b, "multi() must be a singleton");
+    }
+
+    #[test]
+    fn with_suspended_returns_closure_value() {
+        let v: u32 = with_suspended(|| 42);
+        assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn register_returns_a_usable_bar() {
+        let pb = register(ProgressBar::hidden());
+        // Hidden bars are still functional; just confirm the type round-trips.
+        assert!(pb.is_hidden());
+    }
+}

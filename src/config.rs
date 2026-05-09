@@ -462,15 +462,12 @@ pub(crate) fn should_warn_implicit_unfiled(
 }
 
 fn warn_implicit_unfiled_pass() {
-    #[allow(
-        clippy::print_stderr,
-        reason = "runs during config load, before tracing subscriber is installed"
-    )]
-    {
-        eprintln!(
-            "warning: --unfiled defaults to true in v0.13, so kei is also running an unfiled pass (every photo not in any user album) alongside the album pass(es). Pass `--unfiled false` (or `[filters] unfiled = false`) to restrict to just the album pass(es); pass `--unfiled true` to silence this warning."
-        );
-    }
+    tracing::warn!(
+        "--unfiled defaults to true in v0.13, so kei is also running an unfiled pass \
+         (every photo not in any user album) alongside the album pass(es). Pass \
+         `--unfiled false` (or `[filters] unfiled = false`) to restrict to just the \
+         album pass(es); pass `--unfiled true` to silence this warning."
+    );
 }
 
 /// Translate the legacy `(AlbumSelection, exclude_albums)` tuple plus the
@@ -746,6 +743,9 @@ pub struct Config {
     pub xmp_sidecar: bool,
     pub dry_run: bool,
     pub no_progress_bar: bool,
+    /// Resolved friendly UX mode: drives bar / spinner / tracing format.
+    /// `Mode::Off` reproduces v0.13 behaviour byte-for-byte.
+    pub personality_mode: crate::personality::Mode,
     pub keep_unicode_in_filenames: bool,
     pub only_print_filenames: bool,
     pub no_incremental: bool,
@@ -1862,6 +1862,10 @@ impl Config {
             xmp_sidecar,
             dry_run: sync.dry_run,
             no_progress_bar,
+            // Resolved at startup in lib.rs and threaded into Config via the
+            // `friendly` flag. Defaults to Off here; lib.rs overwrites with
+            // the resolved Mode after Config::build returns.
+            personality_mode: crate::personality::Mode::Off,
             keep_unicode_in_filenames,
             only_print_filenames: sync.only_print_filenames,
             no_incremental: sync.no_incremental,

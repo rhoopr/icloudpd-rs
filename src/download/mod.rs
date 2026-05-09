@@ -495,6 +495,10 @@ pub(crate) struct DownloadConfig {
     pub(crate) align_raw: RawTreatmentPolicy,
     pub(crate) no_progress_bar: bool,
     pub(crate) only_print_filenames: bool,
+    /// Friendly UX mode: drives bar template / spinner glyphs / progress chars.
+    /// Defaults to `Mode::Off` so existing callers see v0.13 behaviour
+    /// byte-for-byte until they opt in.
+    pub(crate) personality_mode: crate::personality::Mode,
     pub(crate) file_match_policy: FileMatchPolicy,
     pub(crate) force_size: bool,
     pub(crate) keep_unicode_in_filenames: bool,
@@ -532,6 +536,16 @@ pub(crate) struct DownloadConfig {
 }
 
 impl DownloadConfig {
+    /// Human-readable label for the active pass: the album's own name for
+    /// album/smart-folder passes, "unfiled" for the unfiled pass (which uses
+    /// `library.all()` whose `.name` is the empty string).
+    pub(crate) fn pass_label(&self) -> &str {
+        match self.album_name.as_deref() {
+            Some("") | None => "unfiled",
+            Some(name) => name,
+        }
+    }
+
     /// True when passes can produce divergent paths and need per-pass config
     /// expansion (`with_pass`) plus path-aware skip checks rather than the
     /// merged-stream optimisation + DB-only fast skip.
@@ -608,6 +622,7 @@ impl DownloadConfig {
             align_raw: fields.align_raw,
             no_progress_bar,
             only_print_filenames: false,
+            personality_mode: crate::personality::Mode::Off,
             file_match_policy: fields.file_match_policy,
             force_size: fields.force_size,
             keep_unicode_in_filenames: fields.keep_unicode_in_filenames,
@@ -805,6 +820,7 @@ impl DownloadConfig {
             align_raw: RawTreatmentPolicy::Unchanged,
             no_progress_bar: true,
             only_print_filenames: false,
+            personality_mode: crate::personality::Mode::Off,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,
@@ -1621,6 +1637,19 @@ async fn download_photos_full_with_token(
         };
         let mut token_receivers = Vec::with_capacity(passes.len());
 
+        // One bar shared across every pass. Without this, each pass creates
+        // its own ProgressBar internally and `finish_and_clear`s it on
+        // completion — a small album finishing fast then a large unfiled
+        // starting fresh reads as a visual glitch (panel disappears and
+        // reappears). Threading the same bar through means the user sees one
+        // bar walking from 0 to grand-total continuously.
+        let (shared_pb, shared_bytes) = crate::download::pipeline::create_progress_bar_for_passes(
+            config.no_progress_bar,
+            config.only_print_filenames,
+            total,
+            config.personality_mode,
+        );
+
         for ((pass, &count), pass_config) in passes.iter().zip(&pass_counts).zip(&pass_configs) {
             if shutdown_token.is_cancelled() {
                 combined_result.enumeration_complete = false;
@@ -1639,6 +1668,8 @@ async fn download_photos_full_with_token(
                 pass_config,
                 total,
                 shutdown_token.clone(),
+                Some(shared_pb.clone()),
+                Some(Arc::clone(&shared_bytes)),
             )
             .await?;
 
@@ -1655,6 +1686,10 @@ async fn download_photos_full_with_token(
             combined_result.enumeration_complete =
                 combined_result.enumeration_complete && result.enumeration_complete;
         }
+
+        // Bar lifetime owned here in the per-pass branch — finish once after
+        // all passes complete (or break early on cancel).
+        shared_pb.finish_and_clear();
 
         (combined_result, token_receivers)
     } else {
@@ -1683,12 +1718,16 @@ async fn download_photos_full_with_token(
             .collect();
 
         let combined = stream::select_all(streams);
+        // Merged-stream branch already runs as a single call, so it creates
+        // one bar internally; no shared-bar plumbing needed.
         let result = stream_and_download_from_stream(
             download_client,
             combined,
             &merged_config,
             total,
             shutdown_token.clone(),
+            None,
+            None,
         )
         .await?;
 
@@ -2094,6 +2133,7 @@ async fn download_photos_incremental(
         metadata: MetadataFlags::from(config.as_ref()),
         concurrency: config.concurrent_downloads,
         no_progress_bar: config.no_progress_bar,
+        personality_mode: config.personality_mode,
         temp_suffix: Arc::clone(&config.temp_suffix),
         shutdown_token,
         state_db: config.state_db.clone(),
@@ -2678,6 +2718,7 @@ mod tests {
             xmp_sidecar: false,
             dry_run: false,
             no_progress_bar: true,
+            personality_mode: crate::personality::Mode::Off,
             keep_unicode_in_filenames: false,
             only_print_filenames: false,
             no_incremental: false,

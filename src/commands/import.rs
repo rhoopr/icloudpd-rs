@@ -1282,6 +1282,7 @@ mod wiremock_tests {
             align_raw: RawTreatmentPolicy::Unchanged,
             no_progress_bar: true,
             only_print_filenames: false,
+            personality_mode: crate::personality::Mode::Off,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_size: false,
             keep_unicode_in_filenames: false,

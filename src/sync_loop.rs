@@ -222,6 +222,9 @@ pub(crate) struct SyncArgs {
     pub config_explicitly_set: bool,
     pub config_path: std::path::PathBuf,
     pub redact_password: Arc<std::sync::Mutex<Option<SecretString>>>,
+    /// Resolved friendly UX mode from lib.rs startup. Threaded into Config so
+    /// the download pipeline picks the right bar template.
+    pub personality_mode: crate::personality::Mode,
 }
 
 /// Run the sync command: authenticate, enumerate photos, download, and
@@ -236,6 +239,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         config_explicitly_set,
         config_path,
         redact_password,
+        personality_mode,
     } = args;
 
     let is_retry_failed = sync.retry_failed;
@@ -249,6 +253,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .clone()
         .or_else(|| globals.cookie_directory.clone());
     let mut config = config::Config::build(globals, &pw, sync, toml_config.as_ref())?;
+    // Stamp the resolved Mode onto Config so build_download_config below picks
+    // it up via `config.personality_mode`. Config::build defaults to Off; the
+    // CLI flag and gate logic live up in lib.rs.
+    config.personality_mode = personality_mode;
 
     // On first run (no config file), persist CLI-provided values so
     // subsequent runs don't need the same flags again. Only when the
@@ -680,6 +688,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             align_raw: config.align_raw,
             no_progress_bar: config.no_progress_bar,
             only_print_filenames: config.only_print_filenames,
+            personality_mode: config.personality_mode,
             file_match_policy: config.file_match_policy,
             force_size: config.force_size,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,

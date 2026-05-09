@@ -41,6 +41,7 @@ mod metrics;
 mod migration;
 mod notifications;
 mod password;
+mod personality;
 mod report;
 mod retry;
 mod selection;
@@ -62,7 +63,6 @@ use std::sync::Arc;
 
 use clap::Parser;
 use password::{ExposeSecret, SecretString};
-use tracing_subscriber::EnvFilter;
 
 /// A writer wrapper that redacts a password string from log output.
 ///
@@ -123,6 +123,21 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
             inner: self.inner.clone(),
             password: Arc::clone(&self.password),
         }
+    }
+}
+
+/// `Write` impl that funnels stderr through `MultiProgress::suspend` so a
+/// tracing event mid-redraw doesn't trample the active progress bar's ANSI
+/// cursor positioning. Cheap when no bars are registered (suspend is a
+/// passthrough); essential when a multi-line friendly bar is on screen.
+pub(crate) struct BarSuspendingStderr;
+
+impl std::io::Write for BarSuspendingStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        personality::active_bar::with_suspended(|| std::io::stderr().write(buf))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        personality::active_bar::with_suspended(|| std::io::stderr().flush())
     }
 }
 
@@ -538,32 +553,85 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let config_required = config_explicitly_set && !can_auto_create;
     let mut toml_config = config::load_toml_config(&config_path, config_required)?;
 
-    // Resolve log level: CLI > TOML > default (info)
-    let effective_log_level = cli
-        .log_level
+    // Resolve log level: --log-level > --verbose > TOML > default (info).
+    // `--verbose` is a friendlier alias for `--log-level info` and is
+    // overridden if `--log-level` is also explicitly set.
+    let cli_log_level = cli.log_level.or(if cli.verbose {
+        Some(types::LogLevel::Info)
+    } else {
+        None
+    });
+    let log_level_explicit = cli_log_level.is_some();
+    let effective_log_level = cli_log_level
         .or_else(|| toml_config.as_ref().and_then(|t| t.log_level))
         .unwrap_or(types::LogLevel::Info);
 
     // Scope debug/info to the app crate so dependency crates stay quieter.
     // Users can override with RUST_LOG env var for full control.
-    let filter = match effective_log_level {
+    let off_filter = match effective_log_level {
         types::LogLevel::Debug => "kei=debug,info",
         types::LogLevel::Info => "kei=info",
         types::LogLevel::Warn => "warn",
         types::LogLevel::Error => "error",
     };
+
+    // Resolve friendly mode. The gate has multiple short-circuits (service
+    // context, non-TTY, RUST_LOG, --report-json, ...) so `--friendly` is a
+    // request, not a guarantee.
+    //
+    // `effective_command()` clones SyncArgs, but it's run once here and once
+    // at dispatch below. The clone cost is one-shot at startup and the only
+    // alternative (threading the resolved command through `run`) ripples
+    // through every callee. Acceptable.
+    let resolved_for_personality = cli.effective_command();
+    let (cmd_no_progress_bar, cmd_only_print_filenames, cmd_report_json, cmd_service_run) =
+        match &resolved_for_personality {
+            cli::Command::Sync { sync, .. } => (
+                sync.no_progress_bar.unwrap_or(false),
+                sync.only_print_filenames,
+                sync.report_json.is_some(),
+                false,
+            ),
+            cli::Command::Service { .. } => (false, false, false, true),
+            _ => (false, false, false, false),
+        };
+    let personality_ctx = personality::Context::detect(
+        cmd_no_progress_bar,
+        cmd_only_print_filenames,
+        cmd_report_json,
+        log_level_explicit,
+        cmd_service_run,
+    );
+    let personality_mode = personality::resolve_mode(cli.friendly, &personality_ctx);
+    let default_filter = personality::tracing::default_filter_for(personality_mode, off_filter);
+
     // `_writer_guard` MUST live until `run` returns. A `static`-stored
     // guard never drops (Rust skips static destructors), so subprocess
     // tests reading stderr after kei exits race against unflushed events
     // on fast teardown (observed on macOS CI).
-    let (make_writer, _writer_guard, redact_password) = build_redacting_writer(std::io::stderr());
+    // `BarSuspendingStderr` interposes between tracing and stderr so that
+    // every WARN/ERROR write happens with the in-flight progress bar paused
+    // (via `MultiProgress::suspend`). Without this, a tracing event landing
+    // mid-redraw causes the bar's ANSI cursor moves to desync, leaving
+    // partial duplicate cards on screen (issue surfaced during real syncs).
+    let (make_writer, _writer_guard, redact_password) = build_redacting_writer(BarSuspendingStderr);
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
-        )
-        .with_writer(make_writer)
-        .init();
+    let env_filter = personality::tracing::env_filter(&default_filter);
+    if personality_mode.is_friendly() {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(make_writer)
+            .with_target(false)
+            .with_level(false)
+            .without_time()
+            .event_format(personality::tracing::FriendlyFormat)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(make_writer)
+            .init();
+    }
 
     // Log migration warnings now that tracing is initialized.
     if let Some(report) = &migration_report {
@@ -703,6 +771,9 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         config_explicitly_set,
                         config_path: config_path.clone(),
                         redact_password: Arc::clone(&redact_password),
+                        // service run is hard-off per gate; resolved mode is
+                        // already Off here, but pass through for symmetry.
+                        personality_mode,
                     },
                 )
                 .await;
@@ -727,6 +798,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             config_explicitly_set,
             config_path: config_path.clone(),
             redact_password: Arc::clone(&redact_password),
+            personality_mode,
         },
     )
     .await
@@ -735,6 +807,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_subscriber::EnvFilter;
 
     #[test]
     fn pid_file_guard_creates_and_removes() {
