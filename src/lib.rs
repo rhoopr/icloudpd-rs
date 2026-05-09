@@ -130,6 +130,13 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
 /// tracing event mid-redraw doesn't trample the active progress bar's ANSI
 /// cursor positioning. Cheap when no bars are registered (suspend is a
 /// passthrough); essential when a multi-line friendly bar is on screen.
+///
+/// Stays on `suspend` (rather than `println`) because the pipeline calls
+/// `pb.suspend(|| tracing::warn!(...))` while already holding indicatif's
+/// `MultiProgress` write lock - a `println` call from inside the closure
+/// would re-enter that same `RwLock` and deadlock. Narration outside that
+/// context (greeting, sign-off, stop-signal) routes through `println`
+/// directly via `personality::active_bar::println_above_bars`.
 pub(crate) struct BarSuspendingStderr;
 
 impl std::io::Write for BarSuspendingStderr {

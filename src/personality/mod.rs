@@ -17,6 +17,7 @@ pub mod pace;
 pub mod sparkline;
 pub mod theme;
 pub mod tracing;
+pub mod tty_echo;
 // Phase::Listing + VerbPool::{new, next} are consumed by `cycler` for the
 // pre-first-file scan gap. Other phases and accessors stay reserved for the
 // remaining delight-B wires (phase narration, sign-off card) so we don't

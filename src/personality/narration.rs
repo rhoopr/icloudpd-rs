@@ -8,33 +8,40 @@
 //! Off mode is a strict no-op: nothing is written, no allocation, no lock
 //! contention.
 
+#[cfg(test)]
 use std::io::Write;
 
 use crate::personality::Mode;
 
 /// Write a single narration line to `w`, appending a newline. In off mode
-/// this is a no-op and `w` is not touched. The writer-injectable form is
-/// the testable surface; call `line_to_stderr` for the production path.
-pub fn line<W: Write>(w: &mut W, mode: Mode, text: &str) -> std::io::Result<()> {
+/// this is a no-op and `w` is not touched. Test-only surface that mirrors
+/// the off-vs-friendly gate used by `line_to_stderr`; production callers
+/// go through `line_to_stderr` (which routes through indicatif's
+/// `MultiProgress::println` to coexist with an active bar).
+#[cfg(test)]
+fn line<W: Write>(w: &mut W, mode: Mode, text: &str) -> std::io::Result<()> {
     if !mode.is_friendly() {
         return Ok(());
     }
     writeln!(w, "{text}")
 }
 
-/// Print a narration line to stderr with the active bar suspended.
+/// Print a narration line above any active progress bar.
 ///
-/// Suspending coordinates with the singleton `MultiProgress`: any registered
-/// bar is hidden during the write and redrawn after, so the line lands in
-/// scrollback above an intact bar instead of corrupting an in-flight redraw.
-/// Cheap when no bar is registered (indicatif's `suspend` short-circuits).
+/// Routes through `MultiProgress::println` rather than `suspend(...) +
+/// eprintln!`: println is a single atomic draw that combines the new line
+/// with the bars, so indicatif's cursor tracking stays consistent. The
+/// suspend path has a window between clear and redraw where caller writes
+/// don't update indicatif's line count - on a bar whose last row reaches
+/// the terminal's right edge, the cursor wraps to a new line and the
+/// next redraw lands off-by-one, leaving a stale row above the bar.
+///
+/// Cheap when no bar is registered (indicatif's println short-circuits).
 pub fn line_to_stderr(mode: Mode, text: &str) {
     if !mode.is_friendly() {
         return;
     }
-    crate::personality::active_bar::with_suspended(|| {
-        let _ = line(&mut std::io::stderr(), mode, text);
-    });
+    crate::personality::active_bar::println_above_bars(text);
 }
 
 /// Pre-cycle greeting. One line, fired once per process before the first
@@ -61,6 +68,17 @@ pub fn libraries_resolved_to_stderr(mode: Mode, library_count: usize) {
         n => format!("Found {n} libraries to sync."),
     };
     line_to_stderr(mode, &text);
+}
+
+/// First-Ctrl+C acknowledgement. Friendly mode filters `tracing::info` to
+/// WARN+, so the shutdown handler's existing log lines are silent here -
+/// without this narration the user sees no response and assumes the app
+/// has hung. The off path keeps the original tracing lines for journals.
+pub fn stop_signal_to_stderr(mode: Mode) {
+    line_to_stderr(
+        mode,
+        "Stopping. Finishing in-flight downloads. Press Ctrl+C again to exit immediately.",
+    );
 }
 
 /// Post-cycle sign-off summarising what the cycle did. Friendly-only;
@@ -171,6 +189,36 @@ mod tests {
             line(w, m, "second").unwrap();
         });
         assert_eq!(out, "first\nsecond\n");
+    }
+
+    #[test]
+    fn stop_signal_off_mode_writes_nothing() {
+        let out = capture(Mode::Off, |w, m| {
+            // Mirror line() with the same body stop_signal_to_stderr writes.
+            line(
+                w,
+                m,
+                "Stopping. Finishing in-flight downloads. Press Ctrl+C again to exit immediately.",
+            )
+            .unwrap();
+        });
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn stop_signal_friendly_writes_full_line() {
+        let out = capture(Mode::Friendly, |w, m| {
+            line(
+                w,
+                m,
+                "Stopping. Finishing in-flight downloads. Press Ctrl+C again to exit immediately.",
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            out,
+            "Stopping. Finishing in-flight downloads. Press Ctrl+C again to exit immediately.\n",
+        );
     }
 
     #[test]

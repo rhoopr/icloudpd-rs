@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
+use crate::personality::Mode;
 use crate::systemd::SystemdNotifier;
 
 /// How long to wait for graceful shutdown before force-exiting.
@@ -46,6 +47,7 @@ where
 /// meaningful "shutdown" for these tasks short of the process exiting.
 pub(crate) fn install_signal_handler(
     notifier: SystemdNotifier,
+    mode: Mode,
 ) -> anyhow::Result<CancellationToken> {
     let token = CancellationToken::new();
     let count = Arc::new(AtomicU32::new(0));
@@ -83,6 +85,11 @@ pub(crate) fn install_signal_handler(
             let prev = count.fetch_add(1, Ordering::SeqCst);
             if prev == 0 {
                 handler_notifier.notify_stopping();
+                // Friendly mode filters tracing to WARN+, so the info!
+                // lines below are dropped there. Emit a curated line via
+                // narration so the user sees that Ctrl+C was acknowledged
+                // instead of "nothing happened" (no-op in off mode).
+                crate::personality::narration::stop_signal_to_stderr(mode);
                 tracing::info!("Received shutdown signal, finishing current downloads...");
                 tracing::info!("Press Ctrl+C again to force exit");
                 handler_token.cancel();
@@ -91,10 +98,17 @@ pub(crate) fn install_signal_handler(
                 // stop_grace_period so the app exits cleanly before Docker
                 // sends SIGKILL.
                 tokio::spawn(wait_then_force_exit(GRACEFUL_SHUTDOWN_TIMEOUT, |code| {
+                    // Same restore-before-exit reasoning as the
+                    // second-Ctrl+C branch above.
+                    crate::personality::tty_echo::restore_now();
                     std::process::exit(code)
                 }));
             } else {
                 tracing::warn!("Force exit requested");
+                // Drop guards don't run on `process::exit`. Restore the
+                // tty's ECHOCTL flag explicitly so a force-quit doesn't
+                // leave the user's shell with control-char echo silenced.
+                crate::personality::tty_echo::restore_now();
                 std::process::exit(FORCE_EXIT_CODE);
             }
         }
@@ -126,7 +140,16 @@ mod tests {
     #[tokio::test]
     async fn install_returns_live_token() {
         let notifier = SystemdNotifier::new(false);
-        let token = install_signal_handler(notifier).unwrap();
+        let token = install_signal_handler(notifier, Mode::Off).unwrap();
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn install_accepts_friendly_mode() {
+        // Friendly mode threads through to the narration call inside the
+        // handler; the install path itself must not depend on it.
+        let notifier = SystemdNotifier::new(false);
+        let token = install_signal_handler(notifier, Mode::Friendly).unwrap();
         assert!(!token.is_cancelled());
     }
 

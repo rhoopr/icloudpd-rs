@@ -712,7 +712,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         })
     };
 
-    let shutdown_token = shutdown::install_signal_handler(sd_notifier)?;
+    let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.personality_mode)?;
+
+    // Suppress the tty driver's `^C` echo for the lifetime of this sync run.
+    // Without this, the echoed `^C` overflows the bar's right-edge filler
+    // and pushes the cursor down one line, making indicatif's next redraw
+    // leave a stale top rule above the live bar. Friendly + tty only;
+    // restored on Drop and on the second-Ctrl+C force-exit path. See
+    // `personality::tty_echo` for the full context.
+    let _echo_guard = if config.personality_mode.is_friendly() {
+        crate::personality::tty_echo::EchoGuard::install()
+    } else {
+        None
+    };
 
     let is_watch_mode = config.watch_with_interval.is_some();
     let mut reauth_attempts = 0u32;

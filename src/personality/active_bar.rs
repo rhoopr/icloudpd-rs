@@ -44,6 +44,24 @@ where
     multi().suspend(f)
 }
 
+/// Print a line above the registered bars in a single atomic draw.
+///
+/// `MultiProgress::suspend` has a clear -> caller-writes -> redraw cycle
+/// where the caller's writes don't update indicatif's line tracking. If
+/// the cursor was at the right edge of the last bar row (indicatif fills
+/// the last row to `term_width` so subsequent writes wrap to a new line),
+/// suspend's redraw can land off-by-one and leave a stale row above the
+/// bar. `MultiProgress::println` builds the new line plus the bars into
+/// one `draw` call, so the cursor accounting stays internally consistent.
+///
+/// Strips a single trailing `\n` if present so callers can keep using
+/// `writeln!`/`println!`-style strings without the extra blank line that
+/// indicatif's println would otherwise emit.
+pub fn println_above_bars(msg: &str) {
+    let trimmed = msg.strip_suffix('\n').unwrap_or(msg);
+    let _ = multi().println(trimmed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
