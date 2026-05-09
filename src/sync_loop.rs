@@ -417,6 +417,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         }
         Err(e) => return Err(e),
     };
+    // Post-auth narration. Lands above any future bar; no-op in off mode.
+    crate::personality::narration::auth_ok_to_stderr(config.personality_mode, &config.username);
 
     // Save password to credential store if requested. Only the ephemeral
     // `Direct` source (CLI flag / env var) persists; File / Command /
@@ -501,6 +503,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         count = libraries.len(),
         zones = %libraries.iter().map(|l| l.zone_name().to_string()).collect::<Vec<_>>().join(", "),
         "Resolved libraries"
+    );
+    // Post-library-resolve narration. Friendly-mode-only.
+    crate::personality::narration::libraries_resolved_to_stderr(
+        config.personality_mode,
+        libraries.len(),
     );
 
     // CloudKit shared zones don't expose smart folders. Catch the
@@ -743,6 +750,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         &config.selection,
     );
     sd_notifier.notify_ready();
+    // Friendly-mode greeting. Lands above any future bar via
+    // active_bar::with_suspended; no-op in off mode. Once per process.
+    crate::personality::narration::greet_to_stderr(config.personality_mode, is_watch_mode);
 
     // Spawn the HTTP server (/healthz + /metrics) only in watch mode.
     // A one-shot sync exits before anything could scrape /healthz, so there
@@ -822,6 +832,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 None,
             );
 
+            let cycle_started_at = std::time::Instant::now();
             let cycle_result = run_cycle(
                 &library_states,
                 &config,
@@ -832,6 +843,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &shutdown_token,
             )
             .await?;
+            // Friendly-mode signoff line. Off-mode keeps relying on
+            // log_sync_summary for journal output.
+            crate::personality::narration::signoff_to_stderr(
+                config.personality_mode,
+                &crate::personality::narration::CycleSummary {
+                    downloaded: u64::try_from(cycle_result.stats.downloaded).unwrap_or(u64::MAX),
+                    failed: u64::try_from(cycle_result.failed_count).unwrap_or(u64::MAX),
+                    elapsed: cycle_started_at.elapsed(),
+                    watch_mode: is_watch_mode,
+                },
+            );
 
             // Update health status for Docker HEALTHCHECK observability.
             if cycle_result.session_expired {

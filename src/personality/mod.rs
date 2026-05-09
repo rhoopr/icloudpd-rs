@@ -11,15 +11,20 @@
 
 pub mod active_bar;
 pub mod bar_render;
+pub mod cycler;
+pub mod narration;
 pub mod pace;
 pub mod sparkline;
 pub mod theme;
 pub mod tracing;
-// `verbs` lands here so delight-B can wire its pools into the existing bar
-// surface without a second round-trip through review. The bar's verb-cycling
-// hook is a `set_message` driver that belongs alongside greeting / phase
-// narration in the lifecycle PR.
-#[allow(dead_code, reason = "consumed by delight-B lifecycle work")]
+// Phase::Listing + VerbPool::{new, next} are consumed by `cycler` for the
+// pre-first-file scan gap. Other phases and accessors stay reserved for the
+// remaining delight-B wires (phase narration, sign-off card) so we don't
+// trim the surface and re-grow it in the next PR.
+#[allow(
+    dead_code,
+    reason = "remaining phases/methods consumed by later delight-B wires"
+)]
 pub mod verbs;
 
 use std::env;

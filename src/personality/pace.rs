@@ -43,11 +43,10 @@ pub fn format_known_eta(secs: u64) -> String {
 /// Tracks the "calculating" -> "still calculating" transition so the wording
 /// only escalates when the unknown ETA persists past a threshold.
 ///
-/// Reserved for the album-row layout in delight-B, where each per-album bar
-/// has its own ETA phrasing state. The single-bar pipeline currently uses
-/// `format_known_eta` directly inside an indicatif closure with no per-tick
-/// state.
-#[allow(dead_code, reason = "consumed by delight-B per-album rows")]
+/// Lives inside the bar's `smart_eta` closure (one instance per bar),
+/// wrapped in `Arc<Mutex<>>` because indicatif's `with_key` callbacks must
+/// be `Send + Sync`. Contention is nil: the draw thread is the only writer
+/// and runs at ~10Hz.
 #[derive(Debug, Clone)]
 pub struct EtaPhrasing {
     first_unknown: Option<Instant>,
@@ -63,7 +62,6 @@ impl Default for EtaPhrasing {
     }
 }
 
-#[allow(dead_code, reason = "consumed by delight-B per-album rows")]
 impl EtaPhrasing {
     #[must_use]
     pub fn new() -> Self {
