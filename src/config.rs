@@ -1175,6 +1175,7 @@ impl Config {
         toml: Option<&TomlConfig>,
     ) -> anyhow::Result<Self> {
         let env_watch_interval = parse_env_watch_interval(std::env::var(ENV_WATCH_INTERVAL))?;
+        let friendly_request = toml.and_then(|t| t.ui.as_ref()).and_then(|u| u.friendly);
         Self::build_inner(
             globals,
             pw,
@@ -1182,7 +1183,7 @@ impl Config {
             toml,
             env_watch_interval,
             crate::personality::Mode::Off,
-            None,
+            friendly_request,
         )
     }
 
