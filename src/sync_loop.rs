@@ -1090,6 +1090,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
             tracing::info!(interval_secs = interval, "Waiting before next cycle");
+            // `interval` is u64 seconds; chrono Add panics on overflow.
+            // Skip the heartbeat for the (impossible-in-practice) case where
+            // the interval doesn't fit in a wall-clock instant.
+            if let Some(wake_at) = i64::try_from(interval)
+                .ok()
+                .and_then(chrono::Duration::try_seconds)
+                .and_then(|d| chrono::Local::now().checked_add_signed(d))
+            {
+                crate::personality::narration::sleeping_until_to_stderr(
+                    config.personality_mode,
+                    wake_at,
+                );
+            }
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
                 () = shutdown_token.cancelled() => {
@@ -1137,6 +1150,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         } else {
             break;
         }
+    }
+
+    // Friendly farewell line. Only on graceful Ctrl+C-driven exit: if the
+    // loop fell through without `shutdown_token` ever being cancelled (e.g.
+    // a one-shot run completing normally), the per-cycle signoff already
+    // covered the closing sentiment and a second "Done." line would be noise.
+    if shutdown_token.is_cancelled() {
+        crate::personality::narration::farewell_to_stderr(config.personality_mode);
     }
 
     // Signal the metrics server to shut down (idempotent if SIGINT already

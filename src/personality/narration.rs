@@ -81,6 +81,30 @@ pub fn stop_signal_to_stderr(mode: Mode) {
     );
 }
 
+/// Pre-sleep heartbeat in watch mode: tells the user when the next cycle
+/// will start so an idle-looking process is legible. Local clock; the
+/// existing `tracing::info!(interval_secs)` event at the same call site
+/// keeps the journal-friendly form for off-mode users.
+pub fn sleeping_until_to_stderr(mode: Mode, wake_at: chrono::DateTime<chrono::Local>) {
+    line_to_stderr(mode, &render_sleeping_until(wake_at));
+}
+
+/// Final line on a graceful Ctrl+C exit, after in-flight downloads drain.
+/// Off mode is silent; the existing `tracing::info!` "Shutdown..." lines
+/// already serve journal consumers.
+pub fn farewell_to_stderr(mode: Mode) {
+    line_to_stderr(mode, FAREWELL_LINE);
+}
+
+const FAREWELL_LINE: &str = "Done. See you next time.";
+
+fn render_sleeping_until(wake_at: chrono::DateTime<chrono::Local>) -> String {
+    format!(
+        "Sleeping until {}. Press Ctrl+C to stop.",
+        wake_at.format("%H:%M"),
+    )
+}
+
 /// Post-cycle sign-off summarising what the cycle did. Friendly-only;
 /// callers in off mode keep relying on `log_sync_summary` for journals.
 pub fn signoff_to_stderr(mode: Mode, summary: &CycleSummary) {
@@ -158,6 +182,7 @@ fn format_elapsed(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::time::Duration;
 
     fn capture(mode: Mode, f: impl FnOnce(&mut Vec<u8>, Mode)) -> String {
@@ -293,6 +318,36 @@ mod tests {
     fn format_elapsed_under_one_second_says_a_second() {
         assert_eq!(format_elapsed(Duration::from_millis(0)), "a second");
         assert_eq!(format_elapsed(Duration::from_millis(900)), "a second");
+    }
+
+    #[test]
+    fn farewell_line_is_stable_text() {
+        // Pin the user-visible string so accidental rewording goes through review.
+        assert_eq!(FAREWELL_LINE, "Done. See you next time.");
+    }
+
+    #[test]
+    fn render_sleeping_until_uses_24h_local_clock() {
+        let wake_at = chrono::Local
+            .with_ymd_and_hms(2026, 5, 9, 14, 32, 0)
+            .single()
+            .expect("unambiguous local time");
+        assert_eq!(
+            render_sleeping_until(wake_at),
+            "Sleeping until 14:32. Press Ctrl+C to stop.",
+        );
+    }
+
+    #[test]
+    fn render_sleeping_until_zero_pads_single_digits() {
+        let wake_at = chrono::Local
+            .with_ymd_and_hms(2026, 5, 9, 4, 5, 0)
+            .single()
+            .expect("unambiguous local time");
+        assert_eq!(
+            render_sleeping_until(wake_at),
+            "Sleeping until 04:05. Press Ctrl+C to stop.",
+        );
     }
 
     #[test]
