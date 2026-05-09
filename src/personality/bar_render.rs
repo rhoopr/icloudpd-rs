@@ -181,16 +181,17 @@ pub fn animated_bar_string(fraction: f64, width: usize) -> String {
 /// Color tier for the bar's filled portion based on progress fraction.
 ///
 /// Three tiers chosen for readable contrast on dark and light terminals:
-/// green (early progress), cyan (mid), bright cyan (near done). The shift
-/// gives a glance-able "how far along am I" cue beyond the fill itself.
+/// bright cyan (early progress), cyan (mid), green (near done). The shift
+/// gives a glance-able "how far along am I" cue beyond the fill itself,
+/// landing on green as a "finished" signal as the bar fills.
 #[must_use]
 pub fn bar_fill_style(fraction: f64) -> Style {
     if fraction < 0.30 {
-        Style::new().green()
+        Style::new().cyan().bold()
     } else if fraction < 0.70 {
         Style::new().cyan()
     } else {
-        Style::new().cyan().bold()
+        Style::new().green()
     }
 }
 
@@ -396,8 +397,12 @@ mod tests {
         // SGR 32 = green, SGR 36 = cyan, SGR 1 = bold.
         let early = format!("{}", bar_fill_style(0.10).force_styling(true).apply_to("x"));
         assert!(
-            early.contains("\x1b[32m") || early.contains(";32m"),
-            "early tier should be green: {early:?}"
+            early.contains(";36m") || early.contains("\x1b[36m"),
+            "early tier should be cyan-based: {early:?}"
+        );
+        assert!(
+            early.contains("\x1b[1") || early.contains(";1m"),
+            "early tier should be bold: {early:?}"
         );
         let mid = format!("{}", bar_fill_style(0.50).force_styling(true).apply_to("x"));
         assert!(
@@ -406,13 +411,8 @@ mod tests {
         );
         let late = format!("{}", bar_fill_style(0.85).force_styling(true).apply_to("x"));
         assert!(
-            late.contains(";36m") || late.contains("\x1b[36m"),
-            "late tier should be cyan-based: {late:?}"
-        );
-        // Late tier is bold; bold ANSI is SGR 1.
-        assert!(
-            late.contains("\x1b[1") || late.contains(";1m"),
-            "late tier should be bold: {late:?}"
+            late.contains("\x1b[32m") || late.contains(";32m"),
+            "late tier should be green: {late:?}"
         );
     }
 

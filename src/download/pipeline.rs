@@ -696,8 +696,15 @@ fn create_progress_bar(
     // already gated those paths above to ProgressBar::hidden so this is
     // conservative). Cap at 200 so the rule line doesn't grow unbounded.
     let cols_for_template = cols.unwrap_or(80).min(200);
-    let bar_template =
-        crate::personality::theme::download_bar_template(mode, tier, cols_for_template, total);
+    // iCloud is the only backend today; when Immich/Nextcloud land, plumb
+    // the source through `download::Config` and pass it here.
+    let bar_template = crate::personality::theme::download_bar_template(
+        mode,
+        tier,
+        cols_for_template,
+        total,
+        crate::personality::theme::Source::Icloud,
+    );
     let chars = crate::personality::theme::progress_chars(mode);
     if let Ok(mut style) = ProgressStyle::with_template(&bar_template.template) {
         style = style.progress_chars(chars);
