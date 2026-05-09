@@ -23,9 +23,13 @@ const ICLOUD_CLIENT_MASTERING_NUMBER: &str = "2522B2";
 /// caller; `sync_loop` routes both 421 and 401 through the same SRP re-auth
 /// path (covering the case where stale session routing headers are pinning
 /// the request to the wrong partition).
+///
+/// `mode` controls friendly-mode narration around the 421 retry; off-mode
+/// callers see the existing `tracing::warn!` events unchanged.
 pub(crate) async fn init_photos_service(
     mut auth_result: auth::AuthResult,
     api_retry_config: retry::RetryConfig,
+    mode: crate::personality::Mode,
 ) -> anyhow::Result<(auth::SharedSession, icloud::photos::PhotosService)> {
     if auth_result.data.i_cdp_enabled {
         anyhow::bail!(
@@ -88,6 +92,7 @@ pub(crate) async fn init_photos_service(
     // also 421s, surface `MisdirectedRequest` so `sync_loop` can invalidate
     // the cache and force SRP (where stale routing headers are the likely
     // cause).
+    crate::personality::narration::wobble_to_stderr(mode);
     tracing::warn!(
         url = %ckdatabasews_url,
         "Service returned 421 Misdirected Request, retrying with fresh connection pool"
@@ -106,7 +111,10 @@ pub(crate) async fn init_photos_service(
     )
     .await
     {
-        Ok(s) => s,
+        Ok(s) => {
+            crate::personality::narration::back_on_track_to_stderr(mode);
+            s
+        }
         Err(e) => {
             // The pool-reset retry also failed. Surface it before bubbling
             // so watch-mode operators can correlate reauth cycles with
@@ -1556,7 +1564,8 @@ mod tests {
             .await;
 
         let auth_result = fake_auth_result(&mock_server.uri()).await;
-        let result = init_photos_service(auth_result, no_delay_retry()).await;
+        let result =
+            init_photos_service(auth_result, no_delay_retry(), crate::personality::Mode::Off).await;
 
         assert!(
             result.is_ok(),
@@ -1590,7 +1599,8 @@ mod tests {
             .await;
 
         let auth_result = fake_auth_result(&mock_server.uri()).await;
-        let result = init_photos_service(auth_result, no_delay_retry()).await;
+        let result =
+            init_photos_service(auth_result, no_delay_retry(), crate::personality::Mode::Off).await;
 
         let err = result.expect_err("expected double-421 to return Err");
         // The error must downcast to MisdirectedRequest so sync_loop can

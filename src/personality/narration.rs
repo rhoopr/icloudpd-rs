@@ -96,7 +96,24 @@ pub fn farewell_to_stderr(mode: Mode) {
     line_to_stderr(mode, FAREWELL_LINE);
 }
 
+/// Friendly framing for a CloudKit 421 Misdirected Request. Printed just
+/// before the HTTP/2 connection pool is reset so the user sees a brief
+/// human explanation alongside the existing diagnostic `tracing::warn!`.
+/// Off mode is silent.
+pub fn wobble_to_stderr(mode: Mode) {
+    line_to_stderr(mode, WOBBLE_LINE);
+}
+
+/// Confirms the 421 retry succeeded, so the wobble line doesn't sit in
+/// scrollback as the last thing the user saw before downloads resumed.
+/// Off mode is silent.
+pub fn back_on_track_to_stderr(mode: Mode) {
+    line_to_stderr(mode, BACK_ON_TRACK_LINE);
+}
+
 const FAREWELL_LINE: &str = "Done. See you next time.";
+const WOBBLE_LINE: &str = "iCloud connection wobbled. Resetting...";
+const BACK_ON_TRACK_LINE: &str = "Back on track.";
 
 fn render_sleeping_until(wake_at: chrono::DateTime<chrono::Local>) -> String {
     format!(
@@ -244,6 +261,13 @@ mod tests {
             out,
             "Stopping. Finishing in-flight downloads. Press Ctrl+C again to exit immediately.\n",
         );
+    }
+
+    #[test]
+    fn wobble_and_back_on_track_lines_are_stable_text() {
+        // Pin the user-visible strings so accidental rewording goes through review.
+        assert_eq!(WOBBLE_LINE, "iCloud connection wobbled. Resetting...");
+        assert_eq!(BACK_ON_TRACK_LINE, "Back on track.");
     }
 
     #[test]

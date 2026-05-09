@@ -469,7 +469,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         let this_auth = pending_auth
             .take()
             .expect("auth_result present at start of attempt");
-        let init_result = init_photos_service(this_auth, api_retry_config).await;
+        let init_result =
+            init_photos_service(this_auth, api_retry_config, config.personality_mode).await;
         let (ss, mut ps) = match init_result {
             Ok(pair) => pair,
             Err(e) if should_retry_session_init(&e, retried_after_session_error) => {

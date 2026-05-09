@@ -583,8 +583,14 @@ pub(crate) async fn run_import_existing(
     )
     .await?;
 
-    let (_shared_session, mut photos_service) =
-        init_photos_service(auth_result, retry::RetryConfig::default()).await?;
+    // `kei import-existing` runs without the friendly download bar; off-mode
+    // keeps the existing diagnostic warn line for journals.
+    let (_shared_session, mut photos_service) = init_photos_service(
+        auth_result,
+        retry::RetryConfig::default(),
+        crate::personality::Mode::Off,
+    )
+    .await?;
 
     // Resolve library selection (CLI > TOML > default `primary`)
     let toml_filters = toml.and_then(|t| t.filters.as_ref());
