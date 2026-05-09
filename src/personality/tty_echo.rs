@@ -30,17 +30,15 @@ mod platform {
 
     /// RAII guard: clears `ECHOCTL` on `install`, restores the original
     /// `c_lflag` on `Drop`. Returns `None` if the fd isn't a tty, the
-    /// `tcgetattr` call fails, or a guard is already installed.
-    pub struct EchoGuard {
-        // Anchor a Drop impl; the saved state lives in `SAVED`.
-        _private: (),
-    }
+    /// `tcgetattr` call fails, or a guard is already installed. The
+    /// constructor is gated behind this private module so callers can't
+    /// build one without going through `install`.
+    pub struct EchoGuard;
 
     impl EchoGuard {
         pub fn install() -> Option<Self> {
             let mut saved = SAVED.lock().ok()?;
             if saved.is_some() {
-                // Already installed; don't double-save.
                 return None;
             }
             // SAFETY: `termios` is plain old data; zero-init is sound
@@ -59,7 +57,7 @@ mod platform {
                 return None;
             }
             *saved = Some(original);
-            Some(Self { _private: () })
+            Some(Self)
         }
     }
 
