@@ -79,9 +79,11 @@ pub fn progress_chars(mode: Mode) -> &'static str {
 /// Off mode reproduces v0.13's exact template byte-for-byte so anyone parsing
 /// the bar (e.g. from a recorded asciinema) sees no difference.
 ///
-/// Friendly mode wraps a five-line "card" around the work whose top and
-/// bottom rules are sized to the terminal so the box stays a true rectangle:
+/// Friendly mode wraps a six-row "card" around the work (one blank row of
+/// breathing room above a five-row box) whose top and bottom rules are
+/// sized to the terminal so the box stays a true rectangle:
 /// ```text
+///
 /// ╭── kei · downloading from iCloud ───────
 /// │  IMG_4521.HEIC
 /// │  ████████████████░░░░░░ 62%
@@ -196,7 +198,7 @@ pub fn friendly_sparkline_width(cols: u16) -> u16 {
     (cols / 3).clamp(16, 48)
 }
 
-/// Build a friendly five-line card sized to `cols`.
+/// Build a friendly six-row card (1 blank + 5 content) sized to `cols`.
 ///
 /// Returns the indicatif template (referencing custom keys `{top_rule}`,
 /// `{bottom_rule}`, `{bar_animated}`, `{spinner}`) plus the rendered rule
@@ -241,13 +243,19 @@ fn friendly_card(
     //
     // We embed bar_width into the placeholder name so a future caller could
     // look it up if needed; the closure ignores it but it documents intent.
+    // Leading `\n` on the template gives the card one blank line of
+    // breathing room above the top rule, separating it from prior
+    // scrollback (greeting, narration, the previous cycle's sign-off)
+    // without the user having to read a wall of stacked content. The
+    // empty line is part of the bar's tracked draw region so it scrolls
+    // with the bar instead of accumulating.
     let template = if with_smart_eta {
         format!(
-            "{{top_rule}}\n│  {{wide_msg}}\n│  {{bar_animated}} {{percent:>3}}% {{spinner}}\n│  {{rate_sparkline}}  {{pos:>{pos_width}}}/{{len}}  ·  {{smart_eta}}\n{{bottom_rule}}"
+            "\n{{top_rule}}\n│  {{wide_msg}}\n│  {{bar_animated}} {{percent:>3}}% {{spinner}}\n│  {{rate_sparkline}}  {{pos:>{pos_width}}}/{{len}}  ·  {{smart_eta}}\n{{bottom_rule}}"
         )
     } else {
         format!(
-            "{{top_rule}}\n│  {{wide_msg}}\n│  {{bar_animated}} {{percent:>3}}% {{spinner}}\n│  {{rate_sparkline}}  {{pos:>{pos_width}}}/{{len}}\n{{bottom_rule}}"
+            "\n{{top_rule}}\n│  {{wide_msg}}\n│  {{bar_animated}} {{percent:>3}}% {{spinner}}\n│  {{rate_sparkline}}  {{pos:>{pos_width}}}/{{len}}\n{{bottom_rule}}"
         )
     };
     let _ = bar_width; // captured via pipeline.rs closure; no template slot.
@@ -436,14 +444,20 @@ mod tests {
     }
 
     #[test]
-    fn friendly_wide_is_five_line_card_with_animated_keys() {
+    fn friendly_wide_is_six_line_card_with_animated_keys() {
         let wide = download_bar_template(Mode::Friendly, WidthTier::Wide, 80, 100, Source::Icloud);
         let template = &wide.template;
-        // Top rule key, three content lines, bottom rule key. Four `\n`s.
+        // Leading blank line + top rule + three content rows + bottom
+        // rule = six rows, joined by five `\n`s. The blank gives the
+        // card breathing room from prior scrollback.
         assert_eq!(
             template.matches('\n').count(),
-            4,
-            "wide template should be five lines, got: {template:?}",
+            5,
+            "wide template should be six rows (1 blank + 5 content), got: {template:?}",
+        );
+        assert!(
+            template.starts_with('\n'),
+            "wide template must start with a blank row for breathing room: {template:?}",
         );
         // Vertical bar prefix on content lines.
         assert!(template.contains('\u{2502}'), "missing vertical bar │");
@@ -466,14 +480,20 @@ mod tests {
     }
 
     #[test]
-    fn friendly_medium_is_five_line_card_without_smart_eta() {
+    fn friendly_medium_is_six_line_card_without_smart_eta() {
         let medium =
             download_bar_template(Mode::Friendly, WidthTier::Medium, 70, 100, Source::Icloud);
         let template = &medium.template;
+        // Same 1-blank + 5-content layout as wide; only the third row's
+        // smart-ETA suffix is dropped to keep the line short.
         assert_eq!(
             template.matches('\n').count(),
-            4,
-            "medium template should be five lines, got: {template:?}",
+            5,
+            "medium template should be six rows (1 blank + 5 content), got: {template:?}",
+        );
+        assert!(
+            template.starts_with('\n'),
+            "medium template must start with a blank row for breathing room: {template:?}",
         );
         assert!(template.contains("{top_rule}"));
         assert!(template.contains("{bottom_rule}"));
