@@ -374,7 +374,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let password_source_kind = source.kind();
     let password_provider = make_password_provider(source);
 
-    let auth_result = match auth::authenticate(
+    let auth_result = match auth::authenticate_with_mode(
         &config.cookie_directory,
         &config.username,
         &password_provider,
@@ -382,6 +382,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         None,
         None,
         None,
+        config.personality_mode,
     )
     .await
     {
@@ -403,7 +404,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             );
 
             wait_and_retry_2fa(&config.cookie_directory, &config.username, || {
-                auth::authenticate(
+                auth::authenticate_with_mode(
                     &config.cookie_directory,
                     &config.username,
                     &password_provider,
@@ -411,6 +412,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     None,
                     None,
                     None,
+                    config.personality_mode,
                 )
             })
             .await?
@@ -1209,7 +1211,7 @@ async fn reauth_with_srp(
     let session_file = auth::session_file_path(&config.cookie_directory, &config.username);
     auth::strip_session_routing_state(&session_file).await;
 
-    match auth::authenticate(
+    match auth::authenticate_with_mode(
         &config.cookie_directory,
         &config.username,
         password_provider,
@@ -1217,6 +1219,7 @@ async fn reauth_with_srp(
         None,
         None,
         None,
+        config.personality_mode,
     )
     .await
     {
@@ -1237,7 +1240,7 @@ async fn reauth_with_srp(
                 None,
             );
             wait_and_retry_2fa(&config.cookie_directory, &config.username, || {
-                auth::authenticate(
+                auth::authenticate_with_mode(
                     &config.cookie_directory,
                     &config.username,
                     password_provider,
@@ -1245,6 +1248,7 @@ async fn reauth_with_srp(
                     None,
                     None,
                     None,
+                    config.personality_mode,
                 )
             })
             .await

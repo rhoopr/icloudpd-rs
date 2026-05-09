@@ -362,11 +362,16 @@ async fn submit_2fa_code_inner(
 ///
 /// Returns the trimmed input. An empty string means the user pressed Enter
 /// without typing a code (i.e. they want a new code sent to their device).
+///
+/// In friendly mode prints a contextual line above the prompt explaining
+/// that a push was sent. The bare `Enter 2FA code (...)` line is unchanged
+/// so scripted consumers parsing it stay byte-stable.
 #[allow(
     clippy::print_stdout,
     reason = "interactive TTY prompt; tracing is not appropriate for a user input prompt"
 )]
-pub async fn prompt_2fa_code() -> Result<String> {
+pub async fn prompt_2fa_code(mode: crate::personality::Mode) -> Result<String> {
+    crate::personality::narration::two_fa_prompt_to_stderr(mode);
     Ok(tokio::task::spawn_blocking(|| {
         print!("Enter 2FA code (or press Enter to request a new code): ");
         io::stdout().flush()?;

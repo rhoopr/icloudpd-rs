@@ -128,10 +128,20 @@ pub fn giving_up_to_stderr(mode: Mode) {
     line_to_stderr(mode, GIVING_UP_LINE);
 }
 
+/// Friendly framing for the 2FA prompt. Printed once before
+/// `Enter 2FA code (or press Enter to request a new code):`, so the user
+/// understands a push has been sent and what they're being asked to type.
+/// Off mode preserves today's bare prompt for scripted consumers.
+pub fn two_fa_prompt_to_stderr(mode: Mode) {
+    line_to_stderr(mode, TWO_FA_PROMPT_LINE);
+}
+
 const FAREWELL_LINE: &str = "Done. See you next time.";
 const WOBBLE_LINE: &str = "iCloud connection wobbled. Resetting...";
 const BACK_ON_TRACK_LINE: &str = "Back on track.";
 const GIVING_UP_LINE: &str = "That one is being stubborn. Skipping for now, will retry next sync.";
+const TWO_FA_PROMPT_LINE: &str =
+    "Sent a code to your trusted devices. Approve the push and enter the 6-digit code below.";
 
 fn render_sleeping_until(wake_at: chrono::DateTime<chrono::Local>) -> String {
     format!(
@@ -297,6 +307,14 @@ mod tests {
         assert_eq!(
             GIVING_UP_LINE,
             "That one is being stubborn. Skipping for now, will retry next sync.",
+        );
+    }
+
+    #[test]
+    fn two_fa_prompt_line_is_stable_text() {
+        assert_eq!(
+            TWO_FA_PROMPT_LINE,
+            "Sent a code to your trusted devices. Approve the push and enter the 6-digit code below.",
         );
     }
 

@@ -79,6 +79,36 @@ pub async fn authenticate(
     timeout_secs: Option<u64>,
     code: Option<&str>,
 ) -> Result<AuthResult> {
+    authenticate_with_mode(
+        cookie_dir,
+        apple_id,
+        password_provider,
+        domain,
+        client_id,
+        timeout_secs,
+        code,
+        crate::personality::Mode::Off,
+    )
+    .await
+}
+
+/// Like `authenticate`, but threads the friendly-mode flag through so the
+/// 2FA prompt can print a contextual line above the bare prompt. Off-mode
+/// behaviour is identical to `authenticate`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mode is a UX gate that doesn't fit any existing struct param without muddying its semantics"
+)]
+pub async fn authenticate_with_mode(
+    cookie_dir: &Path,
+    apple_id: &str,
+    password_provider: &crate::password::PasswordProvider,
+    domain: &str,
+    client_id: Option<String>,
+    timeout_secs: Option<u64>,
+    code: Option<&str>,
+    mode: crate::personality::Mode,
+) -> Result<AuthResult> {
     let endpoints = Endpoints::for_domain(domain)?;
     let session = Session::new(cookie_dir, apple_id, endpoints.home, timeout_secs).await?;
     authenticate_inner(
@@ -89,10 +119,15 @@ pub async fn authenticate(
         domain,
         client_id,
         code,
+        mode,
     )
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mode is a UX gate threaded through to the 2FA prompt narration"
+)]
 async fn authenticate_inner(
     mut session: Session,
     endpoints: &Endpoints,
@@ -101,6 +136,7 @@ async fn authenticate_inner(
     domain: &str,
     client_id: Option<String>,
     code: Option<&str>,
+    mode: crate::personality::Mode,
 ) -> Result<AuthResult> {
     // Prefer persisted client_id to maintain session continuity across runs
     let client_id = session
@@ -308,7 +344,7 @@ async fn authenticate_inner(
             let mut wrong_codes = 0u32;
             let mut verified = false;
             loop {
-                let input = twofa::prompt_2fa_code().await?;
+                let input = twofa::prompt_2fa_code(mode).await?;
                 if input.is_empty() {
                     // User didn't receive a code - trigger explicit push.
                     if let Err(e) = twofa::trigger_push_notification(
