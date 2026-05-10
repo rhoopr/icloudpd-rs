@@ -98,7 +98,7 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
 /// (no user keyring) or a virtual `NT SERVICE\kei` account (no
 /// Credential Manager). Both break the "credentials follow the
 /// operator" contract the per-user form provides.
-pub(crate) async fn install_system(_args: &InstallArgs, _config_path: &Path) -> Result<()> {
+pub(crate) fn install_system(_args: &InstallArgs, _config_path: &Path) -> Result<()> {
     bail!(
         "`kei install --system` is not supported on Windows; \
          use `kei install` (per-user) so the service shares your Credential Manager vault \

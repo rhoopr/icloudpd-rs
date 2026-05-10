@@ -184,7 +184,7 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
 /// security review (system-context FDA, keychain access constraints) that
 /// is explicitly out of scope for v0.14. Errors with a pointer at the
 /// supported flag rather than silently downgrading.
-pub(crate) async fn install_system(_args: &InstallArgs, _config_path: &Path) -> Result<()> {
+pub(crate) fn install_system(_args: &InstallArgs, _config_path: &Path) -> Result<()> {
     bail!(
         "macOS only ships a per-user LaunchAgent in v0.14; \
          rerun without --system (or with --user) to install. \

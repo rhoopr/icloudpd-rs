@@ -42,7 +42,7 @@ async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
 async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
     use crate::service::macos;
     if args.system {
-        macos::install_system(&args, config_path).await
+        macos::install_system(&args, config_path)
     } else {
         macos::install_user(&args, config_path).await
     }
@@ -52,7 +52,7 @@ async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
 async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
     use crate::service::windows;
     if args.system {
-        windows::install_system(&args, config_path).await
+        windows::install_system(&args, config_path)
     } else {
         windows::install_user(&args, config_path).await
     }
