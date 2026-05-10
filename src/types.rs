@@ -201,9 +201,9 @@ mod tests {
             (VersionSize::Adjusted, "\"adjusted\""),
             (VersionSize::Alternative, "\"alternative\""),
         ] {
-            let json = serde_json::to_string(&variant).unwrap();
+            let json = serde_json::to_string(&variant).expect("serialize VersionSize");
             assert_eq!(json, expected);
-            let parsed: VersionSize = serde_json::from_str(&json).unwrap();
+            let parsed: VersionSize = serde_json::from_str(&json).expect("deserialize VersionSize");
             assert_eq!(parsed, variant);
         }
     }
@@ -216,9 +216,9 @@ mod tests {
             (LivePhotoSize::Thumb, "\"thumb\""),
             (LivePhotoSize::Adjusted, "\"adjusted\""),
         ] {
-            let json = serde_json::to_string(&variant).unwrap();
+            let json = serde_json::to_string(&variant).expect("serialize LivePhotoSize");
             assert_eq!(json, expected);
-            let parsed: LivePhotoSize = serde_json::from_str(&json).unwrap();
+            let parsed: LivePhotoSize = serde_json::from_str(&json).expect("deserialize LivePhotoSize");
             assert_eq!(parsed, variant);
         }
     }
@@ -226,9 +226,9 @@ mod tests {
     #[test]
     fn domain_serde_round_trip() {
         for (variant, expected) in [(Domain::Com, "\"com\""), (Domain::Cn, "\"cn\"")] {
-            let json = serde_json::to_string(&variant).unwrap();
+            let json = serde_json::to_string(&variant).expect("serialize Domain");
             assert_eq!(json, expected);
-            let parsed: Domain = serde_json::from_str(&json).unwrap();
+            let parsed: Domain = serde_json::from_str(&json).expect("deserialize Domain");
             assert_eq!(parsed, variant);
         }
     }
@@ -241,9 +241,9 @@ mod tests {
             (LogLevel::Warn, "\"warn\""),
             (LogLevel::Error, "\"error\""),
         ] {
-            let json = serde_json::to_string(&variant).unwrap();
+            let json = serde_json::to_string(&variant).expect("serialize LogLevel");
             assert_eq!(json, expected);
-            let parsed: LogLevel = serde_json::from_str(&json).unwrap();
+            let parsed: LogLevel = serde_json::from_str(&json).expect("deserialize LogLevel");
             assert_eq!(parsed, variant);
         }
     }
@@ -257,9 +257,9 @@ mod tests {
             ),
             (FileMatchPolicy::NameId7, "\"name-id7\""),
         ] {
-            let json = serde_json::to_string(&variant).unwrap();
+            let json = serde_json::to_string(&variant).expect("serialize FileMatchPolicy");
             assert_eq!(json, expected);
-            let parsed: FileMatchPolicy = serde_json::from_str(&json).unwrap();
+            let parsed: FileMatchPolicy = serde_json::from_str(&json).expect("deserialize FileMatchPolicy");
             assert_eq!(parsed, variant);
         }
     }
@@ -271,9 +271,9 @@ mod tests {
             (RawTreatmentPolicy::PreferOriginal, "\"original\""),
             (RawTreatmentPolicy::PreferAlternative, "\"alternative\""),
         ] {
-            let json = serde_json::to_string(&variant).unwrap();
+            let json = serde_json::to_string(&variant).expect("serialize RawTreatmentPolicy");
             assert_eq!(json, expected);
-            let parsed: RawTreatmentPolicy = serde_json::from_str(&json).unwrap();
+            let parsed: RawTreatmentPolicy = serde_json::from_str(&json).expect("deserialize RawTreatmentPolicy");
             assert_eq!(parsed, variant);
         }
     }
@@ -286,9 +286,9 @@ mod tests {
             (LivePhotoMode::VideoOnly, "\"video-only\""),
             (LivePhotoMode::Skip, "\"skip\""),
         ] {
-            let json = serde_json::to_string(&variant).unwrap();
+            let json = serde_json::to_string(&variant).expect("serialize LivePhotoMode");
             assert_eq!(json, expected);
-            let parsed: LivePhotoMode = serde_json::from_str(&json).unwrap();
+            let parsed: LivePhotoMode = serde_json::from_str(&json).expect("deserialize LivePhotoMode");
             assert_eq!(parsed, variant);
         }
     }
@@ -299,9 +299,9 @@ mod tests {
             (LivePhotoMovFilenamePolicy::Suffix, "\"suffix\""),
             (LivePhotoMovFilenamePolicy::Original, "\"original\""),
         ] {
-            let json = serde_json::to_string(&variant).unwrap();
+            let json = serde_json::to_string(&variant).expect("serialize LivePhotoMovFilenamePolicy");
             assert_eq!(json, expected);
-            let parsed: LivePhotoMovFilenamePolicy = serde_json::from_str(&json).unwrap();
+            let parsed: LivePhotoMovFilenamePolicy = serde_json::from_str(&json).expect("deserialize LivePhotoMovFilenamePolicy");
             assert_eq!(parsed, variant);
         }
     }
