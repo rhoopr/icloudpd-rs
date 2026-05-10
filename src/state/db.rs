@@ -5466,4 +5466,34 @@ mod tests {
             "expected UnsupportedSchemaVersion, got: {err:?}"
         );
     }
+
+    /// Corrupted state DB file (random bytes, truncated SQLite header)
+    /// must be detected on open, not silently misread or panicked.
+    #[tokio::test]
+    async fn corrupted_db_file_detected_on_open() {
+        let dir = test_dir();
+        let db_path = dir.path().join("corrupt.db");
+        std::fs::write(&db_path, b"not a valid sqlite database file!").unwrap();
+        let result = SqliteStateDb::open(&db_path).await;
+        assert!(result.is_err(), "corrupted file must fail to open");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("not a database")
+                || err.to_string().contains("file is not a database"),
+            "error must indicate the file is not a valid DB, got: {err:?}"
+        );
+    }
+
+    /// Truncated state DB (valid SQLite header, short body) must be
+    /// detected on open or first query.
+    #[tokio::test]
+    async fn truncated_db_file_detected_on_open() {
+        let dir = test_dir();
+        let db_path = dir.path().join("trunc.db");
+        // Write the SQLite magic header but nothing else
+        let header: &[u8] = b"SQLite format 3\x00";
+        std::fs::write(&db_path, header).unwrap();
+        let result = SqliteStateDb::open(&db_path).await;
+        assert!(result.is_err(), "truncated SQLite file must fail");
+    }
 }

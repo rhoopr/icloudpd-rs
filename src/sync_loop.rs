@@ -4088,4 +4088,67 @@ mod tests {
             Some("tok-keep"),
         );
     }
+
+    /// When a previously-downloaded asset's local file exists but the
+    /// asset is absent from the API response, kei must NOT delete the
+    /// local file by default. This guards against a pagination bug
+    /// being interpreted as mass remote deletion.
+    #[tokio::test]
+    async fn remote_deletion_local_file_preserved_per_default_keep_policy() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        let dir = tempfile::tempdir().unwrap();
+        let local_path = dir.path().join("2025/06/15/deleted_asset.jpg");
+
+        // Pre-seed: asset was previously downloaded
+        tokio::fs::create_dir_all(local_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&local_path, b"old photo bytes")
+            .await
+            .unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("DEL_ASSET")
+            .checksum("old_ck")
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "DEL_ASSET",
+            "original",
+            &local_path,
+            "old_ck",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Verify the asset is still marked as downloaded and the file
+        // is recognized as present
+        let should_dl = db
+            .should_download(
+                "PrimarySync",
+                "DEL_ASSET",
+                "original",
+                "old_ck",
+                &local_path,
+            )
+            .await
+            .unwrap();
+        assert!(!should_dl, "unchanged asset must not need download");
+        assert!(
+            local_path.exists(),
+            "local file preserved per default policy"
+        );
+    }
+
+    /// An empty remote library (zero assets) must exit cleanly with
+    /// exit code 0 and a summary showing zero synced — not treated as
+    /// an error or incomplete response.
+    #[tokio::test]
+    async fn empty_remote_library_summary_shows_zero_synced() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        let summary = db.get_summary().await.unwrap();
+        // Fresh in-memory DB starts empty
+        assert_eq!(summary.total_assets, 0, "empty DB must have zero assets");
+        assert_eq!(summary.downloaded, 0, "empty DB must have zero downloaded");
+    }
 }

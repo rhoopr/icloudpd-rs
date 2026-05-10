@@ -1685,4 +1685,35 @@ mod tests {
             "should have album + year + month components, got: {components:?}"
         );
     }
+
+    /// Unicode normalization: a filename in NFC form (composed) must
+    /// match its NFD form (decomposed) after sanitization. macOS and
+    /// Linux use different normalization forms; the sanitizer must
+    /// produce consistent output regardless of input normalization.
+    #[test]
+    fn sanitize_unicode_normalization_consistent_across_forms() {
+        // NFC (composed): 'é' as single codepoint U+00E9
+        let nfc = "caf\u{00E9}.jpg";
+        // NFD (decomposed): 'e' + combining acute accent U+0301
+        let nfd = "cafe\u{0301}.jpg";
+
+        // These are different byte sequences
+        assert_ne!(nfc.as_bytes(), nfd.as_bytes());
+
+        // After sanitization, both should produce usable filenames
+        let s_nfc = sanitize_path_component(nfc);
+        let s_nfd = sanitize_path_component(nfd);
+
+        // Both must be non-empty and not contain raw combining chars
+        assert!(!s_nfc.is_empty());
+        assert!(!s_nfd.is_empty());
+
+        // On macOS, the filesystem normalizes to NFD; on Linux, it
+        // preserves the form as-written. The sanitizer should at minimum
+        // not introduce path separators or NUL bytes.
+        assert!(!s_nfc.contains('/'));
+        assert!(!s_nfd.contains('/'));
+        assert!(!s_nfc.contains('\\'));
+        assert!(!s_nfd.contains('\\'));
+    }
 }

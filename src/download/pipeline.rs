@@ -5070,6 +5070,9 @@ mod tests {
         let child = token.child_token();
         assert!(!child.is_cancelled(), "fresh token must not be cancelled");
         token.cancel();
-        assert!(child.is_cancelled(), "child must reflect parent cancellation");
+        assert!(
+            child.is_cancelled(),
+            "child must reflect parent cancellation"
+        );
     }
 }
