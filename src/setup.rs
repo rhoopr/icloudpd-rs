@@ -8,7 +8,9 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::{bail, Context};
+use console::Style;
 use dialoguer::{Confirm, Input, Password, Select};
+use indicatif::ProgressBar;
 
 use crate::types::{
     Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LogLevel,
@@ -154,13 +156,53 @@ impl Default for SetupAnswers {
     }
 }
 
-/// Print the generated TOML between two horizontal rules.
+// ── Delight helpers ──────────────────────────────────────────────
+
+/// Print a dimmed section divider for visual structure between wizard steps.
+/// Run `f` with a ticking spinner showing `msg`. Clears the spinner when done.
+fn spinner_for<R>(msg: &'static str, f: impl FnOnce() -> R) -> R {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_message(msg);
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    let result = f();
+    spinner.finish_and_clear();
+    result
+}
+
+fn section_header(text: &str) {
+    let dim = Style::new().dim();
+    println!();
+    println!("{}", dim.apply_to(format!("  ── {text} ──")));
+}
+
+/// Print a line prefixed with a green bold checkmark.
+fn check(text: &str) {
+    let mark = Style::new().green().bold();
+    println!("{} {text}", mark.apply_to("✓"));
+}
+
+/// Dim every comment line in a generated TOML string so the active
+/// keys stand out. Returns a new String with ANSI escapes injected.
+fn dim_comments(toml: &str) -> String {
+    let dim = Style::new().dim();
+    toml.lines()
+        .map(|line| {
+            if line.trim_start().starts_with('#') {
+                dim.apply_to(line).to_string()
+            } else if line.trim_start().starts_with('[') {
+                Style::new().cyan().bold().apply_to(line).to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn print_toml_preview(toml_content: &str) {
     println!();
-    println!("Here's your configuration:");
-    println!();
     println!("───────────────────────────────────────────────────────");
-    print!("{toml_content}");
+    print!("{}", dim_comments(toml_content));
     println!("───────────────────────────────────────────────────────");
     println!();
 }
@@ -171,9 +213,10 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     }
 
     println!();
-    println!("Welcome to kei setup!");
+    println!("Hey! Let's get kei set up.");
     println!();
-    println!("This wizard will create a config file. Press Enter to accept defaults.");
+    println!("A few quick questions, then you'll be syncing.");
+    println!("Press Enter to accept a default — it's always a safe bet.");
     println!();
 
     // Check for existing config
@@ -185,37 +228,52 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     let mut answers = SetupAnswers::default();
 
     // Step 1: Account
+    section_header("Account");
     ask_account(&mut answers)?;
+    check(&format!("Glad you're here, {}.", answers.username));
 
     // Step 2: Where to save
+    section_header("Where to save");
     ask_destination(&mut answers)?;
 
     // Step 3: What to download
+    section_header("What to sync");
     ask_what_to_download(&mut answers)?;
+    if !answers.albums.is_empty() {
+        check("Keeping it focused.");
+    }
 
     // Step 4: Media types
+    section_header("Media types");
     ask_media_types(&mut answers)?;
 
     // Step 5: Photo quality & RAW
+    section_header("Quality");
     ask_quality(&mut answers)?;
 
     // Step 6: Date range
+    section_header("Date range");
     ask_date_range(&mut answers)?;
 
     // Step 7: Running mode
+    section_header("Running mode");
     ask_running_mode(&mut answers)?;
+    if answers.watch_interval.is_some() {
+        check("Set-and-forget. Kei will keep an eye on things.");
+    }
 
-    // Step 8: Friendly UX. Defaults to on at runtime; the wizard only
-    // writes `[ui] friendly = false` when the user opts out, so existing
-    // configs and skipped setup runs both fall through to the default.
+    // Step 8: Friendly UX
+    section_header("Friendly UX");
     ask_friendly(&mut answers)?;
 
     // Step 9: Extras
+    section_header("Extras");
     ask_extras(&mut answers)?;
 
-    // Generate TOML. `fmt::Write for String` is infallible, so this never
-    // returns an error in practice.
-    let toml_content: String = generate_toml(&answers);
+    // Generate TOML with a brief spinner so the user sees something happening.
+    let toml_content: String = spinner_for("Building your config...", || generate_toml(&answers));
+    check("All done.");
+    println!();
 
     // The Select offers "Show again" so users on small terminals can
     // re-read the config after it scrolled past.
@@ -228,7 +286,7 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
             "Cancel and exit without writing".to_string(),
         ];
         let action = Select::new()
-            .with_prompt("What now?")
+            .with_prompt("Look good?")
             .items(&action_items)
             .default(0)
             .interact()?;
@@ -248,46 +306,62 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
             .with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
 
-    // Write config
-    std::fs::write(config_path, &toml_content)
-        .with_context(|| format!("Failed to write {}", config_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Failed to set permissions on {}", config_path.display()))?;
-    }
+    // Write files with a spinner for visual closure.
+    let env_path = spinner_for(
+        "Writing your config...",
+        || -> anyhow::Result<std::path::PathBuf> {
+            // Write config
+            std::fs::write(config_path, &toml_content)
+                .with_context(|| format!("Failed to write {}", config_path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| {
+                        format!("Failed to set permissions on {}", config_path.display())
+                    })?;
+            }
 
-    // Write .env file
-    let env_path = config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(".env");
-    // Single-quote values to prevent shell expansion of special characters
-    // ($, `, !, etc.) when the file is sourced. Single quotes inside the
-    // password are escaped as '\'' (end-quote, literal quote, re-open quote).
-    let raw_pass = secrecy::ExposeSecret::expose_secret(&answers.password);
-    let escaped_user = answers.username.replace('\'', "'\\''");
-    let escaped_pass = raw_pass.replace('\'', "'\\''");
-    let env_content =
-        format!("ICLOUD_USERNAME='{escaped_user}'\nICLOUD_PASSWORD='{escaped_pass}'\n",);
-    std::fs::write(&env_path, &env_content)
-        .with_context(|| format!("Failed to write {}", env_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Failed to set permissions on {}", env_path.display()))?;
-    }
+            // Write .env file
+            let env_path = config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(".env");
+            // Single-quote values to prevent shell expansion of special characters
+            // ($, `, !, etc.) when the file is sourced. Single quotes inside the
+            // password are escaped as '\'' (end-quote, literal quote, re-open quote).
+            let raw_pass = secrecy::ExposeSecret::expose_secret(&answers.password);
+            let escaped_user = answers.username.replace('\'', "'\\''");
+            let escaped_pass = raw_pass.replace('\'', "'\\''");
+            let env_content =
+                format!("ICLOUD_USERNAME='{escaped_user}'\nICLOUD_PASSWORD='{escaped_pass}'\n",);
+            std::fs::write(&env_path, &env_content)
+                .with_context(|| format!("Failed to write {}", env_path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| {
+                        format!("Failed to set permissions on {}", env_path.display())
+                    })?;
+            }
 
+            Ok(env_path)
+        },
+    )?;
+
+    check("Config saved.");
     println!();
-    println!("Config written to:  {}", config_path.display());
-    println!("Credentials saved:  {}", env_path.display());
+    println!("  Config  →  {}", config_path.display());
+    println!("  Secrets →  {}", env_path.display());
+    println!();
+    let bold = Style::new().bold();
+    println!("{}", bold.apply_to("You're all set."));
     println!();
 
     // Offer to sync now
     let sync_now = Confirm::new()
-        .with_prompt("Start syncing now?")
+        .with_prompt("Want to kick off your first sync right now?")
         .default(true)
         .interact()?;
 
@@ -298,7 +372,7 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
         })
     } else {
         println!();
-        println!("To sync later, run:");
+        println!("No rush. When you're ready:");
         println!();
         print_load_env_snippet(&env_path);
         println!("  kei sync");
@@ -542,7 +616,7 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 fn ask_media_types(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     println!();
     let include_videos = Confirm::new()
-        .with_prompt("Include videos?")
+        .with_prompt("Include videos along with photos?")
         .default(true)
         .interact()?;
     answers.skip_videos = !include_videos;
@@ -621,7 +695,7 @@ fn ask_quality(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
     println!();
     let shoots_raw = Confirm::new()
-        .with_prompt("Do you shoot RAW photos?")
+        .with_prompt("Do you shoot RAW?")
         .default(false)
         .interact()?;
 
