@@ -160,7 +160,9 @@ pub(crate) async fn install_system(args: &InstallArgs, config_path: &Path) -> Re
     if !is_root() {
         bail!(
             "`kei install --system` must be run as root (EUID=0); \
-             rerun under sudo or use `kei install --user` for a per-user install"
+             rerun:  sudo kei install --system --config {}  \
+             Or use `kei install --user` for a per-user install.",
+            config_path.display()
         );
     }
     let user = sudo_user_or_bail()?;

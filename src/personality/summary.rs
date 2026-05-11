@@ -56,7 +56,7 @@ impl SummaryCard {
     /// the assertions don't have to interact with indicatif.
     pub fn render_lines(&self) -> Vec<String> {
         let mut lines = Vec::with_capacity(8);
-        lines.push("─── kei sync ───────────────────────────────".to_string());
+        lines.push("─── kei ────────────────────────────────────".to_string());
         lines.push(format!(
             "   New      {}",
             format_new(self.photos_new, self.videos_new)
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn render_lines_includes_top_and_bottom_borders() {
         let lines = sample_card().render_lines();
-        assert!(lines.first().unwrap().starts_with("─── kei sync "));
+        assert!(lines.first().unwrap().starts_with("─── kei "));
         assert!(lines.last().unwrap().starts_with("───────"));
     }
 

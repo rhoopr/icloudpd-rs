@@ -785,7 +785,7 @@ pub enum ServiceAction {
 /// Subcommands for kei.
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
-    /// Download photos from iCloud (default command)
+    /// Download photos from iCloud (the default: running `kei` with no command does this)
     Sync {
         #[command(flatten)]
         password: PasswordArgs,
@@ -937,7 +937,22 @@ pub enum Command {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "kei", about = "kei: photo sync engine", version)]
+#[command(
+    name = "kei",
+    about = "kei: photo sync engine",
+    version,
+    after_help = "Getting started:\n  \
+        kei config setup    Generate your config interactively\n  \
+        kei sync            Download your photos (runs after setup)\n\n  \
+        Common:\n  \
+        kei status          See what's been downloaded\n  \
+        kei login           Sign in to iCloud\n  \
+        kei list albums     Browse albums and libraries\n\n  \
+        Advanced:\n  \
+        kei install         Register as a background service\n  \
+        kei verify          Verify downloaded files\n  \
+        kei import-existing  Adopt an existing local photo tree"
+)]
 pub struct Cli {
     // ── Global options ──────────────────────────────────────────────
     /// Log level
@@ -948,25 +963,30 @@ pub struct Cli {
     #[arg(long, short = 'v', global = true)]
     pub verbose: bool,
 
-    /// Force friendly progress messages on (verb-cycling spinners, curated phase narration,
-    /// summary card, sign-off). Default: on for plain TTYs, off in service/container/journal
-    /// contexts and whenever a machine-output flag (`--report-json`, `--only-print-filenames`)
-    /// or an explicit `--log-level` / `RUST_LOG` is in play. `--friendly` overrides the TOML
-    /// `[ui] friendly` setting and the auto-detected default; environmental hard-off contexts
-    /// still win.
+    /// Use friendly progress UI (default on interactive terminals)
     #[arg(
         long,
         global = true,
         overrides_with = "no_friendly",
-        env = "KEI_FRIENDLY"
+        env = "KEI_FRIENDLY",
+        long_help = "Use friendly progress UI (verb-cycling spinners, curated phase narration, summary card, sign-off). \
+                     Default: on for plain TTYs, off in service/container/journal contexts and whenever a \
+                     machine-output flag (`--report-json`, `--only-print-filenames`) or an explicit \
+                     `--log-level` / `RUST_LOG` is in play. `--friendly` overrides the TOML `[ui] friendly` \
+                     setting and the auto-detected default; environmental hard-off contexts still win."
     )]
     pub friendly: bool,
 
-    /// Force friendly progress messages off (preserves v0.13 scrollback byte-for-byte).
-    /// Overrides `--friendly`, the TOML `[ui] friendly` setting, and the auto-detected
-    /// default. Use this when piping kei output to a log aggregator on an interactive TTY
-    /// where auto-detection would otherwise enable friendly mode.
-    #[arg(long, global = true, overrides_with = "friendly")]
+    /// Disable friendly progress UI
+    #[arg(
+        long,
+        global = true,
+        overrides_with = "friendly",
+        long_help = "Force friendly progress messages off (preserves v0.13 scrollback byte-for-byte). \
+                     Overrides `--friendly`, the TOML `[ui] friendly` setting, and the auto-detected default. \
+                     Use this when piping kei output to a log aggregator on an interactive TTY where \
+                     auto-detection would otherwise enable friendly mode."
+    )]
     pub no_friendly: bool,
 
     /// Path to TOML config file
