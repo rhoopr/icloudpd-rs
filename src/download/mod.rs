@@ -1656,17 +1656,21 @@ async fn download_photos_full_with_token(
         };
         let mut token_receivers = Vec::with_capacity(passes.len());
 
-        // One bar shared across every pass. Without this, each pass creates
-        // its own ProgressBar internally and `finish_and_clear`s it on
-        // completion — a small album finishing fast then a large unfiled
-        // starting fresh reads as a visual glitch (panel disappears and
-        // reappears). Threading the same bar through means the user sees one
-        // bar walking from 0 to grand-total continuously.
-        let (shared_pb, shared_bytes) = crate::download::pipeline::create_progress_bar_for_passes(
-            config.no_progress_bar,
-            config.only_print_filenames,
-            total,
+        // Build per-pass labels for the album divider. Friendly multi-pass
+        // syncs print a done line (✓) above the bar after each album
+        // completes. Single-pass and off-mode syncs skip the divider.
+        let pass_labels: Vec<(&str, u64)> = passes
+            .iter()
+            .zip(&pass_counts)
+            .map(|(pass, &count)| {
+                let label: &str = pass.album.name.as_ref();
+                let label = if label.is_empty() { "unfiled" } else { label };
+                (label, count)
+            })
+            .collect();
+        let divider = crate::personality::album_divider::AlbumDivider::new(
             config.personality_mode,
+            &pass_labels,
         );
 
         for ((pass, &count), pass_config) in passes.iter().zip(&pass_counts).zip(&pass_configs) {
@@ -1681,16 +1685,35 @@ async fn download_photos_full_with_token(
             );
             token_receivers.push(token_rx);
 
+            // Per-album bar: the bar represents only this album's progress,
+            // not the cumulative grand total. When the divider is active
+            // (multi-pass friendly), the bar plus divider together give the
+            // user per-album awareness; the divider's done lines accumulate
+            // in scrollback so completed albums don't disappear.
+            let pass_start = Instant::now();
+            let (pass_pb, pass_bytes) = crate::download::pipeline::create_progress_bar_for_passes(
+                config.no_progress_bar,
+                config.only_print_filenames,
+                count,
+                config.personality_mode,
+            );
+
             let result = stream_and_download_from_stream(
                 download_client,
                 stream,
                 pass_config,
-                total,
+                count,
                 shutdown_token.clone(),
-                Some(shared_pb.clone()),
-                Some(Arc::clone(&shared_bytes)),
+                Some(pass_pb.clone()),
+                Some(std::sync::Arc::clone(&pass_bytes)),
             )
             .await?;
+
+            let pass_elapsed = pass_start.elapsed();
+            pass_pb.finish_and_clear();
+            let downloaded_u64 = u64::try_from(result.downloaded).unwrap_or(u64::MAX);
+            let pass_label: &str = pass_config.pass_label();
+            divider.mark_done(pass_label, downloaded_u64, count, pass_elapsed);
 
             combined_result.downloaded += result.downloaded;
             combined_result.exif_failures += result.exif_failures;
@@ -1706,9 +1729,7 @@ async fn download_photos_full_with_token(
                 combined_result.enumeration_complete && result.enumeration_complete;
         }
 
-        // Bar lifetime owned here in the per-pass branch — finish once after
-        // all passes complete (or break early on cancel).
-        shared_pb.finish_and_clear();
+        divider.finish();
 
         (combined_result, token_receivers)
     } else {

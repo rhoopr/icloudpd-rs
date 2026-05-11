@@ -1399,7 +1399,7 @@ where
             match result {
                 Ok(asset) => {
                     if !seen_ids.insert(asset.id_arc()) {
-                        tracing::warn!(
+                        tracing::debug!(
                             asset_id = %asset.id(),
                             "Duplicate asset ID from API, skipping"
                         );

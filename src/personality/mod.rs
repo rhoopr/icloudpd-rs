@@ -10,6 +10,7 @@
 //! than re-detecting at each call site.
 
 pub mod active_bar;
+pub mod album_divider;
 pub mod bar_render;
 pub mod cycler;
 pub mod format;

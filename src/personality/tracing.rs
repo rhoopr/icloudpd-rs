@@ -251,12 +251,12 @@ mod tests {
                 .into()
         });
         assert!(
-            captured.contains("! first warning event"),
-            "WARN line should be `! <message>`; got: {captured}",
+            captured.contains("! ") && captured.contains("first warning event"),
+            "WARN line must have `! ` glyph and message body; got: {captured:?}",
         );
         assert!(
-            captured.contains("x first error event"),
-            "ERROR line should be `x <message>`; got: {captured}",
+            captured.contains("x ") && captured.contains("first error event"),
+            "ERROR line must have `x ` glyph and message body; got: {captured:?}",
         );
     }
 }

@@ -82,7 +82,10 @@ mod tests {
     #[test]
     fn register_returns_a_usable_bar() {
         let pb = register(ProgressBar::hidden());
-        // Hidden bars are still functional; just confirm the type round-trips.
-        assert!(pb.is_hidden());
+        // MultiProgress::add() may override the draw target (depending on
+        // whether stdout is a terminal), so don't assert on is_hidden().
+        // Just verify the returned handle is functional.
+        pb.set_message("hello");
+        assert_eq!(pb.message(), "hello");
     }
 }
