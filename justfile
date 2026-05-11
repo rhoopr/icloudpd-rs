@@ -14,12 +14,74 @@ _default:
 gate:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
-    cargo test --lib --test cli --test behavioral --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
+    cargo test --lib -- --test-threads=1
+    cargo test --test cli --test behavioral --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
     cargo fetch --locked
     cargo audit --deny warnings
     typos
     bash scripts/check-roundtrip-gate.sh
+
+# Pre-release battery: every gate + offline + live + shell suite in order.
+# Stops on first failure. Needs .env + Docker + an existing session.
+full-test:
+    #!/usr/bin/env bash
+    set -euxo pipefail
+    # ── Live-auth bootstrap ────────────────────────────────────────
+    if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f .env ]; then
+        set -a; source .env; set +a
+    fi
+    : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
+    export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
+    if [ -n "${ICLOUD_TEST_COOKIE_DIR:-}" ]; then
+        export ICLOUD_TEST_COOKIE_DIR
+    fi
+    # ── Phase 1: Gate ────────────────────────────────────────────
+    echo "=== Phase 1: Gate ==="
+    cargo fmt --all --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    cargo test --lib -- --test-threads=1
+    cargo test --test cli --test behavioral --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
+    RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
+    cargo fetch --locked
+    cargo audit --deny warnings
+    typos
+    bash scripts/check-roundtrip-gate.sh
+    # ── Phase 2: Deps + tooling ───────────────────────────────────
+    echo "=== Phase 2: Deps + tooling ==="
+    cargo clippy --all-targets --no-default-features -- -D warnings
+    cargo test --no-default-features
+    # udeps needs nightly; fail early with install instructions if missing
+    cargo +nightly --version >/dev/null 2>&1 || { echo "ERROR: nightly toolchain not installed. Run: rustup toolchain install nightly"; exit 1; }
+    cargo udeps --version >/dev/null 2>&1 || { echo "ERROR: cargo-udeps not installed. Run: cargo install cargo-udeps"; exit 1; }
+    cargo +nightly udeps --all-targets
+    # audit and typos already ran in gate
+    # ── Phase 3: Full offline ─────────────────────────────────────
+    echo "=== Phase 3: Full offline ==="
+    cargo test --all-features
+    # ── Phase 4: Live ─────────────────────────────────────────────
+    echo "=== Phase 4: Live sync ==="
+    cargo test --test sync -- --ignored --test-threads=1
+    cargo test --test state_auth -- --ignored --test-threads=1
+    cargo test --test import_existing_live -- --ignored --test-threads=1
+    # ── Phase 5: Concurrency ──────────────────────────────────────
+    echo "=== Phase 5: Concurrency ==="
+    bash tests/shell/concurrency.sh
+    # ── Phase 6: State machine ────────────────────────────────────
+    echo "=== Phase 6: State machine ==="
+    bash tests/shell/state-machine.sh
+    # ── Phase 7: Docker ───────────────────────────────────────────
+    echo "=== Phase 7: Docker ==="
+    bash tests/shell/docker.sh
+    # ── Phase 8: Service smoke ────────────────────────────────────
+    echo "=== Phase 8: Service smoke ==="
+    if ! command -v systemd-analyze >/dev/null 2>&1 && ! command -v plutil >/dev/null 2>&1; then
+        echo "service-smoke skipped: not Linux or macOS"
+    else
+        just service-smoke
+    fi
+    echo ""
+    echo "full-test: all 8 phases passed"
 
 # Test dispatcher: offline | fast | live | concurrency | state | docker | PATTERN.
 test MODE="":
@@ -41,7 +103,8 @@ test MODE="":
             cargo test --all-features
             ;;
         fast)
-            cargo test --lib --test cli --test behavioral --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
+            cargo test --lib -- --test-threads=1
+            cargo test --test cli --test behavioral --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
             ;;
         live)
             _live_env

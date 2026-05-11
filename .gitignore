@@ -1,6 +1,9 @@
 # Local Repo
 .scratch/
 
+# Pi coding agent
+.pi/
+
 # Rust
 /target
 

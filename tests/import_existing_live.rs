@@ -182,6 +182,7 @@ fn parse_summary(stdout: &str) -> ImportSummary {
     let mut total = 0_u64;
     let mut matched = 0_u64;
     let mut unmatched = 0_u64;
+    let mut filtered = 0_u64;
     for line in stdout.lines() {
         let line = line.trim();
         if let Some(n) = line.strip_prefix("Total assets scanned:") {
@@ -190,12 +191,15 @@ fn parse_summary(stdout: &str) -> ImportSummary {
             matched = n.trim().parse().unwrap_or(0);
         } else if let Some(n) = line.strip_prefix("Unmatched versions:") {
             unmatched = n.trim().parse().unwrap_or(0);
+        } else if let Some(n) = line.strip_prefix("Filtered (no path):") {
+            filtered = n.trim().parse().unwrap_or(0);
         }
     }
     ImportSummary {
         total,
         matched,
         unmatched,
+        filtered,
     }
 }
 
@@ -204,6 +208,7 @@ struct ImportSummary {
     total: u64,
     matched: u64,
     unmatched: u64,
+    filtered: u64,
 }
 
 /// Count downloaded rows in the state DB. kei names the DB after the
@@ -269,17 +274,18 @@ fn import_matches_default_layout_after_sync() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let summary = parse_summary(&stdout);
         assert!(summary.total > 0, "expected some assets, got {summary:?}");
-        // With the same `--recent N` as the fixture sync, every enumerated
-        // asset's primary version should already be on disk. The expected
-        // ratio in the happy path is ~1.0; tighten to 0.95 so a regression
-        // that drops half the matches actually fails. The 5% headroom
-        // accommodates rare cases (0-byte placeholder, ProRAW filtered by
-        // `align_raw`, LivePhotoMode::Skip on a live photo) where
-        // import-existing enumerates an asset sync skipped.
-        let match_ratio = (summary.matched as f64) / (summary.total as f64);
+        // Filtered assets are album members correctly excluded from the
+        // unfiled pass — they can't match by design. Compute the ratio
+        // against the eligible set (total minus filtered).
+        let eligible = summary.total.saturating_sub(summary.filtered);
+        let match_ratio = if eligible > 0 {
+            (summary.matched as f64) / (eligible as f64)
+        } else {
+            1.0
+        };
         assert!(
             match_ratio > 0.95,
-            "match ratio too low: {match_ratio:.2} ({summary:?})\n{stdout}"
+            "match ratio too low: {match_ratio:.2} ({summary:?}) eligible={eligible}\n{stdout}"
         );
 
         let rows = count_downloaded_rows(test_data.path());
