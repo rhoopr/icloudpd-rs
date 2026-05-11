@@ -262,11 +262,7 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
         check("Set-and-forget. Kei will keep an eye on things.");
     }
 
-    // Step 8: Friendly UX
-    section_header("Friendly UX");
-    ask_friendly(&mut answers)?;
-
-    // Step 9: Extras
+    // Step 8: Extras
     section_header("Extras");
     ask_extras(&mut answers)?;
 
@@ -357,6 +353,13 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     println!();
     let bold = Style::new().bold();
     println!("{}", bold.apply_to("You're all set."));
+    if answers.watch_interval.is_some() {
+        println!();
+        println!(
+            "  {} to run continuously in the background.",
+            bold.apply_to(format!("kei install --config {}", config_path.display()))
+        );
+    }
     println!();
 
     // Offer to sync now
@@ -868,29 +871,10 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
 
 // ── Step 8: Extras ─────────────────────────────────────────────────
 
-fn ask_friendly(answers: &mut SetupAnswers) -> anyhow::Result<()> {
-    println!();
-    let friendly = Confirm::new()
-        .with_prompt(
-            "Show friendly progress messages\n  \
-             (verb-cycling spinners, summary card, sign-off)?",
-        )
-        .default(true)
-        .interact()?;
-    // Only persist an explicit opt-out. Storing `Some(true)` would freeze
-    // the default into the config; leaving it `None` keeps the runtime
-    // free to flip the default later without rewriting users' files.
-    answers.ui_friendly = if friendly { None } else { Some(false) };
-    Ok(())
-}
-
 fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     println!();
     let configure = Confirm::new()
-        .with_prompt(
-            "Want to configure additional options\n  \
-             (smart folders, bandwidth, exclusions, EXIF, dedup, threads, notifications, logging)?",
-        )
+        .with_prompt("Configure advanced options?")
         .default(false)
         .interact()?;
 
