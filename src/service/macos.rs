@@ -175,7 +175,8 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
 
     tracing::info!(
         "kei is now running as a per-user launchd agent; \
-         check `launchctl list {SERVICE_IDENTIFIER}` to verify"
+         check `launchctl list {SERVICE_IDENTIFIER}` to verify. \
+         Run `kei uninstall` to remove this service."
     );
     Ok(())
 }
@@ -197,8 +198,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
 
     if plist_path.is_none() {
         tracing::info!(
-            "no kei launchd plist found at ~/Library/LaunchAgents/{PLIST_FILE_NAME}; \
-             nothing to uninstall"
+            "kei service was already removed. Nothing to do."
         );
     }
 

@@ -89,7 +89,8 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
         executable = %exe.display(),
         config = %config_path.display(),
         account = %inputs.account_name(),
-        "registered kei with the Windows Service Control Manager",
+        "registered kei with the Windows Service Control Manager. \
+         Run `kei uninstall` to remove this service.",
     );
     Ok(())
 }
@@ -112,7 +113,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
         true => tracing::info!(service = SERVICE_NAME, "removed kei from SCM"),
         false => tracing::info!(
             service = SERVICE_NAME,
-            "no kei service registered with SCM; nothing to remove",
+            "kei service was already removed. Nothing to do.",
         ),
     }
 
