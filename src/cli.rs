@@ -778,7 +778,8 @@ pub enum ServiceAction {
     Run(Box<ServiceRunArgs>),
 
     /// Show whether kei is registered as a service on this host and when
-    /// it last started.
+    /// it last started. For a combined summary including photo library
+    /// stats, use `kei status` instead.
     Status,
 }
 

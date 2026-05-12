@@ -195,7 +195,7 @@ const TWO_FA_PROMPT_LINE: &str =
 
 fn render_sleeping_until(wake_at: chrono::DateTime<chrono::Local>) -> String {
     format!(
-        "Sleeping until {}. Press Ctrl+C to stop.",
+        "Sleeping until {} (local time). Press Ctrl+C to stop.",
         wake_at.format("%H:%M"),
     )
 }
@@ -519,7 +519,7 @@ mod tests {
             .expect("unambiguous local time");
         assert_eq!(
             render_sleeping_until(wake_at),
-            "Sleeping until 14:32. Press Ctrl+C to stop.",
+            "Sleeping until 14:32 (local time). Press Ctrl+C to stop.",
         );
     }
 
@@ -531,7 +531,7 @@ mod tests {
             .expect("unambiguous local time");
         assert_eq!(
             render_sleeping_until(wake_at),
-            "Sleeping until 04:05. Press Ctrl+C to stop.",
+            "Sleeping until 04:05 (local time). Press Ctrl+C to stop.",
         );
     }
 

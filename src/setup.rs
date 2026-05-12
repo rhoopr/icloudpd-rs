@@ -475,7 +475,7 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     // is right for almost everyone, so it's offered here as a single line with
     // an obvious skip, not gated behind the "additional options?" extras prompt.
     let data_dir: String = Input::new()
-        .with_prompt("Data directory (sessions, state DB, credentials)")
+        .with_prompt("App data directory (advanced — leave default unless you know you need to change this)")
         .default("~/.config/kei".to_string())
         .interact_text()?;
     if data_dir != "~/.config/kei" {
