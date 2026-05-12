@@ -37,10 +37,34 @@ pub(crate) struct TomlUi {
     pub friendly: Option<bool>,
 }
 
+/// Notification configuration from TOML.
+///
+/// The `script` field preserves the pre-v0.15 `--notification-script` surface.
+/// `desktop`, `min_severity`, and `webhooks` are new in v0.15.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlNotifications {
     pub script: Option<String>,
+    /// Enable desktop notifications. Default `true` when the field is absent
+    /// in TOML; auto-disabled in containers.
+    pub desktop: Option<bool>,
+    /// Minimum severity for notification backends. "silent" | "info" | "warn" |
+    /// "critical". Default is "warn" when absent.
+    pub min_severity: Option<crate::notifications::Severity>,
+    /// Per-webhook backend configs. Unknown backend names log a warning at
+    /// startup but are otherwise ignored.
+    #[serde(default)]
+    pub webhooks: Option<std::collections::HashMap<String, TomlWebhookEntry>>,
+}
+
+/// A single webhook backend entry under `[notifications.webhooks.<name>]`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct TomlWebhookEntry {
+    pub url: String,
+    /// Per-backend severity override. Falls back to
+    /// `[notifications].min_severity` when absent.
+    #[serde(default)]
+    pub min_severity: Option<crate::notifications::Severity>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -175,6 +199,10 @@ pub(crate) struct TomlMetrics {
 pub(crate) struct TomlServer {
     pub port: Option<u16>,
     pub bind: Option<String>,
+    /// Bind address for control endpoints (status page, pause/resume, SSE).
+    /// Defaults to 127.0.0.1 when absent. Separate from `bind` so that
+    /// `/healthz` and `/metrics` can be public while control stays loopback-only.
+    pub control_bind: Option<String>,
 }
 
 /// Load a TOML config file. Returns `Ok(None)` if the file doesn't exist
@@ -658,6 +686,29 @@ fn resolve_album_selection(
     })
 }
 
+/// Resolved notification configuration.
+///
+/// Built from [`TomlNotifications`] during [`Config::build`]
+/// with CLI > TOML > default resolution.
+#[derive(Debug, Clone)]
+pub(crate) struct NotificationsConfig {
+    /// Whether the user opted into desktop notifications (true unless
+    /// `--desktop-notifications false` or `[notifications].desktop = false`).
+    pub desktop: bool,
+    /// Global minimum severity threshold for notification backends.
+    pub min_severity: crate::notifications::Severity,
+    /// Per-webhook endpoint configs, keyed by backend name ("ntfy", "discord", etc.).
+    pub webhooks: Vec<WebhookConfig>,
+}
+
+/// A single resolved webhook backend.
+#[derive(Debug, Clone)]
+pub(crate) struct WebhookConfig {
+    pub name: String,
+    pub url: String,
+    pub min_severity: crate::notifications::Severity,
+}
+
 /// Application configuration.
 ///
 /// Fields are ordered for optimal memory layout:
@@ -690,6 +741,10 @@ pub struct Config {
     /// preserves their semantics. v0.13: derived from those fields. Future
     /// PRs migrate the resolver and the legacy fields are removed.
     pub selection: crate::selection::Selection,
+
+    /// Resolved notification configuration. Desktop-enabled flag, min-severity
+    /// threshold, and per-webhook endpoint configs.
+    pub notifications: NotificationsConfig,
 
     // DateTime fields
     pub skip_created_before: Option<DateTime<Local>>,
@@ -727,6 +782,11 @@ pub struct Config {
 
     // Net addresses
     pub http_bind: std::net::IpAddr,
+    /// Bind address for control endpoints. Separate from [`http_bind`]
+    /// so `/healthz` and `/metrics` can be public while control
+    /// endpoints (status page, pause/resume, SSE) stay loopback-only.
+    /// Defaults to 127.0.0.1.
+    pub control_bind: std::net::IpAddr,
 
     // 1-byte enums
     pub size: VersionSize,
@@ -1756,6 +1816,35 @@ impl Config {
             .or_else(|| toml_notif.and_then(|n| n.script.clone()))
             .map(|s| expand_tilde(&s));
 
+        // Resolved notification config: desktop, min_severity, webhooks.
+        const DEFAULT_DESKTOP_NOTIFICATIONS: bool = true;
+        let desktop_notifications = sync
+            .desktop_notifications
+            .or_else(|| toml_notif.and_then(|n| n.desktop))
+            .unwrap_or(DEFAULT_DESKTOP_NOTIFICATIONS);
+        let global_min_severity = toml_notif
+            .and_then(|n| n.min_severity)
+            .unwrap_or(crate::notifications::Severity::Warn);
+        // Flatten `[notifications.webhooks.*]` into a Vec<WebhookConfig>.
+        // Unknown backend names are silently ignored (PR 3 adds known names).
+        let webhooks = toml_notif
+            .and_then(|n| n.webhooks.as_ref())
+            .map(|map| {
+                map.iter()
+                    .map(|(name, entry)| WebhookConfig {
+                        name: name.clone(),
+                        url: entry.url.clone(),
+                        min_severity: entry.min_severity.unwrap_or(global_min_severity),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let notifications = NotificationsConfig {
+            desktop: desktop_notifications,
+            min_severity: global_min_severity,
+            webhooks,
+        };
+
         // JSON report: CLI > [report] json TOML > none.
         let toml_report = toml.and_then(|t| t.report.as_ref());
         let report_json = sync.report_json.or_else(|| {
@@ -1814,6 +1903,23 @@ impl Config {
             },
         };
 
+        // Control bind address — CLI > [server] control_bind TOML > default 127.0.0.1.
+        // Control endpoints (status page, pause/resume, SSE) bind loopback-only by
+        // default. Separate from http_bind so /healthz and /metrics can be public.
+        const DEFAULT_CONTROL_BIND: std::net::IpAddr =
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        let control_bind = match sync.control_bind {
+            Some(addr) => addr,
+            None => match toml_server.and_then(|s| s.control_bind.as_deref()) {
+                Some(raw) => raw.parse::<std::net::IpAddr>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "[server] control_bind is not a valid IP address ({raw:?}): {e}"
+                    )
+                })?,
+                None => DEFAULT_CONTROL_BIND,
+            },
+        };
+
         // Reject combinations that would produce zero downloads. When both
         // skip flags are set, the only live-photo modes that still produce
         // output are `both` and `video-only` (Live Photo MOV companions
@@ -1855,9 +1961,11 @@ impl Config {
             skip_created_after,
             pid_file,
             notification_script,
+            notifications,
             report_json,
             http_port,
             http_bind,
+            control_bind,
             watch_with_interval,
             retry_delay_secs,
             reconcile_every_n_cycles,
@@ -2128,12 +2236,58 @@ impl Config {
             } else {
                 None
             },
-            notifications: self
-                .notification_script
-                .as_ref()
-                .map(|s| TomlNotifications {
-                    script: Some(s.display().to_string()),
-                }),
+            notifications: {
+                let has_script = self.notification_script.is_some();
+                let has_desktop_override = !self.notifications.desktop;
+                let has_severity_override =
+                    self.notifications.min_severity != crate::notifications::Severity::Warn;
+                let has_webhooks = !self.notifications.webhooks.is_empty();
+                if has_script || has_desktop_override || has_severity_override || has_webhooks {
+                    Some(TomlNotifications {
+                        script: self
+                            .notification_script
+                            .as_ref()
+                            .map(|s| s.display().to_string()),
+                        desktop: if !self.notifications.desktop {
+                            Some(false)
+                        } else {
+                            None
+                        },
+                        min_severity: if has_severity_override {
+                            Some(self.notifications.min_severity)
+                        } else {
+                            None
+                        },
+                        webhooks: if has_webhooks {
+                            let map: std::collections::HashMap<String, TomlWebhookEntry> = self
+                                .notifications
+                                .webhooks
+                                .iter()
+                                .map(|w| {
+                                    (
+                                        w.name.clone(),
+                                        TomlWebhookEntry {
+                                            url: w.url.clone(),
+                                            min_severity: if w.min_severity
+                                                != self.notifications.min_severity
+                                            {
+                                                Some(w.min_severity)
+                                            } else {
+                                                None
+                                            },
+                                        },
+                                    )
+                                })
+                                .collect();
+                            Some(map)
+                        } else {
+                            None
+                        },
+                    })
+                } else {
+                    None
+                }
+            },
             metrics: None,
             server: Some(TomlServer {
                 port: Some(self.http_port),
@@ -2146,6 +2300,16 @@ impl Config {
                         None
                     } else {
                         Some(self.http_bind.to_string())
+                    }
+                },
+                // Only emit `control_bind` when it's been changed from the
+                // default (127.0.0.1).
+                control_bind: {
+                    let default = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+                    if self.control_bind == default {
+                        None
+                    } else {
+                        Some(self.control_bind.to_string())
                     }
                 },
             }),
@@ -5697,6 +5861,171 @@ mod tests {
             config.notifications.unwrap().script.as_deref(),
             Some("/path/to/hook.sh")
         );
+    }
+
+    #[test]
+    fn test_notifications_config_desktop_and_severity() {
+        let toml_str = r#"
+            [notifications]
+            desktop = false
+            min_severity = "critical"
+        "#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let n = config.notifications.unwrap();
+        assert_eq!(n.desktop, Some(false));
+        assert_eq!(
+            n.min_severity,
+            Some(crate::notifications::Severity::Critical)
+        );
+    }
+
+    #[test]
+    fn test_notifications_config_with_webhook() {
+        let toml_str = r#"
+            [notifications]
+            desktop = true
+            min_severity = "warn"
+
+            [notifications.webhooks.ntfy]
+            url = "https://ntfy.sh/my-topic"
+            min_severity = "critical"
+
+            [notifications.webhooks.discord]
+            url = "https://discord.com/api/webhooks/123"
+            min_severity = "warn"
+        "#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let n = config.notifications.unwrap();
+        assert_eq!(n.desktop, Some(true));
+        assert_eq!(n.min_severity, Some(crate::notifications::Severity::Warn));
+        let webhooks = n.webhooks.unwrap();
+        assert_eq!(webhooks.len(), 2);
+        let ntfy = &webhooks["ntfy"];
+        assert_eq!(ntfy.url, "https://ntfy.sh/my-topic");
+        assert_eq!(
+            ntfy.min_severity,
+            Some(crate::notifications::Severity::Critical)
+        );
+        let discord = &webhooks["discord"];
+        assert_eq!(discord.url, "https://discord.com/api/webhooks/123");
+        assert_eq!(
+            discord.min_severity,
+            Some(crate::notifications::Severity::Warn)
+        );
+    }
+
+    #[test]
+    fn test_notifications_config_round_trip() {
+        // Build a Config with non-default notification settings and verify
+        // to_toml() round-trips the notification section.
+        let toml_str = r#"
+            [notifications]
+            desktop = false
+            min_severity = "info"
+
+            [notifications.webhooks.ntfy]
+            url = "https://ntfy.sh/test"
+            min_severity = "critical"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.desktop_notifications = Some(false);
+        // Note: min_severity is currently TOML-only (no CLI flag).
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        assert!(!cfg.notifications.desktop);
+        assert_eq!(
+            cfg.notifications.min_severity,
+            crate::notifications::Severity::Info
+        );
+        assert_eq!(cfg.notifications.webhooks.len(), 1);
+        assert_eq!(cfg.notifications.webhooks[0].name, "ntfy");
+        assert_eq!(
+            cfg.notifications.webhooks[0].min_severity,
+            crate::notifications::Severity::Critical
+        );
+        // Round-trip through to_toml
+        let rt = cfg.to_toml();
+        assert!(rt.notifications.is_some());
+        let rt_n = rt.notifications.as_ref().unwrap();
+        assert_eq!(rt_n.desktop, Some(false));
+        assert_eq!(
+            rt_n.min_severity,
+            Some(crate::notifications::Severity::Info)
+        );
+        assert!(rt_n.webhooks.is_some());
+        let rt_wh = rt_n.webhooks.as_ref().unwrap();
+        assert_eq!(rt_wh.len(), 1);
+        assert!(rt_wh.contains_key("ntfy"));
+    }
+
+    #[test]
+    fn test_control_bind_default() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.control_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn test_control_bind_from_toml() {
+        let toml_str = r#"
+            [server]
+            control_bind = "10.0.0.1"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.control_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn test_control_bind_cli_overrides_toml() {
+        let toml_str = r#"
+            [server]
+            control_bind = "10.0.0.1"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.control_bind = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        assert_eq!(
+            cfg.control_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn test_control_bind_invalid_string_errors() {
+        let toml_str = r#"
+            [server]
+            control_bind = "not-an-ip"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("control_bind"));
     }
 
     // ── Config::build: recent/dates merge ──────────────────────────

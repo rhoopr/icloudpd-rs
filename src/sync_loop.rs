@@ -317,7 +317,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .transpose()?;
 
     let sd_notifier = SystemdNotifier::new(config.notify_systemd);
-    let notifier = Notifier::new(config.notification_script.clone());
+    let notifier = Notifier::new(
+        config.notification_script.clone(),
+        config.notifications.desktop,
+    );
 
     tracing::info!(concurrency = config.threads_num, "Starting kei");
 
@@ -1115,7 +1118,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             } else if cycle_result.failed_count > 0 {
                 let data = notifications::SyncNotificationData::from(&cycle_result.stats);
                 notifier.notify(
-                    notifications::Event::SyncFailed,
+                    notifications::Event::SyncFailed(notifications::FailureMode::Partial(
+                        cycle_result.failed_count,
+                    )),
                     &format!("{} downloads failed", cycle_result.failed_count),
                     &config.username,
                     Some(&data),
