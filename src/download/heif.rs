@@ -427,10 +427,17 @@ pub(crate) fn insert_xmp<W: Write>(
         .iter()
         .enumerate()
         .take(new_mdat_idx) // skip the mdat we just added; it has no matching original
-        .filter_map(|(idx, a)| {
+        .filter_map(|(idx, _a)| {
             let orig = *original_offsets.get(idx)?;
-            let size = encoded_size(a);
-            Some((orig, orig + size, new_positions[idx]))
+            // Use the original atom's actual extent, not encoded_size(a).
+            // Meta::encode_body always writes ISO format (with 4-byte
+            // version+flags) even when the input was Apple QuickTime
+            // (without version+flags). encoded_size would report the
+            // re-encoded ISO size, making this range 4 bytes wider than
+            // the original atom — iloc entries in that overshoot region
+            // are then captured by the wrong range.
+            let orig_end = original_offsets.get(idx + 1).copied().unwrap_or(total);
+            Some((orig, orig_end, new_positions[idx]))
         })
         .collect();
 
@@ -517,7 +524,10 @@ fn locate_stale_kei_mdat(
                 continue;
             }
             let atom_start = original_offsets[idx];
-            let atom_end = atom_start + encoded_size(atom);
+            let atom_end = original_offsets
+                .get(idx + 1)
+                .copied()
+                .unwrap_or_else(|| atom_start + encoded_size(atom));
             if abs_start < atom_start || abs_end > atom_end {
                 continue;
             }
@@ -1060,5 +1070,240 @@ mod tests {
         let io_err = std::io::Error::other("disk full");
         let err: HeifError = io_err.into();
         assert!(matches!(err, HeifError::Io(_)));
+    }
+
+    // ── Regression: insert_xmp with Apple QuickTime Meta (no version+flags) ──
+    //
+    // mp4_atom::Meta::encode_body always writes ISO format (4-byte
+    // version+flags) regardless of the input format. When the input Meta
+    // is Apple QuickTime format (no version+flags), the re-encoded Meta is
+    // 4 bytes larger than the original. The file_offset_map used
+    // encoded_size() as old_end, which inflates Meta's range 4 bytes into
+    // the next atom's territory. An iloc entry pointing to the start of mdat
+    // is captured by Meta's bloated range and incorrectly remapped to the
+    // old (pre-growth) position instead of the correct shifted position.
+    //
+    // Fix: use original_offsets[i+1] (or total for last atom) as old_end.
+    #[test]
+    fn insert_xmp_remaps_iloc_correctly_with_apple_qt_meta() {
+        let input = build_apple_qt_heic_fixture();
+        assert!(is_heif_content(&input));
+
+        let xmp = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF/></x:xmpmeta>";
+        let mut output: Vec<u8> = Vec::new();
+        insert_xmp(&input, xmp, &mut output).expect("insert_xmp must succeed");
+
+        assert!(is_heif_content(&output));
+
+        // The image mdat atom must have shifted past the (now-larger) meta.
+        // Decode the output iloc and verify it points to the actual mdat data.
+        let out_iloc = decode_iloc_from_heic(&output).expect("output iloc");
+        let out_loc = out_iloc
+            .item_locations
+            .iter()
+            .find(|l| l.item_id == 1)
+            .expect("item 1 in output iloc");
+        let out_abs = out_loc
+            .base_offset
+            .saturating_add(out_loc.extents.first().map(|e| e.offset).unwrap_or(0));
+        let (out_mdat_start, out_mdat_data) = find_mdat(&output).expect("output mdat");
+
+        assert_eq!(
+            out_abs,
+            out_mdat_start + 8,
+            "iloc must point to output mdat data at offset {}+8, got {out_abs}",
+            out_mdat_start,
+        );
+
+        // The input mdat must match output mdat.
+        let (_in_mdat_start, in_mdat_data) = find_mdat(&input).expect("input mdat");
+        assert_eq!(in_mdat_data, out_mdat_data, "mdat data must be preserved");
+
+        // Verify the meta box actually grew (mdat shifted).
+        let in_meta_end = find_atom_end(&input, "meta").expect("input meta");
+        let out_meta_end = find_atom_end(&output, "meta").expect("output meta");
+        assert!(out_meta_end > in_meta_end, "meta must grow on re-encode");
+    }
+
+    /// Build a minimal HEIC with Apple QuickTime Meta (no version+flags)
+    /// and meta-before-mdat layout. Contains one hvc1 image item with
+    /// a 16-byte payload.
+    fn build_apple_qt_heic_fixture() -> Vec<u8> {
+        use mp4_atom::{
+            Hdlr, Hvcc, Iinf, Iloc, Ipco, Ipma, Iprp, ItemInfoEntry, ItemLocation,
+            ItemLocationExtent, Pitm, PropertyAssociation, PropertyAssociations,
+        };
+
+        let payload: Vec<u8> = (0..16).collect();
+        let mut tmp: Vec<u8> = Vec::new();
+
+        let hdlr = Hdlr {
+            handler: FourCC::new(b"pict"),
+            name: String::new(),
+        };
+        hdlr.encode(&mut tmp).unwrap();
+        let hdlr_enc: Vec<u8> = tmp.drain(..).collect();
+
+        Pitm { item_id: 1 }.encode(&mut tmp).unwrap();
+        let pitm_enc: Vec<u8> = tmp.drain(..).collect();
+
+        Iinf {
+            item_infos: vec![ItemInfoEntry {
+                item_id: 1,
+                item_protection_index: 0,
+                item_type: Some(FourCC::new(b"hvc1")),
+                item_name: String::new(),
+                content_type: None,
+                content_encoding: None,
+                item_uri_type: None,
+                item_not_in_presentation: false,
+            }],
+        }
+        .encode(&mut tmp)
+        .unwrap();
+        let iinf_enc: Vec<u8> = tmp.drain(..).collect();
+
+        Iprp {
+            ipco: Ipco {
+                properties: vec![Any::Hvcc(Hvcc::new())],
+            },
+            ipma: vec![Ipma {
+                item_properties: vec![PropertyAssociations {
+                    item_id: 1,
+                    associations: vec![PropertyAssociation {
+                        essential: true,
+                        property_index: 1,
+                    }],
+                }],
+            }],
+        }
+        .encode(&mut tmp)
+        .unwrap();
+        let iprp_enc: Vec<u8> = tmp.drain(..).collect();
+
+        // Iterate to find iloc size / mdat offset fixed point.
+        let non_iloc = hdlr_enc.len() + pitm_enc.len() + iinf_enc.len() + iprp_enc.len();
+        let ftyp = 24u64;
+        let meta_hdr = 8u64; // no version+flags for Apple QT
+        let mut base: u64 = 0;
+        let iloc_enc: Vec<u8> = loop {
+            let iloc = Iloc {
+                item_locations: vec![ItemLocation {
+                    item_id: 1,
+                    construction_method: 0,
+                    data_reference_index: 0,
+                    base_offset: base,
+                    extents: vec![ItemLocationExtent {
+                        item_reference_index: 0,
+                        offset: 0,
+                        length: payload.len() as u64,
+                    }],
+                }],
+            };
+            iloc.encode(&mut tmp).unwrap();
+            let ilc = tmp.drain(..).collect::<Vec<u8>>();
+            let correct = ftyp + meta_hdr + non_iloc as u64 + ilc.len() as u64 + 8;
+            if correct == base {
+                break ilc;
+            }
+            base = correct;
+        };
+
+        let meta_box = 8 + non_iloc + iloc_enc.len();
+        let mdat_box = 8 + payload.len();
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&0x18_u32.to_be_bytes());
+        buf.extend_from_slice(b"ftyp");
+        buf.extend_from_slice(b"heic");
+        buf.extend_from_slice(&0_u32.to_be_bytes());
+        buf.extend_from_slice(b"mif1");
+        buf.extend_from_slice(b"heic");
+        buf.extend_from_slice(&(meta_box as u32).to_be_bytes());
+        buf.extend_from_slice(b"meta");
+        buf.extend_from_slice(&hdlr_enc);
+        buf.extend_from_slice(&pitm_enc);
+        buf.extend_from_slice(&iloc_enc);
+        buf.extend_from_slice(&iinf_enc);
+        buf.extend_from_slice(&iprp_enc);
+        buf.extend_from_slice(&(mdat_box as u32).to_be_bytes());
+        buf.extend_from_slice(b"mdat");
+        buf.extend_from_slice(&payload);
+        buf
+    }
+
+    /// Find the first mdat atom: return (file_offset_of_atom, data_bytes).
+    fn find_mdat(bytes: &[u8]) -> Option<(u64, &[u8])> {
+        let mut pos = 0;
+        while pos + 8 <= bytes.len() {
+            let sz =
+                u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            if &bytes[pos + 4..pos + 8] == b"mdat" {
+                let end = (pos + sz).min(bytes.len());
+                if end > pos + 8 {
+                    return Some((pos as u64, &bytes[pos + 8..end]));
+                }
+            }
+            if sz == 0 || pos + sz > bytes.len() {
+                break;
+            }
+            pos += sz;
+        }
+        None
+    }
+
+    /// Decode the Iloc from the first Meta box in an ISO-BMFF file.
+    fn decode_iloc_from_heic(bytes: &[u8]) -> Option<Iloc> {
+        use mp4_atom::{Atom, Iloc};
+        let mut pos = 0;
+        while pos + 8 <= bytes.len() {
+            let sz =
+                u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            if &bytes[pos + 4..pos + 8] == b"meta" && pos + sz <= bytes.len() {
+                let body = &bytes[pos + 8..pos + sz];
+                let mut cur: &[u8] = body;
+                // Skip version+flags if present (ISO format).
+                if cur.len() >= 8 && cur.get(4..8) != Some(b"hdlr".as_slice()) {
+                    cur = cur.get(4..)?;
+                }
+                while cur.len() >= 8 {
+                    let ss = u32::from_be_bytes([cur[0], cur[1], cur[2], cur[3]]) as usize;
+                    if &cur[4..8] == b"iloc" && cur.len() >= ss {
+                        return Iloc::decode_body(&mut &cur[8..ss]).ok();
+                    }
+                    if ss == 0 || ss > cur.len() {
+                        break;
+                    }
+                    cur = &cur[ss..];
+                }
+                return None;
+            }
+            if sz == 0 || pos + sz > bytes.len() {
+                break;
+            }
+            pos += sz;
+        }
+        None
+    }
+
+    /// Return the byte offset of the end (start + size) of the first
+    /// top-level atom with the given FourCC.
+    fn find_atom_end(bytes: &[u8], tag: &str) -> Option<u64> {
+        let tag = tag.as_bytes();
+        let mut pos = 0;
+        while pos + 8 <= bytes.len() {
+            let sz =
+                u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                    as usize;
+            if &bytes[pos + 4..pos + 8] == tag {
+                return Some((pos + sz) as u64);
+            }
+            if sz == 0 || pos + sz > bytes.len() {
+                break;
+            }
+            pos += sz;
+        }
+        None
     }
 }
