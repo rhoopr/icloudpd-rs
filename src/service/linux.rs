@@ -205,9 +205,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
     let system_path = Some(system_unit_path()).filter(|p| p.exists());
 
     if user_path.is_none() && system_path.is_none() {
-        tracing::info!(
-            "kei service was already removed. Nothing to do."
-        );
+        tracing::info!("kei service was already removed. Nothing to do.");
         // Don't bail — the service is already gone, which is the desired state.
         // Still run purge if requested.
     }

@@ -197,9 +197,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
     let plist_path = user_plist_path().filter(|p| p.exists());
 
     if plist_path.is_none() {
-        tracing::info!(
-            "kei service was already removed. Nothing to do."
-        );
+        tracing::info!("kei service was already removed. Nothing to do.");
     }
 
     if let Some(path) = plist_path.as_ref() {
