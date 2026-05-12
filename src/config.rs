@@ -1224,6 +1224,578 @@ pub(crate) fn parse_env_watch_interval(
     }
 }
 
+// ── build_inner decomposition ───────────────────────────────────────
+//
+// These functions are extracted from [`Config::build_inner`] to keep
+// each call frame small enough for Windows debug builds (1 MiB default
+// stack). Each resolves one logical section of the config.
+
+/// Output of [`resolve_auth_section`].
+#[derive(Debug)]
+struct ResolvedAuth {
+    username: String,
+    password: Option<SecretString>,
+    password_file: Option<PathBuf>,
+    password_command: Option<String>,
+    save_password: bool,
+    domain: Domain,
+    cookie_directory: PathBuf,
+}
+
+/// Resolve auth validation + cookie directory creation.
+fn resolve_auth_section(
+    globals: &GlobalArgs,
+    pw: &crate::cli::PasswordArgs,
+    save_password: bool,
+    no_incremental: bool,
+    toml: Option<&TomlConfig>,
+) -> anyhow::Result<ResolvedAuth> {
+    let toml_auth = toml.and_then(|t| t.auth.as_ref());
+
+    // `[auth].password` is no longer accepted.
+    if toml_auth.and_then(|a| a.password.as_ref()).is_some() {
+        anyhow::bail!(
+            "config file sets `[auth] password`, which is no longer supported. \
+             Plaintext passwords in config files are a security risk. \
+             Use one of: `kei password set` (OS keyring or encrypted file), \
+             `[auth] password_file`, or `[auth] password_command` instead."
+        );
+    }
+
+    let (username, password_str, domain, cookie_directory) = resolve_auth(globals, pw, toml);
+    let password_file = resolve_password_file(pw, toml_auth);
+    let password_command = resolve_password_command(pw, toml_auth);
+
+    // `--password-command` / `[auth] password_command` is Unix-only.
+    #[cfg(windows)]
+    if password_command.is_some() {
+        anyhow::bail!(
+            "`--password-command` / `[auth] password_command` is not supported on Windows: \
+             kei runs commands via `sh -c`, which isn't on the stock Windows PATH. \
+             Use `--password-file` / `[auth] password_file`, or run kei under WSL."
+        );
+    }
+
+    // Reject explicitly provided empty username/password.
+    if globals.username.is_some()
+        || toml
+            .and_then(|t| t.auth.as_ref()?.username.as_ref())
+            .is_some()
+    {
+        anyhow::ensure!(!username.is_empty(), "username must not be empty");
+    }
+    if let Some(pw_str) = &password_str {
+        anyhow::ensure!(!pw_str.is_empty(), "password must not be empty");
+    }
+
+    // Reject both password_file and password_command in the same TOML.
+    if let Some(toml_a) = toml_auth {
+        anyhow::ensure!(
+            !(toml_a.password_file.is_some() && toml_a.password_command.is_some()),
+            "config file sets both `[auth] password_file` and \
+             `[auth] password_command` — pick one"
+        );
+    }
+
+    // `--no-incremental` deprecation.
+    if no_incremental {
+        #[allow(
+            clippy::print_stderr,
+            reason = "runs during config load, before tracing subscriber is installed"
+        )]
+        {
+            eprintln!(
+                "warning: `--no-incremental` is deprecated and will be removed in v0.20.0, use `kei reset sync-token` before sync for the same effect"
+            );
+        }
+    }
+
+    // Convert plain password string to SecretString.
+    let password = password_str.map(SecretString::from);
+
+    // Validate cookie directory early.
+    if let Some(existing) = cookie_directory.ancestors().find(|a| a.exists()) {
+        anyhow::ensure!(
+            existing.is_dir(),
+            "cookie directory path contains a non-directory component: {}",
+            existing.display()
+        );
+    }
+    std::fs::create_dir_all(&cookie_directory).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot create cookie directory {}: {e}",
+            cookie_directory.display()
+        )
+    })?;
+
+    Ok(ResolvedAuth {
+        username,
+        password,
+        password_file,
+        password_command,
+        save_password,
+        domain,
+        cookie_directory,
+    })
+}
+
+/// Output of [`resolve_download_section`].
+#[derive(Debug)]
+struct ResolvedDownload {
+    directory: PathBuf,
+    folder_structure: String,
+    folder_structure_albums: String,
+    folder_structure_albums_user_set: bool,
+    folder_structure_smart_folders: String,
+    bandwidth_limit: Option<u64>,
+    threads_num: u16,
+    temp_suffix: String,
+    #[cfg(feature = "xmp")]
+    set_exif_datetime: bool,
+    #[cfg(feature = "xmp")]
+    set_exif_rating: bool,
+    #[cfg(feature = "xmp")]
+    set_exif_gps: bool,
+    #[cfg(feature = "xmp")]
+    set_exif_description: bool,
+    #[cfg(feature = "xmp")]
+    embed_xmp: bool,
+    #[cfg(feature = "xmp")]
+    xmp_sidecar: bool,
+    no_progress_bar: bool,
+}
+
+/// Resolve download directory, folder structure, threads, and xmp flags.
+fn resolve_download_section(
+    sync: &crate::cli::SyncArgs,
+    toml_dl: Option<&TomlDownload>,
+) -> anyhow::Result<ResolvedDownload> {
+    anyhow::ensure!(
+        !(sync.download_dir.is_some() && sync.directory.is_some()),
+        "both `--download-dir` and `--directory` are set; `--directory` is \
+         deprecated and will be removed in v0.20.0 — pick one"
+    );
+    let directory_cli = if let Some(d) = sync.download_dir.clone() {
+        Some(d)
+    } else if let Some(d) = sync.directory.clone() {
+        #[allow(
+            clippy::print_stderr,
+            reason = "runs during config load, before tracing subscriber is installed"
+        )]
+        {
+            eprintln!(
+                "warning: `--directory` / `KEI_DIRECTORY` is deprecated and will be removed in v0.20.0, use `--download-dir` / `KEI_DOWNLOAD_DIR` instead"
+            );
+        }
+        Some(d)
+    } else {
+        None
+    };
+    let directory = directory_cli
+        .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
+        .map(|d| expand_tilde(&d))
+        .unwrap_or_default();
+    if !directory.as_os_str().is_empty() {
+        validate_download_dir(&directory)?;
+    }
+    let folder_structure = resolve(
+        sync.folder_structure.clone(),
+        toml_dl.and_then(|d| d.folder_structure.clone()),
+        "%Y/%m/%d".to_string(),
+    );
+    validate_folder_structure(&folder_structure)?;
+
+    let folder_structure_albums_user_set = sync.folder_structure_albums.is_some()
+        || toml_dl.is_some_and(|d| d.folder_structure_albums.is_some());
+    let folder_structure_albums = resolve(
+        sync.folder_structure_albums.clone(),
+        toml_dl.and_then(|d| d.folder_structure_albums.clone()),
+        DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+    );
+    let folder_structure_smart_folders = resolve(
+        sync.folder_structure_smart_folders.clone(),
+        toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()),
+        DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string(),
+    );
+
+    // Bandwidth limit.
+    let bandwidth_limit: Option<u64> =
+        if let Some(n) = sync.bandwidth_limit {
+            Some(n)
+        } else if let Some(s) = toml_dl.and_then(|d| d.bandwidth_limit.as_ref()) {
+            Some(crate::cli::parse_bandwidth_limit(s).map_err(|e| {
+                anyhow::anyhow!("invalid [download].bandwidth_limit in config: {e}")
+            })?)
+        } else {
+            None
+        };
+
+    // Threads validation.
+    anyhow::ensure!(
+        !(sync.threads.is_some() && sync.threads_num.is_some()),
+        "both `--threads` and `--threads-num` are set; `--threads-num` is \
+         deprecated and will be removed in v0.20.0 - pick one"
+    );
+    let toml_threads = toml_dl.and_then(|d| d.threads);
+    let toml_threads_num = toml_dl.and_then(|d| d.threads_num);
+    anyhow::ensure!(
+        !(toml_threads.is_some() && toml_threads_num.is_some()),
+        "`[download] threads` and `[download] threads_num` are both set in \
+         the config file; `threads_num` is deprecated and will be removed \
+         in v0.20.0 - pick one"
+    );
+
+    let threads_explicitly_set = sync.threads.is_some()
+        || sync.threads_num.is_some()
+        || toml_threads.is_some()
+        || toml_threads_num.is_some();
+    let threads_default = if bandwidth_limit.is_some() && !threads_explicitly_set {
+        1
+    } else {
+        10
+    };
+
+    let threads_num = if let Some(n) = sync.threads {
+        n
+    } else if let Some(n) = sync.threads_num {
+        #[allow(
+            clippy::print_stderr,
+            reason = "runs during config load, before tracing subscriber is installed"
+        )]
+        {
+            eprintln!(
+                "warning: `--threads-num` / `KEI_THREADS_NUM` is deprecated and will be removed in v0.20.0, use `--threads` / `KEI_THREADS` instead"
+            );
+        }
+        n
+    } else if let Some(n) = toml_threads {
+        n
+    } else if let Some(n) = toml_threads_num {
+        #[allow(
+            clippy::print_stderr,
+            reason = "runs during config load, before tracing subscriber is installed"
+        )]
+        {
+            eprintln!(
+                "warning: `[download] threads_num` is deprecated and will be removed in v0.20.0, use `[download] threads` instead"
+            );
+        }
+        n
+    } else {
+        threads_default
+    };
+    anyhow::ensure!(
+        (1..=64).contains(&threads_num),
+        "threads_num must be in 1..=64, got {threads_num}"
+    );
+
+    let temp_suffix = resolve(
+        sync.temp_suffix.clone(),
+        toml_dl.and_then(|d| d.temp_suffix.clone()),
+        ".kei-tmp".to_string(),
+    );
+
+    #[cfg(feature = "xmp")]
+    let set_exif_datetime = resolve_flag(
+        sync.set_exif_datetime,
+        toml_dl.and_then(|d| d.set_exif_datetime),
+    );
+    #[cfg(feature = "xmp")]
+    let set_exif_rating = resolve_flag(
+        sync.set_exif_rating,
+        toml_dl.and_then(|d| d.set_exif_rating),
+    );
+    #[cfg(feature = "xmp")]
+    let set_exif_gps = resolve_flag(sync.set_exif_gps, toml_dl.and_then(|d| d.set_exif_gps));
+    #[cfg(feature = "xmp")]
+    let set_exif_description = resolve_flag(
+        sync.set_exif_description,
+        toml_dl.and_then(|d| d.set_exif_description),
+    );
+    #[cfg(feature = "xmp")]
+    let embed_xmp = resolve_flag(sync.embed_xmp, toml_dl.and_then(|d| d.embed_xmp));
+    #[cfg(feature = "xmp")]
+    let xmp_sidecar = resolve_flag(sync.xmp_sidecar, toml_dl.and_then(|d| d.xmp_sidecar));
+    let no_progress_bar = resolve_flag(
+        sync.no_progress_bar,
+        toml_dl.and_then(|d| d.no_progress_bar),
+    );
+
+    Ok(ResolvedDownload {
+        directory,
+        folder_structure,
+        folder_structure_albums,
+        folder_structure_albums_user_set,
+        folder_structure_smart_folders,
+        bandwidth_limit,
+        threads_num,
+        temp_suffix,
+        #[cfg(feature = "xmp")]
+        set_exif_datetime,
+        #[cfg(feature = "xmp")]
+        set_exif_rating,
+        #[cfg(feature = "xmp")]
+        set_exif_gps,
+        #[cfg(feature = "xmp")]
+        set_exif_description,
+        #[cfg(feature = "xmp")]
+        embed_xmp,
+        #[cfg(feature = "xmp")]
+        xmp_sidecar,
+        no_progress_bar,
+    })
+}
+
+/// Output of [`resolve_filters_section`]: resolved filters plus migrated
+/// folder-structure values.
+#[derive(Debug)]
+struct ResolvedFilters {
+    albums: AlbumSelection,
+    exclude_albums: Vec<String>,
+    selection: crate::selection::Selection,
+    filename_exclude: Vec<glob::Pattern>,
+    skip_videos: bool,
+    skip_photos: bool,
+    live_photo_mode_pre_resolved: Option<LivePhotoMode>,
+    recent: Option<u32>,
+    skip_created_before: Option<DateTime<Local>>,
+    skip_created_after: Option<DateTime<Local>>,
+    /// Migrated folder_structure (album token stripped).
+    folder_structure: String,
+    /// Migrated folder_structure_albums.
+    folder_structure_albums: String,
+}
+
+/// Resolve album selection, filters, date ranges, and run folder-structure
+/// migration.
+fn resolve_filters_section(
+    sync: &crate::cli::SyncArgs,
+    toml: Option<&TomlConfig>,
+    folder_structure: String,
+    folder_structure_albums: String,
+    folder_structure_albums_user_set: bool,
+    folder_structure_smart_folders: String,
+) -> anyhow::Result<ResolvedFilters> {
+    let toml_filters = toml.and_then(|t| t.filters.as_ref());
+    let toml_photos = toml.and_then(|t| t.photos.as_ref());
+
+    // Library selector.
+    let library_selector = resolve_library_selector(sync.libraries.clone(), toml_filters)?;
+
+    // Albums.
+    let toml_albums = toml_filters.and_then(|f| f.albums.clone());
+    let toml_album_singular = toml_filters.and_then(|f| f.album.clone());
+    if toml_album_singular.is_some() {
+        warn_deprecated(
+            "`[filters].album` (singular string)",
+            "`[filters].albums = [\"name\"]` (array)",
+        );
+    }
+    let toml_albums_resolved = toml_albums.or_else(|| toml_album_singular.map(|s| vec![s]));
+    let raw_albums = resolve_vec(sync.albums.clone(), toml_albums_resolved);
+
+    // Exclude albums.
+    let toml_exclude_albums = toml_filters.and_then(|f| f.exclude_albums.clone());
+    let legacy_excludes_supplied = !sync.exclude_albums.is_empty()
+        || toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty());
+    if !sync.exclude_albums.is_empty() {
+        warn_deprecated(
+            "`--exclude-album` / `KEI_EXCLUDE_ALBUM`",
+            "`--album '!NAME'`",
+        );
+        warn_exclude_album_comma_split();
+    }
+    if toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty()) {
+        warn_deprecated(
+            "`[filters].exclude_albums`",
+            "`!name` entries inside `[filters].albums`",
+        );
+    }
+    let exclude_albums = resolve_vec(sync.exclude_albums.clone(), toml_exclude_albums);
+    let mut merged_raw = raw_albums;
+    for name in &exclude_albums {
+        merged_raw.push(format!("!{name}"));
+    }
+    let (albums, parsed_excludes) = resolve_album_selection(&merged_raw, &folder_structure)?;
+    let exclude_albums = if legacy_excludes_supplied {
+        exclude_albums
+    } else {
+        parsed_excludes
+    };
+
+    // Auto-migrate legacy `{album}` token.
+    let migration = auto_migrate_legacy_album_token(
+        folder_structure,
+        folder_structure_albums,
+        folder_structure_albums_user_set,
+    );
+    if let Some(ref suggestion) = migration.suggestion {
+        warn_deprecated("`{album}` in `--folder-structure`", suggestion);
+    }
+    let folder_structure = migration.folder_structure;
+    let folder_structure_albums = migration.folder_structure_albums;
+
+    // Validate template tokens.
+    validate_template_tokens(&folder_structure, TemplateKind::Unfiled)?;
+    validate_template_tokens(&folder_structure_albums, TemplateKind::Albums)?;
+    validate_template_tokens(&folder_structure_smart_folders, TemplateKind::SmartFolders)?;
+
+    // Skip flags.
+    let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
+    let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
+
+    // Live photo mode pre-resolution.
+    let live_photo_mode_pre_resolved: Option<LivePhotoMode> =
+        if let Some(mode) = sync.live_photo_mode {
+            Some(mode)
+        } else if sync.skip_live_photos == Some(true) {
+            warn_deprecated(
+                "`--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS`",
+                "`--live-photo-mode skip`",
+            );
+            Some(LivePhotoMode::Skip)
+        } else if let Some(mode) = toml_photos.and_then(|p| p.live_photo_mode) {
+            Some(mode)
+        } else if toml_filters.and_then(|f| f.skip_live_photos) == Some(true) {
+            warn_deprecated(
+                "`[filters].skip_live_photos`",
+                "`[photos].live_photo_mode = \"skip\"`",
+            );
+            Some(LivePhotoMode::Skip)
+        } else {
+            None
+        };
+
+    // Smart folders.
+    let raw_smart_folders = resolve_vec(
+        sync.smart_folders.clone(),
+        toml_filters.and_then(|f| f.smart_folders.clone()),
+    );
+
+    // Unfiled override.
+    let unfiled_override = sync
+        .unfiled
+        .or_else(|| toml_filters.and_then(|f| f.unfiled));
+
+    // Selection.
+    let selection = derive_selection(
+        &albums,
+        &exclude_albums,
+        &library_selector,
+        &raw_smart_folders,
+        unfiled_override,
+    )?;
+    if should_warn_implicit_unfiled(unfiled_override, &selection.albums) {
+        warn_implicit_unfiled_pass();
+    }
+
+    // Filename exclude.
+    let filename_exclude_strs = resolve_vec(
+        sync.filename_exclude.clone(),
+        toml_filters.and_then(|f| f.filename_exclude.clone()),
+    );
+    let filename_exclude: Vec<glob::Pattern> = filename_exclude_strs
+        .iter()
+        .map(|p| {
+            glob::Pattern::new(p)
+                .map_err(|e| anyhow::anyhow!("invalid --filename-exclude pattern '{p}': {e}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    // Recent / date range.
+    let recent_raw = sync.recent.or_else(|| toml_filters.and_then(|f| f.recent));
+    let explicit_skip_created_before_str = sync
+        .skip_created_before
+        .clone()
+        .or_else(|| toml_filters.and_then(|f| f.skip_created_before.clone()));
+
+    let (recent, recent_days) = match recent_raw {
+        None => (None, None),
+        Some(crate::cli::RecentLimit::Count(n)) => (Some(n), None),
+        Some(crate::cli::RecentLimit::Days(n)) => {
+            anyhow::ensure!(
+                explicit_skip_created_before_str.is_none(),
+                "`--recent {n}d` and `--skip-created-before` are equivalent controls - pick one"
+            );
+            (None, Some(n))
+        }
+    };
+    let skip_created_before_str = if let Some(n) = recent_days {
+        Some(format!("{n}d"))
+    } else {
+        explicit_skip_created_before_str
+    };
+    let skip_created_after_str = sync
+        .skip_created_after
+        .clone()
+        .or_else(|| toml_filters.and_then(|f| f.skip_created_after.clone()));
+
+    let skip_created_before = skip_created_before_str
+        .as_deref()
+        .map(parse_date_or_interval)
+        .transpose()?;
+    let skip_created_after = skip_created_after_str
+        .as_deref()
+        .map(parse_date_or_interval)
+        .transpose()?;
+
+    if let (Some(before), Some(after)) = (&skip_created_before, &skip_created_after) {
+        if before >= after {
+            tracing::warn!(
+                before = %before.format("%Y-%m-%d"),
+                after = %after.format("%Y-%m-%d"),
+                "skip-created-before >= skip-created-after, no assets can match",
+            );
+        }
+    }
+
+    Ok(ResolvedFilters {
+        albums,
+        exclude_albums,
+        selection,
+        filename_exclude,
+        skip_videos,
+        skip_photos,
+        live_photo_mode_pre_resolved,
+        recent,
+        skip_created_before,
+        skip_created_after,
+        folder_structure,
+        folder_structure_albums,
+    })
+}
+
+/// Resolve notification config (desktop, min_severity, webhooks).
+fn resolve_notifications_section(
+    desktop_notifications: Option<bool>,
+    toml_notif: Option<&TomlNotifications>,
+) -> NotificationsConfig {
+    const DEFAULT_DESKTOP_NOTIFICATIONS: bool = true;
+    let desktop = desktop_notifications
+        .or_else(|| toml_notif.and_then(|n| n.desktop))
+        .unwrap_or(DEFAULT_DESKTOP_NOTIFICATIONS);
+    let min_severity = toml_notif
+        .and_then(|n| n.min_severity)
+        .unwrap_or(crate::notifications::Severity::Warn);
+    let webhooks = toml_notif
+        .and_then(|n| n.webhooks.as_ref())
+        .map(|map| {
+            map.iter()
+                .map(|(name, entry)| WebhookConfig {
+                    name: name.clone(),
+                    url: entry.url.clone(),
+                    min_severity: entry.min_severity.unwrap_or(min_severity),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    NotificationsConfig {
+        desktop,
+        min_severity,
+        webhooks,
+    }
+}
+
 impl Config {
     /// Build a Config by merging CLI args with optional TOML config.
     /// Resolution order: CLI > TOML > env (`KEI_WATCH_WITH_INTERVAL` for the
@@ -1256,289 +1828,30 @@ impl Config {
         personality_mode: crate::personality::Mode,
         friendly_request: Option<bool>,
     ) -> anyhow::Result<Self> {
-        let toml_auth = toml.and_then(|t| t.auth.as_ref());
-
-        // `[auth].password` is no longer accepted. Plaintext passwords in config
-        // files are a standing security risk; kei ships a credential store
-        // (`kei password set`), password files, and shell-command sources.
-        if toml_auth.and_then(|a| a.password.as_ref()).is_some() {
-            anyhow::bail!(
-                "config file sets `[auth] password`, which is no longer supported. \
-                 Plaintext passwords in config files are a security risk. \
-                 Use one of: `kei password set` (OS keyring or encrypted file), \
-                 `[auth] password_file`, or `[auth] password_command` instead."
-            );
-        }
-
-        let (username, password_str, domain, cookie_directory) = resolve_auth(globals, pw, toml);
-        let password_file = resolve_password_file(pw, toml_auth);
-        let password_command = resolve_password_command(pw, toml_auth);
-        let save_password = sync.save_password;
-
-        // `--password-command` / `[auth] password_command` is Unix-only: the
-        // command runs via `sh -c`, which isn't on a stock Windows PATH. Fail
-        // at startup with a clear message instead of a cryptic "No such file
-        // or directory" from the first auth attempt.
-        #[cfg(windows)]
-        if password_command.is_some() {
-            anyhow::bail!(
-                "`--password-command` / `[auth] password_command` is not supported on Windows: \
-                 kei runs commands via `sh -c`, which isn't on the stock Windows PATH. \
-                 Use `--password-file` / `[auth] password_file`, or run kei under WSL."
-            );
-        }
-
-        // Reject explicitly provided empty username/password (CLI value_parser
-        // catches the CLI case; this catches empty strings from TOML).
-        if globals.username.is_some()
-            || toml
-                .and_then(|t| t.auth.as_ref()?.username.as_ref())
-                .is_some()
-        {
-            anyhow::ensure!(!username.is_empty(), "username must not be empty");
-        }
-        if let Some(pw_str) = &password_str {
-            anyhow::ensure!(!pw_str.is_empty(), "password must not be empty");
-        }
-
-        // Reject both `password_file` and `password_command` in the same TOML
-        // (CLI enforces this via `conflicts_with`, TOML has no such mechanism).
-        if let Some(toml_a) = toml_auth {
-            anyhow::ensure!(
-                !(toml_a.password_file.is_some() && toml_a.password_command.is_some()),
-                "config file sets both `[auth] password_file` and \
-                 `[auth] password_command` — pick one"
-            );
-        }
-
-        // `--no-incremental` duplicates the effect of `kei reset sync-token`
-        // plus a normal sync, with one narrow edge case around failed-run
-        // recovery that's not worth a flag. Deprecate and point users at
-        // the subcommand.
-        if sync.no_incremental {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--no-incremental` is deprecated and will be removed in v0.20.0, use `kei reset sync-token` before sync for the same effect"
-                );
-            }
-        }
-
-        // Convert plain password string to SecretString
-        let password = password_str.map(SecretString::from);
-
-        // Validate cookie directory early: check that the path is usable
-        // (exists or can be created) so we fail with a clear message rather
-        // than erroring deep in auth setup.
-        if let Some(existing) = cookie_directory.ancestors().find(|a| a.exists()) {
-            anyhow::ensure!(
-                existing.is_dir(),
-                "cookie directory path contains a non-directory component: {}",
-                existing.display()
-            );
-        }
-        std::fs::create_dir_all(&cookie_directory).map_err(|e| {
-            anyhow::anyhow!(
-                "cannot create cookie directory {}: {e}",
-                cookie_directory.display()
-            )
-        })?;
+        let auth =
+            resolve_auth_section(globals, pw, sync.save_password, sync.no_incremental, toml)?;
 
         let toml_dl = toml.and_then(|t| t.download.as_ref());
         let toml_retry = toml_dl.and_then(|d| d.retry.as_ref());
-        let toml_filters = toml.and_then(|t| t.filters.as_ref());
-        let toml_photos = toml.and_then(|t| t.photos.as_ref());
         let toml_watch = toml.and_then(|t| t.watch.as_ref());
         let toml_metrics = toml.and_then(|t| t.metrics.as_ref());
         let toml_server = toml.and_then(|t| t.server.as_ref());
+        let toml_report = toml.and_then(|t| t.report.as_ref());
+        let toml_notif = toml.and_then(|t| t.notifications.as_ref());
 
-        // Download
-        //
-        // `--directory` / `KEI_DIRECTORY` is the legacy spelling kept for
-        // backward compat. Prefer the new `--download-dir` / `KEI_DOWNLOAD_DIR`
-        // and warn when the old one is the only source. Fail loudly if both
-        // are supplied so users don't silently rely on undefined precedence.
-        anyhow::ensure!(
-            !(sync.download_dir.is_some() && sync.directory.is_some()),
-            "both `--download-dir` and `--directory` are set; `--directory` is \
-             deprecated and will be removed in v0.20.0 — pick one"
-        );
-        let directory_cli = if let Some(d) = sync.download_dir {
-            Some(d)
-        } else if let Some(d) = sync.directory {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--directory` / `KEI_DIRECTORY` is deprecated and will be removed in v0.20.0, use `--download-dir` / `KEI_DOWNLOAD_DIR` instead"
-                );
-            }
-            Some(d)
-        } else {
-            None
-        };
-        let directory = directory_cli
-            .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
-            .map(|d| expand_tilde(&d))
-            .unwrap_or_default();
-        if !directory.as_os_str().is_empty() {
-            validate_download_dir(&directory)?;
-        }
-        let folder_structure = resolve(
-            sync.folder_structure,
-            toml_dl.and_then(|d| d.folder_structure.clone()),
-            "%Y/%m/%d".to_string(),
-        );
-        validate_folder_structure(&folder_structure)?;
+        let dl = resolve_download_section(&sync, toml_dl)?;
 
-        // Track whether the user explicitly supplied a per-category album
-        // template; the legacy `{album}` auto-migration below preserves a
-        // user-supplied value but lifts the legacy template into the new
-        // field when it is unset.
-        let folder_structure_albums_user_set = sync.folder_structure_albums.is_some()
-            || toml_dl.is_some_and(|d| d.folder_structure_albums.is_some());
-        let folder_structure_albums = resolve(
-            sync.folder_structure_albums,
-            toml_dl.and_then(|d| d.folder_structure_albums.clone()),
-            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
-        );
-        let folder_structure_smart_folders = resolve(
-            sync.folder_structure_smart_folders,
-            toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()),
-            DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string(),
-        );
-        // Resolve bandwidth limit (CLI bytes/sec > TOML human-readable string > None).
-        let bandwidth_limit: Option<u64> = if let Some(n) = sync.bandwidth_limit {
-            Some(n)
-        } else if let Some(s) = toml_dl.and_then(|d| d.bandwidth_limit.as_ref()) {
-            Some(crate::cli::parse_bandwidth_limit(s).map_err(|e| {
-                anyhow::anyhow!("invalid [download].bandwidth_limit in config: {e}")
-            })?)
-        } else {
-            None
-        };
-
-        // Reject mixing the new `--threads` with the deprecated
-        // `--threads-num` on the same invocation - keeps user intent
-        // unambiguous. The TOML pair is handled the same way below.
-        anyhow::ensure!(
-            !(sync.threads.is_some() && sync.threads_num.is_some()),
-            "both `--threads` and `--threads-num` are set; `--threads-num` is \
-             deprecated and will be removed in v0.20.0 - pick one"
-        );
-        let toml_threads = toml_dl.and_then(|d| d.threads);
-        let toml_threads_num = toml_dl.and_then(|d| d.threads_num);
-        anyhow::ensure!(
-            !(toml_threads.is_some() && toml_threads_num.is_some()),
-            "`[download] threads` and `[download] threads_num` are both set in \
-             the config file; `threads_num` is deprecated and will be removed \
-             in v0.20.0 - pick one"
-        );
-
-        // When a bandwidth limit is set without an explicit thread-count flag,
-        // default concurrency to 1: many connections starving for a capped
-        // total budget just fragments downloads and adds connection overhead.
-        let threads_explicitly_set = sync.threads.is_some()
-            || sync.threads_num.is_some()
-            || toml_threads.is_some()
-            || toml_threads_num.is_some();
-        let threads_default = if bandwidth_limit.is_some() && !threads_explicitly_set {
-            1
-        } else {
-            10
-        };
-
-        // Resolve the concurrency. CLI beats TOML for each spelling, new
-        // spelling beats old, and the legacy path emits a warning so users
-        // know to migrate before v0.20.0.
-        let threads_num = if let Some(n) = sync.threads {
-            n
-        } else if let Some(n) = sync.threads_num {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--threads-num` / `KEI_THREADS_NUM` is deprecated and will be removed in v0.20.0, use `--threads` / `KEI_THREADS` instead"
-                );
-            }
-            n
-        } else if let Some(n) = toml_threads {
-            n
-        } else if let Some(n) = toml_threads_num {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `[download] threads_num` is deprecated and will be removed in v0.20.0, use `[download] threads` instead"
-                );
-            }
-            n
-        } else {
-            threads_default
-        };
-        anyhow::ensure!(
-            (1..=64).contains(&threads_num),
-            "threads_num must be in 1..=64, got {threads_num}"
-        );
-        let temp_suffix = resolve(
-            sync.temp_suffix,
-            toml_dl.and_then(|d| d.temp_suffix.clone()),
-            ".kei-tmp".to_string(),
-        );
-        #[cfg(feature = "xmp")]
-        let set_exif_datetime = resolve_flag(
-            sync.set_exif_datetime,
-            toml_dl.and_then(|d| d.set_exif_datetime),
-        );
-        #[cfg(feature = "xmp")]
-        let set_exif_rating = resolve_flag(
-            sync.set_exif_rating,
-            toml_dl.and_then(|d| d.set_exif_rating),
-        );
-        #[cfg(feature = "xmp")]
-        let set_exif_gps = resolve_flag(sync.set_exif_gps, toml_dl.and_then(|d| d.set_exif_gps));
-        #[cfg(feature = "xmp")]
-        let set_exif_description = resolve_flag(
-            sync.set_exif_description,
-            toml_dl.and_then(|d| d.set_exif_description),
-        );
-        #[cfg(feature = "xmp")]
-        let embed_xmp = resolve_flag(sync.embed_xmp, toml_dl.and_then(|d| d.embed_xmp));
-        #[cfg(feature = "xmp")]
-        let xmp_sidecar = resolve_flag(sync.xmp_sidecar, toml_dl.and_then(|d| d.xmp_sidecar));
-        let no_progress_bar = resolve_flag(
-            sync.no_progress_bar,
-            toml_dl.and_then(|d| d.no_progress_bar),
-        );
-
-        // Re-validate; clap range attrs run on CLI only.
+        // Retry.
         let max_retries = resolve(sync.max_retries, toml_retry.and_then(|r| r.max_retries), 3);
         anyhow::ensure!(
             max_retries <= 100,
             "retry max_retries must be <= 100, got {max_retries}"
         );
-        // Lifetime cap on download attempts per asset (0 disables). CLI >
-        // TOML > 10, matching every other resolved value. The runtime
-        // skip check in download::pipeline::process_asset short-circuits
-        // when this is 0, so 0 is a valid (cap-off) sentinel.
         let max_download_attempts = resolve(
             sync.max_download_attempts,
             toml_retry.and_then(|r| r.max_download_attempts),
             10,
         );
-        // Retry delay is now derived from `max_retries` via a smart table
-        // (higher max => more patient initial delay). `--retry-delay` and
-        // `[download.retry] delay` are deprecated; setting either still
-        // wins during the deprecation window but emits a warning.
         let explicit_retry_delay = sync.retry_delay.or(toml_retry.and_then(|r| r.delay));
         let retry_delay_secs = if let Some(d) = explicit_retry_delay {
             #[allow(
@@ -1559,195 +1872,16 @@ impl Config {
             "retry delay must be in 1..=3600 seconds, got {retry_delay_secs}"
         );
 
-        // Filters
-        let library_selector = resolve_library_selector(sync.libraries, toml_filters)?;
-        let toml_albums = toml_filters.and_then(|f| f.albums.clone());
-        let toml_album_singular = toml_filters.and_then(|f| f.album.clone());
-        if toml_album_singular.is_some() {
-            warn_deprecated(
-                "`[filters].album` (singular string)",
-                "`[filters].albums = [\"name\"]` (array)",
-            );
-        }
-        // Lift the deprecated singular `album` key into the array form so the
-        // shared resolver only ever sees one shape. CLI takes precedence; TOML
-        // singular only applies when the array form is absent.
-        let toml_albums_resolved = toml_albums.or_else(|| toml_album_singular.map(|s| vec![s]));
-        let raw_albums = resolve_vec(sync.albums, toml_albums_resolved);
-
-        let toml_exclude_albums = toml_filters.and_then(|f| f.exclude_albums.clone());
-        let legacy_excludes_supplied = !sync.exclude_albums.is_empty()
-            || toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty());
-        if !sync.exclude_albums.is_empty() {
-            warn_deprecated(
-                "`--exclude-album` / `KEI_EXCLUDE_ALBUM`",
-                "`--album '!NAME'`",
-            );
-            warn_exclude_album_comma_split();
-        }
-        if toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty()) {
-            warn_deprecated(
-                "`[filters].exclude_albums`",
-                "`!name` entries inside `[filters].albums`",
-            );
-        }
-        let exclude_albums = resolve_vec(sync.exclude_albums, toml_exclude_albums);
-        // Fold deprecated excludes into the raw album list as `!name` so the
-        // new selector grammar performs all validation (contradictions,
-        // sentinel rules) in one place. Legacy excludes also remain on
-        // `Config.exclude_albums` for the unchanged sync pipeline.
-        let mut merged_raw = raw_albums;
-        for name in &exclude_albums {
-            merged_raw.push(format!("!{name}"));
-        }
-        let (albums, parsed_excludes) = resolve_album_selection(&merged_raw, &folder_structure)?;
-        // `compute_config_hash` and `report.rs` still read `Config.exclude_albums`
-        // for token invalidation and run reporting respectively. Prefer the
-        // deprecated list when the user actually supplied it (exact legacy
-        // behaviour); otherwise surface inline `!name` excludes so the new
-        // grammar feeds both surfaces consistently.
-        let exclude_albums = if legacy_excludes_supplied {
-            exclude_albums
-        } else {
-            parsed_excludes
-        };
-
-        // Auto-migrate legacy `{album}` in `--folder-structure` into the
-        // per-category templates the renderer now consumes. Runs after the
-        // album-selection resolver so the auto-`-a all`-from-token behaviour
-        // (also being deprecated) sees the original template before the
-        // token gets stripped from `folder_structure`.
-        let migration = auto_migrate_legacy_album_token(
-            folder_structure,
-            folder_structure_albums,
-            folder_structure_albums_user_set,
-        );
-        if let Some(ref suggestion) = migration.suggestion {
-            warn_deprecated("`{album}` in `--folder-structure`", suggestion);
-        }
-        let folder_structure = migration.folder_structure;
-        let folder_structure_albums = migration.folder_structure_albums;
-
-        // Runs after auto-migration so the unfiled template has no `{album}`
-        // left to reject; remaining bugs (e.g. `{smart-folder}` in albums)
-        // surface here before the first download.
-        validate_template_tokens(&folder_structure, TemplateKind::Unfiled)?;
-        validate_template_tokens(&folder_structure_albums, TemplateKind::Albums)?;
-        validate_template_tokens(&folder_structure_smart_folders, TemplateKind::SmartFolders)?;
-
-        let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
-        let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
-        // Fold sync's deprecated `--skip-live-photos` / `[filters]
-        // skip_live_photos` paths into a single `Option<LivePhotoMode>` so
-        // the shared resolver still sees the chosen value and emits the
-        // deprecation warnings before falling through to defaults.
-        let live_photo_mode_pre_resolved: Option<LivePhotoMode> =
-            if let Some(mode) = sync.live_photo_mode {
-                Some(mode)
-            } else if sync.skip_live_photos == Some(true) {
-                warn_deprecated(
-                    "`--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS`",
-                    "`--live-photo-mode skip`",
-                );
-                Some(LivePhotoMode::Skip)
-            } else if let Some(mode) = toml_photos.and_then(|p| p.live_photo_mode) {
-                Some(mode)
-            } else if toml_filters.and_then(|f| f.skip_live_photos) == Some(true) {
-                warn_deprecated(
-                    "`[filters].skip_live_photos`",
-                    "`[photos].live_photo_mode = \"skip\"`",
-                );
-                Some(LivePhotoMode::Skip)
-            } else {
-                None
-            };
-        let raw_smart_folders = resolve_vec(
-            sync.smart_folders,
-            toml_filters.and_then(|f| f.smart_folders.clone()),
-        );
-
-        let unfiled_override = sync
-            .unfiled
-            .or_else(|| toml_filters.and_then(|f| f.unfiled));
-
-        // Build the v0.13 [`Selection`] that the new resolver (`resolve_passes`)
-        // consumes. The legacy `albums` / `exclude_albums` fields stay on
-        // Config for the sync-token invalidation hash and the report.json
-        // emission; the Selection is the source of truth for pass execution.
-        let selection = derive_selection(
-            &albums,
-            &exclude_albums,
-            &library_selector,
-            &raw_smart_folders,
-            unfiled_override,
+        let filters = resolve_filters_section(
+            &sync,
+            toml,
+            dl.folder_structure,
+            dl.folder_structure_albums,
+            dl.folder_structure_albums_user_set,
+            dl.folder_structure_smart_folders.clone(),
         )?;
-        if should_warn_implicit_unfiled(unfiled_override, &selection.albums) {
-            warn_implicit_unfiled_pass();
-        }
-        let filename_exclude_strs = resolve_vec(
-            sync.filename_exclude,
-            toml_filters.and_then(|f| f.filename_exclude.clone()),
-        );
-        // Compile glob patterns once during build
-        let filename_exclude: Vec<glob::Pattern> = filename_exclude_strs
-            .iter()
-            .map(|p| {
-                glob::Pattern::new(p)
-                    .map_err(|e| anyhow::anyhow!("invalid --filename-exclude pattern '{p}': {e}"))
-            })
-            .collect::<anyhow::Result<_>>()?;
-        let recent_raw = sync.recent.or_else(|| toml_filters.and_then(|f| f.recent));
-        let explicit_skip_created_before_str = sync
-            .skip_created_before
-            .or_else(|| toml_filters.and_then(|f| f.skip_created_before.clone()));
 
-        // Split the RecentLimit: Count(n) is a post-enumeration cap held on
-        // config.recent. Days(n) translates into a skip_created_before cutoff
-        // since "last N days" = "skip everything created before N days ago".
-        // Reject combining the two forms on the same invocation so user
-        // intent stays unambiguous.
-        let (recent, recent_days) = match recent_raw {
-            None => (None, None),
-            Some(crate::cli::RecentLimit::Count(n)) => (Some(n), None),
-            Some(crate::cli::RecentLimit::Days(n)) => {
-                anyhow::ensure!(
-                    explicit_skip_created_before_str.is_none(),
-                    "`--recent {n}d` and `--skip-created-before` are equivalent controls - pick one"
-                );
-                (None, Some(n))
-            }
-        };
-        let skip_created_before_str = if let Some(n) = recent_days {
-            Some(format!("{n}d"))
-        } else {
-            explicit_skip_created_before_str
-        };
-        let skip_created_after_str = sync
-            .skip_created_after
-            .or_else(|| toml_filters.and_then(|f| f.skip_created_after.clone()));
-
-        let skip_created_before = skip_created_before_str
-            .as_deref()
-            .map(parse_date_or_interval)
-            .transpose()?;
-        let skip_created_after = skip_created_after_str
-            .as_deref()
-            .map(parse_date_or_interval)
-            .transpose()?;
-
-        if let (Some(before), Some(after)) = (&skip_created_before, &skip_created_after) {
-            if before >= after {
-                tracing::warn!(
-                    before = %before.format("%Y-%m-%d"),
-                    after = %after.format("%Y-%m-%d"),
-                    "skip-created-before >= skip-created-after, no assets can match",
-                );
-            }
-        }
-
-        // Path-derivation knobs (CLI > TOML > default). `folder_structure`
-        // was already resolved above for `resolve_album_selection`; pass
-        // it through so the resolver short-circuits.
+        // Path-derivation knobs.
         let PathDerivationFields {
             folder_structure: _,
             folder_structure_albums: _,
@@ -1762,11 +1896,11 @@ impl Config {
             keep_unicode_in_filenames,
         } = resolve_path_derivation_fields(
             PathDerivationCliArgs {
-                folder_structure: Some(folder_structure.clone()),
-                folder_structure_albums: Some(folder_structure_albums.clone()),
-                folder_structure_smart_folders: Some(folder_structure_smart_folders.clone()),
+                folder_structure: Some(filters.folder_structure.clone()),
+                folder_structure_albums: Some(filters.folder_structure_albums.clone()),
+                folder_structure_smart_folders: Some(dl.folder_structure_smart_folders.clone()),
                 size: sync.size,
-                live_photo_mode: live_photo_mode_pre_resolved,
+                live_photo_mode: filters.live_photo_mode_pre_resolved,
                 live_photo_size: sync.live_photo_size,
                 live_photo_mov_filename_policy: sync.live_photo_mov_filename_policy,
                 align_raw: sync.align_raw,
@@ -1777,8 +1911,7 @@ impl Config {
             toml,
         );
 
-        // Env read in `build()` (not via clap) so the docker image's ENV
-        // default sits below TOML in the precedence chain. See #293.
+        // Watch.
         let watch_with_interval = sync
             .watch_with_interval
             .or_else(|| toml_watch.and_then(|w| w.interval))
@@ -1789,8 +1922,6 @@ impl Config {
                 "watch interval must be in 60..=86400 seconds, got {n}"
             );
         }
-        // Auto-detect systemd via `NOTIFY_SOCKET` when neither CLI nor TOML
-        // sets the flag explicitly. See `resolve_notify_systemd`.
         let notify_systemd = resolve_notify_systemd(
             sync.notify_systemd,
             toml_watch.and_then(|w| w.notify_systemd),
@@ -1801,68 +1932,27 @@ impl Config {
                 .and_then(|w| w.pid_file.as_ref())
                 .map(PathBuf::from)
         });
-        // `.filter` collapses TOML's `reconcile_every_n_cycles = 0` to None,
-        // matching the documented "0 = off" semantic. The CLI parser already
-        // rejects 0, so the filter only fires for the TOML path.
         let reconcile_every_n_cycles = sync
             .reconcile_every_n_cycles
             .or_else(|| toml_watch.and_then(|w| w.reconcile_every_n_cycles))
             .filter(|n| *n > 0);
 
-        // Notifications
-        let toml_notif = toml.and_then(|t| t.notifications.as_ref());
+        // Notifications.
         let notification_script = sync
             .notification_script
             .or_else(|| toml_notif.and_then(|n| n.script.clone()))
             .map(|s| expand_tilde(&s));
+        let notifications = resolve_notifications_section(sync.desktop_notifications, toml_notif);
 
-        // Resolved notification config: desktop, min_severity, webhooks.
-        const DEFAULT_DESKTOP_NOTIFICATIONS: bool = true;
-        let desktop_notifications = sync
-            .desktop_notifications
-            .or_else(|| toml_notif.and_then(|n| n.desktop))
-            .unwrap_or(DEFAULT_DESKTOP_NOTIFICATIONS);
-        let global_min_severity = toml_notif
-            .and_then(|n| n.min_severity)
-            .unwrap_or(crate::notifications::Severity::Warn);
-        // Flatten `[notifications.webhooks.*]` into a Vec<WebhookConfig>.
-        // Unknown backend names are silently ignored (PR 3 adds known names).
-        let webhooks = toml_notif
-            .and_then(|n| n.webhooks.as_ref())
-            .map(|map| {
-                map.iter()
-                    .map(|(name, entry)| WebhookConfig {
-                        name: name.clone(),
-                        url: entry.url.clone(),
-                        min_severity: entry.min_severity.unwrap_or(global_min_severity),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let notifications = NotificationsConfig {
-            desktop: desktop_notifications,
-            min_severity: global_min_severity,
-            webhooks,
-        };
-
-        // JSON report: CLI > [report] json TOML > none.
-        let toml_report = toml.and_then(|t| t.report.as_ref());
+        // JSON report.
         let report_json = sync.report_json.or_else(|| {
             toml_report
                 .and_then(|r| r.json.as_deref())
                 .map(expand_tilde)
         });
 
-        // HTTP server port — CLI > [server] TOML > [metrics] TOML (deprecated) > KEI_METRICS_PORT
-        // env (deprecated) > default 9090.
+        // HTTP server.
         const DEFAULT_HTTP_PORT: u16 = 9090;
-        // Warn early when the deprecated env var is set, regardless of
-        // whether a higher-precedence value shadows it. Pre-fix the
-        // warning only fired in the env-var arm of the `or_else` chain,
-        // so a user who set both `KEI_HTTP_PORT` and `KEI_METRICS_PORT`
-        // got no signal that their `KEI_METRICS_PORT` was being silently
-        // ignored. Same pattern we use for the `[metrics]` TOML section
-        // below.
         let kei_metrics_port_env = std::env::var("KEI_METRICS_PORT").ok();
         if kei_metrics_port_env.is_some() {
             tracing::warn!(
@@ -1887,10 +1977,6 @@ impl Config {
             })
             .unwrap_or(DEFAULT_HTTP_PORT);
 
-        // HTTP server bind address — CLI > [server] bind TOML > default 0.0.0.0.
-        // 0.0.0.0 preserves the historical behavior and keeps Docker's `-p 9090:9090`
-        // working out of the box; desktop users can set 127.0.0.1 to restrict
-        // /healthz and /metrics to loopback.
         const DEFAULT_HTTP_BIND: std::net::IpAddr =
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0));
         let http_bind = match sync.http_bind {
@@ -1903,9 +1989,6 @@ impl Config {
             },
         };
 
-        // Control bind address — CLI > [server] control_bind TOML > default 127.0.0.1.
-        // Control endpoints (status page, pause/resume, SSE) bind loopback-only by
-        // default. Separate from http_bind so /healthz and /metrics can be public.
         const DEFAULT_CONTROL_BIND: std::net::IpAddr =
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
         let control_bind = match sync.control_bind {
@@ -1920,17 +2003,13 @@ impl Config {
             },
         };
 
-        // Reject combinations that would produce zero downloads. When both
-        // skip flags are set, the only live-photo modes that still produce
-        // output are `both` and `video-only` (Live Photo MOV companions
-        // download even with stills suppressed); `skip` and `image-only`
-        // suppress the MOV too and produce nothing.
+        // Reject combinations that would produce zero downloads.
         let mode_name = match live_photo_mode {
             LivePhotoMode::Skip => Some("skip"),
             LivePhotoMode::ImageOnly => Some("image-only"),
             LivePhotoMode::VideoOnly | LivePhotoMode::Both => None,
         };
-        if skip_videos && skip_photos {
+        if filters.skip_videos && filters.skip_photos {
             if let Some(mode) = mode_name {
                 anyhow::bail!(
                     "`--skip-videos` + `--skip-photos` + `--live-photo-mode {mode}` \
@@ -1943,22 +2022,22 @@ impl Config {
         }
 
         Ok(Self {
-            username,
-            password,
-            password_file,
-            password_command,
-            directory,
-            cookie_directory,
-            folder_structure,
-            folder_structure_albums,
-            folder_structure_smart_folders,
-            albums,
-            exclude_albums,
-            filename_exclude,
-            temp_suffix,
-            selection,
-            skip_created_before,
-            skip_created_after,
+            username: auth.username,
+            password: auth.password,
+            password_file: auth.password_file,
+            password_command: auth.password_command,
+            directory: dl.directory,
+            cookie_directory: auth.cookie_directory,
+            folder_structure: filters.folder_structure,
+            folder_structure_albums: filters.folder_structure_albums,
+            folder_structure_smart_folders: dl.folder_structure_smart_folders,
+            albums: filters.albums,
+            exclude_albums: filters.exclude_albums,
+            filename_exclude: filters.filename_exclude,
+            temp_suffix: dl.temp_suffix,
+            selection: filters.selection,
+            skip_created_before: filters.skip_created_before,
+            skip_created_after: filters.skip_created_after,
             pid_file,
             notification_script,
             notifications,
@@ -1969,35 +2048,35 @@ impl Config {
             watch_with_interval,
             retry_delay_secs,
             reconcile_every_n_cycles,
-            recent,
+            recent: filters.recent,
             max_retries,
             max_download_attempts,
-            bandwidth_limit,
-            threads_num,
+            bandwidth_limit: dl.bandwidth_limit,
+            threads_num: dl.threads_num,
             size,
             live_photo_size,
-            domain,
+            domain: auth.domain,
             live_photo_mode,
             live_photo_mov_filename_policy,
             align_raw,
             file_match_policy,
-            skip_videos,
-            skip_photos,
+            skip_videos: filters.skip_videos,
+            skip_photos: filters.skip_photos,
             force_size,
             #[cfg(feature = "xmp")]
-            set_exif_datetime,
+            set_exif_datetime: dl.set_exif_datetime,
             #[cfg(feature = "xmp")]
-            set_exif_rating,
+            set_exif_rating: dl.set_exif_rating,
             #[cfg(feature = "xmp")]
-            set_exif_gps,
+            set_exif_gps: dl.set_exif_gps,
             #[cfg(feature = "xmp")]
-            set_exif_description,
+            set_exif_description: dl.set_exif_description,
             #[cfg(feature = "xmp")]
-            embed_xmp,
+            embed_xmp: dl.embed_xmp,
             #[cfg(feature = "xmp")]
-            xmp_sidecar,
+            xmp_sidecar: dl.xmp_sidecar,
             dry_run: sync.dry_run,
-            no_progress_bar,
+            no_progress_bar: dl.no_progress_bar,
             // Supplied by the caller. Config::build() (used by tests and
             // non-sync commands) defaults to Off/None; sync_loop::run_sync
             // calls build_inner() directly with the resolved Mode from
@@ -2009,7 +2088,7 @@ impl Config {
             only_print_filenames: sync.only_print_filenames,
             no_incremental: sync.no_incremental,
             notify_systemd,
-            save_password,
+            save_password: auth.save_password,
         })
     }
 
