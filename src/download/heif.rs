@@ -1142,10 +1142,10 @@ mod tests {
             name: String::new(),
         };
         hdlr.encode(&mut tmp).unwrap();
-        let hdlr_enc: Vec<u8> = tmp.drain(..).collect();
+        let hdlr_enc: Vec<u8> = std::mem::take(&mut tmp);
 
         Pitm { item_id: 1 }.encode(&mut tmp).unwrap();
-        let pitm_enc: Vec<u8> = tmp.drain(..).collect();
+        let pitm_enc: Vec<u8> = std::mem::take(&mut tmp);
 
         Iinf {
             item_infos: vec![ItemInfoEntry {
@@ -1161,7 +1161,7 @@ mod tests {
         }
         .encode(&mut tmp)
         .unwrap();
-        let iinf_enc: Vec<u8> = tmp.drain(..).collect();
+        let iinf_enc: Vec<u8> = std::mem::take(&mut tmp);
 
         Iprp {
             ipco: Ipco {
@@ -1179,7 +1179,7 @@ mod tests {
         }
         .encode(&mut tmp)
         .unwrap();
-        let iprp_enc: Vec<u8> = tmp.drain(..).collect();
+        let iprp_enc: Vec<u8> = std::mem::take(&mut tmp);
 
         // Iterate to find iloc size / mdat offset fixed point.
         let non_iloc = hdlr_enc.len() + pitm_enc.len() + iinf_enc.len() + iprp_enc.len();
@@ -1201,7 +1201,7 @@ mod tests {
                 }],
             };
             iloc.encode(&mut tmp).unwrap();
-            let ilc = tmp.drain(..).collect::<Vec<u8>>();
+            let ilc = std::mem::take(&mut tmp);
             let correct = ftyp + meta_hdr + non_iloc as u64 + ilc.len() as u64 + 8;
             if correct == base {
                 break ilc;
