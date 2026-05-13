@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config::WebhookConfig;
+
 // ── Severity ────────────────────────────────────────────────────────
 
 /// Severity level for notification routing.
@@ -36,14 +38,17 @@ pub(crate) enum Severity {
 ///
 /// [`SessionExpired`] and [`AllFailed`] are not constructed in PR 1;
 /// they are wired in PR 2 (desktop notifications) and PR 3 (webhooks).
-#[allow(dead_code, reason = "stub variants wired in PRs 2 & 3")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureMode {
     /// Some downloads failed, but the cycle otherwise completed.
     Partial(usize),
     /// Authentication session expired and re-authentication failed.
+    /// Constructed in PRs 2 & 3.
+    #[allow(dead_code, reason = "constructed in PRs 2 & 3")]
     SessionExpired,
     /// All downloads failed for reasons other than session expiry.
+    /// Constructed in PRs 2 & 3.
+    #[allow(dead_code, reason = "constructed in PRs 2 & 3")]
     AllFailed,
 }
 
@@ -58,7 +63,6 @@ pub(crate) enum FailureMode {
 ///
 /// New variants (`DiskLow` through `Resumed`) are stub-only in PR 1;
 /// events are fired in PR 2 (desktop) and PR 3 (webhooks).
-#[allow(dead_code, reason = "new variants wired in PRs 2 & 3")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Event {
     // ── Existing (re-tagged) ────────────────────────────────────
@@ -76,22 +80,31 @@ pub(crate) enum Event {
 
     // ── New (v0.15) ────────────────────────────────────────────
     /// Low disk space (< 100 MiB free on download volume).
+    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
     DiskLow,
     /// Disk space recovered above low threshold.
+    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
     DiskRecovered,
     /// Session age > 80 % of typical lifetime (pre-warning before expiry).
+    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
     AuthExpiring,
     /// 429 / 503 received this sync cycle.
+    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
     RateLimited,
     /// Adaptive throttle engaged (backoff active).
+    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
     ThrottleEngaged,
     /// Adaptive throttle disengaged (backoff decayed to baseline).
+    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
     ThrottleDisengaged,
     /// Asset count / size mismatch vs iCloud enumeration response.
+    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
     DriftDetected,
     /// Sync paused (user or disk-pressure).
+    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
     Paused,
     /// Sync resumed after pause.
+    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
     Resumed,
 }
 
@@ -117,10 +130,6 @@ impl Event {
     }
 
     /// Severity tag for backend routing.
-    #[allow(
-        dead_code,
-        reason = "consumed by desktop/webhook backends in PRs 2 & 3"
-    )]
     pub(crate) fn severity(&self) -> Severity {
         match self {
             Self::TwoFaRequired => Severity::Critical,
@@ -209,21 +218,23 @@ impl From<&crate::download::SyncStats> for SyncNotificationData {
 ///
 /// In PR 1 this stores whether the user opted in but performs no actual
 /// notification delivery.
-#[allow(dead_code, reason = "stub — wired in PR 2")]
+/// Desktop notification backend. Stub — delivery wired in PR 2.
+///
+/// In PR 1 this stores whether the user opted in and serves as a presence
+/// marker in the multi-backend dispatch loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DesktopBackend {
     pub enabled: bool,
 }
 
 impl DesktopBackend {
-    #[allow(dead_code, reason = "stub — wired in PR 2")]
     pub(crate) const fn new(enabled: bool) -> Self {
         Self { enabled }
     }
 }
 
 /// Error type for webhook delivery failures.
-#[allow(dead_code, reason = "stub — wired in PR 3")]
+#[allow(dead_code, reason = "constructed in PR 3")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WebhookError {
     #[error("HTTP {status}: {body}")]
@@ -235,7 +246,7 @@ pub(crate) enum WebhookError {
 }
 
 /// Trait for webhook notification backends. Implementations in PR 3.
-#[allow(dead_code, reason = "stub — implemented in PR 3")]
+#[allow(dead_code, reason = "implemented in PR 3")]
 #[async_trait::async_trait]
 pub(crate) trait WebhookBackend: Send + Sync + std::fmt::Debug {
     /// Human-readable backend name for logging.
@@ -249,15 +260,20 @@ pub(crate) trait WebhookBackend: Send + Sync + std::fmt::Debug {
 
 // ── Notifier ────────────────────────────────────────────────────────
 
-/// Notification dispatcher. Holds an optional script path plus stub
-/// desktop/webhook slots. When no script is configured, all methods are
-/// no-ops (matching pre-v0.15 behaviour exactly).
+/// Notification dispatcher. Holds an optional script path and multi-backend
+/// slots for desktop and webhook notifications.
 #[derive(Debug, Clone)]
 pub(crate) struct Notifier {
     script: Option<PathBuf>,
-    /// Stub — becomes `Option<DesktopBackend>` in PR 2.
-    #[allow(dead_code, reason = "stub — consumed by desktop backend in PR 2")]
-    desktop_enabled: bool,
+    /// Global minimum severity threshold. Backends filter events below this
+    /// level (script backend is exempt — always fires for backward compat).
+    min_severity: Severity,
+    /// Desktop notification backend. `Some` when the user opted in via
+    /// `--desktop-notifications` or `[notifications].desktop`.
+    desktop: Option<DesktopBackend>,
+    /// Per-webhook endpoint configs, pre-resolved with per-backend
+    /// `min_severity` overrides.
+    webhooks: Vec<WebhookConfig>,
     /// Bounds how many notification scripts can run concurrently. A
     /// misbehaving or long-running script can't queue an unbounded
     /// number of spawned tasks behind itself under load.
@@ -273,13 +289,16 @@ const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const NOTIFIER_MAX_INFLIGHT: usize = 8;
 
 impl Notifier {
-    /// Create a new notifier.
+    /// Create a new notifier from resolved notification config.
     ///
     /// `script` — path to a user-provided notification script (Unix only;
     /// silently dropped on Windows).
     ///
-    /// `desktop_enabled` — stub flag; full `DesktopBackend` wired in PR 2.
-    pub fn new(script: Option<PathBuf>, desktop_enabled: bool) -> Self {
+    /// `notifications` — resolved desktop, severity, and webhook config.
+    pub fn new(
+        script: Option<PathBuf>,
+        notifications: &crate::config::NotificationsConfig,
+    ) -> Self {
         // kei invokes scripts via `/bin/sh`, which isn't available on Windows.
         // Rather than let spawn fail silently on every event, drop the script
         // and warn once at construction time.
@@ -290,22 +309,38 @@ impl Notifier {
             );
             return Self {
                 script: None,
-                desktop_enabled: false,
+                min_severity: notifications.min_severity,
+                desktop: None,
+                webhooks: vec![],
                 concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
             };
         }
         Self {
             script,
-            desktop_enabled,
+            min_severity: notifications.min_severity,
+            desktop: if notifications.desktop {
+                Some(DesktopBackend::new(true))
+            } else {
+                None
+            },
+            webhooks: notifications.webhooks.clone(),
             concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
         }
     }
 
-    /// Fire the notification script with the given event.
+    /// Whether `event` severity meets or exceeds a backend's threshold.
     ///
-    /// Fire-and-forget: spawns the script in a background task so it never
-    /// blocks sync. Desktop and webhook dispatch is stubbed — only script
-    /// execution is active in this PR.
+    /// `backend_min` — the backend's minimum severity (script = `Silent`,
+    /// desktop = global `min_severity`, webhook = per-backend override).
+    fn should_dispatch(backend_min: Severity, event: &Event) -> bool {
+        event.severity() >= backend_min
+    }
+
+    /// Fire all configured notification backends with the given event.
+    ///
+    /// Fire-and-forget: script execution spawns in a background task so it
+    /// never blocks sync. Desktop and webhook dispatch is stubbed — only
+    /// script execution is active in this PR.
     pub fn notify(
         &self,
         event: Event,
@@ -313,7 +348,38 @@ impl Notifier {
         username: &str,
         data: Option<&SyncNotificationData>,
     ) {
-        // ── Script backend ──────────────────────────────────────
+        // ── Script backend (always fires) ───────────────────────
+        if Self::should_dispatch(Severity::Silent, &event) {
+            self.dispatch_script(&event, message, username, data);
+        }
+        // ── Desktop backend (stub) ──────────────────────────────
+        if self.desktop.is_some() && Self::should_dispatch(self.min_severity, &event) {
+            tracing::trace!(
+                event = event.as_str(),
+                "would have sent desktop notification"
+            );
+        }
+        // ── Webhook backends (stub) ─────────────────────────────
+        for wh in &self.webhooks {
+            if Self::should_dispatch(wh.min_severity, &event) {
+                tracing::trace!(
+                    event = event.as_str(),
+                    backend = %wh.name,
+                    "would have sent webhook notification"
+                );
+            }
+        }
+    }
+
+    /// Spawn the script backend for `event`. Extracted from `notify()` so
+    /// the dispatch loop stays readable.
+    fn dispatch_script(
+        &self,
+        event: &Event,
+        message: &str,
+        username: &str,
+        data: Option<&SyncNotificationData>,
+    ) {
         let Some(script) = self.script.clone() else {
             return;
         };
@@ -376,15 +442,6 @@ impl Notifier {
                 }
             }
         });
-    }
-
-    /// Whether a desktop notification backend exists and is enabled.
-    ///
-    /// Stub — always `false` in this PR. PR 2 wires the real
-    /// [`DesktopBackend`] with container detection.
-    #[allow(dead_code, reason = "stub — consumed by desktop backend in PR 2")]
-    pub(crate) fn desktop_enabled(&self) -> bool {
-        self.desktop_enabled
     }
 }
 
@@ -589,32 +646,46 @@ mod tests {
 
     // ── Notifier construction ────────────────────────────────────
 
+    /// Build a `NotificationsConfig` for tests. `desktop` controls whether
+    /// the desktop backend is enabled.
+    fn notif_config(desktop: bool) -> crate::config::NotificationsConfig {
+        crate::config::NotificationsConfig {
+            desktop,
+            min_severity: Severity::Warn,
+            webhooks: vec![],
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn notifier_drops_script_on_windows() {
-        let notifier = Notifier::new(Some(PathBuf::from("C:/does/not/matter.sh")), false);
+        let notifier = Notifier::new(
+            Some(PathBuf::from("C:/does/not/matter.sh")),
+            &notif_config(false),
+        );
         assert!(notifier.script.is_none());
-        assert!(!notifier.desktop_enabled());
+        assert!(notifier.desktop.is_none());
     }
 
     #[test]
     fn notifier_none_is_noop() {
-        let notifier = Notifier::new(None, false);
+        let notifier = Notifier::new(None, &notif_config(false));
         assert!(notifier.script.is_none());
-        assert!(!notifier.desktop_enabled());
+        assert!(notifier.desktop.is_none());
     }
 
     #[test]
     fn notifier_with_desktop_enabled() {
-        let notifier = Notifier::new(None, true);
-        assert!(notifier.desktop_enabled());
+        let notifier = Notifier::new(None, &notif_config(true));
+        assert!(notifier.desktop.is_some());
+        assert!(notifier.desktop.unwrap().enabled);
     }
 
     #[test]
     fn notify_with_nonexistent_script() {
         let notifier = Notifier::new(
             Some(PathBuf::from("/tmp/claude/nonexistent_notify.sh")),
-            false,
+            &notif_config(false),
         );
         // Should not panic, just log a warning (script existence checked synchronously)
         notifier.notify(
@@ -623,6 +694,168 @@ mod tests {
             "user@example.com",
             None,
         );
+    }
+
+    // ── Severity filtering / multi-backend dispatch ────────────
+
+    #[test]
+    fn notifier_script_always_fires_regardless_of_severity() {
+        // Script backend should always dispatch even for Silent events.
+        assert!(Notifier::should_dispatch(
+            Severity::Silent,
+            &Event::SyncStarted
+        ));
+        assert!(Notifier::should_dispatch(
+            Severity::Silent,
+            &Event::SyncComplete
+        ));
+    }
+
+    #[test]
+    fn should_dispatch_respects_threshold() {
+        // Warn threshold: Info events don't pass, Warn+ do.
+        assert!(!Notifier::should_dispatch(
+            Severity::Warn,
+            &Event::SyncStarted
+        ));
+        assert!(Notifier::should_dispatch(
+            Severity::Warn,
+            &Event::RateLimited
+        ));
+        assert!(Notifier::should_dispatch(Severity::Warn, &Event::DiskLow));
+        // Critical threshold: only Critical passes.
+        assert!(!Notifier::should_dispatch(
+            Severity::Critical,
+            &Event::SyncStarted
+        ));
+        assert!(!Notifier::should_dispatch(
+            Severity::Critical,
+            &Event::RateLimited
+        ));
+        assert!(Notifier::should_dispatch(
+            Severity::Critical,
+            &Event::TwoFaRequired
+        ));
+    }
+
+    #[test]
+    fn notifier_desktop_respects_global_min_severity() {
+        let cfg = crate::config::NotificationsConfig {
+            desktop: true,
+            min_severity: Severity::Critical,
+            webhooks: vec![],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        assert!(notifier.desktop.is_some());
+        // Info event below Critical threshold — desktop should not receive it.
+        assert!(!Notifier::should_dispatch(
+            notifier.min_severity,
+            &Event::SyncStarted
+        ));
+        // Critical event meets threshold.
+        assert!(Notifier::should_dispatch(
+            notifier.min_severity,
+            &Event::TwoFaRequired
+        ));
+    }
+
+    #[test]
+    fn notifier_webhook_per_backend_severity_override() {
+        let cfg = crate::config::NotificationsConfig {
+            desktop: false,
+            min_severity: Severity::Warn,
+            webhooks: vec![
+                WebhookConfig {
+                    name: "ntfy".into(),
+                    url: "https://ntfy.example.com/kei".into(),
+                    min_severity: Severity::Critical,
+                },
+                WebhookConfig {
+                    name: "discord".into(),
+                    url: "https://discord.example.com/webhook".into(),
+                    min_severity: Severity::Info,
+                },
+            ],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        assert_eq!(notifier.webhooks.len(), 2);
+        // ntfy: only Critical
+        assert!(!Notifier::should_dispatch(
+            Severity::Critical,
+            &Event::SyncStarted
+        ));
+        assert!(Notifier::should_dispatch(
+            Severity::Critical,
+            &Event::TwoFaRequired
+        ));
+        // discord: Info+ (everything)
+        assert!(Notifier::should_dispatch(
+            Severity::Info,
+            &Event::SyncStarted
+        ));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn desktop_stub_trace_emits_for_above_threshold_event() {
+        let notifier = Notifier::new(None, &notif_config(true));
+        notifier.notify(Event::DiskLow, "disk low", "user@example.com", None);
+        assert!(
+            logs_contain("would have sent desktop notification"),
+            "expected desktop trace for Critical event above Warn threshold"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn webhook_stub_trace_emits_for_above_threshold_event() {
+        let cfg = crate::config::NotificationsConfig {
+            desktop: false,
+            min_severity: Severity::Warn,
+            webhooks: vec![
+                WebhookConfig {
+                    name: "ntfy".into(),
+                    url: "https://ntfy.example.com/kei".into(),
+                    min_severity: Severity::Critical,
+                },
+                WebhookConfig {
+                    name: "discord".into(),
+                    url: "https://discord.example.com/webhook".into(),
+                    min_severity: Severity::Info,
+                },
+            ],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        notifier.notify(Event::SyncStarted, "sync started", "user@example.com", None);
+        // ntfy threshold is Critical — SyncStarted (Info) should not fire.
+        assert!(
+            !logs_contain("backend=ntfy"),
+            "ntfy should not trace for Info < Critical"
+        );
+        // discord threshold is Info — SyncStarted should fire.
+        assert!(
+            logs_contain("backend=discord"),
+            "discord should trace for Info >= Info"
+        );
+    }
+
+    #[test]
+    fn notifier_construction_stores_config() {
+        let cfg = crate::config::NotificationsConfig {
+            desktop: true,
+            min_severity: Severity::Info,
+            webhooks: vec![WebhookConfig {
+                name: "test".into(),
+                url: "https://example.com".into(),
+                min_severity: Severity::Warn,
+            }],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        assert_eq!(notifier.min_severity, Severity::Info);
+        assert!(notifier.desktop.is_some());
+        assert!(notifier.desktop.unwrap().enabled);
+        assert_eq!(notifier.webhooks.len(), 1);
+        assert_eq!(notifier.webhooks[0].name, "test");
     }
 
     // ── Script runner helpers ────────────────────────────────────
@@ -675,7 +908,7 @@ mod tests {
         );
         let script_path = write_test_script(dir.path(), "test_notify.sh", body.as_bytes());
 
-        let notifier = Notifier::new(Some(script_path.clone()), false);
+        let notifier = Notifier::new(Some(script_path.clone()), &notif_config(false));
         notifier.notify(
             Event::TwoFaRequired,
             "Need 2FA code",
@@ -720,7 +953,7 @@ mod tests {
             ..SyncNotificationData::default()
         };
 
-        let notifier = Notifier::new(Some(script_path), false);
+        let notifier = Notifier::new(Some(script_path), &notif_config(false));
         notifier.notify(Event::SyncComplete, "test", "user@example.com", Some(&data));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -817,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn notifier_semaphore_caps_concurrent_inflight() {
         let fixture = BarrierFixture::new();
-        let notifier = Notifier::new(Some(fixture.script_path.clone()), false);
+        let notifier = Notifier::new(Some(fixture.script_path.clone()), &notif_config(false));
         for _ in 0..NOTIFIER_MAX_INFLIGHT * 2 {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
@@ -859,7 +1092,7 @@ mod tests {
     #[tokio::test]
     async fn notifier_drops_events_when_saturated() {
         let fixture = BarrierFixture::new();
-        let notifier = Notifier::new(Some(fixture.script_path.clone()), false);
+        let notifier = Notifier::new(Some(fixture.script_path.clone()), &notif_config(false));
         for _ in 0..NOTIFIER_MAX_INFLIGHT * 4 {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
@@ -926,7 +1159,7 @@ mod tests {
         );
         let script_path = write_test_script(dir.path(), "test_no_data.sh", body.as_bytes());
 
-        let notifier = Notifier::new(Some(script_path), false);
+        let notifier = Notifier::new(Some(script_path), &notif_config(false));
         notifier.notify(Event::SyncComplete, "test", "user@example.com", None);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
