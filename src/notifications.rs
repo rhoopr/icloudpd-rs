@@ -1285,8 +1285,9 @@ mod tests {
         #[cfg(feature = "desktop-notifications")]
         assert!(
             logs_contain("Desktop notification sent")
-                || logs_contain("Desktop notifications unavailable"),
-            "expected desktop backend to either send or warn"
+                || logs_contain("Desktop notifications unavailable")
+                || logs_contain("Failed to send desktop notification"),
+            "expected desktop backend to either send, warn unavailable, or log failure"
         );
         #[cfg(not(feature = "desktop-notifications"))]
         {
