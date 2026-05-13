@@ -353,13 +353,11 @@ impl Notifier {
             self.dispatch_script(&event, message, username, data);
         }
         // ── Desktop backend (stub) ──────────────────────────────
-        if let Some(ref _desktop) = self.desktop {
-            if Self::should_dispatch(self.min_severity, &event) {
-                tracing::trace!(
-                    event = event.as_str(),
-                    "would have sent desktop notification"
-                );
-            }
+        if self.desktop.is_some() && Self::should_dispatch(self.min_severity, &event) {
+            tracing::trace!(
+                event = event.as_str(),
+                "would have sent desktop notification"
+            );
         }
         // ── Webhook backends (stub) ─────────────────────────────
         for wh in &self.webhooks {
@@ -795,6 +793,55 @@ mod tests {
             Severity::Info,
             &Event::SyncStarted
         ));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn desktop_stub_trace_emits_for_above_threshold_event() {
+        let cfg = crate::config::NotificationsConfig {
+            desktop: true,
+            min_severity: Severity::Warn,
+            webhooks: vec![],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        notifier.notify(Event::DiskLow, "disk low", "user@example.com", None);
+        assert!(
+            logs_contain("would have sent desktop notification"),
+            "expected desktop trace for Critical event above Warn threshold"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn webhook_stub_trace_emits_for_above_threshold_event() {
+        let cfg = crate::config::NotificationsConfig {
+            desktop: false,
+            min_severity: Severity::Warn,
+            webhooks: vec![
+                WebhookConfig {
+                    name: "ntfy".into(),
+                    url: "https://ntfy.example.com/kei".into(),
+                    min_severity: Severity::Critical,
+                },
+                WebhookConfig {
+                    name: "discord".into(),
+                    url: "https://discord.example.com/webhook".into(),
+                    min_severity: Severity::Info,
+                },
+            ],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        notifier.notify(Event::SyncStarted, "sync started", "user@example.com", None);
+        // ntfy threshold is Critical — SyncStarted (Info) should not fire.
+        assert!(
+            !logs_contain("backend=ntfy"),
+            "ntfy should not trace for Info < Critical"
+        );
+        // discord threshold is Info — SyncStarted should fire.
+        assert!(
+            logs_contain("backend=discord"),
+            "discord should trace for Info >= Info"
+        );
     }
 
     #[test]
