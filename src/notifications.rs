@@ -285,10 +285,9 @@ impl DesktopBackend {
             .timeout(notify_rust::Timeout::Milliseconds(10_000));
 
         match n.show() {
-            Ok(handle) => {
+            Ok(_handle) => {
                 tracing::trace!(
                     event = %event.as_str(),
-                    id = ?handle.id(),
                     "Desktop notification sent"
                 );
             }
