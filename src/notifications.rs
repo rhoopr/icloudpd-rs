@@ -316,6 +316,10 @@ impl DesktopBackend {
     }
 
     /// Test helper: in the stub path container state is irrelevant.
+    #[allow(
+        dead_code,
+        reason = "used in tests; clippy dead_code fires despite --all-targets"
+    )]
     pub(crate) const fn with_container_state(enabled: bool, _in_container: bool) -> Self {
         Self { enabled }
     }
@@ -334,6 +338,7 @@ impl DesktopBackend {
 }
 
 /// Human-readable title for a desktop notification.
+#[cfg(feature = "desktop-notifications")]
 fn event_summary(event: &Event) -> &'static str {
     match event {
         Event::TwoFaRequired => "kei - 2FA Required",
@@ -586,7 +591,10 @@ impl Clone for Notifier {
         Self {
             script: self.script.clone(),
             min_severity: self.min_severity,
+            #[cfg(feature = "desktop-notifications")]
             desktop: self.desktop.clone(),
+            #[cfg(not(feature = "desktop-notifications"))]
+            desktop: self.desktop,
             webhooks: self.webhooks.clone(),
             concurrency: Arc::clone(&self.concurrency),
         }
