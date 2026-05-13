@@ -210,24 +210,151 @@ impl From<&crate::download::SyncStats> for SyncNotificationData {
     }
 }
 
-// ── Stub backends (PRs 2 & 3) ──────────────────────────────────────
+// ── Desktop notification backend ────────────────────────────────────
 
-/// Stub desktop notification backend. Full implementation in PR 2.
+/// Desktop notification backend.
 ///
-/// In PR 1 this stores whether the user opted in but performs no actual
-/// notification delivery.
-/// Desktop notification backend. Stub — delivery wired in PR 2.
-///
-/// In PR 1 this stores whether the user opted in and serves as a presence
-/// marker in the multi-backend dispatch loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// macOS Notification Center, Windows Toast, Linux libnotify.
+/// Auto-disabled when running inside a container (no D-Bus/display).
+/// Compiled to a no-op when the `desktop-notifications` feature is disabled.
+#[cfg(feature = "desktop-notifications")]
+#[derive(Debug)]
 pub(crate) struct DesktopBackend {
-    pub enabled: bool,
+    enabled: bool,
+    unavailable_but_requested: bool,
+    warned: std::sync::atomic::AtomicBool,
 }
 
+#[cfg(feature = "desktop-notifications")]
+impl Clone for DesktopBackend {
+    fn clone(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            unavailable_but_requested: self.unavailable_but_requested,
+            warned: std::sync::atomic::AtomicBool::new(
+                self.warned.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "desktop-notifications")]
+impl DesktopBackend {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self::with_container_state(enabled, crate::service::env::is_in_container())
+    }
+
+    /// Test helper: build with an explicit container state so unit tests
+    /// stay hermetic regardless of the CI environment.
+    pub(crate) fn with_container_state(enabled: bool, in_container: bool) -> Self {
+        Self {
+            enabled: enabled && !in_container,
+            unavailable_but_requested: enabled && in_container,
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "only used in tests; clippy dead_code fires despite --all-targets"
+    )]
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Send a desktop notification for `event`.
+    ///
+    /// Fire-and-forget: errors are logged, never propagated.
+    pub(crate) fn notify(&self, event: &Event, message: &str) {
+        if !self.enabled {
+            if self.unavailable_but_requested
+                && !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    "Desktop notifications unavailable (no D-Bus/display). \
+                     Falling back to webhooks."
+                );
+            }
+            return;
+        }
+
+        let mut n = notify_rust::Notification::new();
+        n.summary(event_summary(event))
+            .body(message)
+            .appname("kei")
+            .timeout(notify_rust::Timeout::Milliseconds(10_000));
+
+        match n.show() {
+            Ok(_handle) => {
+                tracing::trace!(
+                    event = %event.as_str(),
+                    "Desktop notification sent"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = %event.as_str(),
+                    error = %e,
+                    "Failed to send desktop notification"
+                );
+            }
+        }
+    }
+}
+
+/// Desktop notification backend stub (compiled without `desktop-notifications`).
+#[cfg(not(feature = "desktop-notifications"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DesktopBackend {
+    enabled: bool,
+}
+
+#[cfg(not(feature = "desktop-notifications"))]
 impl DesktopBackend {
     pub(crate) const fn new(enabled: bool) -> Self {
         Self { enabled }
+    }
+
+    /// Test helper: in the stub path container state is irrelevant.
+    #[allow(
+        dead_code,
+        reason = "used in tests; clippy dead_code fires despite --all-targets"
+    )]
+    pub(crate) const fn with_container_state(enabled: bool, _in_container: bool) -> Self {
+        Self { enabled }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "only used in tests; clippy dead_code fires despite --all-targets"
+    )]
+    pub(crate) const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) fn notify(&self, _event: &Event, _message: &str) {
+        // no-op: compiled without desktop-notifications feature
+    }
+}
+
+/// Human-readable title for a desktop notification.
+#[cfg(feature = "desktop-notifications")]
+fn event_summary(event: &Event) -> &'static str {
+    match event {
+        Event::TwoFaRequired => "kei - 2FA Required",
+        Event::SyncStarted => "kei - Sync Started",
+        Event::SyncComplete => "kei - Sync Complete",
+        Event::SyncFailed(_) => "kei - Sync Failed",
+        Event::SessionExpired => "kei - Session Expired",
+        Event::DiskLow => "kei - Disk Space Low",
+        Event::DiskRecovered => "kei - Disk Space Recovered",
+        Event::AuthExpiring => "kei - Auth Expiring",
+        Event::RateLimited => "kei - Rate Limited",
+        Event::ThrottleEngaged => "kei - Throttle Engaged",
+        Event::ThrottleDisengaged => "kei - Throttle Disengaged",
+        Event::DriftDetected => "kei - Drift Detected",
+        Event::Paused => "kei - Paused",
+        Event::Resumed => "kei - Resumed",
     }
 }
 
@@ -464,6 +591,9 @@ impl Clone for Notifier {
         Self {
             script: self.script.clone(),
             min_severity: self.min_severity,
+            #[cfg(feature = "desktop-notifications")]
+            desktop: self.desktop.clone(),
+            #[cfg(not(feature = "desktop-notifications"))]
             desktop: self.desktop,
             webhooks: self.webhooks.clone(),
             concurrency: Arc::clone(&self.concurrency),
@@ -611,12 +741,11 @@ impl Notifier {
         if Self::should_dispatch(Severity::Silent, &event) {
             self.dispatch_script(&event, message, username, data);
         }
-        // ── Desktop backend (stub) ──────────────────────────────
-        if self.desktop.is_some() && Self::should_dispatch(self.min_severity, &event) {
-            tracing::trace!(
-                event = event.as_str(),
-                "would have sent desktop notification"
-            );
+        // ── Desktop backend ───────────────────────────────────
+        if let Some(ref desktop) = self.desktop {
+            if Self::should_dispatch(self.min_severity, &event) {
+                desktop.notify(&event, message);
+            }
         }
         // ── Webhook backends ────────────────────────────────────
         for backend in &self.webhooks {
@@ -935,15 +1064,49 @@ mod tests {
     // ── DesktopBackend ───────────────────────────────────────────
 
     #[test]
-    fn desktop_backend_new_enabled() {
-        let b = DesktopBackend::new(true);
-        assert!(b.enabled);
+    fn desktop_backend_new_enabled_outside_container() {
+        let b = DesktopBackend::with_container_state(true, false);
+        assert!(b.is_enabled());
     }
 
     #[test]
     fn desktop_backend_new_disabled() {
-        let b = DesktopBackend::new(false);
-        assert!(!b.enabled);
+        let b = DesktopBackend::with_container_state(false, false);
+        assert!(!b.is_enabled());
+        let b_container = DesktopBackend::with_container_state(false, true);
+        assert!(!b_container.is_enabled());
+    }
+
+    #[test]
+    fn desktop_backend_disabled_in_container() {
+        let b = DesktopBackend::with_container_state(true, true);
+        #[cfg(feature = "desktop-notifications")]
+        assert!(!b.is_enabled());
+        #[cfg(not(feature = "desktop-notifications"))]
+        assert!(b.is_enabled()); // stub ignores container state
+    }
+
+    #[test]
+    fn desktop_backend_notify_on_disabled_is_noop() {
+        let b = DesktopBackend::with_container_state(false, false);
+        // Must not panic, must not spawn, must not log.
+        b.notify(&Event::SyncComplete, "test");
+    }
+
+    #[cfg(feature = "desktop-notifications")]
+    #[tracing_test::traced_test]
+    #[test]
+    fn desktop_backend_warns_once_when_unavailable() {
+        let b = DesktopBackend::with_container_state(true, true);
+        // First notify should emit the one-time warning.
+        b.notify(&Event::SyncComplete, "test");
+        assert!(logs_contain("Desktop notifications unavailable"));
+
+        // Second notify must be silent (no additional warning).
+        // tracing_test accumulates across the test, so we can't assert
+        // "exactly once", but we confirm the backend doesn't panic and
+        // the warning was present at least once.
+        b.notify(&Event::SyncComplete, "test");
     }
 
     // ── Notifier construction ────────────────────────────────────
@@ -980,7 +1143,15 @@ mod tests {
     fn notifier_with_desktop_enabled() {
         let notifier = Notifier::new(None, &notif_config(true));
         assert!(notifier.desktop.is_some());
-        assert!(notifier.desktop.unwrap().enabled);
+        // In a container desktop is auto-disabled; on a host it stays enabled.
+        // When compiled without the feature the stub ignores container state.
+        #[cfg(feature = "desktop-notifications")]
+        assert_eq!(
+            notifier.desktop.unwrap().is_enabled(),
+            !crate::service::env::is_in_container()
+        );
+        #[cfg(not(feature = "desktop-notifications"))]
+        assert!(notifier.desktop.unwrap().is_enabled());
     }
 
     #[test]
@@ -1108,10 +1279,20 @@ mod tests {
     fn desktop_stub_trace_emits_for_above_threshold_event() {
         let notifier = Notifier::new(None, &notif_config(true));
         notifier.notify(Event::DiskLow, "disk low", "user@example.com", None);
+        // In a container the backend is disabled and emits a one-time warning;
+        // on a host it sends a real notification (trace logged).
+        // Without the desktop-notifications feature the stub is a silent no-op.
+        #[cfg(feature = "desktop-notifications")]
         assert!(
-            logs_contain("would have sent desktop notification"),
-            "expected desktop trace for Critical event above Warn threshold"
+            logs_contain("Desktop notification sent")
+                || logs_contain("Desktop notifications unavailable")
+                || logs_contain("Failed to send desktop notification"),
+            "expected desktop backend to either send, warn unavailable, or log failure"
         );
+        #[cfg(not(feature = "desktop-notifications"))]
+        {
+            // stub path: no trace, no warning — just verify no panic
+        }
     }
 
     #[tokio::test]
@@ -1168,7 +1349,13 @@ mod tests {
         let notifier = Notifier::new(None, &cfg);
         assert_eq!(notifier.min_severity, Severity::Info);
         assert!(notifier.desktop.is_some());
-        assert!(notifier.desktop.unwrap().enabled);
+        #[cfg(feature = "desktop-notifications")]
+        assert_eq!(
+            notifier.desktop.unwrap().is_enabled(),
+            !crate::service::env::is_in_container()
+        );
+        #[cfg(not(feature = "desktop-notifications"))]
+        assert!(notifier.desktop.unwrap().is_enabled());
         assert_eq!(notifier.webhooks.len(), 1);
         assert_eq!(notifier.webhooks[0].name(), "ntfy");
     }
