@@ -798,12 +798,7 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn desktop_stub_trace_emits_for_above_threshold_event() {
-        let cfg = crate::config::NotificationsConfig {
-            desktop: true,
-            min_severity: Severity::Warn,
-            webhooks: vec![],
-        };
-        let notifier = Notifier::new(None, &cfg);
+        let notifier = Notifier::new(None, &notif_config(true));
         notifier.notify(Event::DiskLow, "disk low", "user@example.com", None);
         assert!(
             logs_contain("would have sent desktop notification"),
