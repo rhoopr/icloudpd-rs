@@ -142,7 +142,8 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
     let plist_path = home.join(LAUNCH_AGENTS_SUBDIR).join(PLIST_FILE_NAME);
     let log_dir = home.join(LOG_SUBDIR);
 
-    std::fs::create_dir_all(&log_dir)
+    tokio::fs::create_dir_all(&log_dir)
+        .await
         .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
 
     let dict = render_user_plist(PlistInputs {
@@ -152,7 +153,7 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
         home: &home,
     });
     let xml = serialize_plist(&dict)?;
-    write_plist(&plist_path, &xml)?;
+    write_plist(&plist_path, &xml).await?;
     tracing::info!(
         service = SERVICE_IDENTIFIER,
         path = %plist_path.display(),
@@ -206,7 +207,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
         // mac, plist-not-loaded-but-present). The plist removal is the
         // load-bearing step; log+proceed.
         let _ = bootout_or_unload(path).await;
-        remove_plist_file(path)?;
+        remove_plist_file(path).await?;
         tracing::info!(path = %path.display(), "removed per-user launchd plist");
     }
 
@@ -215,7 +216,13 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
             bail!("--purge requested but $HOME does not resolve; cannot locate kei state");
         };
         let extras: Vec<PathBuf> = user_log_dir().into_iter().collect();
-        purge_kei_state(&kei_dir, &extras)?;
+        tokio::task::spawn_blocking({
+            let kei_dir = kei_dir.clone();
+            let extras = extras.clone();
+            move || purge_kei_state(&kei_dir, &extras)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("purge task panicked: {e}"))??;
     }
 
     Ok(())
@@ -303,21 +310,22 @@ fn probed_to_state(state: &str, pid: Option<&str>) -> ServiceState {
 
 // ── Internals ───────────────────────────────────────────────────────────
 
-fn write_plist(path: &Path, contents: &str) -> Result<()> {
+async fn write_plist(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
             format!(
                 "failed to create LaunchAgents directory {}",
                 parent.display()
             )
         })?;
     }
-    std::fs::write(path, contents)
+    tokio::fs::write(path, contents)
+        .await
         .with_context(|| format!("failed to write plist {}", path.display()))
 }
 
-fn remove_plist_file(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
+async fn remove_plist_file(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("failed to remove plist {}", path.display())),

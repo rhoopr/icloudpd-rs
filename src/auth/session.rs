@@ -356,7 +356,11 @@ impl Session {
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
 
         let cookiejar_path = cookie_dir.join(sanitized);
-        if cookiejar_path.is_file() {
+        let cookiejar_is_file = match tokio::fs::metadata(&cookiejar_path).await {
+            Ok(m) => m.is_file(),
+            Err(_) => false,
+        };
+        if cookiejar_is_file {
             match fs::read_to_string(&cookiejar_path).await {
                 Ok(contents) => {
                     let now = chrono::Utc::now();
@@ -409,7 +413,8 @@ impl Session {
         let (client, download_client) = build_clients(&cookie_jar, home_endpoint, timeout)?;
 
         let session_path = cookie_dir.join(format!("{sanitized}.session"));
-        let session_data = if session_path.exists() {
+        let session_exists = tokio::fs::try_exists(&session_path).await.unwrap_or(false);
+        let session_data = if session_exists {
             match fs::read_to_string(&session_path).await {
                 Ok(contents) => match serde_json::from_str::<HashMap<String, Value>>(&contents) {
                     Ok(map) => {
@@ -697,7 +702,10 @@ impl Session {
 
         // Check if the cookie file already has the same content to avoid
         // redundant disk writes during high-frequency API calls.
-        if cookiejar_path.exists() {
+        let cookiejar_exists = tokio::fs::try_exists(&cookiejar_path)
+            .await
+            .unwrap_or(false);
+        if cookiejar_exists {
             if let Ok(contents) = fs::read_to_string(&cookiejar_path).await {
                 if let Ok(existing) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
                     if existing == entries {

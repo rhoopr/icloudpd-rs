@@ -258,15 +258,26 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .data_dir
         .clone()
         .or_else(|| globals.cookie_directory.clone());
-    let mut config = config::Config::build_inner(
-        globals,
-        &pw,
-        sync,
-        toml_config.as_ref(),
-        config::parse_env_watch_interval(std::env::var(config::ENV_WATCH_INTERVAL))?,
-        personality_mode,
-        friendly_request,
-    )?;
+    let mut config = tokio::task::spawn_blocking({
+        let globals = globals.clone();
+        let pw = pw.clone();
+        let sync = sync.clone();
+        let toml_config = toml_config.clone();
+        let env_watch_interval =
+            config::parse_env_watch_interval(std::env::var(config::ENV_WATCH_INTERVAL))?;
+        move || {
+            config::Config::build_inner(
+                &globals,
+                &pw,
+                sync,
+                toml_config.as_ref(),
+                env_watch_interval,
+                personality_mode,
+                friendly_request,
+            )
+        }
+    })
+    .await??;
 
     // On first run (no config file), persist CLI-provided values so
     // subsequent runs don't need the same flags again. Only when the
@@ -310,11 +321,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     crate::harden_process();
 
     // Write PID file if requested (before auth so the PID is visible immediately)
-    let _pid_guard = config
-        .pid_file
-        .as_ref()
-        .map(|p| PidFileGuard::new(p.clone()))
-        .transpose()?;
+    let _pid_guard = match config.pid_file.clone() {
+        Some(p) => {
+            let guard = tokio::task::spawn_blocking(move || PidFileGuard::new(p))
+                .await
+                .map_err(|e| anyhow::anyhow!("PID file task panicked: {e}"))??;
+            Some(guard)
+        }
+        None => None,
+    };
 
     let sd_notifier = SystemdNotifier::new(config.notify_systemd);
     let notifier = Notifier::new(config.notification_script.clone(), &config.notifications);
