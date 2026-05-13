@@ -51,7 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#373]: https://github.com/rhoopr/kei/pull/373
 [#374]: https://github.com/rhoopr/kei/pull/374
 
-## [Unreleased]
+## [0.14.1] - 2026-05-13
+
+### Fixed
+
+- **HEIC corruption from Chinese iCloud with `set_exif_datetime` enabled.** `insert_xmp` iloc remapping in `src/download/heif.rs` used `encoded_size` to estimate the original extent of each HEIC atom. When Apple QuickTime format inputs (no version+flags prefix) were re-encoded to ISO format, Meta grew 4 bytes — inflating its range past its actual original extent. An iloc entry pointing to mdat fell in this overshoot zone and was remapped to the wrong offset, making downloaded HEICs unopenable. Now uses the next atom's actual original start as `old_end` (falling back to total for the last atom), immune to encode/decode size mismatches. Same fix applied to `locate_stale_kei_mdat()`. ([#376])
+
+[#375]: https://github.com/rhoopr/kei/issues/375
+[#376]: https://github.com/rhoopr/kei/pull/376
 
 ---
 
@@ -1173,8 +1180,39 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.6.1...HEAD
-[0.6.1]: https://github.com/rhoopr/kei/compare/v0.6.0...v0.6.1
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/rhoopr/kei/compare/v0.14.0...v0.14.1
+[0.14.0]: https://github.com/rhoopr/kei/compare/v0.13.3...v0.14.0
+[0.13.3]: https://github.com/rhoopr/kei/compare/v0.13.2...v0.13.3
+[0.13.2]: https://github.com/rhoopr/kei/compare/v0.13.1...v0.13.2
+[0.13.1]: https://github.com/rhoopr/kei/compare/v0.13.0...v0.13.1
+[0.13.0]: https://github.com/rhoopr/kei/compare/v0.12.2...v0.13.0
+[0.12.2]: https://github.com/rhoopr/kei/compare/v0.12.1...v0.12.2
+[0.12.1]: https://github.com/rhoopr/kei/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/rhoopr/kei/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/rhoopr/kei/compare/v0.10.1...v0.11.0
+[0.10.1]: https://github.com/rhoopr/kei/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/rhoopr/kei/compare/v0.9.2...v0.10.0
+[0.9.2]: https://github.com/rhoopr/kei/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/rhoopr/kei/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/rhoopr/kei/compare/v0.8.2...v0.9.0
+[0.8.2]: https://github.com/rhoopr/kei/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/rhoopr/kei/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/rhoopr/kei/compare/v0.7.12...v0.8.0
+[0.7.12]: https://github.com/rhoopr/kei/compare/v0.7.11...v0.7.12
+[0.7.11]: https://github.com/rhoopr/kei/compare/v0.7.10...v0.7.11
+[0.7.10]: https://github.com/rhoopr/kei/compare/v0.7.9...v0.7.10
+[0.7.9]: https://github.com/rhoopr/kei/compare/v0.7.8...v0.7.9
+[0.7.8]: https://github.com/rhoopr/kei/compare/v0.7.7...v0.7.8
+[0.7.7]: https://github.com/rhoopr/kei/compare/v0.7.6...v0.7.7
+[0.7.6]: https://github.com/rhoopr/kei/compare/v0.7.5...v0.7.6
+[0.7.5]: https://github.com/rhoopr/kei/compare/v0.7.4...v0.7.5
+[0.7.4]: https://github.com/rhoopr/kei/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/rhoopr/kei/compare/v0.7.2...v0.7.3
+[0.7.2]: https://github.com/rhoopr/kei/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/rhoopr/kei/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/rhoopr/kei/compare/v0.6.2...v0.7.0
+[0.6.2]: https://github.com/rhoopr/kei/compare/v0.6.1...v0.6.2
 [0.6.0]: https://github.com/rhoopr/kei/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/rhoopr/kei/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/rhoopr/kei/compare/v0.5.1...v0.5.2
