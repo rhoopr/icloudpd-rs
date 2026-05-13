@@ -65,6 +65,15 @@ pub(crate) struct TomlWebhookEntry {
     /// `[notifications].min_severity` when absent.
     #[serde(default)]
     pub min_severity: Option<crate::notifications::Severity>,
+    /// Pushover application token.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Pushover user key.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Telegram chat ID.
+    #[serde(default)]
+    pub chat_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -707,6 +716,9 @@ pub(crate) struct WebhookConfig {
     pub name: String,
     pub url: String,
     pub min_severity: crate::notifications::Severity,
+    pub token: Option<String>,
+    pub user: Option<String>,
+    pub chat_id: Option<String>,
 }
 
 /// Application configuration.
@@ -1785,6 +1797,9 @@ fn resolve_notifications_section(
                     name: name.clone(),
                     url: entry.url.clone(),
                     min_severity: entry.min_severity.unwrap_or(min_severity),
+                    token: entry.token.clone(),
+                    user: entry.user.clone(),
+                    chat_id: entry.chat_id.clone(),
                 })
                 .collect()
         })
@@ -2354,6 +2369,9 @@ impl Config {
                                             } else {
                                                 None
                                             },
+                                            token: w.token.clone(),
+                                            user: w.user.clone(),
+                                            chat_id: w.chat_id.clone(),
                                         },
                                     )
                                 })

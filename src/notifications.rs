@@ -9,8 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::WebhookConfig;
-
 // ── Severity ────────────────────────────────────────────────────────
 
 /// Severity level for notification routing.
@@ -234,19 +232,13 @@ impl DesktopBackend {
 }
 
 /// Error type for webhook delivery failures.
-#[allow(dead_code, reason = "constructed in PR 3")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WebhookError {
     #[error("HTTP {status}: {body}")]
     Http { status: u16, body: String },
-    #[error("Timeout after {0}s")]
-    Timeout(u64),
-    #[error("Serialization: {0}")]
-    Serialization(String),
 }
 
-/// Trait for webhook notification backends. Implementations in PR 3.
-#[allow(dead_code, reason = "implemented in PR 3")]
+/// Trait for webhook notification backends.
 #[async_trait::async_trait]
 pub(crate) trait WebhookBackend: Send + Sync + std::fmt::Debug {
     /// Human-readable backend name for logging.
@@ -258,11 +250,188 @@ pub(crate) trait WebhookBackend: Send + Sync + std::fmt::Debug {
     async fn send(&self, event: Event, message: &str, username: &str) -> Result<(), WebhookError>;
 }
 
+// ── Webhook implementations ─────────────────────────────────────────
+
+/// Shared HTTP timeout for webhook delivery.
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// POST JSON payload to `url` and translate non-success into [`WebhookError`].
+async fn post_json(url: &str, payload: impl serde::Serialize) -> Result<(), WebhookError> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| WebhookError::Http {
+            status: 0,
+            body: e.to_string(),
+        })?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(WebhookError::Http { status, body });
+    }
+    Ok(())
+}
+
+/// POST plain-text body to `url` with an optional `Title` header.
+async fn post_plain(url: &str, title: Option<&str>, body: &str) -> Result<(), WebhookError> {
+    let client = reqwest::Client::new();
+    let mut req = client.post(url).body(body.to_string());
+    if let Some(t) = title {
+        req = req.header("Title", t);
+    }
+    let resp = req.send().await.map_err(|e| WebhookError::Http {
+        status: 0,
+        body: e.to_string(),
+    })?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(WebhookError::Http { status, body });
+    }
+    Ok(())
+}
+
+// ── ntfy ────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct NtfyBackend {
+    url: String,
+    min_severity: Severity,
+}
+
+#[async_trait::async_trait]
+impl WebhookBackend for NtfyBackend {
+    fn name(&self) -> &'static str {
+        "ntfy"
+    }
+
+    fn min_severity(&self) -> Severity {
+        self.min_severity
+    }
+
+    async fn send(&self, event: Event, message: &str, _username: &str) -> Result<(), WebhookError> {
+        post_plain(&self.url, Some(&format!("kei {}", event.as_str())), message).await
+    }
+}
+
+// ── Pushover ────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct PushoverBackend {
+    url: String,
+    token: String,
+    user: String,
+    min_severity: Severity,
+}
+
+#[async_trait::async_trait]
+impl WebhookBackend for PushoverBackend {
+    fn name(&self) -> &'static str {
+        "pushover"
+    }
+
+    fn min_severity(&self) -> Severity {
+        self.min_severity
+    }
+
+    async fn send(&self, event: Event, message: &str, _username: &str) -> Result<(), WebhookError> {
+        let payload = serde_json::json!({
+            "token": self.token,
+            "user": self.user,
+            "message": message,
+            "title": format!("kei {}", event.as_str()),
+        });
+        post_json(&self.url, payload).await
+    }
+}
+
+// ── Discord ───────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct DiscordBackend {
+    url: String,
+    min_severity: Severity,
+}
+
+#[async_trait::async_trait]
+impl WebhookBackend for DiscordBackend {
+    fn name(&self) -> &'static str {
+        "discord"
+    }
+
+    fn min_severity(&self) -> Severity {
+        self.min_severity
+    }
+
+    async fn send(&self, event: Event, message: &str, _username: &str) -> Result<(), WebhookError> {
+        let payload = serde_json::json!({
+            "content": format!("**kei {}**\n{}", event.as_str(), message),
+        });
+        post_json(&self.url, payload).await
+    }
+}
+
+// ── Slack ─────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct SlackBackend {
+    url: String,
+    min_severity: Severity,
+}
+
+#[async_trait::async_trait]
+impl WebhookBackend for SlackBackend {
+    fn name(&self) -> &'static str {
+        "slack"
+    }
+
+    fn min_severity(&self) -> Severity {
+        self.min_severity
+    }
+
+    async fn send(&self, event: Event, message: &str, _username: &str) -> Result<(), WebhookError> {
+        let payload = serde_json::json!({
+            "text": format!("*kei {}*\n{}", event.as_str(), message),
+        });
+        post_json(&self.url, payload).await
+    }
+}
+
+// ── Telegram ────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct TelegramBackend {
+    url: String,
+    chat_id: String,
+    min_severity: Severity,
+}
+
+#[async_trait::async_trait]
+impl WebhookBackend for TelegramBackend {
+    fn name(&self) -> &'static str {
+        "telegram"
+    }
+
+    fn min_severity(&self) -> Severity {
+        self.min_severity
+    }
+
+    async fn send(&self, event: Event, message: &str, _username: &str) -> Result<(), WebhookError> {
+        let payload = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": format!("kei {}\n{}", event.as_str(), message),
+        });
+        post_json(&self.url, payload).await
+    }
+}
+
 // ── Notifier ────────────────────────────────────────────────────────
 
 /// Notification dispatcher. Holds an optional script path and multi-backend
 /// slots for desktop and webhook notifications.
-#[derive(Debug, Clone)]
 pub(crate) struct Notifier {
     script: Option<PathBuf>,
     /// Global minimum severity threshold. Backends filter events below this
@@ -271,13 +440,36 @@ pub(crate) struct Notifier {
     /// Desktop notification backend. `Some` when the user opted in via
     /// `--desktop-notifications` or `[notifications].desktop`.
     desktop: Option<DesktopBackend>,
-    /// Per-webhook endpoint configs, pre-resolved with per-backend
-    /// `min_severity` overrides.
-    webhooks: Vec<WebhookConfig>,
-    /// Bounds how many notification scripts can run concurrently. A
-    /// misbehaving or long-running script can't queue an unbounded
+    /// Active webhook backends.
+    webhooks: Vec<Arc<dyn WebhookBackend>>,
+    /// Bounds how many notification backends can run concurrently. A
+    /// misbehaving or long-running webhook can't queue an unbounded
     /// number of spawned tasks behind itself under load.
     concurrency: Arc<tokio::sync::Semaphore>,
+}
+
+impl std::fmt::Debug for Notifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Notifier")
+            .field("script", &self.script)
+            .field("min_severity", &self.min_severity)
+            .field("desktop", &self.desktop)
+            .field("webhooks", &self.webhooks.len())
+            .field("concurrency", &self.concurrency)
+            .finish()
+    }
+}
+
+impl Clone for Notifier {
+    fn clone(&self) -> Self {
+        Self {
+            script: self.script.clone(),
+            min_severity: self.min_severity,
+            desktop: self.desktop,
+            webhooks: self.webhooks.clone(),
+            concurrency: Arc::clone(&self.concurrency),
+        }
+    }
 }
 
 /// Timeout for notification scripts.
@@ -315,6 +507,74 @@ impl Notifier {
                 concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
             };
         }
+
+        let mut webhooks: Vec<Arc<dyn WebhookBackend>> =
+            Vec::with_capacity(notifications.webhooks.len());
+        for cfg in &notifications.webhooks {
+            match cfg.name.as_str() {
+                "ntfy" => {
+                    webhooks.push(Arc::new(NtfyBackend {
+                        url: cfg.url.clone(),
+                        min_severity: cfg.min_severity,
+                    }));
+                }
+                "pushover" => {
+                    let Some(token) = cfg.token.clone() else {
+                        tracing::warn!(
+                            name = %cfg.name,
+                            "Pushover webhook missing 'token' field; ignoring"
+                        );
+                        continue;
+                    };
+                    let Some(user) = cfg.user.clone() else {
+                        tracing::warn!(
+                            name = %cfg.name,
+                            "Pushover webhook missing 'user' field; ignoring"
+                        );
+                        continue;
+                    };
+                    webhooks.push(Arc::new(PushoverBackend {
+                        url: cfg.url.clone(),
+                        token,
+                        user,
+                        min_severity: cfg.min_severity,
+                    }));
+                }
+                "discord" => {
+                    webhooks.push(Arc::new(DiscordBackend {
+                        url: cfg.url.clone(),
+                        min_severity: cfg.min_severity,
+                    }));
+                }
+                "slack" => {
+                    webhooks.push(Arc::new(SlackBackend {
+                        url: cfg.url.clone(),
+                        min_severity: cfg.min_severity,
+                    }));
+                }
+                "telegram" => {
+                    let Some(chat_id) = cfg.chat_id.clone() else {
+                        tracing::warn!(
+                            name = %cfg.name,
+                            "Telegram webhook missing 'chat_id' field; ignoring"
+                        );
+                        continue;
+                    };
+                    webhooks.push(Arc::new(TelegramBackend {
+                        url: cfg.url.clone(),
+                        chat_id,
+                        min_severity: cfg.min_severity,
+                    }));
+                }
+                other => {
+                    tracing::warn!(
+                        name = %other,
+                        "Unknown webhook backend name; ignoring"
+                    );
+                }
+            }
+        }
+
         Self {
             script,
             min_severity: notifications.min_severity,
@@ -323,7 +583,7 @@ impl Notifier {
             } else {
                 None
             },
-            webhooks: notifications.webhooks.clone(),
+            webhooks,
             concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
         }
     }
@@ -359,15 +619,56 @@ impl Notifier {
                 "would have sent desktop notification"
             );
         }
-        // ── Webhook backends (stub) ─────────────────────────────
-        for wh in &self.webhooks {
-            if Self::should_dispatch(wh.min_severity, &event) {
-                tracing::trace!(
-                    event = event.as_str(),
-                    backend = %wh.name,
-                    "would have sent webhook notification"
-                );
+        // ── Webhook backends ────────────────────────────────────
+        for backend in &self.webhooks {
+            if !Self::should_dispatch(backend.min_severity(), &event) {
+                continue;
             }
+            let backend = Arc::clone(backend);
+            let event = event.clone();
+            let message = message.to_owned();
+            let username = username.to_owned();
+            let permit = match Arc::clone(&self.concurrency).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    tracing::warn!(
+                        event = event.as_str(),
+                        backend = backend.name(),
+                        "Notifier saturated, dropping webhook"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => continue,
+            };
+            tokio::spawn(async move {
+                let _permit = permit;
+                let fut = backend.send(event.clone(), &message, &username);
+                match tokio::time::timeout(WEBHOOK_TIMEOUT, fut).await {
+                    Ok(Ok(())) => {
+                        tracing::debug!(
+                            event = event.as_str(),
+                            backend = backend.name(),
+                            "Webhook delivered"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            event = event.as_str(),
+                            backend = backend.name(),
+                            error = %e,
+                            "Webhook delivery failed"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            event = event.as_str(),
+                            backend = backend.name(),
+                            "Webhook delivery timed out after {}s",
+                            WEBHOOK_TIMEOUT.as_secs()
+                        );
+                    }
+                }
+            });
         }
     }
 
@@ -530,6 +831,8 @@ async fn run_script(
 
 #[cfg(test)]
 mod tests {
+    use crate::config::WebhookConfig;
+
     use super::*;
 
     // ── Severity ─────────────────────────────────────────────────
@@ -769,11 +1072,17 @@ mod tests {
                     name: "ntfy".into(),
                     url: "https://ntfy.example.com/kei".into(),
                     min_severity: Severity::Critical,
+                    token: None,
+                    user: None,
+                    chat_id: None,
                 },
                 WebhookConfig {
                     name: "discord".into(),
                     url: "https://discord.example.com/webhook".into(),
                     min_severity: Severity::Info,
+                    token: None,
+                    user: None,
+                    chat_id: None,
                 },
             ],
         };
@@ -806,9 +1115,15 @@ mod tests {
         );
     }
 
-    #[test]
-    #[tracing_test::traced_test]
-    fn webhook_stub_trace_emits_for_above_threshold_event() {
+    #[tokio::test]
+    async fn webhook_dispatch_respects_per_backend_severity() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
         let cfg = crate::config::NotificationsConfig {
             desktop: false,
             min_severity: Severity::Warn,
@@ -817,26 +1132,24 @@ mod tests {
                     name: "ntfy".into(),
                     url: "https://ntfy.example.com/kei".into(),
                     min_severity: Severity::Critical,
+                    token: None,
+                    user: None,
+                    chat_id: None,
                 },
                 WebhookConfig {
                     name: "discord".into(),
-                    url: "https://discord.example.com/webhook".into(),
+                    url: mock_server.uri(),
                     min_severity: Severity::Info,
+                    token: None,
+                    user: None,
+                    chat_id: None,
                 },
             ],
         };
         let notifier = Notifier::new(None, &cfg);
         notifier.notify(Event::SyncStarted, "sync started", "user@example.com", None);
-        // ntfy threshold is Critical — SyncStarted (Info) should not fire.
-        assert!(
-            !logs_contain("backend=ntfy"),
-            "ntfy should not trace for Info < Critical"
-        );
-        // discord threshold is Info — SyncStarted should fire.
-        assert!(
-            logs_contain("backend=discord"),
-            "discord should trace for Info >= Info"
-        );
+        // Give the spawned task time to hit the mock server.
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     #[test]
@@ -845,9 +1158,12 @@ mod tests {
             desktop: true,
             min_severity: Severity::Info,
             webhooks: vec![WebhookConfig {
-                name: "test".into(),
+                name: "ntfy".into(),
                 url: "https://example.com".into(),
                 min_severity: Severity::Warn,
+                token: None,
+                user: None,
+                chat_id: None,
             }],
         };
         let notifier = Notifier::new(None, &cfg);
@@ -855,7 +1171,7 @@ mod tests {
         assert!(notifier.desktop.is_some());
         assert!(notifier.desktop.unwrap().enabled);
         assert_eq!(notifier.webhooks.len(), 1);
-        assert_eq!(notifier.webhooks[0].name, "test");
+        assert_eq!(notifier.webhooks[0].name(), "ntfy");
     }
 
     // ── Script runner helpers ────────────────────────────────────
@@ -1176,5 +1492,284 @@ mod tests {
 
         let output = std::fs::read_to_string(&output_path).unwrap();
         assert_eq!(output.trim(), "unset|unset");
+    }
+
+    // ── Webhook payload tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn webhook_payload_ntfy() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::header("Title", "kei sync_failed"))
+            .and(wiremock::matchers::body_string("test message"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let cfg = crate::config::NotificationsConfig {
+            desktop: false,
+            min_severity: Severity::Info,
+            webhooks: vec![WebhookConfig {
+                name: "ntfy".into(),
+                url: mock_server.uri(),
+                min_severity: Severity::Info,
+                token: None,
+                user: None,
+                chat_id: None,
+            }],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        notifier.notify(
+            Event::SyncFailed(FailureMode::Partial(3)),
+            "test message",
+            "user",
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_pushover() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "token": "app-token",
+                "user": "user-key",
+                "message": "test message",
+                "title": "kei sync_failed"
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let cfg = crate::config::NotificationsConfig {
+            desktop: false,
+            min_severity: Severity::Info,
+            webhooks: vec![WebhookConfig {
+                name: "pushover".into(),
+                url: mock_server.uri(),
+                min_severity: Severity::Info,
+                token: Some("app-token".into()),
+                user: Some("user-key".into()),
+                chat_id: None,
+            }],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        notifier.notify(
+            Event::SyncFailed(FailureMode::Partial(3)),
+            "test message",
+            "user",
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_discord() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "content": "**kei sync_failed**\ntest message"
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let cfg = crate::config::NotificationsConfig {
+            desktop: false,
+            min_severity: Severity::Info,
+            webhooks: vec![WebhookConfig {
+                name: "discord".into(),
+                url: mock_server.uri(),
+                min_severity: Severity::Info,
+                token: None,
+                user: None,
+                chat_id: None,
+            }],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        notifier.notify(
+            Event::SyncFailed(FailureMode::Partial(3)),
+            "test message",
+            "user",
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_slack() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "text": "*kei sync_failed*\ntest message"
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let cfg = crate::config::NotificationsConfig {
+            desktop: false,
+            min_severity: Severity::Info,
+            webhooks: vec![WebhookConfig {
+                name: "slack".into(),
+                url: mock_server.uri(),
+                min_severity: Severity::Info,
+                token: None,
+                user: None,
+                chat_id: None,
+            }],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        notifier.notify(
+            Event::SyncFailed(FailureMode::Partial(3)),
+            "test message",
+            "user",
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn webhook_payload_telegram() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "chat_id": "12345",
+                "text": "kei sync_failed\ntest message"
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let cfg = crate::config::NotificationsConfig {
+            desktop: false,
+            min_severity: Severity::Info,
+            webhooks: vec![WebhookConfig {
+                name: "telegram".into(),
+                url: mock_server.uri(),
+                min_severity: Severity::Info,
+                token: None,
+                user: None,
+                chat_id: Some("12345".into()),
+            }],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        notifier.notify(
+            Event::SyncFailed(FailureMode::Partial(3)),
+            "test message",
+            "user",
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn webhook_http_500_logged_not_propagated() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let cfg = crate::config::NotificationsConfig {
+            desktop: false,
+            min_severity: Severity::Info,
+            webhooks: vec![WebhookConfig {
+                name: "discord".into(),
+                url: mock_server.uri(),
+                min_severity: Severity::Info,
+                token: None,
+                user: None,
+                chat_id: None,
+            }],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        notifier.notify(Event::SyncStarted, "msg", "user", None);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(logs_contain("Webhook delivery failed"));
+        assert!(logs_contain("HTTP 500"));
+    }
+
+    #[derive(Debug)]
+    struct TimeoutProbeBackend {
+        tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WebhookBackend for TimeoutProbeBackend {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+        fn min_severity(&self) -> Severity {
+            Severity::Silent
+        }
+        async fn send(
+            &self,
+            _event: Event,
+            _message: &str,
+            _username: &str,
+        ) -> Result<(), WebhookError> {
+            struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+            impl Drop for DropSignal {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+
+            let tx = self.tx.lock().unwrap().take();
+            let _signal = DropSignal(tx);
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn webhook_timeout_fires_after_10s() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let notifier = Notifier {
+            script: None,
+            min_severity: Severity::Warn,
+            desktop: None,
+            webhooks: vec![Arc::new(TimeoutProbeBackend {
+                tx: std::sync::Mutex::new(Some(tx)),
+            })],
+            concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
+        };
+        notifier.notify(Event::SyncStarted, "msg", "user", None);
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(
+            rx.await.is_ok(),
+            "expected webhook send to be dropped by timeout"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn unknown_webhook_backend_ignored() {
+        let cfg = crate::config::NotificationsConfig {
+            desktop: false,
+            min_severity: Severity::Warn,
+            webhooks: vec![WebhookConfig {
+                name: "unknown".into(),
+                url: "https://example.com".into(),
+                min_severity: Severity::Warn,
+                token: None,
+                user: None,
+                chat_id: None,
+            }],
+        };
+        let notifier = Notifier::new(None, &cfg);
+        assert!(notifier.webhooks.is_empty());
+        assert!(logs_contain("Unknown webhook backend name"));
     }
 }
