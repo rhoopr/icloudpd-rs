@@ -6080,19 +6080,35 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.notifications.webhooks.len(), 2);
 
-        let pushover = cfg.notifications.webhooks.iter().find(|w| w.name == "pushover").unwrap();
+        let pushover = cfg
+            .notifications
+            .webhooks
+            .iter()
+            .find(|w| w.name == "pushover")
+            .unwrap();
         assert_eq!(pushover.token.as_deref(), Some("app-token"));
         assert_eq!(pushover.user.as_deref(), Some("user-key"));
         assert!(pushover.chat_id.is_none());
 
-        let telegram = cfg.notifications.webhooks.iter().find(|w| w.name == "telegram").unwrap();
+        let telegram = cfg
+            .notifications
+            .webhooks
+            .iter()
+            .find(|w| w.name == "telegram")
+            .unwrap();
         assert_eq!(telegram.chat_id.as_deref(), Some("67890"));
         assert!(telegram.token.is_none());
         assert!(telegram.user.is_none());
 
         // Round-trip through to_toml
         let rt = cfg.to_toml();
-        let rt_wh = rt.notifications.as_ref().unwrap().webhooks.as_ref().unwrap();
+        let rt_wh = rt
+            .notifications
+            .as_ref()
+            .unwrap()
+            .webhooks
+            .as_ref()
+            .unwrap();
         let rt_pushover = &rt_wh["pushover"];
         assert_eq!(rt_pushover.token.as_deref(), Some("app-token"));
         assert_eq!(rt_pushover.user.as_deref(), Some("user-key"));

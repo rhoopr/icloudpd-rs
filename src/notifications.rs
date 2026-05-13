@@ -255,6 +255,15 @@ pub(crate) trait WebhookBackend: Send + Sync + std::fmt::Debug {
 /// Shared HTTP timeout for webhook delivery.
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
+async fn check_response(resp: reqwest::Response) -> Result<(), WebhookError> {
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(WebhookError::Http { status, body });
+    }
+    Ok(())
+}
+
 /// POST JSON payload to `url` and translate non-success into [`WebhookError`].
 async fn post_json(url: &str, payload: impl serde::Serialize) -> Result<(), WebhookError> {
     let client = reqwest::Client::new();
@@ -267,12 +276,7 @@ async fn post_json(url: &str, payload: impl serde::Serialize) -> Result<(), Webh
             status: 0,
             body: e.to_string(),
         })?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(WebhookError::Http { status, body });
-    }
-    Ok(())
+    check_response(resp).await
 }
 
 /// POST plain-text body to `url` with an optional `Title` header.
@@ -286,12 +290,7 @@ async fn post_plain(url: &str, title: Option<&str>, body: &str) -> Result<(), We
         status: 0,
         body: e.to_string(),
     })?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(WebhookError::Http { status, body });
-    }
-    Ok(())
+    check_response(resp).await
 }
 
 // ── ntfy ────────────────────────────────────────────────────────────
