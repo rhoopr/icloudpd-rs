@@ -125,10 +125,20 @@ impl ThrottleController {
 mod tests {
     use super::*;
 
+    /// Compare two f64 values within a tolerance appropriate for the
+    /// throttle's arithmetic (multiplication, 0.25 steps, 0.9 decay).
+    fn assert_pressure_eq(actual: f64, expected: f64) {
+        let abs_diff = (actual - expected).abs();
+        assert!(
+            abs_diff < 1e-9,
+            "pressure mismatch: actual={actual}, expected={expected}, diff={abs_diff}"
+        );
+    }
+
     #[test]
     fn new_has_zero_pressure_and_baseline_interval() {
         let t = ThrottleController::new(300);
-        assert_eq!(t.pressure(), 0.0);
+        assert_pressure_eq(t.pressure(), 0.0);
         assert_eq!(t.current_interval_secs(), 300);
         assert!(!t.is_engaged());
     }
@@ -138,7 +148,7 @@ mod tests {
         let mut t = ThrottleController::new(300);
         let delta = t.cycle_complete(1, true);
         assert_eq!(delta, ThrottleDelta::Engaged);
-        assert_eq!(t.pressure(), 0.25);
+        assert_pressure_eq(t.pressure(), 0.25);
         // interval = 300 * (1 + 0.25 * 2) = 300 * 1.5 = 450
         assert_eq!(t.current_interval_secs(), 450);
     }
@@ -148,7 +158,7 @@ mod tests {
         let mut t = ThrottleController::new(300);
         let delta = t.cycle_complete(4, true);
         assert_eq!(delta, ThrottleDelta::Engaged);
-        assert_eq!(t.pressure(), 1.0);
+        assert_pressure_eq(t.pressure(), 1.0);
         // interval = 300 * (1 + 1.0 * 2) = 900 (3x baseline)
         assert_eq!(t.current_interval_secs(), 900);
     }
@@ -157,11 +167,11 @@ mod tests {
     fn clean_cycle_decays_by_ten_percent() {
         let mut t = ThrottleController::new(300);
         t.cycle_complete(4, true); // pressure = 1.0
-        assert_eq!(t.pressure(), 1.0);
+        assert_pressure_eq(t.pressure(), 1.0);
 
         let delta = t.cycle_complete(0, true);
         assert_eq!(delta, ThrottleDelta::None);
-        assert_eq!(t.pressure(), 0.9);
+        assert_pressure_eq(t.pressure(), 0.9);
         // interval = 300 * (1 + 0.9 * 2) = 300 * 2.8 = 840
         assert_eq!(t.current_interval_secs(), 840);
     }
@@ -174,7 +184,7 @@ mod tests {
         for _ in 0..40 {
             t.cycle_complete(0, true);
         }
-        assert_eq!(t.pressure(), 0.0);
+        assert_pressure_eq(t.pressure(), 0.0);
         assert_eq!(t.current_interval_secs(), 300);
         assert!(!t.is_engaged());
     }
@@ -204,7 +214,7 @@ mod tests {
     fn baseline_zero_is_no_op() {
         let mut t = ThrottleController::new(0);
         assert_eq!(t.cycle_complete(10, true), ThrottleDelta::None);
-        assert_eq!(t.pressure(), 0.0);
+        assert_pressure_eq(t.pressure(), 0.0);
         assert_eq!(t.current_interval_secs(), 0);
     }
 
@@ -227,7 +237,7 @@ mod tests {
         let delta = t.cycle_complete(1, true);
         assert_eq!(delta, ThrottleDelta::None); // already engaged
                                                 // 0.81 + 0.25 = 1.06 -> clamped to 1.0
-        assert_eq!(t.pressure(), 1.0);
+        assert_pressure_eq(t.pressure(), 1.0);
     }
 
     #[test]

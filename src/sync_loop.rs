@@ -1234,9 +1234,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
             }
 
-            let sleep_secs = throttle
-                .as_ref()
-                .map_or(interval, crate::throttle::ThrottleController::current_interval_secs);
+            let sleep_secs = throttle.as_ref().map_or(
+                interval,
+                crate::throttle::ThrottleController::current_interval_secs,
+            );
             sd_notifier.notify_status(&format!("Waiting {sleep_secs} seconds..."));
             tracing::info!(
                 interval_secs = sleep_secs,
