@@ -645,20 +645,11 @@ mod tests {
 
     // ── Notifier construction ────────────────────────────────────
 
-    /// Build a default `NotificationsConfig`. Script backend always
-    /// fires regardless of min_severity, so the value doesn't matter
-    /// for script-only tests.
-    fn default_notif_config() -> crate::config::NotificationsConfig {
+    /// Build a `NotificationsConfig` for tests. `desktop` controls whether
+    /// the desktop backend is enabled.
+    fn notif_config(desktop: bool) -> crate::config::NotificationsConfig {
         crate::config::NotificationsConfig {
-            desktop: true,
-            min_severity: Severity::Warn,
-            webhooks: vec![],
-        }
-    }
-
-    fn disabled_notif_config() -> crate::config::NotificationsConfig {
-        crate::config::NotificationsConfig {
-            desktop: false,
+            desktop,
             min_severity: Severity::Warn,
             webhooks: vec![],
         }
@@ -669,7 +660,7 @@ mod tests {
     fn notifier_drops_script_on_windows() {
         let notifier = Notifier::new(
             Some(PathBuf::from("C:/does/not/matter.sh")),
-            &disabled_notif_config(),
+            &notif_config(false),
         );
         assert!(notifier.script.is_none());
         assert!(notifier.desktop.is_none());
@@ -677,14 +668,14 @@ mod tests {
 
     #[test]
     fn notifier_none_is_noop() {
-        let notifier = Notifier::new(None, &disabled_notif_config());
+        let notifier = Notifier::new(None, &notif_config(false));
         assert!(notifier.script.is_none());
         assert!(notifier.desktop.is_none());
     }
 
     #[test]
     fn notifier_with_desktop_enabled() {
-        let notifier = Notifier::new(None, &default_notif_config());
+        let notifier = Notifier::new(None, &notif_config(true));
         assert!(notifier.desktop.is_some());
         assert!(notifier.desktop.unwrap().enabled);
     }
@@ -693,7 +684,7 @@ mod tests {
     fn notify_with_nonexistent_script() {
         let notifier = Notifier::new(
             Some(PathBuf::from("/tmp/claude/nonexistent_notify.sh")),
-            &disabled_notif_config(),
+            &notif_config(false),
         );
         // Should not panic, just log a warning (script existence checked synchronously)
         notifier.notify(
@@ -851,7 +842,7 @@ mod tests {
         );
         let script_path = write_test_script(dir.path(), "test_notify.sh", body.as_bytes());
 
-        let notifier = Notifier::new(Some(script_path.clone()), &disabled_notif_config());
+        let notifier = Notifier::new(Some(script_path.clone()), &notif_config(false));
         notifier.notify(
             Event::TwoFaRequired,
             "Need 2FA code",
@@ -896,7 +887,7 @@ mod tests {
             ..SyncNotificationData::default()
         };
 
-        let notifier = Notifier::new(Some(script_path), &disabled_notif_config());
+        let notifier = Notifier::new(Some(script_path), &notif_config(false));
         notifier.notify(Event::SyncComplete, "test", "user@example.com", Some(&data));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -993,7 +984,7 @@ mod tests {
     #[tokio::test]
     async fn notifier_semaphore_caps_concurrent_inflight() {
         let fixture = BarrierFixture::new();
-        let notifier = Notifier::new(Some(fixture.script_path.clone()), &disabled_notif_config());
+        let notifier = Notifier::new(Some(fixture.script_path.clone()), &notif_config(false));
         for _ in 0..NOTIFIER_MAX_INFLIGHT * 2 {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
@@ -1035,7 +1026,7 @@ mod tests {
     #[tokio::test]
     async fn notifier_drops_events_when_saturated() {
         let fixture = BarrierFixture::new();
-        let notifier = Notifier::new(Some(fixture.script_path.clone()), &disabled_notif_config());
+        let notifier = Notifier::new(Some(fixture.script_path.clone()), &notif_config(false));
         for _ in 0..NOTIFIER_MAX_INFLIGHT * 4 {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
@@ -1102,7 +1093,7 @@ mod tests {
         );
         let script_path = write_test_script(dir.path(), "test_no_data.sh", body.as_bytes());
 
-        let notifier = Notifier::new(Some(script_path), &disabled_notif_config());
+        let notifier = Notifier::new(Some(script_path), &notif_config(false));
         notifier.notify(Event::SyncComplete, "test", "user@example.com", None);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
