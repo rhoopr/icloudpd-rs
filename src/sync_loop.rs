@@ -319,7 +319,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let sd_notifier = SystemdNotifier::new(config.notify_systemd);
     let notifier = Notifier::new(
         config.notification_script.clone(),
-        config.notifications.desktop,
+        &config.notifications,
     );
 
     tracing::info!(concurrency = config.threads_num, "Starting kei");
