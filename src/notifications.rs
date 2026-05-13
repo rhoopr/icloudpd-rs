@@ -295,7 +295,10 @@ impl Notifier {
     /// silently dropped on Windows).
     ///
     /// `notifications` — resolved desktop, severity, and webhook config.
-    pub fn new(script: Option<PathBuf>, notifications: &crate::config::NotificationsConfig) -> Self {
+    pub fn new(
+        script: Option<PathBuf>,
+        notifications: &crate::config::NotificationsConfig,
+    ) -> Self {
         // kei invokes scripts via `/bin/sh`, which isn't available on Windows.
         // Rather than let spawn fail silently on every event, drop the script
         // and warn once at construction time.
@@ -700,20 +703,41 @@ mod tests {
     #[test]
     fn notifier_script_always_fires_regardless_of_severity() {
         // Script backend should always dispatch even for Silent events.
-        assert!(Notifier::should_dispatch(Severity::Silent, &Event::SyncStarted));
-        assert!(Notifier::should_dispatch(Severity::Silent, &Event::SyncComplete));
+        assert!(Notifier::should_dispatch(
+            Severity::Silent,
+            &Event::SyncStarted
+        ));
+        assert!(Notifier::should_dispatch(
+            Severity::Silent,
+            &Event::SyncComplete
+        ));
     }
 
     #[test]
     fn should_dispatch_respects_threshold() {
         // Warn threshold: Info events don't pass, Warn+ do.
-        assert!(!Notifier::should_dispatch(Severity::Warn, &Event::SyncStarted));
-        assert!(Notifier::should_dispatch(Severity::Warn, &Event::RateLimited));
+        assert!(!Notifier::should_dispatch(
+            Severity::Warn,
+            &Event::SyncStarted
+        ));
+        assert!(Notifier::should_dispatch(
+            Severity::Warn,
+            &Event::RateLimited
+        ));
         assert!(Notifier::should_dispatch(Severity::Warn, &Event::DiskLow));
         // Critical threshold: only Critical passes.
-        assert!(!Notifier::should_dispatch(Severity::Critical, &Event::SyncStarted));
-        assert!(!Notifier::should_dispatch(Severity::Critical, &Event::RateLimited));
-        assert!(Notifier::should_dispatch(Severity::Critical, &Event::TwoFaRequired));
+        assert!(!Notifier::should_dispatch(
+            Severity::Critical,
+            &Event::SyncStarted
+        ));
+        assert!(!Notifier::should_dispatch(
+            Severity::Critical,
+            &Event::RateLimited
+        ));
+        assert!(Notifier::should_dispatch(
+            Severity::Critical,
+            &Event::TwoFaRequired
+        ));
     }
 
     #[test]
