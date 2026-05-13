@@ -587,7 +587,7 @@ impl Clone for Notifier {
         Self {
             script: self.script.clone(),
             min_severity: self.min_severity,
-            desktop: self.desktop,
+            desktop: self.desktop.clone(),
             webhooks: self.webhooks.clone(),
             concurrency: Arc::clone(&self.concurrency),
         }
