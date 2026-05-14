@@ -475,6 +475,20 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_HTTP_BIND")]
     pub http_bind: Option<std::net::IpAddr>,
 
+    /// Bind address for control endpoints: status page, pause/resume, sync-now, SSE.
+    /// Default: 127.0.0.1 (loopback-only). Separate from --http-bind so /healthz and
+    /// /metrics can be public while control endpoints stay restricted. Also
+    /// configurable via `[server] control_bind` in TOML.
+    #[arg(long = "control-bind", env = "KEI_CONTROL_BIND")]
+    pub control_bind: Option<std::net::IpAddr>,
+
+    /// Enable desktop notifications (macOS Notification Center, Windows Toasts,
+    /// Linux libnotify). Default: true. Pass `--desktop-notifications false`
+    /// or set `[notifications] desktop = false` in TOML to disable.
+    #[arg(long = "desktop-notifications", env = "KEI_DESKTOP_NOTIFICATIONS",
+           num_args = 0..=1, default_missing_value = "true")]
+    pub desktop_notifications: Option<bool>,
+
     /// After successful auth, persist the password to the credential store
     /// (OS keyring or encrypted file).
     #[arg(long)]
@@ -1162,6 +1176,12 @@ impl SyncArgs {
             self.notification_script
                 .clone_from(&fallback.notification_script);
         }
+        if self.control_bind.is_none() {
+            self.control_bind = fallback.control_bind;
+        }
+        if self.desktop_notifications.is_none() {
+            self.desktop_notifications = fallback.desktop_notifications;
+        }
         if self.report_json.is_none() {
             self.report_json.clone_from(&fallback.report_json);
         }
@@ -1576,6 +1596,12 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     }
     if matches.value_source("notification_script") == Some(ValueSource::CommandLine) {
         out.push("--notification-script");
+    }
+    if matches.value_source("control_bind") == Some(ValueSource::CommandLine) {
+        out.push("--control-bind");
+    }
+    if matches.value_source("desktop_notifications") == Some(ValueSource::CommandLine) {
+        out.push("--desktop-notifications");
     }
     if matches.value_source("report_json") == Some(ValueSource::CommandLine) {
         out.push("--report-json");

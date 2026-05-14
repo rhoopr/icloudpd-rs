@@ -1,38 +1,150 @@
-//! Notification script support for unattended operation.
+//! Notification support for unattended operation.
 //!
-//! Fires a user-provided script with event information as environment variables.
-//! Used to notify users of 2FA expiry, sync completion, failures, etc.
+//! Provides a severity-tagged event taxonomy and a multi-backend notifier.
+//! Backends include script execution, desktop notifications (stub, PR 2),
+//! and webhooks (stub, PR 3). Script execution is the only operational
+//! backend in this PR and preserves full backward compatibility.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Events that trigger notification scripts.
+// ── Severity ────────────────────────────────────────────────────────
+
+/// Severity level for notification routing.
+///
+/// Backends can filter by severity so that e.g. desktop only shows Warn+,
+/// while a script always gets everything. Ordered: `Silent < Info < Warn < Critical`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Severity {
+    /// Not surfaced to any user-facing backend.
+    Silent,
+    /// Informational — sync started, completed, resumed.
+    Info,
+    /// Warning — partial failure, rate limiting, drift, auth expiring.
+    Warn,
+    /// Critical — session expired, disk full, all downloads failed.
+    Critical,
+}
+
+// ── FailureMode ─────────────────────────────────────────────────────
+
+/// Failure classification for [`Event::SyncFailed`].
+///
+/// [`SessionExpired`] and [`AllFailed`] are not constructed in PR 1;
+/// they are wired in PR 2 (desktop notifications) and PR 3 (webhooks).
+#[allow(dead_code, reason = "stub variants wired in PRs 2 & 3")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Event {
-    /// 2FA code is needed (session expired in headless mode)
-    TwoFaRequired,
-    /// A sync cycle is about to run (fires before run_cycle, after skip-check)
-    SyncStarted,
-    /// Sync cycle completed successfully
-    SyncComplete,
-    /// Sync cycle had failures
-    SyncFailed,
-    /// Session expired and re-authentication failed
+pub(crate) enum FailureMode {
+    /// Some downloads failed, but the cycle otherwise completed.
+    Partial(usize),
+    /// Authentication session expired and re-authentication failed.
     SessionExpired,
+    /// All downloads failed for reasons other than session expiry.
+    AllFailed,
+}
+
+// ── Event ───────────────────────────────────────────────────────────
+
+/// Events that trigger notification backends.
+///
+/// Each variant carries a [`Severity`] tag so backends can route by
+/// importance. The `Copy` derive is intentionally omitted because
+/// [`SyncFailed`](Event::SyncFailed) wraps a [`FailureMode`] — clone
+/// is still cheap (a `usize` discriminant + one word of data).
+///
+/// New variants (`DiskLow` through `Resumed`) are stub-only in PR 1;
+/// events are fired in PR 2 (desktop) and PR 3 (webhooks).
+#[allow(dead_code, reason = "new variants wired in PRs 2 & 3")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Event {
+    // ── Existing (re-tagged) ────────────────────────────────────
+    /// 2FA code is needed (session expired in headless mode).
+    TwoFaRequired,
+    /// A sync cycle is about to run (fires after skip-check, before run_cycle).
+    SyncStarted,
+    /// Sync cycle completed successfully.
+    SyncComplete,
+    /// Sync cycle had failures. Severity depends on [`FailureMode`]:
+    /// `Partial` → Warn; `SessionExpired` / `AllFailed` → Critical.
+    SyncFailed(FailureMode),
+    /// Session expired and re-authentication failed.
+    SessionExpired,
+
+    // ── New (v0.15) ────────────────────────────────────────────
+    /// Low disk space (< 100 MiB free on download volume).
+    DiskLow,
+    /// Disk space recovered above low threshold.
+    DiskRecovered,
+    /// Session age > 80 % of typical lifetime (pre-warning before expiry).
+    AuthExpiring,
+    /// 429 / 503 received this sync cycle.
+    RateLimited,
+    /// Adaptive throttle engaged (backoff active).
+    ThrottleEngaged,
+    /// Adaptive throttle disengaged (backoff decayed to baseline).
+    ThrottleDisengaged,
+    /// Asset count / size mismatch vs iCloud enumeration response.
+    DriftDetected,
+    /// Sync paused (user or disk-pressure).
+    Paused,
+    /// Sync resumed after pause.
+    Resumed,
 }
 
 impl Event {
-    const fn as_str(self) -> &'static str {
+    /// Human-readable event name for script env var `KEI_EVENT`.
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::TwoFaRequired => "2fa_required",
             Self::SyncStarted => "sync_started",
             Self::SyncComplete => "sync_complete",
-            Self::SyncFailed => "sync_failed",
+            Self::SyncFailed(_) => "sync_failed",
             Self::SessionExpired => "session_expired",
+            Self::DiskLow => "disk_low",
+            Self::DiskRecovered => "disk_recovered",
+            Self::AuthExpiring => "auth_expiring",
+            Self::RateLimited => "rate_limited",
+            Self::ThrottleEngaged => "throttle_engaged",
+            Self::ThrottleDisengaged => "throttle_disengaged",
+            Self::DriftDetected => "drift_detected",
+            Self::Paused => "paused",
+            Self::Resumed => "resumed",
+        }
+    }
+
+    /// Severity tag for backend routing.
+    #[allow(
+        dead_code,
+        reason = "consumed by desktop/webhook backends in PRs 2 & 3"
+    )]
+    pub(crate) fn severity(&self) -> Severity {
+        match self {
+            Self::TwoFaRequired => Severity::Critical,
+            Self::SyncStarted => Severity::Info,
+            Self::SyncComplete => Severity::Info,
+            Self::SyncFailed(mode) => match mode {
+                FailureMode::Partial(_) => Severity::Warn,
+                FailureMode::SessionExpired | FailureMode::AllFailed => Severity::Critical,
+            },
+            Self::SessionExpired => Severity::Critical,
+            Self::DiskLow => Severity::Critical,
+            Self::DiskRecovered => Severity::Info,
+            Self::AuthExpiring => Severity::Warn,
+            Self::RateLimited => Severity::Warn,
+            Self::ThrottleEngaged => Severity::Info,
+            Self::ThrottleDisengaged => Severity::Info,
+            Self::DriftDetected => Severity::Warn,
+            Self::Paused => Severity::Info,
+            Self::Resumed => Severity::Info,
         }
     }
 }
+
+// ── SyncNotificationData ────────────────────────────────────────────
 
 /// Sync statistics passed to notification scripts as environment variables.
 #[derive(Debug, Clone, Default)]
@@ -91,11 +203,61 @@ impl From<&crate::download::SyncStats> for SyncNotificationData {
     }
 }
 
-/// Notification dispatcher. Holds an optional script path.
-/// When no script is configured, all methods are no-ops.
+// ── Stub backends (PRs 2 & 3) ──────────────────────────────────────
+
+/// Stub desktop notification backend. Full implementation in PR 2.
+///
+/// In PR 1 this stores whether the user opted in but performs no actual
+/// notification delivery.
+#[allow(dead_code, reason = "stub — wired in PR 2")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DesktopBackend {
+    pub enabled: bool,
+}
+
+impl DesktopBackend {
+    #[allow(dead_code, reason = "stub — wired in PR 2")]
+    pub(crate) const fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+}
+
+/// Error type for webhook delivery failures.
+#[allow(dead_code, reason = "stub — wired in PR 3")]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WebhookError {
+    #[error("HTTP {status}: {body}")]
+    Http { status: u16, body: String },
+    #[error("Timeout after {0}s")]
+    Timeout(u64),
+    #[error("Serialization: {0}")]
+    Serialization(String),
+}
+
+/// Trait for webhook notification backends. Implementations in PR 3.
+#[allow(dead_code, reason = "stub — implemented in PR 3")]
+#[async_trait::async_trait]
+pub(crate) trait WebhookBackend: Send + Sync + std::fmt::Debug {
+    /// Human-readable backend name for logging.
+    fn name(&self) -> &'static str;
+    /// Minimum severity that triggers this backend.
+    fn min_severity(&self) -> Severity;
+    /// Deliver the event. Called in a spawned task; errors are logged, not
+    /// propagated.
+    async fn send(&self, event: Event, message: &str, username: &str) -> Result<(), WebhookError>;
+}
+
+// ── Notifier ────────────────────────────────────────────────────────
+
+/// Notification dispatcher. Holds an optional script path plus stub
+/// desktop/webhook slots. When no script is configured, all methods are
+/// no-ops (matching pre-v0.15 behaviour exactly).
 #[derive(Debug, Clone)]
 pub(crate) struct Notifier {
     script: Option<PathBuf>,
+    /// Stub — becomes `Option<DesktopBackend>` in PR 2.
+    #[allow(dead_code, reason = "stub — consumed by desktop backend in PR 2")]
+    desktop_enabled: bool,
     /// Bounds how many notification scripts can run concurrently. A
     /// misbehaving or long-running script can't queue an unbounded
     /// number of spawned tasks behind itself under load.
@@ -111,7 +273,13 @@ const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const NOTIFIER_MAX_INFLIGHT: usize = 8;
 
 impl Notifier {
-    pub fn new(script: Option<PathBuf>) -> Self {
+    /// Create a new notifier.
+    ///
+    /// `script` — path to a user-provided notification script (Unix only;
+    /// silently dropped on Windows).
+    ///
+    /// `desktop_enabled` — stub flag; full `DesktopBackend` wired in PR 2.
+    pub fn new(script: Option<PathBuf>, desktop_enabled: bool) -> Self {
         // kei invokes scripts via `/bin/sh`, which isn't available on Windows.
         // Rather than let spawn fail silently on every event, drop the script
         // and warn once at construction time.
@@ -122,17 +290,22 @@ impl Notifier {
             );
             return Self {
                 script: None,
+                desktop_enabled: false,
                 concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
             };
         }
         Self {
             script,
+            desktop_enabled,
             concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
         }
     }
 
     /// Fire the notification script with the given event.
-    /// Fire-and-forget: spawns the script in a background task so it never blocks sync.
+    ///
+    /// Fire-and-forget: spawns the script in a background task so it never
+    /// blocks sync. Desktop and webhook dispatch is stubbed — only script
+    /// execution is active in this PR.
     pub fn notify(
         &self,
         event: Event,
@@ -140,6 +313,7 @@ impl Notifier {
         username: &str,
         data: Option<&SyncNotificationData>,
     ) {
+        // ── Script backend ──────────────────────────────────────
         let Some(script) = self.script.clone() else {
             return;
         };
@@ -203,7 +377,18 @@ impl Notifier {
             }
         });
     }
+
+    /// Whether a desktop notification backend exists and is enabled.
+    ///
+    /// Stub — always `false` in this PR. PR 2 wires the real
+    /// [`DesktopBackend`] with container detection.
+    #[allow(dead_code, reason = "stub — consumed by desktop backend in PR 2")]
+    pub(crate) fn desktop_enabled(&self) -> bool {
+        self.desktop_enabled
+    }
 }
+
+// ── Script runner ───────────────────────────────────────────────────
 
 async fn run_script(
     script: &Path,
@@ -284,35 +469,153 @@ async fn run_script(
     }
 }
 
+// ── Tests ───────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Severity ─────────────────────────────────────────────────
+
+    #[test]
+    fn severity_ordering() {
+        assert!(Severity::Silent < Severity::Info);
+        assert!(Severity::Info < Severity::Warn);
+        assert!(Severity::Warn < Severity::Critical);
+    }
+
+    // ── Event::as_str ────────────────────────────────────────────
 
     #[test]
     fn event_as_str() {
         assert_eq!(Event::TwoFaRequired.as_str(), "2fa_required");
         assert_eq!(Event::SyncStarted.as_str(), "sync_started");
         assert_eq!(Event::SyncComplete.as_str(), "sync_complete");
-        assert_eq!(Event::SyncFailed.as_str(), "sync_failed");
+        assert_eq!(
+            Event::SyncFailed(FailureMode::Partial(3)).as_str(),
+            "sync_failed"
+        );
+        assert_eq!(
+            Event::SyncFailed(FailureMode::SessionExpired).as_str(),
+            "sync_failed"
+        );
+        assert_eq!(
+            Event::SyncFailed(FailureMode::AllFailed).as_str(),
+            "sync_failed"
+        );
         assert_eq!(Event::SessionExpired.as_str(), "session_expired");
+        assert_eq!(Event::DiskLow.as_str(), "disk_low");
+        assert_eq!(Event::DiskRecovered.as_str(), "disk_recovered");
+        assert_eq!(Event::AuthExpiring.as_str(), "auth_expiring");
+        assert_eq!(Event::RateLimited.as_str(), "rate_limited");
+        assert_eq!(Event::ThrottleEngaged.as_str(), "throttle_engaged");
+        assert_eq!(Event::ThrottleDisengaged.as_str(), "throttle_disengaged");
+        assert_eq!(Event::DriftDetected.as_str(), "drift_detected");
+        assert_eq!(Event::Paused.as_str(), "paused");
+        assert_eq!(Event::Resumed.as_str(), "resumed");
     }
+
+    // ── Event::severity ──────────────────────────────────────────
+
+    #[test]
+    fn event_severity_existing_variants() {
+        assert_eq!(Event::TwoFaRequired.severity(), Severity::Critical);
+        assert_eq!(Event::SyncStarted.severity(), Severity::Info);
+        assert_eq!(Event::SyncComplete.severity(), Severity::Info);
+        assert_eq!(
+            Event::SyncFailed(FailureMode::Partial(5)).severity(),
+            Severity::Warn
+        );
+        assert_eq!(
+            Event::SyncFailed(FailureMode::SessionExpired).severity(),
+            Severity::Critical
+        );
+        assert_eq!(
+            Event::SyncFailed(FailureMode::AllFailed).severity(),
+            Severity::Critical
+        );
+        assert_eq!(Event::SessionExpired.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn event_severity_new_variants() {
+        assert_eq!(Event::DiskLow.severity(), Severity::Critical);
+        assert_eq!(Event::DiskRecovered.severity(), Severity::Info);
+        assert_eq!(Event::AuthExpiring.severity(), Severity::Warn);
+        assert_eq!(Event::RateLimited.severity(), Severity::Warn);
+        assert_eq!(Event::ThrottleEngaged.severity(), Severity::Info);
+        assert_eq!(Event::ThrottleDisengaged.severity(), Severity::Info);
+        assert_eq!(Event::DriftDetected.severity(), Severity::Warn);
+        assert_eq!(Event::Paused.severity(), Severity::Info);
+        assert_eq!(Event::Resumed.severity(), Severity::Info);
+    }
+
+    #[test]
+    fn sync_failed_severity_differs_by_failure_mode() {
+        // Partial failure → Warn
+        assert_eq!(
+            Event::SyncFailed(FailureMode::Partial(1)).severity(),
+            Severity::Warn
+        );
+        assert_eq!(
+            Event::SyncFailed(FailureMode::Partial(100)).severity(),
+            Severity::Warn
+        );
+        // Session expiry → Critical
+        assert_eq!(
+            Event::SyncFailed(FailureMode::SessionExpired).severity(),
+            Severity::Critical
+        );
+        // All failed → Critical
+        assert_eq!(
+            Event::SyncFailed(FailureMode::AllFailed).severity(),
+            Severity::Critical
+        );
+    }
+
+    // ── DesktopBackend ───────────────────────────────────────────
+
+    #[test]
+    fn desktop_backend_new_enabled() {
+        let b = DesktopBackend::new(true);
+        assert!(b.enabled);
+    }
+
+    #[test]
+    fn desktop_backend_new_disabled() {
+        let b = DesktopBackend::new(false);
+        assert!(!b.enabled);
+    }
+
+    // ── Notifier construction ────────────────────────────────────
 
     #[cfg(windows)]
     #[test]
     fn notifier_drops_script_on_windows() {
-        let notifier = Notifier::new(Some(PathBuf::from("C:/does/not/matter.sh")));
+        let notifier = Notifier::new(Some(PathBuf::from("C:/does/not/matter.sh")), false);
         assert!(notifier.script.is_none());
+        assert!(!notifier.desktop_enabled());
     }
 
     #[test]
     fn notifier_none_is_noop() {
-        let notifier = Notifier::new(None);
+        let notifier = Notifier::new(None, false);
         assert!(notifier.script.is_none());
+        assert!(!notifier.desktop_enabled());
+    }
+
+    #[test]
+    fn notifier_with_desktop_enabled() {
+        let notifier = Notifier::new(None, true);
+        assert!(notifier.desktop_enabled());
     }
 
     #[test]
     fn notify_with_nonexistent_script() {
-        let notifier = Notifier::new(Some(PathBuf::from("/tmp/claude/nonexistent_notify.sh")));
+        let notifier = Notifier::new(
+            Some(PathBuf::from("/tmp/claude/nonexistent_notify.sh")),
+            false,
+        );
         // Should not panic, just log a warning (script existence checked synchronously)
         notifier.notify(
             Event::SyncComplete,
@@ -322,6 +625,8 @@ mod tests {
         );
     }
 
+    // ── Script runner helpers ────────────────────────────────────
+
     /// Write a shell script to a temp dir. No executable permission needed
     /// since `run_script` invokes scripts via `/bin/sh`.
     #[cfg(unix)]
@@ -330,6 +635,8 @@ mod tests {
         std::fs::write(&path, body).unwrap();
         path
     }
+
+    // ── run_script tests ─────────────────────────────────────────
 
     #[cfg(unix)]
     #[tokio::test]
@@ -355,6 +662,8 @@ mod tests {
         assert!(!status.success());
     }
 
+    // ── notify() tests ───────────────────────────────────────────
+
     #[cfg(unix)]
     #[tokio::test]
     async fn notify_runs_script_with_env_vars() {
@@ -366,7 +675,7 @@ mod tests {
         );
         let script_path = write_test_script(dir.path(), "test_notify.sh", body.as_bytes());
 
-        let notifier = Notifier::new(Some(script_path.clone()));
+        let notifier = Notifier::new(Some(script_path.clone()), false);
         notifier.notify(
             Event::TwoFaRequired,
             "Need 2FA code",
@@ -411,7 +720,7 @@ mod tests {
             ..SyncNotificationData::default()
         };
 
-        let notifier = Notifier::new(Some(script_path));
+        let notifier = Notifier::new(Some(script_path), false);
         notifier.notify(Event::SyncComplete, "test", "user@example.com", Some(&data));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -429,6 +738,8 @@ mod tests {
         let output = std::fs::read_to_string(&output_path).unwrap();
         assert_eq!(output.trim(), "42|3|100|1500000|80");
     }
+
+    // ── Semaphore / saturation tests ─────────────────────────────
 
     /// Test scaffold: a barrier-blocked sh script that tracks both
     /// concurrent in-flight invocations (per-pid marker files) and
@@ -506,7 +817,7 @@ mod tests {
     #[tokio::test]
     async fn notifier_semaphore_caps_concurrent_inflight() {
         let fixture = BarrierFixture::new();
-        let notifier = Notifier::new(Some(fixture.script_path.clone()));
+        let notifier = Notifier::new(Some(fixture.script_path.clone()), false);
         for _ in 0..NOTIFIER_MAX_INFLIGHT * 2 {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
@@ -548,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn notifier_drops_events_when_saturated() {
         let fixture = BarrierFixture::new();
-        let notifier = Notifier::new(Some(fixture.script_path.clone()));
+        let notifier = Notifier::new(Some(fixture.script_path.clone()), false);
         for _ in 0..NOTIFIER_MAX_INFLIGHT * 4 {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
@@ -615,7 +926,7 @@ mod tests {
         );
         let script_path = write_test_script(dir.path(), "test_no_data.sh", body.as_bytes());
 
-        let notifier = Notifier::new(Some(script_path));
+        let notifier = Notifier::new(Some(script_path), false);
         notifier.notify(Event::SyncComplete, "test", "user@example.com", None);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
