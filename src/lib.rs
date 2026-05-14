@@ -52,6 +52,7 @@ mod state;
 mod string_interner;
 mod sync_loop;
 mod systemd;
+mod throttle;
 mod types;
 
 #[cfg(test)]

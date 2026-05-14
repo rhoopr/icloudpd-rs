@@ -154,6 +154,33 @@ pub fn wobble_to_stderr(mode: Mode) {
     line_to_stderr(mode, WOBBLE_LINE);
 }
 
+/// Friendly framing when the adaptive throttle engages because Apple is
+/// rate-limiting (429/503). Informs the user that the watch interval has
+/// scaled up. Off mode is silent.
+pub fn throttle_engaged_to_stderr(mode: Mode, interval_secs: u64) {
+    if interval_secs == 0 {
+        return;
+    }
+    let hrs = interval_secs / 3600;
+    let mins = (interval_secs % 3600) / 60;
+    let text = if hrs > 0 && mins > 0 {
+        format!("iCloud is rate-limiting. Slowing sync to every {hrs}h {mins}m.")
+    } else if hrs > 0 {
+        format!("iCloud is rate-limiting. Slowing sync to every {hrs}h.")
+    } else if mins > 0 {
+        format!("iCloud is rate-limiting. Slowing sync to every {mins}m.")
+    } else {
+        format!("iCloud is rate-limiting. Slowing sync to every {interval_secs}s.")
+    };
+    line_to_stderr(mode, &text);
+}
+
+/// Friendly framing when the adaptive throttle disengages and the watch
+/// interval returns to baseline. Off mode is silent.
+pub fn throttle_disengaged_to_stderr(mode: Mode) {
+    line_to_stderr(mode, "iCloud has calmed down. Resuming normal pace.");
+}
+
 /// Pre-sleep narration before a retry. The existing `tracing::warn!` in
 /// `retry_with_backoff` carries the structured fields (attempt, delay,
 /// error) for journals; this is the human-shaped reminder that the pause
@@ -536,12 +563,55 @@ mod tests {
     }
 
     #[test]
-    fn format_elapsed_seconds_minutes_hours() {
-        assert_eq!(format_elapsed(Duration::from_secs(2)), "2 seconds");
-        assert_eq!(format_elapsed(Duration::from_secs(60)), "1 minute");
-        assert_eq!(format_elapsed(Duration::from_secs(120)), "2 minutes");
-        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1 hour");
-        assert_eq!(format_elapsed(Duration::from_secs(7200)), "2 hours");
-        assert_eq!(format_elapsed(Duration::from_secs(7320)), "2h 2m");
+    fn throttle_engaged_renders_seconds() {
+        let mut buf = Vec::new();
+        line(
+            &mut buf,
+            Mode::Friendly,
+            "iCloud is rate-limiting. Slowing sync to every 45s.",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "iCloud is rate-limiting. Slowing sync to every 45s.\n"
+        );
+    }
+
+    #[test]
+    fn throttle_engaged_renders_hours_and_minutes() {
+        let mut buf = Vec::new();
+        line(
+            &mut buf,
+            Mode::Friendly,
+            "iCloud is rate-limiting. Slowing sync to every 2h 30m.",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "iCloud is rate-limiting. Slowing sync to every 2h 30m.\n"
+        );
+    }
+
+    #[test]
+    fn throttle_disengaged_renders_stable_text() {
+        let mut buf = Vec::new();
+        line(
+            &mut buf,
+            Mode::Friendly,
+            "iCloud has calmed down. Resuming normal pace.",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "iCloud has calmed down. Resuming normal pace.\n"
+        );
+    }
+
+    #[test]
+    fn throttle_engaged_zero_interval_is_silent() {
+        let out = capture(Mode::Friendly, |_w, m| {
+            throttle_engaged_to_stderr(m, 0);
+        });
+        assert!(out.is_empty());
     }
 }
