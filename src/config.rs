@@ -7,6 +7,20 @@ use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Print to stderr during config load, before the tracing subscriber is
+/// installed. Deduplicates the `#[allow(clippy::print_stderr)]` boilerplate.
+macro_rules! config_eprintln {
+    ($($arg:tt)*) => {
+        #[allow(
+            clippy::print_stderr,
+            reason = "runs during config load, before tracing subscriber is installed"
+        )]
+        {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 // ── TOML config structs ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -474,30 +488,18 @@ pub(crate) const fn unfiled_default() -> bool {
 /// surface being deprecated (e.g. `` `--exclude-album` ``); `replacement` is
 /// the suggested new form.
 pub(crate) fn warn_deprecated(old: &str, replacement: &str) {
-    #[allow(
-        clippy::print_stderr,
-        reason = "runs during config load, before tracing subscriber is installed"
-    )]
-    {
-        eprintln!(
-            "warning: {old} is deprecated and will be removed in v0.20.0; use {replacement} instead"
-        );
-    }
+    config_eprintln!(
+        "warning: {old} is deprecated and will be removed in v0.20.0; use {replacement} instead"
+    );
 }
 
 /// `--exclude-album` accepts comma-separated values; `--album` does not, so a
 /// mechanical rewrite of `--exclude-album A,B` to `--album '!A,!B'` would
 /// silently produce one literal album name.
 fn warn_exclude_album_comma_split() {
-    #[allow(
-        clippy::print_stderr,
-        reason = "runs during config load, before tracing subscriber is installed"
-    )]
-    {
-        eprintln!(
-            "note: --exclude-album splits on commas; --album does not. --exclude-album A,B becomes --album '!A' --album '!B' (two flags), not --album '!A,!B' (one literal name)."
-        );
-    }
+    config_eprintln!(
+        "note: --exclude-album splits on commas; --album does not. --exclude-album A,B becomes --album '!A' --album '!B' (two flags), not --album '!A,!B' (one literal name)."
+    );
 }
 
 /// `--album none` callers explicitly opted out of album passes and aren't
@@ -1157,15 +1159,9 @@ pub(crate) fn resolve_data_dir(
         return expand_tilde(d);
     }
     if let Some(d) = cookie_directory_cli {
-        #[allow(
-            clippy::print_stderr,
-            reason = "runs during config load, before tracing subscriber is installed"
-        )]
-        {
-            eprintln!(
-                "warning: `--cookie-directory` is deprecated and will be removed in v0.20.0, use `--data-dir` instead"
-            );
-        }
+        config_eprintln!(
+            "warning: `--cookie-directory` is deprecated and will be removed in v0.20.0, use `--data-dir` instead"
+        );
         return expand_tilde(d);
     }
     if let Some(d) = toml.and_then(|t| t.data_dir.as_deref()) {
@@ -1175,15 +1171,9 @@ pub(crate) fn resolve_data_dir(
         .and_then(|t| t.auth.as_ref())
         .and_then(|a| a.cookie_directory.as_deref())
     {
-        #[allow(
-            clippy::print_stderr,
-            reason = "runs during config load, before tracing subscriber is installed"
-        )]
-        {
-            eprintln!(
-                "warning: `[auth] cookie_directory` is deprecated and will be removed in v0.20.0, use top-level `data_dir` instead"
-            );
-        }
+        config_eprintln!(
+            "warning: `[auth] cookie_directory` is deprecated and will be removed in v0.20.0, use top-level `data_dir` instead"
+        );
         return expand_tilde(d);
     }
     // Default: parent of config file path
@@ -1311,15 +1301,9 @@ fn resolve_auth_section(
 
     // `--no-incremental` deprecation.
     if no_incremental {
-        #[allow(
-            clippy::print_stderr,
-            reason = "runs during config load, before tracing subscriber is installed"
-        )]
-        {
-            eprintln!(
-                "warning: `--no-incremental` is deprecated and will be removed in v0.20.0, use `kei reset sync-token` before sync for the same effect"
-            );
-        }
+        config_eprintln!(
+            "warning: `--no-incremental` is deprecated and will be removed in v0.20.0, use `kei reset sync-token` before sync for the same effect"
+        );
     }
 
     // Convert plain password string to SecretString.
@@ -1390,15 +1374,9 @@ fn resolve_download_section(
     let directory_cli = if let Some(d) = sync.download_dir.clone() {
         Some(d)
     } else if let Some(d) = sync.directory.clone() {
-        #[allow(
-            clippy::print_stderr,
-            reason = "runs during config load, before tracing subscriber is installed"
-        )]
-        {
-            eprintln!(
-                "warning: `--directory` / `KEI_DIRECTORY` is deprecated and will be removed in v0.20.0, use `--download-dir` / `KEI_DOWNLOAD_DIR` instead"
-            );
-        }
+        config_eprintln!(
+            "warning: `--directory` / `KEI_DIRECTORY` is deprecated and will be removed in v0.20.0, use `--download-dir` / `KEI_DOWNLOAD_DIR` instead"
+        );
         Some(d)
     } else {
         None
@@ -1470,28 +1448,16 @@ fn resolve_download_section(
     let threads_num = if let Some(n) = sync.threads {
         n
     } else if let Some(n) = sync.threads_num {
-        #[allow(
-            clippy::print_stderr,
-            reason = "runs during config load, before tracing subscriber is installed"
-        )]
-        {
-            eprintln!(
-                "warning: `--threads-num` / `KEI_THREADS_NUM` is deprecated and will be removed in v0.20.0, use `--threads` / `KEI_THREADS` instead"
-            );
-        }
+        config_eprintln!(
+            "warning: `--threads-num` / `KEI_THREADS_NUM` is deprecated and will be removed in v0.20.0, use `--threads` / `KEI_THREADS` instead"
+        );
         n
     } else if let Some(n) = toml_threads {
         n
     } else if let Some(n) = toml_threads_num {
-        #[allow(
-            clippy::print_stderr,
-            reason = "runs during config load, before tracing subscriber is installed"
-        )]
-        {
-            eprintln!(
-                "warning: `[download] threads_num` is deprecated and will be removed in v0.20.0, use `[download] threads` instead"
-            );
-        }
+        config_eprintln!(
+            "warning: `[download] threads_num` is deprecated and will be removed in v0.20.0, use `[download] threads` instead"
+        );
         n
     } else {
         threads_default
@@ -1869,15 +1835,9 @@ impl Config {
         );
         let explicit_retry_delay = sync.retry_delay.or(toml_retry.and_then(|r| r.delay));
         let retry_delay_secs = if let Some(d) = explicit_retry_delay {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--retry-delay` / `KEI_RETRY_DELAY` / `[download.retry] delay` is deprecated and will be removed in v0.20.0. The initial retry delay is now derived from `--max-retries`; remove the explicit setting to use the smart default."
-                );
-            }
+            config_eprintln!(
+                "warning: `--retry-delay` / `KEI_RETRY_DELAY` / `[download.retry] delay` is deprecated and will be removed in v0.20.0. The initial retry delay is now derived from `--max-retries`; remove the explicit setting to use the smart default."
+            );
             d
         } else {
             smart_retry_delay(max_retries)
