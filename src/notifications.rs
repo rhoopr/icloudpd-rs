@@ -382,6 +382,13 @@ pub(crate) trait WebhookBackend: Send + Sync + std::fmt::Debug {
 /// Shared HTTP timeout for webhook delivery.
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Shared HTTP client for webhook delivery. Reusing a single [`reqwest::Client`]
+/// amortizes connection-pool setup and DNS resolution across calls.
+fn webhook_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 async fn check_response(resp: reqwest::Response) -> Result<(), WebhookError> {
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
@@ -393,7 +400,7 @@ async fn check_response(resp: reqwest::Response) -> Result<(), WebhookError> {
 
 /// POST JSON payload to `url` and translate non-success into [`WebhookError`].
 async fn post_json(url: &str, payload: impl serde::Serialize) -> Result<(), WebhookError> {
-    let client = reqwest::Client::new();
+    let client = webhook_client();
     let resp = client
         .post(url)
         .json(&payload)
@@ -408,7 +415,7 @@ async fn post_json(url: &str, payload: impl serde::Serialize) -> Result<(), Webh
 
 /// POST plain-text body to `url` with an optional `Title` header.
 async fn post_plain(url: &str, title: Option<&str>, body: &str) -> Result<(), WebhookError> {
-    let client = reqwest::Client::new();
+    let client = webhook_client();
     let mut req = client.post(url).body(body.to_string());
     if let Some(t) = title {
         req = req.header("Title", t);

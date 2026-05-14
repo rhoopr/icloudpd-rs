@@ -1453,190 +1453,91 @@ fn subcommand_display_name(cmd: &Command) -> &'static str {
 /// combines a non-sync subcommand with bare-kei sync flags. Each branch
 /// corresponds 1:1 to a `SyncArgs` field; when adding a new sync flag,
 /// extend this function so it shows up in the rejection message.
+/// Push a flag name to `out` when `matches` shows the corresponding arg
+/// was explicitly provided on the command line (not env or default).
+macro_rules! push_if_cli {
+    ($matches:expr, $out:expr, $($name:literal => $flag:literal),+ $(,)?) => {
+        $(
+            if $matches.value_source($name) == Some(clap::parser::ValueSource::CommandLine) {
+                $out.push($flag);
+            }
+        )+
+    };
+}
+
 fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str> {
-    use clap::parser::ValueSource;
     let mut out = Vec::new();
-    if matches.value_source("download_dir") == Some(ValueSource::CommandLine) {
-        out.push("--download-dir");
-    }
-    if matches.value_source("directory") == Some(ValueSource::CommandLine) {
-        out.push("--directory");
-    }
-    if matches.value_source("albums") == Some(ValueSource::CommandLine) {
-        out.push("--album");
-    }
-    if matches.value_source("exclude_albums") == Some(ValueSource::CommandLine) {
-        out.push("--exclude-album");
-    }
-    if matches.value_source("smart_folders") == Some(ValueSource::CommandLine) {
-        out.push("--smart-folder");
-    }
-    if matches.value_source("unfiled") == Some(ValueSource::CommandLine) {
-        out.push("--unfiled");
-    }
-    if matches.value_source("filename_exclude") == Some(ValueSource::CommandLine) {
-        out.push("--filename-exclude");
-    }
-    if matches.value_source("libraries") == Some(ValueSource::CommandLine) {
-        out.push("--library");
-    }
-    if matches.value_source("size") == Some(ValueSource::CommandLine) {
-        out.push("--size");
-    }
-    if matches.value_source("live_photo_size") == Some(ValueSource::CommandLine) {
-        out.push("--live-photo-size");
-    }
-    if matches.value_source("recent") == Some(ValueSource::CommandLine) {
-        out.push("--recent");
-    }
-    if matches.value_source("threads") == Some(ValueSource::CommandLine) {
-        out.push("--threads");
-    }
-    if matches.value_source("threads_num") == Some(ValueSource::CommandLine) {
-        out.push("--threads-num");
-    }
-    if matches.value_source("bandwidth_limit") == Some(ValueSource::CommandLine) {
-        out.push("--bandwidth-limit");
-    }
-    if matches.value_source("skip_videos") == Some(ValueSource::CommandLine) {
-        out.push("--skip-videos");
-    }
-    if matches.value_source("skip_photos") == Some(ValueSource::CommandLine) {
-        out.push("--skip-photos");
-    }
-    if matches.value_source("live_photo_mode") == Some(ValueSource::CommandLine) {
-        out.push("--live-photo-mode");
-    }
-    if matches.value_source("skip_live_photos") == Some(ValueSource::CommandLine) {
-        out.push("--skip-live-photos");
-    }
-    if matches.value_source("force_size") == Some(ValueSource::CommandLine) {
-        out.push("--force-size");
-    }
-    if matches.value_source("folder_structure") == Some(ValueSource::CommandLine) {
-        out.push("--folder-structure");
-    }
-    if matches.value_source("folder_structure_albums") == Some(ValueSource::CommandLine) {
-        out.push("--folder-structure-albums");
-    }
-    if matches.value_source("folder_structure_smart_folders") == Some(ValueSource::CommandLine) {
-        out.push("--folder-structure-smart-folders");
-    }
+    push_if_cli!(matches, out,
+        "download_dir" => "--download-dir",
+        "directory" => "--directory",
+        "albums" => "--album",
+        "exclude_albums" => "--exclude-album",
+        "smart_folders" => "--smart-folder",
+        "unfiled" => "--unfiled",
+        "filename_exclude" => "--filename-exclude",
+        "libraries" => "--library",
+        "size" => "--size",
+        "live_photo_size" => "--live-photo-size",
+        "recent" => "--recent",
+        "threads" => "--threads",
+        "threads_num" => "--threads-num",
+        "bandwidth_limit" => "--bandwidth-limit",
+        "skip_videos" => "--skip-videos",
+        "skip_photos" => "--skip-photos",
+        "live_photo_mode" => "--live-photo-mode",
+        "skip_live_photos" => "--skip-live-photos",
+        "force_size" => "--force-size",
+        "folder_structure" => "--folder-structure",
+        "folder_structure_albums" => "--folder-structure-albums",
+        "folder_structure_smart_folders" => "--folder-structure-smart-folders",
+    );
     #[cfg(feature = "xmp")]
     {
-        if matches.value_source("set_exif_datetime") == Some(ValueSource::CommandLine) {
-            out.push("--set-exif-datetime");
-        }
-        if matches.value_source("set_exif_rating") == Some(ValueSource::CommandLine) {
-            out.push("--set-exif-rating");
-        }
-        if matches.value_source("set_exif_gps") == Some(ValueSource::CommandLine) {
-            out.push("--set-exif-gps");
-        }
-        if matches.value_source("set_exif_description") == Some(ValueSource::CommandLine) {
-            out.push("--set-exif-description");
-        }
-        if matches.value_source("embed_xmp") == Some(ValueSource::CommandLine) {
-            out.push("--embed-xmp");
-        }
-        if matches.value_source("xmp_sidecar") == Some(ValueSource::CommandLine) {
-            out.push("--xmp-sidecar");
-        }
+        push_if_cli!(matches, out,
+            "set_exif_datetime" => "--set-exif-datetime",
+            "set_exif_rating" => "--set-exif-rating",
+            "set_exif_gps" => "--set-exif-gps",
+            "set_exif_description" => "--set-exif-description",
+            "embed_xmp" => "--embed-xmp",
+            "xmp_sidecar" => "--xmp-sidecar",
+        );
     }
-    if matches.value_source("dry_run") == Some(ValueSource::CommandLine) {
-        out.push("--dry-run");
-    }
-    if matches.value_source("watch_with_interval") == Some(ValueSource::CommandLine) {
-        out.push("--watch-with-interval");
-    }
-    if matches.value_source("no_progress_bar") == Some(ValueSource::CommandLine) {
-        out.push("--no-progress-bar");
-    }
-    if matches.value_source("keep_unicode_in_filenames") == Some(ValueSource::CommandLine) {
-        out.push("--keep-unicode-in-filenames");
-    }
-    if matches.value_source("live_photo_mov_filename_policy") == Some(ValueSource::CommandLine) {
-        out.push("--live-photo-mov-filename-policy");
-    }
-    if matches.value_source("align_raw") == Some(ValueSource::CommandLine) {
-        out.push("--align-raw");
-    }
-    if matches.value_source("file_match_policy") == Some(ValueSource::CommandLine) {
-        out.push("--file-match-policy");
-    }
-    if matches.value_source("skip_created_before") == Some(ValueSource::CommandLine) {
-        out.push("--skip-created-before");
-    }
-    if matches.value_source("skip_created_after") == Some(ValueSource::CommandLine) {
-        out.push("--skip-created-after");
-    }
-    if matches.value_source("only_print_filenames") == Some(ValueSource::CommandLine) {
-        out.push("--only-print-filenames");
-    }
-    if matches.value_source("max_retries") == Some(ValueSource::CommandLine) {
-        out.push("--max-retries");
-    }
-    if matches.value_source("retry_delay") == Some(ValueSource::CommandLine) {
-        out.push("--retry-delay");
-    }
-    if matches.value_source("temp_suffix") == Some(ValueSource::CommandLine) {
-        out.push("--temp-suffix");
-    }
-    if matches.value_source("no_incremental") == Some(ValueSource::CommandLine) {
-        out.push("--no-incremental");
-    }
-    if matches.value_source("notify_systemd") == Some(ValueSource::CommandLine) {
-        out.push("--notify-systemd");
-    }
-    if matches.value_source("pid_file") == Some(ValueSource::CommandLine) {
-        out.push("--pid-file");
-    }
-    if matches.value_source("reconcile_every_n_cycles") == Some(ValueSource::CommandLine) {
-        out.push("--reconcile-every-n-cycles");
-    }
-    if matches.value_source("notification_script") == Some(ValueSource::CommandLine) {
-        out.push("--notification-script");
-    }
-    if matches.value_source("control_bind") == Some(ValueSource::CommandLine) {
-        out.push("--control-bind");
-    }
-    if matches.value_source("desktop_notifications") == Some(ValueSource::CommandLine) {
-        out.push("--desktop-notifications");
-    }
-    if matches.value_source("report_json") == Some(ValueSource::CommandLine) {
-        out.push("--report-json");
-    }
-    if matches.value_source("http_port") == Some(ValueSource::CommandLine) {
-        out.push("--http-port");
-    }
-    if matches.value_source("http_bind") == Some(ValueSource::CommandLine) {
-        out.push("--http-bind");
-    }
-    if matches.value_source("save_password") == Some(ValueSource::CommandLine) {
-        out.push("--save-password");
-    }
-    if matches.value_source("retry_failed") == Some(ValueSource::CommandLine) {
-        out.push("--retry-failed");
-    }
-    if matches.value_source("max_download_attempts") == Some(ValueSource::CommandLine) {
-        out.push("--max-download-attempts");
-    }
-    // Hidden compat flags. `--auth-only`, `--list-albums`, `--list-libraries`,
-    // and `--reset-sync-token` only resolve to a remapped command when the
-    // bare-kei alias is in play; combining them with an explicit subcommand
-    // is the same silent-swallow class of bug we're guarding against.
-    if matches.value_source("auth_only") == Some(ValueSource::CommandLine) {
-        out.push("--auth-only");
-    }
-    if matches.value_source("list_albums") == Some(ValueSource::CommandLine) {
-        out.push("--list-albums");
-    }
-    if matches.value_source("list_libraries") == Some(ValueSource::CommandLine) {
-        out.push("--list-libraries");
-    }
-    if matches.value_source("reset_sync_token") == Some(ValueSource::CommandLine) {
-        out.push("--reset-sync-token");
-    }
+    push_if_cli!(matches, out,
+        "dry_run" => "--dry-run",
+        "watch_with_interval" => "--watch-with-interval",
+        "no_progress_bar" => "--no-progress-bar",
+        "keep_unicode_in_filenames" => "--keep-unicode-in-filenames",
+        "live_photo_mov_filename_policy" => "--live-photo-mov-filename-policy",
+        "align_raw" => "--align-raw",
+        "file_match_policy" => "--file-match-policy",
+        "skip_created_before" => "--skip-created-before",
+        "skip_created_after" => "--skip-created-after",
+        "only_print_filenames" => "--only-print-filenames",
+        "max_retries" => "--max-retries",
+        "retry_delay" => "--retry-delay",
+        "temp_suffix" => "--temp-suffix",
+        "no_incremental" => "--no-incremental",
+        "notify_systemd" => "--notify-systemd",
+        "pid_file" => "--pid-file",
+        "reconcile_every_n_cycles" => "--reconcile-every-n-cycles",
+        "notification_script" => "--notification-script",
+        "control_bind" => "--control-bind",
+        "desktop_notifications" => "--desktop-notifications",
+        "report_json" => "--report-json",
+        "http_port" => "--http-port",
+        "http_bind" => "--http-bind",
+        "save_password" => "--save-password",
+        "retry_failed" => "--retry-failed",
+        "max_download_attempts" => "--max-download-attempts",
+        // Hidden compat flags. `--auth-only`, `--list-albums`, `--list-libraries`,
+        // and `--reset-sync-token` only resolve to a remapped command when the
+        // bare-kei alias is in play; combining them with an explicit subcommand
+        // is the same silent-swallow class of bug we're guarding against.
+        "auth_only" => "--auth-only",
+        "list_albums" => "--list-albums",
+        "list_libraries" => "--list-libraries",
+        "reset_sync_token" => "--reset-sync-token",
+    );
     out
 }
 
