@@ -65,6 +65,15 @@ pub(crate) struct TomlWebhookEntry {
     /// `[notifications].min_severity` when absent.
     #[serde(default)]
     pub min_severity: Option<crate::notifications::Severity>,
+    /// Pushover application token.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Pushover user key.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Telegram chat ID.
+    #[serde(default)]
+    pub chat_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -707,6 +716,9 @@ pub(crate) struct WebhookConfig {
     pub name: String,
     pub url: String,
     pub min_severity: crate::notifications::Severity,
+    pub token: Option<String>,
+    pub user: Option<String>,
+    pub chat_id: Option<String>,
 }
 
 /// Application configuration.
@@ -1785,6 +1797,9 @@ fn resolve_notifications_section(
                     name: name.clone(),
                     url: entry.url.clone(),
                     min_severity: entry.min_severity.unwrap_or(min_severity),
+                    token: entry.token.clone(),
+                    user: entry.user.clone(),
+                    chat_id: entry.chat_id.clone(),
                 })
                 .collect()
         })
@@ -2354,6 +2369,9 @@ impl Config {
                                             } else {
                                                 None
                                             },
+                                            token: w.token.clone(),
+                                            user: w.user.clone(),
+                                            chat_id: w.chat_id.clone(),
                                         },
                                     )
                                 })
@@ -6036,6 +6054,70 @@ mod tests {
         let rt_wh = rt_n.webhooks.as_ref().unwrap();
         assert_eq!(rt_wh.len(), 1);
         assert!(rt_wh.contains_key("ntfy"));
+    }
+
+    #[test]
+    fn test_webhook_entry_extra_fields_round_trip() {
+        // PR 3 added token/user/chat_id to TomlWebhookEntry. Verify they
+        // serialize through to_toml and deserialize back intact.
+        let toml_str = r#"
+            [notifications.webhooks.pushover]
+            url = "https://api.pushover.net/1/messages.json"
+            token = "app-token"
+            user = "user-key"
+
+            [notifications.webhooks.telegram]
+            url = "https://api.telegram.org/bot123/sendMessage"
+            chat_id = "67890"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.notifications.webhooks.len(), 2);
+
+        let pushover = cfg
+            .notifications
+            .webhooks
+            .iter()
+            .find(|w| w.name == "pushover")
+            .unwrap();
+        assert_eq!(pushover.token.as_deref(), Some("app-token"));
+        assert_eq!(pushover.user.as_deref(), Some("user-key"));
+        assert!(pushover.chat_id.is_none());
+
+        let telegram = cfg
+            .notifications
+            .webhooks
+            .iter()
+            .find(|w| w.name == "telegram")
+            .unwrap();
+        assert_eq!(telegram.chat_id.as_deref(), Some("67890"));
+        assert!(telegram.token.is_none());
+        assert!(telegram.user.is_none());
+
+        // Round-trip through to_toml
+        let rt = cfg.to_toml();
+        let rt_wh = rt
+            .notifications
+            .as_ref()
+            .unwrap()
+            .webhooks
+            .as_ref()
+            .unwrap();
+        let rt_pushover = &rt_wh["pushover"];
+        assert_eq!(rt_pushover.token.as_deref(), Some("app-token"));
+        assert_eq!(rt_pushover.user.as_deref(), Some("user-key"));
+        assert!(rt_pushover.chat_id.is_none());
+
+        let rt_telegram = &rt_wh["telegram"];
+        assert_eq!(rt_telegram.chat_id.as_deref(), Some("67890"));
+        assert!(rt_telegram.token.is_none());
+        assert!(rt_telegram.user.is_none());
     }
 
     #[test]

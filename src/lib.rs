@@ -52,6 +52,7 @@ mod state;
 mod string_interner;
 mod sync_loop;
 mod systemd;
+mod throttle;
 mod types;
 
 #[cfg(test)]
@@ -458,8 +459,17 @@ fn pid_is_alive(_pid: i32) -> bool {
 
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            tracing::debug!(path = %self.path.display(), error = %e, "Failed to remove PID file");
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let path = self.path.clone();
+            let _handle = handle.spawn_blocking(move || {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::debug!(path = %path.display(), error = %e, "Failed to remove PID file");
+                }
+            });
+        } else {
+            if let Err(e) = std::fs::remove_file(&self.path) {
+                tracing::debug!(path = %self.path.display(), error = %e, "Failed to remove PID file");
+            }
         }
     }
 }
@@ -523,7 +533,12 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     // Migrate legacy icloudpd-rs paths before loading config, so the
     // copied config.toml is found at the new location.
-    let migration_report = migration::migrate_legacy_paths();
+    let migration_report = tokio::task::spawn_blocking(migration::migrate_legacy_paths)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Legacy path migration task panicked");
+            None
+        });
 
     // Load TOML config early so it can influence log level.
     // If the user explicitly set --config, the file must exist.
@@ -539,26 +554,37 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         cli.config != "~/.config/kei/config.toml" && cli.config != DOCKER_FALLBACK_CONFIG;
     let (config_path, used_docker_fallback) = {
         let expanded = config::expand_tilde(&cli.config);
-        if !config_explicitly_set && !expanded.exists() {
-            let docker = PathBuf::from(DOCKER_FALLBACK_CONFIG);
-            if docker.exists() {
-                (docker, true)
-            } else {
-                (expanded, false)
+        let docker_fallback = PathBuf::from(DOCKER_FALLBACK_CONFIG);
+        tokio::task::spawn_blocking({
+            let expanded = expanded.clone();
+            let docker_fallback = docker_fallback.clone();
+            move || {
+                if !config_explicitly_set && !expanded.exists() && docker_fallback.exists() {
+                    (docker_fallback, true)
+                } else {
+                    (expanded, false)
+                }
             }
-        } else {
-            (expanded, false)
-        }
+        })
+        .await
+        .unwrap_or((expanded, false))
     };
     // When --config is explicitly set but the file doesn't exist, allow it
     // if the parent directory exists (auto-config will create the file).
     // Otherwise require the file to exist so typos in --config paths error.
     // When --config is explicit but the file doesn't exist and the parent
     // dir does exist, allow it (auto-config will create the file).
-    let can_auto_create =
-        !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
-    let config_required = config_explicitly_set && !can_auto_create;
-    let mut toml_config = config::load_toml_config(&config_path, config_required)?;
+    let config_path_for_load = config_path.clone();
+    let mut toml_config = tokio::task::spawn_blocking(move || {
+        let can_auto_create = !config_path_for_load.exists()
+            && config_path_for_load
+                .parent()
+                .is_some_and(std::path::Path::is_dir);
+        let config_required = config_explicitly_set && !can_auto_create;
+        config::load_toml_config(&config_path_for_load, config_required)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("config load task panicked: {e}")))?;
 
     // Resolve log level: --log-level > --verbose > TOML > default (info).
     // `--verbose` is a friendlier alias for `--log-level info` and is
@@ -720,7 +746,10 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             }
             cli::ConfigAction::Setup { output } => {
                 let path = output.map_or_else(|| config_path.clone(), |o| config::expand_tilde(&o));
-                match setup::run_setup(&path)? {
+                let setup_result = tokio::task::spawn_blocking(move || setup::run_setup(&path))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("setup task panicked: {e}"))??;
+                match setup_result {
                     setup::SetupResult::SyncNow {
                         config_path: cfg_path,
                         env_path,

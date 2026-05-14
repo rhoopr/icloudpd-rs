@@ -25,6 +25,7 @@ use crate::retry;
 use crate::shutdown;
 use crate::state::{self, StateDb};
 use crate::systemd::SystemdNotifier;
+use crate::throttle::{ThrottleController, ThrottleDelta};
 use crate::{
     available_disk_space, check_min_disk_space, make_password_provider, PartialSyncError,
     PidFileGuard,
@@ -258,15 +259,26 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .data_dir
         .clone()
         .or_else(|| globals.cookie_directory.clone());
-    let mut config = config::Config::build_inner(
-        globals,
-        &pw,
-        sync,
-        toml_config.as_ref(),
-        config::parse_env_watch_interval(std::env::var(config::ENV_WATCH_INTERVAL))?,
-        personality_mode,
-        friendly_request,
-    )?;
+    let mut config = tokio::task::spawn_blocking({
+        let globals = globals.clone();
+        let pw = pw.clone();
+        let sync = sync.clone();
+        let toml_config = toml_config.clone();
+        let env_watch_interval =
+            config::parse_env_watch_interval(std::env::var(config::ENV_WATCH_INTERVAL))?;
+        move || {
+            config::Config::build_inner(
+                &globals,
+                &pw,
+                sync,
+                toml_config.as_ref(),
+                env_watch_interval,
+                personality_mode,
+                friendly_request,
+            )
+        }
+    })
+    .await??;
 
     // On first run (no config file), persist CLI-provided values so
     // subsequent runs don't need the same flags again. Only when the
@@ -310,17 +322,18 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     crate::harden_process();
 
     // Write PID file if requested (before auth so the PID is visible immediately)
-    let _pid_guard = config
-        .pid_file
-        .as_ref()
-        .map(|p| PidFileGuard::new(p.clone()))
-        .transpose()?;
+    let _pid_guard = match config.pid_file.clone() {
+        Some(p) => {
+            let guard = tokio::task::spawn_blocking(move || PidFileGuard::new(p))
+                .await
+                .map_err(|e| anyhow::anyhow!("PID file task panicked: {e}"))??;
+            Some(guard)
+        }
+        None => None,
+    };
 
     let sd_notifier = SystemdNotifier::new(config.notify_systemd);
-    let notifier = Notifier::new(
-        config.notification_script.clone(),
-        config.notifications.desktop,
-    );
+    let notifier = Notifier::new(config.notification_script.clone(), &config.notifications);
 
     tracing::info!(concurrency = config.threads_num, "Starting kei");
 
@@ -810,6 +823,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // breadcrumb. Cycle 1 is the first iteration of this loop, cycle 2 is the
     // first re-entry under `--watch`, etc.
     let mut cycle_index: u64 = 0;
+    // Adaptive throttle: scales the watch interval when Apple rate-limits.
+    // Only active in watch mode (baseline != 0).
+    let mut throttle = config.watch_with_interval.map(ThrottleController::new);
     if is_watch_mode {
         match config.reconcile_every_n_cycles {
             Some(n) if n > 0 => tracing::info!(
@@ -1146,6 +1162,61 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     Some(&data),
                 );
             }
+
+            // ── Adaptive throttle ─────────────────────────────────────
+            if let Some(ref mut t) = throttle {
+                let success = !cycle_result.session_expired && cycle_result.failed_count == 0;
+                let delta = t.cycle_complete(cycle_result.stats.rate_limited, success);
+
+                if cycle_result.stats.rate_limited > 0 {
+                    notifier.notify(
+                        notifications::Event::RateLimited,
+                        &format!(
+                            "Observed {} HTTP 429/503 rate-limit responses this cycle",
+                            cycle_result.stats.rate_limited
+                        ),
+                        &config.username,
+                        None,
+                    );
+                }
+
+                match delta {
+                    ThrottleDelta::Engaged => {
+                        tracing::info!(
+                            pressure = t.pressure(),
+                            interval_secs = t.current_interval_secs(),
+                            "Adaptive throttle engaged"
+                        );
+                        notifier.notify(
+                            notifications::Event::ThrottleEngaged,
+                            "Adaptive throttle engaged",
+                            &config.username,
+                            None,
+                        );
+                        crate::personality::narration::throttle_engaged_to_stderr(
+                            config.personality_mode,
+                            t.current_interval_secs(),
+                        );
+                    }
+                    ThrottleDelta::Disengaged => {
+                        tracing::info!("Adaptive throttle disengaged");
+                        notifier.notify(
+                            notifications::Event::ThrottleDisengaged,
+                            "Adaptive throttle disengaged",
+                            &config.username,
+                            None,
+                        );
+                        crate::personality::narration::throttle_disengaged_to_stderr(
+                            config.personality_mode,
+                        );
+                    }
+                    ThrottleDelta::None => {}
+                }
+
+                if let Some(ref handle) = metrics_handle {
+                    handle.update_throttle(t.pressure(), t.current_interval_secs());
+                }
+            }
         }
 
         // Periodic local-vs-state reconciliation. Read-only walk that
@@ -1178,12 +1249,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
             }
 
-            sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
-            tracing::info!(interval_secs = interval, "Waiting before next cycle");
-            // `interval` is u64 seconds; chrono Add panics on overflow.
+            let sleep_secs = throttle.as_ref().map_or(
+                interval,
+                crate::throttle::ThrottleController::current_interval_secs,
+            );
+            sd_notifier.notify_status(&format!("Waiting {sleep_secs} seconds..."));
+            tracing::info!(
+                interval_secs = sleep_secs,
+                baseline_secs = interval,
+                "Waiting before next cycle"
+            );
+            // `sleep_secs` is u64 seconds; chrono Add panics on overflow.
             // Skip the heartbeat for the (impossible-in-practice) case where
             // the interval doesn't fit in a wall-clock instant.
-            if let Some(wake_at) = i64::try_from(interval)
+            if let Some(wake_at) = i64::try_from(sleep_secs)
                 .ok()
                 .and_then(chrono::Duration::try_seconds)
                 .and_then(|d| chrono::Local::now().checked_add_signed(d))
@@ -1194,7 +1273,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 );
             }
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                () = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
                 () = shutdown_token.cancelled() => {
                     tracing::info!("Shutdown during wait, exiting...");
                     break;
