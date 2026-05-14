@@ -462,7 +462,7 @@ impl Drop for PidFileGuard {
     fn drop(&mut self) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let path = self.path.clone();
-            let _ = handle.spawn_blocking(move || {
+            let _handle = handle.spawn_blocking(move || {
                 if let Err(e) = std::fs::remove_file(&path) {
                     tracing::debug!(path = %path.display(), error = %e, "Failed to remove PID file");
                 }
@@ -558,7 +558,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         tokio::task::spawn_blocking({
             let expanded = expanded.clone();
             let docker_fallback = docker_fallback.clone();
-            let config_explicitly_set = config_explicitly_set;
             move || {
                 if !config_explicitly_set && !expanded.exists() && docker_fallback.exists() {
                     (docker_fallback, true)
