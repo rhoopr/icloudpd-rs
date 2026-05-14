@@ -4613,3 +4613,37 @@ fn deprecation_toml_filters_library_singular_warns() {
         "warning must name the new array form; stderr:\n{stderr}"
     );
 }
+
+#[test]
+fn env_sync_flags_allowed_with_non_sync_command() {
+    // Regression: issue #385 - sync-only env vars set in Docker Compose
+    // must not block non-sync subcommands like `kei reset`.
+    let temp = tempfile::tempdir().unwrap();
+    let mut cmd = clean_cmd();
+    cmd.current_dir(temp.path());
+    cmd.env("KEI_DOWNLOAD_DIR", "/photos");
+    cmd.env("KEI_ALBUM", "none");
+    cmd.env("KEI_LIVE_PHOTO_MODE", "image-only");
+    cmd.env("KEI_FOLDER_STRUCTURE", "{:%Y/%m/%Y-%m-%d}");
+    #[cfg(feature = "xmp")]
+    cmd.env("KEI_EMBED_XMP", "true");
+    cmd.args(["--username", "test@example.com", "reset", "state", "--yes"]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("sync-only flag").not());
+}
+
+#[test]
+fn env_sync_flags_allowed_with_service_status() {
+    // Regression: issue #385 - same class of bug on a different non-sync
+    // subcommand (service status does not carry SyncArgs).
+    let temp = tempfile::tempdir().unwrap();
+    let mut cmd = clean_cmd();
+    cmd.current_dir(temp.path());
+    cmd.env("KEI_DOWNLOAD_DIR", "/photos");
+    cmd.env("KEI_ALBUM", "none");
+    cmd.env("KEI_LIVE_PHOTO_MODE", "image-only");
+    cmd.args(["--username", "test@example.com", "service", "status"]);
+    cmd.assert()
+        .stderr(predicate::str::contains("sync-only flag").not());
+}

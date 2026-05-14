@@ -2,7 +2,7 @@ use crate::types::{
     Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
     RawTreatmentPolicy, VersionSize,
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, FromArgMatches, Parser, Subcommand};
 
 /// Reject empty strings at CLI parse time.
 fn non_empty_string(s: &str) -> Result<String, String> {
@@ -1377,26 +1377,33 @@ impl Cli {
     /// combination, naming every offending flag in the error message.
     /// Bare invocation (no subcommand) and the `sync` / `retry-failed`
     /// subcommands legitimately use these flags and pass.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self, explicit_sync_flags: &[&'static str]) -> Result<(), String> {
         // Bare invocation = sync alias; flags are valid.
         let Some(cmd) = &self.command else {
             return Ok(());
         };
         // Sync (and the legacy `retry-failed` alias that maps to sync) carry
         // sync args directly; top-level merge into them is intended.
-        if matches!(cmd, Command::Sync { .. } | Command::RetryFailed { .. }) {
+        // `service run` also carries SyncArgs and merges top-level flags.
+        if matches!(
+            cmd,
+            Command::Sync { .. }
+                | Command::RetryFailed { .. }
+                | Command::Service {
+                    action: ServiceAction::Run(..),
+                }
+        ) {
             return Ok(());
         }
-        let offenders = top_level_sync_flags_present(&self.sync);
-        if offenders.is_empty() {
+        if explicit_sync_flags.is_empty() {
             return Ok(());
         }
         let cmd_name = subcommand_display_name(cmd);
-        let flag_list = offenders.join(", ");
+        let flag_list = explicit_sync_flags.join(", ");
         Err(format!(
             "the following sync-only flag{plural} cannot be combined with `kei {cmd_name}`: {flag_list}\n\
              bare-kei (no subcommand) is shorthand for `kei sync`; sync-only flags are only valid there or under `kei sync`",
-            plural = if offenders.len() == 1 { "" } else { "s" },
+            plural = if explicit_sync_flags.len() == 1 { "" } else { "s" },
         ))
     }
 }
@@ -1438,190 +1445,222 @@ fn subcommand_display_name(cmd: &Command) -> &'static str {
 /// combines a non-sync subcommand with bare-kei sync flags. Each branch
 /// corresponds 1:1 to a `SyncArgs` field; when adding a new sync flag,
 /// extend this function so it shows up in the rejection message.
-fn top_level_sync_flags_present(s: &SyncArgs) -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = Vec::new();
-    if s.download_dir.is_some() {
+/// Return the set of sync-only top-level flags that were explicitly
+/// provided on the command line (not via environment variables or
+/// defaults). An empty Vec means no sync flag came from the CLI.
+///
+/// Used by [`Cli::validate`] to name offending flags when the user
+/// combines a non-sync subcommand with bare-kei sync flags. Each branch
+/// corresponds 1:1 to a `SyncArgs` field; when adding a new sync flag,
+/// extend this function so it shows up in the rejection message.
+fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str> {
+    use clap::parser::ValueSource;
+    let mut out = Vec::new();
+    if matches.value_source("download_dir") == Some(ValueSource::CommandLine) {
         out.push("--download-dir");
     }
-    if s.directory.is_some() {
+    if matches.value_source("directory") == Some(ValueSource::CommandLine) {
         out.push("--directory");
     }
-    if !s.albums.is_empty() {
+    if matches.value_source("albums") == Some(ValueSource::CommandLine) {
         out.push("--album");
     }
-    if !s.exclude_albums.is_empty() {
+    if matches.value_source("exclude_albums") == Some(ValueSource::CommandLine) {
         out.push("--exclude-album");
     }
-    if !s.smart_folders.is_empty() {
+    if matches.value_source("smart_folders") == Some(ValueSource::CommandLine) {
         out.push("--smart-folder");
     }
-    if s.unfiled.is_some() {
+    if matches.value_source("unfiled") == Some(ValueSource::CommandLine) {
         out.push("--unfiled");
     }
-    if !s.filename_exclude.is_empty() {
+    if matches.value_source("filename_exclude") == Some(ValueSource::CommandLine) {
         out.push("--filename-exclude");
     }
-    if !s.libraries.is_empty() {
+    if matches.value_source("libraries") == Some(ValueSource::CommandLine) {
         out.push("--library");
     }
-    if s.size.is_some() {
+    if matches.value_source("size") == Some(ValueSource::CommandLine) {
         out.push("--size");
     }
-    if s.live_photo_size.is_some() {
+    if matches.value_source("live_photo_size") == Some(ValueSource::CommandLine) {
         out.push("--live-photo-size");
     }
-    if s.recent.is_some() {
+    if matches.value_source("recent") == Some(ValueSource::CommandLine) {
         out.push("--recent");
     }
-    if s.threads.is_some() {
+    if matches.value_source("threads") == Some(ValueSource::CommandLine) {
         out.push("--threads");
     }
-    if s.threads_num.is_some() {
+    if matches.value_source("threads_num") == Some(ValueSource::CommandLine) {
         out.push("--threads-num");
     }
-    if s.bandwidth_limit.is_some() {
+    if matches.value_source("bandwidth_limit") == Some(ValueSource::CommandLine) {
         out.push("--bandwidth-limit");
     }
-    if s.skip_videos.is_some() {
+    if matches.value_source("skip_videos") == Some(ValueSource::CommandLine) {
         out.push("--skip-videos");
     }
-    if s.skip_photos.is_some() {
+    if matches.value_source("skip_photos") == Some(ValueSource::CommandLine) {
         out.push("--skip-photos");
     }
-    if s.live_photo_mode.is_some() {
+    if matches.value_source("live_photo_mode") == Some(ValueSource::CommandLine) {
         out.push("--live-photo-mode");
     }
-    if s.skip_live_photos.is_some() {
+    if matches.value_source("skip_live_photos") == Some(ValueSource::CommandLine) {
         out.push("--skip-live-photos");
     }
-    if s.force_size.is_some() {
+    if matches.value_source("force_size") == Some(ValueSource::CommandLine) {
         out.push("--force-size");
     }
-    if s.folder_structure.is_some() {
+    if matches.value_source("folder_structure") == Some(ValueSource::CommandLine) {
         out.push("--folder-structure");
     }
-    if s.folder_structure_albums.is_some() {
+    if matches.value_source("folder_structure_albums") == Some(ValueSource::CommandLine) {
         out.push("--folder-structure-albums");
     }
-    if s.folder_structure_smart_folders.is_some() {
+    if matches.value_source("folder_structure_smart_folders") == Some(ValueSource::CommandLine) {
         out.push("--folder-structure-smart-folders");
     }
     #[cfg(feature = "xmp")]
     {
-        if s.set_exif_datetime.is_some() {
+        if matches.value_source("set_exif_datetime") == Some(ValueSource::CommandLine) {
             out.push("--set-exif-datetime");
         }
-        if s.set_exif_rating.is_some() {
+        if matches.value_source("set_exif_rating") == Some(ValueSource::CommandLine) {
             out.push("--set-exif-rating");
         }
-        if s.set_exif_gps.is_some() {
+        if matches.value_source("set_exif_gps") == Some(ValueSource::CommandLine) {
             out.push("--set-exif-gps");
         }
-        if s.set_exif_description.is_some() {
+        if matches.value_source("set_exif_description") == Some(ValueSource::CommandLine) {
             out.push("--set-exif-description");
         }
-        if s.embed_xmp.is_some() {
+        if matches.value_source("embed_xmp") == Some(ValueSource::CommandLine) {
             out.push("--embed-xmp");
         }
-        if s.xmp_sidecar.is_some() {
+        if matches.value_source("xmp_sidecar") == Some(ValueSource::CommandLine) {
             out.push("--xmp-sidecar");
         }
     }
-    if s.dry_run {
+    if matches.value_source("dry_run") == Some(ValueSource::CommandLine) {
         out.push("--dry-run");
     }
-    if s.watch_with_interval.is_some() {
+    if matches.value_source("watch_with_interval") == Some(ValueSource::CommandLine) {
         out.push("--watch-with-interval");
     }
-    if s.no_progress_bar.is_some() {
+    if matches.value_source("no_progress_bar") == Some(ValueSource::CommandLine) {
         out.push("--no-progress-bar");
     }
-    if s.keep_unicode_in_filenames.is_some() {
+    if matches.value_source("keep_unicode_in_filenames") == Some(ValueSource::CommandLine) {
         out.push("--keep-unicode-in-filenames");
     }
-    if s.live_photo_mov_filename_policy.is_some() {
+    if matches.value_source("live_photo_mov_filename_policy") == Some(ValueSource::CommandLine) {
         out.push("--live-photo-mov-filename-policy");
     }
-    if s.align_raw.is_some() {
+    if matches.value_source("align_raw") == Some(ValueSource::CommandLine) {
         out.push("--align-raw");
     }
-    if s.file_match_policy.is_some() {
+    if matches.value_source("file_match_policy") == Some(ValueSource::CommandLine) {
         out.push("--file-match-policy");
     }
-    if s.skip_created_before.is_some() {
+    if matches.value_source("skip_created_before") == Some(ValueSource::CommandLine) {
         out.push("--skip-created-before");
     }
-    if s.skip_created_after.is_some() {
+    if matches.value_source("skip_created_after") == Some(ValueSource::CommandLine) {
         out.push("--skip-created-after");
     }
-    if s.only_print_filenames {
+    if matches.value_source("only_print_filenames") == Some(ValueSource::CommandLine) {
         out.push("--only-print-filenames");
     }
-    if s.max_retries.is_some() {
+    if matches.value_source("max_retries") == Some(ValueSource::CommandLine) {
         out.push("--max-retries");
     }
-    if s.retry_delay.is_some() {
+    if matches.value_source("retry_delay") == Some(ValueSource::CommandLine) {
         out.push("--retry-delay");
     }
-    if s.temp_suffix.is_some() {
+    if matches.value_source("temp_suffix") == Some(ValueSource::CommandLine) {
         out.push("--temp-suffix");
     }
-    if s.no_incremental {
+    if matches.value_source("no_incremental") == Some(ValueSource::CommandLine) {
         out.push("--no-incremental");
     }
-    if s.notify_systemd.is_some() {
+    if matches.value_source("notify_systemd") == Some(ValueSource::CommandLine) {
         out.push("--notify-systemd");
     }
-    if s.pid_file.is_some() {
+    if matches.value_source("pid_file") == Some(ValueSource::CommandLine) {
         out.push("--pid-file");
     }
-    if s.reconcile_every_n_cycles.is_some() {
+    if matches.value_source("reconcile_every_n_cycles") == Some(ValueSource::CommandLine) {
         out.push("--reconcile-every-n-cycles");
     }
-    if s.notification_script.is_some() {
+    if matches.value_source("notification_script") == Some(ValueSource::CommandLine) {
         out.push("--notification-script");
     }
-    if s.control_bind.is_some() {
+    if matches.value_source("control_bind") == Some(ValueSource::CommandLine) {
         out.push("--control-bind");
     }
-    if s.desktop_notifications.is_some() {
+    if matches.value_source("desktop_notifications") == Some(ValueSource::CommandLine) {
         out.push("--desktop-notifications");
     }
-    if s.report_json.is_some() {
+    if matches.value_source("report_json") == Some(ValueSource::CommandLine) {
         out.push("--report-json");
     }
-    if s.http_port.is_some() {
+    if matches.value_source("http_port") == Some(ValueSource::CommandLine) {
         out.push("--http-port");
     }
-    if s.http_bind.is_some() {
+    if matches.value_source("http_bind") == Some(ValueSource::CommandLine) {
         out.push("--http-bind");
     }
-    if s.save_password {
+    if matches.value_source("save_password") == Some(ValueSource::CommandLine) {
         out.push("--save-password");
     }
-    if s.retry_failed {
+    if matches.value_source("retry_failed") == Some(ValueSource::CommandLine) {
         out.push("--retry-failed");
     }
-    if s.max_download_attempts.is_some() {
+    if matches.value_source("max_download_attempts") == Some(ValueSource::CommandLine) {
         out.push("--max-download-attempts");
     }
     // Hidden compat flags. `--auth-only`, `--list-albums`, `--list-libraries`,
     // and `--reset-sync-token` only resolve to a remapped command when the
     // bare-kei alias is in play; combining them with an explicit subcommand
     // is the same silent-swallow class of bug we're guarding against.
-    if s.auth_only {
+    if matches.value_source("auth_only") == Some(ValueSource::CommandLine) {
         out.push("--auth-only");
     }
-    if s.list_albums {
+    if matches.value_source("list_albums") == Some(ValueSource::CommandLine) {
         out.push("--list-albums");
     }
-    if s.list_libraries {
+    if matches.value_source("list_libraries") == Some(ValueSource::CommandLine) {
         out.push("--list-libraries");
     }
-    if s.reset_sync_token {
+    if matches.value_source("reset_sync_token") == Some(ValueSource::CommandLine) {
         out.push("--reset-sync-token");
     }
     out
+}
+
+/// Parse CLI arguments and return both the parsed struct and the list of
+/// sync-only flags that were explicitly provided on the command line.
+///
+/// This is the production entry point. It replaces `Cli::parse()` so the
+/// validator can distinguish between CLI-provided and env-provided flags.
+pub fn parse_cli_with_sources<I, T>(itr: I) -> Result<(Cli, Vec<&'static str>), clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cmd = <Cli as clap::CommandFactory>::command();
+    let matches = match cmd.try_get_matches_from(itr) {
+        Ok(m) => m,
+        Err(e) => e.exit(),
+    };
+    let explicit_sync_flags = explicit_top_level_sync_flags(&matches);
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(c) => c,
+        Err(e) => e.exit(),
+    };
+    Ok((cli, explicit_sync_flags))
 }
 
 impl Command {
@@ -1705,6 +1744,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).unwrap()
+    }
+
+    /// Parse argv into a `Cli` and compute the explicit sync flags list.
+    /// Used by validation tests that need to distinguish CLI-provided
+    /// values from env-provided ones.
+    fn parse_and_validate(argv: &[&str]) -> Result<(), String> {
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let matches = cmd.try_get_matches_from(argv).map_err(|e| e.to_string())?;
+        let explicit_sync_flags = explicit_top_level_sync_flags(&matches);
+        let cli = Cli::from_arg_matches(&matches).map_err(|e| e.to_string())?;
+        cli.validate(&explicit_sync_flags)
     }
 
     // ── RecentLimit parser ──────────────────────────────────────────
@@ -3715,26 +3765,23 @@ mod tests {
 
     #[test]
     fn validate_rejects_skip_videos_with_status() {
-        // `--skip-videos` uses `num_args = 0..=1`, so the value must be
-        // explicit (`=true`) before a subcommand follows. Both forms exhibit
-        // the underlying bug — clap was happy to swallow it under `status`.
-        let cli = Cli::try_parse_from(["kei", "--skip-videos=true", "status"]).unwrap();
-        let err = cli.validate().expect_err("validation must reject");
+        let err = parse_and_validate(&["kei", "--skip-videos=true", "status"])
+            .expect_err("validation must reject");
         assert!(err.contains("--skip-videos"), "got: {err}");
         assert!(err.contains("status"), "got: {err}");
     }
 
     #[test]
     fn validate_rejects_skip_photos_with_list_albums() {
-        let cli = Cli::try_parse_from(["kei", "--skip-photos=true", "list", "albums"]).unwrap();
-        let err = cli.validate().expect_err("validation must reject");
+        let err = parse_and_validate(&["kei", "--skip-photos=true", "list", "albums"])
+            .expect_err("validation must reject");
         assert!(err.contains("--skip-photos"), "got: {err}");
         assert!(err.contains("list"), "got: {err}");
     }
 
     #[test]
     fn validate_rejects_live_photo_mode_with_reset_state() {
-        let cli = Cli::try_parse_from([
+        let err = parse_and_validate(&[
             "kei",
             "--live-photo-mode",
             "skip",
@@ -3742,53 +3789,49 @@ mod tests {
             "state",
             "--yes",
         ])
-        .unwrap();
-        let err = cli.validate().expect_err("validation must reject");
+        .expect_err("validation must reject");
         assert!(err.contains("--live-photo-mode"), "got: {err}");
         assert!(err.contains("reset"), "got: {err}");
     }
 
     #[test]
     fn validate_rejects_value_flag_with_verify() {
-        let cli = Cli::try_parse_from(["kei", "--download-dir", "/photos", "verify"]).unwrap();
-        let err = cli.validate().expect_err("validation must reject");
+        let err = parse_and_validate(&["kei", "--download-dir", "/photos", "verify"])
+            .expect_err("validation must reject");
         assert!(err.contains("--download-dir"), "got: {err}");
     }
 
     #[test]
     fn validate_rejects_threads_with_reconcile() {
-        let cli = Cli::try_parse_from(["kei", "--threads", "4", "reconcile"]).unwrap();
-        let err = cli.validate().expect_err("validation must reject");
+        let err = parse_and_validate(&["kei", "--threads", "4", "reconcile"])
+            .expect_err("validation must reject");
         assert!(err.contains("--threads"), "got: {err}");
     }
 
     #[test]
     fn validate_rejects_dry_run_with_status() {
-        let cli = Cli::try_parse_from(["kei", "--dry-run", "status"]).unwrap();
-        let err = cli.validate().expect_err("validation must reject");
+        let err = parse_and_validate(&["kei", "--dry-run", "status"])
+            .expect_err("validation must reject");
         assert!(err.contains("--dry-run"), "got: {err}");
     }
 
     #[test]
     fn validate_rejects_album_with_password_set() {
-        let cli = Cli::try_parse_from(["kei", "--album", "Vacation", "password", "set"]).unwrap();
-        let err = cli.validate().expect_err("validation must reject");
+        let err = parse_and_validate(&["kei", "--album", "Vacation", "password", "set"])
+            .expect_err("validation must reject");
         assert!(err.contains("--album"), "got: {err}");
     }
 
     #[test]
     fn validate_rejects_legacy_compat_flag_with_subcommand() {
-        // `--auth-only` is a hidden bare-kei alias that maps to `kei login`.
-        // Combining it with an explicit subcommand is the same silent-swallow
-        // class of bug.
-        let cli = Cli::try_parse_from(["kei", "--auth-only", "status"]).unwrap();
-        let err = cli.validate().expect_err("validation must reject");
+        let err = parse_and_validate(&["kei", "--auth-only", "status"])
+            .expect_err("validation must reject");
         assert!(err.contains("--auth-only"), "got: {err}");
     }
 
     #[test]
     fn validate_lists_every_offending_flag() {
-        let cli = Cli::try_parse_from([
+        let err = parse_and_validate(&[
             "kei",
             "--skip-videos",
             "--skip-photos",
@@ -3796,8 +3839,7 @@ mod tests {
             "4",
             "status",
         ])
-        .unwrap();
-        let err = cli.validate().expect_err("validation must reject");
+        .expect_err("validation must reject");
         assert!(err.contains("--skip-videos"), "got: {err}");
         assert!(err.contains("--skip-photos"), "got: {err}");
         assert!(err.contains("--threads"), "got: {err}");
@@ -3807,45 +3849,31 @@ mod tests {
 
     #[test]
     fn validate_allows_bare_kei_with_sync_flags() {
-        // Bare invocation = sync alias; the flag is honoured and validation
-        // must pass.
-        let cli = Cli::try_parse_from(["kei", "--skip-videos"]).unwrap();
-        cli.validate()
+        parse_and_validate(&["kei", "--skip-videos"])
             .expect("bare-kei with sync flag must validate");
     }
 
     #[test]
     fn validate_allows_sync_subcommand_with_sync_flags() {
-        let cli = Cli::try_parse_from(["kei", "sync", "--skip-videos", "--threads", "4"]).unwrap();
-        cli.validate()
+        parse_and_validate(&["kei", "sync", "--skip-videos", "--threads", "4"])
             .expect("explicit sync subcommand with sync flags must validate");
     }
 
     #[test]
     fn validate_allows_top_level_sync_flag_then_sync_subcommand() {
-        // `kei --skip-videos=true sync` is also valid: top-level flags merge
-        // into sync via `Command::merge_top_level_args`. Need the explicit
-        // value because `--skip-videos` is `num_args = 0..=1`.
-        let cli = Cli::try_parse_from(["kei", "--skip-videos=true", "sync"]).unwrap();
-        cli.validate()
+        parse_and_validate(&["kei", "--skip-videos=true", "sync"])
             .expect("top-level sync flag with sync subcommand must validate");
     }
 
     #[test]
     fn validate_allows_retry_failed_with_sync_flag() {
-        // `retry-failed` is a legacy alias that maps to `sync --retry-failed`
-        // and accepts SyncArgs. Top-level sync flags are merged in.
-        let cli = Cli::try_parse_from(["kei", "--threads", "4", "retry-failed"]).unwrap();
-        cli.validate()
+        parse_and_validate(&["kei", "--threads", "4", "retry-failed"])
             .expect("retry-failed accepts sync flags via merge");
     }
 
     #[test]
     fn validate_allows_global_flags_with_non_sync_subcommand() {
-        // Global flags (--username, --domain, --data-dir, --log-level,
-        // --config) are NOT sync-only and must remain valid with any
-        // subcommand.
-        let cli = Cli::try_parse_from([
+        parse_and_validate(&[
             "kei",
             "--username",
             "u@e.com",
@@ -3853,15 +3881,32 @@ mod tests {
             "debug",
             "status",
         ])
-        .unwrap();
-        cli.validate()
-            .expect("global flags must validate with any subcommand");
+        .expect("global flags must validate with any subcommand");
     }
 
     #[test]
     fn validate_allows_status_with_no_top_level_flags() {
-        let cli = Cli::try_parse_from(["kei", "status"]).unwrap();
-        cli.validate().expect("plain `kei status` must validate");
+        parse_and_validate(&["kei", "status"]).expect("plain `kei status` must validate");
+    }
+
+    #[test]
+    fn validate_allows_service_run_with_sync_flags() {
+        parse_and_validate(&[
+            "kei",
+            "--download-dir",
+            "/photos",
+            "service",
+            "run",
+            "--dry-run",
+        ])
+        .expect("service run must accept top-level sync flags");
+    }
+
+    #[test]
+    fn validate_rejects_service_status_with_sync_flags() {
+        let err = parse_and_validate(&["kei", "--download-dir", "/photos", "service", "status"])
+            .expect_err("validation must reject sync flags with service status");
+        assert!(err.contains("--download-dir"), "got: {err}");
     }
 
     // Parametric coverage so this stays green when new sync-only flags
@@ -3953,9 +3998,7 @@ mod tests {
             let mut argv: Vec<&str> = vec!["kei"];
             argv.extend_from_slice(args);
             argv.push("status");
-            let cli = Cli::try_parse_from(&argv)
-                .unwrap_or_else(|e| panic!("parse failed for `{name}` ({args:?}): {e}"));
-            let result = cli.validate();
+            let result = parse_and_validate(&argv);
             assert!(
                 result.is_err(),
                 "validate() must reject sync-only flag `{name}` ({args:?}) with status; got {result:?}"

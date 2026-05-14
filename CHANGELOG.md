@@ -51,6 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#373]: https://github.com/rhoopr/kei/pull/373
 [#374]: https://github.com/rhoopr/kei/pull/374
 
+---
+
+## [0.14.2] - 2026-05-14
+
+### Fixed
+
+- **Sync-only env vars no longer block non-sync subcommands.** `Cli::validate()` previously rejected any invocation where a non-sync subcommand (e.g. `kei reset state`) was combined with a sync-only top-level flag, but it checked the parsed `SyncArgs` struct fields without knowing whether the value came from the CLI or from an environment variable. Because clap's `env = "..."` attributes populate the same fields, setting `KEI_DOWNLOAD_DIR`, `KEI_ALBUM`, `KEI_LIVE_PHOTO_MODE`, or any other sync env var in Docker Compose caused commands like `kei reset` to error with "the following sync-only flags cannot be combined with `kei reset`". Now the validator inspects `clap::parser::ValueSource` to distinguish between CLI-provided and env-provided values: only explicitly typed flags are rejected. ([#385])
+- **`kei service run` missing from the validator allowlist.** `service run` carries `SyncArgs` and legitimately merges top-level sync flags into the service worker, but `validate()` only allowed `sync` and `retry-failed`. A top-level sync flag followed by `service run` was incorrectly rejected; now it passes. ([#385])
+
+[#385]: https://github.com/rhoopr/kei/issues/385
+
+---
+
 ## [0.14.1] - 2026-05-13
 
 ### Fixed

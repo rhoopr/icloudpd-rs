@@ -62,7 +62,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::Parser;
 use password::{ExposeSecret, SecretString};
 
 /// A writer wrapper that redacts a password string from log output.
@@ -522,12 +521,13 @@ pub fn main_inner() -> ExitCode {
 }
 
 async fn run(env_password: Option<String>) -> anyhow::Result<()> {
-    let cli = cli::Cli::parse();
+    let (cli, explicit_sync_flags) =
+        cli::parse_cli_with_sources(std::env::args_os()).map_err(|e| anyhow::anyhow!(e))?;
 
     // Reject `kei --skip-videos status` and friends, where a sync-only
     // top-level flag is silently swallowed under a non-sync subcommand.
     // See `Cli::validate` for the full rationale.
-    if let Err(msg) = cli.validate() {
+    if let Err(msg) = cli.validate(&explicit_sync_flags) {
         anyhow::bail!("{msg}");
     }
 
