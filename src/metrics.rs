@@ -111,6 +111,8 @@ pub(crate) struct MetricsHandle {
     db_assets_size_bytes: Family<StatusLabels, Gauge>,
     db_last_sync_assets_seen: Gauge,
     db_summary_read_failures: Counter,
+    throttle_pressure: Gauge<f64, AtomicU64>,
+    throttle_current_interval_seconds: Gauge<f64, AtomicU64>,
 }
 
 impl MetricsHandle {
@@ -244,6 +246,20 @@ impl MetricsHandle {
             db_summary_read_failures.clone(),
         );
 
+        let throttle_pressure: Gauge<f64, AtomicU64> = Gauge::default();
+        registry.register(
+            "kei_throttle_pressure",
+            "Current adaptive throttle pressure (0.0 = calm, 1.0 = max)",
+            throttle_pressure.clone(),
+        );
+
+        let throttle_current_interval_seconds: Gauge<f64, AtomicU64> = Gauge::default();
+        registry.register(
+            "kei_throttle_current_interval_seconds",
+            "Current watch interval in seconds (may be scaled above baseline by throttle)",
+            throttle_current_interval_seconds.clone(),
+        );
+
         registry.register(
             "kei_state_mark_downloaded_zero_rows",
             "Total number of mark_downloaded calls that matched 0 rows in the assets table — \
@@ -285,6 +301,8 @@ impl MetricsHandle {
             db_assets_size_bytes,
             db_last_sync_assets_seen,
             db_summary_read_failures,
+            throttle_pressure,
+            throttle_current_interval_seconds,
         }
     }
 
@@ -378,6 +396,21 @@ impl MetricsHandle {
     /// the `/metrics` output rather than only in the log.
     pub(crate) fn record_db_summary_failure(&self) {
         self.db_summary_read_failures.inc();
+    }
+
+    /// Update throttle-related gauges.
+    ///
+    /// Call this after [`Self::update`] on every cycle when a throttle
+    /// controller is active. Mirrors the health-gauge pattern: no-op when
+    /// the handle was never built (one-shot / metrics-disabled).
+    pub(crate) fn update_throttle(&self, pressure: f64, interval_secs: u64) {
+        self.throttle_pressure.set(pressure);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "OpenMetrics gauge format is f64 seconds; sub-second precision is below the metric's granularity"
+        )]
+        self.throttle_current_interval_seconds
+            .set(interval_secs as f64);
     }
 
     async fn update_health_gauges(&self, health: &HealthStatus) {
