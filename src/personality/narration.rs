@@ -181,6 +181,21 @@ pub fn throttle_disengaged_to_stderr(mode: Mode) {
     line_to_stderr(mode, "iCloud has calmed down. Resuming normal pace.");
 }
 
+/// Friendly framing when disk space drops below the critical threshold
+/// during the consumer download loop. Off mode is silent.
+pub fn disk_low_to_stderr(mode: Mode) {
+    line_to_stderr(
+        mode,
+        "Running low on disk space. Pausing downloads until space frees up.",
+    );
+}
+
+/// Friendly framing when disk space recovers above the threshold after a
+/// low-space pause. Off mode is silent.
+pub fn disk_recovered_to_stderr(mode: Mode) {
+    line_to_stderr(mode, "Disk space recovered. Resuming downloads.");
+}
+
 /// Pre-sleep narration before a retry. The existing `tracing::warn!` in
 /// `retry_with_backoff` carries the structured fields (attempt, delay,
 /// error) for journals; this is the human-shaped reminder that the pause
@@ -611,6 +626,52 @@ mod tests {
     fn throttle_engaged_zero_interval_is_silent() {
         let out = capture(Mode::Friendly, |_w, m| {
             throttle_engaged_to_stderr(m, 0);
+        });
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn disk_low_renders_stable_text() {
+        let mut buf = Vec::new();
+        line(
+            &mut buf,
+            Mode::Friendly,
+            "Running low on disk space. Pausing downloads until space frees up.",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "Running low on disk space. Pausing downloads until space frees up.\n",
+        );
+    }
+
+    #[test]
+    fn disk_recovered_renders_stable_text() {
+        let mut buf = Vec::new();
+        line(
+            &mut buf,
+            Mode::Friendly,
+            "Disk space recovered. Resuming downloads.",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "Disk space recovered. Resuming downloads.\n",
+        );
+    }
+
+    #[test]
+    fn disk_low_off_mode_is_silent() {
+        let out = capture(Mode::Off, |_w, m| {
+            disk_low_to_stderr(m);
+        });
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn disk_recovered_off_mode_is_silent() {
+        let out = capture(Mode::Off, |_w, m| {
+            disk_recovered_to_stderr(m);
         });
         assert!(out.is_empty());
     }

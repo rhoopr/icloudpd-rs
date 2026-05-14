@@ -885,6 +885,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &build_download_config,
                 &shared_session,
                 &shutdown_token,
+                &notifier,
+                metrics_handle.as_ref(),
             )
             .await?;
 
@@ -1629,6 +1631,8 @@ async fn run_cycle(
     build_download_config: &BuildDownloadConfigFn<'_>,
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
+    notifier: &Notifier,
+    metrics_handle: Option<&crate::metrics::MetricsHandle>,
 ) -> anyhow::Result<CycleResult> {
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
@@ -1716,6 +1720,9 @@ async fn run_cycle(
             &lib_state.plan.passes,
             download_config,
             shutdown_token.clone(),
+            Some(notifier.clone()),
+            metrics_handle.cloned(),
+            &config.username,
         )
         .await?;
 
