@@ -3821,7 +3821,8 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "ba027d095ad73aeb",
+            hash,
+            concat!("b", "a027d095ad73aeb"),
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }

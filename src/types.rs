@@ -203,7 +203,10 @@ pub enum LivePhotoMode {
 }
 
 impl LivePhotoSize {
-    #[allow(dead_code, reason = "legacy config/tests still use this during migration")]
+    #[allow(
+        dead_code,
+        reason = "legacy config/tests still use this during migration"
+    )]
     pub fn to_asset_version_size(self) -> AssetVersionSize {
         match self {
             Self::Original => AssetVersionSize::LiveOriginal,
@@ -271,8 +274,7 @@ mod tests {
         ] {
             let json = serde_json::to_string(&variant).expect("serialize Resolution");
             assert_eq!(json, expected);
-            let parsed: Resolution =
-                serde_json::from_str(&json).expect("deserialize Resolution");
+            let parsed: Resolution = serde_json::from_str(&json).expect("deserialize Resolution");
             assert_eq!(parsed, variant);
         }
     }

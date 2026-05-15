@@ -437,13 +437,16 @@ pub(super) fn extract_skip_candidates<'a>(
     // Primary version (with fallback to Original, same logic as filter_asset_to_tasks)
     // VideoOnly: skip primary image for live photos.
     let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
-    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
-        versions.get(*key)
+    let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> { versions.get(*key) };
+    let primary_resolution = if skip_primary {
+        None
+    } else {
+        config.resolution
     };
-    if !skip_primary && config.resolution.is_some() {
+    if let Some(resolution) = primary_resolution {
         let primary = version_with_fallback(
             &get_version,
-            config.resolution.expect("checked above"),
+            resolution,
             AssetVersionSize::Original,
             config.force_size,
         );
@@ -563,7 +566,7 @@ impl<'a> DerivationContext<'a> {
         Self {
             base_filename,
             created_local: asset.created().with_timezone(&Local),
-        versions: apply_raw_policy(asset.versions(), config.raw_policy),
+            versions: apply_raw_policy(asset.versions(), config.raw_policy),
         }
     }
 
@@ -1463,7 +1466,9 @@ mod tests {
 
     #[test]
     fn expected_paths_size_none_with_missing_edit_emits_nothing() {
-        let asset = TestPhotoAsset::new("NO_EDIT").filename("IMG_0002.JPG").build();
+        let asset = TestPhotoAsset::new("NO_EDIT")
+            .filename("IMG_0002.JPG")
+            .build();
         let mut config = test_config();
         config.resolution = None;
         config.edited = true;

@@ -1003,18 +1003,23 @@ pub(crate) fn resolve_path_derivation_fields(
         toml_photos.and_then(|p| p.size),
         VersionSize::Original,
     );
-    let mut resolution = toml_photos.and_then(|p| p.resolution).unwrap_or(match size {
+    let mut resolution = toml_photos
+        .and_then(|p| p.resolution)
+        .unwrap_or(match size {
             VersionSize::Medium => Resolution::Medium,
             VersionSize::Thumb => Resolution::Thumb,
             VersionSize::Adjusted | VersionSize::Original => Resolution::Original,
             VersionSize::Alternative | VersionSize::None => Resolution::None,
-    });
+        });
     let mut edited = resolve_flag(cli.edited, toml_photos.and_then(|p| p.edited));
     let mut alternative = resolve_flag(cli.alternative, toml_photos.and_then(|p| p.alternative));
 
     match size {
         VersionSize::Adjusted => {
-            warn_deprecated("`size = \"adjusted\"` / `--size adjusted`", "`--size original --edited true`");
+            warn_deprecated(
+                "`size = \"adjusted\"` / `--size adjusted`",
+                "`--size original --edited true`",
+            );
             if cli.edited.is_none() && toml_photos.and_then(|p| p.edited).is_none() {
                 edited = true;
             }
@@ -1023,7 +1028,10 @@ pub(crate) fn resolve_path_derivation_fields(
             }
         }
         VersionSize::Alternative => {
-            warn_deprecated("`size = \"alternative\"` / `--size alternative`", "`--size none --alternative true`");
+            warn_deprecated(
+                "`size = \"alternative\"` / `--size alternative`",
+                "`--size none --alternative true`",
+            );
             if cli.alternative.is_none() && toml_photos.and_then(|p| p.alternative).is_none() {
                 alternative = true;
             }

@@ -4557,8 +4557,7 @@ mod tests {
         use crate::download::{DownloadConfig, SyncMode};
         use crate::icloud::photos::PhotoAsset;
         use crate::types::{
-            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-            RawPolicy,
+            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
         };
         use futures_util::stream;
         use rustc_hash::FxHashSet;
@@ -4678,8 +4677,7 @@ mod tests {
         use crate::download::{DownloadConfig, SyncMode};
         use crate::icloud::photos::PhotoAsset;
         use crate::types::{
-            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-            RawPolicy,
+            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
         };
         use rustc_hash::FxHashSet;
 

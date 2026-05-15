@@ -1036,8 +1036,7 @@ mod wiremock_tests {
     use crate::retry::RetryConfig;
     use crate::state::{AssetStatus, SqliteStateDb, StateDb, VersionSizeKey};
     use crate::types::{
-        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-        RawPolicy,
+        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
     };
 
     // ── Synthetic asset / wire JSON helpers ──────────────────────────
