@@ -50,6 +50,19 @@ enum BatchForecast {
 /// downloaded.
 pub(super) const FREE_SPACE_RESNAPSHOT_INTERVAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
+/// Consumer-side free-space recheck interval. After this many bytes
+/// have been written to disk by the download consumer, re-probe free
+/// space to catch a disk that is filling mid-sync (from another
+/// process, logs, etc.). 500 MiB is frequent enough to catch a
+/// fast-filling FS before the next download starts, but sparse enough
+/// that the statvfs call is negligible relative to I/O.
+const CONSUMER_FREE_SPACE_CHECK_INTERVAL_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Hard threshold for pausing downloads. Below this we stop accepting
+/// new work to avoid ENOSPC mid-write. Matches the pre-sync startup
+/// guard (`MIN_FREE_BYTES_HARD` in `sync_loop.rs`).
+const DISK_LOW_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Classify the impact of adding `size` bytes to the running queued total
 /// against the free-space snapshot captured at enumeration start.
 ///
@@ -171,6 +184,145 @@ impl From<ProducerSkipSummary> for super::SkipBreakdown {
             duplicates: s.duplicates,
             retry_exhausted: s.retry_exhausted,
             retry_only: s.retry_only,
+        }
+    }
+}
+
+/// Monitor free disk space from the download consumer side.
+///
+/// Tracks cumulative disk bytes written and re-checks `statvfs` every
+/// [`CONSUMER_FREE_SPACE_CHECK_INTERVAL_BYTES`]. When free space drops
+/// below [`DISK_LOW_BYTES`], a `DiskLow` event is fired, the download
+/// stream is paused, and the `kei_disk_free_bytes` gauge is updated.
+/// When space recovers, a `DiskRecovered` event fires and the stream
+/// resumes.
+struct DiskMonitor {
+    directory: PathBuf,
+    mode: crate::personality::Mode,
+    notifier: Option<crate::notifications::Notifier>,
+    metrics: Option<crate::metrics::MetricsHandle>,
+    username: String,
+    bytes_since_check: u64,
+    low_space_triggered: bool,
+    pause_tx: tokio::sync::watch::Sender<bool>,
+    free_space_fn: Box<dyn Fn() -> Option<u64> + Send + Sync>,
+}
+
+impl std::fmt::Debug for DiskMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskMonitor")
+            .field("directory", &self.directory)
+            .field("mode", &self.mode)
+            .field("username", &self.username)
+            .field("bytes_since_check", &self.bytes_since_check)
+            .field("low_space_triggered", &self.low_space_triggered)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DiskMonitor {
+    fn new(
+        directory: PathBuf,
+        mode: crate::personality::Mode,
+        notifier: Option<crate::notifications::Notifier>,
+        metrics: Option<crate::metrics::MetricsHandle>,
+        username: String,
+    ) -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let dir = directory.clone();
+        Self::with_probe(directory, mode, notifier, metrics, username, move || {
+            crate::available_disk_space(&dir)
+        })
+    }
+
+    fn with_probe<F>(
+        directory: PathBuf,
+        mode: crate::personality::Mode,
+        notifier: Option<crate::notifications::Notifier>,
+        metrics: Option<crate::metrics::MetricsHandle>,
+        username: String,
+        probe: F,
+    ) -> (Self, tokio::sync::watch::Receiver<bool>)
+    where
+        F: Fn() -> Option<u64> + Send + Sync + 'static,
+    {
+        let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        (
+            Self {
+                directory,
+                mode,
+                notifier,
+                metrics,
+                username,
+                bytes_since_check: 0,
+                low_space_triggered: false,
+                pause_tx,
+                free_space_fn: Box::new(probe),
+            },
+            pause_rx,
+        )
+    }
+
+    /// Record `disk_bytes` from a completed download and check whether a
+    /// statvfs probe is due. Returns `true` when a pause was triggered
+    /// this call (so the caller can log / narrate once).
+    fn record_bytes(&mut self, disk_bytes: u64) -> bool {
+        self.bytes_since_check += disk_bytes;
+        if self.bytes_since_check < CONSUMER_FREE_SPACE_CHECK_INTERVAL_BYTES {
+            return false;
+        }
+        self.bytes_since_check = 0;
+        let Some(free) = (self.free_space_fn)() else {
+            return false;
+        };
+        if let Some(ref m) = self.metrics {
+            m.update_disk_free(free);
+        }
+        let low = free < DISK_LOW_BYTES;
+        if low && !self.low_space_triggered {
+            self.low_space_triggered = true;
+            let _ = self.pause_tx.send(true);
+            self.fire_disk_low(free);
+            return true;
+        }
+        if !low && self.low_space_triggered {
+            self.low_space_triggered = false;
+            let _ = self.pause_tx.send(false);
+            self.fire_disk_recovered(free);
+        }
+        false
+    }
+
+    fn fire_disk_low(&self, free: u64) {
+        tracing::warn!(
+            free_bytes = free,
+            threshold = DISK_LOW_BYTES,
+            "Disk space critically low — pausing downloads"
+        );
+        crate::personality::narration::disk_low_to_stderr(self.mode);
+        if let Some(ref n) = self.notifier {
+            n.notify(
+                crate::notifications::Event::DiskLow,
+                "Disk space critically low. Pausing downloads until space frees up.",
+                &self.username,
+                None,
+            );
+        }
+    }
+
+    fn fire_disk_recovered(&self, free: u64) {
+        tracing::info!(
+            free_bytes = free,
+            threshold = DISK_LOW_BYTES,
+            "Disk space recovered — resuming downloads"
+        );
+        crate::personality::narration::disk_recovered_to_stderr(self.mode);
+        if let Some(ref n) = self.notifier {
+            n.notify(
+                crate::notifications::Event::DiskRecovered,
+                "Disk space recovered. Resuming downloads.",
+                &self.username,
+                None,
+            );
         }
     }
 }
@@ -981,6 +1133,10 @@ pub(super) struct PassResult {
 /// This is the core producer/consumer download logic from `stream_and_download`,
 /// factored out so that `download_photos_full_with_token` can supply a
 /// token-aware combined stream while reusing the same download machinery.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "notifier, metrics, and username are telemetry wires that don't semantically belong in DownloadConfig"
+)]
 pub(super) async fn stream_and_download_from_stream<S>(
     download_client: &Client,
     combined: S,
@@ -989,6 +1145,9 @@ pub(super) async fn stream_and_download_from_stream<S>(
     shutdown_token: CancellationToken,
     shared_pb: Option<ProgressBar>,
     shared_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    notifier: Option<crate::notifications::Notifier>,
+    metrics: Option<crate::metrics::MetricsHandle>,
+    username: &str,
 ) -> Result<StreamingResult>
 where
     S: futures_util::Stream<Item = anyhow::Result<crate::icloud::photos::PhotoAsset>>
@@ -1740,6 +1899,14 @@ where
         skips
     });
 
+    let (mut disk_monitor, pause_rx) = DiskMonitor::new(
+        config.directory.to_path_buf(),
+        mode,
+        notifier,
+        metrics,
+        username.to_owned(),
+    );
+
     let temp_suffix: Arc<str> = Arc::clone(&config.temp_suffix);
     let rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let bandwidth_limiter = config.bandwidth_limiter.clone();
@@ -1749,7 +1916,16 @@ where
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
+            let mut pause_rx = pause_rx.clone();
             async move {
+                // Wait while paused (disk-pressure or user control).
+                // `buffer_unordered` will hold this slot until we proceed,
+                // naturally throttling new downloads.
+                while *pause_rx.borrow() {
+                    if pause_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
                 let result = Box::pin(download_single_task(
                     &client,
                     &task,
@@ -1812,6 +1988,7 @@ where
                 // smooths out within an EMA tick.
                 bytes_counter.fetch_add(bytes_dl, std::sync::atomic::Ordering::Relaxed);
                 disk_bytes_total += disk_bytes;
+                let _paused = disk_monitor.record_bytes(disk_bytes);
                 if !exif_ok {
                     exif_failures += 1;
                     pb.suspend(|| {
@@ -4477,6 +4654,9 @@ mod tests {
             shutdown_token,
             None,
             None,
+            None,
+            None,
+            "user@test.example",
         )
         .await;
         let elapsed = start.elapsed();
@@ -4571,6 +4751,9 @@ mod tests {
             shutdown_token,
             None,
             None,
+            None,
+            None,
+            "user@test.example",
         )
         .await
         .expect_err("should propagate producer panic");
@@ -4640,6 +4823,9 @@ mod tests {
             CancellationToken::new(),
             None,
             None,
+            None,
+            None,
+            "user@test.example",
         )
         .await
         .expect("sync must complete");
@@ -4667,6 +4853,9 @@ mod tests {
             CancellationToken::new(),
             None,
             None,
+            None,
+            None,
+            "user@test.example",
         )
         .await
         .expect("second sync must complete");
@@ -4755,6 +4944,9 @@ mod tests {
             CancellationToken::new(),
             None,
             None,
+            None,
+            None,
+            "user@test.example",
         )
         .await
         .expect("sync must complete");
@@ -4852,6 +5044,9 @@ mod tests {
             CancellationToken::new(),
             None,
             None,
+            None,
+            None,
+            "user@test.example",
         )
         .await
         .expect("sync must complete");
@@ -5074,5 +5269,105 @@ mod tests {
             child.is_cancelled(),
             "child must reflect parent cancellation"
         );
+    }
+
+    // ── DiskMonitor unit tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn disk_monitor_no_probe_below_interval() {
+        let (mut monitor, _pause_rx) = DiskMonitor::with_probe(
+            PathBuf::from("/tmp"),
+            crate::personality::Mode::Off,
+            None,
+            None,
+            "u".into(),
+            || Some(DISK_LOW_BYTES + 1),
+        );
+        // Below 500 MiB interval — no probe, no state change.
+        let paused = monitor.record_bytes(1);
+        assert!(!paused);
+        assert!(!monitor.low_space_triggered);
+    }
+
+    #[tokio::test]
+    async fn disk_monitor_triggers_pause_when_low() {
+        let (mut monitor, pause_rx) = DiskMonitor::with_probe(
+            PathBuf::from("/tmp"),
+            crate::personality::Mode::Off,
+            None,
+            None,
+            "u".into(),
+            || Some(DISK_LOW_BYTES - 1),
+        );
+        let paused = monitor.record_bytes(CONSUMER_FREE_SPACE_CHECK_INTERVAL_BYTES);
+        assert!(paused);
+        assert!(monitor.low_space_triggered);
+        assert!(*pause_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn disk_monitor_resumes_when_recovered() {
+        let free = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(DISK_LOW_BYTES - 1));
+        let free_ref = std::sync::Arc::clone(&free);
+        let (mut monitor, pause_rx) = DiskMonitor::with_probe(
+            PathBuf::from("/tmp"),
+            crate::personality::Mode::Off,
+            None,
+            None,
+            "u".into(),
+            move || Some(free_ref.load(Ordering::Relaxed)),
+        );
+        // First check — low.
+        let paused = monitor.record_bytes(CONSUMER_FREE_SPACE_CHECK_INTERVAL_BYTES);
+        assert!(paused);
+        assert!(monitor.low_space_triggered);
+
+        // Second check — recovered.
+        free.store(DISK_LOW_BYTES + 1, Ordering::Relaxed);
+        let paused = monitor.record_bytes(CONSUMER_FREE_SPACE_CHECK_INTERVAL_BYTES);
+        assert!(!paused);
+        assert!(!monitor.low_space_triggered);
+        assert!(!*pause_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn disk_monitor_no_op_when_probe_returns_none() {
+        let (mut monitor, _pause_rx) = DiskMonitor::with_probe(
+            PathBuf::from("/tmp"),
+            crate::personality::Mode::Off,
+            None,
+            None,
+            "u".into(),
+            || None,
+        );
+        let paused = monitor.record_bytes(CONSUMER_FREE_SPACE_CHECK_INTERVAL_BYTES);
+        assert!(!paused);
+        assert!(!monitor.low_space_triggered);
+    }
+
+    #[tokio::test]
+    async fn disk_monitor_does_not_double_pause() {
+        let probe_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut monitor, pause_rx) = DiskMonitor::with_probe(
+            PathBuf::from("/tmp"),
+            crate::personality::Mode::Off,
+            None,
+            None,
+            "u".into(),
+            {
+                let count = std::sync::Arc::clone(&probe_count);
+                move || {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    Some(DISK_LOW_BYTES - 1)
+                }
+            },
+        );
+        // First trigger.
+        assert!(monitor.record_bytes(CONSUMER_FREE_SPACE_CHECK_INTERVAL_BYTES));
+        // Second trigger — already paused, must not re-fire.
+        assert!(!monitor.record_bytes(CONSUMER_FREE_SPACE_CHECK_INTERVAL_BYTES));
+        assert_eq!(probe_count.load(Ordering::Relaxed), 2);
+        assert!(monitor.low_space_triggered);
+        assert!(*pause_rx.borrow());
     }
 }

@@ -1368,6 +1368,9 @@ pub async fn download_photos_with_sync(
     passes: &[crate::commands::AlbumPass],
     config: Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
+    notifier: Option<crate::notifications::Notifier>,
+    metrics: Option<crate::metrics::MetricsHandle>,
+    username: &str,
 ) -> Result<SyncResult> {
     let sync_started_at = chrono::Utc::now().timestamp();
     cleanup_orphan_part_files(&config).await;
@@ -1405,6 +1408,9 @@ pub async fn download_photos_with_sync(
                 passes,
                 &config,
                 shutdown_token.clone(),
+                notifier.clone(),
+                metrics.clone(),
+                username,
             )
             .await
         }
@@ -1424,6 +1430,9 @@ pub async fn download_photos_with_sync(
                 passes,
                 &config,
                 shutdown_token.clone(),
+                notifier.clone(),
+                metrics.clone(),
+                username,
             )
             .await
         }
@@ -1440,6 +1449,9 @@ pub async fn download_photos_with_sync(
                 passes,
                 &config,
                 shutdown_token.clone(),
+                notifier.clone(),
+                metrics.clone(),
+                username,
             )
             .await
         }
@@ -1483,6 +1495,9 @@ pub async fn download_photos_with_sync(
                             passes,
                             &config,
                             shutdown_token.clone(),
+                            notifier.clone(),
+                            metrics.clone(),
+                            username,
                         )
                         .await
                     } else {
@@ -1594,6 +1609,9 @@ async fn download_photos_full_with_token(
     passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
+    notifier: Option<crate::notifications::Notifier>,
+    metrics: Option<crate::metrics::MetricsHandle>,
+    username: &str,
 ) -> Result<SyncResult> {
     let started = Instant::now();
     let needs_per_pass = config.requires_per_pass_paths();
@@ -1706,6 +1724,9 @@ async fn download_photos_full_with_token(
                 shutdown_token.clone(),
                 Some(pass_pb.clone()),
                 Some(std::sync::Arc::clone(&pass_bytes)),
+                notifier.clone(),
+                metrics.clone(),
+                username,
             )
             .await?;
 
@@ -1768,6 +1789,9 @@ async fn download_photos_full_with_token(
             shutdown_token.clone(),
             None,
             None,
+            notifier.clone(),
+            metrics.clone(),
+            username,
         )
         .await?;
 

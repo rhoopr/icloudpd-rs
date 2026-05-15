@@ -113,6 +113,13 @@ pub(crate) struct MetricsHandle {
     db_summary_read_failures: Counter,
     throttle_pressure: Gauge<f64, AtomicU64>,
     throttle_current_interval_seconds: Gauge<f64, AtomicU64>,
+    disk_free: Gauge,
+}
+
+impl std::fmt::Debug for MetricsHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsHandle").finish_non_exhaustive()
+    }
 }
 
 impl MetricsHandle {
@@ -260,6 +267,13 @@ impl MetricsHandle {
             throttle_current_interval_seconds.clone(),
         );
 
+        let disk_free: Gauge = Gauge::default();
+        registry.register(
+            "kei_disk_free_bytes",
+            "Current free disk space on the download volume in bytes",
+            disk_free.clone(),
+        );
+
         registry.register(
             "kei_state_mark_downloaded_zero_rows",
             "Total number of mark_downloaded calls that matched 0 rows in the assets table — \
@@ -303,6 +317,7 @@ impl MetricsHandle {
             db_summary_read_failures,
             throttle_pressure,
             throttle_current_interval_seconds,
+            disk_free,
         }
     }
 
@@ -411,6 +426,11 @@ impl MetricsHandle {
         )]
         self.throttle_current_interval_seconds
             .set(interval_secs as f64);
+    }
+
+    /// Update the free-disk gauge from a consumer-side recheck.
+    pub(crate) fn update_disk_free(&self, bytes: u64) {
+        self.disk_free.set(i64::try_from(bytes).unwrap_or(i64::MAX));
     }
 
     async fn update_health_gauges(&self, health: &HealthStatus) {
@@ -1240,5 +1260,19 @@ mod tests {
 
         token.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
+    // ── disk free gauge ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn disk_free_gauge_updates_and_renders() {
+        let handle = MetricsHandle::new(None);
+        handle.update_disk_free(42_000_000);
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains("kei_disk_free_bytes 42000000"),
+            "disk_free gauge missing or wrong:\n{output}"
+        );
     }
 }

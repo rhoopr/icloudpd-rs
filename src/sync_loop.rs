@@ -885,6 +885,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &build_download_config,
                 &shared_session,
                 &shutdown_token,
+                &notifier,
+                metrics_handle.as_ref(),
             )
             .await?;
 
@@ -1621,6 +1623,10 @@ pub(crate) async fn check_and_persist_enum_config_hash(
 }
 
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "notifier and metrics_handle are telemetry wires added to PR 388 that don't fit any existing config struct"
+)]
 async fn run_cycle(
     library_states: &[LibraryState],
     config: &config::Config,
@@ -1629,6 +1635,8 @@ async fn run_cycle(
     build_download_config: &BuildDownloadConfigFn<'_>,
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
+    notifier: &Notifier,
+    metrics_handle: Option<&crate::metrics::MetricsHandle>,
 ) -> anyhow::Result<CycleResult> {
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
@@ -1716,6 +1724,9 @@ async fn run_cycle(
             &lib_state.plan.passes,
             download_config,
             shutdown_token.clone(),
+            Some(notifier.clone()),
+            metrics_handle.cloned(),
+            &config.username,
         )
         .await?;
 
