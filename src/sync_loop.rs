@@ -1623,6 +1623,10 @@ pub(crate) async fn check_and_persist_enum_config_hash(
 }
 
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "notifier and metrics_handle are telemetry wires added to PR 388 that don't fit any existing config struct"
+)]
 async fn run_cycle(
     library_states: &[LibraryState],
     config: &config::Config,

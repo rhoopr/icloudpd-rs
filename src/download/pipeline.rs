@@ -1133,6 +1133,10 @@ pub(super) struct PassResult {
 /// This is the core producer/consumer download logic from `stream_and_download`,
 /// factored out so that `download_photos_full_with_token` can supply a
 /// token-aware combined stream while reusing the same download machinery.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "notifier, metrics, and username are telemetry wires that don't semantically belong in DownloadConfig"
+)]
 pub(super) async fn stream_and_download_from_stream<S>(
     download_client: &Client,
     combined: S,
