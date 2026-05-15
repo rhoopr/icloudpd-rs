@@ -15,7 +15,7 @@ use crate::icloud::photos::VersionsMap;
 use crate::state::{MediaType, VersionSizeKey};
 use crate::types::{
     AssetItemType, AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-    RawTreatmentPolicy,
+    RawPolicy,
 };
 
 use super::paths;
@@ -332,8 +332,8 @@ impl<'a> VersionsView<'a> {
     reason = "orig_idx / alt_idx come from `enumerate()` over `versions`; \
               indexing back into `versions` is in-bounds by construction"
 )]
-fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> VersionsView<'_> {
-    if policy == RawTreatmentPolicy::Unchanged {
+fn apply_raw_policy(versions: &VersionsMap, policy: RawPolicy) -> VersionsView<'_> {
+    if policy == RawPolicy::AsIs {
         return VersionsView::borrowed(versions);
     }
 
@@ -352,11 +352,11 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawTreatmentPolicy) -> Versi
     };
 
     let should_swap = match policy {
-        RawTreatmentPolicy::PreferOriginal => versions[alt_idx].1.asset_type.contains("raw"),
-        RawTreatmentPolicy::PreferAlternative => {
+        RawPolicy::PreferRaw => versions[alt_idx].1.asset_type.contains("raw"),
+        RawPolicy::PreferJpeg => {
             orig_idx.is_some_and(|idx| versions[idx].1.asset_type.contains("raw"))
         }
-        RawTreatmentPolicy::Unchanged => false,
+        RawPolicy::AsIs => false,
     };
 
     match (should_swap, orig_idx) {
@@ -431,24 +431,35 @@ pub(super) fn extract_skip_candidates<'a>(
     config: &DownloadConfig,
 ) -> SmallVec<[(VersionSizeKey, &'a str); 2]> {
     let is_live_photo = asset.is_live_photo();
-    let versions = asset.versions();
+    let versions = apply_raw_policy(asset.versions(), config.raw_policy);
     let mut result = SmallVec::new();
 
     // Primary version (with fallback to Original, same logic as filter_asset_to_tasks)
     // VideoOnly: skip primary image for live photos.
     let skip_primary = config.live_photo_mode == LivePhotoMode::VideoOnly && is_live_photo;
     let get_version = |key: &AssetVersionSize| -> Option<&AssetVersion> {
-        versions.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        versions.get(*key)
     };
-    if !skip_primary {
+    if !skip_primary && config.resolution.is_some() {
         let primary = version_with_fallback(
             &get_version,
-            config.size,
+            config.resolution.expect("checked above"),
             AssetVersionSize::Original,
             config.force_size,
         );
         if let Some((v, effective_size)) = primary {
             result.push((VersionSizeKey::from(effective_size), v.checksum.as_ref()));
+        }
+    }
+
+    if config.edited {
+        if let Some(v) = get_version(&AssetVersionSize::Adjusted) {
+            result.push((VersionSizeKey::Adjusted, v.checksum.as_ref()));
+        }
+    }
+    if config.alternative {
+        if let Some(v) = get_version(&AssetVersionSize::Alternative) {
+            result.push((VersionSizeKey::Alternative, v.checksum.as_ref()));
         }
     }
 
@@ -458,17 +469,19 @@ pub(super) fn extract_skip_candidates<'a>(
         LivePhotoMode::Both | LivePhotoMode::VideoOnly
     ) && asset.item_type() == Some(AssetItemType::Image)
     {
-        let live = version_with_fallback(
-            &get_version,
-            config.live_photo_size,
-            AssetVersionSize::LiveOriginal,
-            config.force_size,
-        );
-        if let Some((v, effective_live_size)) = live {
-            result.push((
-                VersionSizeKey::from(effective_live_size),
-                v.checksum.as_ref(),
-            ));
+        if let Some(live_size) = config.live_size {
+            let live = version_with_fallback(
+                &get_version,
+                live_size,
+                AssetVersionSize::LiveOriginal,
+                config.force_size,
+            );
+            if let Some((v, effective_live_size)) = live {
+                result.push((
+                    VersionSizeKey::from(effective_live_size),
+                    v.checksum.as_ref(),
+                ));
+            }
         }
     }
 
@@ -550,7 +563,7 @@ impl<'a> DerivationContext<'a> {
         Self {
             base_filename,
             created_local: asset.created().with_timezone(&Local),
-            versions: apply_raw_policy(asset.versions(), config.align_raw),
+        versions: apply_raw_policy(asset.versions(), config.raw_policy),
         }
     }
 
@@ -575,10 +588,11 @@ pub(super) fn derive_primary(
         return None;
     }
 
+    let requested = config.resolution?;
     let get_version = |key: &AssetVersionSize| ctx.get_version(*key);
     let (version, effective_size) = version_with_fallback(
         &get_version,
-        config.size,
+        requested,
         AssetVersionSize::Original,
         config.force_size,
     )?;
@@ -612,6 +626,96 @@ pub(super) fn derive_primary(
     })
 }
 
+fn build_extra_path(
+    version: &AssetVersion,
+    key: AssetVersionSize,
+    suffix: &str,
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    ctx: &DerivationContext<'_>,
+) -> DerivedPath {
+    let mapped = paths::map_filename_extension(&ctx.base_filename, &version.asset_type);
+    let suffix = suffix.trim_start_matches('_');
+    let suffixed = if let Some(dot_pos) = mapped.rfind('.') {
+        let (stem, ext) = mapped.split_at(dot_pos);
+        format!("{stem}_{suffix}{ext}")
+    } else {
+        format!("{mapped}_{suffix}")
+    };
+    let filename = match config.file_match_policy {
+        FileMatchPolicy::NameId7 => paths::apply_name_id7(&suffixed, asset.id()),
+        FileMatchPolicy::NameSizeDedupWithSuffix => suffixed,
+    };
+    let path = paths::local_download_path(
+        &config.directory,
+        &config.folder_structure,
+        &ctx.created_local,
+        &filename,
+        config.album_name.as_deref(),
+    );
+
+    DerivedPath {
+        path,
+        filename,
+        url: version.url.clone(),
+        checksum: version.checksum.clone(),
+        size: version.size,
+        version_size: VersionSizeKey::from(key),
+        check_ampm_on_disk: false,
+    }
+}
+
+fn derive_extras(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+    ctx: &DerivationContext<'_>,
+    primary: Option<&DerivedPath>,
+) -> SmallVec<[DerivedPath; 2]> {
+    let mut extras = SmallVec::new();
+    let mut seen_urls = SmallVec::<[&str; 3]>::new();
+    if let Some(p) = primary {
+        seen_urls.push(p.url.as_ref());
+    }
+
+    if config.edited {
+        if let Some(version) = ctx.get_version(AssetVersionSize::Adjusted) {
+            if !seen_urls.iter().any(|url| *url == version.url.as_ref()) {
+                seen_urls.push(version.url.as_ref());
+                extras.push(build_extra_path(
+                    version,
+                    AssetVersionSize::Adjusted,
+                    "_edited",
+                    asset,
+                    config,
+                    ctx,
+                ));
+            }
+        }
+    }
+
+    if config.alternative {
+        if let Some(version) = ctx.get_version(AssetVersionSize::Alternative) {
+            if !seen_urls.iter().any(|url| *url == version.url.as_ref()) {
+                let suffix = if version.asset_type.contains("raw") {
+                    "_RAW"
+                } else {
+                    "_alt"
+                };
+                extras.push(build_extra_path(
+                    version,
+                    AssetVersionSize::Alternative,
+                    suffix,
+                    asset,
+                    config,
+                    ctx,
+                ));
+            }
+        }
+    }
+
+    extras
+}
+
 /// Build the live-photo MOV companion `DerivedPath` (or `None` when no
 /// MOV applies — non-image asset, Skip / ImageOnly mode, no live version
 /// available).
@@ -637,9 +741,10 @@ pub(super) fn derive_mov_companion(
     }
 
     let get_version = |key: &AssetVersionSize| ctx.get_version(*key);
+    let requested_live_size = config.live_size?;
     let (live_version, effective_live_size) = version_with_fallback(
         &get_version,
-        config.live_photo_size,
+        requested_live_size,
         AssetVersionSize::LiveOriginal,
         config.force_size,
     )?;
@@ -690,11 +795,13 @@ pub(super) fn derive_expected_paths(
 ) -> SmallVec<[DerivedPath; 2]> {
     let ctx = DerivationContext::build(asset, config);
     let mut out = SmallVec::new();
-    if let Some(p) = derive_primary(asset, config, &ctx) {
-        out.push(p);
+    let primary = derive_primary(asset, config, &ctx);
+    let primary_filename = primary.as_ref().map(|p| p.filename.clone());
+    out.extend(derive_extras(asset, config, &ctx, primary.as_ref()));
+    if let Some(p) = primary {
+        out.insert(0, p);
     }
-    let primary_filename = out.first().map(|p: &DerivedPath| p.filename.as_str());
-    if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename) {
+    if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename.as_deref()) {
         out.push(mov);
     }
     out
@@ -959,8 +1066,10 @@ pub(super) fn filter_asset_to_tasks(
     let payload = build_payload(asset, config);
     let mut tasks = SmallVec::new();
     let mut effective_primary_filename: Option<String> = None;
+    let primary = derive_primary(asset, config, &ctx);
+    let extras = derive_extras(asset, config, &ctx, primary.as_ref());
 
-    if let Some(d) = derive_primary(asset, config, &ctx) {
+    if let Some(d) = primary {
         let strategy = match config.file_match_policy {
             FileMatchPolicy::NameId7 => CollisionStrategy::SkipIfExists,
             FileMatchPolicy::NameSizeDedupWithSuffix => CollisionStrategy::SizeDedup {
@@ -1001,6 +1110,53 @@ pub(super) fn filter_asset_to_tasks(
                 effective_primary_filename = Some(stem.to_string());
             }
         }
+        if let Some(p) = final_path {
+            claimed_paths.insert(NormalizedPath::new(&p), size);
+            tasks.push(DownloadTask {
+                url,
+                download_path: p,
+                checksum,
+                asset_id: asset.id_arc(),
+                metadata: Arc::clone(&payload),
+                size,
+                created_local: ctx.created_local,
+                version_size,
+                media_type: determine_media_type(version_size, asset),
+            });
+        }
+    }
+
+    for d in extras {
+        let DerivedPath {
+            path,
+            filename,
+            url,
+            checksum,
+            size,
+            version_size,
+            check_ampm_on_disk,
+        } = d;
+        let final_path = {
+            let mut rctx = ResolveContext {
+                config,
+                created_local: &ctx.created_local,
+                claimed_paths,
+                dir_cache,
+            };
+            resolve_download_path(
+                &path,
+                size,
+                asset.id(),
+                CollisionStrategy::SizeDedup {
+                    skip_zero_size: true,
+                },
+                &mut rctx,
+                check_ampm_on_disk,
+                || paths::insert_suffix(&filename, asset.id()),
+                "extra asset",
+            )
+        };
+
         if let Some(p) = final_path {
             claimed_paths.insert(NormalizedPath::new(&p), size);
             tasks.push(DownloadTask {
@@ -1247,7 +1403,7 @@ mod tests {
             .filename("IMG_0001.JPG")
             .build();
         let mut config = test_config();
-        config.size = AssetVersionSize::Medium;
+        config.resolution = Some(AssetVersionSize::Medium);
         config.force_size = true;
         let paths = expected_paths_for(&asset, &config);
         assert!(
@@ -1262,7 +1418,7 @@ mod tests {
             .filename("IMG_0001.JPG")
             .build();
         let mut config = test_config();
-        config.size = AssetVersionSize::Medium;
+        config.resolution = Some(AssetVersionSize::Medium);
         config.force_size = false;
         let paths = expected_paths_for(&asset, &config);
         assert_eq!(paths.len(), 1);
@@ -1272,6 +1428,114 @@ mod tests {
             !name.contains("-medium"),
             "fallback to Original should not carry medium suffix, got {name}"
         );
+    }
+
+    #[test]
+    fn expected_paths_edited_and_alternative_emit_three_paths() {
+        let asset = TestPhotoAsset::new("MULTI_1")
+            .filename("IMG_1234.HEIC")
+            .orig_file_type("public.heic")
+            .adjusted_version(
+                "https://p01.icloud-content.com/edited",
+                "edited_ck",
+                1500,
+                "public.heic",
+            )
+            .alt_version(
+                "https://p01.icloud-content.com/alt",
+                "alt_ck",
+                4000,
+                "com.adobe.raw-image",
+            )
+            .build();
+        let mut config = test_config();
+        config.edited = true;
+        config.alternative = true;
+
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert_eq!(paths[1].version_size, VersionSizeKey::Adjusted);
+        assert_eq!(paths[2].version_size, VersionSizeKey::Alternative);
+        assert!(paths[1].path.to_string_lossy().contains("_edited"));
+        assert!(paths[2].path.to_string_lossy().contains("_RAW"));
+    }
+
+    #[test]
+    fn expected_paths_size_none_with_missing_edit_emits_nothing() {
+        let asset = TestPhotoAsset::new("NO_EDIT").filename("IMG_0002.JPG").build();
+        let mut config = test_config();
+        config.resolution = None;
+        config.edited = true;
+
+        let paths = expected_paths_for(&asset, &config);
+        assert!(paths.is_empty(), "missing optional edit should be skipped");
+    }
+
+    #[test]
+    fn expected_paths_size_none_with_alternative_emits_only_alternative() {
+        let asset = TestPhotoAsset::new("ALT_ONLY")
+            .filename("IMG_0003.JPG")
+            .alt_version(
+                "https://p01.icloud-content.com/alt-only",
+                "alt_only_ck",
+                2000,
+                "public.jpeg",
+            )
+            .build();
+        let mut config = test_config();
+        config.resolution = None;
+        config.alternative = true;
+
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Alternative);
+        assert!(paths[0].path.to_string_lossy().contains("_alt"));
+    }
+
+    #[test]
+    fn expected_paths_raw_policy_prefer_raw_pairs_primary_and_extra() {
+        let asset = TestPhotoAsset::new("RAW_PAIR")
+            .filename("IMG_RAW.JPG")
+            .orig_file_type("public.jpeg")
+            .orig_checksum("jpeg_ck")
+            .alt_version(
+                "https://p01.icloud-content.com/raw",
+                "raw_ck",
+                8000,
+                "com.adobe.raw-image",
+            )
+            .build();
+        let mut config = test_config();
+        config.raw_policy = RawPolicy::PreferRaw;
+        config.alternative = true;
+
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
+        assert_eq!(&*paths[0].checksum, "raw_ck");
+        assert_eq!(paths[1].version_size, VersionSizeKey::Alternative);
+        assert_eq!(&*paths[1].checksum, "jpeg_ck");
+        assert!(paths[1].path.to_string_lossy().contains("_alt"));
+    }
+
+    #[test]
+    fn expected_paths_alternative_same_url_is_deduplicated() {
+        let asset = TestPhotoAsset::new("ALT_DEDUP")
+            .filename("IMG_0004.JPG")
+            .alt_version(
+                "https://p01.icloud-content.com/orig",
+                "alt_same_ck",
+                1000,
+                "public.jpeg",
+            )
+            .build();
+        let mut config = test_config();
+        config.alternative = true;
+
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].version_size, VersionSizeKey::Original);
     }
 
     #[test]
@@ -1380,7 +1644,7 @@ mod tests {
             .filename("IMG_5003.JPG")
             .build();
         let mut config = test_config();
-        config.size = AssetVersionSize::Medium;
+        config.resolution = Some(AssetVersionSize::Medium);
         config.force_size = false;
         assert_path_parity(&asset, &config, VersionSizeKey::Original, "Medium fallback");
     }
@@ -1579,7 +1843,7 @@ mod tests {
     fn expected_paths_size_medium_present_emits_medium_suffix() {
         let asset = primary_multi_size_asset("MED_PRESENT", "IMG_6001.JPG");
         let mut config = test_config();
-        config.size = AssetVersionSize::Medium;
+        config.resolution = Some(AssetVersionSize::Medium);
         let paths = expected_paths_for(&asset, &config);
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].version_size, VersionSizeKey::Medium);
@@ -1597,7 +1861,7 @@ mod tests {
     fn expected_paths_parity_size_medium_present() {
         let asset = primary_multi_size_asset("PAR_MED", "IMG_6002.JPG");
         let mut config = test_config();
-        config.size = AssetVersionSize::Medium;
+        config.resolution = Some(AssetVersionSize::Medium);
         assert_path_parity(&asset, &config, VersionSizeKey::Medium, "Medium present");
     }
 
@@ -1606,7 +1870,7 @@ mod tests {
     fn expected_paths_size_thumb_present_emits_thumb_suffix() {
         let asset = primary_multi_size_asset("THUMB_PRESENT", "IMG_6003.JPG");
         let mut config = test_config();
-        config.size = AssetVersionSize::Thumb;
+        config.resolution = Some(AssetVersionSize::Thumb);
         let paths = expected_paths_for(&asset, &config);
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].version_size, VersionSizeKey::Thumb);
@@ -1623,7 +1887,7 @@ mod tests {
     fn expected_paths_parity_size_thumb_present() {
         let asset = primary_multi_size_asset("PAR_THUMB", "IMG_6004.JPG");
         let mut config = test_config();
-        config.size = AssetVersionSize::Thumb;
+        config.resolution = Some(AssetVersionSize::Thumb);
         assert_path_parity(&asset, &config, VersionSizeKey::Thumb, "Thumb present");
     }
 
@@ -1635,7 +1899,7 @@ mod tests {
     fn expected_paths_live_photo_size_medium_emits_live_medium_path() {
         let asset = live_photo_multi_size_asset("LIVE_MED_1");
         let mut config = test_config();
-        config.live_photo_size = AssetVersionSize::LiveMedium;
+        config.live_size = Some(AssetVersionSize::LiveMedium);
         let paths = expected_paths_for(&asset, &config);
         assert_eq!(paths.len(), 2, "expected primary + MOV companion");
         let mov = paths
@@ -1696,8 +1960,8 @@ mod tests {
             json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
         );
         let mut config = test_config();
-        config.size = AssetVersionSize::Medium;
-        config.live_photo_size = AssetVersionSize::LiveMedium;
+        config.resolution = Some(AssetVersionSize::Medium);
+        config.live_size = Some(AssetVersionSize::LiveMedium);
 
         let paths = expected_paths_for(&asset, &config);
         assert_eq!(paths.len(), 2);
@@ -1742,8 +2006,8 @@ mod tests {
             )
             .build();
         let mut config = test_config();
-        config.align_raw = RawTreatmentPolicy::PreferOriginal;
-        config.size = AssetVersionSize::Medium;
+        config.raw_policy = RawPolicy::PreferRaw;
+        config.resolution = Some(AssetVersionSize::Medium);
         config.force_size = false;
         let paths = expected_paths_for(&asset, &config);
         assert_eq!(paths.len(), 1);
@@ -1771,7 +2035,7 @@ mod tests {
             .live_photo("https://p01.icloud-content.com/live_orig", "live_ck", 3000)
             .build();
         let mut config = test_config();
-        config.live_photo_size = AssetVersionSize::LiveMedium;
+        config.live_size = Some(AssetVersionSize::LiveMedium);
         config.force_size = true;
         let paths = expected_paths_for(&asset, &config);
         // Primary HEIC is still Original and kept (force_size applies to
@@ -2344,7 +2608,7 @@ mod tests {
             json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
         );
         let mut config = test_config();
-        config.live_photo_size = AssetVersionSize::LiveMedium;
+        config.live_size = Some(AssetVersionSize::LiveMedium);
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 2);
         assert_eq!(&*tasks[1].url, "https://p01.icloud-content.com/live_med");
@@ -2393,7 +2657,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_is_no_swap() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::Unchanged);
+        let versions = apply_raw_policy(asset.versions(), RawPolicy::AsIs);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
             "https://p01.icloud-content.com/orig"
@@ -2409,7 +2673,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_original_swaps_when_alt_is_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
+        let versions = apply_raw_policy(asset.versions(), RawPolicy::PreferRaw);
         // Alternative was RAW → swap: Original now has alt URL
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
@@ -2426,7 +2690,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_alternative_swaps_when_orig_is_raw() {
         let asset = photo_asset_with_original_and_alternative("com.adobe.raw-image", "public.jpeg");
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferAlternative);
+        let versions = apply_raw_policy(asset.versions(), RawPolicy::PreferJpeg);
         // Original was RAW → swap: Alternative now has orig URL
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
@@ -2443,7 +2707,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_original_no_swap_when_alt_not_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
+        let versions = apply_raw_policy(asset.versions(), RawPolicy::PreferRaw);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
             "https://p01.icloud-content.com/orig"
@@ -2453,7 +2717,7 @@ mod tests {
     #[test]
     fn test_raw_policy_as_alternative_no_swap_when_orig_not_raw() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "public.jpeg");
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferAlternative);
+        let versions = apply_raw_policy(asset.versions(), RawPolicy::PreferJpeg);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
             "https://p01.icloud-content.com/orig"
@@ -2463,7 +2727,7 @@ mod tests {
     #[test]
     fn test_raw_policy_no_alternative_no_swap() {
         let asset = TestPhotoAsset::new("TEST_1").build(); // only has Original
-        let versions = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
+        let versions = apply_raw_policy(asset.versions(), RawPolicy::PreferRaw);
         assert_eq!(
             &*get_ver(&versions, AssetVersionSize::Original).unwrap().url,
             "https://p01.icloud-content.com/orig"
@@ -2478,7 +2742,7 @@ mod tests {
     #[test]
     fn raw_policy_view_iter_order_matches_underlying_map() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
-        let view = apply_raw_policy(asset.versions(), RawTreatmentPolicy::PreferOriginal);
+        let view = apply_raw_policy(asset.versions(), RawPolicy::PreferRaw);
 
         let elements: Vec<(AssetVersionSize, &str)> =
             view.iter().map(|(k, v)| (k, v.url.as_ref())).collect();
@@ -2499,7 +2763,7 @@ mod tests {
     #[test]
     fn raw_policy_unchanged_yields_underlying_map_verbatim() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
-        let view = apply_raw_policy(asset.versions(), RawTreatmentPolicy::Unchanged);
+        let view = apply_raw_policy(asset.versions(), RawPolicy::AsIs);
 
         let got: Vec<(AssetVersionSize, &str)> =
             view.iter().map(|(k, v)| (k, v.url.as_ref())).collect();
@@ -2515,7 +2779,7 @@ mod tests {
     fn test_filter_asset_uses_raw_policy_swap() {
         let asset = photo_asset_with_original_and_alternative("public.jpeg", "com.adobe.raw-image");
         let mut config = test_config();
-        config.align_raw = RawTreatmentPolicy::PreferOriginal;
+        config.raw_policy = RawPolicy::PreferRaw;
         // With AsOriginal and RAW alternative, the swap makes Original point to alt URL
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
@@ -2745,7 +3009,7 @@ mod tests {
     fn test_extract_skip_candidates_size_fallback_to_original() {
         let asset = TestPhotoAsset::new("TEST_1").build(); // only has resOriginalRes
         let mut config = test_config();
-        config.size = AssetVersionSize::Medium; // not available
+        config.resolution = Some(AssetVersionSize::Medium); // not available
         config.force_size = false;
         let candidates = extract_skip_candidates(&asset, &config);
         // Should fall back to Original
@@ -2757,7 +3021,7 @@ mod tests {
     fn test_extract_skip_candidates_force_size_no_fallback() {
         let asset = TestPhotoAsset::new("TEST_1").build(); // only has resOriginalRes
         let mut config = test_config();
-        config.size = AssetVersionSize::Medium; // not available
+        config.resolution = Some(AssetVersionSize::Medium); // not available
         config.force_size = true;
         let candidates = extract_skip_candidates(&asset, &config);
         // force_size prevents fallback — no primary version
@@ -2768,7 +3032,7 @@ mod tests {
     fn test_extract_skip_candidates_live_adjusted_falls_back_to_live_original() {
         let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
         let mut config = test_config();
-        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.live_size = Some(AssetVersionSize::LiveAdjusted);
         config.force_size = false;
         let candidates = extract_skip_candidates(&asset, &config);
         // Primary + live companion (fallback to LiveOriginal)
@@ -2780,7 +3044,7 @@ mod tests {
     fn test_extract_skip_candidates_live_adjusted_force_size_no_fallback() {
         let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
         let mut config = test_config();
-        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.live_size = Some(AssetVersionSize::LiveAdjusted);
         config.force_size = true;
         let candidates = extract_skip_candidates(&asset, &config);
         // force_size prevents fallback — only primary, no live companion
@@ -2791,7 +3055,7 @@ mod tests {
     fn test_filter_live_adjusted_falls_back_to_live_original() {
         let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
         let mut config = test_config();
-        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.live_size = Some(AssetVersionSize::LiveAdjusted);
         config.force_size = false;
         let tasks = filter_asset_fresh(&asset, &config);
         // Should produce 2 tasks: primary + live companion (fallback to LiveOriginal)
@@ -2804,7 +3068,7 @@ mod tests {
     fn test_filter_live_adjusted_force_size_no_fallback() {
         let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
         let mut config = test_config();
-        config.live_photo_size = AssetVersionSize::LiveAdjusted;
+        config.live_size = Some(AssetVersionSize::LiveAdjusted);
         config.force_size = true;
         let tasks = filter_asset_fresh(&asset, &config);
         // force_size prevents fallback — only primary, no live companion
@@ -3058,7 +3322,7 @@ mod tests {
     fn test_medium_size_adds_suffix() {
         let asset = multi_size_photo_asset();
         let mut config = test_config();
-        config.size = AssetVersionSize::Medium;
+        config.resolution = Some(AssetVersionSize::Medium);
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         let filename = tasks[0]
@@ -3077,7 +3341,7 @@ mod tests {
     fn test_thumb_size_adds_suffix() {
         let asset = multi_size_photo_asset();
         let mut config = test_config();
-        config.size = AssetVersionSize::Thumb;
+        config.resolution = Some(AssetVersionSize::Thumb);
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         let filename = tasks[0]
@@ -3723,7 +3987,7 @@ mod tests {
         // Asset only has Original; request Medium with force_size=true
         let asset = TestPhotoAsset::new("FORCE_1").build();
         let mut config = test_config();
-        config.size = AssetVersionSize::Medium;
+        config.resolution = Some(AssetVersionSize::Medium);
         config.force_size = true;
         assert!(
             filter_asset_fresh(&asset, &config).is_empty(),
