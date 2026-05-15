@@ -283,8 +283,8 @@ docker exec kei kei import-existing --download-dir /photos
 For headless 2FA:
 
 ```sh
-docker exec kei kei login get-code
-docker exec kei kei login submit-code 123456
+docker exec --user $(id -u):$(id -g) kei kei login get-code
+docker exec --user $(id -u):$(id -g) kei kei login submit-code 123456
 ```
 
 ## Known output differences

@@ -187,7 +187,20 @@ pub(crate) async fn strip_session_routing_state(session_file: &Path) {
     let contents = match fs::read_to_string(session_file).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tracing::warn!(
+                path = %session_file.display(),
+                error = %e,
+                "Permission denied reading session file; skipping strip (check PUID/PGID if running in Docker)"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %session_file.display(),
+                error = %e,
+                "Could not read session file, removing"
+            );
             crate::fs_util::log_remove_async(session_file).await;
             return;
         }
@@ -426,6 +439,14 @@ impl Session {
                         HashMap::new()
                     }
                 },
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    tracing::warn!(
+                        path = %session_path.display(),
+                        error = %e,
+                        "Permission denied reading session file (check PUID/PGID if running in Docker)"
+                    );
+                    HashMap::new()
+                }
                 Err(e) => {
                     tracing::warn!(path = %session_path.display(), error = %e, "Could not read session file, starting fresh");
                     HashMap::new()
@@ -1243,6 +1264,26 @@ mod tests {
         strip_session_routing_state(&path).await;
 
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn strip_session_permission_denied_keeps_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locked.session");
+        let data = serde_json::json!({ "session_token": "tok_abc", "trust_token": "trust_xyz" });
+        std::fs::write(&path, data.to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        strip_session_routing_state(&path).await;
+
+        // restore so tempdir cleanup doesn't fail
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(path.exists());
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, data.to_string());
     }
 
     #[tokio::test]
