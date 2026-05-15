@@ -139,6 +139,7 @@ pub struct TestPhotoAsset {
     asset_date: f64,
     live_photo: Option<LivePhotoFields>,
     alt_version: Option<AltVersionFields>,
+    adjusted_version: Option<AdjustedVersionFields>,
 }
 
 struct LivePhotoFields {
@@ -148,6 +149,13 @@ struct LivePhotoFields {
 }
 
 struct AltVersionFields {
+    url: String,
+    checksum: String,
+    size: u64,
+    file_type: String,
+}
+
+struct AdjustedVersionFields {
     url: String,
     checksum: String,
     size: u64,
@@ -167,6 +175,7 @@ impl TestPhotoAsset {
             asset_date: 1736899200000.0,
             live_photo: None,
             alt_version: None,
+            adjusted_version: None,
         }
     }
 
@@ -224,6 +233,22 @@ impl TestPhotoAsset {
         self
     }
 
+    pub fn adjusted_version(
+        mut self,
+        url: &str,
+        checksum: &str,
+        size: u64,
+        file_type: &str,
+    ) -> Self {
+        self.adjusted_version = Some(AdjustedVersionFields {
+            url: url.to_string(),
+            checksum: checksum.to_string(),
+            size,
+            file_type: file_type.to_string(),
+        });
+        self
+    }
+
     pub fn build(self) -> PhotoAsset {
         let mut fields = json!({
             "filenameEnc": {"value": self.filename, "type": "STRING"},
@@ -252,6 +277,15 @@ impl TestPhotoAsset {
                 "fileChecksum": alt.checksum,
             }});
             fields["resOriginalAltFileType"] = json!({"value": alt.file_type});
+        }
+
+        if let Some(adjusted) = &self.adjusted_version {
+            fields["resJPEGFullRes"] = json!({"value": {
+                "size": adjusted.size,
+                "downloadURL": adjusted.url,
+                "fileChecksum": adjusted.checksum,
+            }});
+            fields["resJPEGFullFileType"] = json!({"value": adjusted.file_type});
         }
 
         let master = json!({

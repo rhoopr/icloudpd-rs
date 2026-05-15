@@ -36,6 +36,7 @@ impl From<VersionSize> for AssetVersionSize {
             VersionSize::Thumb => Self::Thumb,
             VersionSize::Adjusted => Self::Adjusted,
             VersionSize::Alternative => Self::Alternative,
+            VersionSize::None => Self::Original,
         }
     }
 }
@@ -58,14 +59,46 @@ pub enum ChangeReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum Resolution {
+    Original,
+    Medium,
+    Thumb,
+    None,
+}
+
+impl Resolution {
+    pub fn to_asset_version_size(self) -> Option<AssetVersionSize> {
+        match self {
+            Self::Original => Some(AssetVersionSize::Original),
+            Self::Medium => Some(AssetVersionSize::Medium),
+            Self::Thumb => Some(AssetVersionSize::Thumb),
+            Self::None => None,
+        }
+    }
+
+    pub fn to_live_asset_version_size(self) -> Option<AssetVersionSize> {
+        match self {
+            Self::Original => Some(AssetVersionSize::LiveOriginal),
+            Self::Medium => Some(AssetVersionSize::LiveMedium),
+            Self::Thumb => Some(AssetVersionSize::LiveThumb),
+            Self::None => None,
+        }
+    }
+}
+
+/// Deprecated config/CLI size parser kept for backward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VersionSize {
     Original,
     Medium,
     Thumb,
     Adjusted,
     Alternative,
+    None,
 }
 
+/// Deprecated config/CLI live-photo size parser kept for backward compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LivePhotoSize {
@@ -111,6 +144,24 @@ pub enum FileMatchPolicy {
     NameId7 = 1,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Hash, clap::ValueEnum, Serialize, Deserialize,
+)]
+#[repr(u8)]
+pub enum RawPolicy {
+    #[default]
+    #[value(name = "as-is")]
+    #[serde(rename = "as-is")]
+    AsIs = 0,
+    #[value(name = "prefer-raw")]
+    #[serde(rename = "prefer-raw")]
+    PreferRaw = 1,
+    #[value(name = "prefer-jpeg")]
+    #[serde(rename = "prefer-jpeg")]
+    PreferJpeg = 2,
+}
+
+/// Deprecated config/CLI RAW alignment parser kept for backward compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum RawTreatmentPolicy {
@@ -152,6 +203,10 @@ pub enum LivePhotoMode {
 }
 
 impl LivePhotoSize {
+    #[allow(
+        dead_code,
+        reason = "legacy config/tests still use this during migration"
+    )]
     pub fn to_asset_version_size(self) -> AssetVersionSize {
         match self {
             Self::Original => AssetVersionSize::LiveOriginal,
@@ -200,10 +255,26 @@ mod tests {
             (VersionSize::Thumb, "\"thumb\""),
             (VersionSize::Adjusted, "\"adjusted\""),
             (VersionSize::Alternative, "\"alternative\""),
+            (VersionSize::None, "\"none\""),
         ] {
             let json = serde_json::to_string(&variant).expect("serialize VersionSize");
             assert_eq!(json, expected);
             let parsed: VersionSize = serde_json::from_str(&json).expect("deserialize VersionSize");
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn resolution_serde_round_trip() {
+        for (variant, expected) in [
+            (Resolution::Original, "\"original\""),
+            (Resolution::Medium, "\"medium\""),
+            (Resolution::Thumb, "\"thumb\""),
+            (Resolution::None, "\"none\""),
+        ] {
+            let json = serde_json::to_string(&variant).expect("serialize Resolution");
+            assert_eq!(json, expected);
+            let parsed: Resolution = serde_json::from_str(&json).expect("deserialize Resolution");
             assert_eq!(parsed, variant);
         }
     }
@@ -267,6 +338,20 @@ mod tests {
     }
 
     #[test]
+    fn raw_policy_serde_round_trip() {
+        for (variant, expected) in [
+            (RawPolicy::AsIs, "\"as-is\""),
+            (RawPolicy::PreferRaw, "\"prefer-raw\""),
+            (RawPolicy::PreferJpeg, "\"prefer-jpeg\""),
+        ] {
+            let json = serde_json::to_string(&variant).expect("serialize RawPolicy");
+            assert_eq!(json, expected);
+            let parsed: RawPolicy = serde_json::from_str(&json).expect("deserialize RawPolicy");
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
     fn raw_treatment_policy_serde_round_trip() {
         for (variant, expected) in [
             (RawTreatmentPolicy::Unchanged, "\"as-is\""),
@@ -320,6 +405,7 @@ mod tests {
             (VersionSize::Thumb, AssetVersionSize::Thumb),
             (VersionSize::Adjusted, AssetVersionSize::Adjusted),
             (VersionSize::Alternative, AssetVersionSize::Alternative),
+            (VersionSize::None, AssetVersionSize::Original),
         ] {
             assert_eq!(AssetVersionSize::from(input), expected, "from {input:?}");
         }

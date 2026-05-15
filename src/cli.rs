@@ -1,6 +1,6 @@
 use crate::types::{
     Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
-    RawTreatmentPolicy, VersionSize,
+    RawPolicy, RawTreatmentPolicy, Resolution, VersionSize,
 };
 use clap::{Args, FromArgMatches, Parser, Subcommand};
 
@@ -258,12 +258,24 @@ pub struct SyncArgs {
     #[arg(long = "library", env = "KEI_LIBRARY", value_parser = non_empty_string)]
     pub libraries: Vec<String>,
 
-    /// Image size to download
+    /// Primary image resolution to download
     #[arg(long, env = "KEI_SIZE", value_enum)]
     pub size: Option<VersionSize>,
 
-    /// Live photo video size
-    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum)]
+    /// Also download the edited full-resolution version when available
+    #[arg(long, env = "KEI_EDITED", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub edited: Option<bool>,
+
+    /// Also download the RAW/JPEG pair sibling when available
+    #[arg(long, env = "KEI_ALTERNATIVE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub alternative: Option<bool>,
+
+    /// Live photo video resolution
+    #[arg(long = "live-size", env = "KEI_LIVE_SIZE", value_enum)]
+    pub live_size: Option<Resolution>,
+
+    /// Deprecated: use --live-size
+    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum, hide = true)]
     pub live_photo_size: Option<LivePhotoSize>,
 
     /// Number of recent photos to download (e.g. `--recent 100`) or a recency
@@ -392,8 +404,12 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY", value_enum)]
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
-    /// RAW treatment policy
-    #[arg(long, env = "KEI_ALIGN_RAW", value_enum)]
+    /// RAW/JPEG pair filename policy
+    #[arg(long = "raw-policy", env = "KEI_RAW_POLICY", value_enum)]
+    pub raw_policy: Option<RawPolicy>,
+
+    /// Deprecated: use --raw-policy
+    #[arg(long, env = "KEI_ALIGN_RAW", value_enum, hide = true)]
     pub align_raw: Option<RawTreatmentPolicy>,
 
     /// File matching and dedup policy
@@ -585,25 +601,41 @@ pub struct ImportArgs {
     #[arg(long, env = "KEI_FILE_MATCH_POLICY", value_enum)]
     pub file_match_policy: Option<FileMatchPolicy>,
 
-    /// Image size to import (must match what was used during sync). Default: original.
+    /// Primary image resolution to import (must match what was used during sync). Default: original.
     #[arg(long, env = "KEI_SIZE", value_enum)]
     pub size: Option<VersionSize>,
+
+    /// Also import edited full-resolution versions when present
+    #[arg(long, env = "KEI_EDITED", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub edited: Option<bool>,
+
+    /// Also import RAW/JPEG pair siblings when present
+    #[arg(long, env = "KEI_ALTERNATIVE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    pub alternative: Option<bool>,
 
     /// Live photo handling: both, image-only, video-only, skip
     /// (must match what was used during sync)
     #[arg(long, env = "KEI_LIVE_PHOTO_MODE", value_enum)]
     pub live_photo_mode: Option<LivePhotoMode>,
 
-    /// Live photo video size (must match what was used during sync)
-    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum)]
+    /// Live photo video resolution (must match what was used during sync)
+    #[arg(long = "live-size", env = "KEI_LIVE_SIZE", value_enum)]
+    pub live_size: Option<Resolution>,
+
+    /// Deprecated: use --live-size
+    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum, hide = true)]
     pub live_photo_size: Option<LivePhotoSize>,
 
     /// Live photo MOV filename policy (must match what was used during sync)
     #[arg(long, env = "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY", value_enum)]
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
-    /// RAW treatment policy (must match what was used during sync)
-    #[arg(long, env = "KEI_ALIGN_RAW", value_enum)]
+    /// RAW/JPEG pair filename policy (must match what was used during sync)
+    #[arg(long = "raw-policy", env = "KEI_RAW_POLICY", value_enum)]
+    pub raw_policy: Option<RawPolicy>,
+
+    /// Deprecated: use --raw-policy
+    #[arg(long, env = "KEI_ALIGN_RAW", value_enum, hide = true)]
     pub align_raw: Option<RawTreatmentPolicy>,
 
     /// Only check the requested size (don't fall back to original)
@@ -1062,6 +1094,15 @@ impl SyncArgs {
         if self.size.is_none() {
             self.size = fallback.size;
         }
+        if self.edited.is_none() {
+            self.edited = fallback.edited;
+        }
+        if self.alternative.is_none() {
+            self.alternative = fallback.alternative;
+        }
+        if self.live_size.is_none() {
+            self.live_size = fallback.live_size;
+        }
         if self.live_photo_size.is_none() {
             self.live_photo_size = fallback.live_photo_size;
         }
@@ -1136,6 +1177,9 @@ impl SyncArgs {
         }
         if self.live_photo_mov_filename_policy.is_none() {
             self.live_photo_mov_filename_policy = fallback.live_photo_mov_filename_policy;
+        }
+        if self.raw_policy.is_none() {
+            self.raw_policy = fallback.raw_policy;
         }
         if self.align_raw.is_none() {
             self.align_raw = fallback.align_raw;
@@ -1477,6 +1521,9 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
         "filename_exclude" => "--filename-exclude",
         "libraries" => "--library",
         "size" => "--size",
+        "edited" => "--edited",
+        "alternative" => "--alternative",
+        "live_size" => "--live-size",
         "live_photo_size" => "--live-photo-size",
         "recent" => "--recent",
         "threads" => "--threads",
@@ -1508,6 +1555,7 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
         "no_progress_bar" => "--no-progress-bar",
         "keep_unicode_in_filenames" => "--keep-unicode-in-filenames",
         "live_photo_mov_filename_policy" => "--live-photo-mov-filename-policy",
+        "raw_policy" => "--raw-policy",
         "align_raw" => "--align-raw",
         "file_match_policy" => "--file-match-policy",
         "skip_created_before" => "--skip-created-before",
@@ -2779,12 +2827,33 @@ mod tests {
             ("thumb", VersionSize::Thumb),
             ("adjusted", VersionSize::Adjusted),
             ("alternative", VersionSize::Alternative),
+            ("none", VersionSize::None),
         ] {
             let mut args = base_args();
             args.extend(["--size", input]);
             let cli = parse(&args);
             assert_eq!(cli.sync.size, Some(expected), "size variant: {input}");
         }
+    }
+
+    #[test]
+    fn test_new_size_axis_flags_parse() {
+        let mut args = base_args();
+        args.extend([
+            "--edited",
+            "true",
+            "--alternative",
+            "true",
+            "--live-size",
+            "medium",
+            "--raw-policy",
+            "prefer-raw",
+        ]);
+        let cli = parse(&args);
+        assert_eq!(cli.sync.edited, Some(true));
+        assert_eq!(cli.sync.alternative, Some(true));
+        assert_eq!(cli.sync.live_size, Some(Resolution::Medium));
+        assert_eq!(cli.sync.raw_policy, Some(RawPolicy::PreferRaw));
     }
 
     #[test]
@@ -3315,10 +3384,29 @@ mod tests {
             ("thumb", VersionSize::Thumb),
             ("adjusted", VersionSize::Adjusted),
             ("alternative", VersionSize::Alternative),
+            ("none", VersionSize::None),
         ] {
             let args = parse_import(&["--size", input]);
             assert_eq!(args.size, Some(expected), "size={input}");
         }
+    }
+
+    #[test]
+    fn import_existing_new_size_axis_flags_parse() {
+        let args = parse_import(&[
+            "--edited",
+            "true",
+            "--alternative",
+            "true",
+            "--live-size",
+            "thumb",
+            "--raw-policy",
+            "prefer-jpeg",
+        ]);
+        assert_eq!(args.edited, Some(true));
+        assert_eq!(args.alternative, Some(true));
+        assert_eq!(args.live_size, Some(Resolution::Thumb));
+        assert_eq!(args.raw_policy, Some(RawPolicy::PreferJpeg));
     }
 
     #[test]

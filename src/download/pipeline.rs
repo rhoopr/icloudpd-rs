@@ -4557,8 +4557,7 @@ mod tests {
         use crate::download::{DownloadConfig, SyncMode};
         use crate::icloud::photos::PhotoAsset;
         use crate::types::{
-            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-            RawTreatmentPolicy,
+            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
         };
         use futures_util::stream;
         use rustc_hash::FxHashSet;
@@ -4585,7 +4584,9 @@ mod tests {
             folder_structure_smart_folders: Arc::from(
                 crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
             ),
-            size: AssetVersionSize::Original,
+            resolution: Some(AssetVersionSize::Original),
+            edited: false,
+            alternative: false,
             skip_videos: false,
             skip_photos: false,
             skip_created_before: None,
@@ -4611,9 +4612,9 @@ mod tests {
                 max_delay_secs: 0,
             },
             live_photo_mode: LivePhotoMode::Both,
-            live_photo_size: AssetVersionSize::LiveOriginal,
+            live_size: Some(AssetVersionSize::LiveOriginal),
             live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-            align_raw: RawTreatmentPolicy::Unchanged,
+            raw_policy: RawPolicy::AsIs,
             no_progress_bar: true,
             only_print_filenames: false,
             personality_mode: crate::personality::Mode::Off,
@@ -4676,8 +4677,7 @@ mod tests {
         use crate::download::{DownloadConfig, SyncMode};
         use crate::icloud::photos::PhotoAsset;
         use crate::types::{
-            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-            RawTreatmentPolicy,
+            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
         };
         use rustc_hash::FxHashSet;
 
@@ -4690,7 +4690,9 @@ mod tests {
             folder_structure_smart_folders: Arc::from(
                 crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
             ),
-            size: AssetVersionSize::Original,
+            resolution: Some(AssetVersionSize::Original),
+            edited: false,
+            alternative: false,
             skip_videos: false,
             skip_photos: false,
             skip_created_before: None,
@@ -4712,9 +4714,9 @@ mod tests {
             recent: None,
             retry: RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
-            live_photo_size: AssetVersionSize::LiveOriginal,
+            live_size: Some(AssetVersionSize::LiveOriginal),
             live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-            align_raw: RawTreatmentPolicy::Unchanged,
+            raw_policy: RawPolicy::AsIs,
             no_progress_bar: true,
             only_print_filenames: false,
             personality_mode: crate::personality::Mode::Off,

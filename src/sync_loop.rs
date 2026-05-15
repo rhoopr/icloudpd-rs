@@ -662,7 +662,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .skip_created_after
         .map(|d| d.with_timezone(&chrono::Utc));
     let retry_config = api_retry_config;
-    let live_photo_size = config.live_photo_size.to_asset_version_size();
     // One shared limiter per sync run so the configured cap applies to
     // aggregate throughput across every concurrent download.
     let bandwidth_limiter = config
@@ -697,7 +696,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             folder_structure_albums: Arc::clone(&cfg_folder_structure_albums),
             folder_structure_smart_folders: Arc::clone(&cfg_folder_structure_smart_folders),
             library,
-            size: config.size.into(),
+            resolution: config.resolution.to_asset_version_size(),
+            edited: config.edited,
+            alternative: config.alternative,
             skip_videos: config.skip_videos,
             skip_photos: config.skip_photos,
             skip_created_before,
@@ -719,9 +720,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             recent: config.recent,
             retry: retry_config,
             live_photo_mode: config.live_photo_mode,
-            live_photo_size,
+            live_size: config.live_size.to_live_asset_version_size(),
             live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
-            align_raw: config.align_raw,
+            raw_policy: config.raw_policy,
             no_progress_bar: config.no_progress_bar,
             only_print_filenames: config.only_print_filenames,
             personality_mode: config.personality_mode,
