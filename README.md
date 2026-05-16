@@ -107,7 +107,7 @@ Operations:
 - `kei verify --checksums` checks files already recorded in state.
 - `kei reconcile --dry-run` finds state rows whose files disappeared.
 - `kei import-existing` adopts an existing local photo tree.
-- `kei install`, `kei uninstall`, and `kei service status` manage the background service on Linux, macOS, and Windows.
+- `kei install`, `kei uninstall`, and `kei service status` manage the [background service](https://github.com/rhoopr/kei/wiki/Service) on Linux, macOS, and Windows.
 - Friendly output is on by default on plain TTYs. Use `--no-friendly` for structured logs, or `--friendly` to opt in where hard-off contexts don't apply.
 - `--report-json` writes an atomic per-cycle sync report.
 - Watch mode serves `/healthz` and `/metrics` on the configured HTTP bind and port.
