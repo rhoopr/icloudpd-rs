@@ -72,9 +72,8 @@ kei import-existing --username you@example.com --download-dir ~/Photos/iCloud \
   --folder-structure-albums "{album}/%Y/%m/%d"
 ```
 
-Putting `{album}` in `--folder-structure` still works for now, but kei prints a
-deprecation warning and auto-migrates it. Update the command or TOML before
-v0.20.
+On v0.20 and later, `{album}` is only accepted in
+`--folder-structure-albums`.
 
 ### Filename policy
 
@@ -149,7 +148,7 @@ if you want kei to store the password for future runs.
 | `-p`, `--password` | Same | Works, but process lists can expose it. Prefer `kei password set`, `--password-file`, or `--password-command`. |
 | `-d`, `--directory` | `-d`, `--download-dir` | `--directory` was removed in v0.20. |
 | `-a`, `--album` | Same | Repeatable. Default is `all`; use `--album '!Name'` for exclusions. |
-| `--exclude-album NAME` | `--album '!NAME'` | Deprecated alias through v0.20. |
+| `--exclude-album NAME` | `--album '!NAME'` | Removed in v0.20. |
 | `--list-albums` | `kei list albums` | The old flag was removed in v0.20. |
 | `--list-libraries` | `kei list libraries` | The old flag was removed in v0.20. |
 | `--cookie-directory` | `--data-dir` | The old flag was removed in v0.20. New default is `~/.config/kei`. |
@@ -215,9 +214,9 @@ iCloud metadata that Python didn't handle the same way.
 | `kei reconcile` | Mark missing local files as failed so the next sync re-downloads them. |
 | `--reconcile-every-n-cycles` | Periodic read-only reconciliation warning pass during watch mode. |
 
-## Deprecated kei compatibility aliases
+## Removed kei compatibility aliases
 
-These still work before v0.20 and are scheduled for removal in v0.20:
+v0.20 removed the remaining v0.13 compatibility aliases:
 
 | Deprecated | Use |
 |---|---|

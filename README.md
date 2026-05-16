@@ -29,7 +29,7 @@
 > kei is pre-release software under active development, and minor versions may contain breaking changes. We follow a deprecate-then-remove practice, but always check CHANGELOG when updating.
 
 > [!IMPORTANT]
-> v0.13 reshapes selection and folder-structure flags. `--exclude-album NAME` becomes `--album '!NAME'`. `--library` accepts multiple values. `kei sync` with no flags now runs per-album passes plus an unfiled pass. Legacy `{album}` in `--folder-structure` auto-migrates with a warning until v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md).
+> v0.13 reshaped selection and folder-structure flags. `--exclude-album NAME` is now `--album '!NAME'`. `--library` accepts multiple values. `kei sync` with no flags runs per-album passes plus an unfiled pass. On v0.20 and later, put `{album}` in `--folder-structure-albums`, not `--folder-structure`. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md).
 >
 > | Flag | Default |
 > |---|---|
