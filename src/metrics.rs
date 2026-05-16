@@ -1,9 +1,8 @@
 //! HTTP observability server (watch-mode only).
 //!
-//! In watch mode, spawns an axum HTTP server on `--http-port` (default 9090) that serves:
+//! In watch mode, spawns an axum HTTP server on `--http-port` (default 9091) that serves:
 //! - `GET /healthz`  — JSON health status (same data as `health.json`)
 //! - `GET /metrics`  — Prometheus text format
-//! - `GET /` plus `/control/*` and `/events` loopback-only control endpoints
 //!
 //! Metrics are updated after every sync cycle by calling [`MetricsHandle::update`].
 //! On skipped cycles (no changes detected), call [`MetricsHandle::update_health_only`]
@@ -11,27 +10,23 @@
 //! All counters are cumulative across cycles (they never reset while the process
 //! is running), matching Prometheus conventions.
 
-use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
-use axum::body::Body;
-use axum::extract::{ConnectInfo, State};
-use axum::http::{header, HeaderValue, Request, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::extract::State;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::get;
 use axum::Router;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::download::SyncStats;
@@ -75,100 +70,12 @@ struct StatusLabels {
 
 // ── State shared between the HTTP handlers and the sync loop ─────────────────
 
-const SSE_CAPACITY: usize = 64;
-const RECENT_ERROR_CAP: usize = 5;
-
-#[derive(Debug, Clone)]
-struct RecentError {
-    at: DateTime<Utc>,
-    message: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StatusStatsSnapshot {
-    assets_seen: u64,
-    downloaded: usize,
-    failed: usize,
-    skipped: usize,
-}
-
-impl From<&SyncStats> for StatusStatsSnapshot {
-    fn from(stats: &SyncStats) -> Self {
-        Self {
-            assets_seen: stats.assets_seen,
-            downloaded: stats.downloaded,
-            failed: stats.failed,
-            skipped: stats.skipped.total(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct StatusSnapshot {
-    service_started_at: DateTime<Utc>,
-    watch_interval_secs: Option<u64>,
-    last_outcome: Option<String>,
-    last_stats: Option<StatusStatsSnapshot>,
-    library_summary: Option<SyncSummary>,
-    recent_errors: Vec<RecentError>,
-}
-
-impl StatusSnapshot {
-    fn new(watch_interval_secs: Option<u64>) -> Self {
-        Self {
-            service_started_at: Utc::now(),
-            watch_interval_secs,
-            last_outcome: None,
-            last_stats: None,
-            library_summary: None,
-            recent_errors: Vec::new(),
-        }
-    }
-
-    fn push_error(&mut self, message: String) {
-        if self
-            .recent_errors
-            .last()
-            .is_some_and(|last| last.message == message)
-        {
-            return;
-        }
-        self.recent_errors.push(RecentError {
-            at: Utc::now(),
-            message,
-        });
-        if self.recent_errors.len() > RECENT_ERROR_CAP {
-            let over = self.recent_errors.len() - RECENT_ERROR_CAP;
-            self.recent_errors.drain(0..over);
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct StructuredEvent {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    timestamp: DateTime<Utc>,
-    data: serde_json::Value,
-}
-
-impl StructuredEvent {
-    pub(crate) fn new(kind: &'static str, data: serde_json::Value) -> Self {
-        Self {
-            kind,
-            timestamp: Utc::now(),
-            data,
-        }
-    }
-}
-
 /// Health snapshot read by the /healthz handler. The registry is immutable
-/// after construction so it lives directly on `MetricsHandle` behind an Arc,
+/// after construction so it lives directly on MetricsHandle behind an Arc,
 /// letting /metrics encode without taking the lock.
 #[derive(Debug)]
 struct Inner {
     health_snapshot: Option<HealthStatus>,
-    status_snapshot: StatusSnapshot,
     /// Maximum age of `last_success_at` before /healthz returns 503. `None`
     /// disables the staleness check (e.g. one-shot syncs where a single
     /// success is final). Set at construction time from `watch_interval * 2`
@@ -177,29 +84,13 @@ struct Inner {
     staleness_threshold: Option<chrono::Duration>,
 }
 
-#[derive(Debug)]
-struct StatusPageView {
-    service_started_at: DateTime<Utc>,
-    watch_interval_secs: Option<u64>,
-    last_sync_at: Option<DateTime<Utc>>,
-    last_success_at: Option<DateTime<Utc>>,
-    last_outcome: String,
-    last_stats: Option<StatusStatsSnapshot>,
-    library_summary: Option<SyncSummary>,
-    recent_errors: Vec<RecentError>,
-    paused: bool,
-}
-
 /// Cheap-to-clone handle passed to the sync loop and into axum state.
 #[derive(Clone)]
 pub(crate) struct MetricsHandle {
-    /// Prometheus registry — immutable after `new()`, so no lock needed for reads.
+    /// Prometheus registry — immutable after new(), so no lock needed for reads.
     registry: Arc<Registry>,
     /// Protects the /healthz snapshot only.
     inner: Arc<Mutex<Inner>>,
-    pause_flag: Arc<AtomicBool>,
-    sync_now_notify: Arc<Notify>,
-    event_broadcast: broadcast::Sender<StructuredEvent>,
     // Metric handles use atomics internally; no lock needed for updates.
     assets_seen: Counter,
     downloaded: Counter,
@@ -220,34 +111,11 @@ pub(crate) struct MetricsHandle {
     db_assets_size_bytes: Family<StatusLabels, Gauge>,
     db_last_sync_assets_seen: Gauge,
     db_summary_read_failures: Counter,
-    throttle_pressure: Gauge<f64, AtomicU64>,
-    throttle_current_interval_seconds: Gauge<f64, AtomicU64>,
-    disk_free: Gauge,
-}
-
-impl std::fmt::Debug for MetricsHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MetricsHandle").finish_non_exhaustive()
-    }
 }
 
 impl MetricsHandle {
     /// Build the registry and register all metrics.
-    #[cfg(test)]
     pub(crate) fn new(staleness_threshold: Option<chrono::Duration>) -> Self {
-        Self::new_with_watch_interval(staleness_threshold, None)
-    }
-
-    /// Build the registry, register all metrics, and seed the status page with
-    /// the configured watch interval.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "metric registration is intentionally centralized so series names, help text, and handles stay together"
-    )]
-    pub(crate) fn new_with_watch_interval(
-        staleness_threshold: Option<chrono::Duration>,
-        watch_interval_secs: Option<u64>,
-    ) -> Self {
         let mut registry = Registry::default();
 
         let assets_seen = Counter::default();
@@ -376,27 +244,6 @@ impl MetricsHandle {
             db_summary_read_failures.clone(),
         );
 
-        let throttle_pressure: Gauge<f64, AtomicU64> = Gauge::default();
-        registry.register(
-            "kei_throttle_pressure",
-            "Current adaptive throttle pressure (0.0 = calm, 1.0 = max)",
-            throttle_pressure.clone(),
-        );
-
-        let throttle_current_interval_seconds: Gauge<f64, AtomicU64> = Gauge::default();
-        registry.register(
-            "kei_throttle_current_interval_seconds",
-            "Current watch interval in seconds (may be scaled above baseline by throttle)",
-            throttle_current_interval_seconds.clone(),
-        );
-
-        let disk_free: Gauge = Gauge::default();
-        registry.register(
-            "kei_disk_free_bytes",
-            "Current free disk space on the download volume in bytes",
-            disk_free.clone(),
-        );
-
         registry.register(
             "kei_state_mark_downloaded_zero_rows",
             "Total number of mark_downloaded calls that matched 0 rows in the assets table — \
@@ -414,18 +261,12 @@ impl MetricsHandle {
             MARK_FAILED_ZERO_ROWS.clone(),
         );
 
-        let (event_broadcast, _) = broadcast::channel(SSE_CAPACITY);
-
         Self {
             registry: Arc::new(registry),
             inner: Arc::new(Mutex::new(Inner {
                 health_snapshot: None,
-                status_snapshot: StatusSnapshot::new(watch_interval_secs),
                 staleness_threshold,
             })),
-            pause_flag: Arc::new(AtomicBool::new(false)),
-            sync_now_notify: Arc::new(Notify::new()),
-            event_broadcast,
             assets_seen,
             downloaded,
             failed,
@@ -444,9 +285,6 @@ impl MetricsHandle {
             db_assets_size_bytes,
             db_last_sync_assets_seen,
             db_summary_read_failures,
-            throttle_pressure,
-            throttle_current_interval_seconds,
-            disk_free,
         }
     }
 
@@ -542,90 +380,17 @@ impl MetricsHandle {
         self.db_summary_read_failures.inc();
     }
 
-    /// Update throttle-related gauges.
-    ///
-    /// Call this after [`Self::update`] on every cycle when a throttle
-    /// controller is active. Mirrors the health-gauge pattern: no-op when
-    /// the handle was never built (one-shot / metrics-disabled).
-    pub(crate) fn update_throttle(&self, pressure: f64, interval_secs: u64) {
-        self.throttle_pressure.set(pressure);
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "OpenMetrics gauge format is f64 seconds; sub-second precision is below the metric's granularity"
-        )]
-        self.throttle_current_interval_seconds
-            .set(interval_secs as f64);
-    }
-
-    /// Update the free-disk gauge from a consumer-side recheck.
-    pub(crate) fn update_disk_free(&self, bytes: u64) {
-        self.disk_free.set(i64::try_from(bytes).unwrap_or(i64::MAX));
-    }
-
-    pub(crate) fn is_paused(&self) -> bool {
-        self.pause_flag.load(Ordering::SeqCst)
-    }
-
-    pub(crate) async fn wait_for_control_signal(&self) {
-        self.sync_now_notify.notified().await;
-    }
-
-    pub(crate) fn publish_event(&self, event: StructuredEvent) {
-        let _ignored = self.event_broadcast.send(event);
-    }
-
-    pub(crate) async fn update_status_snapshot(
-        &self,
-        outcome: &str,
-        stats: Option<&SyncStats>,
-        summary: Option<&SyncSummary>,
-    ) {
-        let mut inner = self.inner.lock().await;
-        inner.status_snapshot.last_outcome = Some(outcome.to_string());
-        if let Some(stats) = stats {
-            inner.status_snapshot.last_stats = Some(StatusStatsSnapshot::from(stats));
-        }
-        if let Some(summary) = summary {
-            inner.status_snapshot.library_summary = Some(summary.clone());
-        }
-    }
-
-    pub(crate) fn publish_sync_started(&self, cycle: u64) {
-        self.publish_event(StructuredEvent::new(
-            "sync_started",
-            serde_json::json!({ "cycle": cycle }),
-        ));
-    }
-
-    pub(crate) fn publish_sync_skipped(&self, cycle: u64, reason: &'static str) {
-        self.publish_event(StructuredEvent::new(
-            "sync_skipped",
-            serde_json::json!({ "cycle": cycle, "reason": reason }),
-        ));
-    }
-
-    pub(crate) fn publish_sync_finished(&self, cycle: u64, outcome: &str, stats: &SyncStats) {
-        self.publish_event(StructuredEvent::new(
-            "sync_finished",
-            serde_json::json!({
-                "cycle": cycle,
-                "outcome": outcome,
-                "assets_seen": stats.assets_seen,
-                "downloaded": stats.downloaded,
-                "failed": stats.failed,
-                "skipped": stats.skipped.total(),
-            }),
-        ));
-    }
-
     async fn update_health_gauges(&self, health: &HealthStatus) {
         self.consecutive_failures
             .set(i64::from(health.consecutive_failures));
-        let last_success_ts = health.last_success_at.map_or(0.0, |t| {
-            #[allow(clippy::cast_precision_loss, reason = "OpenMetrics timestamp format is f64 seconds; precision loss at the second level is below the metric's granularity")]
-            let ts = t.timestamp() as f64;
-            ts
-        });
+        let last_success_ts = health
+            .last_success_at
+            .map(|t| {
+                #[allow(clippy::cast_precision_loss, reason = "OpenMetrics timestamp format is f64 seconds; precision loss at the second level is below the metric's granularity")]
+                let ts = t.timestamp() as f64;
+                ts
+            })
+            .unwrap_or(0.0);
         self.last_success_timestamp.set(last_success_ts);
 
         let mut inner = self.inner.lock().await;
@@ -635,9 +400,6 @@ impl MetricsHandle {
             consecutive_failures: health.consecutive_failures,
             last_error: health.last_error.clone(),
         });
-        if let Some(error) = &health.last_error {
-            inner.status_snapshot.push_error(error.clone());
-        }
     }
 
     fn inc_skip(&self, reason: &'static str, count: usize) {
@@ -717,273 +479,6 @@ async fn handle_healthz(State(handle): State<MetricsHandle>) -> impl IntoRespons
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the status endpoint is a small server-rendered HTML page kept in one place for readability"
-)]
-async fn handle_status_page(State(handle): State<MetricsHandle>) -> impl IntoResponse {
-    let view = {
-        let inner = handle.inner.lock().await;
-        let health = inner.health_snapshot.as_ref();
-        let snapshot = &inner.status_snapshot;
-        StatusPageView {
-            service_started_at: snapshot.service_started_at,
-            watch_interval_secs: snapshot.watch_interval_secs,
-            last_sync_at: health.and_then(|h| h.last_sync_at),
-            last_success_at: health.and_then(|h| h.last_success_at),
-            last_outcome: snapshot
-                .last_outcome
-                .clone()
-                .unwrap_or_else(|| "no sync cycle completed yet".to_string()),
-            last_stats: snapshot.last_stats,
-            library_summary: snapshot.library_summary.clone(),
-            recent_errors: snapshot.recent_errors.clone(),
-            paused: handle.is_paused(),
-        }
-    };
-
-    let uptime = Utc::now() - view.service_started_at;
-    let uptime = format_duration_human(uptime);
-    let watch_interval = view
-        .watch_interval_secs
-        .map_or_else(|| "one-shot".to_string(), |secs| format!("{secs}s"));
-    let last_sync = view
-        .last_sync_at
-        .map_or_else(|| "never".to_string(), |t| t.to_rfc3339());
-    let last_success = view
-        .last_success_at
-        .map_or_else(|| "never".to_string(), |t| t.to_rfc3339());
-    let outcome = view.last_outcome;
-    let stats = view.last_stats;
-    let assets_seen = stats.map_or(0, |s| s.assets_seen);
-    let downloaded = stats.map_or(0, |s| s.downloaded);
-    let failed = stats.map_or(0, |s| s.failed);
-    let skipped = stats.map_or(0, |s| s.skipped);
-    let library = view.library_summary.as_ref();
-    let total_assets = library.map_or(0, |s| s.total_assets);
-    let downloaded_assets = library.map_or(0, |s| s.downloaded);
-    let pending_assets = library.map_or(0, |s| s.pending);
-    let failed_assets = library.map_or(0, |s| s.failed);
-    let downloaded_bytes = library.map_or(0, |s| s.downloaded_bytes);
-    let errors = if view.recent_errors.is_empty() {
-        "<li>No recent errors</li>".to_string()
-    } else {
-        view.recent_errors
-            .iter()
-            .rev()
-            .map(|e| {
-                format!(
-                    "<li><time>{}</time> {}</li>",
-                    e.at.to_rfc3339(),
-                    escape_html(&e.message)
-                )
-            })
-            .collect::<String>()
-    };
-
-    let html = format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta http-equiv="refresh" content="30">
-  <title>kei status</title>
-  <style>
-    body {{ font-family: system-ui, sans-serif; max-width: 56rem; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }}
-    header {{ display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #d1d5db; margin-bottom: 1rem; }}
-    h1 {{ margin: 0 0 .5rem; }}
-    section {{ border: 1px solid #e5e7eb; border-radius: .5rem; padding: 1rem; margin: 1rem 0; }}
-    dl {{ display: grid; grid-template-columns: 12rem 1fr; gap: .35rem 1rem; }}
-    dt {{ font-weight: 700; }}
-    dd {{ margin: 0; }}
-    form {{ display: inline; margin-right: .5rem; }}
-    button {{ padding: .4rem .75rem; }}
-    .pill {{ border-radius: 999px; padding: .2rem .6rem; background: #e5e7eb; }}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>kei <span class="pill">{}</span></h1>
-    <time>{}</time>
-  </header>
-  <section>
-    <h2>Service status</h2>
-    <dl>
-      <dt>State</dt><dd>{}</dd>
-      <dt>Uptime</dt><dd>{}</dd>
-      <dt>Watch interval</dt><dd>{}</dd>
-    </dl>
-  </section>
-  <section>
-    <h2>Last sync</h2>
-    <dl>
-      <dt>Last sync</dt><dd>{}</dd>
-      <dt>Last success</dt><dd>{}</dd>
-      <dt>Outcome</dt><dd>{}</dd>
-      <dt>Assets seen</dt><dd>{}</dd>
-      <dt>Downloaded</dt><dd>{}</dd>
-      <dt>Failed</dt><dd>{}</dd>
-      <dt>Skipped</dt><dd>{}</dd>
-    </dl>
-  </section>
-  <section>
-    <h2>Library</h2>
-    <dl>
-      <dt>Total assets</dt><dd>{}</dd>
-      <dt>Downloaded assets</dt><dd>{}</dd>
-      <dt>Pending assets</dt><dd>{}</dd>
-      <dt>Failed assets</dt><dd>{}</dd>
-      <dt>Downloaded bytes</dt><dd>{}</dd>
-    </dl>
-  </section>
-  <section>
-    <h2>Recent errors</h2>
-    <ul>{}</ul>
-  </section>
-  <section>
-    <h2>Controls</h2>
-    <form method="post" action="/control/pause"><button type="submit">Pause</button></form>
-    <form method="post" action="/control/resume"><button type="submit">Resume</button></form>
-    <form method="post" action="/control/sync-now"><button type="submit">Sync Now</button></form>
-  </section>
-</body>
-</html>"#,
-        env!("CARGO_PKG_VERSION"),
-        Utc::now().to_rfc3339(),
-        if view.paused { "paused" } else { "running" },
-        uptime,
-        watch_interval,
-        last_sync,
-        last_success,
-        escape_html(&outcome),
-        assets_seen,
-        downloaded,
-        failed,
-        skipped,
-        total_assets,
-        downloaded_assets,
-        pending_assets,
-        failed_assets,
-        downloaded_bytes,
-        errors
-    );
-
-    (
-        StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/html; charset=utf-8"),
-        )],
-        html,
-    )
-}
-
-async fn handle_pause(State(handle): State<MetricsHandle>) -> impl IntoResponse {
-    handle.pause_flag.store(true, Ordering::SeqCst);
-    handle.sync_now_notify.notify_one();
-    handle.publish_event(StructuredEvent::new(
-        "paused",
-        serde_json::json!({ "status": "paused" }),
-    ));
-    json_response(r#"{"status":"paused"}"#)
-}
-
-async fn handle_resume(State(handle): State<MetricsHandle>) -> impl IntoResponse {
-    handle.pause_flag.store(false, Ordering::SeqCst);
-    handle.sync_now_notify.notify_one();
-    handle.publish_event(StructuredEvent::new(
-        "resumed",
-        serde_json::json!({ "status": "running" }),
-    ));
-    json_response(r#"{"status":"running"}"#)
-}
-
-async fn handle_sync_now(State(handle): State<MetricsHandle>) -> impl IntoResponse {
-    handle.sync_now_notify.notify_one();
-    handle.publish_event(StructuredEvent::new(
-        "sync_now",
-        serde_json::json!({ "status": "sync triggered" }),
-    ));
-    json_response(r#"{"status":"sync triggered"}"#)
-}
-
-async fn handle_sse_events(State(handle): State<MetricsHandle>) -> impl IntoResponse {
-    let rx = handle.event_broadcast.subscribe();
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let data = serde_json::to_string(&event)
-                        .unwrap_or_else(|_| r#"{"type":"serialization_failed"}"#.to_string());
-                    return Some((Ok::<_, Infallible>(SseEvent::default().data(data)), rx));
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    });
-
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
-            .text("ping"),
-    )
-}
-
-async fn require_loopback_control(req: Request<Body>, next: Next) -> Response {
-    let loopback = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .is_some_and(|ConnectInfo(addr)| addr.ip().is_loopback());
-    if loopback {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::FORBIDDEN,
-            [(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            )],
-            r#"{"error":"control endpoints are loopback-only"}"#,
-        )
-            .into_response()
-    }
-}
-
-fn format_duration_human(duration: chrono::Duration) -> String {
-    let secs = duration.num_seconds().max(0);
-    let hours = secs / 3600;
-    let minutes = (secs % 3600) / 60;
-    let seconds = secs % 60;
-    format!("{hours}h {minutes}m {seconds}s")
-}
-
-fn escape_html(input: &str) -> String {
-    let mut escaped = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-fn json_response(body: &'static str) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        )],
-        body,
-    )
-}
-
 // ── Server entrypoint ─────────────────────────────────────────────────────────
 
 /// Bind and spawn the metrics HTTP server as a background tokio task.
@@ -995,29 +490,14 @@ fn json_response(body: &'static str) -> impl IntoResponse {
 /// `shutdown_token` is cancelled.
 pub(crate) fn spawn_server(
     bind: std::net::IpAddr,
-    control_bind: std::net::IpAddr,
     port: u16,
     shutdown_token: CancellationToken,
     staleness_threshold: Option<chrono::Duration>,
-    watch_interval_secs: Option<u64>,
 ) -> anyhow::Result<(MetricsHandle, tokio::task::JoinHandle<()>, SocketAddr)> {
-    anyhow::ensure!(
-        control_bind.is_loopback(),
-        "control endpoints must bind to a loopback address, got {control_bind}"
-    );
-
-    let handle = MetricsHandle::new_with_watch_interval(staleness_threshold, watch_interval_secs);
-    let metrics_app = Router::new()
+    let handle = MetricsHandle::new(staleness_threshold);
+    let app = Router::new()
         .route("/metrics", get(handle_metrics))
         .route("/healthz", get(handle_healthz))
-        .with_state(handle.clone());
-    let control_app = Router::new()
-        .route("/", get(handle_status_page))
-        .route("/control/pause", post(handle_pause))
-        .route("/control/resume", post(handle_resume))
-        .route("/control/sync-now", post(handle_sync_now))
-        .route("/events", get(handle_sse_events))
-        .route_layer(middleware::from_fn(require_loopback_control))
         .with_state(handle.clone());
 
     let addr = SocketAddr::new(bind, port);
@@ -1027,73 +507,20 @@ pub(crate) fn spawn_server(
     std_listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(std_listener)?;
 
-    let use_single_listener = bind == control_bind || bind.is_unspecified();
-    if use_single_listener {
-        let app = metrics_app.merge(control_app);
-        tracing::info!(
-            bind = %local_addr.ip(),
-            port = local_addr.port(),
-            "HTTP server listening (serving /healthz, /metrics, and loopback-gated control endpoints)"
-        );
-
-        let task = tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move { shutdown_token.cancelled().await })
-            .await
-            {
-                tracing::warn!(error = %e, "HTTP server error");
-            }
-            tracing::info!(port = local_addr.port(), "HTTP server stopped");
-        });
-
-        return Ok((handle, task, local_addr));
-    }
-
-    let control_addr = SocketAddr::new(control_bind, port);
-    let control_std_listener = std::net::TcpListener::bind(control_addr).map_err(|e| {
-        anyhow::anyhow!("Failed to bind control HTTP server on {control_bind}:{port}: {e}")
-    })?;
-    let control_local_addr = control_std_listener.local_addr()?;
-    control_std_listener.set_nonblocking(true)?;
-    let control_listener = tokio::net::TcpListener::from_std(control_std_listener)?;
-
     tracing::info!(
         bind = %local_addr.ip(),
         port = local_addr.port(),
-        control_bind = %control_local_addr.ip(),
-        control_port = control_local_addr.port(),
-        "HTTP server listening with separate metrics and control listeners"
+        "HTTP server listening (serving /healthz and /metrics)"
     );
 
     let task = tokio::spawn(async move {
-        let http_shutdown = shutdown_token.clone();
-        let control_shutdown = shutdown_token;
-        let http = axum::serve(
-            listener,
-            metrics_app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { http_shutdown.cancelled().await });
-        let control = axum::serve(
-            control_listener,
-            control_app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { control_shutdown.cancelled().await });
-
-        let (http_result, control_result) = tokio::join!(http, control);
-        if let Err(e) = http_result {
-            tracing::warn!(error = %e, "HTTP metrics server error");
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { shutdown_token.cancelled().await })
+            .await
+        {
+            tracing::warn!(error = %e, "HTTP server error");
         }
-        if let Err(e) = control_result {
-            tracing::warn!(error = %e, "HTTP control server error");
-        }
-        tracing::info!(
-            port = local_addr.port(),
-            control_port = control_local_addr.port(),
-            "HTTP server stopped"
-        );
+        tracing::info!(port = local_addr.port(), "HTTP server stopped");
     });
 
     Ok((handle, task, local_addr))
@@ -1139,17 +566,6 @@ mod tests {
     async fn render_healthz(handle: &MetricsHandle) -> (axum::http::StatusCode, String) {
         let response = axum::response::IntoResponse::into_response(
             handle_healthz(State(handle.clone())).await,
-        );
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        (status, String::from_utf8(body.to_vec()).unwrap())
-    }
-
-    async fn render_status_page(handle: &MetricsHandle) -> (axum::http::StatusCode, String) {
-        let response = axum::response::IntoResponse::into_response(
-            handle_status_page(State(handle.clone())).await,
         );
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1585,140 +1001,6 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
     }
 
-    // ── status page and control endpoints ────────────────────────────────────
-
-    #[tokio::test]
-    async fn status_page_contains_version_and_service_state() {
-        let handle = MetricsHandle::new_with_watch_interval(None, Some(900));
-        handle
-            .update_status_snapshot("success", Some(&stats_with(2, 0, 2048)), None)
-            .await;
-
-        let (status, body) = render_status_page(&handle).await;
-
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert!(
-            body.contains("kei"),
-            "status page should name the app:\n{body}"
-        );
-        assert!(
-            body.contains(env!("CARGO_PKG_VERSION")),
-            "status page should include the package version:\n{body}"
-        );
-        assert!(
-            body.contains("running"),
-            "status page should show service state:\n{body}"
-        );
-        assert!(
-            body.contains("900s"),
-            "status page should show watch interval:\n{body}"
-        );
-    }
-
-    #[tokio::test]
-    async fn pause_and_resume_handlers_toggle_pause_flag() {
-        let handle = MetricsHandle::new(None);
-
-        let _ = handle_pause(State(handle.clone())).await;
-        assert!(handle.is_paused(), "pause handler should set pause flag");
-
-        let _ = handle_resume(State(handle.clone())).await;
-        assert!(
-            !handle.is_paused(),
-            "resume handler should clear pause flag"
-        );
-    }
-
-    #[tokio::test]
-    async fn sync_now_handler_notifies_waiter() {
-        let handle = MetricsHandle::new(None);
-        let waiter = {
-            let handle = handle.clone();
-            tokio::spawn(async move {
-                handle.wait_for_control_signal().await;
-            })
-        };
-
-        let _ = handle_sync_now(State(handle)).await;
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-            .await
-            .expect("sync-now should notify the waiter")
-            .expect("waiter task should not panic");
-    }
-
-    #[tokio::test]
-    async fn event_broadcast_reaches_subscribers() {
-        let handle = MetricsHandle::new(None);
-        let mut rx = handle.event_broadcast.subscribe();
-
-        handle.publish_sync_started(7);
-
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("subscriber should receive event")
-            .expect("broadcast channel should stay open");
-        assert_eq!(event.kind, "sync_started");
-        assert_eq!(event.data["cycle"], 7);
-    }
-
-    #[tokio::test]
-    async fn control_guard_rejects_requests_without_connect_info() {
-        let handle = MetricsHandle::new(None);
-        let app = Router::new()
-            .route("/control/pause", post(handle_pause))
-            .route_layer(middleware::from_fn(require_loopback_control))
-            .with_state(handle.clone());
-        let token = CancellationToken::new();
-        let std_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = std_listener.local_addr().unwrap();
-        std_listener.set_nonblocking(true).unwrap();
-        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
-        let task = tokio::spawn({
-            let token = token.clone();
-            async move {
-                axum::serve(listener, app.into_make_service())
-                    .with_graceful_shutdown(async move { token.cancelled().await })
-                    .await
-                    .unwrap();
-            }
-        });
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let response = client
-            .post(format!("http://127.0.0.1:{}/control/pause", addr.port()))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
-        assert!(!handle.is_paused(), "rejected request must not pause sync");
-        token.cancel();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
-    }
-
-    #[test]
-    fn spawn_server_rejects_non_loopback_control_bind() {
-        let token = CancellationToken::new();
-        let result = spawn_server(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-            0,
-            token,
-            None,
-            Some(900),
-        );
-
-        let err = result.expect_err("non-loopback control bind should fail");
-        assert!(
-            err.to_string().contains("loopback"),
-            "error should explain loopback restriction: {err}"
-        );
-    }
-
     // ── DB-backed gauges ──────────────────────────────────────────────────────
 
     fn make_summary(
@@ -1848,11 +1130,9 @@ mod tests {
         // Port 0 lets the OS pick a free ephemeral port.
         let result = spawn_server(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             0,
             token.clone(),
             Some(chrono::Duration::seconds(3600)),
-            Some(1800),
         );
         assert!(
             result.is_ok(),
@@ -1871,11 +1151,9 @@ mod tests {
         let token = CancellationToken::new();
         let (handle, task, addr) = spawn_server(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             0,
             token.clone(),
             Some(chrono::Duration::seconds(3600)),
-            Some(1800),
         )
         .expect("spawn_server should bind and spawn");
 
@@ -1927,52 +1205,7 @@ mod tests {
             .expect("GET /healthz should succeed");
         assert_eq!(healthz_resp.status(), reqwest::StatusCode::OK);
 
-        let status_resp = client
-            .get(format!("{base}/"))
-            .send()
-            .await
-            .expect("GET / should succeed");
-        assert_eq!(status_resp.status(), reqwest::StatusCode::OK);
-        let status_body = status_resp.text().await.unwrap();
-        assert!(
-            status_body.contains("kei"),
-            "status page should contain app name:\n{status_body}"
-        );
-
-        let pause_resp = client
-            .post(format!("{base}/control/pause"))
-            .send()
-            .await
-            .expect("POST /control/pause should succeed");
-        assert_eq!(pause_resp.status(), reqwest::StatusCode::OK);
-        assert!(handle.is_paused(), "HTTP pause endpoint should set flag");
-
-        let resume_resp = client
-            .post(format!("{base}/control/resume"))
-            .send()
-            .await
-            .expect("POST /control/resume should succeed");
-        assert_eq!(resume_resp.status(), reqwest::StatusCode::OK);
-        assert!(
-            !handle.is_paused(),
-            "HTTP resume endpoint should clear flag"
-        );
-
         token.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
-    }
-
-    // ── disk free gauge ───────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn disk_free_gauge_updates_and_renders() {
-        let handle = MetricsHandle::new(None);
-        handle.update_disk_free(42_000_000);
-
-        let output = render_metrics(&handle).await;
-        assert!(
-            output.contains("kei_disk_free_bytes 42000000"),
-            "disk_free gauge missing or wrong:\n{output}"
-        );
     }
 }

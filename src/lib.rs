@@ -52,7 +52,6 @@ mod state;
 mod string_interner;
 mod sync_loop;
 mod systemd;
-mod throttle;
 mod types;
 
 #[cfg(test)]
@@ -268,16 +267,34 @@ pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
 
 /// Query available disk space on the filesystem containing `path`.
 ///
-/// Returns `None` if the filesystem query fails (e.g. path doesn't exist yet).
-#[cfg(any(unix, windows))]
+/// Returns `None` if the statvfs call fails (e.g. path doesn't exist yet).
+#[cfg(unix)]
 pub(crate) fn available_disk_space(path: &Path) -> Option<u64> {
-    if !path.exists() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// Widen a platform-dependent statvfs field to u64. `as u64` is the only
+    /// portable way since the underlying types (`c_ulong`, `fsblkcnt_t`) vary
+    /// across targets.
+    #[inline]
+    fn widen(v: impl Into<u64>) -> u64 {
+        v.into()
+    }
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: zeroed is valid for libc::statvfs (all-zero bit pattern is a
+    // valid struct — every field is an integer type).
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is a valid NUL-terminated C string that outlives the
+    // call. statvfs writes into the provided buffer and does not retain the
+    // pointer.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) } != 0 {
         return None;
     }
-    fs4::available_space(path).ok()
+    Some(widen(stat.f_bavail) * widen(stat.f_frsize))
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 pub(crate) fn available_disk_space(_path: &Path) -> Option<u64> {
     None
 }
@@ -441,17 +458,8 @@ fn pid_is_alive(_pid: i32) -> bool {
 
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let path = self.path.clone();
-            let _handle = handle.spawn_blocking(move || {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    tracing::debug!(path = %path.display(), error = %e, "Failed to remove PID file");
-                }
-            });
-        } else {
-            if let Err(e) = std::fs::remove_file(&self.path) {
-                tracing::debug!(path = %self.path.display(), error = %e, "Failed to remove PID file");
-            }
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            tracing::debug!(path = %self.path.display(), error = %e, "Failed to remove PID file");
         }
     }
 }
@@ -515,12 +523,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     // Migrate legacy icloudpd-rs paths before loading config, so the
     // copied config.toml is found at the new location.
-    let migration_report = tokio::task::spawn_blocking(migration::migrate_legacy_paths)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Legacy path migration task panicked");
-            None
-        });
+    let migration_report = migration::migrate_legacy_paths();
 
     // Load TOML config early so it can influence log level.
     // If the user explicitly set --config, the file must exist.
@@ -536,37 +539,26 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         cli.config != "~/.config/kei/config.toml" && cli.config != DOCKER_FALLBACK_CONFIG;
     let (config_path, used_docker_fallback) = {
         let expanded = config::expand_tilde(&cli.config);
-        let docker_fallback = PathBuf::from(DOCKER_FALLBACK_CONFIG);
-        tokio::task::spawn_blocking({
-            let expanded = expanded.clone();
-            let docker_fallback = docker_fallback.clone();
-            move || {
-                if !config_explicitly_set && !expanded.exists() && docker_fallback.exists() {
-                    (docker_fallback, true)
-                } else {
-                    (expanded, false)
-                }
+        if !config_explicitly_set && !expanded.exists() {
+            let docker = PathBuf::from(DOCKER_FALLBACK_CONFIG);
+            if docker.exists() {
+                (docker, true)
+            } else {
+                (expanded, false)
             }
-        })
-        .await
-        .unwrap_or((expanded, false))
+        } else {
+            (expanded, false)
+        }
     };
     // When --config is explicitly set but the file doesn't exist, allow it
     // if the parent directory exists (auto-config will create the file).
     // Otherwise require the file to exist so typos in --config paths error.
     // When --config is explicit but the file doesn't exist and the parent
     // dir does exist, allow it (auto-config will create the file).
-    let config_path_for_load = config_path.clone();
-    let mut toml_config = tokio::task::spawn_blocking(move || {
-        let can_auto_create = !config_path_for_load.exists()
-            && config_path_for_load
-                .parent()
-                .is_some_and(std::path::Path::is_dir);
-        let config_required = config_explicitly_set && !can_auto_create;
-        config::load_toml_config(&config_path_for_load, config_required)
-    })
-    .await
-    .unwrap_or_else(|e| Err(anyhow::anyhow!("config load task panicked: {e}")))?;
+    let can_auto_create =
+        !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
+    let config_required = config_explicitly_set && !can_auto_create;
+    let mut toml_config = config::load_toml_config(&config_path, config_required)?;
 
     // Resolve log level: --log-level > --verbose > TOML > default (info).
     // `--verbose` is a friendlier alias for `--log-level info` and is
@@ -728,10 +720,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             }
             cli::ConfigAction::Setup { output } => {
                 let path = output.map_or_else(|| config_path.clone(), |o| config::expand_tilde(&o));
-                let setup_result = tokio::task::spawn_blocking(move || setup::run_setup(&path))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("setup task panicked: {e}"))??;
-                match setup_result {
+                match setup::run_setup(&path)? {
                     setup::SetupResult::SyncNow {
                         config_path: cfg_path,
                         env_path,
@@ -791,7 +780,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             cli::ServiceAction::Status => return service::status::run().await,
             cli::ServiceAction::Run(args) => {
                 let cli::ServiceRunArgs { password, sync } = *args;
-                return Box::pin(service::run::run(
+                return service::run::run(
                     &globals,
                     sync_loop::SyncArgs {
                         is_one_shot: false,
@@ -807,7 +796,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         personality_mode,
                         friendly_request,
                     },
-                ))
+                )
                 .await;
             }
         },
@@ -1338,19 +1327,6 @@ mod tests {
                 "{ok} bytes is at or above 1 GiB; check_min_disk_space must succeed"
             );
         }
-    }
-
-    #[test]
-    fn available_disk_space_reports_existing_directory_only() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(
-            available_disk_space(dir.path()).is_some(),
-            "existing directory should report available disk space"
-        );
-        assert!(
-            available_disk_space(&dir.path().join("missing")).is_none(),
-            "missing path should preserve the previous None behavior"
-        );
     }
 
     /// Confirm `MIN_FREE_BYTES` is exactly 1 GiB. A future

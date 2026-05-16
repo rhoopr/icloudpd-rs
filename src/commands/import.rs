@@ -821,13 +821,9 @@ fn build_import_download_config(
             folder_structure_albums: args.folder_structure_albums.clone(),
             folder_structure_smart_folders: args.folder_structure_smart_folders.clone(),
             size: args.size,
-            edited: args.edited,
-            alternative: args.alternative,
-            live_size: args.live_size,
             live_photo_mode: args.live_photo_mode,
             live_photo_size: args.live_photo_size,
             live_photo_mov_filename_policy: args.live_photo_mov_filename_policy,
-            raw_policy: args.raw_policy,
             align_raw: args.align_raw,
             file_match_policy: args.file_match_policy,
             force_size: args.force_size,
@@ -1036,7 +1032,8 @@ mod wiremock_tests {
     use crate::retry::RetryConfig;
     use crate::state::{AssetStatus, SqliteStateDb, StateDb, VersionSizeKey};
     use crate::types::{
-        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
+        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
+        RawTreatmentPolicy,
     };
 
     // ── Synthetic asset / wire JSON helpers ──────────────────────────
@@ -1264,9 +1261,7 @@ mod wiremock_tests {
             folder_structure_albums: Arc::from("{album}"),
             folder_structure_smart_folders: Arc::from("{smart-folder}"),
             library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
-            resolution: Some(AssetVersionSize::Original),
-            edited: false,
-            alternative: false,
+            size: AssetVersionSize::Original,
             skip_videos: false,
             skip_photos: false,
             skip_created_before: None,
@@ -1288,9 +1283,9 @@ mod wiremock_tests {
             recent: None,
             retry: RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
-            live_size: Some(AssetVersionSize::LiveOriginal),
+            live_photo_size: AssetVersionSize::LiveOriginal,
             live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-            raw_policy: RawPolicy::AsIs,
+            align_raw: RawTreatmentPolicy::Unchanged,
             no_progress_bar: true,
             only_print_filenames: false,
             personality_mode: crate::personality::Mode::Off,
@@ -1771,7 +1766,7 @@ mod wiremock_tests {
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
         let mut config = base_config(&dl);
-        config.resolution = Some(AssetVersionSize::Medium);
+        config.size = AssetVersionSize::Medium;
         config.force_size = false;
         stage_expected(&asset.to_photo_asset(), &config);
 
@@ -1795,7 +1790,7 @@ mod wiremock_tests {
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
         let mut config = base_config(&dl);
-        config.resolution = Some(AssetVersionSize::Medium);
+        config.size = AssetVersionSize::Medium;
         config.force_size = true;
 
         let db = open_db(&tmp).await;
@@ -1882,7 +1877,7 @@ mod wiremock_tests {
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
         let mut config = base_config(&dl);
-        config.raw_policy = RawPolicy::PreferRaw;
+        config.align_raw = RawTreatmentPolicy::PreferOriginal;
 
         // Stage every path the policy chose. With PreferOriginal swapping
         // RAW↔JPEG, we expect a non-.JPG filename for at least one row.
@@ -2915,7 +2910,7 @@ mod build_config_tests {
     use crate::config::{Config, GlobalArgs, TomlConfig, TomlPhotos};
     use crate::types::{
         AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-        LivePhotoSize, RawPolicy, RawTreatmentPolicy, VersionSize,
+        LivePhotoSize, RawTreatmentPolicy, VersionSize,
     };
     use clap::Parser;
 
@@ -2955,14 +2950,9 @@ mod build_config_tests {
     fn empty_photos() -> TomlPhotos {
         TomlPhotos {
             size: None,
-            resolution: None,
-            edited: None,
-            alternative: None,
-            live_size: None,
             live_photo_size: None,
             live_photo_mode: None,
             live_photo_mov_filename_policy: None,
-            raw_policy: None,
             align_raw: None,
             file_match_policy: None,
             force_size: None,
@@ -2982,11 +2972,7 @@ mod build_config_tests {
             ..empty_photos()
         });
         let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-        assert_eq!(
-            cfg.resolution,
-            Some(AssetVersionSize::Medium),
-            "size: CLI must win"
-        );
+        assert_eq!(cfg.size, AssetVersionSize::Medium, "size: CLI must win");
 
         // file_match_policy: CLI=NameId7, TOML=NameSizeDedupWithSuffix -> NameId7
         let args = parse_import_args(&["--file-match-policy", "name-id7"]);
@@ -3022,8 +3008,8 @@ mod build_config_tests {
         });
         let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
         assert_eq!(
-            cfg.live_size,
-            Some(AssetVersionSize::LiveMedium),
+            cfg.live_photo_size,
+            AssetVersionSize::LiveMedium,
             "live_photo_size: CLI must win"
         );
 
@@ -3048,8 +3034,8 @@ mod build_config_tests {
         });
         let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
         assert_eq!(
-            cfg.raw_policy,
-            RawPolicy::PreferRaw,
+            cfg.align_raw,
+            RawTreatmentPolicy::PreferOriginal,
             "align_raw: CLI must win"
         );
 
@@ -3091,18 +3077,17 @@ mod build_config_tests {
             align_raw: Some(RawTreatmentPolicy::PreferOriginal),
             force_size: Some(true),
             keep_unicode_in_filenames: Some(true),
-            ..empty_photos()
         });
         let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-        assert_eq!(cfg.resolution, Some(AssetVersionSize::Medium));
+        assert_eq!(cfg.size, AssetVersionSize::Medium);
         assert_eq!(cfg.file_match_policy, FileMatchPolicy::NameId7);
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
-        assert_eq!(cfg.live_size, Some(AssetVersionSize::LiveThumb));
+        assert_eq!(cfg.live_photo_size, AssetVersionSize::LiveThumb);
         assert_eq!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Original
         );
-        assert_eq!(cfg.raw_policy, RawPolicy::PreferRaw);
+        assert_eq!(cfg.align_raw, RawTreatmentPolicy::PreferOriginal);
         assert!(cfg.force_size);
         assert!(cfg.keep_unicode_in_filenames);
     }
@@ -3114,18 +3099,18 @@ mod build_config_tests {
     fn build_import_download_config_falls_through_to_default() {
         let args = parse_import_args(&[]);
         let cfg = build_import_download_config(&args, None).unwrap();
-        assert_eq!(cfg.resolution, Some(AssetVersionSize::Original));
+        assert_eq!(cfg.size, AssetVersionSize::Original);
         assert_eq!(
             cfg.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
         );
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::Both);
-        assert_eq!(cfg.live_size, Some(AssetVersionSize::LiveOriginal));
+        assert_eq!(cfg.live_photo_size, AssetVersionSize::LiveOriginal);
         assert_eq!(
             cfg.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Suffix
         );
-        assert_eq!(cfg.raw_policy, RawPolicy::AsIs);
+        assert_eq!(cfg.align_raw, RawTreatmentPolicy::Unchanged);
         assert!(!cfg.force_size);
         assert!(!cfg.keep_unicode_in_filenames);
         assert_eq!(cfg.folder_structure, "%Y/%m/%d");
@@ -3221,20 +3206,17 @@ mod build_config_tests {
         .unwrap();
 
         assert_eq!(import_cfg.folder_structure, sync_cfg.folder_structure);
-        assert_eq!(
-            import_cfg.resolution,
-            sync_cfg.resolution.to_asset_version_size()
-        );
+        assert_eq!(import_cfg.size, sync_cfg.size.into());
         assert_eq!(import_cfg.live_photo_mode, sync_cfg.live_photo_mode);
         assert_eq!(
-            import_cfg.live_size,
-            sync_cfg.live_size.to_live_asset_version_size()
+            import_cfg.live_photo_size,
+            sync_cfg.live_photo_size.to_asset_version_size()
         );
         assert_eq!(
             import_cfg.live_photo_mov_filename_policy,
             sync_cfg.live_photo_mov_filename_policy
         );
-        assert_eq!(import_cfg.raw_policy, sync_cfg.raw_policy);
+        assert_eq!(import_cfg.align_raw, sync_cfg.align_raw);
         assert_eq!(import_cfg.file_match_policy, sync_cfg.file_match_policy);
         assert_eq!(import_cfg.force_size, sync_cfg.force_size);
         assert_eq!(

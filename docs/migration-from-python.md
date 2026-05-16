@@ -145,7 +145,7 @@ If you're using a `icloudpd` Docker wrapper (like boredazfcuk's), here are the k
 |---------------|-------------------|
 | Multiple env vars for every setting | `ICLOUD_USERNAME`, `ICLOUD_PASSWORD`, `TZ` + optional `config.toml` |
 | Cron-based scheduling | Built-in `--watch-with-interval` (set `interval` in config) |
-| Interactive 2FA via console | `docker exec --user $(id -u):$(id -g) kei kei login get-code` then `docker exec --user $(id -u):$(id -g) kei kei login submit-code 123456` |
+| Interactive 2FA via console | `docker exec kei kei login get-code` then `docker exec kei kei login submit-code 123456` |
 | Various notification mechanisms | `--notification-script` with env vars |
 
 Minimal `docker-compose.yml`:

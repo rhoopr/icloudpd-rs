@@ -25,7 +25,6 @@ use crate::retry;
 use crate::shutdown;
 use crate::state::{self, StateDb};
 use crate::systemd::SystemdNotifier;
-use crate::throttle::{ThrottleController, ThrottleDelta};
 use crate::{
     available_disk_space, check_min_disk_space, make_password_provider, PartialSyncError,
     PidFileGuard,
@@ -259,26 +258,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .data_dir
         .clone()
         .or_else(|| globals.cookie_directory.clone());
-    let mut config = tokio::task::spawn_blocking({
-        let globals = globals.clone();
-        let pw = pw.clone();
-        let sync = sync.clone();
-        let toml_config = toml_config.clone();
-        let env_watch_interval =
-            config::parse_env_watch_interval(std::env::var(config::ENV_WATCH_INTERVAL))?;
-        move || {
-            config::Config::build_inner(
-                &globals,
-                &pw,
-                sync,
-                toml_config.as_ref(),
-                env_watch_interval,
-                personality_mode,
-                friendly_request,
-            )
-        }
-    })
-    .await??;
+    let mut config = config::Config::build_inner(
+        globals,
+        &pw,
+        sync,
+        toml_config.as_ref(),
+        config::parse_env_watch_interval(std::env::var(config::ENV_WATCH_INTERVAL))?,
+        personality_mode,
+        friendly_request,
+    )?;
 
     // On first run (no config file), persist CLI-provided values so
     // subsequent runs don't need the same flags again. Only when the
@@ -322,18 +310,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     crate::harden_process();
 
     // Write PID file if requested (before auth so the PID is visible immediately)
-    let _pid_guard = match config.pid_file.clone() {
-        Some(p) => {
-            let guard = tokio::task::spawn_blocking(move || PidFileGuard::new(p))
-                .await
-                .map_err(|e| anyhow::anyhow!("PID file task panicked: {e}"))??;
-            Some(guard)
-        }
-        None => None,
-    };
+    let _pid_guard = config
+        .pid_file
+        .as_ref()
+        .map(|p| PidFileGuard::new(p.clone()))
+        .transpose()?;
 
     let sd_notifier = SystemdNotifier::new(config.notify_systemd);
-    let notifier = Notifier::new(config.notification_script.clone(), &config.notifications);
+    let notifier = Notifier::new(config.notification_script.clone());
 
     tracing::info!(concurrency = config.threads_num, "Starting kei");
 
@@ -356,20 +340,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             "--directory is required for downloading \
              (pass --directory on the CLI or set [download] directory in the config file)"
         );
-    }
-
-    // Preflight explicit password files before the disk-space guard. The guard
-    // is deliberately early to avoid wasting 2FA work, but an empty/unreadable
-    // `--password-file` is an auth-source failure and should keep returning
-    // EXIT_AUTH instead of being masked by unrelated local disk pressure.
-    if let Some(path) = &config.password_file {
-        if let Err(e) = password::read_password_file(path) {
-            tracing::error!(error = %e, "Password source resolution failed");
-            return Err(auth::error::AuthError::FailedLogin(
-                "No password available (see error above for details)".into(),
-            )
-            .into());
-        }
     }
 
     // Validate download directory is writable before spending time on authentication.
@@ -395,7 +365,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             "Could not clean up writability-probe file; harmless leakage"
         );
     }
-    tracing::debug!(path = %config.directory.display(), "Download directory is writable");
 
     // Abort if available disk space is too low. See `check_min_disk_space`
     // for the pure inner check.
@@ -677,6 +646,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .skip_created_after
         .map(|d| d.with_timezone(&chrono::Utc));
     let retry_config = api_retry_config;
+    let live_photo_size = config.live_photo_size.to_asset_version_size();
     // One shared limiter per sync run so the configured cap applies to
     // aggregate throughput across every concurrent download.
     let bandwidth_limiter = config
@@ -711,9 +681,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             folder_structure_albums: Arc::clone(&cfg_folder_structure_albums),
             folder_structure_smart_folders: Arc::clone(&cfg_folder_structure_smart_folders),
             library,
-            resolution: config.resolution.to_asset_version_size(),
-            edited: config.edited,
-            alternative: config.alternative,
+            size: config.size.into(),
             skip_videos: config.skip_videos,
             skip_photos: config.skip_photos,
             skip_created_before,
@@ -735,9 +703,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             recent: config.recent,
             retry: retry_config,
             live_photo_mode: config.live_photo_mode,
-            live_size: config.live_size.to_live_asset_version_size(),
+            live_photo_size,
             live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
-            raw_policy: config.raw_policy,
+            align_raw: config.align_raw,
             no_progress_bar: config.no_progress_bar,
             only_print_filenames: config.only_print_filenames,
             personality_mode: config.personality_mode,
@@ -817,17 +785,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // after two missed intervals so a single slow cycle doesn't flip to 503
     // but a stuck main loop does.
     // Binds synchronously so a misconfigured port fails at startup.
-    let staleness_threshold = config.watch_with_interval.map(|secs| {
-        chrono::Duration::seconds(i64::try_from(secs.saturating_mul(2)).unwrap_or(i64::MAX))
-    });
+    let staleness_threshold = config
+        .watch_with_interval
+        .map(|secs| chrono::Duration::seconds((secs * 2) as i64));
     let (metrics_handle, metrics_task) = if config.watch_with_interval.is_some() {
         let (h, t, _addr) = crate::metrics::spawn_server(
             config.http_bind,
-            config.control_bind,
             config.http_port,
             shutdown_token.clone(),
             staleness_threshold,
-            config.watch_with_interval,
         )?;
         (Some(h), Some(t))
     } else {
@@ -841,9 +807,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // breadcrumb. Cycle 1 is the first iteration of this loop, cycle 2 is the
     // first re-entry under `--watch`, etc.
     let mut cycle_index: u64 = 0;
-    // Adaptive throttle: scales the watch interval when Apple rate-limits.
-    // Only active in watch mode (baseline != 0).
-    let mut throttle = config.watch_with_interval.map(ThrottleController::new);
     if is_watch_mode {
         match config.reconcile_every_n_cycles {
             Some(n) if n > 0 => tracing::info!(
@@ -861,23 +824,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         if shutdown_token.is_cancelled() {
             tracing::info!("Shutdown requested, exiting...");
             break;
-        }
-        if let Some(ref handle) = metrics_handle {
-            while handle.is_paused() {
-                sd_notifier.notify_status("Paused");
-                tracing::info!("Sync paused; waiting for resume");
-                tokio::select! {
-                    () = handle.wait_for_control_signal() => {}
-                    () = shutdown_token.cancelled() => {
-                        tracing::info!("Shutdown while paused, exiting...");
-                        break;
-                    }
-                }
-            }
-            if shutdown_token.is_cancelled() {
-                tracing::info!("Shutdown requested, exiting...");
-                break;
-            }
         }
         cycle_index = cycle_index.saturating_add(1);
 
@@ -900,8 +846,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             // Refresh health gauges only -- do not reset cycle_duration_seconds.
             if let Some(ref handle) = metrics_handle {
                 handle.update_health_only(&health).await;
-                handle.update_status_snapshot("skipped", None, None).await;
-                handle.publish_sync_skipped(cycle_index, "no_changes");
             }
         } else {
             sd_notifier.notify_status("Syncing...");
@@ -912,9 +856,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &config.username,
                 None,
             );
-            if let Some(ref handle) = metrics_handle {
-                handle.publish_sync_started(cycle_index);
-            }
 
             let cycle_started_at = std::time::Instant::now();
             let cycle_result = run_cycle(
@@ -925,8 +866,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &build_download_config,
                 &shared_session,
                 &shutdown_token,
-                &notifier,
-                metrics_handle.as_ref(),
             )
             .await?;
 
@@ -1029,14 +968,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 // Update DB-backed gauges from the state database. Reuse
                 // the post-cycle summary fetched for the friendly card
                 // when it's available, otherwise issue the call here.
-                let mut status_summary = library_after_summary.clone();
                 if let Some(summary) = library_after_summary.as_ref() {
                     handle.update_db_stats(summary, cycle_result.stats.assets_seen);
                 } else if let Some(ref db) = state_db {
                     match db.get_summary().await {
                         Ok(summary) => {
                             handle.update_db_stats(&summary, cycle_result.stats.assets_seen);
-                            status_summary = Some(summary);
                         }
                         Err(e) => {
                             handle.record_db_summary_failure();
@@ -1044,19 +981,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         }
                     }
                 }
-                let outcome = crate::report::sync_status_str(
-                    cycle_result.session_expired,
-                    cycle_result.stats.interrupted,
-                    cycle_result.failed_count,
-                );
-                handle
-                    .update_status_snapshot(
-                        outcome,
-                        Some(&cycle_result.stats),
-                        status_summary.as_ref(),
-                    )
-                    .await;
-                handle.publish_sync_finished(cycle_index, outcome, &cycle_result.stats);
             }
 
             // Write JSON report if configured
@@ -1191,9 +1115,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             } else if cycle_result.failed_count > 0 {
                 let data = notifications::SyncNotificationData::from(&cycle_result.stats);
                 notifier.notify(
-                    notifications::Event::SyncFailed(notifications::FailureMode::Partial(
-                        cycle_result.failed_count,
-                    )),
+                    notifications::Event::SyncFailed,
                     &format!("{} downloads failed", cycle_result.failed_count),
                     &config.username,
                     Some(&data),
@@ -1218,61 +1140,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     &config.username,
                     Some(&data),
                 );
-            }
-
-            // ── Adaptive throttle ─────────────────────────────────────
-            if let Some(ref mut t) = throttle {
-                let success = !cycle_result.session_expired && cycle_result.failed_count == 0;
-                let delta = t.cycle_complete(cycle_result.stats.rate_limited, success);
-
-                if cycle_result.stats.rate_limited > 0 {
-                    notifier.notify(
-                        notifications::Event::RateLimited,
-                        &format!(
-                            "Observed {} HTTP 429/503 rate-limit responses this cycle",
-                            cycle_result.stats.rate_limited
-                        ),
-                        &config.username,
-                        None,
-                    );
-                }
-
-                match delta {
-                    ThrottleDelta::Engaged => {
-                        tracing::info!(
-                            pressure = t.pressure(),
-                            interval_secs = t.current_interval_secs(),
-                            "Adaptive throttle engaged"
-                        );
-                        notifier.notify(
-                            notifications::Event::ThrottleEngaged,
-                            "Adaptive throttle engaged",
-                            &config.username,
-                            None,
-                        );
-                        crate::personality::narration::throttle_engaged_to_stderr(
-                            config.personality_mode,
-                            t.current_interval_secs(),
-                        );
-                    }
-                    ThrottleDelta::Disengaged => {
-                        tracing::info!("Adaptive throttle disengaged");
-                        notifier.notify(
-                            notifications::Event::ThrottleDisengaged,
-                            "Adaptive throttle disengaged",
-                            &config.username,
-                            None,
-                        );
-                        crate::personality::narration::throttle_disengaged_to_stderr(
-                            config.personality_mode,
-                        );
-                    }
-                    ThrottleDelta::None => {}
-                }
-
-                if let Some(ref handle) = metrics_handle {
-                    handle.update_throttle(t.pressure(), t.current_interval_secs());
-                }
             }
         }
 
@@ -1306,20 +1173,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
             }
 
-            let sleep_secs = throttle.as_ref().map_or(
-                interval,
-                crate::throttle::ThrottleController::current_interval_secs,
-            );
-            sd_notifier.notify_status(&format!("Waiting {sleep_secs} seconds..."));
-            tracing::info!(
-                interval_secs = sleep_secs,
-                baseline_secs = interval,
-                "Waiting before next cycle"
-            );
-            // `sleep_secs` is u64 seconds; chrono Add panics on overflow.
+            sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
+            tracing::info!(interval_secs = interval, "Waiting before next cycle");
+            // `interval` is u64 seconds; chrono Add panics on overflow.
             // Skip the heartbeat for the (impossible-in-practice) case where
             // the interval doesn't fit in a wall-clock instant.
-            if let Some(wake_at) = i64::try_from(sleep_secs)
+            if let Some(wake_at) = i64::try_from(interval)
                 .ok()
                 .and_then(chrono::Duration::try_seconds)
                 .and_then(|d| chrono::Local::now().checked_add_signed(d))
@@ -1329,18 +1188,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     wake_at,
                 );
             }
-            let control_signal = async {
-                if let Some(handle) = metrics_handle.as_ref() {
-                    handle.wait_for_control_signal().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            };
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
-                () = control_signal => {
-                    tracing::info!("Control endpoint requested immediate wake");
-                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
                 () = shutdown_token.cancelled() => {
                     tracing::info!("Shutdown during wait, exiting...");
                     break;
@@ -1688,10 +1537,6 @@ pub(crate) async fn check_and_persist_enum_config_hash(
 }
 
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "notifier and metrics_handle are telemetry wires added to PR 388 that don't fit any existing config struct"
-)]
 async fn run_cycle(
     library_states: &[LibraryState],
     config: &config::Config,
@@ -1700,8 +1545,6 @@ async fn run_cycle(
     build_download_config: &BuildDownloadConfigFn<'_>,
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
-    notifier: &Notifier,
-    metrics_handle: Option<&crate::metrics::MetricsHandle>,
 ) -> anyhow::Result<CycleResult> {
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
@@ -1789,9 +1632,6 @@ async fn run_cycle(
             &lib_state.plan.passes,
             download_config,
             shutdown_token.clone(),
-            Some(notifier.clone()),
-            metrics_handle.cloned(),
-            &config.username,
         )
         .await?;
 

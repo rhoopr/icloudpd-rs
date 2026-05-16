@@ -44,7 +44,7 @@ use crate::retry::RetryConfig;
 use crate::state::{AssetRecord, StateDb, VersionSizeKey};
 use crate::types::{
     AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-    RawPolicy,
+    RawTreatmentPolicy,
 };
 
 /// Outcome of a download pass.
@@ -267,13 +267,11 @@ struct SharedHashFields<'a> {
     folder_structure: &'a str,
     folder_structure_albums: &'a str,
     folder_structure_smart_folders: &'a str,
-    resolution: Option<AssetVersionSize>,
-    edited: bool,
-    alternative: bool,
-    live_size: Option<AssetVersionSize>,
+    size: AssetVersionSize,
+    live_photo_size: AssetVersionSize,
     file_match_policy: FileMatchPolicy,
     live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
-    raw_policy: RawPolicy,
+    align_raw: RawTreatmentPolicy,
     keep_unicode_in_filenames: bool,
     skip_created_before: Option<DateTime<Utc>>,
     skip_created_after: Option<DateTime<Utc>>,
@@ -294,13 +292,11 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
     hash_bytes(hasher, f.folder_structure.as_bytes());
     hash_bytes(hasher, f.folder_structure_albums.as_bytes());
     hash_bytes(hasher, f.folder_structure_smart_folders.as_bytes());
-    hasher.update([f.resolution.map_or(u8::MAX, |v| v as u8)]);
-    hasher.update([u8::from(f.edited)]);
-    hasher.update([u8::from(f.alternative)]);
-    hasher.update([f.live_size.map_or(u8::MAX, |v| v as u8)]);
+    hasher.update([f.size as u8]);
+    hasher.update([f.live_photo_size as u8]);
     hasher.update([f.file_match_policy as u8]);
     hasher.update([f.live_photo_mov_filename_policy as u8]);
-    hasher.update([f.raw_policy as u8]);
+    hasher.update([f.align_raw as u8]);
     hasher.update([u8::from(f.keep_unicode_in_filenames)]);
     // Filter fields: changing these affects which assets are eligible, so we
     // must invalidate the trust-state cache (and stored sync tokens) to avoid
@@ -346,13 +342,11 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
             folder_structure: &config.folder_structure,
             folder_structure_albums: &config.folder_structure_albums,
             folder_structure_smart_folders: &config.folder_structure_smart_folders,
-            resolution: config.resolution,
-            edited: config.edited,
-            alternative: config.alternative,
-            live_size: config.live_size,
+            size: config.size,
+            live_photo_size: config.live_photo_size,
             file_match_policy: config.file_match_policy,
             live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
-            raw_policy: config.raw_policy,
+            align_raw: config.align_raw,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,
             skip_created_before: config.skip_created_before,
             skip_created_after: config.skip_created_after,
@@ -381,6 +375,8 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
 pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     use sha2::{Digest, Sha256};
 
+    let size: AssetVersionSize = config.size.into();
+    let live_photo_size = config.live_photo_size.to_asset_version_size();
     let skip_created_before = config
         .skip_created_before
         .map(|d| d.with_timezone(&chrono::Utc));
@@ -396,13 +392,11 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
             folder_structure: &config.folder_structure,
             folder_structure_albums: &config.folder_structure_albums,
             folder_structure_smart_folders: &config.folder_structure_smart_folders,
-            resolution: config.resolution.to_asset_version_size(),
-            edited: config.edited,
-            alternative: config.alternative,
-            live_size: config.live_size.to_live_asset_version_size(),
+            size,
+            live_photo_size,
             file_match_policy: config.file_match_policy,
             live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
-            raw_policy: config.raw_policy,
+            align_raw: config.align_raw,
             keep_unicode_in_filenames: config.keep_unicode_in_filenames,
             skip_created_before,
             skip_created_after,
@@ -489,9 +483,7 @@ pub(crate) struct DownloadConfig {
     /// Template for `PassKind::SmartFolder` passes (default `{smart-folder}`).
     /// Behind `Arc<str>` for the same reason as `folder_structure_albums`.
     pub(crate) folder_structure_smart_folders: Arc<str>,
-    pub(crate) resolution: Option<AssetVersionSize>,
-    pub(crate) edited: bool,
-    pub(crate) alternative: bool,
+    pub(crate) size: AssetVersionSize,
     pub(crate) skip_videos: bool,
     pub(crate) skip_photos: bool,
     pub(crate) skip_created_before: Option<DateTime<Utc>>,
@@ -517,9 +509,9 @@ pub(crate) struct DownloadConfig {
     pub(crate) recent: Option<u32>,
     pub(crate) retry: RetryConfig,
     pub(crate) live_photo_mode: LivePhotoMode,
-    pub(crate) live_size: Option<AssetVersionSize>,
+    pub(crate) live_photo_size: AssetVersionSize,
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
-    pub(crate) raw_policy: RawPolicy,
+    pub(crate) align_raw: RawTreatmentPolicy,
     pub(crate) no_progress_bar: bool,
     pub(crate) only_print_filenames: bool,
     /// Friendly UX mode: drives bar template / spinner glyphs / progress chars.
@@ -622,9 +614,7 @@ impl DownloadConfig {
                 fields.folder_structure_smart_folders.as_str(),
             ),
             library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
-            resolution: fields.resolution.to_asset_version_size(),
-            edited: fields.edited,
-            alternative: fields.alternative,
+            size: fields.size.into(),
             skip_videos: false,
             skip_photos: false,
             skip_created_before: None,
@@ -646,9 +636,9 @@ impl DownloadConfig {
             recent: None,
             retry: RetryConfig::default(),
             live_photo_mode: fields.live_photo_mode,
-            live_size: fields.live_size.to_live_asset_version_size(),
+            live_photo_size: fields.live_photo_size.to_asset_version_size(),
             live_photo_mov_filename_policy: fields.live_photo_mov_filename_policy,
-            raw_policy: fields.raw_policy,
+            align_raw: fields.align_raw,
             no_progress_bar,
             only_print_filenames: false,
             personality_mode: crate::personality::Mode::Off,
@@ -769,9 +759,7 @@ impl std::fmt::Debug for DownloadConfig {
                 "folder_structure_smart_folders",
                 &self.folder_structure_smart_folders,
             )
-            .field("resolution", &self.resolution)
-            .field("edited", &self.edited)
-            .field("alternative", &self.alternative)
+            .field("size", &self.size)
             .field("skip_videos", &self.skip_videos)
             .field("skip_photos", &self.skip_photos)
             .field("skip_created_before", &self.skip_created_before)
@@ -788,12 +776,12 @@ impl std::fmt::Debug for DownloadConfig {
             .field("recent", &self.recent)
             .field("retry", &self.retry)
             .field("live_photo_mode", &self.live_photo_mode)
-            .field("live_size", &self.live_size)
+            .field("live_photo_size", &self.live_photo_size)
             .field(
                 "live_photo_mov_filename_policy",
                 &self.live_photo_mov_filename_policy,
             )
-            .field("raw_policy", &self.raw_policy)
+            .field("align_raw", &self.align_raw)
             .field("no_progress_bar", &self.no_progress_bar)
             .field("only_print_filenames", &self.only_print_filenames)
             .field("file_match_policy", &self.file_match_policy)
@@ -824,9 +812,7 @@ impl DownloadConfig {
             folder_structure_smart_folders: Arc::from(
                 crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
             ),
-            resolution: Some(AssetVersionSize::Original),
-            edited: false,
-            alternative: false,
+            size: AssetVersionSize::Original,
             skip_videos: false,
             skip_photos: false,
             skip_created_before: None,
@@ -848,9 +834,9 @@ impl DownloadConfig {
             recent: None,
             retry: crate::retry::RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
-            live_size: Some(AssetVersionSize::LiveOriginal),
+            live_photo_size: AssetVersionSize::LiveOriginal,
             live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
-            raw_policy: RawPolicy::AsIs,
+            align_raw: RawTreatmentPolicy::Unchanged,
             no_progress_bar: true,
             only_print_filenames: false,
             personality_mode: crate::personality::Mode::Off,
@@ -1382,9 +1368,6 @@ pub async fn download_photos_with_sync(
     passes: &[crate::commands::AlbumPass],
     config: Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
-    notifier: Option<crate::notifications::Notifier>,
-    metrics: Option<crate::metrics::MetricsHandle>,
-    username: &str,
 ) -> Result<SyncResult> {
     let sync_started_at = chrono::Utc::now().timestamp();
     cleanup_orphan_part_files(&config).await;
@@ -1422,9 +1405,6 @@ pub async fn download_photos_with_sync(
                 passes,
                 &config,
                 shutdown_token.clone(),
-                notifier.clone(),
-                metrics.clone(),
-                username,
             )
             .await
         }
@@ -1444,9 +1424,6 @@ pub async fn download_photos_with_sync(
                 passes,
                 &config,
                 shutdown_token.clone(),
-                notifier.clone(),
-                metrics.clone(),
-                username,
             )
             .await
         }
@@ -1463,9 +1440,6 @@ pub async fn download_photos_with_sync(
                 passes,
                 &config,
                 shutdown_token.clone(),
-                notifier.clone(),
-                metrics.clone(),
-                username,
             )
             .await
         }
@@ -1509,9 +1483,6 @@ pub async fn download_photos_with_sync(
                             passes,
                             &config,
                             shutdown_token.clone(),
-                            notifier.clone(),
-                            metrics.clone(),
-                            username,
                         )
                         .await
                     } else {
@@ -1623,9 +1594,6 @@ async fn download_photos_full_with_token(
     passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
-    notifier: Option<crate::notifications::Notifier>,
-    metrics: Option<crate::metrics::MetricsHandle>,
-    username: &str,
 ) -> Result<SyncResult> {
     let started = Instant::now();
     let needs_per_pass = config.requires_per_pass_paths();
@@ -1738,9 +1706,6 @@ async fn download_photos_full_with_token(
                 shutdown_token.clone(),
                 Some(pass_pb.clone()),
                 Some(std::sync::Arc::clone(&pass_bytes)),
-                notifier.clone(),
-                metrics.clone(),
-                username,
             )
             .await?;
 
@@ -1803,9 +1768,6 @@ async fn download_photos_full_with_token(
             shutdown_token.clone(),
             None,
             None,
-            notifier.clone(),
-            metrics.clone(),
-            username,
         )
         .await?;
 
@@ -2593,9 +2555,9 @@ mod tests {
     #[test]
     fn test_hash_download_config_changes_on_size() {
         let mut config1 = test_config();
-        config1.resolution = Some(AssetVersionSize::Original);
+        config1.size = AssetVersionSize::Original;
         let mut config2 = test_config();
-        config2.resolution = Some(AssetVersionSize::Medium);
+        config2.size = AssetVersionSize::Medium;
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -2605,9 +2567,9 @@ mod tests {
     #[test]
     fn test_hash_download_config_changes_on_live_photo_size() {
         let mut config1 = test_config();
-        config1.live_size = Some(AssetVersionSize::LiveOriginal);
+        config1.live_photo_size = AssetVersionSize::LiveOriginal;
         let mut config2 = test_config();
-        config2.live_size = Some(AssetVersionSize::LiveMedium);
+        config2.live_photo_size = AssetVersionSize::LiveMedium;
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -2629,9 +2591,9 @@ mod tests {
     #[test]
     fn test_hash_download_config_changes_on_align_raw() {
         let mut config1 = test_config();
-        config1.raw_policy = RawPolicy::AsIs;
+        config1.align_raw = RawTreatmentPolicy::Unchanged;
         let mut config2 = test_config();
-        config2.raw_policy = RawPolicy::PreferRaw;
+        config2.align_raw = RawTreatmentPolicy::PreferOriginal;
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -2739,7 +2701,7 @@ mod tests {
         use crate::config::Config;
         use crate::types::{
             Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize,
-            RawPolicy, RawTreatmentPolicy, Resolution, VersionSize,
+            RawTreatmentPolicy, VersionSize,
         };
         use secrecy::SecretString;
 
@@ -2764,15 +2726,9 @@ mod tests {
             skip_created_after: None,
             pid_file: None,
             notification_script: None,
-            notifications: crate::config::NotificationsConfig {
-                desktop: true,
-                min_severity: crate::notifications::Severity::Warn,
-                webhooks: vec![],
-            },
             report_json: None,
             http_port: 9090,
             http_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-            control_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             watch_with_interval: None,
             retry_delay_secs: 5,
             reconcile_every_n_cycles: None,
@@ -2782,19 +2738,14 @@ mod tests {
             bandwidth_limit: None,
             threads_num: 1,
             size: VersionSize::Original,
-            resolution: Resolution::Original,
             live_photo_size: LivePhotoSize::Original,
-            live_size: Resolution::Original,
             domain: Domain::Com,
             live_photo_mode: LivePhotoMode::Both,
             live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-            raw_policy: RawPolicy::AsIs,
             align_raw: RawTreatmentPolicy::Unchanged,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             skip_videos: false,
             skip_photos: false,
-            edited: false,
-            alternative: false,
             force_size: false,
             #[cfg(feature = "xmp")]
             set_exif_datetime: false,
@@ -3725,7 +3676,7 @@ mod tests {
         let config = test_config();
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "bdc35cf0a21110d3",
+            hash, "6500d91b19aec487",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
     }
@@ -3735,11 +3686,11 @@ mod tests {
         let mut config = test_config();
         config.directory = std::sync::Arc::from(std::path::Path::new("/my/photos"));
         config.folder_structure = "{:%Y/%m}".to_string();
-        config.resolution = Some(AssetVersionSize::Medium);
-        config.live_size = Some(AssetVersionSize::LiveMedium);
+        config.size = AssetVersionSize::Medium;
+        config.live_photo_size = AssetVersionSize::LiveMedium;
         config.file_match_policy = FileMatchPolicy::NameId7;
         config.live_photo_mov_filename_policy = crate::types::LivePhotoMovFilenamePolicy::Original;
-        config.raw_policy = RawPolicy::PreferJpeg;
+        config.align_raw = RawTreatmentPolicy::PreferAlternative;
         config.keep_unicode_in_filenames = true;
         config.skip_created_before = Some(
             DateTime::parse_from_rfc3339("2020-06-15T00:00:00Z")
@@ -3762,7 +3713,7 @@ mod tests {
         ]);
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "1b0624ec94e385de",
+            hash, "265311b50bfaeb17",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
     }
@@ -3773,7 +3724,7 @@ mod tests {
         let config = build_config_with(tmp.path(), "/photos", |_| {});
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "d039c4a67b0ca110",
+            hash, "90467ca7a96e1e77",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3787,7 +3738,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "37305f689bbf3d39",
+            hash, "3c7e94d9830cb812",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3804,7 +3755,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "3d7dda14469148d5",
+            hash, "1dd59701ae38f405",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3821,8 +3772,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash,
-            concat!("b", "a027d095ad73aeb"),
+            hash, "898b49b4a29fd1e8",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }

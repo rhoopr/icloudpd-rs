@@ -127,7 +127,7 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
     let unit_path =
         user_unit_path().ok_or_else(|| anyhow!("could not resolve XDG_CONFIG_HOME or $HOME"))?;
     let contents = render_user_unit(&exe, config_path);
-    write_unit(&unit_path, &contents).await?;
+    write_unit(&unit_path, &contents)?;
     tracing::info!(
         service = SERVICE_IDENTIFIER,
         path = %unit_path.display(),
@@ -170,7 +170,7 @@ pub(crate) async fn install_system(args: &InstallArgs, config_path: &Path) -> Re
     let exe = current_executable()?;
     let unit_path = system_unit_path();
     let contents = render_system_unit(&exe, config_path, &user);
-    write_unit(&unit_path, &contents).await?;
+    write_unit(&unit_path, &contents)?;
     tracing::info!(
         service = SERVICE_IDENTIFIER,
         path = %unit_path.display(),
@@ -215,7 +215,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
         // environment (tempdir-only test, chroot, sysvinit host). The
         // unit-file removal is the load-bearing step; log+proceed.
         let _ = disable_now_user().await;
-        remove_unit_file(path).await?;
+        remove_unit_file(path)?;
         let _ = daemon_reload_user().await;
         tracing::info!(path = %path.display(), "removed per-user systemd unit");
     }
@@ -229,7 +229,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
             );
         }
         let _ = disable_now_system().await;
-        remove_unit_file(path).await?;
+        remove_unit_file(path)?;
         let _ = daemon_reload_system().await;
         tracing::info!(path = %path.display(), "removed system-wide systemd unit");
     }
@@ -238,10 +238,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
         let Some(config_dir) = dirs::config_dir() else {
             bail!("--purge requested but no XDG config dir resolves; cannot locate kei state");
         };
-        let kei_dir = config_dir.join("kei");
-        tokio::task::spawn_blocking(move || purge_kei_state(&kei_dir, &[]))
-            .await
-            .map_err(|e| anyhow::anyhow!("purge task panicked: {e}"))??;
+        purge_kei_state(&config_dir.join("kei"), &[])?;
     }
 
     Ok(())
@@ -395,19 +392,17 @@ fn parse_systemd_timestamp(raw: &str) -> Option<DateTime<Utc>> {
 
 // ── Internals ───────────────────────────────────────────────────────────
 
-async fn write_unit(path: &Path, contents: &str) -> Result<()> {
+fn write_unit(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
+        std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create unit directory {}", parent.display()))?;
     }
-    tokio::fs::write(path, contents)
-        .await
+    std::fs::write(path, contents)
         .with_context(|| format!("failed to write unit file {}", path.display()))
 }
 
-async fn remove_unit_file(path: &Path) -> Result<()> {
-    match tokio::fs::remove_file(path).await {
+fn remove_unit_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("failed to remove unit file {}", path.display())),

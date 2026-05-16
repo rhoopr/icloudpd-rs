@@ -1,157 +1,38 @@
-//! Notification support for unattended operation.
+//! Notification script support for unattended operation.
 //!
-//! Provides a severity-tagged event taxonomy and a multi-backend notifier.
-//! Backends include script execution, desktop notifications (stub, PR 2),
-//! and webhooks (stub, PR 3). Script execution is the only operational
-//! backend in this PR and preserves full backward compatibility.
+//! Fires a user-provided script with event information as environment variables.
+//! Used to notify users of 2FA expiry, sync completion, failures, etc.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-// ── Severity ────────────────────────────────────────────────────────
-
-/// Severity level for notification routing.
-///
-/// Backends can filter by severity so that e.g. desktop only shows Warn+,
-/// while a script always gets everything. Ordered: `Silent < Info < Warn < Critical`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Severity {
-    /// Not surfaced to any user-facing backend.
-    Silent,
-    /// Informational — sync started, completed, resumed.
-    Info,
-    /// Warning — partial failure, rate limiting, drift, auth expiring.
-    Warn,
-    /// Critical — session expired, disk full, all downloads failed.
-    Critical,
-}
-
-// ── FailureMode ─────────────────────────────────────────────────────
-
-/// Failure classification for [`Event::SyncFailed`].
-///
-/// [`SessionExpired`] and [`AllFailed`] are not constructed in PR 1;
-/// they are wired in PR 2 (desktop notifications) and PR 3 (webhooks).
+/// Events that trigger notification scripts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FailureMode {
-    /// Some downloads failed, but the cycle otherwise completed.
-    Partial(usize),
-    /// Authentication session expired and re-authentication failed.
-    /// Constructed in PRs 2 & 3.
-    #[allow(dead_code, reason = "constructed in PRs 2 & 3")]
-    SessionExpired,
-    /// All downloads failed for reasons other than session expiry.
-    /// Constructed in PRs 2 & 3.
-    #[allow(dead_code, reason = "constructed in PRs 2 & 3")]
-    AllFailed,
-}
-
-// ── Event ───────────────────────────────────────────────────────────
-
-/// Events that trigger notification backends.
-///
-/// Each variant carries a [`Severity`] tag so backends can route by
-/// importance. The `Copy` derive is intentionally omitted because
-/// [`SyncFailed`](Event::SyncFailed) wraps a [`FailureMode`] — clone
-/// is still cheap (a `usize` discriminant + one word of data).
-///
-/// New variants (`DiskLow` through `Resumed`) are stub-only in PR 1;
-/// events are fired in PR 2 (desktop) and PR 3 (webhooks).
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Event {
-    // ── Existing (re-tagged) ────────────────────────────────────
-    /// 2FA code is needed (session expired in headless mode).
+    /// 2FA code is needed (session expired in headless mode)
     TwoFaRequired,
-    /// A sync cycle is about to run (fires after skip-check, before run_cycle).
+    /// A sync cycle is about to run (fires before run_cycle, after skip-check)
     SyncStarted,
-    /// Sync cycle completed successfully.
+    /// Sync cycle completed successfully
     SyncComplete,
-    /// Sync cycle had failures. Severity depends on [`FailureMode`]:
-    /// `Partial` → Warn; `SessionExpired` / `AllFailed` → Critical.
-    SyncFailed(FailureMode),
-    /// Session expired and re-authentication failed.
+    /// Sync cycle had failures
+    SyncFailed,
+    /// Session expired and re-authentication failed
     SessionExpired,
-
-    // ── New (v0.15) ────────────────────────────────────────────
-    /// Low disk space (< 100 MiB free on download volume).
-    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
-    DiskLow,
-    /// Disk space recovered above low threshold.
-    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
-    DiskRecovered,
-    /// Session age > 80 % of typical lifetime (pre-warning before expiry).
-    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
-    AuthExpiring,
-    /// 429 / 503 received this sync cycle.
-    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
-    RateLimited,
-    /// Adaptive throttle engaged (backoff active).
-    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
-    ThrottleEngaged,
-    /// Adaptive throttle disengaged (backoff decayed to baseline).
-    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
-    ThrottleDisengaged,
-    /// Asset count / size mismatch vs iCloud enumeration response.
-    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
-    DriftDetected,
-    /// Sync paused (user or disk-pressure).
-    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
-    Paused,
-    /// Sync resumed after pause.
-    #[allow(dead_code, reason = "event fired in PRs 2 & 3")]
-    Resumed,
 }
 
 impl Event {
-    /// Human-readable event name for script env var `KEI_EVENT`.
-    pub(crate) fn as_str(&self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::TwoFaRequired => "2fa_required",
             Self::SyncStarted => "sync_started",
             Self::SyncComplete => "sync_complete",
-            Self::SyncFailed(_) => "sync_failed",
+            Self::SyncFailed => "sync_failed",
             Self::SessionExpired => "session_expired",
-            Self::DiskLow => "disk_low",
-            Self::DiskRecovered => "disk_recovered",
-            Self::AuthExpiring => "auth_expiring",
-            Self::RateLimited => "rate_limited",
-            Self::ThrottleEngaged => "throttle_engaged",
-            Self::ThrottleDisengaged => "throttle_disengaged",
-            Self::DriftDetected => "drift_detected",
-            Self::Paused => "paused",
-            Self::Resumed => "resumed",
-        }
-    }
-
-    /// Severity tag for backend routing.
-    pub(crate) fn severity(&self) -> Severity {
-        match self {
-            Self::TwoFaRequired => Severity::Critical,
-            Self::SyncStarted => Severity::Info,
-            Self::SyncComplete => Severity::Info,
-            Self::SyncFailed(mode) => match mode {
-                FailureMode::Partial(_) => Severity::Warn,
-                FailureMode::SessionExpired | FailureMode::AllFailed => Severity::Critical,
-            },
-            Self::SessionExpired => Severity::Critical,
-            Self::DiskLow => Severity::Critical,
-            Self::DiskRecovered => Severity::Info,
-            Self::AuthExpiring => Severity::Warn,
-            Self::RateLimited => Severity::Warn,
-            Self::ThrottleEngaged => Severity::Info,
-            Self::ThrottleDisengaged => Severity::Info,
-            Self::DriftDetected => Severity::Warn,
-            Self::Paused => Severity::Info,
-            Self::Resumed => Severity::Info,
         }
     }
 }
-
-// ── SyncNotificationData ────────────────────────────────────────────
 
 /// Sync statistics passed to notification scripts as environment variables.
 #[derive(Debug, Clone, Default)]
@@ -210,402 +91,15 @@ impl From<&crate::download::SyncStats> for SyncNotificationData {
     }
 }
 
-// ── Desktop notification backend ────────────────────────────────────
-
-/// Desktop notification backend.
-///
-/// macOS Notification Center, Windows Toast, Linux libnotify.
-/// Auto-disabled when running inside a container (no D-Bus/display).
-/// Compiled to a no-op when the `desktop-notifications` feature is disabled.
-#[cfg(feature = "desktop-notifications")]
-#[derive(Debug)]
-pub(crate) struct DesktopBackend {
-    enabled: bool,
-    unavailable_but_requested: bool,
-    warned: std::sync::atomic::AtomicBool,
-}
-
-#[cfg(feature = "desktop-notifications")]
-impl Clone for DesktopBackend {
-    fn clone(&self) -> Self {
-        Self {
-            enabled: self.enabled,
-            unavailable_but_requested: self.unavailable_but_requested,
-            warned: std::sync::atomic::AtomicBool::new(
-                self.warned.load(std::sync::atomic::Ordering::Relaxed),
-            ),
-        }
-    }
-}
-
-#[cfg(feature = "desktop-notifications")]
-impl DesktopBackend {
-    pub(crate) fn new(enabled: bool) -> Self {
-        Self::with_container_state(enabled, crate::service::env::is_in_container())
-    }
-
-    /// Test helper: build with an explicit container state so unit tests
-    /// stay hermetic regardless of the CI environment.
-    pub(crate) fn with_container_state(enabled: bool, in_container: bool) -> Self {
-        Self {
-            enabled: enabled && !in_container,
-            unavailable_but_requested: enabled && in_container,
-            warned: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    #[allow(
-        dead_code,
-        reason = "only used in tests; clippy dead_code fires despite --all-targets"
-    )]
-    pub(crate) fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
-    /// Send a desktop notification for `event`.
-    ///
-    /// Fire-and-forget: errors are logged, never propagated.
-    pub(crate) fn notify(&self, event: &Event, message: &str) {
-        if !self.enabled {
-            if self.unavailable_but_requested
-                && !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed)
-            {
-                tracing::warn!(
-                    "Desktop notifications unavailable (no D-Bus/display). \
-                     Falling back to webhooks."
-                );
-            }
-            return;
-        }
-
-        let mut n = notify_rust::Notification::new();
-        n.summary(event_summary(event))
-            .body(message)
-            .appname("kei")
-            .timeout(notify_rust::Timeout::Milliseconds(10_000));
-
-        match n.show() {
-            Ok(_handle) => {
-                tracing::trace!(
-                    event = %event.as_str(),
-                    "Desktop notification sent"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    event = %event.as_str(),
-                    error = %e,
-                    "Failed to send desktop notification"
-                );
-            }
-        }
-    }
-}
-
-/// Desktop notification backend stub (compiled without `desktop-notifications`).
-#[cfg(not(feature = "desktop-notifications"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DesktopBackend {
-    enabled: bool,
-}
-
-#[cfg(not(feature = "desktop-notifications"))]
-impl DesktopBackend {
-    pub(crate) const fn new(enabled: bool) -> Self {
-        Self { enabled }
-    }
-
-    /// Test helper: in the stub path container state is irrelevant.
-    #[allow(
-        dead_code,
-        reason = "used in tests; clippy dead_code fires despite --all-targets"
-    )]
-    pub(crate) const fn with_container_state(enabled: bool, _in_container: bool) -> Self {
-        Self { enabled }
-    }
-
-    #[allow(
-        dead_code,
-        reason = "only used in tests; clippy dead_code fires despite --all-targets"
-    )]
-    pub(crate) const fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
-    pub(crate) fn notify(&self, _event: &Event, _message: &str) {
-        // no-op: compiled without desktop-notifications feature
-    }
-}
-
-/// Human-readable title for a desktop notification.
-#[cfg(feature = "desktop-notifications")]
-fn event_summary(event: &Event) -> &'static str {
-    match event {
-        Event::TwoFaRequired => "kei - 2FA Required",
-        Event::SyncStarted => "kei - Sync Started",
-        Event::SyncComplete => "kei - Sync Complete",
-        Event::SyncFailed(_) => "kei - Sync Failed",
-        Event::SessionExpired => "kei - Session Expired",
-        Event::DiskLow => "kei - Disk Space Low",
-        Event::DiskRecovered => "kei - Disk Space Recovered",
-        Event::AuthExpiring => "kei - Auth Expiring",
-        Event::RateLimited => "kei - Rate Limited",
-        Event::ThrottleEngaged => "kei - Throttle Engaged",
-        Event::ThrottleDisengaged => "kei - Throttle Disengaged",
-        Event::DriftDetected => "kei - Drift Detected",
-        Event::Paused => "kei - Paused",
-        Event::Resumed => "kei - Resumed",
-    }
-}
-
-/// Error type for webhook delivery failures.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum WebhookError {
-    #[error("HTTP {status}: {body}")]
-    Http { status: u16, body: String },
-}
-
-/// Trait for webhook notification backends.
-#[async_trait::async_trait]
-pub(crate) trait WebhookBackend: Send + Sync + std::fmt::Debug {
-    /// Human-readable backend name for logging.
-    fn name(&self) -> &'static str;
-    /// Minimum severity that triggers this backend.
-    fn min_severity(&self) -> Severity;
-    /// Deliver the event. Called in a spawned task; errors are logged, not
-    /// propagated.
-    async fn send(&self, event: Event, message: &str, username: &str) -> Result<(), WebhookError>;
-}
-
-// ── Webhook implementations ─────────────────────────────────────────
-
-/// Shared HTTP timeout for webhook delivery.
-const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Shared HTTP client for webhook delivery. Reusing a single [`reqwest::Client`]
-/// amortizes connection-pool setup and DNS resolution across calls.
-fn webhook_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
-}
-
-async fn check_response(resp: reqwest::Response) -> Result<(), WebhookError> {
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(WebhookError::Http { status, body });
-    }
-    Ok(())
-}
-
-/// POST JSON payload to `url` and translate non-success into [`WebhookError`].
-async fn post_json(url: &str, payload: impl serde::Serialize) -> Result<(), WebhookError> {
-    let client = webhook_client();
-    let resp = client
-        .post(url)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| WebhookError::Http {
-            status: 0,
-            body: e.to_string(),
-        })?;
-    check_response(resp).await
-}
-
-/// POST plain-text body to `url` with an optional `Title` header.
-async fn post_plain(url: &str, title: Option<&str>, body: &str) -> Result<(), WebhookError> {
-    let client = webhook_client();
-    let mut req = client.post(url).body(body.to_string());
-    if let Some(t) = title {
-        req = req.header("Title", t);
-    }
-    let resp = req.send().await.map_err(|e| WebhookError::Http {
-        status: 0,
-        body: e.to_string(),
-    })?;
-    check_response(resp).await
-}
-
-// ── ntfy ────────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-struct NtfyBackend {
-    url: String,
-    min_severity: Severity,
-}
-
-#[async_trait::async_trait]
-impl WebhookBackend for NtfyBackend {
-    fn name(&self) -> &'static str {
-        "ntfy"
-    }
-
-    fn min_severity(&self) -> Severity {
-        self.min_severity
-    }
-
-    async fn send(&self, event: Event, message: &str, _username: &str) -> Result<(), WebhookError> {
-        post_plain(&self.url, Some(&format!("kei {}", event.as_str())), message).await
-    }
-}
-
-// ── Pushover ────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-struct PushoverBackend {
-    url: String,
-    token: String,
-    user: String,
-    min_severity: Severity,
-}
-
-#[async_trait::async_trait]
-impl WebhookBackend for PushoverBackend {
-    fn name(&self) -> &'static str {
-        "pushover"
-    }
-
-    fn min_severity(&self) -> Severity {
-        self.min_severity
-    }
-
-    async fn send(&self, event: Event, message: &str, _username: &str) -> Result<(), WebhookError> {
-        let payload = serde_json::json!({
-            "token": self.token,
-            "user": self.user,
-            "message": message,
-            "title": format!("kei {}", event.as_str()),
-        });
-        post_json(&self.url, payload).await
-    }
-}
-
-// ── Discord ───────────────────────────────────────────────────────
-
-#[derive(Debug)]
-struct DiscordBackend {
-    url: String,
-    min_severity: Severity,
-}
-
-#[async_trait::async_trait]
-impl WebhookBackend for DiscordBackend {
-    fn name(&self) -> &'static str {
-        "discord"
-    }
-
-    fn min_severity(&self) -> Severity {
-        self.min_severity
-    }
-
-    async fn send(&self, event: Event, message: &str, _username: &str) -> Result<(), WebhookError> {
-        let payload = serde_json::json!({
-            "content": format!("**kei {}**\n{}", event.as_str(), message),
-        });
-        post_json(&self.url, payload).await
-    }
-}
-
-// ── Slack ─────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-struct SlackBackend {
-    url: String,
-    min_severity: Severity,
-}
-
-#[async_trait::async_trait]
-impl WebhookBackend for SlackBackend {
-    fn name(&self) -> &'static str {
-        "slack"
-    }
-
-    fn min_severity(&self) -> Severity {
-        self.min_severity
-    }
-
-    async fn send(&self, event: Event, message: &str, _username: &str) -> Result<(), WebhookError> {
-        let payload = serde_json::json!({
-            "text": format!("*kei {}*\n{}", event.as_str(), message),
-        });
-        post_json(&self.url, payload).await
-    }
-}
-
-// ── Telegram ────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-struct TelegramBackend {
-    url: String,
-    chat_id: String,
-    min_severity: Severity,
-}
-
-#[async_trait::async_trait]
-impl WebhookBackend for TelegramBackend {
-    fn name(&self) -> &'static str {
-        "telegram"
-    }
-
-    fn min_severity(&self) -> Severity {
-        self.min_severity
-    }
-
-    async fn send(&self, event: Event, message: &str, _username: &str) -> Result<(), WebhookError> {
-        let payload = serde_json::json!({
-            "chat_id": self.chat_id,
-            "text": format!("kei {}\n{}", event.as_str(), message),
-        });
-        post_json(&self.url, payload).await
-    }
-}
-
-// ── Notifier ────────────────────────────────────────────────────────
-
-/// Notification dispatcher. Holds an optional script path and multi-backend
-/// slots for desktop and webhook notifications.
+/// Notification dispatcher. Holds an optional script path.
+/// When no script is configured, all methods are no-ops.
+#[derive(Debug, Clone)]
 pub(crate) struct Notifier {
     script: Option<PathBuf>,
-    /// Global minimum severity threshold. Backends filter events below this
-    /// level (script backend is exempt — always fires for backward compat).
-    min_severity: Severity,
-    /// Desktop notification backend. `Some` when the user opted in via
-    /// `--desktop-notifications` or `[notifications].desktop`.
-    desktop: Option<DesktopBackend>,
-    /// Active webhook backends.
-    webhooks: Vec<Arc<dyn WebhookBackend>>,
-    /// Bounds how many notification backends can run concurrently. A
-    /// misbehaving or long-running webhook can't queue an unbounded
+    /// Bounds how many notification scripts can run concurrently. A
+    /// misbehaving or long-running script can't queue an unbounded
     /// number of spawned tasks behind itself under load.
     concurrency: Arc<tokio::sync::Semaphore>,
-}
-
-impl std::fmt::Debug for Notifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Notifier")
-            .field("script", &self.script)
-            .field("min_severity", &self.min_severity)
-            .field("desktop", &self.desktop)
-            .field("webhooks", &self.webhooks.len())
-            .field("concurrency", &self.concurrency)
-            .finish()
-    }
-}
-
-impl Clone for Notifier {
-    fn clone(&self) -> Self {
-        Self {
-            script: self.script.clone(),
-            min_severity: self.min_severity,
-            #[cfg(feature = "desktop-notifications")]
-            desktop: self.desktop.clone(),
-            #[cfg(not(feature = "desktop-notifications"))]
-            desktop: self.desktop,
-            webhooks: self.webhooks.clone(),
-            concurrency: Arc::clone(&self.concurrency),
-        }
-    }
 }
 
 /// Timeout for notification scripts.
@@ -617,16 +111,7 @@ const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const NOTIFIER_MAX_INFLIGHT: usize = 8;
 
 impl Notifier {
-    /// Create a new notifier from resolved notification config.
-    ///
-    /// `script` — path to a user-provided notification script (Unix only;
-    /// silently dropped on Windows).
-    ///
-    /// `notifications` — resolved desktop, severity, and webhook config.
-    pub fn new(
-        script: Option<PathBuf>,
-        notifications: &crate::config::NotificationsConfig,
-    ) -> Self {
+    pub fn new(script: Option<PathBuf>) -> Self {
         // kei invokes scripts via `/bin/sh`, which isn't available on Windows.
         // Rather than let spawn fail silently on every event, drop the script
         // and warn once at construction time.
@@ -637,181 +122,20 @@ impl Notifier {
             );
             return Self {
                 script: None,
-                min_severity: notifications.min_severity,
-                desktop: None,
-                webhooks: vec![],
                 concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
             };
         }
-
-        let mut webhooks: Vec<Arc<dyn WebhookBackend>> =
-            Vec::with_capacity(notifications.webhooks.len());
-        for cfg in &notifications.webhooks {
-            match cfg.name.as_str() {
-                "ntfy" => {
-                    webhooks.push(Arc::new(NtfyBackend {
-                        url: cfg.url.clone(),
-                        min_severity: cfg.min_severity,
-                    }));
-                }
-                "pushover" => {
-                    let Some(token) = cfg.token.clone() else {
-                        tracing::warn!(
-                            name = %cfg.name,
-                            "Pushover webhook missing 'token' field; ignoring"
-                        );
-                        continue;
-                    };
-                    let Some(user) = cfg.user.clone() else {
-                        tracing::warn!(
-                            name = %cfg.name,
-                            "Pushover webhook missing 'user' field; ignoring"
-                        );
-                        continue;
-                    };
-                    webhooks.push(Arc::new(PushoverBackend {
-                        url: cfg.url.clone(),
-                        token,
-                        user,
-                        min_severity: cfg.min_severity,
-                    }));
-                }
-                "discord" => {
-                    webhooks.push(Arc::new(DiscordBackend {
-                        url: cfg.url.clone(),
-                        min_severity: cfg.min_severity,
-                    }));
-                }
-                "slack" => {
-                    webhooks.push(Arc::new(SlackBackend {
-                        url: cfg.url.clone(),
-                        min_severity: cfg.min_severity,
-                    }));
-                }
-                "telegram" => {
-                    let Some(chat_id) = cfg.chat_id.clone() else {
-                        tracing::warn!(
-                            name = %cfg.name,
-                            "Telegram webhook missing 'chat_id' field; ignoring"
-                        );
-                        continue;
-                    };
-                    webhooks.push(Arc::new(TelegramBackend {
-                        url: cfg.url.clone(),
-                        chat_id,
-                        min_severity: cfg.min_severity,
-                    }));
-                }
-                other => {
-                    tracing::warn!(
-                        name = %other,
-                        "Unknown webhook backend name; ignoring"
-                    );
-                }
-            }
-        }
-
         Self {
             script,
-            min_severity: notifications.min_severity,
-            desktop: if notifications.desktop {
-                Some(DesktopBackend::new(true))
-            } else {
-                None
-            },
-            webhooks,
             concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
         }
     }
 
-    /// Whether `event` severity meets or exceeds a backend's threshold.
-    ///
-    /// `backend_min` — the backend's minimum severity (script = `Silent`,
-    /// desktop = global `min_severity`, webhook = per-backend override).
-    fn should_dispatch(backend_min: Severity, event: &Event) -> bool {
-        event.severity() >= backend_min
-    }
-
-    /// Fire all configured notification backends with the given event.
-    ///
-    /// Fire-and-forget: script execution spawns in a background task so it
-    /// never blocks sync. Desktop and webhook dispatch is stubbed — only
-    /// script execution is active in this PR.
+    /// Fire the notification script with the given event.
+    /// Fire-and-forget: spawns the script in a background task so it never blocks sync.
     pub fn notify(
         &self,
         event: Event,
-        message: &str,
-        username: &str,
-        data: Option<&SyncNotificationData>,
-    ) {
-        // ── Script backend (always fires) ───────────────────────
-        if Self::should_dispatch(Severity::Silent, &event) {
-            self.dispatch_script(&event, message, username, data);
-        }
-        // ── Desktop backend ───────────────────────────────────
-        if let Some(ref desktop) = self.desktop {
-            if Self::should_dispatch(self.min_severity, &event) {
-                desktop.notify(&event, message);
-            }
-        }
-        // ── Webhook backends ────────────────────────────────────
-        for backend in &self.webhooks {
-            if !Self::should_dispatch(backend.min_severity(), &event) {
-                continue;
-            }
-            let backend = Arc::clone(backend);
-            let event = event.clone();
-            let message = message.to_owned();
-            let username = username.to_owned();
-            let permit = match Arc::clone(&self.concurrency).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(tokio::sync::TryAcquireError::NoPermits) => {
-                    tracing::warn!(
-                        event = event.as_str(),
-                        backend = backend.name(),
-                        "Notifier saturated, dropping webhook"
-                    );
-                    continue;
-                }
-                Err(tokio::sync::TryAcquireError::Closed) => continue,
-            };
-            tokio::spawn(async move {
-                let _permit = permit;
-                let fut = backend.send(event.clone(), &message, &username);
-                match tokio::time::timeout(WEBHOOK_TIMEOUT, fut).await {
-                    Ok(Ok(())) => {
-                        tracing::debug!(
-                            event = event.as_str(),
-                            backend = backend.name(),
-                            "Webhook delivered"
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            event = event.as_str(),
-                            backend = backend.name(),
-                            error = %e,
-                            "Webhook delivery failed"
-                        );
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            event = event.as_str(),
-                            backend = backend.name(),
-                            "Webhook delivery timed out after {}s",
-                            WEBHOOK_TIMEOUT.as_secs()
-                        );
-                    }
-                }
-            });
-        }
-    }
-
-    /// Spawn the script backend for `event`. Extracted from `notify()` so
-    /// the dispatch loop stays readable.
-    fn dispatch_script(
-        &self,
-        event: &Event,
         message: &str,
         username: &str,
         data: Option<&SyncNotificationData>,
@@ -880,8 +204,6 @@ impl Notifier {
         });
     }
 }
-
-// ── Script runner ───────────────────────────────────────────────────
 
 async fn run_script(
     script: &Path,
@@ -962,211 +284,35 @@ async fn run_script(
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
-    use crate::config::WebhookConfig;
-
     use super::*;
-
-    // ── Severity ─────────────────────────────────────────────────
-
-    #[test]
-    fn severity_ordering() {
-        assert!(Severity::Silent < Severity::Info);
-        assert!(Severity::Info < Severity::Warn);
-        assert!(Severity::Warn < Severity::Critical);
-    }
-
-    // ── Event::as_str ────────────────────────────────────────────
 
     #[test]
     fn event_as_str() {
         assert_eq!(Event::TwoFaRequired.as_str(), "2fa_required");
         assert_eq!(Event::SyncStarted.as_str(), "sync_started");
         assert_eq!(Event::SyncComplete.as_str(), "sync_complete");
-        assert_eq!(
-            Event::SyncFailed(FailureMode::Partial(3)).as_str(),
-            "sync_failed"
-        );
-        assert_eq!(
-            Event::SyncFailed(FailureMode::SessionExpired).as_str(),
-            "sync_failed"
-        );
-        assert_eq!(
-            Event::SyncFailed(FailureMode::AllFailed).as_str(),
-            "sync_failed"
-        );
+        assert_eq!(Event::SyncFailed.as_str(), "sync_failed");
         assert_eq!(Event::SessionExpired.as_str(), "session_expired");
-        assert_eq!(Event::DiskLow.as_str(), "disk_low");
-        assert_eq!(Event::DiskRecovered.as_str(), "disk_recovered");
-        assert_eq!(Event::AuthExpiring.as_str(), "auth_expiring");
-        assert_eq!(Event::RateLimited.as_str(), "rate_limited");
-        assert_eq!(Event::ThrottleEngaged.as_str(), "throttle_engaged");
-        assert_eq!(Event::ThrottleDisengaged.as_str(), "throttle_disengaged");
-        assert_eq!(Event::DriftDetected.as_str(), "drift_detected");
-        assert_eq!(Event::Paused.as_str(), "paused");
-        assert_eq!(Event::Resumed.as_str(), "resumed");
-    }
-
-    // ── Event::severity ──────────────────────────────────────────
-
-    #[test]
-    fn event_severity_existing_variants() {
-        assert_eq!(Event::TwoFaRequired.severity(), Severity::Critical);
-        assert_eq!(Event::SyncStarted.severity(), Severity::Info);
-        assert_eq!(Event::SyncComplete.severity(), Severity::Info);
-        assert_eq!(
-            Event::SyncFailed(FailureMode::Partial(5)).severity(),
-            Severity::Warn
-        );
-        assert_eq!(
-            Event::SyncFailed(FailureMode::SessionExpired).severity(),
-            Severity::Critical
-        );
-        assert_eq!(
-            Event::SyncFailed(FailureMode::AllFailed).severity(),
-            Severity::Critical
-        );
-        assert_eq!(Event::SessionExpired.severity(), Severity::Critical);
-    }
-
-    #[test]
-    fn event_severity_new_variants() {
-        assert_eq!(Event::DiskLow.severity(), Severity::Critical);
-        assert_eq!(Event::DiskRecovered.severity(), Severity::Info);
-        assert_eq!(Event::AuthExpiring.severity(), Severity::Warn);
-        assert_eq!(Event::RateLimited.severity(), Severity::Warn);
-        assert_eq!(Event::ThrottleEngaged.severity(), Severity::Info);
-        assert_eq!(Event::ThrottleDisengaged.severity(), Severity::Info);
-        assert_eq!(Event::DriftDetected.severity(), Severity::Warn);
-        assert_eq!(Event::Paused.severity(), Severity::Info);
-        assert_eq!(Event::Resumed.severity(), Severity::Info);
-    }
-
-    #[test]
-    fn sync_failed_severity_differs_by_failure_mode() {
-        // Partial failure → Warn
-        assert_eq!(
-            Event::SyncFailed(FailureMode::Partial(1)).severity(),
-            Severity::Warn
-        );
-        assert_eq!(
-            Event::SyncFailed(FailureMode::Partial(100)).severity(),
-            Severity::Warn
-        );
-        // Session expiry → Critical
-        assert_eq!(
-            Event::SyncFailed(FailureMode::SessionExpired).severity(),
-            Severity::Critical
-        );
-        // All failed → Critical
-        assert_eq!(
-            Event::SyncFailed(FailureMode::AllFailed).severity(),
-            Severity::Critical
-        );
-    }
-
-    // ── DesktopBackend ───────────────────────────────────────────
-
-    #[test]
-    fn desktop_backend_new_enabled_outside_container() {
-        let b = DesktopBackend::with_container_state(true, false);
-        assert!(b.is_enabled());
-    }
-
-    #[test]
-    fn desktop_backend_new_disabled() {
-        let b = DesktopBackend::with_container_state(false, false);
-        assert!(!b.is_enabled());
-        let b_container = DesktopBackend::with_container_state(false, true);
-        assert!(!b_container.is_enabled());
-    }
-
-    #[test]
-    fn desktop_backend_disabled_in_container() {
-        let b = DesktopBackend::with_container_state(true, true);
-        #[cfg(feature = "desktop-notifications")]
-        assert!(!b.is_enabled());
-        #[cfg(not(feature = "desktop-notifications"))]
-        assert!(b.is_enabled()); // stub ignores container state
-    }
-
-    #[test]
-    fn desktop_backend_notify_on_disabled_is_noop() {
-        let b = DesktopBackend::with_container_state(false, false);
-        // Must not panic, must not spawn, must not log.
-        b.notify(&Event::SyncComplete, "test");
-    }
-
-    #[cfg(feature = "desktop-notifications")]
-    #[tracing_test::traced_test]
-    #[test]
-    fn desktop_backend_warns_once_when_unavailable() {
-        let b = DesktopBackend::with_container_state(true, true);
-        // First notify should emit the one-time warning.
-        b.notify(&Event::SyncComplete, "test");
-        assert!(logs_contain("Desktop notifications unavailable"));
-
-        // Second notify must be silent (no additional warning).
-        // tracing_test accumulates across the test, so we can't assert
-        // "exactly once", but we confirm the backend doesn't panic and
-        // the warning was present at least once.
-        b.notify(&Event::SyncComplete, "test");
-    }
-
-    // ── Notifier construction ────────────────────────────────────
-
-    /// Build a `NotificationsConfig` for tests. `desktop` controls whether
-    /// the desktop backend is enabled.
-    fn notif_config(desktop: bool) -> crate::config::NotificationsConfig {
-        crate::config::NotificationsConfig {
-            desktop,
-            min_severity: Severity::Warn,
-            webhooks: vec![],
-        }
     }
 
     #[cfg(windows)]
     #[test]
     fn notifier_drops_script_on_windows() {
-        let notifier = Notifier::new(
-            Some(PathBuf::from("C:/does/not/matter.sh")),
-            &notif_config(false),
-        );
+        let notifier = Notifier::new(Some(PathBuf::from("C:/does/not/matter.sh")));
         assert!(notifier.script.is_none());
-        assert!(notifier.desktop.is_none());
     }
 
     #[test]
     fn notifier_none_is_noop() {
-        let notifier = Notifier::new(None, &notif_config(false));
+        let notifier = Notifier::new(None);
         assert!(notifier.script.is_none());
-        assert!(notifier.desktop.is_none());
-    }
-
-    #[test]
-    fn notifier_with_desktop_enabled() {
-        let notifier = Notifier::new(None, &notif_config(true));
-        assert!(notifier.desktop.is_some());
-        // In a container desktop is auto-disabled; on a host it stays enabled.
-        // When compiled without the feature the stub ignores container state.
-        #[cfg(feature = "desktop-notifications")]
-        assert_eq!(
-            notifier.desktop.unwrap().is_enabled(),
-            !crate::service::env::is_in_container()
-        );
-        #[cfg(not(feature = "desktop-notifications"))]
-        assert!(notifier.desktop.unwrap().is_enabled());
     }
 
     #[test]
     fn notify_with_nonexistent_script() {
-        let notifier = Notifier::new(
-            Some(PathBuf::from("/tmp/claude/nonexistent_notify.sh")),
-            &notif_config(false),
-        );
+        let notifier = Notifier::new(Some(PathBuf::from("/tmp/claude/nonexistent_notify.sh")));
         // Should not panic, just log a warning (script existence checked synchronously)
         notifier.notify(
             Event::SyncComplete,
@@ -1176,199 +322,6 @@ mod tests {
         );
     }
 
-    // ── Severity filtering / multi-backend dispatch ────────────
-
-    #[test]
-    fn notifier_script_always_fires_regardless_of_severity() {
-        // Script backend should always dispatch even for Silent events.
-        assert!(Notifier::should_dispatch(
-            Severity::Silent,
-            &Event::SyncStarted
-        ));
-        assert!(Notifier::should_dispatch(
-            Severity::Silent,
-            &Event::SyncComplete
-        ));
-    }
-
-    #[test]
-    fn should_dispatch_respects_threshold() {
-        // Warn threshold: Info events don't pass, Warn+ do.
-        assert!(!Notifier::should_dispatch(
-            Severity::Warn,
-            &Event::SyncStarted
-        ));
-        assert!(Notifier::should_dispatch(
-            Severity::Warn,
-            &Event::RateLimited
-        ));
-        assert!(Notifier::should_dispatch(Severity::Warn, &Event::DiskLow));
-        // Critical threshold: only Critical passes.
-        assert!(!Notifier::should_dispatch(
-            Severity::Critical,
-            &Event::SyncStarted
-        ));
-        assert!(!Notifier::should_dispatch(
-            Severity::Critical,
-            &Event::RateLimited
-        ));
-        assert!(Notifier::should_dispatch(
-            Severity::Critical,
-            &Event::TwoFaRequired
-        ));
-    }
-
-    #[test]
-    fn notifier_desktop_respects_global_min_severity() {
-        let cfg = crate::config::NotificationsConfig {
-            desktop: true,
-            min_severity: Severity::Critical,
-            webhooks: vec![],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        assert!(notifier.desktop.is_some());
-        // Info event below Critical threshold — desktop should not receive it.
-        assert!(!Notifier::should_dispatch(
-            notifier.min_severity,
-            &Event::SyncStarted
-        ));
-        // Critical event meets threshold.
-        assert!(Notifier::should_dispatch(
-            notifier.min_severity,
-            &Event::TwoFaRequired
-        ));
-    }
-
-    #[test]
-    fn notifier_webhook_per_backend_severity_override() {
-        let cfg = crate::config::NotificationsConfig {
-            desktop: false,
-            min_severity: Severity::Warn,
-            webhooks: vec![
-                WebhookConfig {
-                    name: "ntfy".into(),
-                    url: "https://ntfy.example.com/kei".into(),
-                    min_severity: Severity::Critical,
-                    token: None,
-                    user: None,
-                    chat_id: None,
-                },
-                WebhookConfig {
-                    name: "discord".into(),
-                    url: "https://discord.example.com/webhook".into(),
-                    min_severity: Severity::Info,
-                    token: None,
-                    user: None,
-                    chat_id: None,
-                },
-            ],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        assert_eq!(notifier.webhooks.len(), 2);
-        // ntfy: only Critical
-        assert!(!Notifier::should_dispatch(
-            Severity::Critical,
-            &Event::SyncStarted
-        ));
-        assert!(Notifier::should_dispatch(
-            Severity::Critical,
-            &Event::TwoFaRequired
-        ));
-        // discord: Info+ (everything)
-        assert!(Notifier::should_dispatch(
-            Severity::Info,
-            &Event::SyncStarted
-        ));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn desktop_stub_trace_emits_for_above_threshold_event() {
-        let notifier = Notifier::new(None, &notif_config(true));
-        notifier.notify(Event::DiskLow, "disk low", "user@example.com", None);
-        // In a container the backend is disabled and emits a one-time warning;
-        // on a host it sends a real notification (trace logged).
-        // Without the desktop-notifications feature the stub is a silent no-op.
-        #[cfg(feature = "desktop-notifications")]
-        assert!(
-            logs_contain("Desktop notification sent")
-                || logs_contain("Desktop notifications unavailable")
-                || logs_contain("Failed to send desktop notification"),
-            "expected desktop backend to either send, warn unavailable, or log failure"
-        );
-        #[cfg(not(feature = "desktop-notifications"))]
-        {
-            // stub path: no trace, no warning — just verify no panic
-        }
-    }
-
-    #[tokio::test]
-    async fn webhook_dispatch_respects_per_backend_severity() {
-        let mock_server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let cfg = crate::config::NotificationsConfig {
-            desktop: false,
-            min_severity: Severity::Warn,
-            webhooks: vec![
-                WebhookConfig {
-                    name: "ntfy".into(),
-                    url: "https://ntfy.example.com/kei".into(),
-                    min_severity: Severity::Critical,
-                    token: None,
-                    user: None,
-                    chat_id: None,
-                },
-                WebhookConfig {
-                    name: "discord".into(),
-                    url: mock_server.uri(),
-                    min_severity: Severity::Info,
-                    token: None,
-                    user: None,
-                    chat_id: None,
-                },
-            ],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        notifier.notify(Event::SyncStarted, "sync started", "user@example.com", None);
-        // Give the spawned task time to hit the mock server.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    #[test]
-    fn notifier_construction_stores_config() {
-        let cfg = crate::config::NotificationsConfig {
-            desktop: true,
-            min_severity: Severity::Info,
-            webhooks: vec![WebhookConfig {
-                name: "ntfy".into(),
-                url: "https://example.com".into(),
-                min_severity: Severity::Warn,
-                token: None,
-                user: None,
-                chat_id: None,
-            }],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        assert_eq!(notifier.min_severity, Severity::Info);
-        assert!(notifier.desktop.is_some());
-        #[cfg(feature = "desktop-notifications")]
-        assert_eq!(
-            notifier.desktop.unwrap().is_enabled(),
-            !crate::service::env::is_in_container()
-        );
-        #[cfg(not(feature = "desktop-notifications"))]
-        assert!(notifier.desktop.unwrap().is_enabled());
-        assert_eq!(notifier.webhooks.len(), 1);
-        assert_eq!(notifier.webhooks[0].name(), "ntfy");
-    }
-
-    // ── Script runner helpers ────────────────────────────────────
-
     /// Write a shell script to a temp dir. No executable permission needed
     /// since `run_script` invokes scripts via `/bin/sh`.
     #[cfg(unix)]
@@ -1377,8 +330,6 @@ mod tests {
         std::fs::write(&path, body).unwrap();
         path
     }
-
-    // ── run_script tests ─────────────────────────────────────────
 
     #[cfg(unix)]
     #[tokio::test]
@@ -1404,8 +355,6 @@ mod tests {
         assert!(!status.success());
     }
 
-    // ── notify() tests ───────────────────────────────────────────
-
     #[cfg(unix)]
     #[tokio::test]
     async fn notify_runs_script_with_env_vars() {
@@ -1417,7 +366,7 @@ mod tests {
         );
         let script_path = write_test_script(dir.path(), "test_notify.sh", body.as_bytes());
 
-        let notifier = Notifier::new(Some(script_path.clone()), &notif_config(false));
+        let notifier = Notifier::new(Some(script_path.clone()));
         notifier.notify(
             Event::TwoFaRequired,
             "Need 2FA code",
@@ -1462,7 +411,7 @@ mod tests {
             ..SyncNotificationData::default()
         };
 
-        let notifier = Notifier::new(Some(script_path), &notif_config(false));
+        let notifier = Notifier::new(Some(script_path));
         notifier.notify(Event::SyncComplete, "test", "user@example.com", Some(&data));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1480,8 +429,6 @@ mod tests {
         let output = std::fs::read_to_string(&output_path).unwrap();
         assert_eq!(output.trim(), "42|3|100|1500000|80");
     }
-
-    // ── Semaphore / saturation tests ─────────────────────────────
 
     /// Test scaffold: a barrier-blocked sh script that tracks both
     /// concurrent in-flight invocations (per-pid marker files) and
@@ -1559,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn notifier_semaphore_caps_concurrent_inflight() {
         let fixture = BarrierFixture::new();
-        let notifier = Notifier::new(Some(fixture.script_path.clone()), &notif_config(false));
+        let notifier = Notifier::new(Some(fixture.script_path.clone()));
         for _ in 0..NOTIFIER_MAX_INFLIGHT * 2 {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
@@ -1601,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn notifier_drops_events_when_saturated() {
         let fixture = BarrierFixture::new();
-        let notifier = Notifier::new(Some(fixture.script_path.clone()), &notif_config(false));
+        let notifier = Notifier::new(Some(fixture.script_path.clone()));
         for _ in 0..NOTIFIER_MAX_INFLIGHT * 4 {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
@@ -1668,7 +615,7 @@ mod tests {
         );
         let script_path = write_test_script(dir.path(), "test_no_data.sh", body.as_bytes());
 
-        let notifier = Notifier::new(Some(script_path), &notif_config(false));
+        let notifier = Notifier::new(Some(script_path));
         notifier.notify(Event::SyncComplete, "test", "user@example.com", None);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1685,284 +632,5 @@ mod tests {
 
         let output = std::fs::read_to_string(&output_path).unwrap();
         assert_eq!(output.trim(), "unset|unset");
-    }
-
-    // ── Webhook payload tests ───────────────────────────────────
-
-    #[tokio::test]
-    async fn webhook_payload_ntfy() {
-        let mock_server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::header("Title", "kei sync_failed"))
-            .and(wiremock::matchers::body_string("test message"))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let cfg = crate::config::NotificationsConfig {
-            desktop: false,
-            min_severity: Severity::Info,
-            webhooks: vec![WebhookConfig {
-                name: "ntfy".into(),
-                url: mock_server.uri(),
-                min_severity: Severity::Info,
-                token: None,
-                user: None,
-                chat_id: None,
-            }],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        notifier.notify(
-            Event::SyncFailed(FailureMode::Partial(3)),
-            "test message",
-            "user",
-            None,
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    #[tokio::test]
-    async fn webhook_payload_pushover() {
-        let mock_server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "token": "app-token",
-                "user": "user-key",
-                "message": "test message",
-                "title": "kei sync_failed"
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let cfg = crate::config::NotificationsConfig {
-            desktop: false,
-            min_severity: Severity::Info,
-            webhooks: vec![WebhookConfig {
-                name: "pushover".into(),
-                url: mock_server.uri(),
-                min_severity: Severity::Info,
-                token: Some("app-token".into()),
-                user: Some("user-key".into()),
-                chat_id: None,
-            }],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        notifier.notify(
-            Event::SyncFailed(FailureMode::Partial(3)),
-            "test message",
-            "user",
-            None,
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    #[tokio::test]
-    async fn webhook_payload_discord() {
-        let mock_server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "content": "**kei sync_failed**\ntest message"
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let cfg = crate::config::NotificationsConfig {
-            desktop: false,
-            min_severity: Severity::Info,
-            webhooks: vec![WebhookConfig {
-                name: "discord".into(),
-                url: mock_server.uri(),
-                min_severity: Severity::Info,
-                token: None,
-                user: None,
-                chat_id: None,
-            }],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        notifier.notify(
-            Event::SyncFailed(FailureMode::Partial(3)),
-            "test message",
-            "user",
-            None,
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    #[tokio::test]
-    async fn webhook_payload_slack() {
-        let mock_server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "text": "*kei sync_failed*\ntest message"
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let cfg = crate::config::NotificationsConfig {
-            desktop: false,
-            min_severity: Severity::Info,
-            webhooks: vec![WebhookConfig {
-                name: "slack".into(),
-                url: mock_server.uri(),
-                min_severity: Severity::Info,
-                token: None,
-                user: None,
-                chat_id: None,
-            }],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        notifier.notify(
-            Event::SyncFailed(FailureMode::Partial(3)),
-            "test message",
-            "user",
-            None,
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    #[tokio::test]
-    async fn webhook_payload_telegram() {
-        let mock_server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::body_json(serde_json::json!({
-                "chat_id": "12345",
-                "text": "kei sync_failed\ntest message"
-            })))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let cfg = crate::config::NotificationsConfig {
-            desktop: false,
-            min_severity: Severity::Info,
-            webhooks: vec![WebhookConfig {
-                name: "telegram".into(),
-                url: mock_server.uri(),
-                min_severity: Severity::Info,
-                token: None,
-                user: None,
-                chat_id: Some("12345".into()),
-            }],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        notifier.notify(
-            Event::SyncFailed(FailureMode::Partial(3)),
-            "test message",
-            "user",
-            None,
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn webhook_http_500_logged_not_propagated() {
-        let mock_server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("internal error"))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let cfg = crate::config::NotificationsConfig {
-            desktop: false,
-            min_severity: Severity::Info,
-            webhooks: vec![WebhookConfig {
-                name: "discord".into(),
-                url: mock_server.uri(),
-                min_severity: Severity::Info,
-                token: None,
-                user: None,
-                chat_id: None,
-            }],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        notifier.notify(Event::SyncStarted, "msg", "user", None);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(logs_contain("Webhook delivery failed"));
-        assert!(logs_contain("HTTP 500"));
-    }
-
-    #[derive(Debug)]
-    struct TimeoutProbeBackend {
-        tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl WebhookBackend for TimeoutProbeBackend {
-        fn name(&self) -> &'static str {
-            "probe"
-        }
-        fn min_severity(&self) -> Severity {
-            Severity::Silent
-        }
-        async fn send(
-            &self,
-            _event: Event,
-            _message: &str,
-            _username: &str,
-        ) -> Result<(), WebhookError> {
-            struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
-            impl Drop for DropSignal {
-                fn drop(&mut self) {
-                    if let Some(tx) = self.0.take() {
-                        let _ = tx.send(());
-                    }
-                }
-            }
-
-            let tx = self.tx.lock().unwrap().take();
-            let _signal = DropSignal(tx);
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            Ok(())
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn webhook_timeout_fires_after_10s() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let notifier = Notifier {
-            script: None,
-            min_severity: Severity::Warn,
-            desktop: None,
-            webhooks: vec![Arc::new(TimeoutProbeBackend {
-                tx: std::sync::Mutex::new(Some(tx)),
-            })],
-            concurrency: Arc::new(tokio::sync::Semaphore::new(NOTIFIER_MAX_INFLIGHT)),
-        };
-        notifier.notify(Event::SyncStarted, "msg", "user", None);
-        tokio::time::advance(Duration::from_secs(11)).await;
-        assert!(
-            rx.await.is_ok(),
-            "expected webhook send to be dropped by timeout"
-        );
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn unknown_webhook_backend_ignored() {
-        let cfg = crate::config::NotificationsConfig {
-            desktop: false,
-            min_severity: Severity::Warn,
-            webhooks: vec![WebhookConfig {
-                name: "unknown".into(),
-                url: "https://example.com".into(),
-                min_severity: Severity::Warn,
-                token: None,
-                user: None,
-                chat_id: None,
-            }],
-        };
-        let notifier = Notifier::new(None, &cfg);
-        assert!(notifier.webhooks.is_empty());
-        assert!(logs_contain("Unknown webhook backend name"));
     }
 }

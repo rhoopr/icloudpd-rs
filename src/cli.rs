@@ -1,6 +1,6 @@
 use crate::types::{
     Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
-    RawPolicy, RawTreatmentPolicy, Resolution, VersionSize,
+    RawTreatmentPolicy, VersionSize,
 };
 use clap::{Args, FromArgMatches, Parser, Subcommand};
 
@@ -258,24 +258,12 @@ pub struct SyncArgs {
     #[arg(long = "library", env = "KEI_LIBRARY", value_parser = non_empty_string)]
     pub libraries: Vec<String>,
 
-    /// Primary image resolution to download
+    /// Image size to download
     #[arg(long, env = "KEI_SIZE", value_enum)]
     pub size: Option<VersionSize>,
 
-    /// Also download the edited full-resolution version when available
-    #[arg(long, env = "KEI_EDITED", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub edited: Option<bool>,
-
-    /// Also download the RAW/JPEG pair sibling when available
-    #[arg(long, env = "KEI_ALTERNATIVE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub alternative: Option<bool>,
-
-    /// Live photo video resolution
-    #[arg(long = "live-size", env = "KEI_LIVE_SIZE", value_enum)]
-    pub live_size: Option<Resolution>,
-
-    /// Deprecated: use --live-size
-    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum, hide = true)]
+    /// Live photo video size
+    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum)]
     pub live_photo_size: Option<LivePhotoSize>,
 
     /// Number of recent photos to download (e.g. `--recent 100`) or a recency
@@ -404,12 +392,8 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY", value_enum)]
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
-    /// RAW/JPEG pair filename policy
-    #[arg(long = "raw-policy", env = "KEI_RAW_POLICY", value_enum)]
-    pub raw_policy: Option<RawPolicy>,
-
-    /// Deprecated: use --raw-policy
-    #[arg(long, env = "KEI_ALIGN_RAW", value_enum, hide = true)]
+    /// RAW treatment policy
+    #[arg(long, env = "KEI_ALIGN_RAW", value_enum)]
     pub align_raw: Option<RawTreatmentPolicy>,
 
     /// File matching and dedup policy
@@ -490,20 +474,6 @@ pub struct SyncArgs {
     /// via `[server] bind` in TOML. Accepts any IPv4 or IPv6 address.
     #[arg(long, env = "KEI_HTTP_BIND")]
     pub http_bind: Option<std::net::IpAddr>,
-
-    /// Bind address for control endpoints: status page, pause/resume, sync-now, SSE.
-    /// Default: 127.0.0.1 (loopback-only). Separate from --http-bind so /healthz and
-    /// /metrics can be public while control endpoints stay restricted. Also
-    /// configurable via `[server] control_bind` in TOML.
-    #[arg(long = "control-bind", env = "KEI_CONTROL_BIND")]
-    pub control_bind: Option<std::net::IpAddr>,
-
-    /// Enable desktop notifications (macOS Notification Center, Windows Toasts,
-    /// Linux libnotify). Default: true. Pass `--desktop-notifications false`
-    /// or set `[notifications] desktop = false` in TOML to disable.
-    #[arg(long = "desktop-notifications", env = "KEI_DESKTOP_NOTIFICATIONS",
-           num_args = 0..=1, default_missing_value = "true")]
-    pub desktop_notifications: Option<bool>,
 
     /// After successful auth, persist the password to the credential store
     /// (OS keyring or encrypted file).
@@ -601,41 +571,25 @@ pub struct ImportArgs {
     #[arg(long, env = "KEI_FILE_MATCH_POLICY", value_enum)]
     pub file_match_policy: Option<FileMatchPolicy>,
 
-    /// Primary image resolution to import (must match what was used during sync). Default: original.
+    /// Image size to import (must match what was used during sync). Default: original.
     #[arg(long, env = "KEI_SIZE", value_enum)]
     pub size: Option<VersionSize>,
-
-    /// Also import edited full-resolution versions when present
-    #[arg(long, env = "KEI_EDITED", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub edited: Option<bool>,
-
-    /// Also import RAW/JPEG pair siblings when present
-    #[arg(long, env = "KEI_ALTERNATIVE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub alternative: Option<bool>,
 
     /// Live photo handling: both, image-only, video-only, skip
     /// (must match what was used during sync)
     #[arg(long, env = "KEI_LIVE_PHOTO_MODE", value_enum)]
     pub live_photo_mode: Option<LivePhotoMode>,
 
-    /// Live photo video resolution (must match what was used during sync)
-    #[arg(long = "live-size", env = "KEI_LIVE_SIZE", value_enum)]
-    pub live_size: Option<Resolution>,
-
-    /// Deprecated: use --live-size
-    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum, hide = true)]
+    /// Live photo video size (must match what was used during sync)
+    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum)]
     pub live_photo_size: Option<LivePhotoSize>,
 
     /// Live photo MOV filename policy (must match what was used during sync)
     #[arg(long, env = "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY", value_enum)]
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
-    /// RAW/JPEG pair filename policy (must match what was used during sync)
-    #[arg(long = "raw-policy", env = "KEI_RAW_POLICY", value_enum)]
-    pub raw_policy: Option<RawPolicy>,
-
-    /// Deprecated: use --raw-policy
-    #[arg(long, env = "KEI_ALIGN_RAW", value_enum, hide = true)]
+    /// RAW treatment policy (must match what was used during sync)
+    #[arg(long, env = "KEI_ALIGN_RAW", value_enum)]
     pub align_raw: Option<RawTreatmentPolicy>,
 
     /// Only check the requested size (don't fall back to original)
@@ -1094,15 +1048,6 @@ impl SyncArgs {
         if self.size.is_none() {
             self.size = fallback.size;
         }
-        if self.edited.is_none() {
-            self.edited = fallback.edited;
-        }
-        if self.alternative.is_none() {
-            self.alternative = fallback.alternative;
-        }
-        if self.live_size.is_none() {
-            self.live_size = fallback.live_size;
-        }
         if self.live_photo_size.is_none() {
             self.live_photo_size = fallback.live_photo_size;
         }
@@ -1178,9 +1123,6 @@ impl SyncArgs {
         if self.live_photo_mov_filename_policy.is_none() {
             self.live_photo_mov_filename_policy = fallback.live_photo_mov_filename_policy;
         }
-        if self.raw_policy.is_none() {
-            self.raw_policy = fallback.raw_policy;
-        }
         if self.align_raw.is_none() {
             self.align_raw = fallback.align_raw;
         }
@@ -1219,12 +1161,6 @@ impl SyncArgs {
         if self.notification_script.is_none() {
             self.notification_script
                 .clone_from(&fallback.notification_script);
-        }
-        if self.control_bind.is_none() {
-            self.control_bind = fallback.control_bind;
-        }
-        if self.desktop_notifications.is_none() {
-            self.desktop_notifications = fallback.desktop_notifications;
         }
         if self.report_json.is_none() {
             self.report_json.clone_from(&fallback.report_json);
@@ -1497,95 +1433,184 @@ fn subcommand_display_name(cmd: &Command) -> &'static str {
 /// combines a non-sync subcommand with bare-kei sync flags. Each branch
 /// corresponds 1:1 to a `SyncArgs` field; when adding a new sync flag,
 /// extend this function so it shows up in the rejection message.
-/// Push a flag name to `out` when `matches` shows the corresponding arg
-/// was explicitly provided on the command line (not env or default).
-macro_rules! push_if_cli {
-    ($matches:expr, $out:expr, $($name:literal => $flag:literal),+ $(,)?) => {
-        $(
-            if $matches.value_source($name) == Some(clap::parser::ValueSource::CommandLine) {
-                $out.push($flag);
-            }
-        )+
-    };
-}
-
 fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str> {
+    use clap::parser::ValueSource;
     let mut out = Vec::new();
-    push_if_cli!(matches, out,
-        "download_dir" => "--download-dir",
-        "directory" => "--directory",
-        "albums" => "--album",
-        "exclude_albums" => "--exclude-album",
-        "smart_folders" => "--smart-folder",
-        "unfiled" => "--unfiled",
-        "filename_exclude" => "--filename-exclude",
-        "libraries" => "--library",
-        "size" => "--size",
-        "edited" => "--edited",
-        "alternative" => "--alternative",
-        "live_size" => "--live-size",
-        "live_photo_size" => "--live-photo-size",
-        "recent" => "--recent",
-        "threads" => "--threads",
-        "threads_num" => "--threads-num",
-        "bandwidth_limit" => "--bandwidth-limit",
-        "skip_videos" => "--skip-videos",
-        "skip_photos" => "--skip-photos",
-        "live_photo_mode" => "--live-photo-mode",
-        "skip_live_photos" => "--skip-live-photos",
-        "force_size" => "--force-size",
-        "folder_structure" => "--folder-structure",
-        "folder_structure_albums" => "--folder-structure-albums",
-        "folder_structure_smart_folders" => "--folder-structure-smart-folders",
-    );
+    if matches.value_source("download_dir") == Some(ValueSource::CommandLine) {
+        out.push("--download-dir");
+    }
+    if matches.value_source("directory") == Some(ValueSource::CommandLine) {
+        out.push("--directory");
+    }
+    if matches.value_source("albums") == Some(ValueSource::CommandLine) {
+        out.push("--album");
+    }
+    if matches.value_source("exclude_albums") == Some(ValueSource::CommandLine) {
+        out.push("--exclude-album");
+    }
+    if matches.value_source("smart_folders") == Some(ValueSource::CommandLine) {
+        out.push("--smart-folder");
+    }
+    if matches.value_source("unfiled") == Some(ValueSource::CommandLine) {
+        out.push("--unfiled");
+    }
+    if matches.value_source("filename_exclude") == Some(ValueSource::CommandLine) {
+        out.push("--filename-exclude");
+    }
+    if matches.value_source("libraries") == Some(ValueSource::CommandLine) {
+        out.push("--library");
+    }
+    if matches.value_source("size") == Some(ValueSource::CommandLine) {
+        out.push("--size");
+    }
+    if matches.value_source("live_photo_size") == Some(ValueSource::CommandLine) {
+        out.push("--live-photo-size");
+    }
+    if matches.value_source("recent") == Some(ValueSource::CommandLine) {
+        out.push("--recent");
+    }
+    if matches.value_source("threads") == Some(ValueSource::CommandLine) {
+        out.push("--threads");
+    }
+    if matches.value_source("threads_num") == Some(ValueSource::CommandLine) {
+        out.push("--threads-num");
+    }
+    if matches.value_source("bandwidth_limit") == Some(ValueSource::CommandLine) {
+        out.push("--bandwidth-limit");
+    }
+    if matches.value_source("skip_videos") == Some(ValueSource::CommandLine) {
+        out.push("--skip-videos");
+    }
+    if matches.value_source("skip_photos") == Some(ValueSource::CommandLine) {
+        out.push("--skip-photos");
+    }
+    if matches.value_source("live_photo_mode") == Some(ValueSource::CommandLine) {
+        out.push("--live-photo-mode");
+    }
+    if matches.value_source("skip_live_photos") == Some(ValueSource::CommandLine) {
+        out.push("--skip-live-photos");
+    }
+    if matches.value_source("force_size") == Some(ValueSource::CommandLine) {
+        out.push("--force-size");
+    }
+    if matches.value_source("folder_structure") == Some(ValueSource::CommandLine) {
+        out.push("--folder-structure");
+    }
+    if matches.value_source("folder_structure_albums") == Some(ValueSource::CommandLine) {
+        out.push("--folder-structure-albums");
+    }
+    if matches.value_source("folder_structure_smart_folders") == Some(ValueSource::CommandLine) {
+        out.push("--folder-structure-smart-folders");
+    }
     #[cfg(feature = "xmp")]
     {
-        push_if_cli!(matches, out,
-            "set_exif_datetime" => "--set-exif-datetime",
-            "set_exif_rating" => "--set-exif-rating",
-            "set_exif_gps" => "--set-exif-gps",
-            "set_exif_description" => "--set-exif-description",
-            "embed_xmp" => "--embed-xmp",
-            "xmp_sidecar" => "--xmp-sidecar",
-        );
+        if matches.value_source("set_exif_datetime") == Some(ValueSource::CommandLine) {
+            out.push("--set-exif-datetime");
+        }
+        if matches.value_source("set_exif_rating") == Some(ValueSource::CommandLine) {
+            out.push("--set-exif-rating");
+        }
+        if matches.value_source("set_exif_gps") == Some(ValueSource::CommandLine) {
+            out.push("--set-exif-gps");
+        }
+        if matches.value_source("set_exif_description") == Some(ValueSource::CommandLine) {
+            out.push("--set-exif-description");
+        }
+        if matches.value_source("embed_xmp") == Some(ValueSource::CommandLine) {
+            out.push("--embed-xmp");
+        }
+        if matches.value_source("xmp_sidecar") == Some(ValueSource::CommandLine) {
+            out.push("--xmp-sidecar");
+        }
     }
-    push_if_cli!(matches, out,
-        "dry_run" => "--dry-run",
-        "watch_with_interval" => "--watch-with-interval",
-        "no_progress_bar" => "--no-progress-bar",
-        "keep_unicode_in_filenames" => "--keep-unicode-in-filenames",
-        "live_photo_mov_filename_policy" => "--live-photo-mov-filename-policy",
-        "raw_policy" => "--raw-policy",
-        "align_raw" => "--align-raw",
-        "file_match_policy" => "--file-match-policy",
-        "skip_created_before" => "--skip-created-before",
-        "skip_created_after" => "--skip-created-after",
-        "only_print_filenames" => "--only-print-filenames",
-        "max_retries" => "--max-retries",
-        "retry_delay" => "--retry-delay",
-        "temp_suffix" => "--temp-suffix",
-        "no_incremental" => "--no-incremental",
-        "notify_systemd" => "--notify-systemd",
-        "pid_file" => "--pid-file",
-        "reconcile_every_n_cycles" => "--reconcile-every-n-cycles",
-        "notification_script" => "--notification-script",
-        "control_bind" => "--control-bind",
-        "desktop_notifications" => "--desktop-notifications",
-        "report_json" => "--report-json",
-        "http_port" => "--http-port",
-        "http_bind" => "--http-bind",
-        "save_password" => "--save-password",
-        "retry_failed" => "--retry-failed",
-        "max_download_attempts" => "--max-download-attempts",
-        // Hidden compat flags. `--auth-only`, `--list-albums`, `--list-libraries`,
-        // and `--reset-sync-token` only resolve to a remapped command when the
-        // bare-kei alias is in play; combining them with an explicit subcommand
-        // is the same silent-swallow class of bug we're guarding against.
-        "auth_only" => "--auth-only",
-        "list_albums" => "--list-albums",
-        "list_libraries" => "--list-libraries",
-        "reset_sync_token" => "--reset-sync-token",
-    );
+    if matches.value_source("dry_run") == Some(ValueSource::CommandLine) {
+        out.push("--dry-run");
+    }
+    if matches.value_source("watch_with_interval") == Some(ValueSource::CommandLine) {
+        out.push("--watch-with-interval");
+    }
+    if matches.value_source("no_progress_bar") == Some(ValueSource::CommandLine) {
+        out.push("--no-progress-bar");
+    }
+    if matches.value_source("keep_unicode_in_filenames") == Some(ValueSource::CommandLine) {
+        out.push("--keep-unicode-in-filenames");
+    }
+    if matches.value_source("live_photo_mov_filename_policy") == Some(ValueSource::CommandLine) {
+        out.push("--live-photo-mov-filename-policy");
+    }
+    if matches.value_source("align_raw") == Some(ValueSource::CommandLine) {
+        out.push("--align-raw");
+    }
+    if matches.value_source("file_match_policy") == Some(ValueSource::CommandLine) {
+        out.push("--file-match-policy");
+    }
+    if matches.value_source("skip_created_before") == Some(ValueSource::CommandLine) {
+        out.push("--skip-created-before");
+    }
+    if matches.value_source("skip_created_after") == Some(ValueSource::CommandLine) {
+        out.push("--skip-created-after");
+    }
+    if matches.value_source("only_print_filenames") == Some(ValueSource::CommandLine) {
+        out.push("--only-print-filenames");
+    }
+    if matches.value_source("max_retries") == Some(ValueSource::CommandLine) {
+        out.push("--max-retries");
+    }
+    if matches.value_source("retry_delay") == Some(ValueSource::CommandLine) {
+        out.push("--retry-delay");
+    }
+    if matches.value_source("temp_suffix") == Some(ValueSource::CommandLine) {
+        out.push("--temp-suffix");
+    }
+    if matches.value_source("no_incremental") == Some(ValueSource::CommandLine) {
+        out.push("--no-incremental");
+    }
+    if matches.value_source("notify_systemd") == Some(ValueSource::CommandLine) {
+        out.push("--notify-systemd");
+    }
+    if matches.value_source("pid_file") == Some(ValueSource::CommandLine) {
+        out.push("--pid-file");
+    }
+    if matches.value_source("reconcile_every_n_cycles") == Some(ValueSource::CommandLine) {
+        out.push("--reconcile-every-n-cycles");
+    }
+    if matches.value_source("notification_script") == Some(ValueSource::CommandLine) {
+        out.push("--notification-script");
+    }
+    if matches.value_source("report_json") == Some(ValueSource::CommandLine) {
+        out.push("--report-json");
+    }
+    if matches.value_source("http_port") == Some(ValueSource::CommandLine) {
+        out.push("--http-port");
+    }
+    if matches.value_source("http_bind") == Some(ValueSource::CommandLine) {
+        out.push("--http-bind");
+    }
+    if matches.value_source("save_password") == Some(ValueSource::CommandLine) {
+        out.push("--save-password");
+    }
+    if matches.value_source("retry_failed") == Some(ValueSource::CommandLine) {
+        out.push("--retry-failed");
+    }
+    if matches.value_source("max_download_attempts") == Some(ValueSource::CommandLine) {
+        out.push("--max-download-attempts");
+    }
+    // Hidden compat flags. `--auth-only`, `--list-albums`, `--list-libraries`,
+    // and `--reset-sync-token` only resolve to a remapped command when the
+    // bare-kei alias is in play; combining them with an explicit subcommand
+    // is the same silent-swallow class of bug we're guarding against.
+    if matches.value_source("auth_only") == Some(ValueSource::CommandLine) {
+        out.push("--auth-only");
+    }
+    if matches.value_source("list_albums") == Some(ValueSource::CommandLine) {
+        out.push("--list-albums");
+    }
+    if matches.value_source("list_libraries") == Some(ValueSource::CommandLine) {
+        out.push("--list-libraries");
+    }
+    if matches.value_source("reset_sync_token") == Some(ValueSource::CommandLine) {
+        out.push("--reset-sync-token");
+    }
     out
 }
 
@@ -1700,9 +1725,9 @@ mod tests {
     /// values from env-provided ones.
     fn parse_and_validate(argv: &[&str]) -> Result<(), String> {
         let cmd = <Cli as clap::CommandFactory>::command();
-        let matches = cmd.try_get_matches_from(argv).map_err(|e| e.to_string())?;
+        let matches = cmd.try_get_matches_from(argv).unwrap();
         let explicit_sync_flags = explicit_top_level_sync_flags(&matches);
-        let cli = Cli::from_arg_matches(&matches).map_err(|e| e.to_string())?;
+        let cli = Cli::from_arg_matches(&matches).unwrap();
         cli.validate(&explicit_sync_flags)
     }
 
@@ -2827,33 +2852,12 @@ mod tests {
             ("thumb", VersionSize::Thumb),
             ("adjusted", VersionSize::Adjusted),
             ("alternative", VersionSize::Alternative),
-            ("none", VersionSize::None),
         ] {
             let mut args = base_args();
             args.extend(["--size", input]);
             let cli = parse(&args);
             assert_eq!(cli.sync.size, Some(expected), "size variant: {input}");
         }
-    }
-
-    #[test]
-    fn test_new_size_axis_flags_parse() {
-        let mut args = base_args();
-        args.extend([
-            "--edited",
-            "true",
-            "--alternative",
-            "true",
-            "--live-size",
-            "medium",
-            "--raw-policy",
-            "prefer-raw",
-        ]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.edited, Some(true));
-        assert_eq!(cli.sync.alternative, Some(true));
-        assert_eq!(cli.sync.live_size, Some(Resolution::Medium));
-        assert_eq!(cli.sync.raw_policy, Some(RawPolicy::PreferRaw));
     }
 
     #[test]
@@ -3384,29 +3388,10 @@ mod tests {
             ("thumb", VersionSize::Thumb),
             ("adjusted", VersionSize::Adjusted),
             ("alternative", VersionSize::Alternative),
-            ("none", VersionSize::None),
         ] {
             let args = parse_import(&["--size", input]);
             assert_eq!(args.size, Some(expected), "size={input}");
         }
-    }
-
-    #[test]
-    fn import_existing_new_size_axis_flags_parse() {
-        let args = parse_import(&[
-            "--edited",
-            "true",
-            "--alternative",
-            "true",
-            "--live-size",
-            "thumb",
-            "--raw-policy",
-            "prefer-jpeg",
-        ]);
-        assert_eq!(args.edited, Some(true));
-        assert_eq!(args.alternative, Some(true));
-        assert_eq!(args.live_size, Some(Resolution::Thumb));
-        assert_eq!(args.raw_policy, Some(RawPolicy::PreferJpeg));
     }
 
     #[test]

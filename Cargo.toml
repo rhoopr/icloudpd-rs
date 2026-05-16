@@ -18,9 +18,8 @@ path = "src/main.rs"
 # the `--embed-xmp`, `--xmp-sidecar`, and `--set-exif-*` CLI flags and the
 # code paths behind them; HEIC container edits go with it because the
 # XMP packet serializer lives in xmp_toolkit.
-default = ["xmp", "desktop-notifications"]
+default = ["xmp"]
 xmp = ["dep:xmp_toolkit"]
-desktop-notifications = ["dep:notify-rust"]
 # Re-exports parser entry points for cargo-fuzz harnesses (`fuzz/`).
 # Off by default; production builds never see the `kei::__fuzz` module.
 __fuzz_internals = []
@@ -118,7 +117,6 @@ rand = "0.10.1"
 
 # File locking
 fs4 = "0.13"
-rustix = { version = "1", features = ["process"] }
 
 # Glob pattern matching
 glob = "0.3"
@@ -132,11 +130,6 @@ dirs = "6"
 async-trait = "0.1"
 urlencoding = "2"
 memchr = "2"
-
-# Desktop notifications (macOS Notification Center, Windows Toast, Linux libnotify).
-# Optional so minimal / container builds can `--no-default-features` it away.
-# Linux needs a D-Bus backend (dbus feature); macOS/Windows use native APIs.
-notify-rust = { version = "4", optional = true, default-features = false }
 
 # SQLite state tracking
 rusqlite = { version = "0.39", features = ["bundled"] }
@@ -158,9 +151,6 @@ keyring = { version = "3", features = ["apple-native"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
 sd-notify = "0.5"
-# Linux D-Bus backend for notify-rust (merged here because Cargo allows the
-# same crate in [dependencies] and [target.'...'.dependencies]).
-notify-rust = { version = "4", optional = true, features = ["dbus"] }
 
 # FreeBSD: Secret Service D-Bus API is available via ports (dbus + a
 # keyring daemon like gnome-keyring or KWallet). If no daemon is running,

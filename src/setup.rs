@@ -1376,7 +1376,6 @@ fn version_size_str(size: VersionSize) -> &'static str {
         VersionSize::Thumb => "thumb",
         VersionSize::Adjusted => "adjusted",
         VersionSize::Alternative => "alternative",
-        VersionSize::None => "none",
     }
 }
 

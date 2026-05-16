@@ -797,8 +797,8 @@ async fn kei_align_raw_unchanged_keeps_dng_extension() {
     std::fs::create_dir_all(&dl).unwrap();
     let config = base_config(&dl);
     assert_eq!(
-        config.raw_policy,
-        crate::types::RawPolicy::AsIs,
+        config.align_raw,
+        crate::types::RawTreatmentPolicy::Unchanged,
         "test depends on the Unchanged default"
     );
 

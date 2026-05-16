@@ -121,12 +121,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
         let kei_dir = kei_state_dir().ok_or_else(|| {
             anyhow!("--purge requested but USERPROFILE is not set; cannot locate kei state")
         })?;
-        tokio::task::spawn_blocking({
-            let kei_dir = kei_dir.clone();
-            move || purge_kei_state(&kei_dir, &[])
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("purge task panicked: {e}"))??;
+        purge_kei_state(&kei_dir, &[])?;
     }
 
     Ok(())
