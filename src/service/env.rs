@@ -91,17 +91,11 @@ pub(crate) fn container_supervisor_at(dockerenv: &Path, cgroup: &Path) -> Option
 
 /// Effective UID of the current process.
 ///
-/// Centralises the one `unsafe` block per backend that wraps
-/// `libc::geteuid` so each platform module doesn't carry its own copy
-/// with a duplicated SAFETY comment. POSIX-only -- Windows uses access
-/// tokens rather than UIDs, and the linux + macOS service backends are
-/// the only callers.
+/// POSIX-only -- Windows uses access tokens rather than UIDs, and the
+/// linux + macOS service backends are the only callers.
 #[cfg(unix)]
 pub(crate) fn effective_uid() -> u32 {
-    // SAFETY: libc::geteuid is a stateless POSIX FFI call with no
-    // memory-safety preconditions, no side effects, and a uid_t return
-    // value that cannot violate Rust memory safety.
-    unsafe { libc::geteuid() }
+    rustix::process::geteuid().as_raw()
 }
 
 /// Reads `auth.username` out of `kei_dir/config.toml`.

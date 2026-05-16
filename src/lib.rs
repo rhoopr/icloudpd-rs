@@ -268,31 +268,10 @@ pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
 
 /// Query available disk space on the filesystem containing `path`.
 ///
-/// Returns `None` if the statvfs call fails (e.g. path doesn't exist yet).
+/// Returns `None` if the filesystem query fails (e.g. path doesn't exist yet).
 #[cfg(unix)]
 pub(crate) fn available_disk_space(path: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    /// Widen a platform-dependent statvfs field to u64. `as u64` is the only
-    /// portable way since the underlying types (`c_ulong`, `fsblkcnt_t`) vary
-    /// across targets.
-    #[inline]
-    fn widen(v: impl Into<u64>) -> u64 {
-        v.into()
-    }
-
-    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: zeroed is valid for libc::statvfs (all-zero bit pattern is a
-    // valid struct — every field is an integer type).
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: c_path is a valid NUL-terminated C string that outlives the
-    // call. statvfs writes into the provided buffer and does not retain the
-    // pointer.
-    if unsafe { libc::statvfs(c_path.as_ptr(), &raw mut stat) } != 0 {
-        return None;
-    }
-    Some(widen(stat.f_bavail) * widen(stat.f_frsize))
+    fs4::available_space(path).ok()
 }
 
 #[cfg(not(unix))]
@@ -1356,6 +1335,19 @@ mod tests {
                 "{ok} bytes is at or above 1 GiB; check_min_disk_space must succeed"
             );
         }
+    }
+
+    #[test]
+    fn available_disk_space_reports_existing_directory_only() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            available_disk_space(dir.path()).is_some(),
+            "existing directory should report available disk space"
+        );
+        assert!(
+            available_disk_space(&dir.path().join("missing")).is_none(),
+            "missing path should preserve the previous None behavior"
+        );
     }
 
     /// Confirm `MIN_FREE_BYTES` is exactly 1 GiB. A future

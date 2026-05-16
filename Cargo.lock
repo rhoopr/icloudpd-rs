@@ -1667,6 +1667,7 @@ dependencies = [
  "rpassword",
  "rusqlite",
  "rustc-hash",
+ "rustix",
  "sd-notify",
  "secrecy",
  "serde",

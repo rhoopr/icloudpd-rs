@@ -128,8 +128,7 @@ fn install_system_without_root_fails_clearly() {
     // CI runs as a non-root user, which is exactly the condition this
     // test wants to exercise. Skipping when EUID==0 (rare local-dev
     // case) keeps the assertion meaningful without false negatives.
-    // SAFETY: stateless POSIX FFI call, no memory-safety preconditions.
-    if unsafe { libc::geteuid() } == 0 {
+    if rustix::process::geteuid().as_raw() == 0 {
         eprintln!("skipping non-root assertion: running as root");
         return;
     }

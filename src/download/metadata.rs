@@ -557,18 +557,11 @@ fn build_xmp_packet(write: &MetadataWrite) -> Result<Vec<u8>> {
 fn exif_datetime_to_iso(s: &str) -> String {
     let bytes = s.as_bytes();
     if bytes.len() == 19 && bytes[4] == b':' && bytes[7] == b':' && bytes[10] == b' ' {
-        let mut out = s.to_owned();
-        // SAFETY: `out` is a freshly-owned String with no aliases. The length
-        // check above proves indices 4, 7, 10 are in-bounds, and the
-        // replacement bytes are all valid 7-bit ASCII, so UTF-8
-        // well-formedness is preserved.
-        unsafe {
-            let b = out.as_bytes_mut();
-            b[4] = b'-';
-            b[7] = b'-';
-            b[10] = b'T';
-        }
-        out
+        let mut out = bytes.to_vec();
+        out[4] = b'-';
+        out[7] = b'-';
+        out[10] = b'T';
+        String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
     } else {
         s.to_owned()
     }
