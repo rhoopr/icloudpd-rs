@@ -1518,10 +1518,6 @@ mod tests {
         assert_eq!(download.directory.as_deref(), Some("~/Photos/iCloud"));
 
         let filters = parsed.filters.expect("filters section missing");
-        assert!(
-            filters.library.is_none(),
-            "wizard must not emit deprecated [filters].library (singular)"
-        );
         assert_eq!(filters.libraries.as_deref(), Some(&["all".to_string()][..]));
     }
 
@@ -1689,10 +1685,6 @@ mod tests {
             Some(&["*.tmp".to_string()][..])
         );
         assert_eq!(filters.skip_videos, Some(true));
-        assert!(
-            filters.library.is_none(),
-            "deprecated [filters].library (singular) must not be emitted"
-        );
         assert!(
             filters.libraries.is_none(),
             "empty libraries vec must produce a comment, not an array"

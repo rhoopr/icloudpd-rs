@@ -3271,11 +3271,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_config_hash_different_exclude_albums() {
+    fn test_compute_config_hash_different_inline_album_excludes() {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.exclude_albums = vec!["Hidden".to_string()];
+            s.albums = vec!["!Hidden".to_string()];
         });
         assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
     }
@@ -3731,8 +3731,11 @@ mod tests {
     fn golden_compute_config_hash_with_albums() {
         let tmp = TempDir::new().unwrap();
         let config = build_config_with(tmp.path(), "/photos", |s| {
-            s.albums = vec!["Favorites".to_string(), "Travel".to_string()];
-            s.exclude_albums = vec!["Hidden".to_string()];
+            s.albums = vec![
+                "Favorites".to_string(),
+                "Travel".to_string(),
+                "!Hidden".to_string(),
+            ];
         });
         let hash = compute_config_hash(&config);
         assert_eq!(

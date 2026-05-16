@@ -211,11 +211,6 @@ pub struct SyncArgs {
     #[arg(short = 'a', long = "album", env = "KEI_ALBUM", value_parser = non_empty_string)]
     pub albums: Vec<String>,
 
-    /// Deprecated: use --album '!NAME' (will be removed in v0.20.0). Note:
-    /// --exclude-album splits on commas; --album does not.
-    #[arg(long = "exclude-album", env = "KEI_EXCLUDE_ALBUM", value_delimiter = ',', value_parser = non_empty_string, hide = true)]
-    pub exclude_albums: Vec<String>,
-
     /// Smart folder(s) to download. Repeatable; default `none` (smart folders
     /// are skipped unless opted in). Accepts the same value grammar as
     /// `--album`: a name, the sentinel `all` (every smart folder except
@@ -1177,9 +1172,6 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     }
     if matches.value_source("albums") == Some(ValueSource::CommandLine) {
         out.push("--album");
-    }
-    if matches.value_source("exclude_albums") == Some(ValueSource::CommandLine) {
-        out.push("--exclude-album");
     }
     if matches.value_source("smart_folders") == Some(ValueSource::CommandLine) {
         out.push("--smart-folder");
@@ -3100,19 +3092,10 @@ mod tests {
     }
 
     #[test]
-    fn test_exclude_album_single() {
+    fn test_exclude_album_rejected() {
         let mut args = base_args();
         args.extend(["--exclude-album", "Hidden"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.exclude_albums, vec!["Hidden"]);
-    }
-
-    #[test]
-    fn test_exclude_album_multiple() {
-        let mut args = base_args();
-        args.extend(["--exclude-album", "Hidden", "--exclude-album", "Trash"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.exclude_albums, vec!["Hidden", "Trash"]);
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     // ── Cli::validate: bare-kei sync flags + non-sync subcommand ──
@@ -3291,7 +3274,6 @@ mod tests {
             ("retry_failed", &["--retry-failed"]),
             ("download_dir", &["--download-dir", "/photos"]),
             ("album", &["--album", "Vacation"]),
-            ("exclude_album", &["--exclude-album", "Hidden"]),
             ("smart_folder", &["--smart-folder", "Favorites"]),
             ("filename_exclude", &["--filename-exclude", "*.AAE"]),
             ("library", &["--library", "primary"]),

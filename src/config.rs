@@ -102,21 +102,14 @@ pub(crate) struct TomlRetry {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlFilters {
-    /// Deprecated v0.13: use `libraries` (an array). Removed in v0.20.
-    pub library: Option<String>,
-    /// v0.13+ replacement for `library`. Repeatable; accepts the same value
-    /// grammar as `--library` (`primary`, `shared`, `all`, raw zone names,
-    /// `!name` exclusions).
+    /// Repeatable library selector. Accepts `primary`, `shared`, `all`,
+    /// `none`, raw zone names, and `!name` exclusions.
     pub libraries: Option<Vec<String>>,
-    /// Deprecated v0.13: use `albums` (an array). Removed in v0.20.
-    pub album: Option<String>,
     pub albums: Option<Vec<String>>,
-    /// v0.13+ smart-folder selector. Same value grammar as `albums`.
+    /// Smart-folder selector. Same value grammar as `albums`.
     pub smart_folders: Option<Vec<String>>,
-    /// v0.13+ unfiled-pass toggle. Default: `true`.
+    /// Unfiled-pass toggle. Default: `true`.
     pub unfiled: Option<bool>,
-    /// Deprecated v0.13: use `albums` with `!name` entries. Removed in v0.20.
-    pub exclude_albums: Option<Vec<String>>,
     pub filename_exclude: Option<Vec<String>>,
     pub skip_videos: Option<bool>,
     pub skip_photos: Option<bool>,
@@ -195,9 +188,8 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
 // ── Application Config ──────────────────────────────────────────────
 
 /// Resolve `--library` from CLI > TOML > default (`primary`). The CLI list
-/// and the TOML `[filters].libraries` array share the v0.13 grammar
+/// and the TOML `[filters].libraries` array share the selector grammar
 /// (`primary` / `shared` / `all` / `none` / `!name` / raw zone names);
-/// `[filters].library` (singular) is a deprecated alias warned at use.
 ///
 /// Returns the parsed [`crate::selection::LibrarySelector`]; the matching
 /// against live CloudKit zones happens in
@@ -207,15 +199,7 @@ pub(crate) fn resolve_library_selector(
     toml_filters: Option<&TomlFilters>,
 ) -> anyhow::Result<crate::selection::LibrarySelector> {
     let toml_libraries = toml_filters.and_then(|f| f.libraries.clone());
-    let toml_library_singular = toml_filters.and_then(|f| f.library.clone());
-    if toml_library_singular.is_some() {
-        warn_deprecated(
-            "`[filters].library` (singular string)",
-            "`[filters].libraries = [\"name\"]` (array)",
-        );
-    }
-    let toml_libraries_resolved = toml_libraries.or_else(|| toml_library_singular.map(|s| vec![s]));
-    let raw = resolve_vec(cli_libraries, toml_libraries_resolved);
+    let raw = resolve_vec(cli_libraries, toml_libraries);
     crate::selection::parse_library_selector(&raw)
 }
 
@@ -266,33 +250,6 @@ pub(crate) const DEFAULT_FOLDER_STRUCTURE_ALBUMS: &str = "{album}";
 /// Default template for smart-folder passes: a flat per-smart-folder folder.
 pub(crate) const DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS: &str = "{smart-folder}";
 
-/// Reject `--folder-structure` values that place `{album}` somewhere other
-/// than the first path segment, or use it more than once. Both cases would
-/// make the "unfiled photos" fallback path shift other segments around
-/// unpredictably when `{album}` collapses to an empty string.
-///
-/// Runs *before* the legacy-`{album}` auto-migration so the migration helper
-/// can rely on the placement guarantee when lifting the segment out.
-fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
-    use crate::download::paths::TOKEN_ALBUM;
-    let stripped = crate::download::paths::strip_python_wrapper(folder_structure);
-    let count = stripped.matches(TOKEN_ALBUM).count();
-    if count == 0 {
-        return Ok(());
-    }
-    if count > 1 {
-        anyhow::bail!(
-            "'{{album}}' may only appear once in --folder-structure; got {count} occurrences in \"{folder_structure}\""
-        );
-    }
-    if stripped.split('/').next() != Some(TOKEN_ALBUM) {
-        anyhow::bail!(
-            "'{{album}}' must be the first path segment of --folder-structure; got \"{folder_structure}\""
-        );
-    }
-    Ok(())
-}
-
 /// Which folder-structure flag a template was supplied via. Drives the
 /// per-template token rules: each kind allows exactly one category token
 /// (`{album}` for albums, `{smart-folder}` for smart folders, none for the
@@ -300,18 +257,14 @@ fn validate_folder_structure(folder_structure: &str) -> anyhow::Result<()> {
 ///
 /// See also [`crate::commands::PassKind`], which classifies the same three
 /// categories at *render* time. The two enums look identical but encode
-/// different rules: `PassKind::Unfiled` reuses `{album}` as its render
-/// token (legacy compatibility), while `TemplateKind::Unfiled` *forbids*
-/// it (post-migration).
+/// different rules: `TemplateKind::Unfiled` forbids category tokens.
 #[derive(Debug, Clone, Copy)]
 enum TemplateKind {
     /// `--folder-structure-albums`.
     Albums,
     /// `--folder-structure-smart-folders`.
     SmartFolders,
-    /// `--folder-structure` (unfiled / library-wide). Auto-migration of a
-    /// legacy `{album}` token has already run by the time this kind is
-    /// validated, so the unfiled template should carry no category tokens.
+    /// `--folder-structure` (unfiled / library-wide).
     Unfiled,
 }
 
@@ -416,35 +369,6 @@ pub(crate) const fn unfiled_default() -> bool {
 }
 
 /// Stderr deprecation warning, scheduled for removal in v0.20.0. `old` is the
-/// surface being deprecated (e.g. `` `--exclude-album` ``); `replacement` is
-/// the suggested new form.
-pub(crate) fn warn_deprecated(old: &str, replacement: &str) {
-    #[allow(
-        clippy::print_stderr,
-        reason = "runs during config load, before tracing subscriber is installed"
-    )]
-    {
-        eprintln!(
-            "warning: {old} is deprecated and will be removed in v0.20.0; use {replacement} instead"
-        );
-    }
-}
-
-/// `--exclude-album` accepts comma-separated values; `--album` does not, so a
-/// mechanical rewrite of `--exclude-album A,B` to `--album '!A,!B'` would
-/// silently produce one literal album name.
-fn warn_exclude_album_comma_split() {
-    #[allow(
-        clippy::print_stderr,
-        reason = "runs during config load, before tracing subscriber is installed"
-    )]
-    {
-        eprintln!(
-            "note: --exclude-album splits on commas; --album does not. --exclude-album A,B becomes --album '!A' --album '!B' (two flags), not --album '!A,!B' (one literal name)."
-        );
-    }
-}
-
 /// `--album none` callers explicitly opted out of album passes and aren't
 /// surprised when the unfiled pass runs alongside; carve them out of the
 /// warning even though `unfiled_override.is_none()`.
@@ -464,12 +388,12 @@ fn warn_implicit_unfiled_pass() {
     );
 }
 
-/// Translate the legacy `(AlbumSelection, exclude_albums)` tuple plus the
-/// parsed library/smart-folder selectors into the v0.13
+/// Translate the internal `(AlbumSelection, exclude_albums)` tuple plus the
+/// parsed library/smart-folder selectors into the
 /// [`crate::selection::Selection`]. Pure function so the truth table is
 /// testable without `Config::build`.
 ///
-/// Lowering for legacy album fields:
+/// Lowering for album fields:
 /// - `AlbumSelection::LibraryOnly` maps to `AlbumSelector::None`. Set when
 ///   the user passed `--album none`; produces no album passes (unfiled
 ///   alone covers the library).
@@ -522,81 +446,6 @@ pub(crate) fn derive_selection(
     })
 }
 
-/// Outcome of [`auto_migrate_legacy_album_token`].
-#[derive(Debug, PartialEq, Eq)]
-struct LegacyAlbumTokenMigration {
-    /// Base template after stripping the `{album}` segment.
-    folder_structure: String,
-    /// Album-pass template - either lifted from the legacy single template
-    /// (when the user did not set `--folder-structure-albums`) or preserved
-    /// as supplied.
-    folder_structure_albums: String,
-    /// Equivalent CLI/TOML pair to suggest to the user in the deprecation
-    /// warning. `None` when nothing was migrated.
-    suggestion: Option<String>,
-}
-
-/// Detect a legacy `{album}` token in `folder_structure` and split it across
-/// the new per-category templates so the path renderer (which consumes
-/// `folder_structure_albums` for album passes) stays equivalent.
-///
-/// - `{album}/<rest>` migrates to `folder_structure_albums = "{album}/<rest>"`,
-///   `folder_structure = "<rest>"` (so the unfiled pass keeps its date
-///   hierarchy).
-/// - Bare `{album}` migrates to `folder_structure_albums = "{album}"`,
-///   `folder_structure = "none"` (the user explicitly opted out of any
-///   date hierarchy on either pass; "none" preserves that for unfiled).
-/// - When the user already set `folder_structure_albums`, the supplied
-///   value is preserved and only the base template is stripped.
-///
-/// Returns `suggestion: None` when the input has no `{album}` token, in
-/// which case the caller should not emit the deprecation warning.
-fn auto_migrate_legacy_album_token(
-    folder_structure: String,
-    folder_structure_albums: String,
-    folder_structure_albums_user_set: bool,
-) -> LegacyAlbumTokenMigration {
-    use crate::download::paths::TOKEN_ALBUM;
-    let stripped = crate::download::paths::strip_python_wrapper(&folder_structure);
-    if !stripped.contains(TOKEN_ALBUM) {
-        return LegacyAlbumTokenMigration {
-            folder_structure,
-            folder_structure_albums,
-            suggestion: None,
-        };
-    }
-
-    let new_albums = if folder_structure_albums_user_set {
-        folder_structure_albums
-    } else {
-        stripped.to_string()
-    };
-
-    // `validate_folder_structure` guarantees `{album}` is the leading
-    // segment when present, so the only shapes reaching here are exactly
-    // `{album}` (no remainder, base becomes `none`) and `{album}/<rest>`
-    // (lift the rest into the base). Falling through to `none` on any
-    // would-be-malformed input is the safe outcome: the unfiled pass gets
-    // no date hierarchy, but no unstripped `{album}` token leaks back
-    // into the renderer's base path.
-    let new_base = match stripped.split_once('/') {
-        Some((first, rest)) if first == TOKEN_ALBUM => rest.to_string(),
-        _ => crate::download::paths::NO_DATE_STRUCTURE.to_string(),
-    };
-
-    // Single-quoted form so users can paste the suggestion straight into
-    // a POSIX shell. `{:?}` would emit Rust string escapes (\n, \u{...})
-    // which bash would mis-interpret; templates can't contain single
-    // quotes today (validated upstream).
-    let suggestion =
-        format!("`--folder-structure '{new_base}' --folder-structure-albums '{new_albums}'`");
-    LegacyAlbumTokenMigration {
-        folder_structure: new_base,
-        folder_structure_albums: new_albums,
-        suggestion: Some(suggestion),
-    }
-}
-
 /// Convert a raw `Vec<String>` (from CLI or TOML, with optional `!name`
 /// exclusions and `all`/`none` sentinels) into the legacy
 /// `(AlbumSelection, exclude_albums)` pair. Validates the new v0.13 grammar
@@ -604,26 +453,11 @@ fn auto_migrate_legacy_album_token(
 /// [`crate::selection::parse_album_selector`], then lowers back into the
 /// legacy shape that `compute_config_hash` and `report.rs` still consume.
 /// Pass execution itself runs off `Selection.albums` via `resolve_passes`.
-fn resolve_album_selection(
-    raw: &[String],
-    folder_structure: &str,
-) -> anyhow::Result<(AlbumSelection, Vec<String>)> {
+fn resolve_album_selection(raw: &[String]) -> anyhow::Result<(AlbumSelection, Vec<String>)> {
     if raw.is_empty() {
-        // v0.13 default: `--album all`. No-flag `kei sync` enumerates every
+        // v0.13+ default: `--album all`. No-flag `kei sync` enumerates every
         // user album and (with `unfiled = true`) runs an unfiled pass for
-        // photos in no album. The legacy auto-promotion from `{album}` in
-        // `--folder-structure` is now redundant -- the default already
-        // includes albums:all -- but we keep the deprecation warning until
-        // v0.20 so users with `{album}` in their unfiled template know to
-        // migrate to `--folder-structure-albums`.
-        if crate::download::paths::strip_python_wrapper(folder_structure)
-            .contains(crate::download::paths::TOKEN_ALBUM)
-        {
-            warn_deprecated(
-                "implicit `--album all` from `{album}` in `--folder-structure`",
-                "an explicit `--album all` (now the default)",
-            );
-        }
+        // photos in no album.
         return Ok((AlbumSelection::All, Vec::new()));
     }
 
@@ -1229,14 +1063,6 @@ impl Config {
             toml_dl.and_then(|d| d.folder_structure.clone()),
             "%Y/%m/%d".to_string(),
         );
-        validate_folder_structure(&folder_structure)?;
-
-        // Track whether the user explicitly supplied a per-category album
-        // template; the legacy `{album}` auto-migration below preserves a
-        // user-supplied value but lifts the legacy template into the new
-        // field when it is unset.
-        let folder_structure_albums_user_set = sync.folder_structure_albums.is_some()
-            || toml_dl.is_some_and(|d| d.folder_structure_albums.is_some());
         let folder_structure_albums = resolve(
             sync.folder_structure_albums,
             toml_dl.and_then(|d| d.folder_structure_albums.clone()),
@@ -1326,75 +1152,11 @@ impl Config {
         // Filters
         let library_selector = resolve_library_selector(sync.libraries, toml_filters)?;
         let toml_albums = toml_filters.and_then(|f| f.albums.clone());
-        let toml_album_singular = toml_filters.and_then(|f| f.album.clone());
-        if toml_album_singular.is_some() {
-            warn_deprecated(
-                "`[filters].album` (singular string)",
-                "`[filters].albums = [\"name\"]` (array)",
-            );
-        }
-        // Lift the deprecated singular `album` key into the array form so the
-        // shared resolver only ever sees one shape. CLI takes precedence; TOML
-        // singular only applies when the array form is absent.
-        let toml_albums_resolved = toml_albums.or_else(|| toml_album_singular.map(|s| vec![s]));
-        let raw_albums = resolve_vec(sync.albums, toml_albums_resolved);
+        let raw_albums = resolve_vec(sync.albums, toml_albums);
+        let (albums, exclude_albums) = resolve_album_selection(&raw_albums)?;
 
-        let toml_exclude_albums = toml_filters.and_then(|f| f.exclude_albums.clone());
-        let legacy_excludes_supplied = !sync.exclude_albums.is_empty()
-            || toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty());
-        if !sync.exclude_albums.is_empty() {
-            warn_deprecated(
-                "`--exclude-album` / `KEI_EXCLUDE_ALBUM`",
-                "`--album '!NAME'`",
-            );
-            warn_exclude_album_comma_split();
-        }
-        if toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty()) {
-            warn_deprecated(
-                "`[filters].exclude_albums`",
-                "`!name` entries inside `[filters].albums`",
-            );
-        }
-        let exclude_albums = resolve_vec(sync.exclude_albums, toml_exclude_albums);
-        // Fold deprecated excludes into the raw album list as `!name` so the
-        // new selector grammar performs all validation (contradictions,
-        // sentinel rules) in one place. Legacy excludes also remain on
-        // `Config.exclude_albums` for the unchanged sync pipeline.
-        let mut merged_raw = raw_albums;
-        for name in &exclude_albums {
-            merged_raw.push(format!("!{name}"));
-        }
-        let (albums, parsed_excludes) = resolve_album_selection(&merged_raw, &folder_structure)?;
-        // `compute_config_hash` and `report.rs` still read `Config.exclude_albums`
-        // for token invalidation and run reporting respectively. Prefer the
-        // deprecated list when the user actually supplied it (exact legacy
-        // behaviour); otherwise surface inline `!name` excludes so the new
-        // grammar feeds both surfaces consistently.
-        let exclude_albums = if legacy_excludes_supplied {
-            exclude_albums
-        } else {
-            parsed_excludes
-        };
-
-        // Auto-migrate legacy `{album}` in `--folder-structure` into the
-        // per-category templates the renderer now consumes. Runs after the
-        // album-selection resolver so the auto-`-a all`-from-token behaviour
-        // (also being deprecated) sees the original template before the
-        // token gets stripped from `folder_structure`.
-        let migration = auto_migrate_legacy_album_token(
-            folder_structure,
-            folder_structure_albums,
-            folder_structure_albums_user_set,
-        );
-        if let Some(ref suggestion) = migration.suggestion {
-            warn_deprecated("`{album}` in `--folder-structure`", suggestion);
-        }
-        let folder_structure = migration.folder_structure;
-        let folder_structure_albums = migration.folder_structure_albums;
-
-        // Runs after auto-migration so the unfiled template has no `{album}`
-        // left to reject; remaining bugs (e.g. `{smart-folder}` in albums)
-        // surface here before the first download.
+        // The base template is for unfiled/library-only paths. Album-specific
+        // paths must use `folder_structure_albums`.
         validate_template_tokens(&folder_structure, TemplateKind::Unfiled)?;
         validate_template_tokens(&folder_structure_albums, TemplateKind::Albums)?;
         validate_template_tokens(&folder_structure_smart_folders, TemplateKind::SmartFolders)?;
@@ -1774,8 +1536,6 @@ impl Config {
                 }),
             }),
             filters: Some(TomlFilters {
-                library: None, // deprecated singular key never round-trips; new array form below
-                album: None, // emit only the array form; deprecated singular dropped on round-trip
                 libraries: {
                     // Emit only when the user picked something other than
                     // the default (primary). Default `[primary]` round-trips
@@ -1809,11 +1569,6 @@ impl Config {
                     None
                 } else {
                     Some(false)
-                },
-                exclude_albums: if self.exclude_albums.is_empty() {
-                    None
-                } else {
-                    Some(self.exclude_albums.clone())
                 },
                 filename_exclude: if self.filename_exclude.is_empty() {
                     None
@@ -2279,7 +2034,7 @@ mod tests {
             max_retries = 3
 
             [filters]
-            library = "PrimarySync"
+            libraries = ["PrimarySync"]
             albums = ["Favorites"]
             skip_videos = false
             skip_photos = false
@@ -2431,7 +2186,7 @@ mod tests {
             folder_structure = "%Y-%m"
 
             [filters]
-            library = "SharedSync-ABC"
+            libraries = ["SharedSync-ABC"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -2456,7 +2211,7 @@ mod tests {
             threads = 4
 
             [filters]
-            library = "SharedSync-ABC"
+            libraries = ["SharedSync-ABC"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
 
@@ -2493,7 +2248,7 @@ mod tests {
     fn test_library_all_from_toml() {
         let toml_str = r#"
             [filters]
-            library = "all"
+            libraries = ["all"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -2841,99 +2596,6 @@ mod tests {
         assert_eq!(
             cfg.folder_structure_smart_folders,
             "{smart-folder}/from-cli"
-        );
-    }
-
-    // ── auto_migrate_legacy_album_token ────────────────────────────────
-    //
-    // The legacy `{album}` auto-migration is the only path by which a
-    // pre-v0.13 user's existing `--folder-structure "{album}/..."` keeps
-    // working. A regression that drops the migration silently moves every
-    // album pass back to the unfiled date hierarchy. Pin every shape the
-    // function declares it handles.
-
-    #[test]
-    fn auto_migrate_album_token_with_date_hierarchy_lifts_segment() {
-        let m = auto_migrate_legacy_album_token(
-            "{album}/%Y/%m".to_string(),
-            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
-            false,
-        );
-        assert_eq!(m.folder_structure, "%Y/%m");
-        assert_eq!(m.folder_structure_albums, "{album}/%Y/%m");
-        assert!(
-            m.suggestion.is_some(),
-            "migration must surface a suggestion to warn the user"
-        );
-    }
-
-    #[test]
-    fn auto_migrate_bare_album_token_emits_none_unfiled_template() {
-        let m = auto_migrate_legacy_album_token(
-            "{album}".to_string(),
-            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
-            false,
-        );
-        assert_eq!(
-            m.folder_structure,
-            crate::download::paths::NO_DATE_STRUCTURE,
-            "bare {{album}} must collapse the unfiled template to `none`"
-        );
-        assert_eq!(m.folder_structure_albums, "{album}");
-        assert!(m.suggestion.is_some());
-    }
-
-    #[test]
-    fn auto_migrate_no_album_token_is_noop() {
-        let m = auto_migrate_legacy_album_token(
-            "%Y/%m/%d".to_string(),
-            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
-            false,
-        );
-        assert_eq!(m.folder_structure, "%Y/%m/%d");
-        assert_eq!(m.folder_structure_albums, DEFAULT_FOLDER_STRUCTURE_ALBUMS);
-        assert!(
-            m.suggestion.is_none(),
-            "no-token input must not surface a deprecation suggestion"
-        );
-    }
-
-    #[test]
-    fn auto_migrate_preserves_user_set_albums_template() {
-        // When the user already supplied --folder-structure-albums, the
-        // legacy template's segments should NOT clobber it.
-        let m = auto_migrate_legacy_album_token(
-            "{album}/%Y".to_string(),
-            "{album}/by-day/%Y/%m/%d".to_string(),
-            true,
-        );
-        assert_eq!(m.folder_structure, "%Y");
-        assert_eq!(
-            m.folder_structure_albums, "{album}/by-day/%Y/%m/%d",
-            "user-set per-category template must survive migration"
-        );
-        assert!(m.suggestion.is_some());
-    }
-
-    #[test]
-    fn config_build_legacy_album_token_warns_and_migrates() {
-        // End-to-end: --folder-structure "{album}/%Y/%m" through Config::build
-        // applies the migration and leaves the resolved fields in the new shape.
-        use crate::cli::{Cli, Command};
-        use clap::Parser;
-        let cli =
-            Cli::try_parse_from(["kei", "sync", "--folder-structure", "{album}/%Y/%m"]).unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(
-            cfg.folder_structure, "%Y/%m",
-            "unfiled template must be the post-migration base"
-        );
-        assert_eq!(
-            cfg.folder_structure_albums, "{album}/%Y/%m",
-            "album template must inherit the legacy segment"
         );
     }
 
@@ -3735,7 +3397,7 @@ mod tests {
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         assert!(config.auth.unwrap().username.is_none());
         assert!(config.download.unwrap().threads.is_none());
-        assert!(config.filters.unwrap().library.is_none());
+        assert!(config.filters.unwrap().libraries.is_none());
         assert!(config.photos.unwrap().size.is_none());
         assert!(config.watch.unwrap().interval.is_none());
         assert!(config.notifications.unwrap().script.is_none());
@@ -3782,7 +3444,7 @@ mod tests {
     fn test_toml_filters_all_fields() {
         let toml_str = r#"
             [filters]
-            library = "SharedSync-ABC"
+            libraries = ["SharedSync-ABC"]
             albums = ["A", "B"]
             skip_videos = true
             skip_photos = true
@@ -3792,7 +3454,10 @@ mod tests {
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         let f = config.filters.unwrap();
-        assert_eq!(f.library.as_deref(), Some("SharedSync-ABC"));
+        assert_eq!(
+            f.libraries.as_deref(),
+            Some(&["SharedSync-ABC".to_string()][..])
+        );
         assert_eq!(f.albums, Some(vec!["A".to_string(), "B".to_string()]));
         assert_eq!(f.skip_videos, Some(true));
         assert_eq!(f.skip_photos, Some(true));
@@ -5169,7 +4834,7 @@ mod tests {
             max_retries = 1
 
             [filters]
-            library = "SharedSync-FULL"
+            libraries = ["SharedSync-FULL"]
             albums = ["Album1"]
             skip_videos = true
             recent = 50
@@ -5420,10 +5085,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_album_smart_default_kicks_in_with_album_token() {
-        // No -a passed, but {album} in folder_structure -> implicit All.
+    fn test_build_default_is_all_with_album_template() {
         let mut sync = default_sync();
-        sync.folder_structure = Some("{album}/%Y/%m".to_string());
+        sync.folder_structure_albums = Some("{album}/%Y/%m".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.albums, AlbumSelection::All);
     }
@@ -5518,57 +5182,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_exclude_album_cli_merges_into_excludes() {
-        // Deprecated --exclude-album still works: each entry feeds into the
-        // selector as `!name` so the legacy and new pipelines both observe it.
-        let mut sync = default_sync();
-        sync.albums = vec!["all".to_string()];
-        sync.exclude_albums = vec!["Family".to_string(), "Hidden".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.albums, AlbumSelection::All);
-        assert_eq!(cfg.exclude_albums, vec!["Family", "Hidden"]);
-    }
-
-    #[test]
-    fn test_build_toml_album_singular_lifted_into_array() {
-        let toml: TomlConfig = toml::from_str("[filters]\nalbum = \"Vacation\"\n").unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.albums,
-            AlbumSelection::Named(vec!["Vacation".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_build_toml_albums_array_takes_precedence_over_singular() {
-        let toml: TomlConfig =
-            toml::from_str("[filters]\nalbum = \"Singular\"\nalbums = [\"Array\"]\n").unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.albums, AlbumSelection::Named(vec!["Array".to_string()]));
-    }
-
-    // ── folder_structure {album} placement validation ──────────────
-
-    #[test]
     fn test_build_album_token_rejected_mid_path() {
         let mut sync = default_sync();
         sync.folder_structure = Some("Photos/{album}/%Y".to_string());
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("'{album}' must be the first path segment"),
+                .contains("'{album}' is not valid in --folder-structure"),
             "unexpected error: {err}"
         );
     }
@@ -5580,7 +5200,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("'{album}' must be the first path segment"),
+                .contains("'{album}' is not valid in --folder-structure"),
             "unexpected error: {err}"
         );
     }
@@ -5590,7 +5210,11 @@ mod tests {
         let mut sync = default_sync();
         sync.folder_structure = Some("%Y/%m/{album}".to_string());
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
-        assert!(err.to_string().contains("must be the first path segment"));
+        assert!(
+            err.to_string()
+                .contains("'{album}' is not valid in --folder-structure"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -5599,125 +5223,10 @@ mod tests {
         sync.folder_structure = Some("{album}/%Y/{album}".to_string());
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
-            err.to_string().contains("may only appear once"),
+            err.to_string()
+                .contains("'{album}' is not valid in --folder-structure"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn test_auto_migrate_no_token_passes_through() {
-        let m =
-            auto_migrate_legacy_album_token("%Y/%m/%d".to_string(), "{album}".to_string(), false);
-        assert_eq!(m.folder_structure, "%Y/%m/%d");
-        assert_eq!(m.folder_structure_albums, "{album}");
-        assert!(m.suggestion.is_none());
-    }
-
-    #[test]
-    fn test_auto_migrate_lifts_full_template_when_albums_unset() {
-        let m = auto_migrate_legacy_album_token(
-            "{album}/%Y/%m".to_string(),
-            "{album}".to_string(),
-            false,
-        );
-        assert_eq!(m.folder_structure, "%Y/%m");
-        assert_eq!(m.folder_structure_albums, "{album}/%Y/%m");
-        assert!(m.suggestion.is_some());
-    }
-
-    #[test]
-    fn test_auto_migrate_preserves_user_albums_template() {
-        let m = auto_migrate_legacy_album_token(
-            "{album}/%Y/%m".to_string(),
-            "{album}/custom".to_string(),
-            true,
-        );
-        assert_eq!(m.folder_structure, "%Y/%m");
-        assert_eq!(m.folder_structure_albums, "{album}/custom");
-        assert!(m.suggestion.is_some());
-    }
-
-    #[test]
-    fn test_auto_migrate_bare_album_token_uses_none_base() {
-        let m = auto_migrate_legacy_album_token(
-            "{album}".to_string(),
-            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
-            false,
-        );
-        assert_eq!(
-            m.folder_structure,
-            crate::download::paths::NO_DATE_STRUCTURE
-        );
-        assert_eq!(m.folder_structure_albums, "{album}");
-    }
-
-    #[test]
-    fn test_auto_migrate_unwraps_python_wrapper() {
-        let m = auto_migrate_legacy_album_token(
-            "{:{album}/%Y/%m}".to_string(),
-            "{album}".to_string(),
-            false,
-        );
-        assert_eq!(m.folder_structure, "%Y/%m");
-        assert_eq!(m.folder_structure_albums, "{album}/%Y/%m");
-    }
-
-    #[test]
-    fn test_build_album_token_at_root_migrates() {
-        // Legacy `{album}/%Y/%m` is auto-migrated: the album-pass template
-        // gets the original (so album passes still produce `Vacation/2024/06`)
-        // and the base template loses `{album}/` so the unfiled pass keeps
-        // its date hierarchy.
-        let mut sync = default_sync();
-        sync.albums = vec!["Vacation".to_string()];
-        sync.folder_structure = Some("{album}/%Y/%m".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.folder_structure, "%Y/%m");
-        assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m");
-    }
-
-    #[test]
-    fn test_build_album_token_alone_migrates_to_none() {
-        // Bare `{album}` had no date hierarchy on either pass; the
-        // migration preserves that by setting the unfiled template to
-        // "none" rather than the new default "%Y/%m/%d".
-        let mut sync = default_sync();
-        sync.albums = vec!["Vacation".to_string()];
-        sync.folder_structure = Some("{album}".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(
-            cfg.folder_structure,
-            crate::download::paths::NO_DATE_STRUCTURE
-        );
-        assert_eq!(cfg.folder_structure_albums, "{album}");
-    }
-
-    #[test]
-    fn test_build_album_token_within_python_wrapper_migrates() {
-        // The legacy Python `{:...}` wrapper is unwrapped by the migration
-        // so the resulting templates render directly through chrono's
-        // strftime (no nested wrapper to confuse the parser).
-        let mut sync = default_sync();
-        sync.albums = vec!["Vacation".to_string()];
-        sync.folder_structure = Some("{:{album}/%Y/%m}".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.folder_structure, "%Y/%m");
-        assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m");
-    }
-
-    #[test]
-    fn test_build_album_token_preserves_user_set_albums_template() {
-        // When the user explicitly set `--folder-structure-albums`, the
-        // legacy template is stripped from the base but the supplied album
-        // template is preserved verbatim - users get the migration warning
-        // but their explicit value wins.
-        let mut sync = default_sync();
-        sync.albums = vec!["Vacation".to_string()];
-        sync.folder_structure = Some("{album}/%Y".to_string());
-        sync.folder_structure_albums = Some("{album}/explicit".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.folder_structure, "%Y");
-        assert_eq!(cfg.folder_structure_albums, "{album}/explicit");
     }
 
     #[test]
@@ -6000,19 +5509,6 @@ mod tests {
     }
 
     #[test]
-    fn test_to_toml_roundtrip_exclude_albums() {
-        let mut sync = default_sync();
-        sync.exclude_albums = vec!["Hidden".to_string(), "Trash".to_string()];
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        let toml = cfg.to_toml();
-        let filters = toml.filters.as_ref().unwrap();
-        assert_eq!(
-            filters.exclude_albums.as_deref(),
-            Some(&["Hidden".to_string(), "Trash".to_string()][..])
-        );
-    }
-
-    #[test]
     fn test_to_toml_roundtrip_filename_exclude() {
         let mut sync = default_sync();
         sync.filename_exclude = vec!["*.AAE".to_string(), "Screenshot*".to_string()];
@@ -6049,19 +5545,6 @@ mod tests {
             parsed.photos.as_ref().unwrap().live_photo_mode,
             Some(crate::types::LivePhotoMode::ImageOnly)
         );
-    }
-
-    #[test]
-    fn test_to_toml_empty_exclude_albums_omitted() {
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            None,
-        )
-        .unwrap();
-        let toml = cfg.to_toml();
-        assert!(toml.filters.as_ref().unwrap().exclude_albums.is_none());
     }
 
     #[test]
@@ -6339,17 +5822,22 @@ mod tests {
     }
 
     #[test]
-    fn test_exclude_albums_from_toml() {
-        let toml_str = "[filters]\nexclude_albums = [\"Hidden\", \"Trash\"]\n";
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.exclude_albums, vec!["Hidden", "Trash"]);
+    fn removed_filter_aliases_are_rejected() {
+        for (field, toml_str) in [
+            ("album", "[filters]\nalbum = \"Vacation\"\n"),
+            (
+                "exclude_albums",
+                "[filters]\nexclude_albums = [\"Hidden\", \"Trash\"]\n",
+            ),
+            ("library", "[filters]\nlibrary = \"SharedSync-ABC\"\n"),
+        ] {
+            let err = toml::from_str::<TomlConfig>(toml_str).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("unknown field `{field}`")),
+                "unexpected error for {field}: {err}"
+            );
+        }
     }
 
     fn assert_sf_named(
@@ -6728,31 +6216,6 @@ mod tests {
     }
 
     #[test]
-    fn test_exclude_album_cli_overrides_toml() {
-        let mut sync = default_sync();
-        sync.exclude_albums = vec!["CLI_Album".to_string()];
-        let toml_str = "[filters]\nexclude_albums = [\"TOML_Album\"]\n";
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.exclude_albums, vec!["CLI_Album"]);
-    }
-
-    #[test]
-    fn test_exclude_album_falls_back_to_toml() {
-        let toml_str = "[filters]\nexclude_albums = [\"TOML_Album\"]\n";
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.exclude_albums, vec!["TOML_Album"]);
-    }
-
-    #[test]
     fn test_filename_exclude_cli_overrides_toml() {
         let mut sync = default_sync();
         sync.filename_exclude = vec!["*.AAE".to_string()];
@@ -6841,27 +6304,6 @@ mod tests {
         };
         let sel = resolve_library_selector(vec![], Some(&toml_filters)).unwrap();
         assert_eq!(sel.to_raw(), vec!["SharedSync-ABCD".to_string()]);
-    }
-
-    #[test]
-    fn resolve_library_falls_back_to_deprecated_toml_singular() {
-        let toml_filters = TomlFilters {
-            library: Some("SharedSync-LEGACY".to_string()),
-            ..Default::default()
-        };
-        let sel = resolve_library_selector(vec![], Some(&toml_filters)).unwrap();
-        assert_eq!(sel.to_raw(), vec!["SharedSync-LEGACY".to_string()]);
-    }
-
-    #[test]
-    fn resolve_library_toml_array_takes_precedence_over_singular() {
-        let toml_filters = TomlFilters {
-            library: Some("SharedSync-OLD".to_string()),
-            libraries: Some(vec!["SharedSync-NEW".to_string()]),
-            ..Default::default()
-        };
-        let sel = resolve_library_selector(vec![], Some(&toml_filters)).unwrap();
-        assert_eq!(sel.to_raw(), vec!["SharedSync-NEW".to_string()]);
     }
 
     #[test]

@@ -82,8 +82,7 @@ fn sync_help_omits_removed_directory_flag() {
 
 #[test]
 fn sync_help_hides_deprecated_exclude_album_flag() {
-    // `--exclude-album` still parses for backward compat but must not appear
-    // in help output; users should only see `--album '!NAME'`.
+    // `--exclude-album` was removed; users should only see `--album '!NAME'`.
     common::cmd()
         .args(["sync", "--help"])
         .assert()
