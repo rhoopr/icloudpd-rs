@@ -81,7 +81,7 @@ kei install
 
 Run this from an **elevated** PowerShell prompt (right-click PowerShell -> Run as administrator). Service Control Manager `CreateService` requires admin rights, and a non-elevated install fails with `Access is denied`.
 
-`kei install` registers `com.rhoopr.kei` with SCM, set to run as your Windows user account. You'll be prompted for your account password during install: SCM stores it in the Local Security Authority (LSA) so the service can start under your identity at boot, and so it can read your iCloud password from Credential Manager. See [credential-storage.md](credential-storage.md) for how kei stores the iCloud password itself.
+`kei install` registers `com.rhoopr.kei` with SCM, set to run as your Windows user account. You'll be prompted for your account password during install: SCM stores it in the Local Security Authority (LSA) so the service can start under your identity at boot, and so it can read your iCloud password from Credential Manager. See the [Credentials wiki page](https://github.com/rhoopr/kei/wiki/Credentials#credential-store) for how kei stores the iCloud password itself.
 
 Per-user services aren't a Windows concept; `--user` and `--system` are both ignored. There is one install per machine.
 
