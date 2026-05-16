@@ -327,6 +327,51 @@ mod tests {
     }
 
     #[test]
+    fn run_options_from_config_uses_schema_v2_option_names() {
+        let download_dir = tempfile::tempdir().expect("download dir");
+        let toml_str = format!(
+            r#"
+            [download]
+            directory = "{}"
+            threads = 6
+        "#,
+            download_dir.path().display()
+        );
+        let toml: crate::config::TomlConfig = toml::from_str(&toml_str).expect("parse TOML");
+        let globals = crate::config::GlobalArgs {
+            username: Some("report@example.com".to_string()),
+            domain: None,
+            data_dir: None,
+        };
+        let config = crate::config::Config::build(
+            &globals,
+            &crate::cli::PasswordArgs::default(),
+            crate::cli::SyncArgs::default(),
+            Some(&toml),
+        )
+        .expect("build config");
+
+        let options = RunOptions::from_config(&config);
+        assert_eq!(options.download_dir, download_dir.path());
+        assert_eq!(options.threads, 6);
+
+        let json = serde_json::to_value(&options).expect("serialize options");
+        assert_eq!(
+            json["download_dir"],
+            download_dir.path().display().to_string()
+        );
+        assert_eq!(json["threads"], 6);
+        assert!(
+            json.get("directory").is_none(),
+            "schema v2 must not emit the legacy options.directory key"
+        );
+        assert!(
+            json.get("threads_num").is_none(),
+            "schema v2 must not emit the legacy options.threads_num key"
+        );
+    }
+
+    #[test]
     fn failed_assets_are_omitted_when_empty() {
         // serde(skip_serializing_if = "Vec::is_empty") on failed_assets
         // and is_zero_usize on failed_assets_truncated must keep clean-run
