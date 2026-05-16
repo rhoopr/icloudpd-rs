@@ -358,6 +358,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         );
     }
 
+    // Preflight explicit password files before the disk-space guard. The guard
+    // is deliberately early to avoid wasting 2FA work, but an empty/unreadable
+    // `--password-file` is an auth-source failure and should keep returning
+    // EXIT_AUTH instead of being masked by unrelated local disk pressure.
+    if let Some(path) = &config.password_file {
+        if let Err(e) = password::read_password_file(path) {
+            tracing::error!(error = %e, "Password source resolution failed");
+            return Err(auth::error::AuthError::FailedLogin(
+                "No password available (see error above for details)".into(),
+            )
+            .into());
+        }
+    }
+
     // Validate download directory is writable before spending time on authentication.
     tokio::fs::create_dir_all(&config.directory)
         .await
@@ -381,6 +395,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             "Could not clean up writability-probe file; harmless leakage"
         );
     }
+    tracing::debug!(path = %config.directory.display(), "Download directory is writable");
 
     // Abort if available disk space is too low. See `check_min_disk_space`
     // for the pure inner check.
@@ -802,15 +817,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // after two missed intervals so a single slow cycle doesn't flip to 503
     // but a stuck main loop does.
     // Binds synchronously so a misconfigured port fails at startup.
-    let staleness_threshold = config
-        .watch_with_interval
-        .map(|secs| chrono::Duration::seconds((secs * 2) as i64));
+    let staleness_threshold = config.watch_with_interval.map(|secs| {
+        chrono::Duration::seconds(i64::try_from(secs.saturating_mul(2)).unwrap_or(i64::MAX))
+    });
     let (metrics_handle, metrics_task) = if config.watch_with_interval.is_some() {
         let (h, t, _addr) = crate::metrics::spawn_server(
             config.http_bind,
+            config.control_bind,
             config.http_port,
             shutdown_token.clone(),
             staleness_threshold,
+            config.watch_with_interval,
         )?;
         (Some(h), Some(t))
     } else {
@@ -845,6 +862,23 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             tracing::info!("Shutdown requested, exiting...");
             break;
         }
+        if let Some(ref handle) = metrics_handle {
+            while handle.is_paused() {
+                sd_notifier.notify_status("Paused");
+                tracing::info!("Sync paused; waiting for resume");
+                tokio::select! {
+                    () = handle.wait_for_control_signal() => {}
+                    () = shutdown_token.cancelled() => {
+                        tracing::info!("Shutdown while paused, exiting...");
+                        break;
+                    }
+                }
+            }
+            if shutdown_token.is_cancelled() {
+                tracing::info!("Shutdown requested, exiting...");
+                break;
+            }
+        }
         cycle_index = cycle_index.saturating_add(1);
 
         // In watch mode with incremental sync, use changes/database as a
@@ -866,6 +900,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             // Refresh health gauges only -- do not reset cycle_duration_seconds.
             if let Some(ref handle) = metrics_handle {
                 handle.update_health_only(&health).await;
+                handle.update_status_snapshot("skipped", None, None).await;
+                handle.publish_sync_skipped(cycle_index, "no_changes");
             }
         } else {
             sd_notifier.notify_status("Syncing...");
@@ -876,6 +912,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &config.username,
                 None,
             );
+            if let Some(ref handle) = metrics_handle {
+                handle.publish_sync_started(cycle_index);
+            }
 
             let cycle_started_at = std::time::Instant::now();
             let cycle_result = run_cycle(
@@ -990,12 +1029,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 // Update DB-backed gauges from the state database. Reuse
                 // the post-cycle summary fetched for the friendly card
                 // when it's available, otherwise issue the call here.
+                let mut status_summary = library_after_summary.clone();
                 if let Some(summary) = library_after_summary.as_ref() {
                     handle.update_db_stats(summary, cycle_result.stats.assets_seen);
                 } else if let Some(ref db) = state_db {
                     match db.get_summary().await {
                         Ok(summary) => {
                             handle.update_db_stats(&summary, cycle_result.stats.assets_seen);
+                            status_summary = Some(summary);
                         }
                         Err(e) => {
                             handle.record_db_summary_failure();
@@ -1003,6 +1044,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         }
                     }
                 }
+                let outcome = crate::report::sync_status_str(
+                    cycle_result.session_expired,
+                    cycle_result.stats.interrupted,
+                    cycle_result.failed_count,
+                );
+                handle
+                    .update_status_snapshot(
+                        outcome,
+                        Some(&cycle_result.stats),
+                        status_summary.as_ref(),
+                    )
+                    .await;
+                handle.publish_sync_finished(cycle_index, outcome, &cycle_result.stats);
             }
 
             // Write JSON report if configured
@@ -1275,8 +1329,18 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     wake_at,
                 );
             }
+            let control_signal = async {
+                if let Some(handle) = metrics_handle.as_ref() {
+                    handle.wait_for_control_signal().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)) => {}
+                () = control_signal => {
+                    tracing::info!("Control endpoint requested immediate wake");
+                }
                 () = shutdown_token.cancelled() => {
                     tracing::info!("Shutdown during wait, exiting...");
                     break;

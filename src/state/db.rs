@@ -4098,10 +4098,7 @@ mod tests {
 
         // Skip when running as root: 0o555 doesn't restrict root, so the
         // mkdir would succeed and the assertion below would falsely fail.
-        // SAFETY: libc::geteuid() is a stateless POSIX FFI call with no
-        // preconditions, no side effects, and a uid_t return value; it cannot
-        // violate Rust memory safety.
-        if unsafe { libc::geteuid() } == 0 {
+        if crate::service::env::effective_uid() == 0 {
             return;
         }
 

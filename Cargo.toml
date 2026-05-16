@@ -118,6 +118,7 @@ rand = "0.10.1"
 
 # File locking
 fs4 = "0.13"
+rustix = { version = "1", features = ["process"] }
 
 # Glob pattern matching
 glob = "0.3"
