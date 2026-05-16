@@ -271,6 +271,9 @@ pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
 /// Returns `None` if the filesystem query fails (e.g. path doesn't exist yet).
 #[cfg(any(unix, windows))]
 pub(crate) fn available_disk_space(path: &Path) -> Option<u64> {
+    if !path.exists() {
+        return None;
+    }
     fs4::available_space(path).ok()
 }
 
