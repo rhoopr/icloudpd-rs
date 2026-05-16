@@ -3640,7 +3640,7 @@ fn sync_cmd_for_validation() -> assert_cmd::Command {
 }
 
 #[test]
-fn migration_legacy_album_in_cli_warns() {
+fn removed_legacy_album_in_cli_errors() {
     sync_cmd_for_validation()
         .args([
             "--folder-structure",
@@ -3648,63 +3648,45 @@ fn migration_legacy_album_in_cli_warns() {
             "--only-print-filenames",
         ])
         .assert()
+        .failure()
         .stderr(predicate::str::contains(
-            "`{album}` in `--folder-structure`",
+            "'{album}' is not valid in --folder-structure",
         ))
-        .stderr(predicate::str::contains("v0.20.0"))
         .stderr(predicate::str::contains("--folder-structure-albums"));
 }
 
 #[test]
-fn migration_legacy_album_in_toml_warns_and_lifts() {
-    let (stdout, stderr) = run_config_show("folder_structure = \"{album}/%B\"\n");
+fn removed_legacy_album_in_toml_errors() {
+    let stderr = run_config_show_error("folder_structure = \"{album}/%B\"\n");
     assert!(
-        stderr.contains("`{album}` in `--folder-structure`") && stderr.contains("v0.20.0"),
+        stderr.contains("'{album}' is not valid in --folder-structure")
+            && stderr.contains("--folder-structure-albums"),
         "stderr: {stderr}"
-    );
-    assert!(
-        stdout.contains("folder_structure_albums = \"{album}/%B\""),
-        "stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("folder_structure = \"%B\""),
-        "stdout: {stdout}"
     );
 }
 
-/// Locks in that all three input surfaces (CLI / TOML / env) flow through
-/// the same migration helper.
 #[test]
-fn migration_legacy_album_in_env_warns() {
+fn removed_legacy_album_in_env_errors() {
     sync_cmd_for_validation()
         .env("KEI_FOLDER_STRUCTURE", "{album}/%Y")
         .arg("--only-print-filenames")
         .assert()
+        .failure()
         .stderr(predicate::str::contains(
-            "`{album}` in `--folder-structure`",
+            "'{album}' is not valid in --folder-structure",
         ))
-        .stderr(predicate::str::contains("v0.20.0"));
+        .stderr(predicate::str::contains("--folder-structure-albums"));
 }
 
-/// User's albums template wins; the legacy `{album}` segment in the base
-/// template still gets stripped (so no leftover token reaches the renderer)
-/// and the warning still fires.
 #[test]
-fn migration_legacy_album_preserves_user_set_albums_template() {
-    let (stdout, stderr) = run_config_show(
+fn removed_legacy_album_errors_even_with_user_set_albums_template() {
+    let stderr = run_config_show_error(
         "folder_structure = \"{album}/%Y\"\nfolder_structure_albums = \"{album}/custom\"\n",
     );
     assert!(
-        stderr.contains("`{album}` in `--folder-structure`"),
+        stderr.contains("'{album}' is not valid in --folder-structure")
+            && stderr.contains("--folder-structure-albums"),
         "stderr: {stderr}"
-    );
-    assert!(
-        stdout.contains("folder_structure_albums = \"{album}/custom\""),
-        "stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("folder_structure = \"%Y\""),
-        "stdout: {stdout}"
     );
 }
 
