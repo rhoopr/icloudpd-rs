@@ -2,7 +2,7 @@
 
 `kei install` registers kei to start at boot and run continuously. This page explains what runs once the service is up, what each platform's artifact looks like, and how to inspect or control it from the platform's native tools.
 
-For installing the service, see [install.md](install.md).
+For installing the service, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install#registering-kei-as-a-service).
 
 ## What `kei service run` does
 
@@ -125,4 +125,4 @@ If the binary moved (e.g. you switched from the homebrew install to a manually p
 
 ## Removing the service
 
-`kei uninstall` removes only the platform artifact. State (DB, config, credentials) is preserved by default; pass `--purge` to wipe `~/.config/kei` along with the service entry. See [install.md](install.md) for the per-platform commands.
+`kei uninstall` removes only the platform artifact. State (DB, config, credentials) is preserved by default; pass `--purge` to wipe `~/.config/kei` along with the service entry. See the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install#registering-kei-as-a-service) for the per-platform commands.
