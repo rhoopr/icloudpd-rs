@@ -98,6 +98,14 @@ def check_coverage_comment(errors: list[str]) -> None:
             errors.append(f"coverage-comment.yml: missing artifact hardening marker: {needle}")
 
 
+def check_windows_stack_link_arg(errors: list[str]) -> None:
+    text = Path("build.rs").read_text()
+    if 'cargo:rustc-link-arg=/STACK:4194304' not in text:
+        errors.append("build.rs: missing Windows stack linker argument")
+    if 'RUSTFLAGS="-Dwarnings"' not in text:
+        errors.append("build.rs: Windows stack fix must document CI RUSTFLAGS override")
+
+
 def main() -> int:
     errors: list[str] = []
     check_action_refs(errors)
@@ -106,6 +114,7 @@ def main() -> int:
     check_docker_test(errors)
     check_release(errors)
     check_coverage_comment(errors)
+    check_windows_stack_link_arg(errors)
 
     if errors:
         print("\n".join(errors), file=sys.stderr)
