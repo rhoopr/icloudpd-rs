@@ -329,25 +329,21 @@ mod tests {
     #[test]
     fn run_options_from_config_uses_schema_v2_option_names() {
         let download_dir = tempfile::tempdir().expect("download dir");
-        let toml_str = format!(
-            r#"
-            [download]
-            directory = "{}"
-            threads = 6
-        "#,
-            download_dir.path().display()
-        );
-        let toml: crate::config::TomlConfig = toml::from_str(&toml_str).expect("parse TOML");
         let globals = crate::config::GlobalArgs {
             username: Some("report@example.com".to_string()),
             domain: None,
             data_dir: None,
         };
+        let sync = crate::cli::SyncArgs {
+            download_dir: Some(download_dir.path().display().to_string()),
+            threads: Some(6),
+            ..crate::cli::SyncArgs::default()
+        };
         let config = crate::config::Config::build(
             &globals,
             &crate::cli::PasswordArgs::default(),
-            crate::cli::SyncArgs::default(),
-            Some(&toml),
+            sync,
+            None,
         )
         .expect("build config");
 
