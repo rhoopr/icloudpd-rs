@@ -5509,6 +5509,25 @@ mod tests {
     }
 
     #[test]
+    fn test_to_toml_keeps_inline_album_excludes_canonical() {
+        let mut sync = default_sync();
+        sync.albums = vec!["!Family".to_string()];
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let filters = toml.filters.as_ref().unwrap();
+        assert_eq!(
+            filters.albums.as_deref(),
+            Some(&["all".to_string(), "!Family".to_string()][..])
+        );
+
+        let serialized = ::toml::to_string_pretty(&toml).unwrap();
+        assert!(
+            !serialized.contains("exclude_albums"),
+            "config show must not re-emit removed exclude_albums:\n{serialized}"
+        );
+    }
+
+    #[test]
     fn test_to_toml_roundtrip_filename_exclude() {
         let mut sync = default_sync();
         sync.filename_exclude = vec!["*.AAE".to_string(), "Screenshot*".to_string()];
