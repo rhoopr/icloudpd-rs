@@ -7,49 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.14.0] - 2026-05-12
-
-### Added
-
-- **Friendly progress UI, on by default on plain TTYs.** `kei sync` on an interactive terminal now shows a smoothed multi-pass card in place of the plain progress bar: a source-aware top rule (`kei · downloading from iCloud`), bandwidth sparkline (B/s through GB/s), smart ETA, album-or-unfiled prefix on the active filename, color-tiered rules (bright cyan → cyan → green as progress climbs), and a moon-phase spinner. A stripped tracing format drops the `target+timestamp` prefix so on-screen lines stay compact. Friendly mode auto-disables when output isn't a TTY, when `--report-json` / `--only-print-filenames` / `--no-progress-bar` is set, under `kei service run` / Docker / systemd, when `TERM=dumb`, or when `--log-level` / `RUST_LOG` is set explicitly — journals and pipes keep the v0.13 structured format byte-for-byte. Opt out with `--no-friendly` per invocation or `[ui] friendly = false` in `config.toml`. Resolution order is CLI > TOML > default-on, with hard-off contexts winning over everything. `--friendly` still works as a force-on (subject to the auto-off rules above). `--verbose` / `-v` aliases `--log-level info` and restores the structured log format. ([#362], [#363], [#364], [#365], [#366], [#367], [#370])
-- **Friendly-mode lifecycle narration.** While the bar reads `scanning…`, it cycles through a phase-aware verb pool ("looking around", "counting albums", "asking iCloud what is new") every ~600ms. Smart-ETA wording escalates from `calculating…` to `still calculating…` after 5 seconds of indeterminate ETA. Four phase ✓ lines print alongside the bar: `✓ Authenticated as you@example.com`, `✓ Listed N library/libraries`, `✓ Downloaded N new files (412 GB → 412.3 GB)` (with library size delta from the state DB), and `✓ Verified N files (N of N matched)`. All four no-op on no-op cycles. After the cycle, a summary card replaces the plain `── Summary ──` block with photos/videos split, skipped/failed counts, elapsed time, speed (bytes/elapsed), and library totals. A "what's new" recap (`Biggest grab`, `Oldest find`, `Newest album`) prints below the card when anything was downloaded. Multi-album syncs get per-album column-aligned `✓` lines (`✓ Family  1,204 / 1,204  2m 04s`). ([#363], [#364], [#374])
-- **Friendly-mode narration during transient errors.** 2FA prompts get a context line above the code input (`Sent a code to your trusted devices. Approve the push and enter the 6-digit code below.`). CloudKit 421 Misdirected Request resets print `iCloud connection wobbled. Resetting…` / `Back on track.` Per-file download retries print `iCloud hiccup. Retrying in 4s…` / `Back on track.` / `That one is being stubborn. Skipping for now, will retry next sync.` Watch-mode idle prints `Sleeping until 14:32 (local time). Press Ctrl+C to stop.` Graceful exit prints `Done. See you next time.` Ctrl+C prints `Stopping. Finishing in-flight downloads. Press Ctrl+C again to exit immediately.` All narration is friendly-mode-only; off mode keeps its existing `tracing` events for journals. ([#364], [#365], [#366], [#367])
-- **`kei install` registers kei as a long-running service on Linux, macOS, and Windows.** Renders the platform-native artifact (systemd unit, launchd plist, or Service Control Manager entry) and hands it to the platform's service manager. Defaults to per-user on Linux and macOS; Windows is per-user only and needs an elevated prompt. Inside Docker / Kubernetes / Podman the command is a no-op so existing compose workflows are unchanged. The service runs `kei service run`, which is `kei sync` with a once-per-day watch interval default. ([#351], [#352], [#355], [#356], [#358])
-- **`kei uninstall` removes the service.** Reverses `kei install` on every platform. Pass `--purge` to also delete the state database, configuration, and stored credentials; default keeps your data. Double-uninstall prints "already removed" instead of a path-not-found diagnostic. `kei install` prints the `kei uninstall` counterpart hint. ([#352], [#355], [#356], [#358], [#374])
-- **`kei service status` reports per-platform service state.** Surfaces the systemd `SubState`, launchd lifecycle, or SCM `current_state` in the platform's own terms. ([#352], [#355], [#356], [#358])
-- **`kei status` leads with a `Service:` summary line.** Cross-platform one-liner (`Service: running (systemd user, pid 12345, since 2026-05-08 14:32 UTC)`, `Service: not installed`, `Service: running in container (process supervisor: docker)`, etc.) so you can script against a single output regardless of host. ([#359])
-- **Docker image now honors `PUID` and `PGID` environment variables.** When both are set, the container's entrypoint chowns ownership-mismatched files in `/config` and `/photos` to that UID:GID and drops privileges via `gosu` before running kei. Setting only one is rejected; setting neither preserves the prior root-default. The chown uses `find -not -uid` so a multi-TB volume only pays for stragglers, not the full tree, on every restart. Unblocks NAS deployments (Synology Container Manager, Unraid, TrueNAS Scale) where downstream indexers like Synology Photos can't see root-owned files. ([Synology wiki](https://github.com/rhoopr/kei/wiki/Synology), [Docker wiki](https://github.com/rhoopr/kei/wiki/Docker))
-- **Setup wizard visual polish.** The `kei config setup` wizard now has dimmed section banners between steps, green-bold ✓ checkmarks on step completions, brief spinners during TOML generation and config write, and a styled TOML preview with dimmed comments and cyan section headers. Prompts use warmer, more conversational language throughout. No new dependencies. ([#373])
+## [Unreleased]
 
 ### Changed
 
-- **rpassword bumped to 7.5.2.** Supersedes stale dependabot PRs #353 and #354. No user-visible change. ([#357])
-
-### Fixed
-
-- **Ghost top rule after Ctrl+C in friendly mode.** Indicatif filled the last bar row with spaces to the terminal's right edge; when the tty driver echoed `^C` there it overflowed to a new line, throwing `cursor_up` off by one and leaving the prior top rule as a stale frame. Narration now routes through `MultiProgress::println` (atomic draw), and the friendly bar clears the `ECHOCTL` termios flag on stdin while active so `^C` never echoes (Unix only — Windows console doesn't echo `^C`). Restored on Drop and on both `process::exit` paths.
-- **100 MiB free-space floor before enumeration.** kei now requires at least 100 MiB of free space on the download filesystem before starting iCloud enumeration, preventing a cycle that enumerates thousands of assets then fails every download with "no space left". ([#372])
-- **State-write failures now produce a non-zero exit code.** `complete_sync_run` failure was silently swallowed, so a full disk at the "commit sync results" stage looked like a clean exit. Now bumps `state_write_failures` and propagates through the exit-code logic. ([#372])
-- **Help text polish.** `--friendly`/`--no-friendly` show short help in `-h`; top-level `--help` footer groups commands logically (Getting started / Common / Advanced). ([#374])
-
-[#351]: https://github.com/rhoopr/kei/pull/351
-[#352]: https://github.com/rhoopr/kei/pull/352
-[#355]: https://github.com/rhoopr/kei/pull/355
-[#356]: https://github.com/rhoopr/kei/pull/356
-[#357]: https://github.com/rhoopr/kei/pull/357
-[#358]: https://github.com/rhoopr/kei/pull/358
-[#359]: https://github.com/rhoopr/kei/pull/359
-[#362]: https://github.com/rhoopr/kei/pull/362
-[#363]: https://github.com/rhoopr/kei/pull/363
-[#364]: https://github.com/rhoopr/kei/pull/364
-[#365]: https://github.com/rhoopr/kei/pull/365
-[#366]: https://github.com/rhoopr/kei/pull/366
-[#367]: https://github.com/rhoopr/kei/pull/367
-[#370]: https://github.com/rhoopr/kei/pull/370
-[#371]: https://github.com/rhoopr/kei/pull/371
-[#372]: https://github.com/rhoopr/kei/pull/372
-[#373]: https://github.com/rhoopr/kei/pull/373
-[#374]: https://github.com/rhoopr/kei/pull/374
+- **README scope refreshed.** The README now leads with the current iCloud sync, media, operations, service, Docker, and planned-backend scope, then moves the longer capability list into a `Features` section. The command links now include `reconcile`.
 
 ---
 
@@ -68,10 +30,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **HEIC corruption from Chinese iCloud with `set_exif_datetime` enabled.** `insert_xmp` iloc remapping in `src/download/heif.rs` used `encoded_size` to estimate the original extent of each HEIC atom. When Apple QuickTime format inputs (no version+flags prefix) were re-encoded to ISO format, Meta grew 4 bytes — inflating its range past its actual original extent. An iloc entry pointing to mdat fell in this overshoot zone and was remapped to the wrong offset, making downloaded HEICs unopenable. Now uses the next atom's actual original start as `old_end` (falling back to total for the last atom), immune to encode/decode size mismatches. Same fix applied to `locate_stale_kei_mdat()`. ([#376])
+- **HEIC corruption from Chinese iCloud with `set_exif_datetime` enabled.** `insert_xmp` iloc remapping in `src/download/heif.rs` used `encoded_size` to estimate the original extent of each HEIC atom. When Apple QuickTime format inputs (no version+flags prefix) were re-encoded to ISO format, Meta grew 4 bytes, inflating its range past its actual original extent. An iloc entry pointing to mdat fell in this overshoot zone and was remapped to the wrong offset, making downloaded HEICs unopenable. It now uses the next atom's actual original start as `old_end` (falling back to total for the last atom), immune to encode/decode size mismatches. Same fix applied to `locate_stale_kei_mdat()`. ([#376])
 
 [#375]: https://github.com/rhoopr/kei/issues/375
 [#376]: https://github.com/rhoopr/kei/pull/376
+
+---
+
+## [0.14.0] - 2026-05-12
+
+### Added
+
+- **Friendly progress UI, on by default on plain TTYs.** `kei sync` on an interactive terminal now shows a smoothed multi-pass card in place of the plain progress bar: a source-aware top rule (`kei · downloading from iCloud`), bandwidth sparkline (B/s through GB/s), smart ETA, album-or-unfiled prefix on the active filename, color-tiered rules (bright cyan → cyan → green as progress climbs), and a moon-phase spinner. A stripped tracing format drops the `target+timestamp` prefix so on-screen lines stay compact. Friendly mode auto-disables when output isn't a TTY, when `--report-json` / `--only-print-filenames` / `--no-progress-bar` is set, under `kei service run` / Docker / systemd, when `TERM=dumb`, or when `--log-level` / `RUST_LOG` is set explicitly - journals and pipes keep the v0.13 structured format byte-for-byte. Opt out with `--no-friendly` per invocation or `[ui] friendly = false` in `config.toml`. Resolution order is CLI > TOML > default-on, with hard-off contexts winning over everything. `--friendly` still works as a force-on (subject to the auto-off rules above). `--verbose` / `-v` aliases `--log-level info` and restores the structured log format. ([#362], [#363], [#364], [#365], [#366], [#367], [#370])
+- **Friendly-mode lifecycle narration.** While the bar reads `scanning…`, it cycles through a phase-aware verb pool ("looking around", "counting albums", "asking iCloud what is new") every ~600ms. Smart-ETA wording escalates from `calculating…` to `still calculating…` after 5 seconds of indeterminate ETA. Four phase ✓ lines print alongside the bar: `✓ Authenticated as you@example.com`, `✓ Listed N library/libraries`, `✓ Downloaded N new files (412 GB → 412.3 GB)` (with library size delta from the state DB), and `✓ Verified N files (N of N matched)`. All four no-op on no-op cycles. After the cycle, a summary card replaces the plain `── Summary ──` block with photos/videos split, skipped/failed counts, elapsed time, speed (bytes/elapsed), and library totals. A "what's new" recap (`Biggest grab`, `Oldest find`, `Newest album`) prints below the card when anything was downloaded. Multi-album syncs get per-album column-aligned `✓` lines (`✓ Family  1,204 / 1,204  2m 04s`). ([#363], [#364], [#374])
+- **Friendly-mode narration during transient errors.** 2FA prompts get a context line above the code input (`Sent a code to your trusted devices. Approve the push and enter the 6-digit code below.`). CloudKit 421 Misdirected Request resets print `iCloud connection wobbled. Resetting…` / `Back on track.` Per-file download retries print `iCloud hiccup. Retrying in 4s…` / `Back on track.` / `That one is being stubborn. Skipping for now, will retry next sync.` Watch-mode idle prints `Sleeping until 14:32 (local time). Press Ctrl+C to stop.` Graceful exit prints `Done. See you next time.` Ctrl+C prints `Stopping. Finishing in-flight downloads. Press Ctrl+C again to exit immediately.` All narration is friendly-mode-only; off mode keeps its existing `tracing` events for journals. ([#364], [#365], [#366], [#367])
+- **`kei install` registers kei as a long-running service on Linux, macOS, and Windows.** Renders the platform-native artifact (systemd unit, launchd plist, or Service Control Manager entry) and hands it to the platform's service manager. Defaults to per-user on Linux and macOS; Windows is per-user only and needs an elevated prompt. Inside Docker / Kubernetes / Podman the command is a no-op so existing compose workflows are unchanged. The service runs `kei service run`, which is `kei sync` with a once-per-day watch interval default. ([#351], [#352], [#355], [#356], [#358])
+- **`kei uninstall` removes the service.** Reverses `kei install` on every platform. Pass `--purge` to also delete the state database, configuration, and stored credentials; default keeps your data. Double-uninstall prints "already removed" instead of a path-not-found diagnostic. `kei install` prints the `kei uninstall` counterpart hint. ([#352], [#355], [#356], [#358], [#374])
+- **`kei service status` reports per-platform service state.** Surfaces the systemd `SubState`, launchd lifecycle, or SCM `current_state` in the platform's own terms. ([#352], [#355], [#356], [#358])
+- **`kei status` leads with a `Service:` summary line.** Cross-platform one-liner (`Service: running (systemd user, pid 12345, since 2026-05-08 14:32 UTC)`, `Service: not installed`, `Service: running in container (process supervisor: docker)`, etc.) so you can script against a single output regardless of host. ([#359])
+- **Per-platform install and service guides.** New `docs/install.md` and `docs/service.md` cover Linux systemd, macOS launchd, Windows SCM, Docker supervisor behavior, troubleshooting, and service runtime inspection. The README links to both guides from its service section. ([#360])
+- **Docker image now honors `PUID` and `PGID` environment variables.** When both are set, the container's entrypoint chowns ownership-mismatched files in `/config` and `/photos` to that UID:GID and drops privileges via `gosu` before running kei. Setting only one is rejected; setting neither preserves the prior root-default. The chown uses `find -not -uid` so a multi-TB volume only pays for stragglers, not the full tree, on every restart. Unblocks NAS deployments (Synology Container Manager, Unraid, TrueNAS Scale) where downstream indexers like Synology Photos can't see root-owned files. ([#346], [Synology wiki](https://github.com/rhoopr/kei/wiki/Synology), [Docker wiki](https://github.com/rhoopr/kei/wiki/Docker))
+- **Setup wizard visual polish.** The `kei config setup` wizard now has dimmed section banners between steps, green-bold ✓ checkmarks on step completions, brief spinners during TOML generation and config write, and a styled TOML preview with dimmed comments and cyan section headers. Prompts use warmer, more conversational language throughout. No new dependencies. ([#373])
+
+### Changed
+
+- **rpassword bumped to 7.5.2.** Supersedes stale dependabot PRs #353 and #354. No user-visible change. ([#357])
+
+### Fixed
+
+- **Ghost top rule after Ctrl+C in friendly mode.** Indicatif filled the last bar row with spaces to the terminal's right edge; when the tty driver echoed `^C` there it overflowed to a new line, throwing `cursor_up` off by one and leaving the prior top rule as a stale frame. Narration now routes through `MultiProgress::println` (atomic draw), and the friendly bar clears the `ECHOCTL` termios flag on stdin while active so `^C` never echoes (Unix only - Windows console doesn't echo `^C`). Restored on Drop and on both `process::exit` paths.
+- **100 MiB free-space floor before enumeration.** kei now requires at least 100 MiB of free space on the download filesystem before starting iCloud enumeration, preventing a cycle that enumerates thousands of assets then fails every download with "no space left". ([#372])
+- **State-write failures now produce a non-zero exit code.** `complete_sync_run` failure was silently swallowed, so a full disk at the "commit sync results" stage looked like a clean exit. Now bumps `state_write_failures` and propagates through the exit-code logic. ([#372])
+- **Help text polish.** `--friendly`/`--no-friendly` show short help in `-h`; top-level `--help` footer groups commands logically (Getting started / Common / Advanced). ([#374])
+
+[#346]: https://github.com/rhoopr/kei/pull/346
+[#351]: https://github.com/rhoopr/kei/pull/351
+[#352]: https://github.com/rhoopr/kei/pull/352
+[#355]: https://github.com/rhoopr/kei/pull/355
+[#356]: https://github.com/rhoopr/kei/pull/356
+[#357]: https://github.com/rhoopr/kei/pull/357
+[#358]: https://github.com/rhoopr/kei/pull/358
+[#359]: https://github.com/rhoopr/kei/pull/359
+[#360]: https://github.com/rhoopr/kei/pull/360
+[#362]: https://github.com/rhoopr/kei/pull/362
+[#363]: https://github.com/rhoopr/kei/pull/363
+[#364]: https://github.com/rhoopr/kei/pull/364
+[#365]: https://github.com/rhoopr/kei/pull/365
+[#366]: https://github.com/rhoopr/kei/pull/366
+[#367]: https://github.com/rhoopr/kei/pull/367
+[#370]: https://github.com/rhoopr/kei/pull/370
+[#371]: https://github.com/rhoopr/kei/pull/371
+[#372]: https://github.com/rhoopr/kei/pull/372
+[#373]: https://github.com/rhoopr/kei/pull/373
+[#374]: https://github.com/rhoopr/kei/pull/374
 
 ---
 
@@ -1193,7 +1204,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.14.1...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.14.2...HEAD
+[0.14.2]: https://github.com/rhoopr/kei/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/rhoopr/kei/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/rhoopr/kei/compare/v0.13.3...v0.14.0
 [0.13.3]: https://github.com/rhoopr/kei/compare/v0.13.2...v0.13.3
@@ -1226,6 +1238,7 @@ The following Python icloudpd features are not yet available. Links go to tracki
 [0.7.1]: https://github.com/rhoopr/kei/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/rhoopr/kei/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/rhoopr/kei/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/rhoopr/kei/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/rhoopr/kei/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/rhoopr/kei/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/rhoopr/kei/compare/v0.5.1...v0.5.2
