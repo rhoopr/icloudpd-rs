@@ -118,10 +118,10 @@ GET  {cdn_url}                File download (supports Range headers)
 ```
 src/main.rs (lines ~1295-1330)
 
-                    ┌───────────────────┐
-                    │ --no-incremental  │──── YES ──▶ SyncMode::Full
-                    │ --reset-sync-token│
-                    └────────┬──────────┘
+                    ┌─────────────────────────────┐
+                    │ token cleared by             │
+                    │ `kei reset sync-token --yes` │──── YES ──▶ SyncMode::Full
+                    └────────┬────────────────────┘
                              │ NO
                              ▼
               ┌──────────────────────────┐
@@ -395,7 +395,7 @@ Token management:
 │  SyncTokenError::ZoneNotFound                                       │
 │  └─ Zone was deleted (shared library removed) → skip zone           │
 │                                                                     │
-│  --reset-sync-token CLI flag                                        │
+│  `kei reset sync-token --yes`                                      │
 │  └─ Clears db_sync_token + sync_token:{zone} → forces Full sync     │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘

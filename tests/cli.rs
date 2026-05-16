@@ -71,9 +71,8 @@ fn sync_help_succeeds() {
 }
 
 #[test]
-fn sync_help_hides_deprecated_directory_flag() {
-    // `--directory` still parses for backward compat but must not appear in
-    // help output; users should only see the new spelling.
+fn sync_help_omits_removed_directory_flag() {
+    // Users should only see the current spelling.
     common::cmd()
         .args(["sync", "--help"])
         .assert()
@@ -93,19 +92,17 @@ fn sync_help_hides_deprecated_exclude_album_flag() {
 }
 
 #[test]
-fn sync_help_hides_deprecated_sync_token_flags() {
-    // Both `--no-incremental` (deprecated, use `kei reset sync-token`) and
-    // `--reset-sync-token` (hidden compat, use `kei reset sync-token`) are
-    // kept out of sync help. The canonical way is the subcommand.
+fn sync_help_omits_removed_sync_token_flags() {
+    // The canonical way to force a fresh token is `kei reset sync-token`.
     let assert = common::cmd().args(["sync", "--help"]).assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     assert!(
         !stdout.contains("--no-incremental"),
-        "sync help should not advertise the deprecated `--no-incremental` flag"
+        "sync help should not advertise the removed `--no-incremental` flag"
     );
     assert!(
         !stdout.contains("--reset-sync-token"),
-        "sync help should not advertise the deprecated `--reset-sync-token` flag"
+        "sync help should not advertise the removed `--reset-sync-token` flag"
     );
 }
 
@@ -121,7 +118,7 @@ fn status_help_succeeds() {
 #[test]
 fn reset_state_help_succeeds() {
     common::cmd()
-        .args(["reset-state", "--help"])
+        .args(["reset", "state", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--yes"));
@@ -146,31 +143,30 @@ fn verify_help_succeeds() {
 }
 
 #[test]
-fn get_code_help_succeeds() {
-    // get-code is a hidden legacy alias for `login get-code`
+fn legacy_get_code_help_fails() {
     common::cmd()
         .args(["get-code", "--help"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("login get-code"));
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
 }
 
 #[test]
 fn submit_code_help_succeeds() {
     common::cmd()
-        .args(["submit-code", "--help"])
+        .args(["login", "submit-code", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("2FA"));
 }
 
 #[test]
-fn retry_failed_help_succeeds() {
+fn legacy_retry_failed_help_fails() {
     common::cmd()
         .args(["retry-failed", "--help"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("--download-dir"));
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
 }
 
 // ── Invalid subcommand / unknown flags ──────────────────────────────────
@@ -217,8 +213,7 @@ fn unknown_flag_on_status_fails() {
 fn log_level_debug_accepted() {
     // Just parsing — the binary will fail at runtime without creds, but
     // the exit code for "bad args" is 2, not 1. A non-2 exit means parsing
-    // succeeded. We use --auth-only to short-circuit into auth, which will
-    // fail gracefully without credentials.
+    // succeeded.
     common::cmd()
         .args(["--log-level", "debug", "--help"])
         .assert()
@@ -269,11 +264,12 @@ fn short_d_flag_accepted() {
 }
 
 #[test]
-fn short_l_flag_accepted() {
+fn short_l_flag_removed() {
     common::cmd()
         .args(["sync", "-l", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -287,7 +283,7 @@ fn short_a_flag_accepted() {
 #[test]
 fn short_y_flag_on_reset_state() {
     common::cmd()
-        .args(["reset-state", "-y", "--help"])
+        .args(["reset", "state", "-y", "--help"])
         .assert()
         .success();
 }
@@ -406,13 +402,12 @@ fn threads_rejects_zero() {
 }
 
 #[test]
-fn legacy_threads_num_rejects_zero() {
-    // Same validator on the deprecated flag path - 0 is still 0.
+fn removed_threads_num_flag_fails() {
     common::cmd()
-        .args(["sync", "--username", "x@x.com", "--threads-num", "0"])
+        .args(["sync", "--username", "x@x.com", "--threads-num", "4"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 // ── submit-code requires positional CODE ────────────────────────────────
@@ -420,21 +415,13 @@ fn legacy_threads_num_rejects_zero() {
 #[test]
 fn submit_code_requires_code_argument() {
     common::cmd()
-        .args(["submit-code", "--username", "x@x.com"])
+        .args(["login", "submit-code", "--username", "x@x.com"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("error"));
 }
 
-#[test]
-fn submit_code_accepts_code_argument() {
-    common::cmd()
-        .args(["submit-code", "--help"])
-        .assert()
-        .success();
-}
-
-// ── import-existing requires --directory ─────────────────────────────────
+// ── import-existing requires --download-dir ─────────────────────────────
 
 #[test]
 fn import_existing_requires_directory() {
@@ -450,19 +437,13 @@ fn import_existing_requires_directory() {
 #[test]
 fn boolean_sync_flags_accepted() {
     let mut flags = vec![
-        "--auth-only",
-        "--list-albums",
-        "--list-libraries",
         "--skip-videos",
         "--skip-photos",
-        "--skip-live-photos",
         "--force-size",
         "--dry-run",
         "--no-progress-bar",
         "--keep-unicode-in-filenames",
         "--notify-systemd",
-        "--no-incremental",
-        "--reset-sync-token",
     ];
     if cfg!(feature = "xmp") {
         flags.push("--set-exif-datetime");
@@ -480,20 +461,18 @@ fn boolean_sync_flags_accepted() {
 #[test]
 fn value_sync_flags_accepted() {
     let pairs = [
-        ("--directory", "/tmp"),
+        ("--download-dir", "/tmp"),
         ("--folder-structure", "%Y-%m"),
         ("--recent", "10"),
         ("--threads", "4"),
         ("--watch-with-interval", "3600"),
         ("--max-retries", "5"),
-        ("--retry-delay", "10"),
         ("--temp-suffix", ".downloading"),
         ("--skip-created-before", "2024-01-01"),
         ("--skip-created-after", "2025-01-01"),
         ("--pid-file", "/tmp/test.pid"),
         ("--notification-script", "/tmp/notify.sh"),
         ("--library", "SharedSync-ABC"),
-        ("--cookie-directory", "/tmp/cookies"),
     ];
     for (flag, value) in pairs {
         common::cmd()
@@ -633,7 +612,13 @@ fn unfiled_flag_accepts_bare_and_explicit_value() {
 fn bare_invocation_with_username_and_directory_parses() {
     // With --help to avoid actually running
     common::cmd()
-        .args(["--username", "x@x.com", "--directory", "/photos", "--help"])
+        .args([
+            "--username",
+            "x@x.com",
+            "--download-dir",
+            "/photos",
+            "--help",
+        ])
         .assert()
         .success();
 }
@@ -667,7 +652,7 @@ fn import_existing_folder_structure_flag() {
     common::cmd()
         .args([
             "import-existing",
-            "--directory",
+            "--download-dir",
             "/tmp",
             "--folder-structure",
             "%Y-%m",
@@ -721,7 +706,7 @@ fn import_existing_recent_flag() {
     common::cmd()
         .args([
             "import-existing",
-            "--directory",
+            "--download-dir",
             "/tmp",
             "--recent",
             "100",
@@ -834,17 +819,9 @@ fn domain_flag_works_on_status() {
 }
 
 #[test]
-fn cookie_directory_flag_works_on_verify() {
-    common::cmd()
-        .args(["verify", "--cookie-directory", "/tmp/cookies", "--help"])
-        .assert()
-        .success();
-}
-
-#[test]
 fn password_flag_works_on_submit_code() {
     common::cmd()
-        .args(["submit-code", "-p", "secret", "123456", "--help"])
+        .args(["login", "-p", "secret", "submit-code", "123456", "--help"])
         .assert()
         .success();
 }
@@ -925,8 +902,9 @@ fn auth_flags_accepted_on_all_subcommands() {
 fn retry_failed_accepts_sync_flags() {
     common::cmd()
         .args([
-            "retry-failed",
-            "--directory",
+            "sync",
+            "--retry-failed",
+            "--download-dir",
             "/tmp",
             "--recent",
             "10",
@@ -940,24 +918,12 @@ fn retry_failed_accepts_sync_flags() {
 }
 
 #[test]
-fn retry_failed_accepts_sync_token_flags() {
-    common::cmd()
-        .args([
-            "retry-failed",
-            "--no-incremental",
-            "--reset-sync-token",
-            "--help",
-        ])
-        .assert()
-        .success();
-}
-
-#[test]
-fn no_incremental_and_reset_sync_token_together() {
+fn removed_sync_token_flags_fail() {
     common::cmd()
         .args(["sync", "--no-incremental", "--reset-sync-token", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 // ── Version flag ────────────────────────────────────────────────────────
@@ -1032,9 +998,9 @@ fn exit_code_1_on_missing_username() {
         .env_remove("ICLOUD_PASSWORD")
         .args([
             "sync",
-            "--directory",
+            "--download-dir",
             "/tmp/claude/exit-code-test",
-            "--cookie-directory",
+            "--data-dir",
             "/tmp/claude/exit-code-cookies",
         ])
         .timeout(std::time::Duration::from_secs(30))
@@ -1060,9 +1026,9 @@ fn exit_code_3_on_empty_password_file() {
             "sync",
             "--username",
             "exit-code-test@example.com",
-            "--directory",
+            "--download-dir",
             "/tmp/claude/exit-code-test",
-            "--cookie-directory",
+            "--data-dir",
             dir.path().to_str().unwrap(),
             "--password-file",
             pw_file.to_str().unwrap(),
@@ -1087,9 +1053,9 @@ fn exit_code_3_on_newline_only_password_file() {
             "sync",
             "--username",
             "exit-code-test@example.com",
-            "--directory",
+            "--download-dir",
             "/tmp/claude/exit-code-test",
-            "--cookie-directory",
+            "--data-dir",
             dir.path().to_str().unwrap(),
             "--password-file",
             pw_file.to_str().unwrap(),
@@ -1248,63 +1214,23 @@ fn sync_retry_failed_help_succeeds() {
         .success();
 }
 
-// ── Hidden legacy commands not in help ─────────────────────────────────
+// ── Removed legacy commands not in help ─────────────────────────────────
 
 #[test]
 fn hidden_legacy_commands_not_in_help() {
     let assert = common::cmd().arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     // These hyphenated names only appeared as top-level subcommands in
-    // the old CLI. They should now be hidden.
-    // Note: "retry-failed" excluded because --retry-failed is a visible
-    // flag on sync (flattened at top level).
+    // the old CLI. They should stay out of help.
     for hidden in ["get-code", "submit-code", "reset-state", "reset-sync-token"] {
         assert!(
             !stdout.contains(hidden),
-            "help output should not list hidden command `{hidden}`"
+            "help output should not list removed command `{hidden}`"
         );
     }
 }
 
-// ── Deprecation warnings ──────────────────────────────────────────────
-
-#[test]
-fn legacy_credential_backend_prints_deprecation_warning() {
-    let output = common::cmd()
-        .env_remove("ICLOUD_USERNAME")
-        .env_remove("ICLOUD_PASSWORD")
-        .args(["credential", "backend", "--username", "x@x.com"])
-        .timeout(std::time::Duration::from_secs(10))
-        .assert()
-        .get_output()
-        .clone();
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("deprecated"),
-        "legacy command should print deprecation warning, stderr:\n{stderr}"
-    );
-}
-
-#[test]
-fn legacy_reset_state_prints_deprecation_warning() {
-    let output = common::cmd()
-        .env_remove("ICLOUD_USERNAME")
-        .env_remove("ICLOUD_PASSWORD")
-        .args(["reset-state", "--username", "x@x.com", "--yes"])
-        .timeout(std::time::Duration::from_secs(10))
-        .assert()
-        .get_output()
-        .clone();
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("deprecated"),
-        "legacy command should print deprecation warning, stderr:\n{stderr}"
-    );
-}
-
-// ── --retry-failed conflicts ──────────────────────────────────────────
+// ── Retry-failed conflicts ─────────────────────────────────────────────
 
 #[test]
 fn retry_failed_conflicts_with_dry_run() {
@@ -1347,9 +1273,9 @@ fn data_dir_global_works_with_subcommands() {
 // ── KEI_* env vars ────────────────────────────────────────────────────
 
 #[test]
-fn kei_directory_env_var_accepted() {
+fn kei_download_dir_env_var_accepted() {
     common::cmd()
-        .env("KEI_DIRECTORY", "/photos")
+        .env("KEI_DOWNLOAD_DIR", "/photos")
         .args(["sync", "--help"])
         .assert()
         .success();
@@ -1460,7 +1386,7 @@ fn submit_code_fails_without_username() {
     common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
-        .args(["submit-code", "123456"])
+        .args(["login", "submit-code", "123456"])
         .timeout(std::time::Duration::from_secs(30))
         .assert()
         .failure()

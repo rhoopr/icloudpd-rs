@@ -101,7 +101,7 @@ pub struct SyncStats {
     /// Number of tasks that observed at least one HTTP 429 / 503 response
     /// during retry. A high ratio of rate_limited / assets_seen signals the
     /// sync is running against a back-pressured account; operators should
-    /// either raise --watch-with-interval or lower --threads-num.
+    /// either raise --watch-with-interval or lower --threads.
     pub rate_limited: usize,
     /// Photos downloaded this run (`MediaType::Photo` and
     /// `MediaType::LivePhotoImage`). Sums to `downloaded` together with
@@ -2765,7 +2765,6 @@ mod tests {
             friendly_request: None,
             keep_unicode_in_filenames: false,
             only_print_filenames: false,
-            no_incremental: false,
             notify_systemd: false,
             save_password: false,
         };
@@ -3214,10 +3213,9 @@ mod tests {
             username: Some("test@example.com".to_string()),
             domain: None,
             data_dir: Some(cookie_dir.to_string_lossy().into_owned()),
-            cookie_directory: None,
         };
         let mut sync = SyncArgs {
-            directory: Some(directory.to_string()),
+            download_dir: Some(directory.to_string()),
             ..SyncArgs::default()
         };
         overrides(&mut sync);

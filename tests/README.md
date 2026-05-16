@@ -143,11 +143,11 @@ happens:
 - **`sync.rs`** - live iCloud, `#[ignore]` gated. Covers the happy-path
   download flow, filters, EXIF/XMP write-through, HEIC embed, sidecars.
 - **`state_auth.rs`** - live iCloud, `#[ignore]` gated. Covers status /
-  reset-state / verify / import-existing / retry-failed.
+  reset state / verify / import-existing / sync --retry-failed.
 - **`import_existing_live.rs`** - live iCloud, `#[ignore]` gated.
   Comprehensive `import-existing` scenarios: matches a real-sync fixture,
   dry-run, idempotency, `--recent` cap, `--recent Nd` rejection, truncated
-  / missing files producing unmatched, deprecated `--directory` alias,
+  / missing files producing unmatched entries,
   TOML-only resolution. Companion to the wiremock unit tests in
   `src/commands/import.rs::wiremock_tests` -- live verifies real Apple
   CloudKit shapes work end-to-end; wiremock covers the policy matrix

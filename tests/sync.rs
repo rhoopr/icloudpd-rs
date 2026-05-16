@@ -72,10 +72,9 @@ fn album_cmd(
         password,
         "--data-dir",
         cookie_dir.to_str().unwrap(),
-        "--directory",
+        "--download-dir",
         download_dir.to_str().unwrap(),
         "--no-progress-bar",
-        "--no-incremental",
     ]);
     cmd
 }
@@ -309,7 +308,7 @@ fn sync_skip_photos_excludes_image_files() {
     });
 }
 
-/// --skip-live-photos flag should be accepted and sync should succeed.
+/// --live-photo-mode skip should be accepted and sync should succeed.
 /// NOTE: test album has no Live Photos -- this only verifies the flag works.
 #[test]
 #[ignore]
@@ -320,7 +319,7 @@ fn sync_skip_live_photos_excludes_companions() {
         let download_dir = tempdir().expect("tempdir");
 
         album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--skip-live-photos"])
+            .args(["--live-photo-mode", "skip"])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
@@ -992,17 +991,17 @@ fn sync_temp_suffix_leaves_no_remnants() {
     });
 }
 
-/// --threads-num value should appear as concurrency=N in log output.
+/// --threads value should appear as concurrency=N in log output.
 #[test]
 #[ignore]
-fn sync_threads_num_reflected_in_log() {
+fn sync_threads_reflected_in_log() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
         let assertion = album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--threads-num", "1", "--log-level", "info"])
+            .args(["--threads", "1", "--log-level", "info"])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
             .success();
@@ -1011,7 +1010,7 @@ fn sync_threads_num_reflected_in_log() {
         let clean = common::strip_ansi(&stderr);
         assert!(
             clean.contains("concurrency=1"),
-            "log should reflect --threads-num 1, stderr:\n{clean}"
+            "log should reflect --threads 1, stderr:\n{clean}"
         );
     });
 }
@@ -1156,10 +1155,9 @@ fn sync_bare_invocation_works_like_sync() {
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--directory",
+                "--download-dir",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
-                "--no-incremental",
             ])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .assert()
@@ -1199,7 +1197,9 @@ fn sync_without_directory_fails() {
         .timeout(Duration::from_secs(TIMEOUT_META))
         .assert()
         .failure()
-        .stderr(predicate::str::contains("directory").or(predicate::str::contains("--directory")));
+        .stderr(
+            predicate::str::contains("directory").or(predicate::str::contains("--download-dir")),
+        );
 }
 
 // ── Error paths (auth required) ─────────────────────────────────────────
@@ -1223,7 +1223,7 @@ fn sync_nonexistent_album_fails() {
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--directory",
+                "--download-dir",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
             ])
@@ -1253,7 +1253,7 @@ fn sync_nonexistent_library_fails() {
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--directory",
+                "--download-dir",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
             ])
@@ -1333,7 +1333,7 @@ fn sync_retry_failed_flag() {
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--directory",
+                "--download-dir",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
             ])
@@ -1360,7 +1360,7 @@ fn sync_incremental_second_run_skips_download() {
         let first_count = common::walkdir(download_dir.path()).len();
         assert!(first_count >= 3, "first sync should download files");
 
-        // Second sync: incremental (no --no-incremental)
+        // Second sync: incremental.
         let output = common::cmd()
             .args([
                 "sync",
@@ -1374,7 +1374,7 @@ fn sync_incremental_second_run_skips_download() {
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--directory",
+                "--download-dir",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
                 "--log-level",
@@ -1435,7 +1435,7 @@ fn sync_watch_runs_multiple_cycles() {
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--directory",
+                "--download-dir",
                 download_dir.path().to_str().unwrap(),
                 "--no-progress-bar",
                 "--watch-with-interval",
@@ -1688,7 +1688,7 @@ fn zz_bad_credentials_fails() {
             "wrong-password",
             "--data-dir",
             cookie_dir.path().to_str().unwrap(),
-            "--directory",
+            "--download-dir",
             download_dir.path().to_str().unwrap(),
             "--no-progress-bar",
         ])

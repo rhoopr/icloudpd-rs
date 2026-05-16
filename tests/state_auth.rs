@@ -57,10 +57,9 @@ fn sync_cmd(
         password,
         "--data-dir",
         cookie_dir.to_str().unwrap(),
-        "--directory",
+        "--download-dir",
         dir.to_str().unwrap(),
         "--no-progress-bar",
-        "--no-incremental",
     ]);
     cmd
 }
@@ -117,7 +116,7 @@ fn import_cmd(
         password,
         "--data-dir",
         cookie_dir.to_str().unwrap(),
-        "--directory",
+        "--download-dir",
         dir.to_str().unwrap(),
     ]);
     cmd
@@ -144,7 +143,7 @@ fn retry_failed_cmd(
         password,
         "--data-dir",
         cookie_dir.to_str().unwrap(),
-        "--directory",
+        "--download-dir",
         dir.to_str().unwrap(),
         "--no-progress-bar",
         "--log-level",
@@ -427,7 +426,7 @@ fn import_existing_with_nonexistent_directory_fails() {
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--directory",
+                "--download-dir",
                 "/nonexistent/path/that/does/not/exist",
             ])
             .timeout(std::time::Duration::from_secs(60))

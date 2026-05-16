@@ -249,15 +249,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     } = args;
 
     let is_retry_failed = sync.retry_failed;
-    let reset_sync_token = sync.reset_sync_token;
-    if reset_sync_token {
-        crate::cli::deprecation_warning("--reset-sync-token", "kei reset sync-token");
-    }
     let toml_existed = toml_config.is_some();
-    let cli_data_dir = globals
-        .data_dir
-        .clone()
-        .or_else(|| globals.cookie_directory.clone());
+    let cli_data_dir = globals.data_dir.clone();
     let mut config = config::Config::build_inner(
         globals,
         &pw,
@@ -333,12 +326,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         );
     }
 
-    // Validate --directory early (before auth) to avoid wasting a 2FA code
-    // when the user simply forgot --directory.
+    // Validate download directory early (before auth) to avoid wasting a 2FA code
+    // when the user simply forgot the destination.
     if config.directory.as_os_str().is_empty() {
         anyhow::bail!(
-            "--directory is required for downloading \
-             (pass --directory on the CLI or set [download] directory in the config file)"
+            "--download-dir is required for downloading \
+             (pass --download-dir on the CLI or set [download] directory in the config file)"
         );
     }
 
@@ -616,27 +609,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     )
     .await;
 
-    // Handle --reset-sync-token (hidden compat flag): clear stored tokens before the sync loop
-    if reset_sync_token {
-        if let Some(db) = &state_db {
-            let mut cleared_ok = true;
-            if let Err(e) = db.set_metadata("db_sync_token", "").await {
-                tracing::warn!(error = %e, "Failed to clear db_sync_token");
-                cleared_ok = false;
-            }
-            for library in &libraries {
-                let key = format!("sync_token:{}", library.zone_name());
-                if let Err(e) = db.set_metadata(&key, "").await {
-                    tracing::warn!(error = %e, key = %key, "Failed to clear sync token");
-                    cleared_ok = false;
-                }
-            }
-            if cleared_ok {
-                tracing::debug!("Cleared stored sync tokens");
-            }
-        }
-    }
-
     // Pre-compute config values used each cycle to build DownloadConfig.
     // DownloadConfig is rebuilt per-cycle so sync_mode can vary.
     let skip_created_before = config
@@ -831,7 +803,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // cheap pre-check to skip cycles when nothing has changed.
         // Only used for single-library mode; multi-library skips this optimization.
         let skip_cycle = match library_states.as_slice() {
-            [only] if is_watch_mode && !config.no_incremental => {
+            [only] if is_watch_mode => {
                 check_changes_database(state_db.as_deref(), only, &mut photos_service).await
             }
             _ => false,
@@ -1026,7 +998,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     None => (Vec::new(), 0),
                 };
                 let report = crate::report::SyncReport {
-                    version: "1",
+                    version: "2",
                     kei_version: env!("CARGO_PKG_VERSION"),
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     status: status.to_string(),
@@ -1594,7 +1566,6 @@ async fn run_cycle(
         // failed assets that were already enumerated but not downloaded.
         let sync_mode = determine_sync_mode(
             is_retry_failed,
-            config.no_incremental,
             library_states.len(),
             state_db,
             &lib_state.sync_token_key,
@@ -1883,19 +1854,13 @@ fn warn_if_multi_library_paths_commingle(
 /// Determine the sync mode for a library: full enumeration or incremental.
 async fn determine_sync_mode(
     is_retry_failed: bool,
-    no_incremental: bool,
     library_count: usize,
     state_db: Option<&dyn state::StateDb>,
     sync_token_key: &str,
     zone_name: &str,
 ) -> download::SyncMode {
-    if is_retry_failed || no_incremental {
-        if no_incremental && library_count == 1 {
-            tracing::debug!(
-                "Incremental sync disabled via --no-incremental, performing full enumeration"
-            );
-        }
-        if is_retry_failed {
+    if is_retry_failed {
+        if library_count == 1 {
             tracing::debug!(
                 "Retry-failed requires full enumeration to find previously-failed assets"
             );
@@ -2602,8 +2567,7 @@ mod tests {
             .expect("set token");
 
         let mode = determine_sync_mode(
-            true,  // is_retry_failed
-            false, // no_incremental
+            true, // is_retry_failed
             1,
             Some(db.as_ref()),
             sync_token_key,
@@ -2617,38 +2581,6 @@ mod tests {
         );
     }
 
-    /// `--no-incremental` MUST force `SyncMode::Full`, ignoring any
-    /// stored token. The flag exists so a user can deliberately re-enumerate
-    /// (e.g. after a known incremental drift); silently downgrading would
-    /// betray that contract.
-    #[tokio::test]
-    async fn determine_sync_mode_no_incremental_overrides_stored_token() {
-        let db = make_state_db();
-        let sync_token_key = "sync_token:PrimarySync";
-        db.set_metadata(sync_token_key, "stored-token-xyz")
-            .await
-            .expect("set token");
-
-        let mode = determine_sync_mode(
-            false, // is_retry_failed
-            true,  // no_incremental
-            1,
-            Some(db.as_ref()),
-            sync_token_key,
-            "PrimarySync",
-        )
-        .await;
-
-        assert!(
-            matches!(mode, download::SyncMode::Full),
-            "--no-incremental must force Full, got {mode:?}"
-        );
-    }
-
-    /// An empty stored token must fall back to Full. Production
-    /// guards on `!token.is_empty()`; if a refactor flipped that check the
-    /// caller would request `changes/zone` with empty token and silently
-    /// drop pending events.
     #[tokio::test]
     async fn determine_sync_mode_empty_stored_token_falls_back_to_full() {
         let db = make_state_db();
@@ -2658,15 +2590,8 @@ mod tests {
             .await
             .expect("set empty token");
 
-        let mode = determine_sync_mode(
-            false,
-            false,
-            1,
-            Some(db.as_ref()),
-            sync_token_key,
-            "PrimarySync",
-        )
-        .await;
+        let mode =
+            determine_sync_mode(false, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
 
         assert!(
             matches!(mode, download::SyncMode::Full),
@@ -2679,15 +2604,8 @@ mod tests {
         db.set_metadata(sync_token_key, "real-token")
             .await
             .expect("set real token");
-        let mode = determine_sync_mode(
-            false,
-            false,
-            1,
-            Some(db.as_ref()),
-            sync_token_key,
-            "PrimarySync",
-        )
-        .await;
+        let mode =
+            determine_sync_mode(false, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
         assert!(
             matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "real-token"),
             "non-empty token must yield Incremental with that token, got {mode:?}"
@@ -2956,7 +2874,6 @@ mod tests {
 
         let mode = determine_sync_mode(
             false,
-            false,
             1,
             Some(db.as_ref()),
             "sync_token:PrimarySync",
@@ -2975,15 +2892,8 @@ mod tests {
     /// it so a future refactor that drops the `else` branch tells us.
     #[tokio::test]
     async fn determine_sync_mode_no_state_db_returns_full() {
-        let mode = determine_sync_mode(
-            false,
-            false,
-            1,
-            None,
-            "sync_token:PrimarySync",
-            "PrimarySync",
-        )
-        .await;
+        let mode =
+            determine_sync_mode(false, 1, None, "sync_token:PrimarySync", "PrimarySync").await;
 
         assert!(
             matches!(mode, download::SyncMode::Full),

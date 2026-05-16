@@ -126,7 +126,7 @@ pub fn cookie_dir() -> PathBuf {
     dir
 }
 
-/// Run `--auth-only` once to ensure the session cookies are fresh.
+/// Run `kei login` once to make sure the session cookies are fresh.
 ///
 /// If the pre-existing session has expired, this re-authenticates and
 /// refreshes the cookies. If authentication genuinely fails (wrong
@@ -216,7 +216,7 @@ fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
     });
 }
 
-/// Refresh the authentication session by running `--auth-only`.
+/// Refresh the authentication session by running `kei login`.
 ///
 /// Called reactively when a test command fails with an authentication error
 /// mid-run (stale session). Panics if the refresh itself fails.
@@ -258,7 +258,7 @@ fn refresh_auth() {
 /// Run a test body with automatic auth retry on stale-session errors.
 ///
 /// If the test panics with an "Invalid email/password combination" error,
-/// refreshes the session via `--auth-only` and retries once. If the retry
+/// refreshes the session via `kei login` and retries once. If the retry
 /// also hits the same auth error, aborts the entire test suite.
 ///
 /// Does **not** retry on 503 rate limits or other errors.
@@ -315,7 +315,7 @@ pub fn with_auth_retry(f: impl Fn()) {
 /// cargo test --test sync -- --ignored --test-threads=1
 /// ```
 ///
-/// On the first call, runs `--auth-only` to validate (and refresh if needed)
+/// On the first call, runs `kei login` to validate (and refresh if needed)
 /// the session cookies. This prevents stale-session failures mid-run.
 ///
 /// Panics if credentials are not configured or session validation fails.

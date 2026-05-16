@@ -20,7 +20,6 @@ pub(crate) struct TomlConfig {
     pub photos: Option<TomlPhotos>,
     pub watch: Option<TomlWatch>,
     pub notifications: Option<TomlNotifications>,
-    pub metrics: Option<TomlMetrics>,
     pub server: Option<TomlServer>,
     pub report: Option<TomlReport>,
     pub ui: Option<TomlUi>,
@@ -57,9 +56,6 @@ pub(crate) struct TomlAuth {
     pub password_file: Option<String>,
     pub password_command: Option<String>,
     pub domain: Option<Domain>,
-    /// Deprecated v0.13: use top-level `data_dir` (which also stores
-    /// sessions, state DB, credentials, and health). Removed in v0.20.
-    pub cookie_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -73,8 +69,6 @@ pub(crate) struct TomlDownload {
     /// `{smart-folder}`.
     pub folder_structure_smart_folders: Option<String>,
     pub threads: Option<u16>,
-    /// Deprecated v0.13: use `threads`. Removed in v0.20.
-    pub threads_num: Option<u16>,
     pub bandwidth_limit: Option<String>,
     pub temp_suffix: Option<String>,
     #[cfg(feature = "xmp")]
@@ -97,9 +91,6 @@ pub(crate) struct TomlDownload {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlRetry {
     pub max_retries: Option<u32>,
-    /// Deprecated v0.13: initial retry delay is now derived from
-    /// `max_retries` via a smart table. Removed in v0.20.
-    pub delay: Option<u64>,
     /// Lifetime cap on download attempts per asset across syncs (default
     /// `10`). The same value as the `--max-download-attempts` CLI flag /
     /// `KEI_MAX_DOWNLOAD_ATTEMPTS` env var; CLI > TOML > default. Distinct
@@ -129,9 +120,6 @@ pub(crate) struct TomlFilters {
     pub filename_exclude: Option<Vec<String>>,
     pub skip_videos: Option<bool>,
     pub skip_photos: Option<bool>,
-    /// Deprecated v0.13: use `[photos] live_photo_mode = "skip"`. Removed
-    /// in v0.20.
-    pub skip_live_photos: Option<bool>,
     pub recent: Option<crate::cli::RecentLimit>,
     pub skip_created_before: Option<String>,
     pub skip_created_after: Option<String>,
@@ -162,12 +150,6 @@ pub(crate) struct TomlWatch {
     /// reported via `tracing::warn!` and never auto-marked failed in the
     /// state DB. The default is unset to preserve existing behaviour.
     pub reconcile_every_n_cycles: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TomlMetrics {
-    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -765,7 +747,6 @@ pub struct Config {
     pub friendly_request: Option<bool>,
     pub keep_unicode_in_filenames: bool,
     pub only_print_filenames: bool,
-    pub no_incremental: bool,
     pub notify_systemd: bool,
     pub save_password: bool,
 }
@@ -847,8 +828,6 @@ fn resolve_vec(cli: Vec<String>, toml: Option<Vec<String>>) -> Vec<String> {
 ///
 /// Each field is `Option<T>`; `Some` means the CLI (or env var) supplied
 /// the value, `None` means fall through to TOML and then to the default.
-/// Sync's `--skip-live-photos` deprecation is folded into `live_photo_mode`
-/// by the caller before calling the resolver.
 #[derive(Debug, Default)]
 pub(crate) struct PathDerivationCliArgs {
     pub folder_structure: Option<String>,
@@ -970,7 +949,6 @@ pub(crate) struct GlobalArgs {
     pub username: Option<String>,
     pub domain: Option<Domain>,
     pub data_dir: Option<String>,
-    pub cookie_directory: Option<String>,
 }
 
 impl GlobalArgs {
@@ -979,7 +957,6 @@ impl GlobalArgs {
             username: cli.username.clone(),
             domain: cli.domain,
             data_dir: cli.data_dir.clone(),
-            cookie_directory: cli.cookie_directory.clone(),
         }
     }
 }
@@ -1046,20 +1023,11 @@ pub(crate) fn resolve_auth(
         Domain::Com,
     );
 
-    let has_explicit_data_dir = globals.data_dir.is_some()
-        || globals.cookie_directory.is_some()
-        || toml.and_then(|t| t.data_dir.as_ref()).is_some()
-        || toml_auth
-            .and_then(|a| a.cookie_directory.as_ref())
-            .is_some();
+    let has_explicit_data_dir =
+        globals.data_dir.is_some() || toml.and_then(|t| t.data_dir.as_ref()).is_some();
     let cookie_directory = if has_explicit_data_dir {
         let default_config = expand_tilde("~/.config/kei/config.toml");
-        resolve_data_dir(
-            globals.data_dir.as_deref(),
-            globals.cookie_directory.as_deref(),
-            toml,
-            &default_config,
-        )
+        resolve_data_dir(globals.data_dir.as_deref(), toml, &default_config)
     } else {
         expand_tilde("~/.config/kei/cookies")
     };
@@ -1071,54 +1039,23 @@ pub(crate) fn resolve_auth(
 ///
 /// Resolution order:
 /// 1. Explicit `--data-dir` CLI flag
-/// 2. Legacy `--cookie-directory` CLI flag (deprecated, warns)
-/// 3. TOML top-level `data_dir`
-/// 4. TOML `[auth] cookie_directory` (deprecated, warns)
-/// 5. Default: parent of the resolved config file path
+/// 2. TOML top-level `data_dir`
+/// 3. Default: parent of the resolved config file path
 pub(crate) fn resolve_data_dir(
     data_dir_cli: Option<&str>,
-    cookie_directory_cli: Option<&str>,
     toml: Option<&TomlConfig>,
     config_path: &Path,
 ) -> PathBuf {
     if let Some(d) = data_dir_cli {
         return expand_tilde(d);
     }
-    if let Some(d) = cookie_directory_cli {
-        #[allow(
-            clippy::print_stderr,
-            reason = "runs during config load, before tracing subscriber is installed"
-        )]
-        {
-            eprintln!(
-                "warning: `--cookie-directory` is deprecated and will be removed in v0.20.0, use `--data-dir` instead"
-            );
-        }
-        return expand_tilde(d);
-    }
     if let Some(d) = toml.and_then(|t| t.data_dir.as_deref()) {
         return expand_tilde(d);
     }
-    if let Some(d) = toml
-        .and_then(|t| t.auth.as_ref())
-        .and_then(|a| a.cookie_directory.as_deref())
-    {
-        #[allow(
-            clippy::print_stderr,
-            reason = "runs during config load, before tracing subscriber is installed"
-        )]
-        {
-            eprintln!(
-                "warning: `[auth] cookie_directory` is deprecated and will be removed in v0.20.0, use top-level `data_dir` instead"
-            );
-        }
-        return expand_tilde(d);
-    }
-    // Default: parent of config file path
-    config_path.parent().map_or_else(
-        || expand_tilde("~/.config/kei"),
-        std::path::Path::to_path_buf,
-    )
+    config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| expand_tilde("~/.config/kei"))
 }
 
 /// Resolve `password_file` from CLI + TOML.
@@ -1251,22 +1188,6 @@ impl Config {
             );
         }
 
-        // `--no-incremental` duplicates the effect of `kei reset sync-token`
-        // plus a normal sync, with one narrow edge case around failed-run
-        // recovery that's not worth a flag. Deprecate and point users at
-        // the subcommand.
-        if sync.no_incremental {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--no-incremental` is deprecated and will be removed in v0.20.0, use `kei reset sync-token` before sync for the same effect"
-                );
-            }
-        }
-
         // Convert plain password string to SecretString
         let password = password_str.map(SecretString::from);
 
@@ -1292,37 +1213,11 @@ impl Config {
         let toml_filters = toml.and_then(|t| t.filters.as_ref());
         let toml_photos = toml.and_then(|t| t.photos.as_ref());
         let toml_watch = toml.and_then(|t| t.watch.as_ref());
-        let toml_metrics = toml.and_then(|t| t.metrics.as_ref());
         let toml_server = toml.and_then(|t| t.server.as_ref());
 
         // Download
-        //
-        // `--directory` / `KEI_DIRECTORY` is the legacy spelling kept for
-        // backward compat. Prefer the new `--download-dir` / `KEI_DOWNLOAD_DIR`
-        // and warn when the old one is the only source. Fail loudly if both
-        // are supplied so users don't silently rely on undefined precedence.
-        anyhow::ensure!(
-            !(sync.download_dir.is_some() && sync.directory.is_some()),
-            "both `--download-dir` and `--directory` are set; `--directory` is \
-             deprecated and will be removed in v0.20.0 — pick one"
-        );
-        let directory_cli = if let Some(d) = sync.download_dir {
-            Some(d)
-        } else if let Some(d) = sync.directory {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--directory` / `KEI_DIRECTORY` is deprecated and will be removed in v0.20.0, use `--download-dir` / `KEI_DOWNLOAD_DIR` instead"
-                );
-            }
-            Some(d)
-        } else {
-            None
-        };
-        let directory = directory_cli
+        let directory = sync
+            .download_dir
             .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
             .map(|d| expand_tilde(&d))
             .unwrap_or_default();
@@ -1363,71 +1258,22 @@ impl Config {
             None
         };
 
-        // Reject mixing the new `--threads` with the deprecated
-        // `--threads-num` on the same invocation - keeps user intent
-        // unambiguous. The TOML pair is handled the same way below.
-        anyhow::ensure!(
-            !(sync.threads.is_some() && sync.threads_num.is_some()),
-            "both `--threads` and `--threads-num` are set; `--threads-num` is \
-             deprecated and will be removed in v0.20.0 - pick one"
-        );
         let toml_threads = toml_dl.and_then(|d| d.threads);
-        let toml_threads_num = toml_dl.and_then(|d| d.threads_num);
-        anyhow::ensure!(
-            !(toml_threads.is_some() && toml_threads_num.is_some()),
-            "`[download] threads` and `[download] threads_num` are both set in \
-             the config file; `threads_num` is deprecated and will be removed \
-             in v0.20.0 - pick one"
-        );
 
         // When a bandwidth limit is set without an explicit thread-count flag,
         // default concurrency to 1: many connections starving for a capped
         // total budget just fragments downloads and adds connection overhead.
-        let threads_explicitly_set = sync.threads.is_some()
-            || sync.threads_num.is_some()
-            || toml_threads.is_some()
-            || toml_threads_num.is_some();
+        let threads_explicitly_set = sync.threads.is_some() || toml_threads.is_some();
         let threads_default = if bandwidth_limit.is_some() && !threads_explicitly_set {
             1
         } else {
             10
         };
 
-        // Resolve the concurrency. CLI beats TOML for each spelling, new
-        // spelling beats old, and the legacy path emits a warning so users
-        // know to migrate before v0.20.0.
-        let threads_num = if let Some(n) = sync.threads {
-            n
-        } else if let Some(n) = sync.threads_num {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--threads-num` / `KEI_THREADS_NUM` is deprecated and will be removed in v0.20.0, use `--threads` / `KEI_THREADS` instead"
-                );
-            }
-            n
-        } else if let Some(n) = toml_threads {
-            n
-        } else if let Some(n) = toml_threads_num {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `[download] threads_num` is deprecated and will be removed in v0.20.0, use `[download] threads` instead"
-                );
-            }
-            n
-        } else {
-            threads_default
-        };
+        let threads_num = sync.threads.or(toml_threads).unwrap_or(threads_default);
         anyhow::ensure!(
             (1..=64).contains(&threads_num),
-            "threads_num must be in 1..=64, got {threads_num}"
+            "threads must be in 1..=64, got {threads_num}"
         );
         let temp_suffix = resolve(
             sync.temp_suffix,
@@ -1475,29 +1321,7 @@ impl Config {
             toml_retry.and_then(|r| r.max_download_attempts),
             10,
         );
-        // Retry delay is now derived from `max_retries` via a smart table
-        // (higher max => more patient initial delay). `--retry-delay` and
-        // `[download.retry] delay` are deprecated; setting either still
-        // wins during the deprecation window but emits a warning.
-        let explicit_retry_delay = sync.retry_delay.or(toml_retry.and_then(|r| r.delay));
-        let retry_delay_secs = if let Some(d) = explicit_retry_delay {
-            #[allow(
-                clippy::print_stderr,
-                reason = "runs during config load, before tracing subscriber is installed"
-            )]
-            {
-                eprintln!(
-                    "warning: `--retry-delay` / `KEI_RETRY_DELAY` / `[download.retry] delay` is deprecated and will be removed in v0.20.0. The initial retry delay is now derived from `--max-retries`; remove the explicit setting to use the smart default."
-                );
-            }
-            d
-        } else {
-            smart_retry_delay(max_retries)
-        };
-        anyhow::ensure!(
-            (1..=3600).contains(&retry_delay_secs),
-            "retry delay must be in 1..=3600 seconds, got {retry_delay_secs}"
-        );
+        let retry_delay_secs = smart_retry_delay(max_retries);
 
         // Filters
         let library_selector = resolve_library_selector(sync.libraries, toml_filters)?;
@@ -1577,30 +1401,9 @@ impl Config {
 
         let skip_videos = resolve_flag(sync.skip_videos, toml_filters.and_then(|f| f.skip_videos));
         let skip_photos = resolve_flag(sync.skip_photos, toml_filters.and_then(|f| f.skip_photos));
-        // Fold sync's deprecated `--skip-live-photos` / `[filters]
-        // skip_live_photos` paths into a single `Option<LivePhotoMode>` so
-        // the shared resolver still sees the chosen value and emits the
-        // deprecation warnings before falling through to defaults.
-        let live_photo_mode_pre_resolved: Option<LivePhotoMode> =
-            if let Some(mode) = sync.live_photo_mode {
-                Some(mode)
-            } else if sync.skip_live_photos == Some(true) {
-                warn_deprecated(
-                    "`--skip-live-photos` / `KEI_SKIP_LIVE_PHOTOS`",
-                    "`--live-photo-mode skip`",
-                );
-                Some(LivePhotoMode::Skip)
-            } else if let Some(mode) = toml_photos.and_then(|p| p.live_photo_mode) {
-                Some(mode)
-            } else if toml_filters.and_then(|f| f.skip_live_photos) == Some(true) {
-                warn_deprecated(
-                    "`[filters].skip_live_photos`",
-                    "`[photos].live_photo_mode = \"skip\"`",
-                );
-                Some(LivePhotoMode::Skip)
-            } else {
-                None
-            };
+        let live_photo_mode_pre_resolved: Option<LivePhotoMode> = sync
+            .live_photo_mode
+            .or_else(|| toml_photos.and_then(|p| p.live_photo_mode));
         let raw_smart_folders = resolve_vec(
             sync.smart_folders,
             toml_filters.and_then(|f| f.smart_folders.clone()),
@@ -1764,38 +1567,11 @@ impl Config {
                 .map(expand_tilde)
         });
 
-        // HTTP server port — CLI > [server] TOML > [metrics] TOML (deprecated) > KEI_METRICS_PORT
-        // env (deprecated) > default 9090.
+        // HTTP server port - CLI > [server] TOML > default 9090.
         const DEFAULT_HTTP_PORT: u16 = 9090;
-        // Warn early when the deprecated env var is set, regardless of
-        // whether a higher-precedence value shadows it. Pre-fix the
-        // warning only fired in the env-var arm of the `or_else` chain,
-        // so a user who set both `KEI_HTTP_PORT` and `KEI_METRICS_PORT`
-        // got no signal that their `KEI_METRICS_PORT` was being silently
-        // ignored. Same pattern we use for the `[metrics]` TOML section
-        // below.
-        let kei_metrics_port_env = std::env::var("KEI_METRICS_PORT").ok();
-        if kei_metrics_port_env.is_some() {
-            tracing::warn!(
-                "KEI_METRICS_PORT is deprecated and will be removed in v0.20.0; \
-                 use KEI_HTTP_PORT instead"
-            );
-        }
-        if toml_metrics.and_then(|m| m.port).is_some() {
-            tracing::warn!(
-                "[metrics] port in TOML is deprecated and will be removed in v0.20.0; \
-                 rename the section to [server]"
-            );
-        }
         let http_port = sync
             .http_port
             .or_else(|| toml_server.and_then(|s| s.port))
-            .or_else(|| toml_metrics.and_then(|m| m.port))
-            .or_else(|| {
-                kei_metrics_port_env
-                    .as_deref()
-                    .and_then(|v| v.parse::<u16>().ok())
-            })
             .unwrap_or(DEFAULT_HTTP_PORT);
 
         // HTTP server bind address — CLI > [server] bind TOML > default 0.0.0.0.
@@ -1830,8 +1606,8 @@ impl Config {
                     "`--skip-videos` + `--skip-photos` + `--live-photo-mode {mode}` \
                      would download nothing. Unset one of the skip flags, use \
                      `--live-photo-mode video-only` if you only want Live Photo \
-                     video companions, or use `kei login` / `--dry-run` for an \
-                     auth-only test."
+                     video companions, or use `--dry-run` for an \
+                     auth-free test."
                 );
             }
         }
@@ -1899,7 +1675,6 @@ impl Config {
             friendly_request,
             keep_unicode_in_filenames,
             only_print_filenames: sync.only_print_filenames,
-            no_incremental: sync.no_incremental,
             notify_systemd,
             save_password,
         })
@@ -1927,7 +1702,6 @@ impl Config {
                 } else {
                     Some(self.domain)
                 },
-                cookie_directory: None, // deprecated, use data_dir
             }),
             download: Some(TomlDownload {
                 directory: if self.directory.as_os_str().is_empty() {
@@ -1951,7 +1725,6 @@ impl Config {
                     Some(self.folder_structure_smart_folders.clone())
                 },
                 threads: Some(self.threads_num),
-                threads_num: None, // deprecated, canonical spelling is `threads`
                 bandwidth_limit: self.bandwidth_limit.map(|n| n.to_string()),
                 temp_suffix: if self.temp_suffix == ".kei-tmp" {
                     None
@@ -1989,15 +1762,6 @@ impl Config {
                 },
                 retry: Some(TomlRetry {
                     max_retries: Some(self.max_retries),
-                    // `delay` is deprecated and derived from max_retries by
-                    // default. Emit it only when it differs from the smart
-                    // value so config dumps stay clean for the common case
-                    // and round-trip correctly when the user has overridden.
-                    delay: if self.retry_delay_secs == smart_retry_delay(self.max_retries) {
-                        None
-                    } else {
-                        Some(self.retry_delay_secs)
-                    },
                     // Emit `max_download_attempts` only when the user has
                     // overridden the default of 10. Keeps the round-trip
                     // clean for the common case and surfaces explicit
@@ -2063,10 +1827,9 @@ impl Config {
                 },
                 skip_videos: if self.skip_videos { Some(true) } else { None },
                 skip_photos: if self.skip_photos { Some(true) } else { None },
-                skip_live_photos: None, // deprecated, use live_photo_mode in [photos]
-                recent: None,           // per-run
+                recent: None,              // per-run
                 skip_created_before: None, // per-run
-                skip_created_after: None, // per-run
+                skip_created_after: None,  // per-run
             }),
             photos: Some(TomlPhotos {
                 size: if self.size == VersionSize::Original {
@@ -2134,7 +1897,6 @@ impl Config {
                 .map(|s| TomlNotifications {
                     script: Some(s.display().to_string()),
                 }),
-            metrics: None,
             server: Some(TomlServer {
                 port: Some(self.http_port),
                 // Only emit `bind` when it's been changed from the default.
@@ -2213,7 +1975,6 @@ pub(crate) fn persist_first_run_config(
             password_file: a.password_file,
             password_command: a.password_command,
             domain: a.domain,
-            cookie_directory: None, // deprecated, use data_dir
         }),
         download: full.download.map(|d| TomlDownload {
             directory: d.directory,
@@ -2221,7 +1982,6 @@ pub(crate) fn persist_first_run_config(
             folder_structure_albums: None,
             folder_structure_smart_folders: None,
             threads: None,
-            threads_num: None, // deprecated
             bandwidth_limit: None,
             temp_suffix: None,
             #[cfg(feature = "xmp")]
@@ -2243,7 +2003,6 @@ pub(crate) fn persist_first_run_config(
         photos: None,
         watch: None,
         notifications: None,
-        metrics: None,
         server: None,
         report: None,
         ui: None,
@@ -2508,7 +2267,6 @@ mod tests {
             [auth]
             username = "user@example.com"
             domain = "com"
-            cookie_directory = "~/.config/kei/cookies"
 
             [download]
             directory = "/photos"
@@ -2519,14 +2277,12 @@ mod tests {
 
             [download.retry]
             max_retries = 3
-            delay = 5
 
             [filters]
             library = "PrimarySync"
             albums = ["Favorites"]
             skip_videos = false
             skip_photos = false
-            skip_live_photos = false
             recent = 500
             skip_created_before = "2024-01-01"
             skip_created_after = "2025-01-01"
@@ -2552,10 +2308,10 @@ mod tests {
         assert_eq!(auth.domain, Some(Domain::Com));
         let dl = config.download.unwrap();
         assert_eq!(dl.threads, Some(10));
-        assert_eq!(dl.threads_num, None);
+
         let retry = dl.retry.unwrap();
         assert_eq!(retry.max_retries, Some(3));
-        assert_eq!(retry.delay, Some(5));
+
         let filters = config.filters.unwrap();
         assert_eq!(filters.albums, Some(vec!["Favorites".to_string()]));
         assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(500)));
@@ -2603,12 +2359,10 @@ mod tests {
         let toml_str = r#"
             [download.retry]
             max_retries = 5
-            delay = 10
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         let retry = config.download.unwrap().retry.unwrap();
         assert_eq!(retry.max_retries, Some(5));
-        assert_eq!(retry.delay, Some(10));
     }
 
     #[test]
@@ -2635,7 +2389,6 @@ mod tests {
             username: Some("u@example.com".to_string()),
             domain: None,
             data_dir: None,
-            cookie_directory: None,
         }
     }
 
@@ -3274,14 +3027,14 @@ mod tests {
                         body.push_str(&format!("bandwidth_limit = \"{l}\"\n"));
                     }
                     if let Some(t) = threads {
-                        body.push_str(&format!("threads_num = {t}\n"));
+                        body.push_str(&format!("threads = {t}\n"));
                     }
                     Some(toml::from_str::<TomlConfig>(&body).unwrap())
                 }
             };
             let mut sync = default_sync();
             sync.bandwidth_limit = case.cli;
-            sync.threads_num = case.toml_cli_threads;
+            sync.threads = case.toml_cli_threads;
             let cfg = Config::build(&default_globals(), &default_password(), sync, toml.as_ref())
                 .unwrap_or_else(|e| panic!("{}: build failed: {e}", case.name));
             assert_eq!(cfg.bandwidth_limit, case.want_limit, "{}", case.name);
@@ -3450,46 +3203,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_threads_num_zero_from_toml_rejected() {
-        let toml_str = r#"
-            [download]
-            threads_num = 0
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let result = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        );
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("threads_num"),
-            "Error should mention threads_num"
-        );
-    }
-
-    #[test]
-    fn test_build_threads_num_above_upper_bound_from_toml_rejected() {
-        let toml_str = r#"
-            [download]
-            threads_num = 128
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let result = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        );
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("threads_num"),
-            "Error should mention threads_num"
-        );
-    }
-
-    #[test]
     fn test_build_watch_interval_above_upper_bound_from_toml_rejected() {
         let toml_str = r#"
             [watch]
@@ -3621,47 +3334,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_retry_delay_zero_from_toml_rejected() {
-        let toml_str = r#"
-            [download.retry]
-            delay = 0
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let result = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        );
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("retry delay"),
-            "Error should mention retry delay"
-        );
-    }
-
-    #[test]
-    fn test_build_retry_delay_above_upper_bound_from_toml_rejected() {
-        let toml_str = r#"
-            [download.retry]
-            delay = 86400
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let result = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        );
-        assert!(result.is_err(), "TOML delay > 3600 must be rejected");
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("retry delay") && msg.contains("3600"),
-            "Error should mention retry delay and the bound: {msg}"
-        );
-    }
-
-    #[test]
     fn test_build_max_retries_above_upper_bound_from_toml_rejected() {
         let toml_str = r#"
             [download.retry]
@@ -3687,7 +3359,6 @@ mod tests {
         let toml_str = r#"
             [download.retry]
             max_retries = 100
-            delay = 3600
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -3696,9 +3367,9 @@ mod tests {
             default_sync(),
             Some(&toml),
         )
-        .expect("max_retries=100, delay=3600 must be accepted");
+        .expect("max_retries=100 must be accepted");
         assert_eq!(cfg.max_retries, 100);
-        assert_eq!(cfg.retry_delay_secs, 3600);
+        assert_eq!(cfg.retry_delay_secs, 30);
     }
 
     #[test]
@@ -3818,7 +3489,7 @@ mod tests {
         assert!(err.contains("not supported on Windows"), "{err}");
     }
 
-    // ── Download directory: --download-dir vs deprecated --directory ───
+    // ── Download directory: --download-dir ─────────────────────────
 
     #[test]
     fn test_build_download_dir_from_cli() {
@@ -3826,30 +3497,6 @@ mod tests {
         sync.download_dir = Some("/photos/new".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/new"));
-    }
-
-    #[test]
-    fn test_build_legacy_directory_from_cli_still_works() {
-        // `--directory` keeps working through v0.20.0. Warning is stderr-only
-        // and not asserted here (tested via integration test in tests/cli.rs).
-        let mut sync = default_sync();
-        sync.directory = Some("/photos/legacy".to_string());
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.directory, PathBuf::from("/photos/legacy"));
-    }
-
-    #[test]
-    fn test_build_both_download_dir_and_directory_rejected() {
-        // Using both forms at once is ambiguous. Fail loudly instead of
-        // picking one silently.
-        let mut sync = default_sync();
-        sync.download_dir = Some("/photos/new".to_string());
-        sync.directory = Some("/photos/old".to_string());
-        let result = Config::build(&default_globals(), &default_password(), sync, None);
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("--download-dir"), "{err}");
-        assert!(err.contains("--directory"), "{err}");
-        assert!(err.contains("v0.20.0"), "{err}");
     }
 
     #[test]
@@ -3864,20 +3511,6 @@ mod tests {
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/cli"));
-    }
-
-    #[test]
-    fn test_build_legacy_directory_cli_beats_toml() {
-        let toml_str = r#"
-            [download]
-            directory = "/photos/toml"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.directory = Some("/photos/cli-legacy".to_string());
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.directory, PathBuf::from("/photos/cli-legacy"));
     }
 
     #[test]
@@ -3897,34 +3530,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/photos/via-toml"));
-    }
-
-    #[test]
-    fn test_build_cookie_directory_under_file_rejected() {
-        // Create a regular file, then try to use a path under it as cookie dir
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path().join("kei_config_test_cookie_file");
-        std::fs::write(&tmp, b"not a dir").unwrap();
-        let path = tmp.join("nested").join("cookies");
-        let mut globals = default_globals();
-        let pw = default_password();
-        globals.cookie_directory = Some(path.to_string_lossy().to_string());
-        let result = Config::build(&globals, &pw, default_sync(), None);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("cookie directory"),
-            "Error should mention cookie directory"
-        );
-    }
-
-    #[test]
-    fn test_build_cookie_directory_nonexistent_rejected() {
-        let mut globals = default_globals();
-        let pw = default_password();
-        // Use a path with a null byte which is invalid on all platforms
-        globals.cookie_directory = Some("\0invalid/cookies".to_string());
-        let result = Config::build(&globals, &pw, default_sync(), None);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -4083,7 +3688,7 @@ mod tests {
     fn test_toml_reject_wrong_type() {
         let toml_str = r#"
             [download]
-            threads_num = "not_a_number"
+            threads = "not_a_number"
         "#;
         assert!(toml::from_str::<TomlConfig>(toml_str).is_err());
     }
@@ -4092,7 +3697,7 @@ mod tests {
     fn test_toml_reject_negative_number() {
         let toml_str = r#"
             [download]
-            threads_num = -1
+            threads = -1
         "#;
         assert!(toml::from_str::<TomlConfig>(toml_str).is_err());
     }
@@ -4129,7 +3734,7 @@ mod tests {
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         assert!(config.auth.unwrap().username.is_none());
-        assert!(config.download.unwrap().threads_num.is_none());
+        assert!(config.download.unwrap().threads.is_none());
         assert!(config.filters.unwrap().library.is_none());
         assert!(config.photos.unwrap().size.is_none());
         assert!(config.watch.unwrap().interval.is_none());
@@ -4158,7 +3763,7 @@ mod tests {
             [download]
             directory = "/photos"
             folder_structure = "%Y-%m"
-            threads_num = 4
+            threads = 4
             temp_suffix = ".part"
             set_exif_datetime = true
             no_progress_bar = true
@@ -4167,7 +3772,7 @@ mod tests {
         let dl = config.download.unwrap();
         assert_eq!(dl.directory.as_deref(), Some("/photos"));
         assert_eq!(dl.folder_structure.as_deref(), Some("%Y-%m"));
-        assert_eq!(dl.threads_num, Some(4));
+        assert_eq!(dl.threads, Some(4));
         assert_eq!(dl.temp_suffix.as_deref(), Some(".part"));
         assert_eq!(dl.set_exif_datetime, Some(true));
         assert_eq!(dl.no_progress_bar, Some(true));
@@ -4181,7 +3786,6 @@ mod tests {
             albums = ["A", "B"]
             skip_videos = true
             skip_photos = true
-            skip_live_photos = true
             recent = 100
             skip_created_before = "2024-01-01"
             skip_created_after = "2025-12-31"
@@ -4192,7 +3796,7 @@ mod tests {
         assert_eq!(f.albums, Some(vec!["A".to_string(), "B".to_string()]));
         assert_eq!(f.skip_videos, Some(true));
         assert_eq!(f.skip_photos, Some(true));
-        assert_eq!(f.skip_live_photos, Some(true));
+
         assert_eq!(f.recent, Some(crate::cli::RecentLimit::Count(100)));
         assert_eq!(f.skip_created_before.as_deref(), Some("2024-01-01"));
         assert_eq!(f.skip_created_after.as_deref(), Some("2025-12-31"));
@@ -4250,17 +3854,6 @@ mod tests {
     }
 
     #[test]
-    fn test_toml_metrics_port_parsed_deprecated() {
-        // [metrics] section is still accepted for backwards compatibility.
-        let toml_str = r#"
-            [metrics]
-            port = 9090
-        "#;
-        let config: TomlConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.metrics.unwrap().port, Some(9090));
-    }
-
-    #[test]
     fn test_toml_server_port_resolves_in_config() {
         let toml_str = r#"
             [auth]
@@ -4268,28 +3861,6 @@ mod tests {
             [download]
             directory = "/photos"
             [server]
-            port = 9090
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let config = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(config.http_port, 9090);
-    }
-
-    #[test]
-    fn test_toml_metrics_port_resolves_in_config_deprecated() {
-        // [metrics] port is still accepted as a deprecated fallback.
-        let toml_str = r#"
-            [auth]
-            username = "user@example.com"
-            [download]
-            directory = "/photos"
-            [metrics]
             port = 9090
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
@@ -4319,138 +3890,6 @@ mod tests {
         let config =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(config.http_port, 8080);
-    }
-
-    /// Serialize KEI_METRICS_PORT env var across the deprecation tests so
-    /// they don't race each other or leak state. Mirrors the
-    /// `scrub_auth_env` pattern in `cli.rs`.
-    fn scrub_metrics_port_env() -> MetricsPortEnvGuard {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("KEI_METRICS_PORT").ok();
-        // SAFETY: the static mutex serializes every other caller of
-        // scrub_metrics_port_env; the suite does not read this env var
-        // from a separate thread.
-        unsafe {
-            std::env::remove_var("KEI_METRICS_PORT");
-        }
-        MetricsPortEnvGuard { _lock: guard, prev }
-    }
-
-    struct MetricsPortEnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        prev: Option<String>,
-    }
-
-    impl Drop for MetricsPortEnvGuard {
-        fn drop(&mut self) {
-            if let Some(v) = self.prev.take() {
-                // SAFETY: still holding the static mutex; restoration is
-                // exclusive under the same "no cross-thread readers" rule.
-                unsafe {
-                    std::env::set_var("KEI_METRICS_PORT", v);
-                }
-            } else {
-                // SAFETY: same as above.
-                unsafe {
-                    std::env::remove_var("KEI_METRICS_PORT");
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn test_kei_metrics_port_env_warns_when_set_even_if_shadowed() {
-        // KEI_METRICS_PORT is set, but [server] port wins. Pre-fix the
-        // warning was inside the env-var arm of the or_else chain so it
-        // never fired in this case; users had no signal that their
-        // KEI_METRICS_PORT was being silently ignored.
-        let _guard = scrub_metrics_port_env();
-        // SAFETY: the guard above holds the static lock for the duration
-        // of this test, so no other thread is reading the env var.
-        unsafe {
-            std::env::set_var("KEI_METRICS_PORT", "9999");
-        }
-        let toml_str = r#"
-            [auth]
-            username = "user@example.com"
-            [download]
-            directory = "/photos"
-            [server]
-            port = 9090
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let config = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        // [server] port still wins.
-        assert_eq!(config.http_port, 9090);
-        // ...but the deprecation warning fires anyway.
-        assert!(
-            logs_contain("KEI_METRICS_PORT is deprecated"),
-            "deprecation warning should fire whenever KEI_METRICS_PORT is set"
-        );
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn test_kei_metrics_port_env_resolves_when_no_higher_value() {
-        // No CLI / [server] / [metrics] value: env var still wins, with a
-        // warning. Confirms the migration path stays usable for one minor
-        // cycle while users move to KEI_HTTP_PORT.
-        let _guard = scrub_metrics_port_env();
-        // SAFETY: the guard above holds the static lock for the duration
-        // of this test, so no other thread is reading the env var.
-        unsafe {
-            std::env::set_var("KEI_METRICS_PORT", "8765");
-        }
-        let config = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(config.http_port, 8765);
-        assert!(logs_contain("KEI_METRICS_PORT is deprecated"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn test_metrics_toml_warns_even_when_shadowed_by_server() {
-        // [metrics] port is shadowed by [server] port; the deprecation
-        // warning still fires so config-driven users learn that the
-        // section is on its way out.
-        let _guard = scrub_metrics_port_env();
-        let toml_str = r#"
-            [auth]
-            username = "user@example.com"
-            [download]
-            directory = "/photos"
-            [server]
-            port = 9090
-            [metrics]
-            port = 9999
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let config = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(config.http_port, 9090);
-        assert!(
-            logs_contain("[metrics] port in TOML is deprecated"),
-            "deprecation warning should fire whenever [metrics] port is set"
-        );
     }
 
     #[test]
@@ -4574,17 +4013,14 @@ mod tests {
     }
 
     #[test]
-    fn test_toml_metrics_unknown_field_rejected() {
+    fn test_toml_metrics_section_is_removed() {
         let toml_str = r#"
             [metrics]
             port = 9090
             unknown_field = true
         "#;
         let result: Result<TomlConfig, _> = toml::from_str(toml_str);
-        assert!(
-            result.is_err(),
-            "unknown fields in [metrics] should be rejected"
-        );
+        assert!(result.is_err(), "[metrics] should be rejected");
     }
 
     // ── TOML file loading from disk ────────────────────────────────
@@ -4737,58 +4173,6 @@ mod tests {
     }
 
     /// Escape backslashes for embedding a path in a TOML string literal.
-    fn toml_escape(path: &std::path::Path) -> String {
-        path.to_string_lossy().replace('\\', "\\\\")
-    }
-
-    #[test]
-    fn test_build_cookie_directory_cli_overrides_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        let cli_path = dir.path().join("cli_cookies");
-        let toml_path = dir.path().join("toml_cookies");
-        let toml_str = format!("[auth]\ncookie_directory = \"{}\"", toml_escape(&toml_path));
-        let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
-        let mut globals = default_globals();
-        let pw = default_password();
-        globals.cookie_directory = Some(cli_path.to_string_lossy().to_string());
-        let cfg = Config::build(&globals, &pw, default_sync(), Some(&toml)).unwrap();
-        assert_eq!(cfg.cookie_directory, cli_path);
-    }
-
-    #[test]
-    fn test_build_cookie_directory_from_toml() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml_path = dir.path().join("toml_cookies");
-        let toml_str = format!("[auth]\ncookie_directory = \"{}\"", toml_escape(&toml_path));
-        let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.cookie_directory, toml_path);
-    }
-
-    #[test]
-    fn test_build_cookie_directory_tilde_expansion() {
-        // Use a path under the home directory that we can actually create
-        let home = dirs::home_dir().expect("home dir required for test");
-        let unique = format!(".kei-test-{}", std::process::id());
-        let toml_str = format!("[auth]\ncookie_directory = \"~/{unique}\"");
-        let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.cookie_directory, home.join(&unique));
-        let _ = std::fs::remove_dir(&cfg.cookie_directory);
-    }
-
     #[test]
     fn test_build_directory_tilde_expansion() {
         let toml_str = r#"
@@ -4958,37 +4342,6 @@ mod tests {
         let toml = cfg.to_toml();
         let retry = toml.download.unwrap().retry.unwrap();
         assert_eq!(retry.max_download_attempts, Some(42));
-    }
-
-    #[test]
-    fn test_build_retry_delay_cli_overrides_toml() {
-        let toml_str = r#"
-            [download.retry]
-            delay = 10
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.retry_delay = Some(30);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.retry_delay_secs, 30);
-    }
-
-    #[test]
-    fn test_build_retry_delay_from_toml() {
-        let toml_str = r#"
-            [download.retry]
-            delay = 15
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.retry_delay_secs, 15);
     }
 
     #[test]
@@ -5282,7 +4635,7 @@ mod tests {
     #[test]
     fn test_build_all_boolean_flags_from_toml() {
         // `skip_photos = true` is intentionally omitted: combining it with
-        // `skip_videos = true` and `skip_live_photos = true` would download
+        // `skip_videos = true` and `live_photo_mode = "skip"` would download
         // nothing and is rejected at Config::build. See
         // `test_build_skip_videos_and_photos_with_live_skip_rejected`.
         let toml_str = r#"
@@ -5292,9 +4645,9 @@ mod tests {
 
             [filters]
             skip_videos = true
-            skip_live_photos = true
 
             [photos]
+            live_photo_mode = "skip"
             force_size = true
             keep_unicode_in_filenames = true
 
@@ -5328,7 +4681,7 @@ mod tests {
         sync.set_exif_datetime = Some(true);
         sync.no_progress_bar = Some(true);
         sync.skip_videos = Some(true);
-        sync.skip_live_photos = Some(true);
+        sync.live_photo_mode = Some(LivePhotoMode::Skip);
         sync.force_size = Some(true);
         sync.keep_unicode_in_filenames = Some(true);
         sync.notify_systemd = Some(true);
@@ -5797,28 +5150,23 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[test]
     fn test_build_full_toml_all_sections() {
-        let dir = tempfile::tempdir().unwrap();
-        let cookie_path = dir.path().join("full_cookies");
-        let toml_str = format!(
-            r#"
+        let toml_str = r#"
             log_level = "warn"
 
             [auth]
             username = "full@example.com"
             domain = "cn"
-            cookie_directory = "{cookie}"
 
             [download]
             directory = "/full/photos"
             folder_structure = "%Y"
-            threads_num = 2
+            threads = 2
             temp_suffix = ".full-tmp"
             set_exif_datetime = true
             no_progress_bar = true
 
             [download.retry]
             max_retries = 1
-            delay = 2
 
             [filters]
             library = "SharedSync-FULL"
@@ -5837,10 +5185,8 @@ mod tests {
             [watch]
             interval = 900
             pid_file = "/full/pid"
-        "#,
-            cookie = toml_escape(&cookie_path)
-        );
-        let toml: TomlConfig = toml::from_str(&toml_str).unwrap();
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
             &default_globals(),
             &default_password(),
@@ -5852,7 +5198,7 @@ mod tests {
         assert_eq!(cfg.username, "u@example.com");
         assert!(cfg.password.is_none());
         assert!(matches!(cfg.domain, Domain::Cn));
-        assert_eq!(cfg.cookie_directory, cookie_path);
+        assert!(cfg.cookie_directory.ends_with("kei/cookies"));
         assert_eq!(cfg.directory, PathBuf::from("/full/photos"));
         assert_eq!(cfg.folder_structure, "%Y");
         assert_eq!(cfg.threads_num, 2);
@@ -5892,27 +5238,24 @@ mod tests {
     #[test]
     fn test_resolve_auth_all_from_toml() {
         // `[auth].password` is rejected in `Config::build()`, so resolve_auth
-        // itself never reads it from TOML. Username, domain, and cookie
-        // directory still flow through.
+        // itself never reads it from TOML. Username and domain still flow through.
         let toml_str = r#"
             [auth]
             username = "toml@example.com"
             domain = "cn"
-            cookie_directory = "/toml/cookies"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let globals = GlobalArgs {
             username: None,
             domain: None,
             data_dir: None,
-            cookie_directory: None,
         };
         let pw = crate::cli::PasswordArgs::default();
         let (username, password, domain, cookie_dir) = resolve_auth(&globals, &pw, Some(&toml));
         assert_eq!(username, "toml@example.com");
         assert!(password.is_none());
         assert!(matches!(domain, Domain::Cn));
-        assert_eq!(cookie_dir, PathBuf::from("/toml/cookies"));
+        assert!(cookie_dir.ends_with("kei/cookies"));
     }
 
     #[test]
@@ -5921,14 +5264,12 @@ mod tests {
             [auth]
             username = "toml@example.com"
             domain = "cn"
-            cookie_directory = "/toml/cookies"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let globals = GlobalArgs {
             username: Some("cli@example.com".to_string()),
             domain: Some(Domain::Com),
-            data_dir: None,
-            cookie_directory: Some("/cli/cookies".to_string()),
+            data_dir: Some("/cli/data".to_string()),
         };
         let pw = crate::cli::PasswordArgs {
             password: Some("cli-pw".to_string()),
@@ -5938,7 +5279,7 @@ mod tests {
         assert_eq!(username, "cli@example.com");
         assert_eq!(password.as_deref(), Some("cli-pw"));
         assert!(matches!(domain, Domain::Com));
-        assert_eq!(cookie_dir, PathBuf::from("/cli/cookies"));
+        assert_eq!(cookie_dir, PathBuf::from("/cli/data"));
     }
 
     #[test]
@@ -5955,7 +5296,6 @@ mod tests {
             username: None,
             domain: None,
             data_dir: None,
-            cookie_directory: None,
         };
         let pw = crate::cli::PasswordArgs::default();
         let (_, password, _, _) = resolve_auth(&globals, &pw, Some(&toml));
@@ -5971,7 +5311,6 @@ mod tests {
             username: None,
             domain: None,
             data_dir: None,
-            cookie_directory: None,
         };
         let pw = crate::cli::PasswordArgs::default();
         let (username, password, domain, cookie_dir) = resolve_auth(&globals, &pw, None);
@@ -6400,7 +5739,7 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
-        sync.directory = Some("/cli/photos".to_string());
+        sync.download_dir = Some("/cli/photos".to_string());
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.directory, PathBuf::from("/cli/photos"));
@@ -6533,7 +5872,6 @@ mod tests {
             photos: None,
             watch: None,
             notifications: None,
-            metrics: None,
             server: None,
             report: None,
             ui: Some(TomlUi {
@@ -6567,7 +5905,6 @@ mod tests {
             photos: None,
             watch: None,
             notifications: None,
-            metrics: None,
             server: None,
             report: None,
             ui: Some(TomlUi {
@@ -6779,93 +6116,10 @@ mod tests {
         assert!(toml.download.as_ref().unwrap().bandwidth_limit.is_none());
     }
 
-    // ── TOML-only skip_live_photos legacy path ──────────────────────
-
-    #[test]
-    fn test_toml_skip_live_photos_legacy_maps_to_skip_mode() {
-        let toml_str = r#"
-            [auth]
-            username = "u@example.com"
-
-            [filters]
-            skip_live_photos = true
-        "#;
-        let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::Skip);
-    }
-
-    #[test]
-    fn test_toml_skip_live_photos_false_stays_both() {
-        let toml_str = r#"
-            [auth]
-            username = "u@example.com"
-
-            [filters]
-            skip_live_photos = false
-        "#;
-        let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::Both);
-    }
-
-    #[test]
-    fn test_toml_photos_live_photo_mode_overrides_filters_skip_live_photos() {
-        let toml_str = r#"
-            [auth]
-            username = "u@example.com"
-
-            [filters]
-            skip_live_photos = true
-
-            [photos]
-            live_photo_mode = "image-only"
-        "#;
-        let toml: TomlConfig = ::toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.live_photo_mode, crate::types::LivePhotoMode::ImageOnly);
-    }
-
-    // ── resolve_data_dir() tests ────────────────────────────────────
-
     #[test]
     fn test_resolve_data_dir_explicit_cli() {
-        let result = resolve_data_dir(
-            Some("/explicit"),
-            None,
-            None,
-            Path::new("/config/config.toml"),
-        );
+        let result = resolve_data_dir(Some("/explicit"), None, Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/explicit"));
-    }
-
-    #[test]
-    fn test_resolve_data_dir_legacy_cookie_dir() {
-        let result = resolve_data_dir(
-            None,
-            Some("/legacy/cookies"),
-            None,
-            Path::new("/config/config.toml"),
-        );
-        assert_eq!(result, PathBuf::from("/legacy/cookies"));
     }
 
     #[test]
@@ -6879,45 +6133,17 @@ mod tests {
             photos: None,
             watch: None,
             notifications: None,
-            metrics: None,
             server: None,
             report: None,
             ui: None,
         };
-        let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
+        let result = resolve_data_dir(None, Some(&toml), Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/toml/data"));
     }
 
     #[test]
-    fn test_resolve_data_dir_toml_legacy_cookie_directory() {
-        let toml = TomlConfig {
-            data_dir: None,
-            log_level: None,
-            auth: Some(TomlAuth {
-                username: None,
-                password: None,
-                password_file: None,
-                password_command: None,
-                domain: None,
-                cookie_directory: Some("/toml/cookies".to_string()),
-            }),
-            download: None,
-            filters: None,
-            photos: None,
-            watch: None,
-            notifications: None,
-            metrics: None,
-            server: None,
-            report: None,
-            ui: None,
-        };
-        let result = resolve_data_dir(None, None, Some(&toml), Path::new("/config/config.toml"));
-        assert_eq!(result, PathBuf::from("/toml/cookies"));
-    }
-
-    #[test]
     fn test_resolve_data_dir_defaults_to_config_parent() {
-        let result = resolve_data_dir(None, None, None, Path::new("/config/config.toml"));
+        let result = resolve_data_dir(None, None, Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/config"));
     }
 
@@ -6932,14 +6158,12 @@ mod tests {
             photos: None,
             watch: None,
             notifications: None,
-            metrics: None,
             server: None,
             report: None,
             ui: None,
         };
         let result = resolve_data_dir(
             Some("/cli/data"),
-            None,
             Some(&toml),
             Path::new("/config/config.toml"),
         );
@@ -6970,7 +6194,7 @@ mod tests {
         }
         let mut sync = default_sync();
         if let Some(d) = directory {
-            sync.directory = Some(d.to_string());
+            sync.download_dir = Some(d.to_string());
         }
         Config::build(&globals, &pw_args, sync, None).unwrap()
     }
@@ -6998,43 +6222,6 @@ mod tests {
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(!content.contains("secret123"));
-    }
-
-    /// Regression guard: even when the resolved Config got its
-    /// `cookie_directory` from the deprecated `[auth] cookie_directory`
-    /// TOML key, `persist_first_run_config` (and `Config::to_toml` under
-    /// it) must never echo the deprecated key back out. Pairs with
-    /// `setup::tests::test_generate_toml_*` to cover both wizard-generated
-    /// and auto-persisted first-run configs.
-    #[test]
-    fn test_persist_first_run_never_emits_deprecated_cookie_directory() {
-        let (td, config_path) = persist_test_dir("no_cookie_directory");
-
-        // Build a config with cookie_directory explicitly set, the way
-        // `--cookie-directory /some/path` or `[auth] cookie_directory`
-        // would land it in the resolved Config. Use a writable temp dir
-        // because `Config::build` actually creates `cookie_directory`.
-        let cookie_dir = td.path().join("legacy_cookies");
-        let mut globals = default_globals();
-        globals.username = Some("test@example.com".to_string());
-        globals.cookie_directory = Some(cookie_dir.to_string_lossy().to_string());
-        let mut sync = default_sync();
-        sync.directory = Some("/photos".to_string());
-        let config = Config::build(&globals, &default_password(), sync, None).unwrap();
-
-        persist_first_run_config(&config_path, &config, None).unwrap();
-
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        // Strip comment lines to avoid false positives on hint comments.
-        let active: String = content
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !active.contains("cookie_directory"),
-            "persisted config must not emit deprecated [auth].cookie_directory; got:\n{content}"
-        );
     }
 
     #[test]
@@ -7070,7 +6257,7 @@ mod tests {
         pw.password_file = Some("/run/secrets/pw".to_string());
         globals.domain = Some(crate::types::Domain::Cn);
         let mut sync = default_sync();
-        sync.directory = Some("/photos".to_string());
+        sync.download_dir = Some("/photos".to_string());
         let config = Config::build(&globals, &pw, sync, None).unwrap();
 
         persist_first_run_config(&config_path, &config, Some("/data")).unwrap();
@@ -7799,35 +6986,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_retry_delay_explicit_cli_still_wins() {
-        // Deprecated-but-functional: explicit delay overrides the smart
-        // default during the deprecation window. Warning is stderr-only,
-        // not asserted here (covered in a behavioral test).
-        let mut sync = default_sync();
-        sync.max_retries = Some(3);
-        sync.retry_delay = Some(42);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.retry_delay_secs, 42);
-    }
-
-    #[test]
-    fn test_build_retry_delay_explicit_toml_still_wins() {
-        let toml_str = r#"
-            [download.retry]
-            delay = 77
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(cfg.retry_delay_secs, 77);
-    }
-
-    #[test]
     fn test_to_toml_omits_delay_when_matches_smart_default() {
         // Smart default for max_retries=3 is 5. to_toml should NOT write
         // `delay = 5` back out because it's redundant (and deprecated).
@@ -7837,24 +6995,7 @@ mod tests {
         let toml = cfg.to_toml();
         let retry = toml.download.unwrap().retry.unwrap();
         assert_eq!(retry.max_retries, Some(3));
-        assert_eq!(retry.delay, None);
     }
-
-    #[test]
-    fn test_to_toml_writes_delay_when_overridden() {
-        // User set delay=20 against max_retries=3 (smart default would be 5).
-        // to_toml preserves the override so round-trips don't silently lose
-        // the user's intent while the flag is still accepted.
-        let mut sync = default_sync();
-        sync.max_retries = Some(3);
-        sync.retry_delay = Some(20);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        let toml = cfg.to_toml();
-        let retry = toml.download.unwrap().retry.unwrap();
-        assert_eq!(retry.delay, Some(20));
-    }
-
-    // ── --threads vs deprecated --threads-num ─────────────────────────
 
     #[test]
     fn test_build_threads_cli_canonical() {
@@ -7862,79 +7003,6 @@ mod tests {
         sync.threads = Some(7);
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.threads_num, 7);
-    }
-
-    #[test]
-    fn test_build_legacy_threads_num_still_works() {
-        let mut sync = default_sync();
-        sync.threads_num = Some(12);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.threads_num, 12);
-    }
-
-    #[test]
-    fn test_build_both_threads_forms_rejected_cli() {
-        let mut sync = default_sync();
-        sync.threads = Some(4);
-        sync.threads_num = Some(8);
-        let err = Config::build(&default_globals(), &default_password(), sync, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--threads"), "{err}");
-        assert!(err.contains("--threads-num"), "{err}");
-        assert!(err.contains("v0.20.0"), "{err}");
-        assert!(err.contains("pick one"), "{err}");
-    }
-
-    #[test]
-    fn test_build_both_threads_forms_rejected_toml() {
-        let toml_str = r#"
-            [download]
-            threads = 4
-            threads_num = 8
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let err = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("[download] threads"), "{err}");
-        assert!(err.contains("threads_num"), "{err}");
-        assert!(err.contains("v0.20.0"), "{err}");
-    }
-
-    #[test]
-    fn test_build_threads_cli_beats_legacy_toml() {
-        let toml_str = r#"
-            [download]
-            threads_num = 2
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.threads = Some(20);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.threads_num, 20);
-    }
-
-    #[test]
-    fn test_build_legacy_threads_num_cli_beats_toml_new() {
-        // CLI always wins over TOML, even when the CLI spelling is the
-        // legacy one. Warning still fires - not asserted here (stderr-only).
-        let toml_str = r#"
-            [download]
-            threads = 2
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.threads_num = Some(20);
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.threads_num, 20);
     }
 
     #[test]
@@ -8159,13 +7227,14 @@ mod tests {
 
     #[test]
     fn test_build_skip_videos_and_photos_from_toml_rejected() {
-        // TOML version of the same check. Live-photo-mode comes from
-        // [filters] skip_live_photos which maps to Skip mode.
+        // TOML version of the same check.
         let toml_str = r#"
             [filters]
             skip_videos = true
             skip_photos = true
-            skip_live_photos = true
+
+            [photos]
+            live_photo_mode = "skip"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let err = Config::build(

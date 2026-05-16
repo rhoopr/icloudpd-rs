@@ -127,12 +127,11 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
                 &password,
                 "--data-dir",
                 data_dir.to_str().unwrap(),
-                "--directory",
+                "--download-dir",
                 download_dir.to_str().unwrap(),
                 "--recent",
                 &FIXTURE_RECENT.to_string(),
                 "--no-progress-bar",
-                "--no-incremental",
             ])
             .timeout(Duration::from_secs(FIXTURE_TIMEOUT_SECS))
             .output()
@@ -644,42 +643,6 @@ fn import_bails_on_missing_download_dir() {
     });
 }
 
-/// `--directory` is the deprecated alias for `--download-dir`. It must
-/// still resolve, with a warning logged. Skips dry-run-only verification --
-/// just exercises the alias resolution end-to-end.
-#[test]
-#[ignore]
-fn import_accepts_deprecated_directory_flag() {
-    let (username, password, cookie_dir) = common::require_preauth();
-    let (download_dir, _sync_data_dir) = fixture();
-
-    common::with_auth_retry(|| {
-        let test_data = tempdir().unwrap();
-        copy_auth_artifacts(&cookie_dir, test_data.path());
-        // Use --directory directly (bypassing import_cmd which uses --download-dir)
-        let mut cmd = common::cmd();
-        cmd.args([
-            "import-existing",
-            "--username",
-            &username,
-            "--password",
-            &password,
-            "--data-dir",
-            test_data.path().to_str().unwrap(),
-            "--directory",
-            download_dir.to_str().unwrap(),
-            "--no-progress-bar",
-            "--dry-run",
-            "--recent",
-            "10",
-        ]);
-        cmd.timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("DRY RUN"));
-    });
-}
-
 /// TOML-only configuration (no CLI flags for resolved fields). Verifies
 /// `[photos]` and `[download]` sections feed import-existing's
 /// `DownloadConfig` correctly.
@@ -829,12 +792,11 @@ fn run_sync_against_fixture(
         password,
         "--data-dir",
         data_dir.to_str().unwrap(),
-        "--directory",
+        "--download-dir",
         download_dir.to_str().unwrap(),
         "--recent",
         &ROUNDTRIP_RECENT.to_string(),
         "--no-progress-bar",
-        "--no-incremental",
     ]);
     cmd.args(extra);
     let output = cmd

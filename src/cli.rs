@@ -95,15 +95,6 @@ fn parse_2fa_code(s: &str) -> Result<String, String> {
     }
 }
 
-/// Print a deprecation warning to stderr.
-#[allow(
-    clippy::print_stderr,
-    reason = "runs during CLI arg parsing, before tracing subscriber is installed"
-)]
-pub(crate) fn deprecation_warning(old: &str, new: &str) {
-    eprintln!("warning: `{old}` is deprecated and will be removed in v0.20.0; use `{new}` instead");
-}
-
 /// Limit on which assets a sync pass processes.
 ///
 /// `--recent 100` is a count limit (top N most-recent assets). `--recent 30d`
@@ -211,10 +202,6 @@ pub struct SyncArgs {
     #[arg(short = 'd', long = "download-dir", env = "KEI_DOWNLOAD_DIR", value_parser = non_empty_string)]
     pub download_dir: Option<String>,
 
-    /// Deprecated: use --download-dir (will be removed in v0.20.0)
-    #[arg(long = "directory", env = "KEI_DIRECTORY", value_parser = non_empty_string, hide = true)]
-    pub directory: Option<String>,
-
     /// Album(s) to download. Repeatable; default `all` (every user-created
     /// album, plus an unfiled pass for photos not in any album). Accepts a
     /// literal name, the sentinels `all` / `none`, or `!name` to exclude.
@@ -276,10 +263,6 @@ pub struct SyncArgs {
     #[arg(long = "threads", env = "KEI_THREADS", value_parser = clap::value_parser!(u16).range(1..=64))]
     pub threads: Option<u16>,
 
-    /// Deprecated: use --threads (will be removed in v0.20.0)
-    #[arg(long = "threads-num", env = "KEI_THREADS_NUM", value_parser = clap::value_parser!(u16).range(1..=64), hide = true)]
-    pub threads_num: Option<u16>,
-
     /// Cap total download throughput across all concurrent downloads.
     /// Accepts human-readable values: `10M` (10 MB/s), `500K` (500 KB/s),
     /// `1Mi` (1 MiB/s), bare integer = bytes/s. When set without an explicit
@@ -299,10 +282,6 @@ pub struct SyncArgs {
     /// Live photo handling: both, image-only, video-only, skip
     #[arg(long, env = "KEI_LIVE_PHOTO_MODE", value_enum)]
     pub live_photo_mode: Option<LivePhotoMode>,
-
-    /// Deprecated: use `--live-photo-mode skip` (will be removed in v0.20.0)
-    #[arg(long, env = "KEI_SKIP_LIVE_PHOTOS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true, hide = true)]
-    pub skip_live_photos: Option<bool>,
 
     /// Only download requested size (don't fall back to original)
     #[arg(long, env = "KEI_FORCE_SIZE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
@@ -416,20 +395,10 @@ pub struct SyncArgs {
     #[arg(long, env = "KEI_MAX_RETRIES", value_parser = clap::value_parser!(u32).range(0..=100))]
     pub max_retries: Option<u32>,
 
-    /// Deprecated: initial retry delay is now derived from `--max-retries`
-    /// (will be removed in v0.20.0)
-    #[arg(long, env = "KEI_RETRY_DELAY", value_parser = clap::value_parser!(u64).range(1..=3600), hide = true)]
-    pub retry_delay: Option<u64>,
-
     /// Temp file suffix for partial downloads (default: .kei-tmp).
     /// Change if the default conflicts with your filesystem (e.g. Nextcloud rejects .part).
     #[arg(long, env = "KEI_TEMP_SUFFIX")]
     pub temp_suffix: Option<String>,
-
-    /// Deprecated: use `kei reset sync-token` before a sync for the same
-    /// effect (will be removed in v0.20.0)
-    #[arg(long, hide = true)]
-    pub no_incremental: bool,
 
     /// Send systemd `sd_notify` messages (READY, STOPPING, STATUS).
     /// Auto-detected via `NOTIFY_SOCKET` under `Type=notify` units; pass
@@ -487,23 +456,6 @@ pub struct SyncArgs {
     /// Maximum download attempts per asset before skipping (default: 10)
     #[arg(long, env = "KEI_MAX_DOWNLOAD_ATTEMPTS")]
     pub max_download_attempts: Option<u32>,
-
-    // ── Hidden compat flags (deprecated, still parse) ──────────────
-    /// Deprecated: use `kei login` instead
-    #[arg(long, hide = true, conflicts_with_all = ["watch_with_interval"])]
-    pub auth_only: bool,
-
-    /// Deprecated: use `kei list albums` instead
-    #[arg(short = 'l', long, hide = true, conflicts_with_all = ["watch_with_interval"])]
-    pub list_albums: bool,
-
-    /// Deprecated: use `kei list libraries` instead
-    #[arg(long, hide = true, conflicts_with = "watch_with_interval")]
-    pub list_libraries: bool,
-
-    /// Deprecated: use `kei reset sync-token` instead
-    #[arg(long, hide = true)]
-    pub reset_sync_token: bool,
 }
 
 /// Arguments for the status command.
@@ -541,10 +493,6 @@ pub struct ImportArgs {
     /// Local directory containing existing downloads
     #[arg(short = 'd', long = "download-dir", env = "KEI_DOWNLOAD_DIR", value_parser = non_empty_string)]
     pub download_dir: Option<String>,
-
-    /// Deprecated: use --download-dir (will be removed in v0.20.0)
-    #[arg(long = "directory", env = "KEI_DIRECTORY", value_parser = non_empty_string, hide = true)]
-    pub directory: Option<String>,
 
     /// Folder structure used by the unfiled pass when matching files on
     /// disk (must match `--folder-structure` during sync).
@@ -708,17 +656,6 @@ pub enum ConfigAction {
     },
 }
 
-/// Credential management actions (legacy, hidden).
-#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CredentialAction {
-    /// Store a password in the credential store (prompts interactively)
-    Set,
-    /// Remove a stored password
-    Clear,
-    /// Show which credential backend is active (keyring, encrypted-file, none)
-    Backend,
-}
-
 /// Arguments for `kei install`.
 ///
 /// Per-platform defaults: Linux installs a per-user systemd unit unless
@@ -784,6 +721,10 @@ pub enum ServiceAction {
 }
 
 /// Subcommands for kei.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "parsed once at startup; boxing flattened clap args would add command plumbing without runtime benefit"
+)]
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
     /// Download photos from iCloud (the default: running `kei` with no command does this)
@@ -876,65 +817,6 @@ pub enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
-
-    // ── Hidden legacy aliases (deprecated, still parse) ──────────
-    /// Deprecated: use `kei login get-code`
-    #[command(hide = true)]
-    GetCode {
-        #[command(flatten)]
-        password: PasswordArgs,
-    },
-
-    /// Deprecated: use `kei login submit-code`
-    #[command(hide = true)]
-    SubmitCode {
-        #[command(flatten)]
-        password: PasswordArgs,
-
-        /// 6-digit 2FA code from your trusted device
-        #[arg(value_parser = parse_2fa_code)]
-        code: String,
-    },
-
-    /// Deprecated: use `kei password`
-    #[command(hide = true)]
-    Credential {
-        #[command(flatten)]
-        password: PasswordArgs,
-
-        #[command(subcommand)]
-        action: CredentialAction,
-    },
-
-    /// Deprecated: use `kei sync --retry-failed`
-    #[command(hide = true)]
-    RetryFailed {
-        #[command(flatten)]
-        password: PasswordArgs,
-
-        #[command(flatten)]
-        sync: SyncArgs,
-    },
-
-    /// Deprecated: use `kei reset state`
-    #[command(hide = true)]
-    ResetState {
-        /// Skip confirmation prompt
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
-
-    /// Deprecated: use `kei reset sync-token`
-    #[command(hide = true)]
-    ResetSyncToken,
-
-    /// Deprecated: use `kei config setup`
-    #[command(hide = true)]
-    Setup {
-        /// Output path (overrides --config)
-        #[arg(short = 'o', long)]
-        output: Option<String>,
-    },
 }
 
 #[derive(Parser, Debug)]
@@ -1011,10 +893,6 @@ pub struct Cli {
     #[arg(long, global = true, env = "KEI_DATA_DIR")]
     pub data_dir: Option<String>,
 
-    /// Deprecated: use --data-dir (will be removed in v0.20.0)
-    #[arg(long, global = true, hide = true)]
-    pub cookie_directory: Option<String>,
-
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -1033,12 +911,6 @@ impl SyncArgs {
         if self.download_dir.is_none() {
             self.download_dir.clone_from(&fallback.download_dir);
         }
-        if self.directory.is_none() {
-            self.directory.clone_from(&fallback.directory);
-        }
-        self.auth_only = self.auth_only || fallback.auth_only;
-        self.list_albums = self.list_albums || fallback.list_albums;
-        self.list_libraries = self.list_libraries || fallback.list_libraries;
         if self.albums.is_empty() {
             self.albums.clone_from(&fallback.albums);
         }
@@ -1057,9 +929,6 @@ impl SyncArgs {
         if self.threads.is_none() {
             self.threads = fallback.threads;
         }
-        if self.threads_num.is_none() {
-            self.threads_num = fallback.threads_num;
-        }
         if self.bandwidth_limit.is_none() {
             self.bandwidth_limit = fallback.bandwidth_limit;
         }
@@ -1071,9 +940,6 @@ impl SyncArgs {
         }
         if self.skip_photos.is_none() {
             self.skip_photos = fallback.skip_photos;
-        }
-        if self.skip_live_photos.is_none() {
-            self.skip_live_photos = fallback.skip_live_photos;
         }
         if self.force_size.is_none() {
             self.force_size = fallback.force_size;
@@ -1141,14 +1007,9 @@ impl SyncArgs {
         if self.max_retries.is_none() {
             self.max_retries = fallback.max_retries;
         }
-        if self.retry_delay.is_none() {
-            self.retry_delay = fallback.retry_delay;
-        }
         if self.temp_suffix.is_none() {
             self.temp_suffix.clone_from(&fallback.temp_suffix);
         }
-        self.no_incremental = self.no_incremental || fallback.no_incremental;
-        self.reset_sync_token = self.reset_sync_token || fallback.reset_sync_token;
         if self.notify_systemd.is_none() {
             self.notify_systemd = fallback.notify_systemd;
         }
@@ -1212,132 +1073,16 @@ impl Cli {
     /// When a subcommand is present, top-level password/sync args are merged
     /// as fallbacks so `kei --password X sync` works the same as
     /// `kei sync --password X`.
-    ///
-    /// Legacy subcommands and compat flags are mapped to their new equivalents
-    /// with deprecation warnings to stderr.
     pub fn effective_command(&self) -> Command {
-        let cmd = if let Some(cmd) = &self.command {
+        if let Some(cmd) = &self.command {
             let mut cmd = cmd.clone();
             cmd.merge_top_level_args(&self.password, &self.sync);
             cmd
         } else {
-            // Check hidden compat flags on bare invocation
-            if self.sync.auth_only {
-                deprecation_warning("--auth-only", "kei login");
-                return Command::Login {
-                    password: self.password.clone(),
-                    subcommand: None,
-                };
-            }
-            if self.sync.list_albums {
-                deprecation_warning("--list-albums", "kei list albums");
-                return Command::List {
-                    password: self.password.clone(),
-                    libraries: self.sync.libraries.clone(),
-                    what: ListCommand::Albums,
-                };
-            }
-            if self.sync.list_libraries {
-                deprecation_warning("--list-libraries", "kei list libraries");
-                return Command::List {
-                    password: self.password.clone(),
-                    libraries: self.sync.libraries.clone(),
-                    what: ListCommand::Libraries,
-                };
-            }
             Command::Sync {
                 password: self.password.clone(),
                 sync: self.sync.clone(),
             }
-        };
-
-        // Map legacy subcommands to new equivalents
-        match cmd {
-            Command::GetCode { password } => {
-                deprecation_warning("kei get-code", "kei login get-code");
-                Command::Login {
-                    password,
-                    subcommand: Some(LoginCommand::GetCode),
-                }
-            }
-            Command::SubmitCode { password, code } => {
-                deprecation_warning("kei submit-code", "kei login submit-code");
-                Command::Login {
-                    password,
-                    subcommand: Some(LoginCommand::SubmitCode { code }),
-                }
-            }
-            Command::Credential { password, action } => {
-                deprecation_warning("kei credential", "kei password");
-                let new_action = match action {
-                    CredentialAction::Set => PasswordAction::Set,
-                    CredentialAction::Clear => PasswordAction::Clear,
-                    CredentialAction::Backend => PasswordAction::Backend,
-                };
-                Command::Password {
-                    password,
-                    action: new_action,
-                }
-            }
-            Command::RetryFailed { password, mut sync } => {
-                deprecation_warning("kei retry-failed", "kei sync --retry-failed");
-                sync.retry_failed = true;
-                Command::Sync { password, sync }
-            }
-            Command::ResetState { yes } => {
-                deprecation_warning("kei reset-state", "kei reset state");
-                Command::Reset {
-                    what: ResetCommand::State { yes },
-                }
-            }
-            Command::ResetSyncToken => {
-                deprecation_warning("kei reset-sync-token", "kei reset sync-token");
-                // Legacy alias never prompted; preserve that for shell scripts
-                // and docker callers that have been shipping this form.
-                Command::Reset {
-                    what: ResetCommand::SyncToken { yes: true },
-                }
-            }
-            Command::Setup { output } => {
-                deprecation_warning("kei setup", "kei config setup");
-                Command::Config {
-                    action: ConfigAction::Setup { output },
-                }
-            }
-            // Handle compat flags on sync subcommand (e.g. `kei sync --auth-only`)
-            Command::Sync {
-                ref password,
-                ref sync,
-            } if sync.auth_only => {
-                deprecation_warning("--auth-only", "kei login");
-                Command::Login {
-                    password: password.clone(),
-                    subcommand: None,
-                }
-            }
-            Command::Sync {
-                ref password,
-                ref sync,
-            } if sync.list_albums => {
-                deprecation_warning("--list-albums", "kei list albums");
-                Command::List {
-                    password: password.clone(),
-                    libraries: sync.libraries.clone(),
-                    what: ListCommand::Albums,
-                }
-            }
-            Command::Sync {
-                ref password,
-                ref sync,
-            } if sync.list_libraries => {
-                deprecation_warning("--list-libraries", "kei list libraries");
-                Command::List {
-                    password: password.clone(),
-                    libraries: sync.libraries.clone(),
-                    what: ListCommand::Libraries,
-                }
-            }
-            other => other,
         }
     }
 }
@@ -1355,20 +1100,18 @@ impl Cli {
     ///
     /// This validator runs after `Cli::parse()` and rejects any such
     /// combination, naming every offending flag in the error message.
-    /// Bare invocation (no subcommand) and the `sync` / `retry-failed`
-    /// subcommands legitimately use these flags and pass.
+    /// Bare invocation (no subcommand) and the `sync` subcommand
+    /// legitimately use these flags and pass.
     pub fn validate(&self, explicit_sync_flags: &[&'static str]) -> Result<(), String> {
         // Bare invocation = sync alias; flags are valid.
         let Some(cmd) = &self.command else {
             return Ok(());
         };
-        // Sync (and the legacy `retry-failed` alias that maps to sync) carry
-        // sync args directly; top-level merge into them is intended.
+        // Sync carries sync args directly; top-level merge into it is intended.
         // `service run` also carries SyncArgs and merges top-level flags.
         if matches!(
             cmd,
             Command::Sync { .. }
-                | Command::RetryFailed { .. }
                 | Command::Service {
                     action: ServiceAction::Run(..),
                 }
@@ -1407,13 +1150,6 @@ fn subcommand_display_name(cmd: &Command) -> &'static str {
             ServiceAction::Run(_) => "service run",
             ServiceAction::Status => "service status",
         },
-        Command::GetCode { .. } => "get-code",
-        Command::SubmitCode { .. } => "submit-code",
-        Command::Credential { .. } => "credential",
-        Command::RetryFailed { .. } => "retry-failed",
-        Command::ResetState { .. } => "reset-state",
-        Command::ResetSyncToken => "reset-sync-token",
-        Command::Setup { .. } => "setup",
     }
 }
 
@@ -1438,9 +1174,6 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     let mut out = Vec::new();
     if matches.value_source("download_dir") == Some(ValueSource::CommandLine) {
         out.push("--download-dir");
-    }
-    if matches.value_source("directory") == Some(ValueSource::CommandLine) {
-        out.push("--directory");
     }
     if matches.value_source("albums") == Some(ValueSource::CommandLine) {
         out.push("--album");
@@ -1472,9 +1205,6 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     if matches.value_source("threads") == Some(ValueSource::CommandLine) {
         out.push("--threads");
     }
-    if matches.value_source("threads_num") == Some(ValueSource::CommandLine) {
-        out.push("--threads-num");
-    }
     if matches.value_source("bandwidth_limit") == Some(ValueSource::CommandLine) {
         out.push("--bandwidth-limit");
     }
@@ -1486,9 +1216,6 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     }
     if matches.value_source("live_photo_mode") == Some(ValueSource::CommandLine) {
         out.push("--live-photo-mode");
-    }
-    if matches.value_source("skip_live_photos") == Some(ValueSource::CommandLine) {
-        out.push("--skip-live-photos");
     }
     if matches.value_source("force_size") == Some(ValueSource::CommandLine) {
         out.push("--force-size");
@@ -1556,14 +1283,8 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     if matches.value_source("max_retries") == Some(ValueSource::CommandLine) {
         out.push("--max-retries");
     }
-    if matches.value_source("retry_delay") == Some(ValueSource::CommandLine) {
-        out.push("--retry-delay");
-    }
     if matches.value_source("temp_suffix") == Some(ValueSource::CommandLine) {
         out.push("--temp-suffix");
-    }
-    if matches.value_source("no_incremental") == Some(ValueSource::CommandLine) {
-        out.push("--no-incremental");
     }
     if matches.value_source("notify_systemd") == Some(ValueSource::CommandLine) {
         out.push("--notify-systemd");
@@ -1594,22 +1315,6 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     }
     if matches.value_source("max_download_attempts") == Some(ValueSource::CommandLine) {
         out.push("--max-download-attempts");
-    }
-    // Hidden compat flags. `--auth-only`, `--list-albums`, `--list-libraries`,
-    // and `--reset-sync-token` only resolve to a remapped command when the
-    // bare-kei alias is in play; combining them with an explicit subcommand
-    // is the same silent-swallow class of bug we're guarding against.
-    if matches.value_source("auth_only") == Some(ValueSource::CommandLine) {
-        out.push("--auth-only");
-    }
-    if matches.value_source("list_albums") == Some(ValueSource::CommandLine) {
-        out.push("--list-albums");
-    }
-    if matches.value_source("list_libraries") == Some(ValueSource::CommandLine) {
-        out.push("--list-libraries");
-    }
-    if matches.value_source("reset_sync_token") == Some(ValueSource::CommandLine) {
-        out.push("--reset-sync-token");
     }
     out
 }
@@ -1643,7 +1348,7 @@ impl Command {
     fn merge_top_level_args(&mut self, top_password: &PasswordArgs, top_sync: &SyncArgs) {
         // Merge sync args for commands that carry them
         match self {
-            Self::Sync { sync, .. } | Self::RetryFailed { sync, .. } => {
+            Self::Sync { sync, .. } => {
                 sync.merge_from(top_sync);
             }
             Self::Service {
@@ -1680,11 +1385,7 @@ impl Command {
             Self::Sync { password, .. }
             | Self::Login { password, .. }
             | Self::List { password, .. }
-            | Self::Password { password, .. }
-            | Self::GetCode { password, .. }
-            | Self::SubmitCode { password, .. }
-            | Self::Credential { password, .. }
-            | Self::RetryFailed { password, .. } => Some(password),
+            | Self::Password { password, .. } => Some(password),
             Self::ImportExisting(args) => Some(&mut args.password),
             Self::Service {
                 action: ServiceAction::Run(args),
@@ -1698,10 +1399,7 @@ impl Command {
             | Self::Uninstall(_)
             | Self::Service {
                 action: ServiceAction::Status,
-            }
-            | Self::ResetState { .. }
-            | Self::ResetSyncToken
-            | Self::Setup { .. } => None,
+            } => None,
         }
     }
 }
@@ -1915,12 +1613,6 @@ mod tests {
     fn test_data_dir_global() {
         let cli = parse(&["kei", "--data-dir", "/config"]);
         assert_eq!(cli.data_dir.as_deref(), Some("/config"));
-    }
-
-    #[test]
-    fn test_cookie_directory_compat() {
-        let cli = parse(&["kei", "--cookie-directory", "/cookies"]);
-        assert_eq!(cli.cookie_directory.as_deref(), Some("/cookies"));
     }
 
     #[test]
@@ -2185,55 +1877,6 @@ mod tests {
     // ── Legacy subcommand compat ──────────────────────────────────
 
     #[test]
-    fn test_legacy_get_code_maps_to_login() {
-        let cli = Cli::try_parse_from(["kei", "get-code"]).unwrap();
-        assert!(matches!(
-            cli.effective_command(),
-            Command::Login {
-                subcommand: Some(LoginCommand::GetCode),
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_legacy_submit_code_maps_to_login() {
-        let cli = Cli::try_parse_from(["kei", "submit-code", "123456"]).unwrap();
-        match cli.effective_command() {
-            Command::Login {
-                subcommand: Some(LoginCommand::SubmitCode { code }),
-                ..
-            } => assert_eq!(code, "123456"),
-            _ => panic!("Expected Login SubmitCode"),
-        }
-    }
-
-    #[test]
-    fn test_legacy_credential_maps_to_password() {
-        let cli = Cli::try_parse_from(["kei", "credential", "set"]).unwrap();
-        assert!(matches!(
-            cli.effective_command(),
-            Command::Password {
-                action: PasswordAction::Set,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_legacy_retry_failed_maps_to_sync() {
-        let cli =
-            Cli::try_parse_from(["kei", "retry-failed", "--download-dir", "/photos"]).unwrap();
-        match cli.effective_command() {
-            Command::Sync { sync, .. } => {
-                assert!(sync.retry_failed);
-                assert_eq!(sync.download_dir, Some("/photos".to_string()));
-            }
-            _ => panic!("Expected Sync with retry_failed"),
-        }
-    }
-
-    #[test]
     fn test_max_download_attempts_cli_parse() {
         let cli = Cli::try_parse_from([
             "kei",
@@ -2262,115 +1905,6 @@ mod tests {
             _ => panic!("Expected Sync"),
         }
     }
-
-    #[test]
-    fn test_legacy_reset_state_maps_to_reset() {
-        let cli = Cli::try_parse_from(["kei", "reset-state", "--yes"]).unwrap();
-        match cli.effective_command() {
-            Command::Reset {
-                what: ResetCommand::State { yes },
-            } => assert!(yes),
-            _ => panic!("Expected Reset State"),
-        }
-    }
-
-    #[test]
-    fn test_legacy_reset_sync_token_maps_to_reset() {
-        // Legacy alias preserves auto-confirm; the new canonical
-        // `kei reset sync-token` is the form that prompts.
-        let cli = Cli::try_parse_from(["kei", "reset-sync-token"]).unwrap();
-        assert!(matches!(
-            cli.effective_command(),
-            Command::Reset {
-                what: ResetCommand::SyncToken { yes: true },
-            }
-        ));
-    }
-
-    #[test]
-    fn test_legacy_setup_maps_to_config() {
-        let cli = Cli::try_parse_from(["kei", "setup"]).unwrap();
-        assert!(matches!(
-            cli.effective_command(),
-            Command::Config {
-                action: ConfigAction::Setup { output: None },
-            }
-        ));
-    }
-
-    #[test]
-    fn test_legacy_auth_only_maps_to_login() {
-        let cli = Cli::try_parse_from(["kei", "--auth-only"]).unwrap();
-        assert!(matches!(
-            cli.effective_command(),
-            Command::Login {
-                subcommand: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_legacy_list_albums_maps_to_list() {
-        let cli = Cli::try_parse_from(["kei", "--list-albums"]).unwrap();
-        assert!(matches!(
-            cli.effective_command(),
-            Command::List {
-                what: ListCommand::Albums,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_sync_auth_only_maps_to_login() {
-        let cli = Cli::try_parse_from(["kei", "sync", "--auth-only"]).unwrap();
-        assert!(matches!(
-            cli.effective_command(),
-            Command::Login {
-                subcommand: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_sync_list_albums_maps_to_list() {
-        let cli = Cli::try_parse_from(["kei", "sync", "--list-albums"]).unwrap();
-        assert!(matches!(
-            cli.effective_command(),
-            Command::List {
-                what: ListCommand::Albums,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_sync_list_libraries_maps_to_list() {
-        let cli = Cli::try_parse_from(["kei", "sync", "--list-libraries"]).unwrap();
-        assert!(matches!(
-            cli.effective_command(),
-            Command::List {
-                what: ListCommand::Libraries,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_legacy_list_libraries_maps_to_list() {
-        let cli = Cli::try_parse_from(["kei", "--list-libraries"]).unwrap();
-        assert!(matches!(
-            cli.effective_command(),
-            Command::List {
-                what: ListCommand::Libraries,
-                ..
-            }
-        ));
-    }
-
-    // ── Password args ─────────────────────────────────────────────
 
     #[test]
     fn test_password_flag() {
@@ -2478,40 +2012,6 @@ mod tests {
                 "!SharedSync-ABCD1234".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn test_threads_num_accepts_valid_value() {
-        let mut args = base_args();
-        args.extend(["--threads-num", "8"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.threads_num, Some(8));
-    }
-
-    #[test]
-    fn test_threads_num_rejects_zero() {
-        let mut args = base_args();
-        args.extend(["--threads-num", "0"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_threads_num_accepts_upper_bound() {
-        let mut args = base_args();
-        args.extend(["--threads-num", "64"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.threads_num, Some(64));
-    }
-
-    #[test]
-    fn test_threads_num_rejects_above_upper_bound() {
-        let mut args = base_args();
-        args.extend(["--threads-num", "65"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-
-        let mut args = base_args();
-        args.extend(["--threads-num", "5000"]);
-        assert!(Cli::try_parse_from(&args).is_err());
     }
 
     #[test]
@@ -2636,14 +2136,6 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_delay_custom() {
-        let mut args = base_args();
-        args.extend(["--retry-delay", "15"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.retry_delay, Some(15));
-    }
-
-    #[test]
     fn test_temp_suffix_custom() {
         let mut args = base_args();
         args.extend(["--temp-suffix", ".downloading"]);
@@ -2703,14 +2195,6 @@ mod tests {
         args.push("--skip-photos");
         let cli = parse(&args);
         assert_eq!(cli.sync.skip_photos, Some(true));
-    }
-
-    #[test]
-    fn test_skip_live_photos_flag() {
-        let mut args = base_args();
-        args.push("--skip-live-photos");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.skip_live_photos, Some(true));
     }
 
     #[test]
@@ -2976,18 +2460,6 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_directory_still_parses() {
-        // `--directory` is deprecated but must still parse into the legacy
-        // field so Config::build can emit the deprecation warning. Removal
-        // happens in v0.20.0, not now.
-        let mut args = base_args();
-        args.extend(["--directory", "/photos"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.directory.as_deref(), Some("/photos"));
-        assert!(cli.sync.download_dir.is_none());
-    }
-
-    #[test]
     fn test_watch_with_interval() {
         let mut args = base_args();
         args.extend(["--watch-with-interval", "3600"]);
@@ -3089,15 +2561,6 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_legacy_directory_rejected() {
-        // `non_empty_string` validator applies to the legacy field too, so an
-        // empty `--directory` fails at parse time rather than slipping through
-        // to emit a deprecation warning on an invalid value.
-        let args = ["kei", "--username", "user@example.com", "--directory", ""];
-        assert!(Cli::try_parse_from(args).is_err());
-    }
-
-    #[test]
     fn test_empty_album_rejected() {
         let mut args = base_args();
         args.extend(["--album", ""]);
@@ -3125,36 +2588,6 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_delay_rejects_zero() {
-        let mut args = base_args();
-        args.extend(["--retry-delay", "0"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_retry_delay_accepts_one() {
-        let mut args = base_args();
-        args.extend(["--retry-delay", "1"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.retry_delay, Some(1));
-    }
-
-    #[test]
-    fn test_retry_delay_rejects_above_3600() {
-        let mut args = base_args();
-        args.extend(["--retry-delay", "3601"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-    }
-
-    #[test]
-    fn test_retry_delay_accepts_3600() {
-        let mut args = base_args();
-        args.extend(["--retry-delay", "3600"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.retry_delay, Some(3600));
-    }
-
-    #[test]
     fn test_max_retries_rejects_above_100() {
         let mut args = base_args();
         args.extend(["--max-retries", "101"]);
@@ -3168,36 +2601,6 @@ mod tests {
         let cli = parse(&args);
         assert_eq!(cli.sync.max_retries, Some(100));
     }
-
-    // ── no-incremental / reset-sync-token compat flags ───────────
-
-    #[test]
-    fn test_no_incremental_flag() {
-        let mut args = base_args();
-        args.push("--no-incremental");
-        let cli = parse(&args);
-        assert!(cli.sync.no_incremental);
-    }
-
-    #[test]
-    fn test_reset_sync_token_compat_flag() {
-        let mut args = base_args();
-        args.push("--reset-sync-token");
-        let cli = parse(&args);
-        assert!(cli.sync.reset_sync_token);
-    }
-
-    #[test]
-    fn test_no_incremental_and_reset_sync_token_together() {
-        let mut args = base_args();
-        args.push("--no-incremental");
-        args.push("--reset-sync-token");
-        let cli = parse(&args);
-        assert!(cli.sync.no_incremental);
-        assert!(cli.sync.reset_sync_token);
-    }
-
-    // ── Sync subcommand ───────────────────────────────────────────
 
     #[test]
     fn test_sync_subcommand() {
@@ -3292,21 +2695,9 @@ mod tests {
             Cli::try_parse_from(["kei", "import-existing", "--download-dir", "/photos"]).unwrap();
         if let Some(Command::ImportExisting(args)) = cli.command {
             assert_eq!(args.download_dir.as_deref(), Some("/photos"));
-            assert!(args.directory.is_none());
+
             assert!(args.folder_structure.is_none());
             assert!(args.recent.is_none());
-        } else {
-            panic!("Expected ImportExisting command");
-        }
-    }
-
-    #[test]
-    fn test_import_existing_legacy_directory_still_parses() {
-        let cli =
-            Cli::try_parse_from(["kei", "import-existing", "--directory", "/photos"]).unwrap();
-        if let Some(Command::ImportExisting(args)) = cli.command {
-            assert_eq!(args.directory.as_deref(), Some("/photos"));
-            assert!(args.download_dir.is_none());
         } else {
             panic!("Expected ImportExisting command");
         }
@@ -3688,14 +3079,6 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_live_photos_compat_still_parses() {
-        let mut args = base_args();
-        args.push("--skip-live-photos");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.skip_live_photos, Some(true));
-    }
-
-    #[test]
     fn test_filename_exclude_single() {
         let mut args = base_args();
         args.extend(["--filename-exclude", "*.AAE"]);
@@ -3799,9 +3182,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_legacy_compat_flag_with_subcommand() {
+    fn removed_auth_only_flag_is_rejected() {
         let err = parse_and_validate(&["kei", "--auth-only", "status"])
-            .expect_err("validation must reject");
+            .expect_err("parse must reject removed flag");
         assert!(err.contains("--auth-only"), "got: {err}");
     }
 
@@ -3843,8 +3226,8 @@ mod tests {
 
     #[test]
     fn validate_allows_retry_failed_with_sync_flag() {
-        parse_and_validate(&["kei", "--threads", "4", "retry-failed"])
-            .expect("retry-failed accepts sync flags via merge");
+        parse_and_validate(&["kei", "sync", "--retry-failed", "--threads", "4"])
+            .expect("sync --retry-failed accepts sync flags");
     }
 
     #[test]
@@ -3902,18 +3285,11 @@ mod tests {
             ("no_progress_bar", &["--no-progress-bar=true"]),
             ("keep_unicode", &["--keep-unicode-in-filenames=true"]),
             ("notify_systemd", &["--notify-systemd=true"]),
-            ("skip_live_photos", &["--skip-live-photos=true"]),
             ("dry_run", &["--dry-run"]),
             ("only_print_filenames", &["--only-print-filenames"]),
             ("save_password", &["--save-password"]),
             ("retry_failed", &["--retry-failed"]),
-            ("no_incremental", &["--no-incremental"]),
-            ("reset_sync_token", &["--reset-sync-token"]),
-            ("auth_only", &["--auth-only"]),
-            ("list_albums", &["--list-albums"]),
-            ("list_libraries", &["--list-libraries"]),
             ("download_dir", &["--download-dir", "/photos"]),
-            ("directory", &["--directory", "/photos"]),
             ("album", &["--album", "Vacation"]),
             ("exclude_album", &["--exclude-album", "Hidden"]),
             ("smart_folder", &["--smart-folder", "Favorites"]),
@@ -3923,7 +3299,6 @@ mod tests {
             ("live_photo_size", &["--live-photo-size", "original"]),
             ("recent", &["--recent", "100"]),
             ("threads", &["--threads", "4"]),
-            ("threads_num", &["--threads-num", "8"]),
             ("bandwidth_limit", &["--bandwidth-limit", "10M"]),
             ("live_photo_mode", &["--live-photo-mode", "skip"]),
             ("folder_structure", &["--folder-structure", "%Y/%m"]),
@@ -3954,7 +3329,6 @@ mod tests {
                 &["--skip-created-after", "2025-12-31"],
             ),
             ("max_retries", &["--max-retries", "3"]),
-            ("retry_delay", &["--retry-delay", "10"]),
             ("temp_suffix", &["--temp-suffix", ".part"]),
             ("pid_file", &["--pid-file", "/tmp/kei.pid"]),
             (

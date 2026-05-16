@@ -193,7 +193,7 @@ dev CMD *ARGS:
     fi
     cargo run -- {{CMD}} \
         --data-dir "${KEI_DEV_DATA_DIR:-$HOME/.config/kei}" \
-        --directory "${KEI_DEV_PHOTOS_DIR:-/tmp/kei-dev-photos}" \
+        --download-dir "${KEI_DEV_PHOTOS_DIR:-/tmp/kei-dev-photos}" \
         {{ARGS}}
 
 # Docker: build | multiarch | run | shell | health.

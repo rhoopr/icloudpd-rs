@@ -789,22 +789,7 @@ fn build_import_download_config(
 ) -> anyhow::Result<download::DownloadConfig> {
     let toml_dl = toml.and_then(|t| t.download.as_ref());
 
-    anyhow::ensure!(
-        !(args.download_dir.is_some() && args.directory.is_some()),
-        "both `--download-dir` and `--directory` are set; `--directory` is \
-         deprecated and will be removed in v0.20.0 -- pick one"
-    );
-    let directory_cli = if let Some(d) = args.download_dir.clone() {
-        Some(d)
-    } else if let Some(d) = args.directory.clone() {
-        tracing::warn!(
-            "`--directory` / `KEI_DIRECTORY` is deprecated and will be removed in v0.20.0, \
-             use `--download-dir` / `KEI_DOWNLOAD_DIR` instead"
-        );
-        Some(d)
-    } else {
-        None
-    };
+    let directory_cli = args.download_dir.clone();
     let directory_str = directory_cli
         .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
         .unwrap_or_default();
@@ -2934,7 +2919,6 @@ mod build_config_tests {
             photos: None,
             watch: None,
             notifications: None,
-            metrics: None,
             server: None,
             report: None,
             ui: None,
@@ -3188,14 +3172,13 @@ mod build_config_tests {
             align_raw: Some(RawTreatmentPolicy::PreferOriginal),
             force_size: Some(true),
             keep_unicode_in_filenames: Some(true),
-            directory: Some("/photos".to_string()),
+            download_dir: Some("/photos".to_string()),
             ..Default::default()
         };
         let globals = GlobalArgs {
             username: Some("u@example.com".to_string()),
             domain: None,
             data_dir: None,
-            cookie_directory: None,
         };
         let sync_cfg = Config::build(
             &globals,
@@ -3243,14 +3226,13 @@ mod build_config_tests {
             .expect_err("import: system dir must reject");
 
         let sync = SyncArgs {
-            directory: Some("/etc".to_string()),
+            download_dir: Some("/etc".to_string()),
             ..Default::default()
         };
         let globals = GlobalArgs {
             username: Some("u@example.com".to_string()),
             domain: None,
             data_dir: None,
-            cookie_directory: None,
         };
         let sync_err = Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
             .expect_err("sync: system dir must reject");
@@ -3298,26 +3280,6 @@ mod build_config_tests {
         assert!(
             msg.contains("libraries PrimarySync, SharedSync-abc"),
             "must use plural `libraries` and list both, got: {msg}"
-        );
-    }
-
-    /// CG-10: setting both `--directory` (deprecated) and `--download-dir`
-    /// at once fails fast rather than letting one silently win. The
-    /// deprecation warning users rely on requires this guard to stay
-    /// strict.
-    #[test]
-    fn build_import_download_config_both_directory_flags_bails() {
-        let args = parse_import_args(&["--directory", "/old/photos"]);
-        // parse_import_args already set --download-dir=/photos, so both
-        // are present.
-        assert!(args.download_dir.is_some());
-        assert!(args.directory.is_some());
-        let err = build_import_download_config(&args, None)
-            .expect_err("both directory flags should bail");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("--directory") && (msg.contains("deprecated") || msg.contains("pick one")),
-            "error must name the deprecation conflict, got: {msg}"
         );
     }
 }

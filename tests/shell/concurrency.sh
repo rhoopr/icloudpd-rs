@@ -2,7 +2,7 @@
 # Concurrency, resume, and partial-failure tests against live iCloud.
 #
 # Covers scenarios that are easier to exercise from shell than from Rust:
-#   1. threads-num=5 against a real album, asserting DB/disk consistency
+#   1. threads=5 against a real album, asserting DB/disk consistency
 #   2. Interrupt mid-download (SIGKILL) and resume on re-run
 #   3. chmod-555 a target dir to force a per-asset failure, assert exit
 #      code 2 (partial failure)
@@ -50,11 +50,11 @@ kei_preflight_session
 # 1. Concurrent downloads + state DB consistency
 # ══════════════════════════════════════════════════════════════════════════
 echo ""
-echo "=== 1. Concurrent downloads (threads-num=5) ==="
+echo "=== 1. Concurrent downloads (threads=5) ==="
 DIR1=$(kei_scratch_dir concurrent)
 kei_db_exec "DELETE FROM assets"
 
-OUT=$(kei_sync --directory "$DIR1" --no-incremental --threads-num 5)
+OUT=$(kei_sync --download-dir "$DIR1" --threads 5)
 echo "$OUT" | grep -E "concurrency|downloaded|failed|completed"
 
 FC=$(find "$DIR1" -type f | wc -l | tr -d ' ')
@@ -92,7 +92,7 @@ kei_db_exec "DELETE FROM assets"
 # Session reuse puts auth at ~3s; kill at 4s so we interrupt mid- or
 # just-post-download. Even if all files complete before the kill the
 # resume pass validates idempotency.
-kei_sync --directory "$DIR2" --no-incremental --threads-num 1 &
+kei_sync --download-dir "$DIR2" --threads 1 &
 SYNC_PID=$!
 sleep 4
 kill -9 $SYNC_PID 2>/dev/null
@@ -103,7 +103,7 @@ PART_COUNT=$(find "$DIR2" -name "*.kei-tmp" | wc -l | tr -d ' ')
 FILE_COUNT=$(find "$DIR2" -type f ! -name "*.kei-tmp" | wc -l | tr -d ' ')
 echo "  After interrupt: $FILE_COUNT complete, $PART_COUNT .kei-tmp files"
 
-OUT=$(kei_sync --directory "$DIR2" --no-incremental --threads-num 1)
+OUT=$(kei_sync --download-dir "$DIR2" --threads 1)
 echo "$OUT" | grep -E "downloaded|failed|completed|Skipping"
 
 FINAL_FILES=$(find "$DIR2" -type f ! -name "*.kei-tmp" | wc -l | tr -d ' ')
@@ -130,7 +130,7 @@ kei_db_exec "DELETE FROM assets"
 mkdir -p "$DIR3/2019/11/09"
 chmod 555 "$DIR3/2019/11/09" "$DIR3/2019/11" "$DIR3/2019"
 
-kei_sync --directory "$DIR3" --no-incremental --threads-num 1 \
+kei_sync --download-dir "$DIR3" --threads 1 \
     --folder-structure-albums "%Y/%m/%d"
 EC=$?
 echo "  Exit code: $EC"

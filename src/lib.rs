@@ -667,7 +667,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         );
     }
 
-    // Build globals from CLI early (username, domain, data_dir, cookie_directory).
+    // Build globals from CLI early (username, domain, data_dir).
     let mut globals = config::GlobalArgs::from_cli(&cli);
 
     // Dispatch based on command
@@ -801,12 +801,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             }
         },
         Command::Sync { password, sync } => (sync.retry_failed, password, sync),
-        // Legacy variants should never reach here (effective_command maps them)
-        #[allow(
-            clippy::unreachable,
-            reason = "effective_command() maps every legacy variant to a modern one before this match"
-        )]
-        _ => unreachable!("legacy command variants should be mapped by effective_command()"),
     };
     sync_loop::run_sync(
         &globals,

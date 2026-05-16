@@ -56,11 +56,11 @@ docker run --rm \
         --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
         --data-dir /config \
-        --directory /photos \
+        --download-dir /photos \
         --album "$ALBUM" \
         --unfiled false \
         --no-progress-bar \
-        --no-incremental \
+        \
     2>&1
 kei_check "sync exits successfully"
 
@@ -114,7 +114,7 @@ docker run --rm \
         --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
         --data-dir /config \
-        --directory /photos \
+        --download-dir /photos \
         --album "$ALBUM" \
         --unfiled false \
         --no-progress-bar \
@@ -133,7 +133,7 @@ docker run --rm \
         --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
         --data-dir /config \
-        --directory /photos \
+        --download-dir /photos \
         --album "$ALBUM" \
         --unfiled false \
         --no-progress-bar \
@@ -172,7 +172,7 @@ docker run -d --name "$WATCH_NAME" \
         --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
         --data-dir /config \
-        --directory /photos \
+        --download-dir /photos \
         --album "$ALBUM" \
         --unfiled false \
         --no-progress-bar \
@@ -225,7 +225,7 @@ PWFILE_OUT=$(docker run --rm \
         --username "$ICLOUD_USERNAME" \
         --password-file /run/secrets/icloud_password \
         --data-dir /config \
-        --directory /photos \
+        --download-dir /photos \
         --album "$ALBUM" \
         --unfiled false \
         --no-progress-bar \

@@ -63,8 +63,7 @@ struct SetupAnswers {
     // Media types
     skip_videos: bool,
     /// `Some(_)` emits `[photos].live_photo_mode = "..."`; `None` keeps the
-    /// `Both` default. Replaces the wizard's old binary skip prompt and the
-    /// deprecated `[filters].skip_live_photos` emission.
+    /// `Both` default. Replaces the wizard's old binary skip prompt.
     live_photo_mode: Option<LivePhotoMode>,
     live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
@@ -100,8 +99,7 @@ struct SetupAnswers {
     #[cfg(feature = "xmp")]
     xmp_sidecar: bool,
     file_match_policy: Option<FileMatchPolicy>,
-    /// Top-level `data_dir` in the emitted TOML (replaces the deprecated
-    /// `[auth].cookie_directory`).
+    /// Top-level `data_dir` in the emitted TOML.
     data_dir: Option<String>,
     log_level: Option<LogLevel>,
     /// `[ui].friendly`. `None` keeps the section out of the emitted TOML so
@@ -1245,8 +1243,7 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             writeln!(out, "# skip_videos = false")?;
         }
         writeln!(out, "# skip_photos = false")?;
-        // `[filters].skip_live_photos` was deprecated in v0.13; the
-        // `live_photo_mode` setting is emitted in the [photos] section below.
+        // `live_photo_mode` is emitted in the [photos] section below.
         match answers.recent {
             Some(n) => writeln!(out, "recent = {n}")?,
             None => writeln!(out, "# recent = 0  (0 = all)")?,
@@ -1443,8 +1440,7 @@ mod tests {
         assert!(toml.contains("# threads = 10"));
         assert!(toml.contains("# log_level = \"warn\""));
         assert!(toml.contains("# data_dir = \"~/.config/kei\""));
-        // The deprecated `cookie_directory` and `skip_live_photos` keys
-        // must not appear in the generated config.
+        // Removed v0.20 keys must not appear in the generated config.
         assert!(!toml.contains("cookie_directory"));
         assert!(!toml.contains("skip_live_photos"));
     }
@@ -1518,11 +1514,6 @@ mod tests {
         let auth = parsed.auth.expect("auth section missing");
         assert_eq!(auth.username.as_deref(), Some("user@example.com"));
         assert!(auth.password.is_none());
-        assert!(
-            auth.cookie_directory.is_none(),
-            "wizard must not emit deprecated [auth].cookie_directory"
-        );
-
         let download = parsed.download.expect("download section missing");
         assert_eq!(download.directory.as_deref(), Some("~/Photos/iCloud"));
 
@@ -1532,10 +1523,6 @@ mod tests {
             "wizard must not emit deprecated [filters].library (singular)"
         );
         assert_eq!(filters.libraries.as_deref(), Some(&["all".to_string()][..]));
-        assert!(
-            filters.skip_live_photos.is_none(),
-            "wizard must not emit deprecated [filters].skip_live_photos"
-        );
     }
 
     #[test]
@@ -1675,17 +1662,11 @@ mod tests {
         let auth = parsed.auth.unwrap();
         assert_eq!(auth.username.as_deref(), Some("test@icloud.com"));
         assert_eq!(auth.domain, Some(Domain::Cn));
-        assert!(
-            auth.cookie_directory.is_none(),
-            "deprecated [auth].cookie_directory must not be emitted"
-        );
-
         let dl = parsed.download.unwrap();
         assert_eq!(dl.directory.as_deref(), Some("/data/photos"));
         assert_eq!(dl.folder_structure.as_deref(), Some("%Y-%m"));
         assert_eq!(dl.folder_structure_albums.as_deref(), Some("{album}/%Y-%m"));
         assert_eq!(dl.threads, Some(2));
-        assert_eq!(dl.threads_num, None);
         assert_eq!(dl.bandwidth_limit.as_deref(), Some("1Mi"));
         #[cfg(feature = "xmp")]
         {
@@ -1695,7 +1676,6 @@ mod tests {
         }
         let retry = dl.retry.unwrap();
         assert_eq!(retry.max_retries, Some(0));
-        assert_eq!(retry.delay, None);
 
         let filters = parsed.filters.unwrap();
         assert_eq!(filters.albums.as_deref(), Some(&["A".to_string()][..]));
@@ -1709,10 +1689,6 @@ mod tests {
             Some(&["*.tmp".to_string()][..])
         );
         assert_eq!(filters.skip_videos, Some(true));
-        assert!(
-            filters.skip_live_photos.is_none(),
-            "deprecated [filters].skip_live_photos must not be emitted; live_photo_mode in [photos] is canonical"
-        );
         assert!(
             filters.library.is_none(),
             "deprecated [filters].library (singular) must not be emitted"
@@ -1816,9 +1792,9 @@ mod tests {
             },
         ];
 
-        // Substrings the v0.13 deprecation paths in `Config::build` warn on.
-        // Match `key = ` (with the equals sign) so we don't false-positive on
-        // comment hints or substring matches inside a non-deprecated key.
+        // Removed/deprecated keys must not appear in wizard output. Match
+        // `key = ` (with the equals sign) so we don't false-positive on
+        // comment hints or substring matches inside another key.
         const DEPRECATED_KEYS: &[(&str, &str)] = &[
             (
                 "cookie_directory =",
@@ -2014,10 +1990,8 @@ mod tests {
         assert_eq!(sf, vec!["all", "!Hidden", "Recently Saved"]);
     }
 
-    /// `[metrics]` is the deprecated-since-0.11 section. The wizard must
-    /// emit the v0.13 replacement `[server]` instead and never name
-    /// `[metrics]` (even as a hint), since that would steer copy-pasters
-    /// straight back into the deprecation warning.
+    /// `[metrics]` was removed in v0.20. The wizard must emit `[server]`
+    /// instead and never name `[metrics]` even as a hint.
     #[test]
     fn test_wizard_emits_server_section_not_metrics() {
         let answers = SetupAnswers {
@@ -2031,7 +2005,7 @@ mod tests {
         assert!(toml_str.contains("# port = 9090"));
         assert!(
             !toml_str.contains("[metrics]"),
-            "wizard must not name the deprecated [metrics] section; got:\n{toml_str}"
+            "wizard must not name the removed [metrics] section; got:\n{toml_str}"
         );
     }
 
