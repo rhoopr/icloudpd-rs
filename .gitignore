@@ -1,5 +1,9 @@
 # Local Repo
 .scratch/
+.codex
+.codex/
+AGENTS.md
+CODEBASE.md
 
 # Pi coding agent
 .pi/
