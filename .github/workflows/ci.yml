@@ -14,6 +14,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_STABLE_TOOLCHAIN: "1.94.1"
+  RUST_NIGHTLY_TOOLCHAIN: "nightly-2026-05-15"
   # Treat any compiler warning as an error to keep the codebase warning-free
   RUSTFLAGS: "-Dwarnings"
 
@@ -74,6 +76,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -101,6 +104,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
           components: clippy
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       # Caches compiled dependencies to speed up subsequent runs
@@ -120,6 +124,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
           components: clippy
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -140,6 +145,8 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
@@ -158,6 +165,8 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo doc --no-deps --all-features
@@ -173,6 +182,8 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: taiki-e/install-action@7170fe35ac006b4d8f0bcdfba8168cf5c431a122 # cargo-udeps
       - run: cargo +nightly udeps --all-targets
@@ -187,6 +198,8 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
       - run: cargo fetch --locked
 
   # PR head coverage. Runs in parallel with coverage-base.
@@ -200,6 +213,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -239,6 +253,7 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:

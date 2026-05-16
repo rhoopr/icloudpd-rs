@@ -1725,9 +1725,9 @@ mod tests {
     /// values from env-provided ones.
     fn parse_and_validate(argv: &[&str]) -> Result<(), String> {
         let cmd = <Cli as clap::CommandFactory>::command();
-        let matches = cmd.try_get_matches_from(argv).unwrap();
+        let matches = cmd.try_get_matches_from(argv).map_err(|err| err.to_string())?;
         let explicit_sync_flags = explicit_top_level_sync_flags(&matches);
-        let cli = Cli::from_arg_matches(&matches).unwrap();
+        let cli = Cli::from_arg_matches(&matches).map_err(|err| err.to_string())?;
         cli.validate(&explicit_sync_flags)
     }
 

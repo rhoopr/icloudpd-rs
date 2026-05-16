@@ -16,9 +16,12 @@ def workflow_text(name: str) -> str:
     return (WORKFLOW_DIR / name).read_text()
 
 
+def workflow_paths() -> list[Path]:
+    return sorted([*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml")])
+
+
 def check_action_refs(errors: list[str]) -> None:
-    workflows = [*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml")]
-    for path in sorted(workflows):
+    for path in workflow_paths():
         for line_no, line in enumerate(path.read_text().splitlines(), start=1):
             if "\t" in line:
                 errors.append(f"{path}:{line_no}: tab character")
@@ -37,6 +40,24 @@ def check_action_refs(errors: list[str]) -> None:
                 errors.append(
                     f"{path}:{line_no}: action ref is not pinned to a full commit SHA: {ref}"
                 )
+
+
+def check_rust_toolchains(errors: list[str]) -> None:
+    for path in workflow_paths():
+        lines = path.read_text().splitlines()
+        for idx, line in enumerate(lines):
+            if "uses: dtolnay/rust-toolchain@" not in line:
+                continue
+
+            window = lines[idx : idx + 6]
+            toolchain_lines = [entry.strip() for entry in window if entry.strip().startswith("toolchain:")]
+            if not toolchain_lines:
+                errors.append(f"{path}:{idx + 1}: rust-toolchain step is missing explicit toolchain")
+                continue
+
+            value = toolchain_lines[0].split(":", maxsplit=1)[1].strip().strip('"\'')
+            if value in {"stable", "nightly"}:
+                errors.append(f"{path}:{idx + 1}: rust toolchain must not be a moving channel: {value}")
 
 
 def check_docker_publish(errors: list[str]) -> None:
@@ -80,6 +101,7 @@ def check_coverage_comment(errors: list[str]) -> None:
 def main() -> int:
     errors: list[str] = []
     check_action_refs(errors)
+    check_rust_toolchains(errors)
     check_docker_publish(errors)
     check_docker_test(errors)
     check_release(errors)
