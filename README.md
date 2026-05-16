@@ -15,10 +15,13 @@
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fgithub.com%2Fipitio%2Fbackage%2Fraw%2Findex%2Frhoopr%2Fkei%2Fkei.json&query=%24.raw_downloads&logo=docker&label=pulls" alt="Pulls"></a></p>
 
-- Parallel downloads with incremental sync (seconds on large libraries after the first run)
-- Resumable transfers verified by size and content hash
-- Watch mode, systemd integration, headless 2FA, Docker-ready
-- iCloud Photos supported today. NextCloud, Immich, Ente, and Google Takeout next.
+- Parallel, resumable downloads verified by size and checksum
+- Incremental CloudKit sync after the first run, with retry and watch mode
+- Albums, smart folders, unfiled photos, PrimarySync, and shared libraries
+- EXIF, XMP, RAW, Live Photo, and folder-template controls
+- Friendly terminal progress on TTYs, structured logs for services and scripts
+- Ops tools for status, verify, reconcile, import-existing, services, reports, health, and metrics
+- iCloud Photos is supported today. Nextcloud, Immich, Ente, and Google Takeout are planned.
 
 ---
 
@@ -73,38 +76,44 @@ For a guided walkthrough, run `kei config setup` instead.
 
 ---
 
-## Run as a service
+## Features
 
-Register kei to start at boot and keep syncing in the background. One command per platform:
+Sync scope:
 
-```sh
-kei install --user            # Linux (systemd user unit)
-kei install                   # macOS (launchd agent)
-kei install                   # Windows (run from elevated PowerShell)
-```
+- Choose albums with `--album`, smart folders with `--smart-folder`, and source libraries with `--library`.
+- Use `--unfiled` for photos that don't belong to a user album.
+- Filter by media type, filename glob, creation date, or recent count/window.
+- Keep multi-library trees separate with `{library}` in folder templates.
 
-Inside Docker the command is a no-op; the container runtime is the supervisor. Keep using `docker compose up -d`.
+Download behavior:
 
-Verify with `kei status` (the first line reports the service state) or `kei service status` for the platform-tuned view. To remove: `kei uninstall` (add `--purge` to also wipe state, config, and credentials).
+- Full scan on first run, CloudKit syncToken deltas after that.
+- Parallel workers, resumable temp files, checksum checks, retry limits, and failed-asset retry.
+- Optional bandwidth cap with `--bandwidth-limit`.
+- `--dry-run` and `--only-print-filenames` for planning without writes.
+- Watch mode with `--watch-with-interval`.
 
-Full per-platform guide including troubleshooting: [docs/install.md](docs/install.md). What the service runs once registered: [docs/service.md](docs/service.md).
+Media and metadata:
 
----
+- Download original, adjusted, medium, thumb, or alternative resources.
+- Pick Live Photo behavior: both, image-only, video-only, or skip.
+- Control RAW pairing and Live Photo MOV filenames.
+- Optionally write EXIF date, rating, GPS, and description fields.
+- Embed XMP or write `.xmp` sidecars with album, people, keyword, hidden, archived, burst, and subtype metadata.
 
-## Friendly output
+Operations:
 
-By default, `kei sync` on a plain terminal shows verb-cycling spinners, a summary card, and lifecycle narration ("Bringing them home...", "Done. 12 new files in 3 minutes."). Pipe the output, set `--report-json`, run under systemd or Docker, or set `--log-level` and kei automatically reverts to the structured `target+timestamp` log format that journals and shell scripts expect.
-
-Per-invocation override: `--no-friendly` forces the structured format; `--friendly` forces the friendly UX (subject to the auto-off rules above).
-
-Persist the choice in `config.toml`:
-
-```toml
-[ui]
-friendly = false   # or omit entirely to take the default
-```
-
-`kei config setup` includes a "Show friendly progress messages?" question that writes the same key.
+- `kei status` shows the local state database summary.
+- `kei verify --checksums` checks files already recorded in state.
+- `kei reconcile --dry-run` finds state rows whose files disappeared.
+- `kei import-existing` adopts an existing local photo tree.
+- `kei install`, `kei uninstall`, and `kei service status` manage the background service on Linux, macOS, and Windows.
+- Friendly output is on by default on plain TTYs. Use `--no-friendly` for structured logs, or `--friendly` to opt in where hard-off contexts don't apply.
+- `--report-json` writes an atomic per-cycle sync report.
+- Watch mode serves `/healthz` and `/metrics` on the configured HTTP bind and port.
+- Docker runs watch mode by default and supports `PUID`/`PGID` ownership for NAS deployments.
+- Passwords can come from the OS keyring, encrypted file fallback, environment, file, or command.
+- Notification scripts can run on 2FA, sync start, sync success, sync failure, and session expiry.
 
 ---
 
@@ -112,7 +121,7 @@ friendly = false   # or omit entirely to take the default
 
 Everything lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CLI reference, filtering and folder templates, watch mode, Docker Compose, credentials, troubleshooting, and more.
 
-- [Commands](https://github.com/rhoopr/kei/wiki/Home#commands) - `sync`, `install`, `uninstall`, `service`, `login`, `list`, `password`, `config`, `reset`, `status`, `verify`, `import-existing`
+- [Commands](https://github.com/rhoopr/kei/wiki/Home#commands) - `sync`, `install`, `uninstall`, `service`, `login`, `list`, `password`, `config`, `reset`, `status`, `verify`, `reconcile`, `import-existing`
 - [Configuration](https://github.com/rhoopr/kei/wiki/Configuration) - TOML file, env vars, precedence
 - [Docker](https://github.com/rhoopr/kei/wiki/Docker) - Compose files and headless 2FA
 - [Synology](https://github.com/rhoopr/kei/wiki/Synology) - Container Manager setup, PUID/PGID, Synology Photos integration
