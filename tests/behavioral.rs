@@ -19,16 +19,21 @@ mod common;
 
 use predicates::prelude::*;
 use rusqlite::OptionalExtension;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+static CLEAN_CMD_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Helper: run kei with env scrubbed and a temp data-dir so it never
 /// touches real config/cookies.
 fn clean_cmd() -> assert_cmd::Command {
     let mut cmd = common::cmd();
-    let default_data_dir =
-        std::env::temp_dir().join(format!("kei-behavioral-{}", std::process::id()));
+    let default_data_dir = std::env::temp_dir().join(format!(
+        "kei-behavioral-{}-{}",
+        std::process::id(),
+        CLEAN_CMD_ID.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&default_data_dir).unwrap();
     cmd.env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")

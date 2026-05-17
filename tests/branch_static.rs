@@ -11,7 +11,10 @@ use std::path::PathBuf;
 fn repo_file(path: &str) -> String {
     let mut full = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     full.push(path);
-    std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {}: {e}", full.display()))
+    std::fs::read_to_string(&full)
+        .unwrap_or_else(|e| panic!("read {}: {e}", full.display()))
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
 }
 
 #[test]
