@@ -3,85 +3,65 @@
 # env, or dispatch on a mode.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
+set tempdir := "/tmp"
 
 _default:
     @just --list
 
-# Pre-push gate: fmt + clippy + offline tests + doc + audit + typos +
+# Pre-push gate: fmt + clippy + offline tests + doc + audit + workflow hardening + typos +
 # round-trip property gate. The round-trip gate fails when this branch
 # adds/changes a serializer in src/ without a paired round-trip test;
 # see scripts/check-roundtrip-gate.sh for the detector and override.
 gate:
     cargo fmt --all --check
     cargo clippy --all-targets --all-features -- -D warnings
-    cargo test --lib -- --test-threads=1
-    cargo test --test cli --test behavioral --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
+    cargo clippy --all-targets --no-default-features -- -D warnings
+    cargo test --all-features
+    cargo test --no-default-features
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
     cargo fetch --locked
     cargo audit --deny warnings
+    python3 .github/scripts/check_workflow_hardening.py
     typos
     bash scripts/check-roundtrip-gate.sh
 
-# Pre-release battery: every gate + offline + live + shell suite in order.
-# Stops on first failure. Needs .env + Docker + an existing session.
+# Pre-release battery with phase logs, metrics, Docker smokes, and live smokes.
+# Stops on first failure. Keeps a /tmp/kei-full-test-*.log only when failing.
 full-test:
     #!/usr/bin/env bash
-    set -euxo pipefail
-    # ── Live-auth bootstrap ────────────────────────────────────────
-    if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f .env ]; then
-        set -a; source .env; set +a
-    fi
-    : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
-    export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
-    if [ -n "${ICLOUD_TEST_COOKIE_DIR:-}" ]; then
-        export ICLOUD_TEST_COOKIE_DIR
-    fi
-    # ── Phase 1: Gate ────────────────────────────────────────────
-    echo "=== Phase 1: Gate ==="
-    cargo fmt --all --check
-    cargo clippy --all-targets --all-features -- -D warnings
-    cargo test --lib -- --test-threads=1
-    cargo test --test cli --test behavioral --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
-    RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
-    cargo fetch --locked
-    cargo audit --deny warnings
-    typos
-    bash scripts/check-roundtrip-gate.sh
-    # ── Phase 2: Deps + tooling ───────────────────────────────────
-    echo "=== Phase 2: Deps + tooling ==="
-    cargo clippy --all-targets --no-default-features -- -D warnings
-    cargo test --no-default-features
-    # udeps needs nightly; fail early with install instructions if missing
-    cargo +nightly --version >/dev/null 2>&1 || { echo "ERROR: nightly toolchain not installed. Run: rustup toolchain install nightly"; exit 1; }
-    cargo udeps --version >/dev/null 2>&1 || { echo "ERROR: cargo-udeps not installed. Run: cargo install cargo-udeps"; exit 1; }
-    cargo +nightly udeps --all-targets
-    # audit and typos already ran in gate
-    # ── Phase 3: Full offline ─────────────────────────────────────
-    echo "=== Phase 3: Full offline ==="
-    cargo test --all-features
-    # ── Phase 4: Live ─────────────────────────────────────────────
-    echo "=== Phase 4: Live sync ==="
-    cargo test --test sync -- --ignored --test-threads=1
-    cargo test --test state_auth -- --ignored --test-threads=1
-    cargo test --test import_existing_live -- --ignored --test-threads=1
-    # ── Phase 5: Concurrency ──────────────────────────────────────
-    echo "=== Phase 5: Concurrency ==="
-    bash tests/shell/concurrency.sh
-    # ── Phase 6: State machine ────────────────────────────────────
-    echo "=== Phase 6: State machine ==="
-    bash tests/shell/state-machine.sh
-    # ── Phase 7: Docker ───────────────────────────────────────────
-    echo "=== Phase 7: Docker ==="
-    bash tests/shell/docker.sh
-    # ── Phase 8: Service smoke ────────────────────────────────────
-    echo "=== Phase 8: Service smoke ==="
-    if ! command -v systemd-analyze >/dev/null 2>&1 && ! command -v plutil >/dev/null 2>&1; then
-        echo "service-smoke skipped: not Linux or macOS"
-    else
-        just service-smoke
-    fi
-    echo ""
-    echo "full-test: all 8 phases passed"
+    set -Eeuo pipefail
+    log_path=$(mktemp "/tmp/kei-full-test-$(date +%Y%m%dT%H%M%S)-XXXXXX.log")
+    failed_line=""
+    failed_command=""
+    record_failure() {
+        failed_line="${BASH_LINENO[0]:-unknown}"
+        failed_command="$BASH_COMMAND"
+    }
+    finish() {
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            rm -f "$log_path"
+            return 0
+        fi
+        {
+            echo ""
+            echo "full-test: failed with exit code $rc"
+            if [ -n "$failed_command" ]; then
+                echo "full-test: failed command near line $failed_line: $failed_command"
+            fi
+            echo "full-test: log saved at $log_path"
+        } >&2
+        exit "$rc"
+    }
+    trap record_failure ERR
+    trap finish EXIT
+    exec > >(tee "$log_path") 2>&1
+    echo "full-test: keeping failure log at $log_path if this run fails"
+    scripts/full-test/run_all.sh
+
+# Compact history table for previous `just full-test` runs.
+full-test-history N="10":
+    scripts/full-test/history.sh "{{N}}"
 
 # Test dispatcher: offline | fast | live | concurrency | state | docker | PATTERN.
 test MODE="":
@@ -92,11 +72,7 @@ test MODE="":
     # harness default (./.test-cookies) when unset. Overridable via
     # the environment.
     _live_env() {
-        if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f .env ]; then
-            set -a; source .env; set +a
-        fi
-        : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
-        export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
+        source scripts/just/live-env.sh
     }
     case "{{MODE}}" in
         "")
@@ -134,11 +110,7 @@ cov MODE="" BASE="main":
     #!/usr/bin/env bash
     set -euo pipefail
     _live_env() {
-        if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f .env ]; then
-            set -a; source .env; set +a
-        fi
-        : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
-        export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
+        source scripts/just/live-env.sh
     }
     case "{{MODE}}" in
         "")
@@ -222,7 +194,7 @@ docker MODE:
             docker run --rm -it --entrypoint bash kei:dev
             ;;
         health)
-            container=$(docker ps --filter ancestor=kei:dev --format '{{{{.ID}}}}' | head -1)
+            container=$(docker ps --filter ancestor=kei:dev --quiet | head -1)
             if [ -z "$container" ]; then
                 echo "No running kei:dev container found." >&2
                 exit 1
@@ -253,7 +225,7 @@ release TARGET="":
             export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
             ;;
     esac
-    cargo build --release --target "$target"
+    cargo build --locked --release --target "$target"
     mkdir -p dist
     case "$target" in
         *-windows-*)
@@ -265,10 +237,18 @@ release TARGET="":
             tar -C "target/$target/release" -czf "$archive" kei
             ;;
     esac
-    (cd dist && sha256sum "$(basename "$archive")") >> dist/SHA256SUMS.txt
+    checksum_file="dist/SHA256SUMS.txt"
+    archive_name=$(basename "$archive")
+    checksum=$(cd dist && sha256sum "$archive_name")
+    tmp=$(mktemp "dist/SHA256SUMS.XXXXXX")
+    if [ -f "$checksum_file" ]; then
+        awk -v name="$archive_name" '$2 != name { print }' "$checksum_file" > "$tmp"
+    fi
+    printf '%s\n' "$checksum" >> "$tmp"
+    mv "$tmp" "$checksum_file"
     echo ""
     echo "Archive: $archive"
-    echo "Checksum appended to dist/SHA256SUMS.txt"
+    echo "Checksum written to dist/SHA256SUMS.txt"
     echo ""
     version=$(awk -F'"' '/^version = "/ {print $2; exit}' Cargo.toml)
     echo "=== CHANGELOG [$version] ==="
@@ -277,7 +257,7 @@ release TARGET="":
         in_section { print }
     ' CHANGELOG.md | sed '/./,$!d' | awk 'NR==1 && /^$/ {next} {print}'
 
-# Fuzz: list | build | run TARGET [SECONDS]. Requires nightly + cargo-fuzz; install with `rustup install nightly && cargo install cargo-fuzz`.
+# Fuzz: list | build | run TARGET [SECONDS] | all [SECONDS]. Requires nightly + cargo-fuzz; install with `rustup install nightly && cargo install cargo-fuzz`.
 fuzz MODE="list" *ARGS="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -295,6 +275,25 @@ fuzz MODE="list" *ARGS="":
             ;;
         build)
             cargo +nightly fuzz build
+            ;;
+        all)
+            args=({{ARGS}})
+            seconds="${args[0]:-60}"
+            mapfile -t targets < <(cargo +nightly fuzz list)
+            if [ "${#targets[@]}" -eq 0 ]; then
+                echo "no fuzz targets found" >&2
+                exit 1
+            fi
+            for target in "${targets[@]}"; do
+                echo ""
+                echo "=== fuzz $target (${seconds}s) ==="
+                mkdir -p "fuzz/corpus/$target"
+                extra=()
+                if [ -d "fuzz/seeds/$target" ]; then
+                    extra+=("fuzz/seeds/$target")
+                fi
+                cargo +nightly fuzz run "$target" "fuzz/corpus/$target" "${extra[@]}" -- -max_total_time="$seconds"
+            done
             ;;
         run)
             args=({{ARGS}})
@@ -320,10 +319,76 @@ fuzz MODE="list" *ARGS="":
             ;;
         *)
             echo "Unknown mode: {{MODE}}" >&2
-            echo "Modes: list | build | run TARGET [SECONDS]" >&2
+            echo "Modes: list | build | run TARGET [SECONDS] | all [SECONDS]" >&2
             exit 1
             ;;
     esac
+
+# Check local tools needed by gate/full-test/cov/fuzz/docker recipes.
+doctor:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    status=0
+    ok() { printf '[ok]   %s\n' "$1"; }
+    fail() { printf '[miss] %s\n' "$1"; status=1; }
+    note() { printf '[note] %s\n' "$1"; }
+    have_cmd() {
+        local cmd="$1"
+        local label="${2:-$1}"
+        local version=""
+        if command -v "$cmd" >/dev/null 2>&1; then
+            version=$("$cmd" --version 2>/dev/null | head -1 || true)
+            ok "$label${version:+: $version}"
+        else
+            fail "$label not found"
+        fi
+    }
+    have_cargo_subcommand() {
+        local subcmd="$1"
+        local label="${2:-cargo $subcmd}"
+        local version=""
+        if cargo "$subcmd" --version >/dev/null 2>&1; then
+            version=$(cargo "$subcmd" --version 2>/dev/null | head -1 || true)
+            ok "$label${version:+: $version}"
+        else
+            fail "$label not available"
+        fi
+    }
+    have_cmd just
+    have_cmd cargo
+    have_cmd rustup
+    if cargo +nightly --version >/dev/null 2>&1; then
+        ok "nightly toolchain: $(cargo +nightly --version | head -1)"
+    else
+        fail "nightly toolchain not installed"
+    fi
+    have_cmd cargo-fuzz
+    have_cargo_subcommand udeps "cargo-udeps"
+    have_cargo_subcommand audit "cargo-audit"
+    have_cargo_subcommand llvm-cov "cargo-llvm-cov"
+    have_cmd typos
+    have_cmd docker
+    if docker buildx version >/dev/null 2>&1; then
+        ok "docker buildx: $(docker buildx version | head -1)"
+    else
+        fail "docker buildx not available"
+    fi
+    if command -v systemd-analyze >/dev/null 2>&1 || command -v plutil >/dev/null 2>&1; then
+        ok "service-smoke verifier available"
+    else
+        note "service-smoke verifier not found; service-smoke is Linux/macOS only"
+    fi
+    if [ -f .env ]; then
+        ok ".env present for live recipes"
+    else
+        note ".env missing; live recipes need ICLOUD_USERNAME/ICLOUD_PASSWORD in environment"
+    fi
+    if [ -d .test-cookies ]; then
+        ok ".test-cookies present"
+    else
+        note ".test-cookies missing; live auth may need a fresh login"
+    fi
+    exit "$status"
 
 # Service-install smoke: builds release, dry-run install, validates artifact, uninstall, asserts clean.
 # Mirrors .github/workflows/service-smoke.yml. Linux + macOS only.
@@ -369,13 +434,14 @@ service-smoke:
             ;;
     esac
 
-# Create branch NAME off a freshly fetched origin/main (CLAUDE.md branch-from-fresh-main rule).
-branch NAME:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    git fetch origin main
-    if git show-ref --verify --quiet "refs/heads/{{NAME}}"; then
-        echo "branch '{{NAME}}' already exists locally" >&2
-        exit 1
-    fi
-    git switch -c "{{NAME}}" origin/main
+# Disabled: not part of the active workflow.
+# Create branch NAME off a freshly fetched origin/main (AGENTS.md branch-from-fresh-main rule).
+# branch NAME:
+#     #!/usr/bin/env bash
+#     set -euo pipefail
+#     git fetch origin main
+#     if git show-ref --verify --quiet "refs/heads/{{NAME}}"; then
+#         echo "branch '{{NAME}}' already exists locally" >&2
+#         exit 1
+#     fi
+#     git switch -c "{{NAME}}" origin/main

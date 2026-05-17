@@ -11,6 +11,10 @@ CODEBASE.md
 # Rust
 /target
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Claude
 .claude/
 CLAUDE.md
