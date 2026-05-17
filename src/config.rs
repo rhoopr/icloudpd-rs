@@ -1001,10 +1001,10 @@ impl Config {
     pub fn build(
         globals: &GlobalArgs,
         pw: &crate::cli::PasswordArgs,
-        sync: crate::cli::SyncArgs,
+        mut sync: crate::cli::SyncArgs,
         toml: Option<&TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let overrides = sync.config_overrides.clone();
+        let overrides = std::mem::take(&mut sync.config_overrides);
         Self::build_with_overrides(globals, pw, sync, overrides, toml)
     }
 

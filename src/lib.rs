@@ -548,11 +548,9 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             (expanded, false)
         }
     };
-    // When --config is explicitly set but the file doesn't exist, allow it
-    // if the parent directory exists (auto-config will create the file).
-    // Otherwise require the file to exist so typos in --config paths error.
     // When --config is explicit but the file doesn't exist and the parent
     // dir does exist, allow it (auto-config will create the file).
+    // Otherwise require the file to exist so typos in --config paths error.
     let can_auto_create =
         !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
