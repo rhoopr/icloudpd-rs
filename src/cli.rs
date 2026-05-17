@@ -1,5 +1,5 @@
 use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
+    FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
     RawTreatmentPolicy, VersionSize,
 };
 use clap::{Args, FromArgMatches, Parser, Subcommand};
@@ -233,91 +233,10 @@ pub struct SyncArgs {
     #[arg(long, conflicts_with = "dry_run")]
     pub retry_failed: bool,
 
-    // Durable sync settings are TOML-only in v0.20. These skipped fields keep
-    // internal resolver tests and programmatic call sites able to construct
-    // non-default configs without re-exposing the old public CLI/env mirrors.
+    /// Internal durable config overrides for tests and programmatic call
+    /// sites. Public CLI/env no longer expose these fields in v0.20.
     #[arg(skip)]
-    pub download_dir: Option<String>,
-    #[arg(skip)]
-    pub albums: Vec<String>,
-    #[arg(skip)]
-    pub smart_folders: Vec<String>,
-    #[arg(skip)]
-    pub unfiled: Option<bool>,
-    #[arg(skip)]
-    pub filename_exclude: Vec<String>,
-    #[arg(skip)]
-    pub libraries: Vec<String>,
-    #[arg(skip)]
-    pub size: Option<VersionSize>,
-    #[arg(skip)]
-    pub live_photo_size: Option<LivePhotoSize>,
-    #[arg(skip)]
-    pub threads: Option<u16>,
-    #[arg(skip)]
-    pub bandwidth_limit: Option<u64>,
-    #[arg(skip)]
-    pub skip_videos: Option<bool>,
-    #[arg(skip)]
-    pub skip_photos: Option<bool>,
-    #[arg(skip)]
-    pub live_photo_mode: Option<LivePhotoMode>,
-    #[arg(skip)]
-    pub force_size: Option<bool>,
-    #[arg(skip)]
-    pub folder_structure: Option<String>,
-    #[arg(skip)]
-    pub folder_structure_albums: Option<String>,
-    #[arg(skip)]
-    pub folder_structure_smart_folders: Option<String>,
-    #[cfg(feature = "xmp")]
-    #[arg(skip)]
-    pub set_exif_datetime: Option<bool>,
-    #[cfg(feature = "xmp")]
-    #[arg(skip)]
-    pub set_exif_rating: Option<bool>,
-    #[cfg(feature = "xmp")]
-    #[arg(skip)]
-    pub set_exif_gps: Option<bool>,
-    #[cfg(feature = "xmp")]
-    #[arg(skip)]
-    pub set_exif_description: Option<bool>,
-    #[cfg(feature = "xmp")]
-    #[arg(skip)]
-    pub embed_xmp: Option<bool>,
-    #[cfg(feature = "xmp")]
-    #[arg(skip)]
-    pub xmp_sidecar: Option<bool>,
-    #[arg(skip)]
-    pub watch_with_interval: Option<u64>,
-    #[arg(skip)]
-    pub keep_unicode_in_filenames: Option<bool>,
-    #[arg(skip)]
-    pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-    #[arg(skip)]
-    pub align_raw: Option<RawTreatmentPolicy>,
-    #[arg(skip)]
-    pub file_match_policy: Option<FileMatchPolicy>,
-    #[arg(skip)]
-    pub max_retries: Option<u32>,
-    #[arg(skip)]
-    pub temp_suffix: Option<String>,
-    #[arg(skip)]
-    pub notify_systemd: Option<bool>,
-    #[arg(skip)]
-    pub pid_file: Option<std::path::PathBuf>,
-    #[arg(skip)]
-    pub reconcile_every_n_cycles: Option<u64>,
-    #[arg(skip)]
-    pub notification_script: Option<String>,
-    #[arg(skip)]
-    pub report_json: Option<std::path::PathBuf>,
-    #[arg(skip)]
-    pub http_port: Option<u16>,
-    #[arg(skip)]
-    pub http_bind: Option<std::net::IpAddr>,
-    #[arg(skip)]
-    pub max_download_attempts: Option<u32>,
+    pub(crate) config_overrides: crate::config::SyncConfigOverrides,
 }
 
 /// Arguments for the status command.
@@ -713,7 +632,6 @@ pub struct Cli {
         long,
         global = true,
         overrides_with = "no_friendly",
-        env = "KEI_FRIENDLY",
         long_help = "Use friendly progress UI (verb-cycling spinners, curated phase narration, summary card, sign-off). \
                      Default: on for plain TTYs, off in service/container/journal contexts and whenever a \
                      machine-output mode (`--only-print-filenames` or TOML report JSON) or an explicit \
@@ -742,18 +660,6 @@ pub struct Cli {
         env = "KEI_CONFIG"
     )]
     pub config: String,
-
-    /// Apple ID email address
-    #[arg(short = 'u', long, global = true, env = "ICLOUD_USERNAME", value_parser = non_empty_string)]
-    pub username: Option<String>,
-
-    /// iCloud domain (com or cn)
-    #[arg(long, global = true, value_enum, env = "KEI_DOMAIN")]
-    pub domain: Option<Domain>,
-
-    /// Directory for sessions, state DB, and credentials
-    #[arg(long, global = true, env = "KEI_DATA_DIR")]
-    pub data_dir: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -808,8 +714,7 @@ impl PasswordArgs {
 
 impl Cli {
     /// User-stated friendly-mode preference, distilled from the
-    /// `--friendly` / `--no-friendly` pair (with `KEI_FRIENDLY` feeding the
-    /// former). `Some(true)` and `Some(false)` are explicit user requests
+    /// `--friendly` / `--no-friendly` pair. `Some(true)` and `Some(false)` are explicit user requests
     /// that override the TOML and the auto-detected default; `None` means
     /// neither flag was set, so the resolution chain falls through to TOML
     /// then to the default-on-for-TTY policy.
@@ -886,7 +791,11 @@ impl Cli {
         Err(format!(
             "the following sync-only flag{plural} cannot be combined with `kei {cmd_name}`: {flag_list}\n\
              bare-kei (no subcommand) is shorthand for `kei sync`; sync-only flags are only valid there or under `kei sync`",
-            plural = if explicit_sync_flags.len() == 1 { "" } else { "s" },
+            plural = if explicit_sync_flags.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
         ))
     }
 }
@@ -1063,8 +972,14 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
+    fn assert_removed_global_option(option: &str, value: &str) {
+        let err = Cli::try_parse_from(["kei", option, value])
+            .expect_err("removed global option must fail to parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
     fn assert_removed_sync_option(tail: &[&str]) {
-        let mut args = vec!["kei", "--username", "test@example.com"];
+        let mut args = vec!["kei"];
         args.extend_from_slice(tail);
         assert_removed_sync_flag(&args);
     }
@@ -1187,7 +1102,7 @@ mod tests {
     }
 
     fn base_args() -> Vec<&'static str> {
-        vec!["kei", "--username", "test@example.com"]
+        vec!["kei"]
     }
 
     /// Scrub auth-related env vars for the duration of the returned guard so
@@ -1249,21 +1164,18 @@ mod tests {
     // ── Global args ───────────────────────────────────────────────
 
     #[test]
-    fn test_username_global() {
-        let cli = parse(&["kei", "--username", "test@example.com"]);
-        assert_eq!(cli.username.as_deref(), Some("test@example.com"));
+    fn test_username_global_removed() {
+        assert_removed_global_option("--username", "test@example.com");
     }
 
     #[test]
-    fn test_domain_global() {
-        let cli = parse(&["kei", "--domain", "cn"]);
-        assert_eq!(cli.domain, Some(Domain::Cn));
+    fn test_domain_global_removed() {
+        assert_removed_global_option("--domain", "cn");
     }
 
     #[test]
-    fn test_data_dir_global() {
-        let cli = parse(&["kei", "--data-dir", "/config"]);
-        assert_eq!(cli.data_dir.as_deref(), Some("/config"));
+    fn test_data_dir_global_removed() {
+        assert_removed_global_option("--data-dir", "/config");
     }
 
     #[test]
@@ -1286,7 +1198,6 @@ mod tests {
     fn test_bare_invocation_without_username() {
         let _guard = scrub_auth_env();
         let cli = Cli::try_parse_from(["kei"]).unwrap();
-        assert!(cli.username.is_none());
         assert!(cli.command.is_none());
     }
     #[test]
@@ -1581,7 +1492,7 @@ mod tests {
 
     #[test]
     fn test_save_password_merges_into_subcommand() {
-        let cli = parse(&["kei", "--username", "u@e.com", "--save-password", "sync"]);
+        let cli = parse(&["kei", "--save-password", "sync"]);
         if let Command::Sync { sync, .. } = cli.effective_command() {
             assert!(sync.save_password);
         } else {
@@ -1712,7 +1623,7 @@ mod tests {
     #[test]
     fn test_unfiled_flag_default_none() {
         let cli = parse(&base_args());
-        assert_eq!(cli.sync.unfiled, None);
+        assert_eq!(cli.sync.config_overrides.unfiled, None);
     }
     #[test]
     fn test_unfiled_flag_bare_true() {
@@ -1788,7 +1699,7 @@ mod tests {
     #[test]
     fn test_reconcile_every_n_cycles_default_unset() {
         let cli = parse(&base_args());
-        assert!(cli.sync.reconcile_every_n_cycles.is_none());
+        assert!(cli.sync.config_overrides.reconcile_every_n_cycles.is_none());
     }
 
     // 0 is "off" via TOML (or absence); the CLI flag rejects it so users
@@ -1896,7 +1807,7 @@ mod tests {
     #[test]
     fn test_albums_empty_by_default() {
         let cli = parse(&base_args());
-        assert!(cli.sync.albums.is_empty());
+        assert!(cli.sync.config_overrides.albums.is_empty());
     }
     #[test]
     fn test_album_all_accepted() {
@@ -1907,8 +1818,7 @@ mod tests {
 
     #[test]
     fn test_empty_username_rejected() {
-        let args = ["kei", "--username", ""];
-        assert!(Cli::try_parse_from(args).is_err());
+        assert_removed_global_option("--username", "");
     }
 
     #[test]
@@ -1920,14 +1830,7 @@ mod tests {
 
     #[test]
     fn test_empty_download_dir_rejected() {
-        let args = [
-            "kei",
-            "--username",
-            "user@example.com",
-            "--download-dir",
-            "",
-        ];
-        assert!(Cli::try_parse_from(args).is_err());
+        assert_removed_sync_option(&["--download-dir", ""]);
     }
 
     #[test]
@@ -1969,7 +1872,7 @@ mod tests {
     }
     #[test]
     fn test_sync_subcommand() {
-        let cli = Cli::try_parse_from(["kei", "sync", "--username", "x@x.com"]).unwrap();
+        let cli = Cli::try_parse_from(["kei", "sync"]).unwrap();
         assert!(matches!(cli.effective_command(), Command::Sync { .. }));
     }
 
@@ -2039,9 +1942,10 @@ mod tests {
     }
 
     #[test]
-    fn test_username_global_before_subcommand() {
-        let cli = Cli::try_parse_from(["kei", "--username", "test@example.com", "sync"]).unwrap();
-        assert_eq!(cli.username.as_deref(), Some("test@example.com"));
+    fn test_username_global_before_subcommand_removed() {
+        let err = Cli::try_parse_from(["kei", "--username", "test@example.com", "sync"])
+            .expect_err("removed global option must fail to parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     // ── import-existing ───────────────────────────────────────────
@@ -2550,16 +2454,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_allows_global_flags_with_non_sync_subcommand() {
-        parse_and_validate(&[
-            "kei",
-            "--username",
-            "u@e.com",
-            "--log-level",
-            "debug",
-            "status",
-        ])
-        .expect("global flags must validate with any subcommand");
+    fn validate_allows_kept_global_flags_with_non_sync_subcommand() {
+        parse_and_validate(&["kei", "--log-level", "debug", "status"])
+            .expect("global flags must validate with any subcommand");
     }
 
     #[test]

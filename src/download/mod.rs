@@ -375,12 +375,14 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
 pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     use sha2::{Digest, Sha256};
 
-    let size: AssetVersionSize = config.size.into();
-    let live_photo_size = config.live_photo_size.to_asset_version_size();
+    let size: AssetVersionSize = config.photos.size.into();
+    let live_photo_size = config.photos.live_photo_size.to_asset_version_size();
     let skip_created_before = config
+        .filters
         .skip_created_before
         .map(|d| d.with_timezone(&chrono::Utc));
     let skip_created_after = config
+        .filters
         .skip_created_after
         .map(|d| d.with_timezone(&chrono::Utc));
 
@@ -388,23 +390,23 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     hash_shared_fields(
         &mut hasher,
         &SharedHashFields {
-            directory: &config.directory,
-            folder_structure: &config.folder_structure,
-            folder_structure_albums: &config.folder_structure_albums,
-            folder_structure_smart_folders: &config.folder_structure_smart_folders,
+            directory: &config.download.directory,
+            folder_structure: &config.download.folder_structure,
+            folder_structure_albums: &config.download.folder_structure_albums,
+            folder_structure_smart_folders: &config.download.folder_structure_smart_folders,
             size,
             live_photo_size,
-            file_match_policy: config.file_match_policy,
-            live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
-            align_raw: config.align_raw,
-            keep_unicode_in_filenames: config.keep_unicode_in_filenames,
+            file_match_policy: config.photos.file_match_policy,
+            live_photo_mov_filename_policy: config.photos.live_photo_mov_filename_policy,
+            align_raw: config.photos.align_raw,
+            keep_unicode_in_filenames: config.photos.keep_unicode_in_filenames,
             skip_created_before,
             skip_created_after,
-            force_size: config.force_size,
-            skip_videos: config.skip_videos,
-            skip_photos: config.skip_photos,
-            live_photo_mode: config.live_photo_mode,
-            filename_exclude: &config.filename_exclude,
+            force_size: config.photos.force_size,
+            skip_videos: config.filters.skip_videos,
+            skip_photos: config.filters.skip_photos,
+            live_photo_mode: config.photos.live_photo_mode,
+            filename_exclude: &config.download.filename_exclude,
         },
     );
     // Note: `recent` is intentionally excluded from this enum hash.
@@ -419,7 +421,7 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     // Tag byte distinguishes the three selection modes so switching between
     // them (e.g. `-a A` -> `-a all`) invalidates the sync token even if no
     // explicit album name changed.
-    match &config.albums {
+    match &config.filters.albums {
         crate::config::AlbumSelection::LibraryOnly => hasher.update([0]),
         crate::config::AlbumSelection::All => hasher.update([1]),
         crate::config::AlbumSelection::Named(names) => {
@@ -431,6 +433,7 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
         }
     }
     let mut sorted_excludes: Vec<&str> = config
+        .filters
         .exclude_albums
         .iter()
         .map(std::string::String::as_str)
@@ -444,7 +447,7 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     // Library selector: stable tag bytes per shape so changing the resolved
     // library set invalidates sync tokens. `to_raw()` emits a deterministic
     // ordering (`primary`/`shared`/named-then-`!excluded`).
-    for entry in config.selection.libraries.to_raw() {
+    for entry in config.filters.selection.libraries.to_raw() {
         hasher.update(b"library:");
         hasher.update(entry.as_bytes());
         hasher.update(b"\0");
@@ -455,13 +458,13 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     // `--smart-folder none` → `--smart-folder all` (or `--unfiled false` →
     // default true) change reuses a stale enumeration cursor and the next
     // cycle silently misses every newly-eligible asset.
-    for entry in config.selection.smart_folders.to_raw() {
+    for entry in config.filters.selection.smart_folders.to_raw() {
         hasher.update(b"smart_folder:");
         hasher.update(entry.as_bytes());
         hasher.update(b"\0");
     }
     hasher.update(b"unfiled:");
-    hasher.update([u8::from(config.selection.unfiled)]);
+    hasher.update([u8::from(config.filters.selection.unfiled)]);
     finalize_hash(hasher)
 }
 
@@ -2699,75 +2702,31 @@ mod tests {
     #[test]
     fn test_compute_config_hash_matches_hash_download_config() {
         use crate::config::Config;
-        use crate::types::{
-            Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize,
-            RawTreatmentPolicy, VersionSize,
-        };
-        use secrecy::SecretString;
+        use crate::types::VersionSize;
 
         let dl_config = test_config();
-        let app_config = Config {
-            username: String::new(),
-            password: Some(SecretString::from("x")),
-            password_file: None,
-            password_command: None,
-            directory: dl_config.directory.to_path_buf(),
-            cookie_directory: std::path::PathBuf::from("/tmp"),
-            folder_structure: dl_config.folder_structure.clone(),
-            folder_structure_albums: crate::config::DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
-            folder_structure_smart_folders: crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS
-                .to_string(),
-            albums: crate::config::AlbumSelection::LibraryOnly,
-            exclude_albums: vec![],
-            filename_exclude: vec![],
-            temp_suffix: dl_config.temp_suffix.to_string(),
-            selection: crate::selection::Selection::default(),
-            skip_created_before: None,
-            skip_created_after: None,
-            pid_file: None,
-            notification_script: None,
-            report_json: None,
-            http_port: 9090,
-            http_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-            watch_with_interval: None,
-            retry_delay_secs: 5,
-            reconcile_every_n_cycles: None,
-            recent: dl_config.recent,
-            max_retries: 3,
-            max_download_attempts: 10,
-            bandwidth_limit: None,
-            threads_num: 1,
-            size: VersionSize::Original,
-            live_photo_size: LivePhotoSize::Original,
-            domain: Domain::Com,
-            live_photo_mode: LivePhotoMode::Both,
-            live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-            align_raw: RawTreatmentPolicy::Unchanged,
-            file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
-            skip_videos: false,
-            skip_photos: false,
-            force_size: false,
-            #[cfg(feature = "xmp")]
-            set_exif_datetime: false,
-            #[cfg(feature = "xmp")]
-            set_exif_rating: false,
-            #[cfg(feature = "xmp")]
-            set_exif_gps: false,
-            #[cfg(feature = "xmp")]
-            set_exif_description: false,
-            #[cfg(feature = "xmp")]
-            embed_xmp: false,
-            #[cfg(feature = "xmp")]
-            xmp_sidecar: false,
-            dry_run: false,
-            no_progress_bar: true,
-            personality_mode: crate::personality::Mode::Off,
-            friendly_request: None,
-            keep_unicode_in_filenames: false,
-            only_print_filenames: false,
-            notify_systemd: false,
-            save_password: false,
+        let globals = crate::config::GlobalArgs {
+            username: Some("u@example.com".to_string()),
+            domain: None,
+            data_dir: Some("/tmp".to_string()),
         };
+        let app_config = Config::build(
+            &globals,
+            &crate::cli::PasswordArgs::default(),
+            crate::cli::SyncArgs {
+                recent: dl_config.recent.map(crate::cli::RecentLimit::Count),
+                config_overrides: crate::config::SyncConfigOverrides {
+                    download_dir: Some(dl_config.directory.display().to_string()),
+                    folder_structure: Some(dl_config.folder_structure.clone()),
+                    size: Some(VersionSize::Original),
+                    ..Default::default()
+                },
+                no_progress_bar: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
 
         // compute_config_hash is a superset (includes albums, library, live_photo_mode)
         // so it won't match hash_download_config. Verify it's deterministic and valid hex.
@@ -2779,7 +2738,7 @@ mod tests {
 
         // Verify album changes produce a different hash
         let mut config_with_album = app_config;
-        config_with_album.albums =
+        config_with_album.filters.albums =
             crate::config::AlbumSelection::Named(vec!["Favorites".to_string()]);
         let hash3 = compute_config_hash(&config_with_album);
         assert_ne!(hash1, hash3, "adding an album must change the hash");
@@ -3215,7 +3174,10 @@ mod tests {
             data_dir: Some(cookie_dir.to_string_lossy().into_owned()),
         };
         let mut sync = SyncArgs {
-            download_dir: Some(directory.to_string()),
+            config_overrides: crate::config::SyncConfigOverrides {
+                download_dir: Some(directory.to_string()),
+                ..Default::default()
+            },
             ..SyncArgs::default()
         };
         overrides(&mut sync);
@@ -3245,7 +3207,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.size = Some(VersionSize::Medium);
+            s.config_overrides.size = Some(VersionSize::Medium);
         });
         assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
     }
@@ -3255,7 +3217,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.skip_videos = Some(true);
+            s.config_overrides.skip_videos = Some(true);
         });
         assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
     }
@@ -3265,7 +3227,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.albums = vec!["Favorites".to_string()];
+            s.config_overrides.albums = vec!["Favorites".to_string()];
         });
         assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
     }
@@ -3275,7 +3237,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.albums = vec!["!Hidden".to_string()];
+            s.config_overrides.albums = vec!["!Hidden".to_string()];
         });
         assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
     }
@@ -3285,7 +3247,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.live_photo_mode = Some(LivePhotoMode::Skip);
+            s.config_overrides.live_photo_mode = Some(LivePhotoMode::Skip);
         });
         assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
     }
@@ -3301,7 +3263,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.smart_folders = vec!["Favorites".to_string()];
+            s.config_overrides.smart_folders = vec!["Favorites".to_string()];
         });
         assert_ne!(
             compute_config_hash(&a),
@@ -3320,7 +3282,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.unfiled = Some(false);
+            s.config_overrides.unfiled = Some(false);
         });
         assert_ne!(
             compute_config_hash(&a),
@@ -3335,7 +3297,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.libraries = vec!["all".to_string()];
+            s.config_overrides.libraries = vec!["all".to_string()];
         });
         assert_ne!(
             compute_config_hash(&a),
@@ -3626,7 +3588,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.filename_exclude = vec!["*.AAE".to_string()];
+            s.config_overrides.filename_exclude = vec!["*.AAE".to_string()];
         });
         assert_ne!(
             compute_config_hash(&a),
@@ -3731,7 +3693,7 @@ mod tests {
     fn golden_compute_config_hash_with_albums() {
         let tmp = TempDir::new().unwrap();
         let config = build_config_with(tmp.path(), "/photos", |s| {
-            s.albums = vec![
+            s.config_overrides.albums = vec![
                 "Favorites".to_string(),
                 "Travel".to_string(),
                 "!Hidden".to_string(),
@@ -3752,7 +3714,7 @@ mod tests {
         // test catches accidental field-format changes.
         let tmp = TempDir::new().unwrap();
         let config = build_config_with(tmp.path(), "/photos", |s| {
-            s.smart_folders = vec!["Favorites".to_string(), "Videos".to_string()];
+            s.config_overrides.smart_folders = vec!["Favorites".to_string(), "Videos".to_string()];
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
@@ -3769,7 +3731,7 @@ mod tests {
         // collapsing the two branches is caught.
         let tmp = TempDir::new().unwrap();
         let config = build_config_with(tmp.path(), "/photos", |s| {
-            s.unfiled = Some(false);
+            s.config_overrides.unfiled = Some(false);
         });
         let hash = compute_config_hash(&config);
         assert_eq!(

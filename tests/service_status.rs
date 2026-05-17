@@ -44,8 +44,7 @@ fn status_cmd(tmp: &TempDir) -> assert_cmd::Command {
     let mut cmd = common::cmd();
     cmd.timeout(TIMEOUT)
         .env("ICLOUD_USERNAME", "service-status-test@example.invalid")
-        .args(["--data-dir"])
-        .arg(tmp.path())
+        .env("KEI_DATA_DIR", tmp.path())
         .arg("status");
     cmd
 }

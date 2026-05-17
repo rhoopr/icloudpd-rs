@@ -240,17 +240,18 @@ fn config_flag_accepted() {
 // ── Short flag aliases ──────────────────────────────────────────────────
 
 #[test]
-fn short_u_flag_accepted() {
+fn short_u_flag_removed() {
     common::cmd()
         .args(["sync", "-u", "x@x.com", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
 fn short_p_flag_accepted() {
     common::cmd()
-        .args(["sync", "-u", "x@x.com", "-p", "secret", "--help"])
+        .args(["sync", "-p", "secret", "--help"])
         .assert()
         .success();
 }
@@ -323,7 +324,7 @@ fn reset_sync_token_short_y_flag_parses() {
 #[test]
 fn size_rejects_invalid_variant() {
     common::cmd()
-        .args(["sync", "--username", "x@x.com", "--size", "huge"])
+        .args(["sync", "--size", "huge"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument"));
@@ -332,7 +333,7 @@ fn size_rejects_invalid_variant() {
 #[test]
 fn domain_rejects_invalid() {
     common::cmd()
-        .args(["sync", "--username", "x@x.com", "--domain", "uk"])
+        .args(["sync", "--domain", "uk"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("error"));
@@ -341,13 +342,7 @@ fn domain_rejects_invalid() {
 #[test]
 fn live_photo_size_rejects_invalid() {
     common::cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--live-photo-size",
-            "xlarge",
-        ])
+        .args(["sync", "--live-photo-size", "xlarge"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument"));
@@ -356,13 +351,7 @@ fn live_photo_size_rejects_invalid() {
 #[test]
 fn live_photo_mov_filename_policy_rejects_invalid() {
     common::cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--live-photo-mov-filename-policy",
-            "custom",
-        ])
+        .args(["sync", "--live-photo-mov-filename-policy", "custom"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument"));
@@ -371,7 +360,7 @@ fn live_photo_mov_filename_policy_rejects_invalid() {
 #[test]
 fn align_raw_rejects_invalid() {
     common::cmd()
-        .args(["sync", "--username", "x@x.com", "--align-raw", "bogus"])
+        .args(["sync", "--align-raw", "bogus"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument"));
@@ -380,13 +369,7 @@ fn align_raw_rejects_invalid() {
 #[test]
 fn file_match_policy_rejects_invalid() {
     common::cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--file-match-policy",
-            "random",
-        ])
+        .args(["sync", "--file-match-policy", "random"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument"));
@@ -397,7 +380,7 @@ fn file_match_policy_rejects_invalid() {
 #[test]
 fn threads_rejects_zero() {
     common::cmd()
-        .args(["sync", "--username", "x@x.com", "--threads", "0"])
+        .args(["sync", "--threads", "0"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument"));
@@ -406,7 +389,7 @@ fn threads_rejects_zero() {
 #[test]
 fn removed_threads_num_flag_fails() {
     common::cmd()
-        .args(["sync", "--username", "x@x.com", "--threads-num", "4"])
+        .args(["sync", "--threads-num", "4"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument"));
@@ -417,7 +400,8 @@ fn removed_threads_num_flag_fails() {
 #[test]
 fn submit_code_requires_code_argument() {
     common::cmd()
-        .args(["login", "submit-code", "--username", "x@x.com"])
+        .env("ICLOUD_USERNAME", "x@x.com")
+        .args(["login", "submit-code"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("error"));
@@ -428,7 +412,8 @@ fn submit_code_requires_code_argument() {
 #[test]
 fn import_existing_requires_directory() {
     common::cmd()
-        .args(["import-existing", "--username", "x@x.com"])
+        .env("ICLOUD_USERNAME", "x@x.com")
+        .args(["import-existing"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--download-dir is required"));
@@ -553,7 +538,7 @@ fn unfiled_flag_accepts_bare_and_explicit_value() {
 // ── Default command (no subcommand = sync) ──────────────────────────────
 
 #[test]
-fn bare_invocation_with_username_and_directory_parses() {
+fn bare_invocation_with_removed_durable_flags_fails() {
     common::cmd()
         .args(["--username", "x@x.com", "--download-dir", "/tmp", "--help"])
         .assert()
@@ -726,13 +711,8 @@ fn config_explicit_nonexistent_path_fails_at_runtime() {
     let output = common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
-        .args([
-            "--config",
-            "/nonexistent/explicit/config.toml",
-            "status",
-            "--username",
-            "x@x.com",
-        ])
+        .env("ICLOUD_USERNAME", "x@x.com")
+        .args(["--config", "/nonexistent/explicit/config.toml", "status"])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
         .failure()
@@ -749,11 +729,12 @@ fn config_explicit_nonexistent_path_fails_at_runtime() {
 // ── Auth flags on non-sync subcommands ──────────────────────────────────
 
 #[test]
-fn domain_flag_works_on_status() {
+fn domain_flag_is_removed_on_status() {
     common::cmd()
         .args(["status", "--domain", "cn", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -808,11 +789,11 @@ fn unknown_flag_on_all_subcommands_fails() {
     }
 }
 
-// ── Auth flags accepted on all subcommands ──────────────────────────
+// ── Auth flags removed from all subcommands ─────────────────────────
 
 #[test]
-fn auth_flags_accepted_on_all_subcommands() {
-    // Global flags (--username, --domain, --data-dir) work on all subcommands
+fn auth_flags_rejected_on_all_subcommands() {
+    // Durable auth/storage inputs are TOML/env only in v0.20.
     for sub in ALL_SUBCOMMANDS {
         for (flag, value) in [
             ("--username", "x@x.com"),
@@ -822,7 +803,8 @@ fn auth_flags_accepted_on_all_subcommands() {
             common::cmd()
                 .args([sub, flag, value, "--help"])
                 .assert()
-                .success();
+                .failure()
+                .stderr(predicate::str::contains("unexpected argument"));
         }
     }
     // --password only accepted on commands with PasswordArgs
@@ -917,7 +899,7 @@ fn exit_code_0_on_version() {
     common::cmd().arg("--version").assert().code(0);
 }
 
-/// Exit code 1 (generic failure) when --username is missing.
+/// Exit code 1 (generic failure) when username is missing.
 #[test]
 fn exit_code_1_on_missing_username() {
     let dir = tempfile::tempdir().unwrap();
@@ -931,17 +913,12 @@ fn exit_code_1_on_missing_username() {
     common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
-        .args([
-            "sync",
-            "--config",
-            config.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["sync", "--config", config.to_str().unwrap()])
         .timeout(std::time::Duration::from_secs(30))
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("--username is required"));
+        .stderr(predicate::str::contains("username is required"));
 }
 
 /// Exit code 3 (auth failure) when password file is empty.
@@ -963,14 +940,12 @@ fn exit_code_3_on_empty_password_file() {
     common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
+        .env("ICLOUD_USERNAME", "exit-code-test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
         .args([
             "sync",
-            "--username",
-            "exit-code-test@example.com",
             "--config",
             config.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
             "--password-file",
             pw_file.to_str().unwrap(),
         ])
@@ -996,14 +971,12 @@ fn exit_code_3_on_newline_only_password_file() {
     common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
+        .env("ICLOUD_USERNAME", "exit-code-test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
         .args([
             "sync",
-            "--username",
-            "exit-code-test@example.com",
             "--config",
             config.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
             "--password-file",
             pw_file.to_str().unwrap(),
         ])
@@ -1017,10 +990,10 @@ fn exit_code_3_on_newline_only_password_file() {
 #[test]
 fn exit_code_2_on_invalid_argument() {
     common::cmd()
-        .args(["sync", "--username", ""])
+        .args(["sync", "--unknown"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("value must not be empty"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 // ── New subcommand help ────────────────────────────────────────────────
@@ -1197,23 +1170,25 @@ fn retry_failed_conflicts_with_watch() {
         .stderr(predicate::str::contains("unexpected argument"));
 }
 
-// ── --data-dir global ─────────────────────────────────────────────────
+// ── --data-dir global removed ─────────────────────────────────────────
 
 #[test]
-fn data_dir_flag_accepted() {
+fn data_dir_flag_rejected() {
     common::cmd()
         .args(["sync", "--data-dir", "/tmp/data", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
-fn data_dir_global_works_with_subcommands() {
+fn data_dir_global_rejected_with_subcommands() {
     for sub in ALL_SUBCOMMANDS {
         common::cmd()
             .args([sub, "--data-dir", "/tmp/data", "--help"])
             .assert()
-            .success();
+            .failure()
+            .stderr(predicate::str::contains("unexpected argument"));
     }
 }
 
@@ -1262,14 +1237,9 @@ fn config_show_produces_toml_output() {
     let output = common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
-        .args([
-            "config",
-            "show",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            "/tmp",
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", "/tmp")
+        .args(["config", "show"])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
         .success()
@@ -1291,14 +1261,9 @@ fn reset_sync_token_no_db_prints_message() {
     common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
-        .args([
-            "reset",
-            "sync-token",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "sync-token"])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
         .success()
@@ -1311,15 +1276,9 @@ fn reset_state_no_db_prints_message() {
     common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
-        .args([
-            "reset",
-            "state",
-            "--yes",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "state", "--yes"])
         .timeout(std::time::Duration::from_secs(10))
         .assert()
         .success()

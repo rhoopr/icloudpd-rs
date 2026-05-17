@@ -143,17 +143,15 @@ kei_preflight_session() {
     local bin cookies out
     bin="$(kei_release_bin)"
     cookies="$(kei_cookie_dir)"
-    out=$("$bin" login \
-        --username "$ICLOUD_USERNAME" \
-        --password "$ICLOUD_PASSWORD" \
-        --data-dir "$cookies" 2>&1)
+    out=$(KEI_DATA_DIR="$cookies" "$bin" login \
+        --password "$ICLOUD_PASSWORD" 2>&1)
     if echo "$out" | grep -q "Authentication completed\|Session OK\|already authenticated"; then
         kei_check "session valid" 0
         return 0
     fi
     echo "  ABORT: session invalid or rate-limited"
     echo "$out" | tail -3
-    echo "  Re-authenticate: cargo run --release -- login --data-dir $cookies"
+    echo "  Re-authenticate: KEI_DATA_DIR=$cookies cargo run --release -- login"
     exit 1
 }
 

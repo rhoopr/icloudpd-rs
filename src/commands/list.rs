@@ -21,7 +21,7 @@ pub(crate) async fn run_list(
     let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
 
     if username.is_empty() {
-        anyhow::bail!("--username is required");
+        anyhow::bail!("username is required (set ICLOUD_USERNAME or [auth].username)");
     }
 
     let password_provider =

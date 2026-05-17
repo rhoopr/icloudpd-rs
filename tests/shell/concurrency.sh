@@ -34,10 +34,8 @@ kei_sync() {
     # default `--unfiled true` would also enumerate every unfiled photo in
     # the live account on every concurrency-test sync, blowing wall time
     # past the suite's expected cadence.
-    "$KEI" sync \
-        --username "$ICLOUD_USERNAME" \
+    KEI_DATA_DIR="$COOKIES" "$KEI" sync \
         --password "$ICLOUD_PASSWORD" \
-        --data-dir "$COOKIES" \
         --config "$config" \
         --no-progress-bar \
         --log-level info "$@" 2>&1

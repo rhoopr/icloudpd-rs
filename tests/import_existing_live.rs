@@ -120,14 +120,12 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
         );
         let config_path = write_kei_toml(&data_dir, &download_dir, "");
         let output = common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &data_dir)
             .args([
                 "sync",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                data_dir.to_str().unwrap(),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--recent",
@@ -147,7 +145,7 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
 }
 
 /// Build an `import-existing` command targeting the fixture's download
-/// dir but with a fresh `--data-dir` so the per-test state DB stays
+/// dir but with a fresh `KEI_DATA_DIR` so the per-test state DB stays
 /// isolated.
 fn import_cmd(
     username: &str,
@@ -161,14 +159,12 @@ fn import_cmd(
     // per-test data_dir so import-existing can re-use the trust cookie.
     copy_auth_artifacts(cookie_dir, data_dir);
     let mut cmd = common::cmd();
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", data_dir);
     cmd.args([
         "import-existing",
-        "--username",
-        username,
         "--password",
         password,
-        "--data-dir",
-        data_dir.to_str().unwrap(),
         "--download-dir",
         download_dir.to_str().unwrap(),
         "--no-progress-bar",
@@ -411,14 +407,12 @@ fn import_recent_limit_caps_scan() {
             "[filters]\nalbums = [\"none\"]\nunfiled = true\n",
         );
         let output = common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", test_data.path())
             .args([
                 "import-existing",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                test_data.path().to_str().unwrap(),
                 "--config",
                 toml_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -678,14 +672,12 @@ force_size = false
 
         let mut cmd = common::cmd();
         clear_toml_resolved_env(&mut cmd);
+        cmd.env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", test_data.path());
         cmd.args([
             "import-existing",
-            "--username",
-            &username,
             "--password",
             &password,
-            "--data-dir",
-            test_data.path().to_str().unwrap(),
             "--config",
             toml_path.to_str().unwrap(),
             "--no-progress-bar",
@@ -786,14 +778,12 @@ fn run_sync_against_fixture(
 ) -> (u64, u64) {
     let config_path = write_kei_toml(data_dir, download_dir, extra_toml);
     let mut cmd = common::cmd();
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", data_dir);
     cmd.args([
         "sync",
-        "--username",
-        username,
         "--password",
         password,
-        "--data-dir",
-        data_dir.to_str().unwrap(),
         "--config",
         config_path.to_str().unwrap(),
         "--recent",
@@ -1051,14 +1041,9 @@ fn verify_checksums_passes_after_import() {
         }
 
         let verify_out = common::cmd()
-            .args([
-                "verify",
-                "--checksums",
-                "--username",
-                &username,
-                "--data-dir",
-                test_data.path().to_str().unwrap(),
-            ])
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", test_data.path())
+            .args(["verify", "--checksums"])
             .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
             .assert()
             .success()
@@ -1196,14 +1181,12 @@ fn toml_invalid_file_match_policy_errors_loudly() {
 
         let mut cmd = common::cmd();
         clear_toml_resolved_env(&mut cmd);
+        cmd.env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", test_data.path());
         cmd.args([
             "import-existing",
-            "--username",
-            &username,
             "--password",
             &password,
-            "--data-dir",
-            test_data.path().to_str().unwrap(),
             "--config",
             toml_path.to_str().unwrap(),
             "--no-progress-bar",
@@ -1249,14 +1232,12 @@ fn import_sigint_then_rerun_is_idempotent() {
         let recent = ROUNDTRIP_RECENT.to_string();
 
         let mut child = kei_std_command()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", test_data.path())
             .args([
                 "import-existing",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                test_data.path().to_str().unwrap(),
                 "--download-dir",
                 download_dir.to_str().unwrap(),
                 "--recent",
@@ -1354,14 +1335,12 @@ fn two_concurrent_imports_do_not_both_succeed_silently() {
 
         let spawn = || {
             kei_std_command()
+                .env("ICLOUD_USERNAME", &username)
+                .env("KEI_DATA_DIR", test_data.path())
                 .args([
                     "import-existing",
-                    "--username",
-                    &username,
                     "--password",
                     &password,
-                    "--data-dir",
-                    test_data.path().to_str().unwrap(),
                     "--download-dir",
                     download_dir.to_str().unwrap(),
                     "--recent",

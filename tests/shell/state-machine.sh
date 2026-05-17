@@ -37,10 +37,8 @@ kei_sync() {
     # photo in the live account on each sync (huge wall time + Apple rate
     # limits). The state-machine assertions only care about the album
     # pass; the unfiled-pass flow is exercised by the cargo `sync` suite.
-    "$KEI" sync \
-        --username "$ICLOUD_USERNAME" \
+    KEI_DATA_DIR="$COOKIES" "$KEI" sync \
         --password "$ICLOUD_PASSWORD" \
-        --data-dir "$COOKIES" \
         --config "$config" \
         --no-progress-bar \
         --log-level info \
@@ -118,7 +116,7 @@ echo "$OUTPUT" | grep -E "config|changed|cleared|token|incremental|download|comp
 # ── 5. reset sync-token forces full enumeration ─────────────────────
 echo ""
 echo "=== 5. reset sync-token ==="
-"$KEI" reset sync-token --yes --username "$ICLOUD_USERNAME" --data-dir "$COOKIES" >/dev/null
+KEI_DATA_DIR="$COOKIES" "$KEI" reset sync-token --yes >/dev/null
 OUTPUT=$(kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "reset|clear|token|Fetching|full|incremental|download|completed"
 echo "$OUTPUT" | grep -qi "Fetching"; kei_check "full enumeration ran"
@@ -172,7 +170,7 @@ delete_and_sync() {
     [ "$dl" -ge 1 ]; kei_check "$label finds missing file"
 }
 delete_and_sync "" "incremental"
-"$KEI" reset sync-token --yes --username "$ICLOUD_USERNAME" --data-dir "$COOKIES" >/dev/null
+KEI_DATA_DIR="$COOKIES" "$KEI" reset sync-token --yes >/dev/null
 delete_and_sync "" "full re-enum"
 
 # ── 8. --dry-run preserves token ─────────────────────────────────────────

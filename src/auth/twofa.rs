@@ -495,10 +495,10 @@ pub async fn authenticate_with_token(
     body.check_errors()?;
 
     // Apple redirects China mainland accounts to .com.cn — users must
-    // re-run with --domain cn to use the correct regional endpoint.
+    // re-run with auth.domain = "cn" to use the correct regional endpoint.
     if let Some(domain_to_use) = &body.domain_to_use {
         return Err(anyhow::anyhow!(
-            "Apple insists on using {domain_to_use} for your request. Please use --domain parameter"
+            "Apple insists on using {domain_to_use} for your request. Please set auth.domain in config"
         ));
     }
 

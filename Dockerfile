@@ -78,4 +78,5 @@ HEALTHCHECK --interval=60s --timeout=5s --start-period=15m --retries=3 \
 # deployments where files must be host-user-owned (Synology Photos,
 # Unraid, TrueNAS Scale).
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["service", "run", "--config", "/config/config.toml", "--data-dir", "/config"]
+ENV KEI_DATA_DIR=/config
+CMD ["service", "run", "--config", "/config/config.toml"]

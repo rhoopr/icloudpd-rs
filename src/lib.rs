@@ -377,9 +377,7 @@ fn get_db_path(globals: &config::GlobalArgs, toml: Option<&TomlConfig>) -> anyho
     let (username, _, _, cookie_dir) =
         config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
     if username.is_empty() {
-        anyhow::bail!(
-            "--username is required (or set ICLOUD_USERNAME, or add username to config file)"
-        );
+        anyhow::bail!("username is required (set ICLOUD_USERNAME or [auth].username)");
     }
     Ok(cookie_dir.join(format!(
         "{}.db",
@@ -672,7 +670,8 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         );
     }
 
-    // Build globals from CLI early (username, domain, data_dir).
+    // Build non-TOML globals early. In v0.20 these come from the narrow
+    // bootstrap env allow-list, not public global CLI flags.
     let mut globals = config::GlobalArgs::from_cli(&cli);
 
     // Dispatch based on command

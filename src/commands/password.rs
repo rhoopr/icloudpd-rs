@@ -17,7 +17,9 @@ pub(crate) fn run_password(
     let (username, _password, _domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
 
     if username.is_empty() {
-        anyhow::bail!("--username is required for password management");
+        anyhow::bail!(
+            "username is required for password management (set ICLOUD_USERNAME or [auth].username)"
+        );
     }
 
     let store = credential::CredentialStore::new(&username, &cookie_directory);

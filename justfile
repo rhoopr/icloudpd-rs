@@ -163,10 +163,11 @@ dev CMD *ARGS:
     if [ -f .env ]; then
         set -a; source .env; set +a
     fi
-    cargo run -- {{CMD}} \
-        --data-dir "${KEI_DEV_DATA_DIR:-$HOME/.config/kei}" \
-        --download-dir "${KEI_DEV_PHOTOS_DIR:-/tmp/kei-dev-photos}" \
-        {{ARGS}}
+    export KEI_DATA_DIR="${KEI_DEV_DATA_DIR:-$HOME/.config/kei}"
+    cfg="$(mktemp)"
+    trap 'rm -f "$cfg"' EXIT
+    printf 'data_dir = "%s"\n[download]\ndirectory = "%s"\n' "$KEI_DATA_DIR" "${KEI_DEV_PHOTOS_DIR:-/tmp/kei-dev-photos}" > "$cfg"
+    cargo run -- {{CMD}} --config "$cfg" {{ARGS}}
 
 # Docker: build | multiarch | run | shell | health.
 docker MODE:

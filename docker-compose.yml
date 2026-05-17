@@ -6,6 +6,7 @@ services:
     stop_grace_period: 30s
     environment:
       - ICLOUD_USERNAME=${ICLOUD_USERNAME}
+      - KEI_DATA_DIR=/config
       - TZ=${TZ:-UTC}
       # Option 1: Password via environment variable (least secure — visible in
       # `docker inspect`). Removed by kei from the process environment after
@@ -34,16 +35,14 @@ services:
     #   secrets:
     #     - icloud_password
     #   command: >-
-    #     sync
+    #     service run
     #     --config /config/config.toml
-    #     --data-dir /config
     #     --password-file /run/secrets/icloud_password
     #
     # Option 4: External secret manager (zero password on host)
     #   command: >-
-    #     sync
+    #     service run
     #     --config /config/config.toml
-    #     --data-dir /config
     #     --password-command "cat /run/secrets/icloud_password"
 
 # Uncomment for Docker secrets (Option 3):

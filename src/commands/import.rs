@@ -3035,14 +3035,17 @@ mod build_config_tests {
         let import_cfg = build_import_download_config(&import_args, Some(&toml)).unwrap();
 
         let sync = SyncArgs {
-            folder_structure: Some("%Y/%m".to_string()),
-            size: Some(VersionSize::Adjusted),
-            file_match_policy: Some(FileMatchPolicy::NameId7),
-            live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-            align_raw: Some(RawTreatmentPolicy::PreferOriginal),
-            force_size: Some(true),
-            keep_unicode_in_filenames: Some(true),
-            download_dir: Some("/photos".to_string()),
+            config_overrides: crate::config::SyncConfigOverrides {
+                folder_structure: Some("%Y/%m".to_string()),
+                size: Some(VersionSize::Adjusted),
+                file_match_policy: Some(FileMatchPolicy::NameId7),
+                live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
+                align_raw: Some(RawTreatmentPolicy::PreferOriginal),
+                force_size: Some(true),
+                keep_unicode_in_filenames: Some(true),
+                download_dir: Some("/photos".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let globals = GlobalArgs {
@@ -3058,23 +3061,29 @@ mod build_config_tests {
         )
         .unwrap();
 
-        assert_eq!(import_cfg.folder_structure, sync_cfg.folder_structure);
-        assert_eq!(import_cfg.size, sync_cfg.size.into());
-        assert_eq!(import_cfg.live_photo_mode, sync_cfg.live_photo_mode);
+        assert_eq!(
+            import_cfg.folder_structure,
+            sync_cfg.download.folder_structure
+        );
+        assert_eq!(import_cfg.size, sync_cfg.photos.size.into());
+        assert_eq!(import_cfg.live_photo_mode, sync_cfg.photos.live_photo_mode);
         assert_eq!(
             import_cfg.live_photo_size,
-            sync_cfg.live_photo_size.to_asset_version_size()
+            sync_cfg.photos.live_photo_size.to_asset_version_size()
         );
         assert_eq!(
             import_cfg.live_photo_mov_filename_policy,
-            sync_cfg.live_photo_mov_filename_policy
+            sync_cfg.photos.live_photo_mov_filename_policy
         );
-        assert_eq!(import_cfg.align_raw, sync_cfg.align_raw);
-        assert_eq!(import_cfg.file_match_policy, sync_cfg.file_match_policy);
-        assert_eq!(import_cfg.force_size, sync_cfg.force_size);
+        assert_eq!(import_cfg.align_raw, sync_cfg.photos.align_raw);
+        assert_eq!(
+            import_cfg.file_match_policy,
+            sync_cfg.photos.file_match_policy
+        );
+        assert_eq!(import_cfg.force_size, sync_cfg.photos.force_size);
         assert_eq!(
             import_cfg.keep_unicode_in_filenames,
-            sync_cfg.keep_unicode_in_filenames
+            sync_cfg.photos.keep_unicode_in_filenames
         );
     }
 
@@ -3096,7 +3105,10 @@ mod build_config_tests {
             .expect_err("import: system dir must reject");
 
         let sync = SyncArgs {
-            download_dir: Some("/etc".to_string()),
+            config_overrides: crate::config::SyncConfigOverrides {
+                download_dir: Some("/etc".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let globals = GlobalArgs {

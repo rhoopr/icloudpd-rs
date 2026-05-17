@@ -57,7 +57,7 @@ run() {
 # Wrappers for commands that need shell composition (rc check, etc.).
 verify_wrapper() {
   set +e
-  "$binary" verify --username "$USR" --data-dir "$DD"
+  env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" verify
   rc=$?
   set -e
   # rc=2 is clap parse error; everything else (including non-zero data
@@ -67,12 +67,12 @@ verify_wrapper() {
 export -f verify_wrapper
 export USR DD binary
 
-run live_status            "$binary" status                       --username "$USR" --data-dir "$DD"
-run live_libraries         "$binary" list libraries               --username "$USR" --data-dir "$DD"
-run live_albums            "$binary" list albums                  --username "$USR" --data-dir "$DD"
-run live_dryrun            "$binary" sync --dry-run --recent 5 --config "$sync_config" --username "$USR" --data-dir "$DD"
-run live_config_show       "$binary" config show                  --username "$USR" --data-dir "$DD"
+run live_status            env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" status
+run live_libraries         env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" list libraries
+run live_albums            env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" list albums
+run live_dryrun            env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" sync --dry-run --recent 5 --config "$sync_config"
+run live_config_show       env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" config show
 run live_verify            bash -c verify_wrapper
-run live_reconcile_dryrun  "$binary" reconcile --dry-run          --username "$USR" --data-dir "$DD"
-run live_password_backend  "$binary" password backend             --username "$USR" --data-dir "$DD"
-run live_import_dryrun     "$binary" import-existing --dry-run --recent 5 --download-dir "$DOWNLOAD_DIR" --username "$USR" --data-dir "$DD"
+run live_reconcile_dryrun  env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" reconcile --dry-run
+run live_password_backend  env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" password backend
+run live_import_dryrun     env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" import-existing --dry-run --recent 5 --download-dir "$DOWNLOAD_DIR"

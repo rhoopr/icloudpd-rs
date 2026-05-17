@@ -27,14 +27,17 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// touches real config/cookies.
 fn clean_cmd() -> assert_cmd::Command {
     let mut cmd = common::cmd();
+    let default_data_dir =
+        std::env::temp_dir().join(format!("kei-behavioral-{}", std::process::id()));
+    std::fs::create_dir_all(&default_data_dir).unwrap();
     cmd.env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
         .env_remove("KEI_CONFIG")
         .env_remove("KEI_DATA_DIR")
         .env_remove("KEI_DOWNLOAD_DIR")
-        .env_remove("KEI_DOMAIN")
         .env_remove("KEI_LOG_LEVEL")
         .env_remove("KEI_NO_AUTO_CONFIG")
+        .env("KEI_DATA_DIR", default_data_dir)
         .timeout(TIMEOUT);
     cmd
 }
@@ -232,11 +235,12 @@ fn behavioral_helper_schema_matches_production() {
 // ═══════════════════════════════════════════════════════════════════════
 // Current commands: no deprecation warnings
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn no_deprecation_login() {
     let out = clean_cmd()
-        .args(["login", "--username", "x@x.com", "--data-dir", "/tmp"])
+        .env("ICLOUD_USERNAME", "x@x.com")
+        .env("KEI_DATA_DIR", "/tmp")
+        .args(["login"])
         .assert()
         .failure() // fails at auth, not at parsing
         .get_output()
@@ -247,18 +251,10 @@ fn no_deprecation_login() {
         "new command should not print deprecation, stderr: {stderr}"
     );
 }
-
 #[test]
 fn no_deprecation_list_albums() {
     let out = clean_cmd()
-        .args([
-            "list",
-            "albums",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            "/tmp",
-        ])
+        .args(["list", "albums"])
         .assert()
         .failure()
         .get_output()
@@ -269,19 +265,13 @@ fn no_deprecation_list_albums() {
         "new command should not print deprecation, stderr: {stderr}"
     );
 }
-
 #[test]
 fn no_deprecation_password_backend() {
     let dir = tempfile::tempdir().unwrap();
     let out = clean_cmd()
-        .args([
-            "password",
-            "backend",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["password", "backend"])
         .assert()
         .success()
         .get_output()
@@ -292,20 +282,13 @@ fn no_deprecation_password_backend() {
         "new command should not print deprecation, stderr: {stderr}"
     );
 }
-
 #[test]
 fn no_deprecation_reset_state() {
     let dir = tempfile::tempdir().unwrap();
     let out = clean_cmd()
-        .args([
-            "reset",
-            "state",
-            "--yes",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "state", "--yes"])
         .assert()
         .success()
         .get_output()
@@ -316,19 +299,13 @@ fn no_deprecation_reset_state() {
         "new command should not print deprecation, stderr: {stderr}"
     );
 }
-
 #[test]
 fn no_deprecation_reset_sync_token() {
     let dir = tempfile::tempdir().unwrap();
     let out = clean_cmd()
-        .args([
-            "reset",
-            "sync-token",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "sync-token"])
         .assert()
         .success()
         .get_output()
@@ -343,18 +320,10 @@ fn no_deprecation_reset_sync_token() {
 // ═══════════════════════════════════════════════════════════════════════
 // config show: resolved config output
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn config_show_outputs_valid_toml() {
     let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            "/tmp",
-        ])
+        .args(["config", "show"])
         .assert()
         .success()
         .get_output()
@@ -366,23 +335,15 @@ fn config_show_outputs_valid_toml() {
         "config show should produce valid TOML, got:\n{stdout}"
     );
 }
-
 #[test]
 fn config_show_contains_username() {
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--username",
-            "myuser@icloud.com",
-            "--data-dir",
-            "/tmp",
-        ])
+        .env("ICLOUD_USERNAME", "myuser@icloud.com")
+        .args(["config", "show"])
         .assert()
         .success()
         .stdout(predicate::str::contains("myuser@icloud.com"));
 }
-
 #[test]
 fn config_show_reflects_directory_from_toml() {
     let dir = tempfile::tempdir().unwrap();
@@ -394,19 +355,12 @@ fn config_show_reflects_directory_from_toml() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "cli@example.com")
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("/my/photos"));
 }
-
 #[test]
 fn config_show_rejects_toml_with_password() {
     // `[auth] password` is banned; `config show` should fail loudly with
@@ -420,14 +374,7 @@ fn config_show_rejects_toml_with_password() {
     .unwrap();
 
     let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
         .get_output()
@@ -438,7 +385,6 @@ fn config_show_rejects_toml_with_password() {
         "password must not appear in stdout even on rejection, got:\n{stdout}"
     );
 }
-
 #[test]
 fn config_show_reflects_toml_values() {
     let dir = tempfile::tempdir().unwrap();
@@ -457,14 +403,7 @@ threads = 4
     .unwrap();
 
     let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .get_output()
@@ -477,7 +416,6 @@ threads = 4
         "threads should be 4, stdout: {stdout}"
     );
 }
-
 #[test]
 fn config_show_emits_unfiled_false_when_explicit() {
     // The cli.rs help-shadow test for --unfiled only verifies clap parses;
@@ -502,14 +440,7 @@ unfiled = false
     .unwrap();
 
     let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .get_output()
@@ -526,7 +457,6 @@ unfiled = false
         "config show must round-trip explicit `unfiled = false`; got:\n{stdout}"
     );
 }
-
 #[test]
 fn config_show_cli_overrides_toml() {
     let dir = tempfile::tempdir().unwrap();
@@ -541,16 +471,8 @@ username = "toml@example.com"
     .unwrap();
 
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--username",
-            "cli@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "cli@example.com")
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("cli@example.com"));
@@ -559,50 +481,50 @@ username = "toml@example.com"
 // ═══════════════════════════════════════════════════════════════════════
 // Error messages: missing required args
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn login_requires_username() {
     clean_cmd()
-        .args(["login", "--data-dir", "/tmp"])
+        .env_remove("ICLOUD_USERNAME")
+        .args(["login"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--username is required"));
+        .stderr(predicate::str::contains("username is required"));
 }
-
 #[test]
 fn list_albums_requires_username() {
     clean_cmd()
-        .args(["list", "albums", "--data-dir", "/tmp"])
+        .env_remove("ICLOUD_USERNAME")
+        .args(["list", "albums"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--username is required"));
+        .stderr(predicate::str::contains("username is required"));
 }
-
 #[test]
 fn password_set_requires_username() {
     clean_cmd()
-        .args(["password", "set", "--data-dir", "/tmp"])
+        .env_remove("ICLOUD_USERNAME")
+        .args(["password", "set"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--username is required"));
+        .stderr(predicate::str::contains("username is required"));
 }
-
 #[test]
 fn password_clear_requires_username() {
     clean_cmd()
-        .args(["password", "clear", "--data-dir", "/tmp"])
+        .env_remove("ICLOUD_USERNAME")
+        .args(["password", "clear"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--username is required"));
+        .stderr(predicate::str::contains("username is required"));
 }
-
 #[test]
 fn password_backend_requires_username() {
     clean_cmd()
-        .args(["password", "backend", "--data-dir", "/tmp"])
+        .env_remove("ICLOUD_USERNAME")
+        .args(["password", "backend"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--username is required"));
+        .stderr(predicate::str::contains("username is required"));
 }
 
 /// `password backend` against a fresh cookie dir prints the credential
@@ -613,14 +535,9 @@ fn password_backend_requires_username() {
 fn password_backend_prints_backend_name() {
     let dir = tempfile::tempdir().unwrap();
     let out = clean_cmd()
-        .args([
-            "password",
-            "backend",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["password", "backend"])
         .assert()
         .success()
         .get_output()
@@ -640,83 +557,59 @@ fn password_backend_prints_backend_name() {
 fn password_clear_on_empty_store_errors() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
-        .args([
-            "password",
-            "clear",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["password", "clear"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("No stored credential"));
 }
-
 #[test]
 fn sync_requires_username() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     write_sync_config(&config_path, "/photos");
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env_remove("ICLOUD_USERNAME")
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("--username is required"));
+        .stderr(predicate::str::contains("username is required"));
 }
-
 #[test]
 fn sync_requires_directory() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["sync"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("[download] directory is required"));
 }
-
 #[test]
 fn import_existing_requires_directory() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
-        .args([
-            "import-existing",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["import-existing"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
             "--download-dir is required for import-existing",
         ));
 }
-
 #[test]
 fn import_existing_rejects_nonexistent_directory() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
         .args([
             "import-existing",
-            "--username",
-            "x@x.com",
             "--download-dir",
             "/does/not/exist/anywhere",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -728,69 +621,46 @@ fn import_existing_rejects_nonexistent_directory() {
 // ═══════════════════════════════════════════════════════════════════════
 // No-DB paths: commands that hit the DB but none exists
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn status_no_db() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
-        .args([
-            "status",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
         .assert()
         .success()
         .stdout(predicate::str::contains("No state database found"));
 }
-
 #[test]
 fn verify_no_db() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
-        .args([
-            "verify",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify"])
         .assert()
         .success()
         .stdout(predicate::str::contains("No state database found"));
 }
-
 #[test]
 fn reset_state_no_db() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
-        .args([
-            "reset",
-            "state",
-            "--yes",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "state", "--yes"])
         .assert()
         .success()
         .stdout(predicate::str::contains("No state database found"));
 }
-
 #[test]
 fn reset_sync_token_no_db() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
-        .args([
-            "reset",
-            "sync-token",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "sync-token"])
         .assert()
         .success()
         .stdout(predicate::str::contains("No state database found"));
@@ -799,20 +669,14 @@ fn reset_sync_token_no_db() {
 // ═══════════════════════════════════════════════════════════════════════
 // password backend: shows backend name without auth
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn password_backend_shows_a_backend_name() {
     let dir = tempfile::tempdir().unwrap();
     // Output is one of: "encrypted-file", "keyring", or "none"
     clean_cmd()
-        .args([
-            "password",
-            "backend",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["password", "backend"])
         .assert()
         .success()
         .stdout(
@@ -821,24 +685,17 @@ fn password_backend_shows_a_backend_name() {
                 .or(predicate::str::contains("none")),
         );
 }
-
 #[test]
 fn password_clear_without_stored_credential_errors() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
-        .args([
-            "password",
-            "clear",
-            "--username",
-            "nobody@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["password", "clear"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("No stored credential"));
 }
-
 #[test]
 fn password_backend_with_empty_data_dir_reports_none() {
     // Fresh data dir with no keyring entry (keyring may still report for the
@@ -846,14 +703,9 @@ fn password_backend_with_empty_data_dir_reports_none() {
     // username to minimize false positives.
     let dir = tempfile::tempdir().unwrap();
     let out = clean_cmd()
-        .args([
-            "password",
-            "backend",
-            "--username",
-            "kei-behavioral-test-nonexistent@example.invalid",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "unlikely-empty-store@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["password", "backend"])
         .assert()
         .success()
         .get_output()
@@ -868,59 +720,47 @@ fn password_backend_with_empty_data_dir_reports_none() {
 // ═══════════════════════════════════════════════════════════════════════
 // Env var behavior: KEI_* vars actually resolve
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn kei_data_dir_env_resolves_in_status() {
     // KEI_DATA_DIR env var should be used for the data directory
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
+        .env("ICLOUD_USERNAME", "test@example.com")
         .env("KEI_DATA_DIR", dir.path().to_str().unwrap())
-        .args(["status", "--username", "x@x.com"])
+        .args(["status"])
         .assert()
         .success()
         .stdout(predicate::str::contains("No state database found"));
 }
-
 #[test]
 fn icloud_username_env_resolves_in_config_show() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
         .env("ICLOUD_USERNAME", "env@icloud.com")
-        .args(["config", "show", "--data-dir", dir.path().to_str().unwrap()])
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["config", "show"])
         .assert()
         .success()
         .stdout(predicate::str::contains("env@icloud.com"));
 }
-
 #[test]
-fn cli_flag_overrides_env_var() {
+fn icloud_username_env_resolves_without_cli_flag() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
         .env("ICLOUD_USERNAME", "env@icloud.com")
-        .args([
-            "config",
-            "show",
-            "--username",
-            "cli@icloud.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["config", "show"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("cli@icloud.com"));
+        .stdout(predicate::str::contains("env@icloud.com"));
 }
-
 #[test]
 fn data_dir_no_deprecation() {
     let dir = tempfile::tempdir().unwrap();
     let out = clean_cmd()
-        .args([
-            "status",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
         .assert()
         .success()
         .get_output()
@@ -928,14 +768,13 @@ fn data_dir_no_deprecation() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stderr.contains("deprecated"),
-        "--data-dir should not warn, stderr: {stderr}"
+        "KEI_DATA_DIR should not warn, stderr: {stderr}"
     );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // First-run auto-config
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn first_run_auto_config_creates_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -944,15 +783,8 @@ fn first_run_auto_config_creates_file() {
     // sync will fail at auth, but auto-config fires before auth.
     // Use --config pointing at non-existent file in existing directory.
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--username",
-            "auto@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "auto@example.com")
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .failure(); // fails at auth, but config file should have been created
 
@@ -967,7 +799,6 @@ fn first_run_auto_config_creates_file() {
         "auto-config should contain username, got:\n{content}"
     );
 }
-
 #[test]
 fn first_run_auto_config_does_not_overwrite() {
     let dir = tempfile::tempdir().unwrap();
@@ -975,16 +806,7 @@ fn first_run_auto_config_does_not_overwrite() {
     std::fs::write(&config_path, "# existing config\n").unwrap();
 
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--username",
-            "new@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success();
 
@@ -998,7 +820,6 @@ fn first_run_auto_config_does_not_overwrite() {
 // ═══════════════════════════════════════════════════════════════════════
 // Config validation: malformed/invalid TOML
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn config_malformed_toml() {
     let dir = tempfile::tempdir().unwrap();
@@ -1006,19 +827,11 @@ fn config_malformed_toml() {
     std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
 
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("parse").or(predicate::str::contains("expected")));
 }
-
 #[test]
 fn config_unknown_toml_field() {
     let dir = tempfile::tempdir().unwrap();
@@ -1026,19 +839,11 @@ fn config_unknown_toml_field() {
     std::fs::write(&config_path, "[auth]\nbogus = true\n").unwrap();
 
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("unknown field"));
 }
-
 #[test]
 fn config_empty_username_in_toml() {
     let dir = tempfile::tempdir().unwrap();
@@ -1053,18 +858,11 @@ fn config_empty_username_in_toml() {
     // only when a username source is present in TOML. Since TOML sets
     // username = "", the build path validates it.
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("must not be empty"));
 }
-
 #[test]
 fn config_toml_password_field_rejected() {
     // `[auth] password` is no longer accepted, empty or otherwise; kei must
@@ -1078,13 +876,7 @@ fn config_toml_password_field_rejected() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("`[auth] password`"))
@@ -1110,18 +902,11 @@ fn config_multiple_password_sources_in_toml() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("pick one"));
 }
-
 #[test]
 fn config_strftime_folder_structure_accepted() {
     // Full strftime support: %B (month name), %q, etc. are no longer rejected.
@@ -1135,19 +920,12 @@ fn config_strftime_folder_structure_accepted() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         // Should get past config validation (no "unrecognized format token" error).
         // Fails on auth, not on config.
         .stderr(predicate::str::contains("unrecognized format token").not());
 }
-
 #[test]
 fn config_valid_folder_structure_ymd() {
     let dir = tempfile::tempdir().unwrap();
@@ -1159,19 +937,11 @@ fn config_valid_folder_structure_ymd() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("%Y/%m/%d"));
 }
-
 #[test]
 fn config_valid_folder_structure_ym() {
     let dir = tempfile::tempdir().unwrap();
@@ -1183,19 +953,11 @@ fn config_valid_folder_structure_ym() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("%Y-%m"));
 }
-
 #[test]
 fn config_valid_folder_structure_ymdh() {
     let dir = tempfile::tempdir().unwrap();
@@ -1207,19 +969,11 @@ fn config_valid_folder_structure_ymdh() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("%Y/%m/%d/%H"));
 }
-
 #[test]
 fn config_folder_structure_none() {
     let dir = tempfile::tempdir().unwrap();
@@ -1232,19 +986,11 @@ fn config_folder_structure_none() {
 
     // "none" is a special value that should be accepted (no error)
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("none"));
 }
-
 #[test]
 fn config_watch_interval_below_60_in_toml() {
     let dir = tempfile::tempdir().unwrap();
@@ -1256,20 +1002,13 @@ fn config_watch_interval_below_60_in_toml() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
         .stderr(predicate::str::contains(
             "watch interval must be in 60..=86400 seconds, got 30",
         ));
 }
-
 #[test]
 fn config_retry_delay_toml_key_is_removed() {
     let dir = tempfile::tempdir().unwrap();
@@ -1281,18 +1020,11 @@ fn config_retry_delay_toml_key_is_removed() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("unknown field `delay`"));
 }
-
 #[test]
 fn config_threads_num_toml_key_is_removed() {
     let dir = tempfile::tempdir().unwrap();
@@ -1304,13 +1036,7 @@ fn config_threads_num_toml_key_is_removed() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("unknown field `threads_num`"));
@@ -1319,7 +1045,6 @@ fn config_threads_num_toml_key_is_removed() {
 // ═══════════════════════════════════════════════════════════════════════
 // Config resolution: TOML / CLI / env merge via config show
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn config_resolution_toml_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -1331,14 +1056,7 @@ fn config_resolution_toml_only() {
     .unwrap();
 
     let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .get_output()
@@ -1347,29 +1065,19 @@ fn config_resolution_toml_only() {
     assert!(stdout.contains("tomluser@example.com"), "stdout: {stdout}");
     assert!(stdout.contains("/toml/dir"), "stdout: {stdout}");
 }
-
 #[test]
-fn config_resolution_cli_overrides_toml() {
+fn config_resolution_toml_username_used() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(&config_path, "[auth]\nusername = \"toml@example.com\"\n").unwrap();
 
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--username",
-            "cli@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env_remove("ICLOUD_USERNAME")
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("cli@example.com"));
+        .stdout(predicate::str::contains("toml@example.com"));
 }
-
 #[test]
 fn config_resolution_env_overrides_toml() {
     let dir = tempfile::tempdir().unwrap();
@@ -1378,14 +1086,7 @@ fn config_resolution_env_overrides_toml() {
 
     let out = clean_cmd()
         .env("ICLOUD_USERNAME", "env@example.com")
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .get_output()
@@ -1397,37 +1098,23 @@ fn config_resolution_env_overrides_toml() {
         "env should override TOML, stdout: {stdout}"
     );
 }
-
 #[test]
-fn config_resolution_cli_overrides_env() {
+fn config_resolution_env_username_used_without_toml() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
         .env("ICLOUD_USERNAME", "env@example.com")
-        .args([
-            "config",
-            "show",
-            "--username",
-            "cli@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["config", "show"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("cli@example.com"));
+        .stdout(predicate::str::contains("env@example.com"));
 }
-
 #[test]
 fn config_resolution_default_values() {
     let dir = tempfile::tempdir().unwrap();
     let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["config", "show"])
         .assert()
         .success()
         .get_output()
@@ -1449,7 +1136,6 @@ fn config_resolution_default_values() {
         "default folder_structure should be %Y/%m/%d, stdout: {stdout}"
     );
 }
-
 #[test]
 fn config_show_does_not_read_password_file_contents() {
     // `config show` may echo the `password_file` path back to the user, but
@@ -1471,14 +1157,7 @@ fn config_show_does_not_read_password_file_contents() {
     .unwrap();
 
     let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .get_output()
@@ -1498,7 +1177,6 @@ fn config_show_does_not_read_password_file_contents() {
 // ═══════════════════════════════════════════════════════════════════════
 // Auto-config behavior
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn auto_config_suppressed_by_env() {
     let dir = tempfile::tempdir().unwrap();
@@ -1507,15 +1185,7 @@ fn auto_config_suppressed_by_env() {
     // KEI_NO_AUTO_CONFIG=1 should prevent creation of the config file
     clean_cmd()
         .env("KEI_NO_AUTO_CONFIG", "1")
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--username",
-            "suppress@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .failure(); // fails at auth
 
@@ -1524,7 +1194,6 @@ fn auto_config_suppressed_by_env() {
         "KEI_NO_AUTO_CONFIG=1 should suppress config file creation"
     );
 }
-
 #[test]
 #[cfg(unix)]
 fn auto_config_has_0600_perms() {
@@ -1534,15 +1203,7 @@ fn auto_config_has_0600_perms() {
     let config_path = dir.path().join("config.toml");
 
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--username",
-            "perms@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .failure(); // fails at auth
 
@@ -1558,7 +1219,6 @@ fn auto_config_has_0600_perms() {
 // ═══════════════════════════════════════════════════════════════════════
 // State DB pre-seeded tests: status
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn status_shows_counts() {
     let dir = tempfile::tempdir().unwrap();
@@ -1605,13 +1265,9 @@ fn status_shows_counts() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
         .assert()
         .success()
         .get_output()
@@ -1622,7 +1278,6 @@ fn status_shows_counts() {
     assert!(stdout.contains("Failed:     1"), "stdout: {stdout}");
     assert!(stdout.contains("Pending:    1"), "stdout: {stdout}");
 }
-
 #[test]
 fn status_failed_shows_error_messages() {
     let dir = tempfile::tempdir().unwrap();
@@ -1641,14 +1296,9 @@ fn status_failed_shows_error_messages() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--failed",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--failed"])
         .assert()
         .success()
         .get_output()
@@ -1660,7 +1310,6 @@ fn status_failed_shows_error_messages() {
 // ═══════════════════════════════════════════════════════════════════════
 // State DB pre-seeded tests: verify
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn verify_all_files_present() {
     let dir = tempfile::tempdir().unwrap();
@@ -1682,13 +1331,9 @@ fn verify_all_files_present() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "verify",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify"])
         .assert()
         .success()
         .get_output()
@@ -1697,7 +1342,6 @@ fn verify_all_files_present() {
     assert!(stdout.contains("Verified:  1"), "stdout: {stdout}");
     assert!(stdout.contains("Missing:   0"), "stdout: {stdout}");
 }
-
 #[test]
 fn verify_detects_missing_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -1719,13 +1363,9 @@ fn verify_detects_missing_file() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "verify",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify"])
         .assert()
         .code(1)
         .get_output()
@@ -1733,7 +1373,6 @@ fn verify_detects_missing_file() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("MISSING"), "stdout: {stdout}");
 }
-
 #[test]
 fn verify_checksums_match() {
     let dir = tempfile::tempdir().unwrap();
@@ -1759,14 +1398,9 @@ fn verify_checksums_match() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "verify",
-            "--checksums",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify", "--checksums"])
         .assert()
         .success()
         .get_output()
@@ -1774,7 +1408,6 @@ fn verify_checksums_match() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Verified:  1"), "stdout: {stdout}");
 }
-
 #[test]
 fn verify_checksums_mismatch() {
     use std::io::Write;
@@ -1802,14 +1435,9 @@ fn verify_checksums_mismatch() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "verify",
-            "--checksums",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify", "--checksums"])
         .assert()
         .code(1)
         .get_output()
@@ -1853,14 +1481,9 @@ fn verify_checksums_mismatch_emits_asset_id_in_output() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "verify",
-            "--checksums",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify", "--checksums"])
         .assert()
         .code(1)
         .get_output()
@@ -1879,7 +1502,6 @@ fn verify_checksums_mismatch_emits_asset_id_in_output() {
 // ═══════════════════════════════════════════════════════════════════════
 // State DB pre-seeded tests: reset
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn reset_state_deletes_db() {
     let dir = tempfile::tempdir().unwrap();
@@ -1902,15 +1524,9 @@ fn reset_state_deletes_db() {
     assert!(db_path.exists(), "DB should exist before reset");
 
     let out = clean_cmd()
-        .args([
-            "reset",
-            "state",
-            "--yes",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "state", "--yes"])
         .assert()
         .success()
         .get_output()
@@ -1923,7 +1539,6 @@ fn reset_state_deletes_db() {
         "should print 'deleted', stdout: {stdout}"
     );
 }
-
 #[test]
 fn reset_sync_token_clears_tokens() {
     let dir = tempfile::tempdir().unwrap();
@@ -1943,15 +1558,9 @@ fn reset_sync_token_clears_tokens() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "reset",
-            "sync-token",
-            "--yes",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "sync-token", "--yes"])
         .assert()
         .success()
         .get_output()
@@ -1984,7 +1593,6 @@ fn reset_sync_token_clears_tokens() {
     // db_sync_token is set to empty string, not deleted
     assert_eq!(db_token, "", "db_sync_token should be cleared to empty");
 }
-
 #[test]
 fn reset_state_without_yes_on_non_tty() {
     let dir = tempfile::tempdir().unwrap();
@@ -2007,14 +1615,9 @@ fn reset_state_without_yes_on_non_tty() {
 
     // Without --yes on a non-TTY, stdin.read_line returns empty/EOF -> "Cancelled"
     let out = clean_cmd()
-        .args([
-            "reset",
-            "state",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "state"])
         .assert()
         .success()
         .get_output()
@@ -2026,7 +1629,6 @@ fn reset_state_without_yes_on_non_tty() {
     );
     assert!(db_path.exists(), "DB should NOT be deleted without --yes");
 }
-
 #[test]
 fn reset_sync_token_without_yes_on_non_tty_errors() {
     // `kei reset sync-token` ships a confirmation guard. Under non-TTY use
@@ -2047,14 +1649,9 @@ fn reset_sync_token_without_yes_on_non_tty_errors() {
         .join(format!("{}.db", sanitize_username(username)));
 
     let out = clean_cmd()
-        .args([
-            "reset",
-            "sync-token",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "sync-token"])
         .assert()
         .failure()
         .get_output()
@@ -2081,7 +1678,6 @@ fn reset_sync_token_without_yes_on_non_tty_errors() {
         "zone token must not be cleared without --yes"
     );
 }
-
 #[test]
 fn reset_sync_token_with_yes_clears_under_non_tty() {
     // Mirror of the test above with `--yes`: the same non-TTY context now
@@ -2107,15 +1703,9 @@ fn reset_sync_token_with_yes_clears_under_non_tty() {
         .join(format!("{}.db", sanitize_username(username)));
 
     let out = clean_cmd()
-        .args([
-            "reset",
-            "sync-token",
-            "--yes",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "sync-token", "--yes"])
         .assert()
         .success()
         .get_output()
@@ -2144,7 +1734,6 @@ fn reset_sync_token_with_yes_clears_under_non_tty() {
 // ═══════════════════════════════════════════════════════════════════════
 // Password source behavior
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn password_file_strips_trailing_newline() {
     let dir = tempfile::tempdir().unwrap();
@@ -2154,15 +1743,7 @@ fn password_file_strips_trailing_newline() {
     // Should fail at auth (network), not at password retrieval.
     // The error message should NOT contain "empty" or "No password available".
     let out = clean_cmd()
-        .args([
-            "login",
-            "--username",
-            "x@x.com",
-            "--password-file",
-            pw_file.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["login", "--password-file", pw_file.to_str().unwrap()])
         .assert()
         .failure()
         .get_output()
@@ -2177,7 +1758,6 @@ fn password_file_strips_trailing_newline() {
         "password should not be empty, stderr: {stderr}"
     );
 }
-
 #[test]
 fn password_file_empty() {
     let dir = tempfile::tempdir().unwrap();
@@ -2185,22 +1765,14 @@ fn password_file_empty() {
     std::fs::write(&pw_file, "").unwrap();
 
     clean_cmd()
-        .args([
-            "login",
-            "--username",
-            "x@x.com",
-            "--password-file",
-            pw_file.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .args(["login", "--password-file", pw_file.to_str().unwrap()])
         .assert()
         .code(3)
         .stderr(
             predicate::str::contains("No password available").or(predicate::str::contains("empty")),
         );
 }
-
 #[test]
 fn password_file_newline_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -2208,15 +1780,8 @@ fn password_file_newline_only() {
     std::fs::write(&pw_file, "\n").unwrap();
 
     clean_cmd()
-        .args([
-            "login",
-            "--username",
-            "x@x.com",
-            "--password-file",
-            pw_file.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .args(["login", "--password-file", pw_file.to_str().unwrap()])
         .assert()
         .code(3)
         .stderr(
@@ -2234,15 +1799,9 @@ fn password_command_success() {
     // The password command succeeds and returns "cmdpw".
     // Auth will fail at network, not at password retrieval.
     let out = clean_cmd()
-        .args([
-            "login",
-            "--username",
-            "x@x.com",
-            "--password-command",
-            "echo cmdpw",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["login", "--password-command", "echo cmdpw"])
         .assert()
         .failure()
         .get_output()
@@ -2253,21 +1812,14 @@ fn password_command_success() {
         "password command should provide password, stderr: {stderr}"
     );
 }
-
 #[test]
 fn password_command_failure() {
     let dir = tempfile::tempdir().unwrap();
 
     clean_cmd()
-        .args([
-            "login",
-            "--username",
-            "x@x.com",
-            "--password-command",
-            "false",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["login", "--password-command", "false"])
         .assert()
         .code(3)
         .stderr(
@@ -2279,54 +1831,41 @@ fn password_command_failure() {
 // ═══════════════════════════════════════════════════════════════════════
 // Exit codes
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn exit_2_for_clap_errors() {
-    // Pass --username with an empty string -- clap's value_parser rejects it
+    // Removed durable flags are clap errors.
     clean_cmd()
         .args(["--username", "", "config", "show"])
         .assert()
         .code(2);
 }
-
 #[test]
 fn exit_1_for_missing_directory_on_sync() {
     let dir = tempfile::tempdir().unwrap();
     clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["sync"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("[download] directory is required"));
 }
-
 #[test]
 fn exit_1_for_missing_username_on_sync() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     write_sync_config(&config_path, "/photos");
     clean_cmd()
-        .args([
-            "sync",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env_remove("ICLOUD_USERNAME")
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("--username is required"));
+        .stderr(predicate::str::contains("username is required"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Log level behavior
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn log_level_default_info() {
     let dir = tempfile::tempdir().unwrap();
@@ -2334,15 +1873,8 @@ fn log_level_default_info() {
     write_sync_config(&config_path, "/photos");
     // sync with username + directory will fail at auth. Check stderr for INFO.
     let out = clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .failure()
         .get_output()
@@ -2362,7 +1894,6 @@ fn log_level_default_info() {
         "default log level should suppress DEBUG-level messages, stderr: {stderr}"
     );
 }
-
 #[test]
 fn log_level_debug() {
     let dir = tempfile::tempdir().unwrap();
@@ -2370,16 +1901,13 @@ fn log_level_debug() {
     let config_path = dir.path().join("config.toml");
     write_sync_config(&config_path, dl_dir.to_str().unwrap());
     let out = clean_cmd()
+        .env("ICLOUD_USERNAME", "test@example.com")
         .args([
             "--log-level",
             "debug",
             "sync",
-            "--username",
-            "x@x.com",
             "--config",
             config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -2391,7 +1919,6 @@ fn log_level_debug() {
         "debug log level should produce DEBUG entries, stderr: {stderr}"
     );
 }
-
 #[test]
 fn log_level_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -2402,12 +1929,8 @@ fn log_level_error() {
             "--log-level",
             "error",
             "sync",
-            "--username",
-            "x@x.com",
             "--config",
             config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -2430,12 +1953,10 @@ fn log_level_error() {
 // ═══════════════════════════════════════════════════════════════════════
 // Help and version
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn help_flag_exits_zero() {
     clean_cmd().arg("--help").assert().success();
 }
-
 #[test]
 fn version_flag_exits_zero() {
     clean_cmd()
@@ -2444,12 +1965,10 @@ fn version_flag_exits_zero() {
         .success()
         .stdout(predicate::str::contains("kei"));
 }
-
 #[test]
 fn sync_help_exits_zero() {
     clean_cmd().args(["sync", "--help"]).assert().success();
 }
-
 #[test]
 fn config_show_help_exits_zero() {
     clean_cmd()
@@ -2461,7 +1980,6 @@ fn config_show_help_exits_zero() {
 // ═══════════════════════════════════════════════════════════════════════
 // Subcommand parsing: unknown subcommand
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn unknown_subcommand_fails() {
     clean_cmd().arg("nonexistent-command").assert().code(2);
@@ -2470,7 +1988,6 @@ fn unknown_subcommand_fails() {
 // ═══════════════════════════════════════════════════════════════════════
 // verify with empty DB (no downloaded assets)
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn verify_empty_db() {
     let dir = tempfile::tempdir().unwrap();
@@ -2478,13 +1995,9 @@ fn verify_empty_db() {
     let _conn = create_state_db(dir.path(), username);
 
     let out = clean_cmd()
-        .args([
-            "verify",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify"])
         .assert()
         .success()
         .get_output()
@@ -2499,7 +2012,6 @@ fn verify_empty_db() {
 // ═══════════════════════════════════════════════════════════════════════
 // status with DB but no sync runs
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn status_with_db_no_sync_runs() {
     let dir = tempfile::tempdir().unwrap();
@@ -2509,13 +2021,9 @@ fn status_with_db_no_sync_runs() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
         .assert()
         .success()
         .get_output()
@@ -2533,7 +2041,6 @@ fn status_with_db_no_sync_runs() {
 // ═══════════════════════════════════════════════════════════════════════
 // verify with --checksums but no local_checksum stored
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn verify_checksums_no_stored_checksum_still_passes() {
     let dir = tempfile::tempdir().unwrap();
@@ -2557,14 +2064,9 @@ fn verify_checksums_no_stored_checksum_still_passes() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "verify",
-            "--checksums",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify", "--checksums"])
         .assert()
         .success()
         .get_output()
@@ -2576,47 +2078,39 @@ fn verify_checksums_no_stored_checksum_still_passes() {
 // ═══════════════════════════════════════════════════════════════════════
 // Domain flag
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn domain_cn_accepted() {
     let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[auth]\nusername = \"x@x.com\"\ndomain = \"cn\"\n",
+    )
+    .unwrap();
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--username",
-            "x@x.com",
-            "--domain",
-            "cn",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("cn"));
 }
-
 #[test]
 fn domain_invalid_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[auth]\nusername = \"x@x.com\"\ndomain = \"uk\"\n",
+    )
+    .unwrap();
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--username",
-            "x@x.com",
-            "--domain",
-            "invalid",
-            "--data-dir",
-            "/tmp",
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
-        .code(2);
+        .code(1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // TOML config with domain
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn toml_domain_cn() {
     let dir = tempfile::tempdir().unwrap();
@@ -2628,14 +2122,7 @@ fn toml_domain_cn() {
     .unwrap();
 
     clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("cn"));
@@ -2644,7 +2131,6 @@ fn toml_domain_cn() {
 // ═══════════════════════════════════════════════════════════════════════
 // Status --failed with no failed assets
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn status_failed_with_no_failures() {
     let dir = tempfile::tempdir().unwrap();
@@ -2662,14 +2148,9 @@ fn status_failed_with_no_failures() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--failed",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--failed"])
         .assert()
         .success()
         .get_output()
@@ -2686,7 +2167,6 @@ fn status_failed_with_no_failures() {
 // ═══════════════════════════════════════════════════════════════════════
 // Reset sync-token on empty metadata
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn reset_sync_token_empty_metadata() {
     let dir = tempfile::tempdir().unwrap();
@@ -2694,15 +2174,9 @@ fn reset_sync_token_empty_metadata() {
     let _conn = create_state_db(dir.path(), username);
 
     let out = clean_cmd()
-        .args([
-            "reset",
-            "sync-token",
-            "--yes",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "sync-token", "--yes"])
         .assert()
         .success()
         .get_output()
@@ -2717,7 +2191,6 @@ fn reset_sync_token_empty_metadata() {
 // ═══════════════════════════════════════════════════════════════════════
 // Config show outputs threads from TOML
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn config_show_reflects_threads_from_toml() {
     let dir = tempfile::tempdir().unwrap();
@@ -2729,14 +2202,7 @@ fn config_show_reflects_threads_from_toml() {
     .unwrap();
 
     let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .get_output()
@@ -2748,7 +2214,6 @@ fn config_show_reflects_threads_from_toml() {
 // ═══════════════════════════════════════════════════════════════════════
 // Multiple verify issues at once
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn verify_mixed_present_and_missing() {
     let dir = tempfile::tempdir().unwrap();
@@ -2781,13 +2246,9 @@ fn verify_mixed_present_and_missing() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "verify",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify"])
         .assert()
         .code(1)
         .get_output()
@@ -2796,7 +2257,6 @@ fn verify_mixed_present_and_missing() {
     assert!(stdout.contains("Verified:  1"), "stdout: {stdout}");
     assert!(stdout.contains("Missing:   1"), "stdout: {stdout}");
 }
-
 #[test]
 fn verify_truncates_issue_listing_past_cap() {
     // Covers the 200-issue listing cap for `kei verify` on large libraries
@@ -2825,13 +2285,9 @@ fn verify_truncates_issue_listing_past_cap() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "verify",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["verify"])
         .assert()
         .code(1)
         .get_output()
@@ -2856,7 +2312,6 @@ fn verify_truncates_issue_listing_past_cap() {
         "201st missing line should have been suppressed; stdout: {stdout}"
     );
 }
-
 #[test]
 fn reconcile_truncates_issue_listing_past_cap() {
     // Covers the 200-issue listing cap for `kei reconcile`. 250 seeded
@@ -2886,13 +2341,9 @@ fn reconcile_truncates_issue_listing_past_cap() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "reconcile",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reconcile"])
         .assert()
         .success()
         .get_output()
@@ -2918,21 +2369,13 @@ fn reconcile_truncates_issue_listing_past_cap() {
 // ═══════════════════════════════════════════════════════════════════════
 // Dry run + retry-failed conflict
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn dry_run_and_retry_failed_conflict() {
     let dir = tempfile::tempdir().unwrap();
     // clap-level conflicts_with should reject this
     clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "x@x.com",
-            "--dry-run",
-            "--retry-failed",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["sync", "--dry-run", "--retry-failed"])
         .assert()
         .code(2);
 }
@@ -2940,7 +2383,6 @@ fn dry_run_and_retry_failed_conflict() {
 // ═══════════════════════════════════════════════════════════════════════
 // Dry run: no state DB created
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn dry_run_creates_no_state_db() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -2951,12 +2393,8 @@ fn dry_run_creates_no_state_db() {
     clean_cmd()
         .args([
             "sync",
-            "--username",
-            "drytest@example.com",
             "--config",
             config_path.to_str().unwrap(),
-            "--data-dir",
-            data_dir.path().to_str().unwrap(),
             "--dry-run",
         ])
         .assert()
@@ -2978,7 +2416,6 @@ fn dry_run_creates_no_state_db() {
 // ═══════════════════════════════════════════════════════════════════════
 // Status: --pending and --downloaded (issue #211)
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn status_pending_shows_pending_assets() {
     let dir = tempfile::tempdir().unwrap();
@@ -2999,14 +2436,9 @@ fn status_pending_shows_pending_assets() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--pending",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--pending"])
         .assert()
         .success()
         .get_output()
@@ -3018,7 +2450,6 @@ fn status_pending_shows_pending_assets() {
     // Downloaded asset must not appear in the pending listing
     assert!(!stdout.contains("photo3.jpg"), "stdout: {stdout}");
 }
-
 #[test]
 fn status_downloaded_shows_downloaded_assets() {
     let dir = tempfile::tempdir().unwrap();
@@ -3038,14 +2469,9 @@ fn status_downloaded_shows_downloaded_assets() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--downloaded",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--downloaded"])
         .assert()
         .success()
         .get_output()
@@ -3057,7 +2483,6 @@ fn status_downloaded_shows_downloaded_assets() {
     // Pending asset must not appear in the downloaded listing
     assert!(!stdout.contains("photo2.jpg"), "stdout: {stdout}");
 }
-
 #[test]
 fn status_pending_empty_when_none_pending() {
     let dir = tempfile::tempdir().unwrap();
@@ -3075,14 +2500,9 @@ fn status_pending_empty_when_none_pending() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--pending",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--pending"])
         .assert()
         .success()
         .get_output()
@@ -3090,7 +2510,6 @@ fn status_pending_empty_when_none_pending() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("Pending assets:"), "stdout: {stdout}");
 }
-
 #[test]
 fn status_downloaded_with_null_local_path_surfaces_missing_marker() {
     // Covers the `<MISSING local_path>` display path in print_downloaded.
@@ -3107,14 +2526,9 @@ fn status_downloaded_with_null_local_path_surfaces_missing_marker() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--downloaded",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--downloaded"])
         .assert()
         .success()
         .get_output()
@@ -3126,7 +2540,6 @@ fn status_downloaded_with_null_local_path_surfaces_missing_marker() {
     );
     assert!(stdout.contains("broken.jpg"), "stdout: {stdout}");
 }
-
 #[test]
 fn status_all_three_flags_render_all_sections() {
     // End-to-end coverage for --failed --pending --downloaded combined.
@@ -3158,16 +2571,9 @@ fn status_all_three_flags_render_all_sections() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--failed",
-            "--pending",
-            "--downloaded",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--failed", "--pending", "--downloaded"])
         .assert()
         .success()
         .get_output()
@@ -3180,7 +2586,6 @@ fn status_all_three_flags_render_all_sections() {
     assert!(stdout.contains("Downloaded assets:"), "stdout: {stdout}");
     assert!(stdout.contains("dl.jpg"), "stdout: {stdout}");
 }
-
 #[test]
 fn status_downloaded_paginates_past_page_size() {
     // Covers the pagination loop in run_status for --downloaded when the
@@ -3208,14 +2613,9 @@ fn status_downloaded_paginates_past_page_size() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--downloaded",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--downloaded"])
         .assert()
         .success()
         .get_output()
@@ -3235,7 +2635,6 @@ fn status_downloaded_paginates_past_page_size() {
         "no truncation tail expected when under cap; stdout: {stdout}"
     );
 }
-
 #[test]
 fn status_downloaded_truncates_past_print_cap() {
     // Covers the 200-row listing cap for --downloaded on large libraries.
@@ -3261,14 +2660,9 @@ fn status_downloaded_truncates_past_print_cap() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--downloaded",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--downloaded"])
         .assert()
         .success()
         .get_output()
@@ -3286,7 +2680,6 @@ fn status_downloaded_truncates_past_print_cap() {
         "truncation tail missing; stdout: {stdout}"
     );
 }
-
 #[test]
 fn status_failed_truncates_past_print_cap() {
     let dir = tempfile::tempdir().unwrap();
@@ -3301,14 +2694,9 @@ fn status_failed_truncates_past_print_cap() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "status",
-            "--failed",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--failed"])
         .assert()
         .success()
         .get_output()
@@ -3324,7 +2712,6 @@ fn status_failed_truncates_past_print_cap() {
 // ═══════════════════════════════════════════════════════════════════════
 // Config env vars in TOML (KEI_CONFIG, KEI_DATA_DIR)
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn kei_config_env_var_loads_toml() {
     let dir = tempfile::tempdir().unwrap();
@@ -3333,7 +2720,8 @@ fn kei_config_env_var_loads_toml() {
 
     clean_cmd()
         .env("KEI_CONFIG", config_path.to_str().unwrap())
-        .args(["config", "show", "--data-dir", dir.path().to_str().unwrap()])
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["config", "show"])
         .assert()
         .success()
         .stdout(predicate::str::contains("fromenv@example.com"));
@@ -3342,7 +2730,6 @@ fn kei_config_env_var_loads_toml() {
 // ═══════════════════════════════════════════════════════════════════════
 // kei reconcile: end-to-end CLI routing (no network)
 // ═══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn reconcile_subcommand_marks_missing_and_preserves_present() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -3375,13 +2762,9 @@ fn reconcile_subcommand_marks_missing_and_preserves_present() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "reconcile",
-            "--username",
-            username,
-            "--data-dir",
-            data_dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", data_dir.path())
+        .args(["reconcile"])
         .assert()
         .success()
         .get_output()
@@ -3428,7 +2811,6 @@ fn reconcile_subcommand_marks_missing_and_preserves_present() {
         .unwrap();
     assert_eq!(present_status, "downloaded");
 }
-
 #[test]
 fn reconcile_dry_run_reports_but_does_not_mutate() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -3449,14 +2831,9 @@ fn reconcile_dry_run_reports_but_does_not_mutate() {
     drop(conn);
 
     let out = clean_cmd()
-        .args([
-            "reconcile",
-            "--dry-run",
-            "--username",
-            username,
-            "--data-dir",
-            data_dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", data_dir.path())
+        .args(["reconcile", "--dry-run"])
         .assert()
         .success()
         .get_output()
@@ -3486,20 +2863,15 @@ fn reconcile_dry_run_reports_but_does_not_mutate() {
         .unwrap();
     assert_eq!(status, "downloaded", "dry-run must leave the DB unchanged");
 }
-
 #[test]
 fn reconcile_on_empty_db_prints_guidance_and_exits_clean() {
     let data_dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
 
     let out = clean_cmd()
-        .args([
-            "reconcile",
-            "--username",
-            username,
-            "--data-dir",
-            data_dir.path().to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", data_dir.path())
+        .args(["reconcile"])
         .assert()
         .success()
         .get_output()
@@ -3585,14 +2957,7 @@ fn run_config_show(body: &str) -> (String, String) {
     )
     .unwrap();
     let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .success()
         .get_output()
@@ -3612,14 +2977,7 @@ fn run_config_show_error(body: &str) -> String {
     )
     .unwrap();
     let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
         .assert()
         .failure()
         .get_output()
@@ -3649,22 +3007,13 @@ fn sync_cmd_for_config_body(body: &str) -> assert_cmd::Command {
     )
     .unwrap();
     let mut cmd = clean_cmd();
-    cmd.args([
-        "sync",
-        "--username",
-        "x@x.com",
-        "--config",
-        config_path.to_str().unwrap(),
-        "--data-dir",
-        dir.path().to_str().unwrap(),
-    ]);
+    cmd.args(["sync", "--config", config_path.to_str().unwrap()]);
     // Tempdirs leak intentionally: tests bail before sync touches them, and
     // OS-level tmpfs cleanup handles the directories at process exit.
     let _ = dir.keep();
     let _ = dl_dir.keep();
     cmd
 }
-
 #[test]
 fn removed_legacy_album_in_cli_errors() {
     sync_cmd_for_validation()
@@ -3678,7 +3027,6 @@ fn removed_legacy_album_in_cli_errors() {
         .stderr(predicate::str::contains("unexpected argument"))
         .stderr(predicate::str::contains("--folder-structure"));
 }
-
 #[test]
 fn removed_legacy_album_in_toml_errors() {
     let stderr = run_config_show_error("folder_structure = \"{album}/%B\"\n");
@@ -3688,7 +3036,6 @@ fn removed_legacy_album_in_toml_errors() {
         "stderr: {stderr}"
     );
 }
-
 #[test]
 fn removed_legacy_album_env_is_ignored() {
     sync_cmd_for_validation()
@@ -3698,7 +3045,6 @@ fn removed_legacy_album_env_is_ignored() {
         .failure()
         .stderr(predicate::str::contains("'{album}' is not valid in --folder-structure").not());
 }
-
 #[test]
 fn removed_legacy_album_errors_even_with_user_set_albums_template() {
     let stderr = run_config_show_error(
@@ -3710,7 +3056,6 @@ fn removed_legacy_album_errors_even_with_user_set_albums_template() {
         "stderr: {stderr}"
     );
 }
-
 #[test]
 fn migration_no_warning_when_no_album_token() {
     sync_cmd_for_config_body("folder_structure = \"%Y/%m/%d\"\n")
@@ -3795,7 +3140,6 @@ fn sync_validation_accepts_full_selection_combo() {
         "no sentinel-mix bail expected; stderr: {stderr}"
     );
 }
-
 #[test]
 fn config_show_emits_per_category_templates_from_toml() {
     let (stdout, _) = run_config_show(
@@ -3825,7 +3169,6 @@ fn config_show_omits_default_per_category_templates() {
         "stdout: {stdout}"
     );
 }
-
 #[test]
 fn sync_bails_on_album_token_in_smart_folders_template() {
     sync_cmd_for_config_body("folder_structure_smart_folders = \"{album}/%Y\"\n")
@@ -3834,7 +3177,6 @@ fn sync_bails_on_album_token_in_smart_folders_template() {
         .stderr(predicate::str::contains("{album}"))
         .stderr(predicate::str::contains("--folder-structure-albums"));
 }
-
 #[test]
 fn sync_bails_on_smart_folder_token_in_albums_template() {
     sync_cmd_for_config_body("folder_structure_albums = \"{smart-folder}/foo\"\n")
@@ -3843,7 +3185,6 @@ fn sync_bails_on_smart_folder_token_in_albums_template() {
         .stderr(predicate::str::contains("{smart-folder}"))
         .stderr(predicate::str::contains("--folder-structure-smart-folders"));
 }
-
 #[test]
 fn sync_bails_on_library_token_not_first_segment() {
     sync_cmd_for_config_body("folder_structure = \"%Y/{library}\"\n")
@@ -3852,7 +3193,6 @@ fn sync_bails_on_library_token_not_first_segment() {
         .stderr(predicate::str::contains("{library}"))
         .stderr(predicate::str::contains("first path segment"));
 }
-
 #[test]
 fn sync_bails_on_duplicate_library_token() {
     sync_cmd_for_config_body("folder_structure_albums = \"{library}/{library}/{album}\"\n")
@@ -3861,7 +3201,6 @@ fn sync_bails_on_duplicate_library_token() {
         .stderr(predicate::str::contains("{library}"))
         .stderr(predicate::str::contains("once"));
 }
-
 #[test]
 fn sync_bails_on_within_album_contradiction() {
     sync_cmd_for_config_body("\n[filters]\nalbums = [\"Family\", \"!Family\"]\n")
@@ -3870,7 +3209,6 @@ fn sync_bails_on_within_album_contradiction() {
         .stderr(predicate::str::contains("include and exclude"))
         .stderr(predicate::str::contains("Family"));
 }
-
 #[test]
 fn sync_bails_on_library_none() {
     sync_cmd_for_config_body("\n[filters]\nlibraries = [\"none\"]\n")
@@ -3878,7 +3216,6 @@ fn sync_bails_on_library_none() {
         .code(1)
         .stderr(predicate::str::contains("library none"));
 }
-
 #[test]
 fn config_show_emits_smart_folder_selection() {
     let (stdout, _) =
@@ -3887,7 +3224,6 @@ fn config_show_emits_smart_folder_selection() {
     assert!(stdout.contains("Favorites"), "stdout: {stdout}");
     assert!(stdout.contains("!Hidden"), "stdout: {stdout}");
 }
-
 #[test]
 fn config_show_emits_unfiled_false_when_disabled() {
     let (stdout, _) = run_config_show("\n[filters]\nunfiled = false\n");
@@ -3901,13 +3237,11 @@ fn config_show_omits_unfiled_when_default_true() {
     let (stdout, _) = run_config_show("");
     assert!(!stdout.contains("unfiled = true"), "stdout: {stdout}");
 }
-
 #[test]
 fn config_show_emits_libraries_when_non_default() {
     let (stdout, _) = run_config_show("\n[filters]\nlibraries = [\"all\"]\n");
     assert!(stdout.contains("libraries = [\"all\"]"), "stdout: {stdout}");
 }
-
 #[test]
 fn config_show_emits_libraries_when_repeatable_named_zone() {
     // Pin the multi-zone case at the binary boundary: a zone-truncated
@@ -3932,7 +3266,6 @@ fn config_show_emits_libraries_when_repeatable_named_zone() {
 }
 
 // ── Removed v0.20 selection aliases ───────────────────────────────
-
 #[test]
 fn removed_exclude_album_cli_flag_errors() {
     sync_cmd_for_validation()
@@ -3941,7 +3274,6 @@ fn removed_exclude_album_cli_flag_errors() {
         .failure()
         .stderr(predicate::str::contains("--exclude-album"));
 }
-
 #[test]
 fn removed_toml_filter_aliases_error() {
     for (field, body) in [
@@ -3959,7 +3291,6 @@ fn removed_toml_filter_aliases_error() {
         );
     }
 }
-
 #[test]
 fn removed_sync_env_vars_do_not_block_non_sync_command() {
     // Regression: issue #385 - stale sync env vars set in old Docker Compose
@@ -3973,12 +3304,12 @@ fn removed_sync_env_vars_do_not_block_non_sync_command() {
     cmd.env("KEI_FOLDER_STRUCTURE", "{:%Y/%m/%Y-%m-%d}");
     #[cfg(feature = "xmp")]
     cmd.env("KEI_EMBED_XMP", "true");
-    cmd.args(["--username", "test@example.com", "reset", "state", "--yes"]);
+    cmd.env("ICLOUD_USERNAME", "test@example.com");
+    cmd.args(["reset", "state", "--yes"]);
     cmd.assert()
         .success()
         .stderr(predicate::str::contains("sync-only flag").not());
 }
-
 #[test]
 fn removed_sync_env_vars_do_not_block_service_status() {
     // Regression: issue #385 - same class of bug on a different non-sync
@@ -3989,7 +3320,8 @@ fn removed_sync_env_vars_do_not_block_service_status() {
     cmd.env("KEI_DOWNLOAD_DIR", "/photos");
     cmd.env("KEI_ALBUM", "none");
     cmd.env("KEI_LIVE_PHOTO_MODE", "image-only");
-    cmd.args(["--username", "test@example.com", "service", "status"]);
+    cmd.env("ICLOUD_USERNAME", "test@example.com");
+    cmd.args(["service", "status"]);
     cmd.assert()
         .stderr(predicate::str::contains("sync-only flag").not());
 }

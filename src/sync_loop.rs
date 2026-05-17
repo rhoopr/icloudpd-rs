@@ -254,15 +254,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         globals,
         &pw,
         sync,
+        config::SyncConfigOverrides::default(),
         toml_config.as_ref(),
         personality_mode,
         friendly_request,
     )?;
 
-    // On first run (no config file), persist CLI-provided values so
-    // subsequent runs don't need the same flags again. Only when the
-    // user explicitly chose a config path (--config), to avoid surprise
-    // writes at the default location during tests or one-off runs.
+    // On first run (no config file), persist bootstrap values so subsequent
+    // runs don't need the same env again. Only when the user explicitly chose
+    // a config path (--config), to avoid surprise writes at the default
+    // location during tests or one-off runs.
     if !toml_existed && config_explicitly_set {
         if let Err(e) =
             config::persist_first_run_config(&config_path, &config, cli_data_dir.as_deref())
@@ -276,14 +277,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // retry-failed: one-shot by definition.
     // setup → "sync now": initial test sync, not a daemon.
     if is_one_shot {
-        config.watch_with_interval = None;
+        config.watch.interval = None;
     }
 
-    // Service-mode contract: the daemon must poll. If neither CLI, TOML,
-    // nor env supplied an interval, fall through to the canonical 24h
-    // default so a launchd/systemd/SCM unit still has a heartbeat.
-    if let Some(applied) = service_mode_default_interval(config.watch_with_interval, service_mode) {
-        config.watch_with_interval = Some(applied);
+    // Service-mode contract: the daemon must poll. If neither CLI nor TOML
+    // supplied an interval, fall through to the canonical 24h default so a
+    // launchd/systemd/SCM unit still has a heartbeat.
+    if let Some(applied) = service_mode_default_interval(config.watch.interval, service_mode) {
+        config.watch.interval = Some(applied);
         tracing::info!(
             interval_secs = applied,
             "service mode: applied default watch interval"
@@ -291,7 +292,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
 
     // Install password redaction now that we know the password
-    if let Some(pw) = &config.password {
+    if let Some(pw) = &config.auth.password {
         if let Ok(mut guard) = redact_password.lock() {
             *guard = Some(SecretString::from(pw.expose_secret().to_owned()));
         }
@@ -302,23 +303,24 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // Write PID file if requested (before auth so the PID is visible immediately)
     let _pid_guard = config
+        .watch
         .pid_file
         .as_ref()
         .map(|p| PidFileGuard::new(p.clone()))
         .transpose()?;
 
-    let sd_notifier = SystemdNotifier::new(config.notify_systemd);
-    let notifier = Notifier::new(config.notification_script.clone());
+    let sd_notifier = SystemdNotifier::new(config.watch.notify_systemd);
+    let notifier = Notifier::new(config.notifications.script.clone());
 
-    tracing::info!(concurrency = config.threads_num, "Starting kei");
+    tracing::info!(concurrency = config.download.threads_num, "Starting kei");
 
-    if config.username.is_empty() {
-        anyhow::bail!("--username is required");
+    if config.auth.username.is_empty() {
+        anyhow::bail!("username is required (set ICLOUD_USERNAME or [auth].username)");
     }
 
     // retry-failed + dry-run is unsupported: dry-run skips the state DB,
     // but retry-failed needs it to know which assets failed.
-    if is_retry_failed && config.dry_run {
+    if is_retry_failed && config.runtime.dry_run {
         anyhow::bail!(
             "--dry-run cannot be used with retry-failed (retry needs the state database)"
         );
@@ -326,7 +328,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // Validate download directory early (before auth) to avoid wasting a 2FA code
     // when the user simply forgot the destination.
-    if config.directory.as_os_str().is_empty() {
+    if config.download.directory.as_os_str().is_empty() {
         anyhow::bail!(
             "[download] directory is required for downloading \
              (set it in the config file)"
@@ -334,19 +336,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
 
     // Validate download directory is writable before spending time on authentication.
-    tokio::fs::create_dir_all(&config.directory)
+    tokio::fs::create_dir_all(&config.download.directory)
         .await
         .with_context(|| {
             format!(
                 "Failed to create download directory {}",
-                config.directory.display()
+                config.download.directory.display()
             )
         })?;
-    let probe = config.directory.join(".kei_probe");
+    let probe = config.download.directory.join(".kei_probe");
     tokio::fs::write(&probe, b"").await.with_context(|| {
         format!(
             "Download directory {} is not writable",
-            config.directory.display()
+            config.download.directory.display()
         )
     })?;
     if let Err(e) = tokio::fs::remove_file(&probe).await {
@@ -359,15 +361,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
     // Abort if available disk space is too low. See `check_min_disk_space`
     // for the pure inner check.
-    if let Some(avail) = available_disk_space(&config.directory) {
-        check_min_disk_space(avail, &config.directory)?;
+    if let Some(avail) = available_disk_space(&config.download.directory) {
+        check_min_disk_space(avail, &config.download.directory)?;
     }
 
-    let cred_store = credential::CredentialStore::new(&config.username, &config.cookie_directory);
+    let cred_store =
+        credential::CredentialStore::new(&config.auth.username, &config.auth.cookie_directory);
     let source = password::build_password_source(
-        config.password.as_ref(),
-        config.password_command.as_deref(),
-        config.password_file.as_deref(),
+        config.auth.password.as_ref(),
+        config.auth.password_command.as_deref(),
+        config.auth.password_file.as_deref(),
         cred_store,
     );
     // Snapshot the source kind before moving `source` into the provider
@@ -376,14 +379,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let password_provider = make_password_provider(source);
 
     let auth_result = match auth::authenticate_with_mode(
-        &config.cookie_directory,
-        &config.username,
+        &config.auth.cookie_directory,
+        &config.auth.username,
         &password_provider,
-        config.domain.as_str(),
+        config.auth.domain.as_str(),
         None,
         None,
         None,
-        config.personality_mode,
+        config.ui.personality_mode,
     )
     .await
     {
@@ -394,26 +397,26 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         {
             let msg = format!(
                 "2FA required for {u}. Run: kei login get-code",
-                u = config.username
+                u = config.auth.username
             );
             tracing::warn!(message = %msg, "2FA required");
             notifier.notify(
                 notifications::Event::TwoFaRequired,
                 &msg,
-                &config.username,
+                &config.auth.username,
                 None,
             );
 
-            wait_and_retry_2fa(&config.cookie_directory, &config.username, || {
+            wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
                 auth::authenticate_with_mode(
-                    &config.cookie_directory,
-                    &config.username,
+                    &config.auth.cookie_directory,
+                    &config.auth.username,
                     &password_provider,
-                    config.domain.as_str(),
+                    config.auth.domain.as_str(),
                     None,
                     None,
                     None,
-                    config.personality_mode,
+                    config.ui.personality_mode,
                 )
             })
             .await?
@@ -421,19 +424,22 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         Err(e) => return Err(e),
     };
     // Post-auth narration. Lands above any future bar; no-op in off mode.
-    crate::personality::narration::auth_ok_to_stderr(config.personality_mode, &config.username);
+    crate::personality::narration::auth_ok_to_stderr(
+        config.ui.personality_mode,
+        &config.auth.username,
+    );
 
     // Save password to credential store if requested. Only the ephemeral
     // `Direct` source (CLI flag / env var) persists; File / Command /
     // Store / Interactive each emit a warning explaining why the flag is
     // a no-op for that source.
-    if config.save_password {
+    if config.auth.save_password {
         match password::decide_save_password_action(password_source_kind) {
             password::SavePasswordAction::Save => {
-                if let Some(ref pw) = config.password {
+                if let Some(ref pw) = config.auth.password {
                     let store = credential::CredentialStore::new(
-                        &config.username,
-                        &config.cookie_directory,
+                        &config.auth.username,
+                        &config.auth.cookie_directory,
                     );
                     if let Err(e) = store.store(pw.expose_secret()) {
                         tracing::warn!(error = %e, "Failed to save password to credential store");
@@ -452,8 +458,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
 
     let api_retry_config = retry::RetryConfig {
-        max_retries: config.max_retries,
-        base_delay_secs: config.retry_delay_secs,
+        max_retries: config.retry.max_retries,
+        base_delay_secs: config.retry.retry_delay_secs,
         max_delay_secs: 60,
     };
     api_retry_config.validate()?;
@@ -473,7 +479,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             .take()
             .expect("auth_result present at start of attempt");
         let init_result =
-            init_photos_service(this_auth, api_retry_config, config.personality_mode).await;
+            init_photos_service(this_auth, api_retry_config, config.ui.personality_mode).await;
         let (ss, mut ps) = match init_result {
             Ok(pair) => pair,
             Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
@@ -488,7 +494,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
             Err(e) => return Err(e),
         };
-        match resolve_libraries(&config.selection.libraries, &mut ps).await {
+        match resolve_libraries(&config.filters.selection.libraries, &mut ps).await {
             Ok(libs) => break (ss, ps, libs),
             Err(e) if should_retry_session_init(&e, retried_after_session_error) => {
                 tracing::warn!(
@@ -510,7 +516,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     );
     // Post-library-resolve narration. Friendly-mode-only.
     crate::personality::narration::libraries_resolved_to_stderr(
-        config.personality_mode,
+        config.ui.personality_mode,
         libraries.len(),
     );
 
@@ -518,18 +524,18 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // impossible-config case (e.g. shared libraries plus a smart-folder selector)
     // here, before any per-library work, so the user gets a clear error
     // instead of a silent zero-pass run with exit code 0.
-    validate_smart_folder_fulfillability(&libraries, &config.selection)?;
+    validate_smart_folder_fulfillability(&libraries, &config.filters.selection)?;
 
     // Initialize state database.
     // Skip for --dry-run so a preview doesn't create the DB or poison
     // sync tokens, which would cause a subsequent real sync to believe
     // nothing has changed and download 0 photos.
-    let state_db: Option<Arc<dyn state::StateDb>> = if config.dry_run {
+    let state_db: Option<Arc<dyn state::StateDb>> = if config.runtime.dry_run {
         None
     } else {
-        let db_path = config.cookie_directory.join(format!(
+        let db_path = config.auth.cookie_directory.join(format!(
             "{}.db",
-            auth::session::sanitize_username(&config.username)
+            auth::session::sanitize_username(&config.auth.username)
         ));
         match state::SqliteStateDb::open(&db_path).await {
             Ok(db) => {
@@ -601,7 +607,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // shared libraries they could be syncing. Runs once per data dir,
     // gated by state DB metadata.
     maybe_notify_shared_libraries(
-        &config.selection.libraries,
+        &config.filters.selection.libraries,
         &mut photos_service,
         state_db.as_deref(),
     )
@@ -610,16 +616,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Pre-compute config values used each cycle to build DownloadConfig.
     // DownloadConfig is rebuilt per-cycle so sync_mode can vary.
     let skip_created_before = config
+        .filters
         .skip_created_before
         .map(|d| d.with_timezone(&chrono::Utc));
     let skip_created_after = config
+        .filters
         .skip_created_after
         .map(|d| d.with_timezone(&chrono::Utc));
     let retry_config = api_retry_config;
-    let live_photo_size = config.live_photo_size.to_asset_version_size();
+    let live_photo_size = config.photos.live_photo_size.to_asset_version_size();
     // One shared limiter per sync run so the configured cap applies to
     // aggregate throughput across every concurrent download.
     let bandwidth_limiter = config
+        .download
         .bandwidth_limit
         .map(download::limiter::BandwidthLimiter::new);
     if let Some(limiter) = &bandwidth_limiter {
@@ -633,12 +642,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Arc-sharing win is half-defeated: each build_download_config
     // call would re-allocate directory / filename_exclude / temp_suffix
     // from scratch instead of refcount-bumping.
-    let cfg_directory: Arc<std::path::Path> = Arc::from(config.directory.as_path());
-    let cfg_filename_exclude: Arc<[glob::Pattern]> = Arc::from(config.filename_exclude.clone());
-    let cfg_temp_suffix: Arc<str> = Arc::from(config.temp_suffix.as_str());
-    let cfg_folder_structure_albums: Arc<str> = Arc::from(config.folder_structure_albums.as_str());
+    let cfg_directory: Arc<std::path::Path> = Arc::from(config.download.directory.as_path());
+    let cfg_filename_exclude: Arc<[glob::Pattern]> =
+        Arc::from(config.download.filename_exclude.clone());
+    let cfg_temp_suffix: Arc<str> = Arc::from(config.download.temp_suffix.as_str());
+    let cfg_folder_structure_albums: Arc<str> =
+        Arc::from(config.download.folder_structure_albums.as_str());
     let cfg_folder_structure_smart_folders: Arc<str> =
-        Arc::from(config.folder_structure_smart_folders.as_str());
+        Arc::from(config.download.folder_structure_smart_folders.as_str());
 
     let build_download_config = |sync_mode: download::SyncMode,
                                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
@@ -647,46 +658,46 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
      -> Arc<download::DownloadConfig> {
         Arc::new(download::DownloadConfig {
             directory: Arc::clone(&cfg_directory),
-            folder_structure: config.folder_structure.clone(),
+            folder_structure: config.download.folder_structure.clone(),
             folder_structure_albums: Arc::clone(&cfg_folder_structure_albums),
             folder_structure_smart_folders: Arc::clone(&cfg_folder_structure_smart_folders),
             library,
-            size: config.size.into(),
-            skip_videos: config.skip_videos,
-            skip_photos: config.skip_photos,
+            size: config.photos.size.into(),
+            skip_videos: config.filters.skip_videos,
+            skip_photos: config.filters.skip_photos,
             skip_created_before,
             skip_created_after,
             #[cfg(feature = "xmp")]
-            set_exif_datetime: config.set_exif_datetime,
+            set_exif_datetime: config.metadata.set_exif_datetime,
             #[cfg(feature = "xmp")]
-            set_exif_rating: config.set_exif_rating,
+            set_exif_rating: config.metadata.set_exif_rating,
             #[cfg(feature = "xmp")]
-            set_exif_gps: config.set_exif_gps,
+            set_exif_gps: config.metadata.set_exif_gps,
             #[cfg(feature = "xmp")]
-            set_exif_description: config.set_exif_description,
+            set_exif_description: config.metadata.set_exif_description,
             #[cfg(feature = "xmp")]
-            embed_xmp: config.embed_xmp,
+            embed_xmp: config.metadata.embed_xmp,
             #[cfg(feature = "xmp")]
-            xmp_sidecar: config.xmp_sidecar,
-            dry_run: config.dry_run,
-            concurrent_downloads: config.threads_num as usize,
-            recent: config.recent,
+            xmp_sidecar: config.metadata.xmp_sidecar,
+            dry_run: config.runtime.dry_run,
+            concurrent_downloads: config.download.threads_num as usize,
+            recent: config.filters.recent,
             retry: retry_config,
-            live_photo_mode: config.live_photo_mode,
+            live_photo_mode: config.photos.live_photo_mode,
             live_photo_size,
-            live_photo_mov_filename_policy: config.live_photo_mov_filename_policy,
-            align_raw: config.align_raw,
-            no_progress_bar: config.no_progress_bar,
-            only_print_filenames: config.only_print_filenames,
-            personality_mode: config.personality_mode,
-            file_match_policy: config.file_match_policy,
-            force_size: config.force_size,
-            keep_unicode_in_filenames: config.keep_unicode_in_filenames,
+            live_photo_mov_filename_policy: config.photos.live_photo_mov_filename_policy,
+            align_raw: config.photos.align_raw,
+            no_progress_bar: config.download.no_progress_bar,
+            only_print_filenames: config.runtime.only_print_filenames,
+            personality_mode: config.ui.personality_mode,
+            file_match_policy: config.photos.file_match_policy,
+            force_size: config.photos.force_size,
+            keep_unicode_in_filenames: config.photos.keep_unicode_in_filenames,
             filename_exclude: Arc::clone(&cfg_filename_exclude),
             temp_suffix: Arc::clone(&cfg_temp_suffix),
             state_db: state_db.clone(),
             retry_only: is_retry_failed,
-            max_download_attempts: config.max_download_attempts,
+            max_download_attempts: config.retry.max_download_attempts,
             sync_mode,
             album_name: None,
             exclude_asset_ids,
@@ -695,7 +706,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         })
     };
 
-    let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.personality_mode)?;
+    let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
 
     // Suppress the tty driver's `^C` echo for the lifetime of this sync run.
     // Without this, the echoed `^C` overflows the bar's right-edge filler
@@ -703,13 +714,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // leave a stale top rule above the live bar. Friendly + tty only;
     // restored on Drop and on the second-Ctrl+C force-exit path. See
     // `personality::tty_echo` for the full context.
-    let _echo_guard = if config.personality_mode.is_friendly() {
+    let _echo_guard = if config.ui.personality_mode.is_friendly() {
         crate::personality::tty_echo::EchoGuard::install()
     } else {
         None
     };
 
-    let is_watch_mode = config.watch_with_interval.is_some();
+    let is_watch_mode = config.watch.interval.is_some();
     let mut reauth_attempts = 0u32;
     // Sum of per-cycle failed_counts across the lifetime of this process.
     // Surfaced at exit so watch-mode daemons don't mask earlier-cycle
@@ -720,7 +731,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     for library in &libraries {
         let zone_name = library.zone_name().to_string();
         let sync_token_key = format!("sync_token:{zone_name}");
-        let plan = resolve_passes(library, &config.selection).await?;
+        let plan = resolve_passes(library, &config.filters.selection).await?;
         let (album_passes, smart_folder_passes, unfiled) = count_passes(&plan);
         tracing::info!(
             zone = %zone_name,
@@ -739,15 +750,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     }
     warn_if_multi_library_paths_commingle(
         library_states.len(),
-        &config.folder_structure,
-        &config.folder_structure_albums,
-        &config.folder_structure_smart_folders,
-        &config.selection,
+        &config.download.folder_structure,
+        &config.download.folder_structure_albums,
+        &config.download.folder_structure_smart_folders,
+        &config.filters.selection,
     );
     sd_notifier.notify_ready();
     // Friendly-mode greeting. Lands above any future bar via
     // active_bar::with_suspended; no-op in off mode. Once per process.
-    crate::personality::narration::greet_to_stderr(config.personality_mode, is_watch_mode);
+    crate::personality::narration::greet_to_stderr(config.ui.personality_mode, is_watch_mode);
 
     // Spawn the HTTP server (/healthz + /metrics) only in watch mode.
     // A one-shot sync exits before anything could scrape /healthz, so there
@@ -756,12 +767,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // but a stuck main loop does.
     // Binds synchronously so a misconfigured port fails at startup.
     let staleness_threshold = config
-        .watch_with_interval
+        .watch
+        .interval
         .map(|secs| chrono::Duration::seconds((secs * 2) as i64));
-    let (metrics_handle, metrics_task) = if config.watch_with_interval.is_some() {
+    let (metrics_handle, metrics_task) = if config.watch.interval.is_some() {
         let (h, t, _addr) = crate::metrics::spawn_server(
-            config.http_bind,
-            config.http_port,
+            config.server.bind,
+            config.server.port,
             shutdown_token.clone(),
             staleness_threshold,
         )?;
@@ -778,7 +790,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // first re-entry under `--watch`, etc.
     let mut cycle_index: u64 = 0;
     if is_watch_mode {
-        match config.reconcile_every_n_cycles {
+        match config.watch.reconcile_every_n_cycles {
             Some(n) if n > 0 => tracing::info!(
                 every_n_cycles = n,
                 "Periodic local-vs-state reconciliation enabled"
@@ -812,7 +824,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             // Docker HEALTHCHECK doesn't mark the container unhealthy after
             // the 2-hour staleness window when no new photos are uploaded.
             health.record_success();
-            health.write(&config.cookie_directory);
+            health.write(&config.auth.cookie_directory);
             // Refresh health gauges only -- do not reset cycle_duration_seconds.
             if let Some(ref handle) = metrics_handle {
                 handle.update_health_only(&health).await;
@@ -823,7 +835,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             notifier.notify(
                 notifications::Event::SyncStarted,
                 "Sync cycle starting",
-                &config.username,
+                &config.auth.username,
                 None,
             );
 
@@ -844,7 +856,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             // card's library totals, and the metrics gauges below; all
             // three reuse the same fetch. Off mode skips it entirely so
             // the v0.13 cycle path stays free of friendly-only DB calls.
-            let library_after_summary = if config.personality_mode.is_friendly() {
+            let library_after_summary = if config.ui.personality_mode.is_friendly() {
                 match state_db.as_deref() {
                     Some(db) => match db.get_summary().await {
                         Ok(s) => Some(s),
@@ -871,14 +883,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 let after = library_after.downloaded_bytes;
                 let before = after.saturating_sub(cycle_result.stats.bytes_downloaded);
                 crate::personality::narration::downloaded_phase_to_stderr(
-                    config.personality_mode,
+                    config.ui.personality_mode,
                     downloaded_u64,
                     before,
                     after,
                 );
             }
             crate::personality::narration::verified_phase_to_stderr(
-                config.personality_mode,
+                config.ui.personality_mode,
                 downloaded_u64,
             );
             if let Some(library_after) = library_after_summary.as_ref() {
@@ -899,9 +911,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     library_total_assets: library_after.total_assets,
                     library_total_bytes: library_after.downloaded_bytes,
                 };
-                card.print_to_stderr(config.personality_mode);
+                card.print_to_stderr(config.ui.personality_mode);
                 crate::personality::summary::print_recap_to_stderr(
-                    config.personality_mode,
+                    config.ui.personality_mode,
                     &cycle_result.stats.recap,
                 );
             }
@@ -909,7 +921,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             // Friendly-mode signoff line. Off-mode keeps relying on
             // log_sync_summary for journal output.
             crate::personality::narration::signoff_to_stderr(
-                config.personality_mode,
+                config.ui.personality_mode,
                 &crate::personality::narration::CycleSummary {
                     downloaded: downloaded_u64,
                     failed: u64::try_from(cycle_result.failed_count).unwrap_or(u64::MAX),
@@ -926,7 +938,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             } else {
                 health.record_success();
             }
-            health.write(&config.cookie_directory);
+            health.write(&config.auth.cookie_directory);
 
             // Update Prometheus metrics if the server is running.
             if let Some(ref handle) = metrics_handle {
@@ -954,7 +966,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
 
             // Write JSON report if configured
-            if let Some(report_path) = &config.report_json {
+            if let Some(report_path) = &config.report.json {
                 let status = crate::report::sync_status_str(
                     cycle_result.session_expired,
                     cycle_result.stats.interrupted,
@@ -1025,9 +1037,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 );
                 match attempt_reauth(
                     &shared_session,
-                    &config.cookie_directory,
-                    &config.username,
-                    config.domain.as_str(),
+                    &config.auth.cookie_directory,
+                    &config.auth.username,
+                    config.auth.domain.as_str(),
                     &password_provider,
                 )
                 .await
@@ -1047,28 +1059,32 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
                         let msg = format!(
                             "2FA required for {u}. Run: kei login get-code",
-                            u = config.username
+                            u = config.auth.username
                         );
                         tracing::warn!(message = %msg, "2FA required");
                         notifier.notify(
                             notifications::Event::TwoFaRequired,
                             &msg,
-                            &config.username,
+                            &config.auth.username,
                             None,
                         );
                         if !should_wait_for_2fa(is_watch_mode, &e) {
                             return Err(e);
                         }
 
-                        wait_and_retry_2fa(&config.cookie_directory, &config.username, || {
-                            attempt_reauth(
-                                &shared_session,
-                                &config.cookie_directory,
-                                &config.username,
-                                config.domain.as_str(),
-                                &password_provider,
-                            )
-                        })
+                        wait_and_retry_2fa(
+                            &config.auth.cookie_directory,
+                            &config.auth.username,
+                            || {
+                                attempt_reauth(
+                                    &shared_session,
+                                    &config.auth.cookie_directory,
+                                    &config.auth.username,
+                                    config.auth.domain.as_str(),
+                                    &password_provider,
+                                )
+                            },
+                        )
                         .await?;
                         continue;
                     }
@@ -1076,7 +1092,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         notifier.notify(
                             notifications::Event::SessionExpired,
                             &format!("Re-authentication failed: {e}"),
-                            &config.username,
+                            &config.auth.username,
                             None,
                         );
                         return Err(e);
@@ -1087,7 +1103,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 notifier.notify(
                     notifications::Event::SyncFailed,
                     &format!("{} downloads failed", cycle_result.failed_count),
-                    &config.username,
+                    &config.auth.username,
                     Some(&data),
                 );
                 cumulative_failed_count =
@@ -1107,7 +1123,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 notifier.notify(
                     notifications::Event::SyncComplete,
                     "Sync completed successfully",
-                    &config.username,
+                    &config.auth.username,
                     Some(&data),
                 );
             }
@@ -1121,14 +1137,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // etc.); a periodic visible signal beats waiting for the next sync
         // to stumble over the missing files.
         if is_watch_mode
-            && should_reconcile_this_cycle(cycle_index, config.reconcile_every_n_cycles)
+            && should_reconcile_this_cycle(cycle_index, config.watch.reconcile_every_n_cycles)
         {
             if let Some(db) = state_db.as_ref() {
                 run_periodic_reconcile(db.as_ref(), cycle_index).await;
             }
         }
 
-        if let Some(interval) = config.watch_with_interval {
+        if let Some(interval) = config.watch.interval {
             if shutdown_token.is_cancelled() {
                 tracing::info!("Shutdown requested, exiting...");
                 break;
@@ -1154,7 +1170,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 .and_then(|d| chrono::Local::now().checked_add_signed(d))
             {
                 crate::personality::narration::sleeping_until_to_stderr(
-                    config.personality_mode,
+                    config.ui.personality_mode,
                     wake_at,
                 );
             }
@@ -1174,7 +1190,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             // exclusion set; for libraries with many albums this can be slow under
             // watch mode. PR12+ may add per-album sync-token caching.
             for lib_state in &mut library_states {
-                match resolve_passes(&lib_state.library, &config.selection).await {
+                match resolve_passes(&lib_state.library, &config.filters.selection).await {
                     Ok(refreshed) => {
                         lib_state.plan = refreshed;
                         lib_state.plan_is_stale = false;
@@ -1212,7 +1228,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // a one-shot run completing normally), the per-cycle signoff already
     // covered the closing sentiment and a second "Done." line would be noise.
     if shutdown_token.is_cancelled() {
-        crate::personality::narration::farewell_to_stderr(config.personality_mode);
+        crate::personality::narration::farewell_to_stderr(config.ui.personality_mode);
     }
 
     // Signal the metrics server to shut down (idempotent if SIGINT already
@@ -1260,18 +1276,19 @@ async fn reauth_with_srp(
         drop(ps);
         drop(ss);
     }
-    let session_file = auth::session_file_path(&config.cookie_directory, &config.username);
+    let session_file =
+        auth::session_file_path(&config.auth.cookie_directory, &config.auth.username);
     auth::strip_session_routing_state(&session_file).await;
 
     match auth::authenticate_with_mode(
-        &config.cookie_directory,
-        &config.username,
+        &config.auth.cookie_directory,
+        &config.auth.username,
         password_provider,
-        config.domain.as_str(),
+        config.auth.domain.as_str(),
         None,
         None,
         None,
-        config.personality_mode,
+        config.ui.personality_mode,
     )
     .await
     {
@@ -1282,25 +1299,25 @@ async fn reauth_with_srp(
         {
             let msg = format!(
                 "2FA required for {u}. Run: kei login get-code",
-                u = config.username
+                u = config.auth.username
             );
             tracing::warn!(message = %msg, "2FA required");
             notifier.notify(
                 notifications::Event::TwoFaRequired,
                 &msg,
-                &config.username,
+                &config.auth.username,
                 None,
             );
-            wait_and_retry_2fa(&config.cookie_directory, &config.username, || {
+            wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
                 auth::authenticate_with_mode(
-                    &config.cookie_directory,
-                    &config.username,
+                    &config.auth.cookie_directory,
+                    &config.auth.username,
                     password_provider,
-                    config.domain.as_str(),
+                    config.auth.domain.as_str(),
                     None,
                     None,
                     None,
-                    config.personality_mode,
+                    config.ui.personality_mode,
                 )
             })
             .await
@@ -1546,7 +1563,7 @@ async fn run_cycle(
     // pipeline's `config_hash` (which tracks path-affecting fields only).
     // Using a single key for both would cause the two hashes to overwrite
     // each other every cycle, permanently preventing incremental sync.
-    if !config.dry_run {
+    if !config.runtime.dry_run {
         if let Some(db) = state_db {
             let config_hash = download::compute_config_hash(config);
             let _ = check_and_persist_enum_config_hash(db, &config_hash).await;
@@ -1579,7 +1596,7 @@ async fn run_cycle(
 
         // Skip the DB scan entirely when nothing downstream will read it.
         #[cfg(feature = "xmp")]
-        let asset_groupings = if config.embed_xmp || config.xmp_sidecar {
+        let asset_groupings = if config.metadata.embed_xmp || config.metadata.xmp_sidecar {
             preload_asset_groupings(state_db, &lib_state.zone_name).await
         } else {
             Arc::new(download::AssetGroupings::default())
@@ -1613,7 +1630,7 @@ async fn run_cycle(
         // NOT advanced, so assets will replay on next sync (safe, not data loss).
         let should_store_token = should_store_sync_token_for_cycle(
             &sync_result.outcome,
-            config.dry_run,
+            config.runtime.dry_run,
             cycle_has_stale_plan,
         );
         if should_store_token {
@@ -1894,9 +1911,9 @@ async fn reacquire_session(
 ) {
     match attempt_reauth(
         shared_session,
-        &config.cookie_directory,
-        &config.username,
-        config.domain.as_str(),
+        &config.auth.cookie_directory,
+        &config.auth.username,
+        config.auth.domain.as_str(),
         password_provider,
     )
     .await

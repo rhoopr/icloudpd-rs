@@ -1715,17 +1715,20 @@ libraries = ["shared"]
         .unwrap();
 
         // Sanity-check the TOML → Selection wiring before pinning the pass list.
-        assert_eq!(cfg.selection.libraries.to_raw(), vec!["shared".to_string()]);
+        assert_eq!(
+            cfg.filters.selection.libraries.to_raw(),
+            vec!["shared".to_string()]
+        );
         assert!(matches!(
-            cfg.selection.albums,
+            cfg.filters.selection.albums,
             AlbumSelector::All { ref excluded } if excluded.is_empty()
         ));
         assert!(matches!(
-            cfg.selection.smart_folders,
+            cfg.filters.selection.smart_folders,
             SmartFolderSelector::Named { ref included, ref excluded }
                 if included.contains("Favorites") && excluded.is_empty()
         ));
-        assert!(!cfg.selection.unfiled);
+        assert!(!cfg.filters.selection.unfiled);
 
         // Stub a library exposing one user album ("Vacation") plus the
         // Favorites smart folder. resolve_passes only consumes the first
@@ -1737,7 +1740,9 @@ libraries = ["shared"]
             .ok(serde_json::json!({"records": []}));
         let library = stub_library(mock);
 
-        let plan = resolve_passes(&library, &cfg.selection).await.unwrap();
+        let plan = resolve_passes(&library, &cfg.filters.selection)
+            .await
+            .unwrap();
         let pairs: Vec<(String, PassKind)> = plan
             .passes
             .iter()

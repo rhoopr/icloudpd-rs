@@ -81,7 +81,7 @@ opt-in (nightly + cargo-fuzz), excluded from `just gate`, and run via
    ```sh
    just dev login
    # or without just:
-   cargo run -- login --data-dir ~/.config/kei
+   KEI_DATA_DIR=~/.config/kei cargo run -- login
    ```
 
    This prompts for a 2FA code and writes session tokens. Redo only when

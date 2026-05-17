@@ -59,16 +59,14 @@ fn sync_cmd(
     // independent.
     let config_path = sync_config(cookie_dir, dir, "", "");
     let mut cmd = common::cmd();
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
         "--recent",
         &recent.to_string(),
-        "--username",
-        username,
         "--password",
         password,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
         "--config",
         config_path.to_str().unwrap(),
         "--no-progress-bar",
@@ -78,38 +76,25 @@ fn sync_cmd(
 
 fn status_cmd(username: &str, cookie_dir: &Path) -> assert_cmd::Command {
     let mut cmd = common::cmd();
-    cmd.args([
-        "status",
-        "--username",
-        username,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
-    ]);
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir)
+        .arg("status");
     cmd
 }
 
 fn reset_state_cmd(username: &str, cookie_dir: &Path) -> assert_cmd::Command {
     let mut cmd = common::cmd();
-    cmd.args([
-        "reset",
-        "state",
-        "--username",
-        username,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
-    ]);
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir)
+        .args(["reset", "state"]);
     cmd
 }
 
 fn verify_cmd(username: &str, cookie_dir: &Path) -> assert_cmd::Command {
     let mut cmd = common::cmd();
-    cmd.args([
-        "verify",
-        "--username",
-        username,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
-    ]);
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir)
+        .arg("verify");
     cmd
 }
 
@@ -120,14 +105,12 @@ fn import_cmd(
     dir: &Path,
 ) -> assert_cmd::Command {
     let mut cmd = common::cmd();
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "import-existing",
-        "--username",
-        username,
         "--password",
         password,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
         "--download-dir",
         dir.to_str().unwrap(),
     ]);
@@ -145,15 +128,13 @@ fn retry_failed_cmd(
 ) -> assert_cmd::Command {
     let config_path = sync_config(cookie_dir, dir, "", "");
     let mut cmd = common::cmd();
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
         "--retry-failed",
-        "--username",
-        username,
         "--password",
         password,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
         "--config",
         config_path.to_str().unwrap(),
         "--no-progress-bar",
@@ -399,16 +380,14 @@ fn verify_checksums_detects_corruption() {
 
         let config_path = sync_config(&cookie_dir, download_dir.path(), "", "skip_videos = true\n");
         common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
                 "--recent",
                 "1",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -443,14 +422,12 @@ fn import_existing_with_nonexistent_directory_fails() {
 
     common::with_auth_retry(|| {
         common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "import-existing",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
                 "--download-dir",
                 "/nonexistent/path/that/does/not/exist",
             ])
@@ -535,16 +512,14 @@ fn import_existing_custom_folder_structure() {
             "",
         );
         common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
                 "--recent",
                 "1",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -710,15 +685,9 @@ fn reset_sync_token_forces_full_enumeration() {
         // (and in CI), since the next sync re-enumerates every asset and we
         // ship a confirmation prompt by default.
         common::cmd()
-            .args([
-                "reset",
-                "sync-token",
-                "--yes",
-                "--username",
-                &username,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-            ])
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args(["reset", "sync-token", "--yes"])
             .timeout(Duration::from_secs(10))
             .assert()
             .success()
@@ -749,14 +718,9 @@ fn config_show_after_sync() {
     let (username, _password, cookie_dir) = common::require_preauth();
     // config show doesn't need auth, just needs username resolution
     common::cmd()
-        .args([
-            "config",
-            "show",
-            "--username",
-            &username,
-            "--data-dir",
-            cookie_dir.to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", &username)
+        .env("KEI_DATA_DIR", &cookie_dir)
+        .args(["config", "show"])
         .timeout(Duration::from_secs(10))
         .assert()
         .success()
@@ -774,15 +738,9 @@ fn login_with_existing_session() {
     let (username, password, cookie_dir) = common::require_preauth();
     common::with_auth_retry(|| {
         common::cmd()
-            .args([
-                "login",
-                "--username",
-                &username,
-                "--password",
-                &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-            ])
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args(["login", "--password", &password])
             .timeout(Duration::from_secs(60))
             .assert()
             .success();

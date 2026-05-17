@@ -63,13 +63,13 @@ EOF
 
 echo "--- 1. Docker sync ($ALBUM album) ---"
 docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DOCKER_PHOTOS:/photos" \
     "$IMAGE" sync \
         --config /config/config.toml \
-        --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
-        --data-dir /config \
         --no-progress-bar \
         \
     2>&1
@@ -118,13 +118,13 @@ fi
 echo ""
 echo "--- 6. Idempotent re-sync (no new downloads) ---"
 docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DOCKER_PHOTOS:/photos" \
     "$IMAGE" sync \
         --config /config/config.toml \
-        --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
-        --data-dir /config \
         --no-progress-bar \
         --log-level info \
     2>&1 | tee /dev/stderr | grep -qE "downloaded=0|No new photos"
@@ -134,13 +134,13 @@ echo ""
 echo "--- 7. Dry run ---"
 DRY_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-dry-XXXXX")
 docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DRY_PHOTOS:/photos" \
     "$IMAGE" sync \
         --config /config/config.toml \
-        --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
-        --data-dir /config \
         --no-progress-bar \
         --dry-run \
     2>&1
@@ -151,18 +151,20 @@ rm -rf "$DRY_PHOTOS"
 echo ""
 echo "--- 8. Password backend in container ---"
 BACKEND=$(docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
-    "$IMAGE" password --username "$ICLOUD_USERNAME" --data-dir /config backend 2>&1)
+    "$IMAGE" password backend 2>&1)
 echo "  Backend: $BACKEND"
 [ -n "$BACKEND" ]; kei_check "credential backend reports a value"
 
 echo ""
 echo "--- 9. List albums in container ---"
 docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" list albums \
-        --username "$ICLOUD_USERNAME" \
-        --data-dir /config \
     2>&1 | grep -qF "$ALBUM"
 kei_check "list-albums shows $ALBUM album"
 
@@ -171,13 +173,13 @@ echo "--- 10. Watch mode cycles + graceful SIGTERM ---"
 WATCH_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-watch-XXXXX")
 WATCH_NAME="kei-docker-watch-$$"
 docker run -d --name "$WATCH_NAME" \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$WATCH_PHOTOS:/photos" \
     "$IMAGE" sync \
         --config /config/watch-config.toml \
-        --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
-        --data-dir /config \
         --no-progress-bar \
         --log-level info >/dev/null
 
@@ -219,14 +221,14 @@ printf '%s' "$ICLOUD_PASSWORD" > "$SECRETS_DIR/icloud_password"
 chmod 400 "$SECRETS_DIR/icloud_password"
 PWFILE_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-pwfile-XXXXX")
 PWFILE_OUT=$(docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$PWFILE_PHOTOS:/photos" \
     -v "$SECRETS_DIR:/run/secrets:ro" \
     "$IMAGE" sync \
         --config /config/config.toml \
-        --username "$ICLOUD_USERNAME" \
         --password-file /run/secrets/icloud_password \
-        --data-dir /config \
         --no-progress-bar \
         --dry-run \
     2>&1)
@@ -238,10 +240,10 @@ rm -rf "$SECRETS_DIR" "$PWFILE_PHOTOS"
 echo ""
 echo "--- 13. kei status --downloaded inside container ---"
 STATUS_OUT=$(docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" status \
-        --username "$ICLOUD_USERNAME" \
-        --data-dir /config \
         --downloaded \
     2>&1)
 echo "$STATUS_OUT" | tail -5
@@ -321,13 +323,13 @@ echo "--- 14e. kei subcommand routes through kei and runs as dropped user under 
 SUB_CONFIG=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-puid-sub-config-XXXXX")
 SUB_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-puid-sub-photos-XXXXX")
 SUB_OUT=$(docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -e PUID="$TEST_PUID" \
     -e PGID="$TEST_PGID" \
     -v "$SUB_CONFIG:/config" \
     -v "$SUB_PHOTOS:/photos" \
     "$IMAGE" status \
-        --username "$ICLOUD_USERNAME" \
-        --data-dir /config \
         --downloaded \
     2>&1)
 SUB_EC=$?
@@ -347,10 +349,10 @@ rm -rf "$SUB_CONFIG" "$SUB_PHOTOS"
 echo ""
 echo "--- 15. kei status --pending --failed --downloaded combined ---"
 COMBINED_OUT=$(docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" status \
-        --username "$ICLOUD_USERNAME" \
-        --data-dir /config \
         --pending --failed --downloaded \
     2>&1)
 COMBINED_EC=$?

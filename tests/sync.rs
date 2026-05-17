@@ -87,14 +87,12 @@ fn album_cmd_with_toml(
     // the unfiled pass is exercised separately by the no-flag tests.
     let config_path = album_config(cookie_dir, download_dir, toml);
     let mut cmd = common::cmd();
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
-        "--username",
-        username,
         "--password",
         password,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
         "--config",
         config_path.to_str().unwrap(),
         "--no-progress-bar",
@@ -152,14 +150,9 @@ fn list_albums_prints_album_names() {
 
     common::with_auth_retry(|| {
         common::cmd()
-            .args([
-                "list",
-                "albums",
-                "--username",
-                &username,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-            ])
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args(["list", "albums"])
             .timeout(Duration::from_secs(TIMEOUT_META))
             .assert()
             .success()
@@ -174,14 +167,9 @@ fn list_libraries_prints_output() {
 
     common::with_auth_retry(|| {
         common::cmd()
-            .args([
-                "list",
-                "libraries",
-                "--username",
-                &username,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-            ])
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args(["list", "libraries"])
             .timeout(Duration::from_secs(TIMEOUT_META))
             .assert()
             .success()
@@ -1395,13 +1383,11 @@ fn sync_bare_invocation_works_like_sync() {
         let config_path = album_config(&cookie_dir, download_dir.path(), SyncToml::default());
 
         common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
             .args([
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -1432,14 +1418,12 @@ fn sync_without_directory_fails() {
     let config_path = common::write_toml_config(&cookie_dir, "sync-live-empty", "");
 
     common::cmd()
+        .env("ICLOUD_USERNAME", &username)
+        .env("KEI_DATA_DIR", &cookie_dir)
         .args([
             "sync",
-            "--username",
-            &username,
             "--password",
             &password,
-            "--data-dir",
-            cookie_dir.to_str().unwrap(),
             "--config",
             config_path.to_str().unwrap(),
             "--no-progress-bar",
@@ -1471,14 +1455,12 @@ fn sync_nonexistent_album_fails() {
         );
 
         common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -1504,14 +1486,12 @@ fn sync_nonexistent_library_fails() {
         let config_path = common::write_toml_config(&cookie_dir, "sync-live", &body);
 
         common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -1536,15 +1516,9 @@ fn login_authenticates_successfully() {
 
     common::with_auth_retry(|| {
         common::cmd()
-            .args([
-                "login",
-                "--username",
-                &username,
-                "--password",
-                &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-            ])
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args(["login", "--password", &password])
             .timeout(Duration::from_secs(60))
             .assert()
             .success();
@@ -1558,14 +1532,9 @@ fn list_albums_new_syntax() {
 
     common::with_auth_retry(|| {
         common::cmd()
-            .args([
-                "list",
-                "albums",
-                "--username",
-                &username,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-            ])
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args(["list", "albums"])
             .timeout(Duration::from_secs(60))
             .assert()
             .success()
@@ -1584,15 +1553,13 @@ fn sync_retry_failed_flag() {
 
         // sync --retry-failed with no prior failures should succeed (noop)
         common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
                 "--retry-failed",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -1674,14 +1641,12 @@ fn sync_watch_runs_multiple_cycles() {
         );
         let bin = env!("CARGO_BIN_EXE_kei");
         let mut child = Command::new(bin)
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "sync",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
                 "--config",
                 config_path.to_str().unwrap(),
                 "--no-progress-bar",
@@ -1937,14 +1902,12 @@ fn zz_bad_credentials_fails() {
     common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
+        .env("ICLOUD_USERNAME", "nonexistent-xyz@icloud.com")
+        .env("KEI_DATA_DIR", cookie_dir.path())
         .args([
             "sync",
-            "--username",
-            "nonexistent-xyz@icloud.com",
             "--password",
             "wrong-password",
-            "--data-dir",
-            cookie_dir.path().to_str().unwrap(),
             "--config",
             config_path.to_str().unwrap(),
             "--no-progress-bar",

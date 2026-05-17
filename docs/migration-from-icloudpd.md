@@ -21,7 +21,7 @@ fresh Apple login and 2FA approval. Your local photo files can stay in place.
 Point kei at the directory that `icloudpd` has been writing to:
 
 ```sh
-kei import-existing --username you@example.com --download-dir ~/Photos/iCloud
+ICLOUD_USERNAME=you@example.com kei import-existing --download-dir ~/Photos/iCloud
 ```
 
 `import-existing` signs in, enumerates the selected iCloud libraries, computes
@@ -32,7 +32,7 @@ those adopted files and downloads only new or previously failed assets.
 Run a dry import first when you're not sure the flags are right:
 
 ```sh
-kei import-existing --username you@example.com --download-dir ~/Photos/iCloud --dry-run
+ICLOUD_USERNAME=you@example.com kei import-existing --download-dir ~/Photos/iCloud --dry-run
 ```
 
 If most files show as unmatched, stop and fix the path options before running a
@@ -68,7 +68,7 @@ If your Python tree included album names, put the album template on
 `--folder-structure-albums`:
 
 ```sh
-kei import-existing --username you@example.com --download-dir ~/Photos/iCloud \
+ICLOUD_USERNAME=you@example.com kei import-existing --download-dir ~/Photos/iCloud \
   --folder-structure-albums "{album}/%Y/%m/%d"
 ```
 
@@ -133,25 +133,36 @@ config file for sync selection, pass that same `--config` during import.
 After the import looks good:
 
 ```sh
-kei sync --username you@example.com --download-dir ~/Photos/iCloud
+kei sync --config ~/.config/kei/config.toml
 ```
 
-After the first 2FA approval, kei stores session state under `--data-dir`
-(default `~/.config/kei`). Run `kei password set` or `kei sync --save-password`
-if you want kei to store the password for future runs.
+Put the account and sync directory in TOML:
+
+```toml
+[auth]
+username = "you@example.com"
+
+[download]
+directory = "~/Photos/iCloud"
+```
+
+After the first 2FA approval, kei stores session state under `data_dir`
+(default `~/.config/kei`; `KEI_DATA_DIR` can override it for automation). Run
+`kei password set` or `kei sync --save-password` if you want kei to store the
+password for future runs.
 
 ## Common flag mapping
 
 | `icloudpd` | kei | Notes |
 |---|---|---|
-| `-u`, `--username` | Same | Also `ICLOUD_USERNAME`. |
+| `-u`, `--username` | `[auth].username` | `ICLOUD_USERNAME` still works for automation. |
 | `-p`, `--password` | Same | Works, but process lists can expose it. Prefer `kei password set`, `--password-file`, or `--password-command`. |
 | `-d`, `--directory` | `-d`, `--download-dir` | `--directory` was removed in v0.20. |
 | `-a`, `--album` | Same | Repeatable. Default is `all`; use `--album '!Name'` for exclusions. |
 | `--exclude-album NAME` | `--album '!NAME'` | Removed in v0.20. |
 | `--list-albums` | `kei list albums` | The old flag was removed in v0.20. |
 | `--list-libraries` | `kei list libraries` | The old flag was removed in v0.20. |
-| `--cookie-directory` | `--data-dir` | The old flag was removed in v0.20. New default is `~/.config/kei`. |
+| `--cookie-directory` | `data_dir` | The old flag was removed in v0.20. New default is `~/.config/kei`; `KEI_DATA_DIR` still works for automation. |
 | `--folder-structure "{:%Y/%m/%d}"` | `--folder-structure "%Y/%m/%d"` | Python wrapper syntax is still accepted. Album and smart-folder templates now have separate flags. |
 | `--size original` | Same | Values: `original`, `medium`, `thumb`, `adjusted`, `alternative`. kei accepts one size per run. |
 | `--threads-num` | `--threads` | The old flag was removed in v0.20. Default is 10. With `--bandwidth-limit` and no explicit thread count, default drops to 1. |
@@ -163,7 +174,7 @@ if you want kei to store the password for future runs.
 | `--keep-unicode-in-filenames` | Same | Must match during import. |
 | `--live-photo-mov-filename-policy` | Same | `suffix` or `original`. |
 | `--file-match-policy` | Same | `name-size-dedup-with-suffix` or `name-id7`. |
-| `--domain` | Same | `com` or `cn`. |
+| `--domain` | `[auth].domain` | `com` or `cn`. |
 | `--watch-with-interval` | Same | Built-in watch mode. |
 | `--log-level` | Same | `debug`, `info`, `warn`, `error`. |
 | `--only-print-filenames` | Same | Prints paths and doesn't download. |
@@ -229,9 +240,9 @@ v0.20 removed the remaining v0.13 compatibility aliases:
 ## Docker migration
 
 The official image is `ghcr.io/rhoopr/kei:latest`. It uses `/config` and
-`/photos` volumes. The image runs `kei sync --config /config/config.toml
---data-dir /config --download-dir /photos` by default, with a 24-hour watch
-interval from `KEI_WATCH_WITH_INTERVAL=86400`.
+`/photos` volumes. The image runs `kei service run --config /config/config.toml`
+by default, with `KEI_DATA_DIR=/config`. Set `[download].directory = "/photos"`
+in the config file.
 
 A minimal compose file:
 

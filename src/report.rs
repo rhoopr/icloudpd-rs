@@ -107,43 +107,43 @@ impl RunOptions {
     /// Build from the resolved Config. Only includes user-facing settings.
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
         Self {
-            username: config.username.clone(),
-            download_dir: config.directory.clone(),
-            folder_structure: config.folder_structure.clone(),
-            size: format!("{:?}", config.size).to_lowercase(),
-            live_photo_mode: format!("{:?}", config.live_photo_mode).to_lowercase(),
-            live_photo_size: format!("{:?}", config.live_photo_size).to_lowercase(),
-            file_match_policy: format!("{:?}", config.file_match_policy).to_lowercase(),
-            albums: config.albums.to_vec(),
-            library: config.selection.libraries.to_raw().join(","),
-            skip_videos: config.skip_videos,
-            skip_photos: config.skip_photos,
+            username: config.auth.username.clone(),
+            download_dir: config.download.directory.clone(),
+            folder_structure: config.download.folder_structure.clone(),
+            size: format!("{:?}", config.photos.size).to_lowercase(),
+            live_photo_mode: format!("{:?}", config.photos.live_photo_mode).to_lowercase(),
+            live_photo_size: format!("{:?}", config.photos.live_photo_size).to_lowercase(),
+            file_match_policy: format!("{:?}", config.photos.file_match_policy).to_lowercase(),
+            albums: config.filters.albums.to_vec(),
+            library: config.filters.selection.libraries.to_raw().join(","),
+            skip_videos: config.filters.skip_videos,
+            skip_photos: config.filters.skip_photos,
             #[cfg(feature = "xmp")]
-            set_exif_datetime: config.set_exif_datetime,
+            set_exif_datetime: config.metadata.set_exif_datetime,
             #[cfg(not(feature = "xmp"))]
             set_exif_datetime: false,
             #[cfg(feature = "xmp")]
-            set_exif_rating: config.set_exif_rating,
+            set_exif_rating: config.metadata.set_exif_rating,
             #[cfg(not(feature = "xmp"))]
             set_exif_rating: false,
             #[cfg(feature = "xmp")]
-            set_exif_gps: config.set_exif_gps,
+            set_exif_gps: config.metadata.set_exif_gps,
             #[cfg(not(feature = "xmp"))]
             set_exif_gps: false,
             #[cfg(feature = "xmp")]
-            set_exif_description: config.set_exif_description,
+            set_exif_description: config.metadata.set_exif_description,
             #[cfg(not(feature = "xmp"))]
             set_exif_description: false,
             #[cfg(feature = "xmp")]
-            embed_xmp: config.embed_xmp,
+            embed_xmp: config.metadata.embed_xmp,
             #[cfg(not(feature = "xmp"))]
             embed_xmp: false,
             #[cfg(feature = "xmp")]
-            xmp_sidecar: config.xmp_sidecar,
+            xmp_sidecar: config.metadata.xmp_sidecar,
             #[cfg(not(feature = "xmp"))]
             xmp_sidecar: false,
-            threads: config.threads_num,
-            dry_run: config.dry_run,
+            threads: config.download.threads_num,
+            dry_run: config.runtime.dry_run,
         }
     }
 }
@@ -335,8 +335,11 @@ mod tests {
             data_dir: None,
         };
         let sync = crate::cli::SyncArgs {
-            download_dir: Some(download_dir.path().display().to_string()),
-            threads: Some(6),
+            config_overrides: crate::config::SyncConfigOverrides {
+                download_dir: Some(download_dir.path().display().to_string()),
+                threads: Some(6),
+                ..Default::default()
+            },
             ..crate::cli::SyncArgs::default()
         };
         let config = crate::config::Config::build(
