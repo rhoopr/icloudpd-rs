@@ -91,6 +91,7 @@ pub(crate) struct RunOptions {
     pub file_match_policy: String,
     pub albums: Vec<String>,
     pub library: String,
+    pub media: Vec<crate::config::MediaKind>,
     pub skip_videos: bool,
     pub skip_photos: bool,
     pub set_exif_datetime: bool,
@@ -116,6 +117,7 @@ impl RunOptions {
             file_match_policy: format!("{:?}", config.photos.file_match_policy).to_lowercase(),
             albums: config.filters.selection.albums.to_raw(),
             library: config.filters.selection.libraries.to_raw().join(","),
+            media: config.filters.media.to_kinds(),
             skip_videos: config.filters.skip_videos,
             skip_photos: config.filters.skip_photos,
             #[cfg(feature = "xmp")]
@@ -282,6 +284,7 @@ mod tests {
                 file_match_policy: "name-size-dedup".to_string(),
                 albums: vec!["Favorites".to_string()],
                 library: "personal".to_string(),
+                media: crate::config::MediaSelection::all().to_kinds(),
                 skip_videos: false,
                 skip_photos: false,
                 set_exif_datetime: true,
@@ -371,6 +374,48 @@ mod tests {
     }
 
     #[test]
+    fn run_options_from_config_reports_media_selection() {
+        let download_dir = tempfile::tempdir().expect("download dir");
+        let globals = crate::config::GlobalArgs {
+            username: Some("report@example.com".to_string()),
+            domain: None,
+            data_dir: None,
+        };
+        let sync = crate::cli::SyncArgs {
+            config_overrides: crate::config::SyncConfigOverrides {
+                download_dir: Some(download_dir.path().display().to_string()),
+                ..Default::default()
+            },
+            ..crate::cli::SyncArgs::default()
+        };
+        let toml: crate::config::TomlConfig =
+            toml::from_str("[filters]\nmedia = [\"photos\", \"videos\"]\n")
+                .expect("parse media config");
+        let config = crate::config::Config::build(
+            &globals,
+            &crate::cli::PasswordArgs::default(),
+            sync,
+            Some(&toml),
+        )
+        .expect("build config");
+
+        let options = RunOptions::from_config(&config);
+
+        assert_eq!(
+            options.media,
+            vec![
+                crate::config::MediaKind::Photos,
+                crate::config::MediaKind::Videos,
+            ],
+        );
+        assert!(!options.skip_videos);
+        assert!(!options.skip_photos);
+
+        let json = serde_json::to_value(&options).expect("serialize options");
+        assert_eq!(json["media"], serde_json::json!(["photos", "videos"]));
+    }
+
+    #[test]
     fn failed_assets_are_omitted_when_empty() {
         // serde(skip_serializing_if = "Vec::is_empty") on failed_assets
         // and is_zero_usize on failed_assets_truncated must keep clean-run
@@ -390,6 +435,7 @@ mod tests {
                 file_match_policy: String::new(),
                 albums: vec![],
                 library: String::new(),
+                media: crate::config::MediaSelection::all().to_kinds(),
                 skip_videos: false,
                 skip_photos: false,
                 set_exif_datetime: false,
@@ -438,6 +484,7 @@ mod tests {
                 file_match_policy: String::new(),
                 albums: vec![],
                 library: String::new(),
+                media: crate::config::MediaSelection::all().to_kinds(),
                 skip_videos: false,
                 skip_photos: false,
                 set_exif_datetime: false,
@@ -481,6 +528,7 @@ mod tests {
                 file_match_policy: String::new(),
                 albums: vec![],
                 library: String::new(),
+                media: crate::config::MediaSelection::all().to_kinds(),
                 skip_videos: false,
                 skip_photos: false,
                 set_exif_datetime: false,
@@ -525,6 +573,7 @@ mod tests {
                 file_match_policy: "name-size-dedup".to_string(),
                 albums: vec![],
                 library: "personal".to_string(),
+                media: crate::config::MediaSelection::all().to_kinds(),
                 skip_videos: false,
                 skip_photos: false,
                 set_exif_datetime: false,
