@@ -184,9 +184,9 @@ kei_sync "$DIR" --dry-run >/dev/null
 echo ""
 echo "=== 9. Filter flag changes config hash ==="
 HASH_BEFORE=$(get_hash)
-OUTPUT=$(KEI_SYNC_FILTERS_TOML=$'skip_videos = true\n' kei_sync "$DIR")
+OUTPUT=$(KEI_SYNC_FILTERS_TOML=$'media = ["photos", "live-photos"]\n' kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "config|changed|cleared|token|download|completed"
-[ "$HASH_BEFORE" != "$(get_hash)" ]; kei_check "hash changed with --skip-videos"
+[ "$HASH_BEFORE" != "$(get_hash)" ]; kei_check "hash changed with media filter"
 
 # ── 10. Session reuse check ─────────────────────────────────────────────
 echo ""

@@ -5,6 +5,7 @@ use crate::types::{
 };
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 // ── TOML config structs ─────────────────────────────────────────────
@@ -110,12 +111,65 @@ pub(crate) struct TomlFilters {
     pub smart_folders: Option<Vec<String>>,
     /// Unfiled-pass toggle. Default: `true`.
     pub unfiled: Option<bool>,
+    pub media: Option<Vec<MediaKind>>,
     pub filename_exclude: Option<Vec<String>>,
-    pub skip_videos: Option<bool>,
-    pub skip_photos: Option<bool>,
     pub recent: Option<crate::cli::RecentLimit>,
     pub skip_created_before: Option<String>,
     pub skip_created_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum MediaKind {
+    Photos,
+    Videos,
+    LivePhotos,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MediaSelection {
+    pub photos: bool,
+    pub videos: bool,
+    pub live_photos: bool,
+}
+
+impl Default for MediaSelection {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl MediaSelection {
+    pub(crate) const fn all() -> Self {
+        Self {
+            photos: true,
+            videos: true,
+            live_photos: true,
+        }
+    }
+
+    pub(crate) const fn skip_videos(self) -> bool {
+        !self.videos
+    }
+
+    pub(crate) const fn skip_photos(self) -> bool {
+        !self.photos
+    }
+
+    pub(crate) const fn is_all(self) -> bool {
+        self.photos && self.videos && self.live_photos
+    }
+
+    pub(crate) fn to_kinds(self) -> Vec<MediaKind> {
+        [
+            (self.photos, MediaKind::Photos),
+            (self.videos, MediaKind::Videos),
+            (self.live_photos, MediaKind::LivePhotos),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, kind)| enabled.then_some(kind))
+        .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -231,12 +285,24 @@ pub struct DownloadSettings {
 
 #[derive(Debug)]
 pub struct FilterConfig {
+    #[allow(
+        dead_code,
+        reason = "legacy album shape stays during v0.20 migration while runtime uses Selection"
+    )]
     pub albums: AlbumSelection,
+    #[allow(
+        dead_code,
+        reason = "legacy album exclude shape stays during v0.20 migration while runtime uses Selection"
+    )]
     pub exclude_albums: Vec<String>,
     pub selection: crate::selection::Selection,
+    pub media: MediaSelection,
     pub skip_created_before: Option<DateTime<Local>>,
     pub skip_created_after: Option<DateTime<Local>>,
     pub recent: Option<u32>,
+    pub persistent_recent: Option<crate::cli::RecentLimit>,
+    pub persistent_skip_created_before: Option<String>,
+    pub persistent_skip_created_after: Option<String>,
     pub skip_videos: bool,
     pub skip_photos: bool,
 }
@@ -367,6 +433,59 @@ pub(crate) fn resolve_library_selector(
     crate::selection::parse_library_selector(&raw)
 }
 
+fn resolve_media_selection(
+    toml_filters: Option<&TomlFilters>,
+    skip_videos_override: Option<bool>,
+    skip_photos_override: Option<bool>,
+) -> anyhow::Result<MediaSelection> {
+    let mut selection = if let Some(kinds) = toml_filters.and_then(|f| f.media.as_ref()) {
+        anyhow::ensure!(!kinds.is_empty(), "[filters] media must not be empty");
+        let mut seen = BTreeSet::new();
+        let mut selection = MediaSelection {
+            photos: false,
+            videos: false,
+            live_photos: false,
+        };
+        for kind in kinds {
+            anyhow::ensure!(
+                seen.insert(*kind),
+                "[filters] media contains duplicate `{}`",
+                media_kind_name(*kind)
+            );
+            match kind {
+                MediaKind::Photos => selection.photos = true,
+                MediaKind::Videos => selection.videos = true,
+                MediaKind::LivePhotos => selection.live_photos = true,
+            }
+        }
+        selection
+    } else {
+        MediaSelection::all()
+    };
+
+    if let Some(skip_videos) = skip_videos_override {
+        selection.videos = !skip_videos;
+    }
+    if let Some(skip_photos) = skip_photos_override {
+        selection.photos = !skip_photos;
+    }
+
+    anyhow::ensure!(
+        selection.photos || selection.videos || selection.live_photos,
+        "[filters] media must select at least one media category"
+    );
+
+    Ok(selection)
+}
+
+const fn media_kind_name(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Photos => "photos",
+        MediaKind::Videos => "videos",
+        MediaKind::LivePhotos => "live-photos",
+    }
+}
+
 /// Which albums to sync.
 ///
 /// v0.13 default is `All`. `-a all` (explicit), no `-a` flag, and the
@@ -388,6 +507,10 @@ pub enum AlbumSelection {
 
 impl AlbumSelection {
     /// Serialize to a `Vec<String>` for TOML persistence and JSON reports.
+    #[allow(
+        dead_code,
+        reason = "legacy report/test helper kept while runtime selection uses Selection::to_raw"
+    )]
     pub fn to_vec(&self) -> Vec<String> {
         match self {
             Self::LibraryOnly => Vec::new(),
@@ -571,6 +694,10 @@ fn warn_implicit_unfiled_pass() {
 /// `unfiled_override` is `Some(b)` when the user passed `--unfiled` (or set
 /// `[filters].unfiled` in TOML) and `None` otherwise. When `None`, unfiled
 /// defaults to `true` regardless of `--album` (v0.13 semantics).
+#[allow(
+    dead_code,
+    reason = "kept as a pure adapter for selection truth-table tests and future config refactors"
+)]
 pub(crate) fn derive_selection(
     albums: &AlbumSelection,
     exclude_albums: &[String],
@@ -1228,14 +1355,10 @@ impl Config {
         validate_template_tokens(&folder_structure_albums, TemplateKind::Albums)?;
         validate_template_tokens(&folder_structure_smart_folders, TemplateKind::SmartFolders)?;
 
-        let skip_videos = resolve_flag(
-            overrides.skip_videos,
-            toml_filters.and_then(|f| f.skip_videos),
-        );
-        let skip_photos = resolve_flag(
-            overrides.skip_photos,
-            toml_filters.and_then(|f| f.skip_photos),
-        );
+        let media =
+            resolve_media_selection(toml_filters, overrides.skip_videos, overrides.skip_photos)?;
+        let skip_videos = media.skip_videos();
+        let skip_photos = media.skip_photos();
         let live_photo_mode_pre_resolved: Option<LivePhotoMode> = overrides
             .live_photo_mode
             .or_else(|| toml_photos.and_then(|p| p.live_photo_mode));
@@ -1248,17 +1371,17 @@ impl Config {
             .unfiled
             .or_else(|| toml_filters.and_then(|f| f.unfiled));
 
-        // Build the v0.13 [`Selection`] that the new resolver (`resolve_passes`)
-        // consumes. The legacy `albums` / `exclude_albums` fields stay on
-        // Config for the sync-token invalidation hash and the report.json
-        // emission; the Selection is the source of truth for pass execution.
-        let selection = derive_selection(
-            &albums,
-            &exclude_albums,
-            &library_selector,
-            &raw_smart_folders,
-            unfiled_override,
-        )?;
+        // Build the [`Selection`] that the pass resolver consumes directly
+        // from raw TOML/override values. Keep the legacy `albums` /
+        // `exclude_albums` fields for report compatibility, but don't route
+        // TOML serialization through them: that would erase escaped literal
+        // sentinel names such as `=all`.
+        let selection = crate::selection::Selection {
+            albums: crate::selection::parse_album_selector(&raw_albums, true)?,
+            smart_folders: crate::selection::parse_smart_folder_selector(&raw_smart_folders)?,
+            libraries: library_selector.clone(),
+            unfiled: unfiled_override.unwrap_or_else(unfiled_default),
+        };
         if should_warn_implicit_unfiled(unfiled_override, &selection.albums) {
             warn_implicit_unfiled_pass();
         }
@@ -1274,10 +1397,14 @@ impl Config {
                     .map_err(|e| anyhow::anyhow!("invalid --filename-exclude pattern '{p}': {e}"))
             })
             .collect::<anyhow::Result<_>>()?;
-        let recent_raw = sync.recent.or_else(|| toml_filters.and_then(|f| f.recent));
+        let persistent_recent = toml_filters.and_then(|f| f.recent);
+        let recent_raw = sync.recent.or(persistent_recent);
+        let persistent_skip_created_before =
+            toml_filters.and_then(|f| f.skip_created_before.clone());
+        let persistent_skip_created_after = toml_filters.and_then(|f| f.skip_created_after.clone());
         let explicit_skip_created_before_str = sync
             .skip_created_before
-            .or_else(|| toml_filters.and_then(|f| f.skip_created_before.clone()));
+            .or_else(|| persistent_skip_created_before.clone());
 
         // Split the RecentLimit: Count(n) is a post-enumeration cap held on
         // config.recent. Days(n) translates into a skip_created_before cutoff
@@ -1302,7 +1429,7 @@ impl Config {
         };
         let skip_created_after_str = sync
             .skip_created_after
-            .or_else(|| toml_filters.and_then(|f| f.skip_created_after.clone()));
+            .or_else(|| persistent_skip_created_after.clone());
 
         let skip_created_before = skip_created_before_str
             .as_deref()
@@ -1422,26 +1549,15 @@ impl Config {
             },
         };
 
-        // Reject combinations that would produce zero downloads. When both
-        // skip flags are set, the only live-photo modes that still produce
-        // output are `both` and `video-only` (Live Photo MOV companions
-        // download even with stills suppressed); `skip` and `image-only`
-        // suppress the MOV too and produce nothing.
-        let mode_name = match live_photo_mode {
-            LivePhotoMode::Skip => Some("skip"),
-            LivePhotoMode::ImageOnly => Some("image-only"),
-            LivePhotoMode::VideoOnly | LivePhotoMode::Both => None,
-        };
-        if skip_videos && skip_photos {
-            if let Some(mode) = mode_name {
-                anyhow::bail!(
-                    "`--skip-videos` + `--skip-photos` + `--live-photo-mode {mode}` \
-                     would download nothing. Unset one of the skip flags, use \
-                     `--live-photo-mode video-only` if you only want Live Photo \
-                     video companions, or use `--dry-run` for an \
-                     auth-free test."
-                );
-            }
+        if !media.photos
+            && !media.videos
+            && media.live_photos
+            && live_photo_mode == LivePhotoMode::Skip
+        {
+            anyhow::bail!(
+                "[filters] media selects only live-photos, but [photos] live_photo_mode = \"skip\" \
+                 would download nothing. Enable photos or videos, or change live_photo_mode."
+            );
         }
 
         Ok(Self {
@@ -1469,9 +1585,13 @@ impl Config {
                 albums,
                 exclude_albums,
                 selection,
+                media,
                 skip_created_before,
                 skip_created_after,
                 recent,
+                persistent_recent,
+                persistent_skip_created_before,
+                persistent_skip_created_after,
                 skip_videos,
                 skip_photos,
             },
@@ -1679,6 +1799,11 @@ impl Config {
                 } else {
                     Some(false)
                 },
+                media: if self.filters.media.is_all() {
+                    None
+                } else {
+                    Some(self.filters.media.to_kinds())
+                },
                 filename_exclude: if self.download.filename_exclude.is_empty() {
                     None
                 } else {
@@ -1690,19 +1815,9 @@ impl Config {
                             .collect(),
                     )
                 },
-                skip_videos: if self.filters.skip_videos {
-                    Some(true)
-                } else {
-                    None
-                },
-                skip_photos: if self.filters.skip_photos {
-                    Some(true)
-                } else {
-                    None
-                },
-                recent: None,              // per-run
-                skip_created_before: None, // per-run
-                skip_created_after: None,  // per-run
+                recent: self.filters.persistent_recent,
+                skip_created_before: self.filters.persistent_skip_created_before.clone(),
+                skip_created_after: self.filters.persistent_skip_created_after.clone(),
             }),
             photos: Some(TomlPhotos {
                 size: if self.photos.size == VersionSize::Original {
@@ -2163,8 +2278,7 @@ mod tests {
             [filters]
             libraries = ["PrimarySync"]
             albums = ["Favorites"]
-            skip_videos = false
-            skip_photos = false
+            media = ["photos", "videos", "live-photos"]
             recent = 500
             skip_created_before = "2024-01-01"
             skip_created_after = "2025-01-01"
@@ -2829,7 +2943,7 @@ mod tests {
             set_exif_datetime = true
 
             [filters]
-            skip_videos = true
+            media = ["photos", "live-photos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -2899,7 +3013,7 @@ mod tests {
     fn test_build_cli_flag_overrides_toml_false() {
         let toml_str = r#"
             [filters]
-            skip_videos = false
+            media = ["photos", "videos", "live-photos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
@@ -2913,7 +3027,7 @@ mod tests {
     fn test_build_cli_false_overrides_toml_true() {
         let toml_str = r#"
             [filters]
-            skip_videos = true
+            media = ["photos", "live-photos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
@@ -3508,8 +3622,7 @@ mod tests {
             [filters]
             libraries = ["SharedSync-ABC"]
             albums = ["A", "B"]
-            skip_videos = true
-            skip_photos = true
+            media = ["photos", "videos", "live-photos"]
             recent = 100
             skip_created_before = "2024-01-01"
             skip_created_after = "2025-12-31"
@@ -3521,8 +3634,10 @@ mod tests {
             Some(&["SharedSync-ABC".to_string()][..])
         );
         assert_eq!(f.albums, Some(vec!["A".to_string(), "B".to_string()]));
-        assert_eq!(f.skip_videos, Some(true));
-        assert_eq!(f.skip_photos, Some(true));
+        assert_eq!(
+            f.media.as_deref(),
+            Some(&[MediaKind::Photos, MediaKind::Videos, MediaKind::LivePhotos,][..])
+        );
 
         assert_eq!(f.recent, Some(crate::cli::RecentLimit::Count(100)));
         assert_eq!(f.skip_created_before.as_deref(), Some("2024-01-01"));
@@ -4375,22 +4490,21 @@ mod tests {
         assert_eq!(pd.live_photo_size, LivePhotoSize::Adjusted);
     }
 
-    // ── Config::build: boolean flag merge exhaustive ───────────────
+    // ── Config::build: boolean/media merge exhaustive ─────────────
 
     #[cfg(feature = "xmp")]
     #[test]
     fn test_build_all_boolean_flags_from_toml() {
-        // `skip_photos = true` is intentionally omitted: combining it with
-        // `skip_videos = true` and `live_photo_mode = "skip"` would download
-        // nothing and is rejected at Config::build. See
-        // `test_build_skip_videos_and_photos_with_live_skip_rejected`.
+        // `media` replaces the old durable skip booleans. This keeps the
+        // test anchored to the TOML-first filter surface while still checking
+        // the derived runtime skip flags.
         let toml_str = r#"
             [download]
             set_exif_datetime = true
             no_progress_bar = true
 
             [filters]
-            skip_videos = true
+            media = ["photos", "live-photos"]
 
             [photos]
             live_photo_mode = "skip"
@@ -4421,8 +4535,8 @@ mod tests {
     #[cfg(feature = "xmp")]
     #[test]
     fn test_build_all_boolean_flags_cli_overrides() {
-        // `skip_photos = Some(true)` is intentionally omitted here too; see
-        // the matching TOML test above.
+        // Programmatic skip overrides still feed the same media owner type
+        // for tests and internal call sites.
         let mut sync = default_sync();
         sync.config_overrides.set_exif_datetime = Some(true);
         sync.no_progress_bar = Some(true);
@@ -4446,8 +4560,7 @@ mod tests {
     fn test_build_boolean_flags_false_in_toml_stays_false() {
         let toml_str = r#"
             [filters]
-            skip_videos = false
-            skip_photos = false
+            media = ["photos", "videos", "live-photos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -4745,7 +4858,7 @@ mod tests {
             [filters]
             libraries = ["SharedSync-FULL"]
             albums = ["Album1"]
-            skip_videos = true
+            media = ["photos", "live-photos"]
             recent = 50
 
             [photos]
@@ -5418,6 +5531,51 @@ mod tests {
         assert!(filters.recent.is_none());
         assert!(filters.skip_created_before.is_none());
         assert!(filters.skip_created_after.is_none());
+    }
+
+    #[test]
+    fn test_to_toml_persists_filter_recent_and_dates_from_toml() {
+        let toml_str = r#"
+            [filters]
+            recent = 100
+            skip_created_before = "2024-01-01"
+            skip_created_after = "30d"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        let serialized = cfg.to_toml();
+        let filters = serialized.filters.as_ref().unwrap();
+        assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(100)));
+        assert_eq!(filters.skip_created_before.as_deref(), Some("2024-01-01"));
+        assert_eq!(filters.skip_created_after.as_deref(), Some("30d"));
+    }
+
+    #[test]
+    fn test_to_toml_roundtrip_media() {
+        let toml_str = r#"
+            [filters]
+            media = ["photos", "live-photos"]
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        let serialized = cfg.to_toml();
+        let filters = serialized.filters.as_ref().unwrap();
+        assert_eq!(
+            filters.media.as_deref(),
+            Some(&[MediaKind::Photos, MediaKind::LivePhotos][..])
+        );
     }
 
     #[test]
@@ -6552,12 +6710,83 @@ mod tests {
         assert!(err.contains("--recent 7d"), "{err}");
     }
 
-    // ── skip-videos + skip-photos empty-result guard ──────────────────
+    // ── media empty-result guard ─────────────────────────────────────
+
+    #[test]
+    fn test_build_live_photos_only_with_live_skip_rejected() {
+        let toml_str = r#"
+            [filters]
+            media = ["live-photos"]
+
+            [photos]
+            live_photo_mode = "skip"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("would download nothing"),
+            "error should explain the outcome; got: {err}"
+        );
+        assert!(
+            err.contains("live_photo_mode"),
+            "error should name the conflicting field; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_empty_media_rejected() {
+        let toml_str = r#"
+            [filters]
+            media = []
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("media must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn test_build_duplicate_media_rejected() {
+        let toml_str = r#"
+            [filters]
+            media = ["photos", "photos"]
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate `photos`"), "{err}");
+    }
+
+    #[test]
+    fn test_build_legacy_skip_media_toml_keys_rejected() {
+        for key in ["skip_videos", "skip_photos"] {
+            let toml_str = format!("[filters]\n{key} = true\n");
+            let err = toml::from_str::<TomlConfig>(&toml_str).unwrap_err();
+            assert!(err.to_string().contains(&format!("unknown field `{key}`")));
+        }
+    }
 
     #[test]
     fn test_build_skip_videos_and_photos_with_live_skip_rejected() {
-        // Classic "user thought these were orthogonal" mistake: both flags
-        // true with live-photo-mode skip means nothing at all downloads.
         let mut sync = default_sync();
         sync.config_overrides.skip_videos = Some(true);
         sync.config_overrides.skip_photos = Some(true);
@@ -6570,28 +6799,20 @@ mod tests {
             "error should explain the outcome; got: {err}"
         );
         assert!(
-            err.contains("--live-photo-mode skip"),
-            "error should name the specific mode; got: {err}"
-        );
-        assert!(
-            err.contains("video-only"),
-            "error should suggest the escape hatch; got: {err}"
+            err.contains("live_photo_mode"),
+            "error should name the conflicting field; got: {err}"
         );
     }
 
     #[test]
-    fn test_build_skip_videos_and_photos_with_image_only_rejected() {
-        // image-only drops Live Photo MOVs, so combined with both skip
-        // flags the result is still nothing. Same error applies.
+    fn test_build_skip_videos_and_photos_with_image_only_allowed() {
         let mut sync = default_sync();
         sync.config_overrides.skip_videos = Some(true);
         sync.config_overrides.skip_photos = Some(true);
         sync.config_overrides.live_photo_mode = Some(LivePhotoMode::ImageOnly);
-        let err = Config::build(&default_globals(), &default_password(), sync, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("would download nothing"), "{err}");
-        assert!(err.contains("--live-photo-mode image-only"), "{err}");
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.filters.media.to_kinds(), vec![MediaKind::LivePhotos]);
+        assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::ImageOnly);
     }
 
     #[test]
@@ -6641,25 +6862,24 @@ mod tests {
     }
 
     #[test]
-    fn test_build_skip_videos_and_photos_from_toml_rejected() {
-        // TOML version of the same check.
+    fn test_build_media_from_toml() {
         let toml_str = r#"
             [filters]
-            skip_videos = true
-            skip_photos = true
-
-            [photos]
-            live_photo_mode = "skip"
+            media = ["videos", "live-photos"]
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let err = Config::build(
+        let cfg = Config::build(
             &default_globals(),
             &default_password(),
             default_sync(),
             Some(&toml),
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("would download nothing"), "{err}");
+        .unwrap();
+        assert_eq!(
+            cfg.filters.media.to_kinds(),
+            vec![MediaKind::Videos, MediaKind::LivePhotos]
+        );
+        assert!(cfg.filters.skip_photos);
+        assert!(!cfg.filters.skip_videos);
     }
 }

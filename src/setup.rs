@@ -1237,11 +1237,10 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             writeln!(out, "filename_exclude = [{}]", pat_strs.join(", "))?;
         }
         if answers.skip_videos {
-            writeln!(out, "skip_videos = true")?;
+            writeln!(out, "media = [\"photos\", \"live-photos\"]")?;
         } else {
-            writeln!(out, "# skip_videos = false")?;
+            writeln!(out, "# media = [\"photos\", \"videos\", \"live-photos\"]")?;
         }
-        writeln!(out, "# skip_photos = false")?;
         // `live_photo_mode` is emitted in the [photos] section below.
         match answers.recent {
             Some(n) => writeln!(out, "recent = {n}")?,
@@ -1574,7 +1573,7 @@ mod tests {
         assert!(toml_str.contains("smart_folders = [\"all\"]"));
         assert!(toml_str.contains("unfiled = false"));
         assert!(toml_str.contains("filename_exclude = [\"IMG_screenshot*.png\"]"));
-        assert!(toml_str.contains("skip_videos = true"));
+        assert!(toml_str.contains("media = [\"photos\", \"live-photos\"]"));
         assert!(toml_str.contains("size = \"medium\""));
         // live_photo_mode = "both" is the default; emitting it explicitly is
         // also fine, but the test above sets `Some(Both)` so we expect it.
@@ -1683,7 +1682,15 @@ mod tests {
             filters.filename_exclude.as_deref(),
             Some(&["*.tmp".to_string()][..])
         );
-        assert_eq!(filters.skip_videos, Some(true));
+        assert_eq!(
+            filters.media.as_deref(),
+            Some(
+                &[
+                    crate::config::MediaKind::Photos,
+                    crate::config::MediaKind::LivePhotos,
+                ][..]
+            )
+        );
         assert!(
             filters.libraries.is_none(),
             "empty libraries vec must produce a comment, not an array"
@@ -1807,6 +1814,8 @@ mod tests {
                 "skip_live_photos =",
                 "[filters].skip_live_photos -> [photos].live_photo_mode",
             ),
+            ("skip_videos =", "[filters].skip_videos -> [filters].media"),
+            ("skip_photos =", "[filters].skip_photos -> [filters].media"),
             (
                 "threads_num =",
                 "[download].threads_num -> [download].threads",

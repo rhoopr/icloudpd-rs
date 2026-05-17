@@ -4409,8 +4409,7 @@ mod tests {
                 crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
             ),
             size: AssetVersionSize::Original,
-            skip_videos: false,
-            skip_photos: false,
+            media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
             #[cfg(feature = "xmp")]
@@ -4511,8 +4510,7 @@ mod tests {
                 crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
             ),
             size: AssetVersionSize::Original,
-            skip_videos: false,
-            skip_photos: false,
+            media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
             #[cfg(feature = "xmp")]
@@ -4625,7 +4623,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = DownloadConfig::test_default();
         config.directory = std::sync::Arc::from(dir.path());
-        config.skip_videos = true;
+        config.media.videos = false;
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
 

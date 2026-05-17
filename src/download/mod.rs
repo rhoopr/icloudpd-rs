@@ -276,8 +276,7 @@ struct SharedHashFields<'a> {
     skip_created_before: Option<DateTime<Utc>>,
     skip_created_after: Option<DateTime<Utc>>,
     force_size: bool,
-    skip_videos: bool,
-    skip_photos: bool,
+    media: crate::config::MediaSelection,
     live_photo_mode: LivePhotoMode,
     filename_exclude: &'a [glob::Pattern],
 }
@@ -308,8 +307,9 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
     hash_optional_date(hasher, truncate_date_to_day(f.skip_created_before));
     hash_optional_date(hasher, truncate_date_to_day(f.skip_created_after));
     hasher.update([u8::from(f.force_size)]);
-    hasher.update([u8::from(f.skip_videos)]);
-    hasher.update([u8::from(f.skip_photos)]);
+    hasher.update([u8::from(f.media.photos)]);
+    hasher.update([u8::from(f.media.videos)]);
+    hasher.update([u8::from(f.media.live_photos)]);
     hasher.update([f.live_photo_mode as u8]);
     // filename_exclude patterns affect which assets are eligible
     let mut sorted_excludes: Vec<&str> = f
@@ -351,8 +351,7 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
             skip_created_before: config.skip_created_before,
             skip_created_after: config.skip_created_after,
             force_size: config.force_size,
-            skip_videos: config.skip_videos,
-            skip_photos: config.skip_photos,
+            media: config.media,
             live_photo_mode: config.live_photo_mode,
             filename_exclude: &config.filename_exclude,
         },
@@ -403,8 +402,7 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
             skip_created_before,
             skip_created_after,
             force_size: config.photos.force_size,
-            skip_videos: config.filters.skip_videos,
-            skip_photos: config.filters.skip_photos,
+            media: config.filters.media,
             live_photo_mode: config.photos.live_photo_mode,
             filename_exclude: &config.download.filename_exclude,
         },
@@ -421,27 +419,9 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     // Tag byte distinguishes the three selection modes so switching between
     // them (e.g. `-a A` -> `-a all`) invalidates the sync token even if no
     // explicit album name changed.
-    match &config.filters.albums {
-        crate::config::AlbumSelection::LibraryOnly => hasher.update([0]),
-        crate::config::AlbumSelection::All => hasher.update([1]),
-        crate::config::AlbumSelection::Named(names) => {
-            hasher.update([2]);
-            for album in names {
-                hasher.update(album.as_bytes());
-                hasher.update(b"\0");
-            }
-        }
-    }
-    let mut sorted_excludes: Vec<&str> = config
-        .filters
-        .exclude_albums
-        .iter()
-        .map(std::string::String::as_str)
-        .collect();
-    sorted_excludes.sort_unstable();
-    for name in &sorted_excludes {
-        hasher.update(b"exclude:");
-        hasher.update(name.as_bytes());
+    for entry in config.filters.selection.albums.to_raw() {
+        hasher.update(b"album:");
+        hasher.update(entry.as_bytes());
         hasher.update(b"\0");
     }
     // Library selector: stable tag bytes per shape so changing the resolved
@@ -487,8 +467,7 @@ pub(crate) struct DownloadConfig {
     /// Behind `Arc<str>` for the same reason as `folder_structure_albums`.
     pub(crate) folder_structure_smart_folders: Arc<str>,
     pub(crate) size: AssetVersionSize,
-    pub(crate) skip_videos: bool,
-    pub(crate) skip_photos: bool,
+    pub(crate) media: crate::config::MediaSelection,
     pub(crate) skip_created_before: Option<DateTime<Utc>>,
     pub(crate) skip_created_after: Option<DateTime<Utc>>,
     #[cfg(feature = "xmp")]
@@ -618,8 +597,7 @@ impl DownloadConfig {
             ),
             library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
             size: fields.size.into(),
-            skip_videos: false,
-            skip_photos: false,
+            media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
             #[cfg(feature = "xmp")]
@@ -763,8 +741,7 @@ impl std::fmt::Debug for DownloadConfig {
                 &self.folder_structure_smart_folders,
             )
             .field("size", &self.size)
-            .field("skip_videos", &self.skip_videos)
-            .field("skip_photos", &self.skip_photos)
+            .field("media", &self.media)
             .field("skip_created_before", &self.skip_created_before)
             .field("skip_created_after", &self.skip_created_after);
         #[cfg(feature = "xmp")]
@@ -816,8 +793,7 @@ impl DownloadConfig {
                 crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
             ),
             size: AssetVersionSize::Original,
-            skip_videos: false,
-            skip_photos: false,
+            media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
             #[cfg(feature = "xmp")]
@@ -2660,11 +2636,11 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_skip_videos() {
+    fn test_hash_download_config_changes_on_media_videos() {
         let mut config1 = test_config();
-        config1.skip_videos = false;
+        config1.media.videos = true;
         let mut config2 = test_config();
-        config2.skip_videos = true;
+        config2.media.videos = false;
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -2672,11 +2648,11 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_download_config_changes_on_skip_photos() {
+    fn test_hash_download_config_changes_on_media_photos() {
         let mut config1 = test_config();
-        config1.skip_photos = false;
+        config1.media.photos = true;
         let mut config2 = test_config();
-        config2.skip_photos = true;
+        config2.media.photos = false;
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -2738,8 +2714,8 @@ mod tests {
 
         // Verify album changes produce a different hash
         let mut config_with_album = app_config;
-        config_with_album.filters.albums =
-            crate::config::AlbumSelection::Named(vec!["Favorites".to_string()]);
+        config_with_album.filters.selection.albums =
+            crate::selection::parse_album_selector(&["Favorites".to_string()], true).unwrap();
         let hash3 = compute_config_hash(&config_with_album);
         assert_ne!(hash1, hash3, "adding an album must change the hash");
     }
@@ -3553,8 +3529,8 @@ mod tests {
         use crate::commands::PassKind;
         let mut config = test_config();
         config.folder_structure_albums = Arc::from("{album}/%Y");
-        config.skip_videos = true;
-        config.skip_photos = true;
+        config.media.photos = false;
+        config.media.videos = false;
         config.live_photo_mode = LivePhotoMode::ImageOnly;
         config.force_size = true;
         config.keep_unicode_in_filenames = true;
@@ -3566,8 +3542,8 @@ mod tests {
         config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         config.temp_suffix = std::sync::Arc::from(".custom-tmp");
         let derived = config.with_pass(&make_pass(PassKind::Album, "Test"));
-        assert!(derived.skip_videos);
-        assert!(derived.skip_photos);
+        assert!(!derived.media.photos);
+        assert!(!derived.media.videos);
         assert_eq!(derived.live_photo_mode, LivePhotoMode::ImageOnly);
         assert!(derived.force_size);
         assert!(derived.keep_unicode_in_filenames);
@@ -3636,7 +3612,7 @@ mod tests {
         let config = test_config();
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "6500d91b19aec487",
+            hash, "2f00bc3c8c25ebd3",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
     }
@@ -3664,8 +3640,7 @@ mod tests {
         );
         config.recent = Some(500);
         config.force_size = true;
-        config.skip_videos = true;
-        config.skip_photos = false;
+        config.media.videos = false;
         config.live_photo_mode = LivePhotoMode::ImageOnly;
         config.filename_exclude = std::sync::Arc::from(vec![
             glob::Pattern::new("*.AAE").unwrap(),
@@ -3673,7 +3648,7 @@ mod tests {
         ]);
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "265311b50bfaeb17",
+            hash, "982597ed8d530291",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
     }
@@ -3684,7 +3659,7 @@ mod tests {
         let config = build_config_with(tmp.path(), "/photos", |_| {});
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "90467ca7a96e1e77",
+            hash, "8cee1ab323f75f43",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3701,7 +3676,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "3c7e94d9830cb812",
+            hash, "76240320547a5e90",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3718,7 +3693,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "1dd59701ae38f405",
+            hash, "3db6469af693c9d8",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3735,7 +3710,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "898b49b4a29fd1e8",
+            hash, "0eb3687e0905dea6",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }

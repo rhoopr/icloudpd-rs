@@ -3349,6 +3349,41 @@ fn config_show_emits_libraries_when_repeatable_named_zone() {
     );
 }
 
+#[test]
+fn config_show_round_trips_persistent_recent_and_dates() {
+    let (stdout, _) = run_config_show(
+        "\n[filters]\nrecent = 100\nskip_created_before = \"2024-01-01\"\nskip_created_after = \"30d\"\n",
+    );
+    assert!(stdout.contains("recent = 100"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("skip_created_before = \"2024-01-01\""),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("skip_created_after = \"30d\""),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn config_show_round_trips_media_filter() {
+    let (stdout, _) = run_config_show("\n[filters]\nmedia = [\"photos\", \"live-photos\"]\n");
+    assert!(stdout.contains("media"), "stdout: {stdout}");
+    assert!(stdout.contains("photos"), "stdout: {stdout}");
+    assert!(stdout.contains("live-photos"), "stdout: {stdout}");
+}
+
+#[test]
+fn config_show_round_trips_escaped_selection_values() {
+    let (stdout, _) = run_config_show(
+        "\n[filters]\nalbums = [\"=all\", \"=!Drafts\"]\nsmart_folders = [\"=none\"]\nlibraries = [\"=primary\"]\n",
+    );
+    assert!(stdout.contains("\"=all\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"=!Drafts\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"=none\""), "stdout: {stdout}");
+    assert!(stdout.contains("\"=primary\""), "stdout: {stdout}");
+}
+
 // ── Removed v0.20 selection aliases ───────────────────────────────
 #[test]
 fn removed_exclude_album_cli_flag_errors() {
@@ -3367,6 +3402,8 @@ fn removed_toml_filter_aliases_error() {
             "\n[filters]\nexclude_albums = [\"Drafts\", \"Family\"]\n",
         ),
         ("library", "\n[filters]\nlibrary = \"PrimarySync\"\n"),
+        ("skip_videos", "\n[filters]\nskip_videos = true\n"),
+        ("skip_photos", "\n[filters]\nskip_photos = true\n"),
     ] {
         let stderr = run_config_show_error(body);
         assert!(

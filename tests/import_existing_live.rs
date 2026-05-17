@@ -924,7 +924,7 @@ fn roundtrip_name_id7_sync_skips_after_import() {
     });
 }
 
-/// Import with `--skip-videos`, sync without it. Sync still must NOT
+/// Import with videos disabled, sync without that filter. Sync still must NOT
 /// re-download the photos imported. Videos (which import skipped) should
 /// also be skipped by sync because the state DB has nothing on them and
 /// the on-disk files match.
@@ -935,14 +935,13 @@ fn roundtrip_skip_videos_sync_skips_imported_photos() {
     let (download_dir, _sync_data_dir) = fixture();
 
     common::with_auth_retry(|| {
-        // import-existing doesn't expose --skip-videos as a flag (it
-        // builds DownloadConfig with skip_videos=false hard-coded). Use
-        // TOML to force it.
+        // import-existing doesn't expose media selection as a flag. Use TOML
+        // to force it.
         let test_data = tempdir().unwrap();
         let toml_path = write_kei_toml(
             test_data.path(),
             download_dir,
-            "[filters]\nskip_videos = true\n",
+            "[filters]\nmedia = [\"photos\", \"live-photos\"]\n",
         );
 
         let recent = ROUNDTRIP_RECENT.to_string();
@@ -961,7 +960,7 @@ fn roundtrip_skip_videos_sync_skips_imported_photos() {
         .clone();
         let summary = parse_summary(&String::from_utf8_lossy(&import_out.stdout));
         if summary.matched == 0 {
-            eprintln!("skip: skip_videos import matched nothing; round-trip not applicable");
+            eprintln!("skip: media-filtered import matched nothing; round-trip not applicable");
             return;
         }
 
@@ -969,7 +968,7 @@ fn roundtrip_skip_videos_sync_skips_imported_photos() {
             run_sync_against_fixture(&username, &password, download_dir, test_data.path(), "");
         assert_eq!(
             downloaded, 0,
-            "sync re-downloaded {downloaded} after skip_videos import; matched={}",
+            "sync re-downloaded {downloaded} after media-filtered import; matched={}",
             summary.matched,
         );
     });

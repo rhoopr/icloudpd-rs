@@ -176,7 +176,7 @@ password for future runs.
 | `--folder-structure "{:%Y/%m/%d}"` | `[download].folder_structure = "%Y/%m/%d"` | Python wrapper syntax is still accepted. Use `folder_structure_albums` and `folder_structure_smart_folders` for the other passes. |
 | `--size original` | `[photos].size = "original"` | Values: `original`, `medium`, `thumb`, `adjusted`, `alternative`. kei accepts one size per run. |
 | `--threads-num` | `[download].threads` | Default is 10. With `[download].bandwidth_limit` and no explicit thread count, default drops to 1. |
-| `--skip-videos`, `--skip-photos` | `[filters].skip_videos`, `[filters].skip_photos` | Boolean TOML settings replace the sync flags. |
+| `--skip-videos`, `--skip-photos` | `[filters].media` | Use `media = ["photos", "live-photos"]` to skip videos, or `media = ["videos", "live-photos"]` to skip normal photos. |
 | `--skip-live-photos` | `[photos].live_photo_mode = "skip"` | The old flag was removed in v0.20. |
 | `--recent 100` | `--recent 100` | Count form works for sync and import. |
 | `--recent 30d` | `--recent 30d` for sync | Import rejects the days form. |

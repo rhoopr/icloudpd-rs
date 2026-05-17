@@ -378,7 +378,12 @@ fn verify_checksums_detects_corruption() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        let config_path = sync_config(&cookie_dir, download_dir.path(), "", "skip_videos = true\n");
+        let config_path = sync_config(
+            &cookie_dir,
+            download_dir.path(),
+            "",
+            "media = [\"photos\", \"live-photos\"]\n",
+        );
         common::cmd()
             .env("ICLOUD_USERNAME", &username)
             .env("KEI_DATA_DIR", &cookie_dir)

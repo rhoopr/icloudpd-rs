@@ -378,12 +378,19 @@ pub(crate) fn is_asset_filtered(
         tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
         return Some(FilterReason::ExcludedAlbum);
     }
-    if config.skip_videos && asset.item_type() == Some(AssetItemType::Movie) {
-        tracing::debug!(asset_id = %asset.id(), "Skipping video (skip_videos enabled)");
+    if asset.is_live_photo() && !config.media.live_photos {
+        tracing::debug!(asset_id = %asset.id(), "Skipping live photo (media filter)");
         return Some(FilterReason::MediaType);
     }
-    if config.skip_photos && asset.item_type() == Some(AssetItemType::Image) {
-        tracing::debug!(asset_id = %asset.id(), "Skipping photo (skip_photos enabled)");
+    if !config.media.videos && asset.item_type() == Some(AssetItemType::Movie) {
+        tracing::debug!(asset_id = %asset.id(), "Skipping video (media filter)");
+        return Some(FilterReason::MediaType);
+    }
+    if !config.media.photos
+        && asset.item_type() == Some(AssetItemType::Image)
+        && !asset.is_live_photo()
+    {
+        tracing::debug!(asset_id = %asset.id(), "Skipping photo (media filter)");
         return Some(FilterReason::MediaType);
     }
     if config.live_photo_mode == LivePhotoMode::Skip && asset.is_live_photo() {
@@ -2024,7 +2031,7 @@ mod tests {
             .orig_checksum("vid_ck")
             .build();
         let mut config = test_config();
-        config.skip_videos = true;
+        config.media.videos = false;
         assert_eq!(
             is_asset_filtered(&asset, &config),
             Some(FilterReason::MediaType)
@@ -2051,11 +2058,39 @@ mod tests {
     fn test_filter_skips_photos_when_configured() {
         let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
-        config.skip_photos = true;
+        config.media.photos = false;
         assert_eq!(
             is_asset_filtered(&asset, &config),
             Some(FilterReason::MediaType)
         );
+    }
+
+    #[test]
+    fn test_filter_live_photos_only_skips_normal_photos_and_videos() {
+        let photo = TestPhotoAsset::new("PHOTO_1").build();
+        let video = TestPhotoAsset::new("VID_1")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50000)
+            .orig_url("https://p01.icloud-content.com/vid")
+            .orig_checksum("vid_ck")
+            .build();
+        let live = test_live_photo_asset();
+        let mut config = test_config();
+        config.media.photos = false;
+        config.media.videos = false;
+        config.media.live_photos = true;
+
+        assert_eq!(
+            is_asset_filtered(&photo, &config),
+            Some(FilterReason::MediaType)
+        );
+        assert_eq!(
+            is_asset_filtered(&video, &config),
+            Some(FilterReason::MediaType)
+        );
+        assert_eq!(is_asset_filtered(&live, &config), None);
     }
 
     #[test]
@@ -2644,7 +2679,7 @@ mod tests {
             .orig_checksum("vid_ck")
             .build();
         let mut config = test_config();
-        config.skip_videos = true;
+        config.media.videos = false;
         assert_eq!(
             is_asset_filtered(&asset, &config),
             Some(FilterReason::MediaType)
@@ -2655,7 +2690,7 @@ mod tests {
     fn test_extract_skip_candidates_skip_photos() {
         let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
-        config.skip_photos = true;
+        config.media.photos = false;
         assert_eq!(
             is_asset_filtered(&asset, &config),
             Some(FilterReason::MediaType)

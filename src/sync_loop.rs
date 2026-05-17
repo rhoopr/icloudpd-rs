@@ -663,8 +663,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             folder_structure_smart_folders: Arc::clone(&cfg_folder_structure_smart_folders),
             library,
             size: config.photos.size.into(),
-            skip_videos: config.filters.skip_videos,
-            skip_photos: config.filters.skip_photos,
+            media: config.filters.media,
             skip_created_before,
             skip_created_after,
             #[cfg(feature = "xmp")]
@@ -1556,7 +1555,7 @@ async fn run_cycle(
     // sync tokens so the subsequent lookup falls back to full enumeration
     // -- the stored incremental token would miss assets that are newly
     // eligible under the changed config (e.g. a user switching --size or
-    // adding --skip-videos). The hash is cycle-invariant across libraries,
+    // changing [filters].media). The hash is cycle-invariant across libraries,
     // so this runs once per cycle, not once per library.
     //
     // The metadata key `enum_config_hash` is distinct from the download

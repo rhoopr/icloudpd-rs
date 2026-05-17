@@ -292,9 +292,10 @@ fn sync_idempotent_second_run_noop() {
     });
 }
 
-// ── Filter flags ────────────────────────────────────────────────────────
+// ── Media filters ───────────────────────────────────────────────────────
 
-/// --skip-videos should exclude all .mov/.mp4 files but still download images.
+/// `[filters].media` without videos should exclude all .mov/.mp4 files but
+/// still download images.
 #[test]
 #[ignore]
 fn sync_skip_videos_excludes_video_files() {
@@ -309,7 +310,7 @@ fn sync_skip_videos_excludes_video_files() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                filters: "skip_videos = true\n",
+                filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
         )
@@ -327,7 +328,7 @@ fn sync_skip_videos_excludes_video_files() {
         let video_files: Vec<_> = files.iter().filter(|p| is_video_ext(p)).collect();
         assert!(
             video_files.is_empty(),
-            "--skip-videos should exclude all video files, found: {video_files:?}"
+            "media filter should exclude all video files, found: {video_files:?}"
         );
 
         let image_files: Vec<_> = files.iter().filter(|p| is_image_ext(p)).collect();
@@ -338,7 +339,8 @@ fn sync_skip_videos_excludes_video_files() {
     });
 }
 
-/// --skip-photos should exclude all image files but still download videos.
+/// `[filters].media` without photos should exclude all image files but still
+/// download videos.
 #[test]
 #[ignore]
 fn sync_skip_photos_excludes_image_files() {
@@ -353,7 +355,7 @@ fn sync_skip_photos_excludes_image_files() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                filters: "skip_photos = true\n",
+                filters: "media = [\"videos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
         )
@@ -365,7 +367,7 @@ fn sync_skip_photos_excludes_image_files() {
         let image_files: Vec<_> = files.iter().filter(|p| is_image_ext(p)).collect();
         assert!(
             image_files.is_empty(),
-            "--skip-photos should exclude all image files, found: {image_files:?}"
+            "media filter should exclude all image files, found: {image_files:?}"
         );
 
         let video_files: Vec<_> = files.iter().filter(|p| is_video_ext(p)).collect();
@@ -411,9 +413,9 @@ fn sync_skip_live_photos_excludes_companions() {
     });
 }
 
-/// `--skip-videos` + `--skip-photos` + a live-photo mode that drops everything
-/// is rejected at startup (since v0.11.x's flag-audit) rather than silently
-/// completing with zero downloads.
+/// A media filter that selects only live photos plus a live-photo mode that
+/// drops them is rejected at startup rather than silently completing with zero
+/// downloads.
 #[test]
 #[ignore]
 fn sync_skip_all_media_rejected_at_startup() {
@@ -427,7 +429,7 @@ fn sync_skip_all_media_rejected_at_startup() {
         &cookie_dir,
         download_dir.path(),
         SyncToml {
-            filters: "skip_videos = true\nskip_photos = true\n",
+            filters: "media = [\"live-photos\"]\n",
             photos: "live_photo_mode = \"skip\"\n",
             ..SyncToml::default()
         },
@@ -506,7 +508,7 @@ fn sync_size_medium_produces_smaller_files() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                filters: "skip_videos = true\n",
+                filters: "media = [\"photos\", \"live-photos\"]\n",
                 photos: "size = \"medium\"\n",
                 ..SyncToml::default()
             },
@@ -755,7 +757,7 @@ fn sync_set_exif_datetime_embeds_date() {
             download_dir.path(),
             SyncToml {
                 download: "set_exif_datetime = true\n",
-                filters: "skip_videos = true\n",
+                filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
         )
@@ -812,7 +814,7 @@ fn sync_set_exif_rating_embeds_rating() {
             download_dir.path(),
             SyncToml {
                 download: "set_exif_rating = true\n",
-                filters: "skip_videos = true\n",
+                filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
         )
@@ -851,7 +853,7 @@ fn sync_set_exif_gps_embeds_gps() {
             download_dir.path(),
             SyncToml {
                 download: "set_exif_gps = true\n",
-                filters: "skip_videos = true\n",
+                filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
         )
@@ -890,7 +892,7 @@ fn sync_set_exif_description_embeds_description() {
             download_dir.path(),
             SyncToml {
                 download: "set_exif_description = true\n",
-                filters: "skip_videos = true\n",
+                filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
         )
@@ -928,7 +930,7 @@ fn sync_embed_xmp_writes_xmp_packet() {
             download_dir.path(),
             SyncToml {
                 download: "embed_xmp = true\n",
-                filters: "skip_videos = true\n",
+                filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
         )
@@ -972,7 +974,7 @@ fn sync_xmp_sidecar_writes_sidecar_file() {
             download_dir.path(),
             SyncToml {
                 download: "xmp_sidecar = true\n",
-                filters: "skip_videos = true\n",
+                filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
         )

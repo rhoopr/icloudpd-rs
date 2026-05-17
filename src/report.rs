@@ -114,7 +114,7 @@ impl RunOptions {
             live_photo_mode: format!("{:?}", config.photos.live_photo_mode).to_lowercase(),
             live_photo_size: format!("{:?}", config.photos.live_photo_size).to_lowercase(),
             file_match_policy: format!("{:?}", config.photos.file_match_policy).to_lowercase(),
-            albums: config.filters.albums.to_vec(),
+            albums: config.filters.selection.albums.to_raw(),
             library: config.filters.selection.libraries.to_raw().join(","),
             skip_videos: config.filters.skip_videos,
             skip_photos: config.filters.skip_photos,

@@ -133,10 +133,50 @@ impl Default for Selection {
 
 // ── Parsing ─────────────────────────────────────────────────────────────────
 
-/// Parse a single raw album entry. Returns the canonical token plus a flag
-/// indicating whether it was an exclusion (`!name`).
-fn split_exclusion(raw: &str) -> (&str, bool) {
-    raw.strip_prefix('!').map_or((raw, false), |r| (r, true))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectorToken<'a> {
+    name: &'a str,
+    exclude: bool,
+    escaped: bool,
+}
+
+/// Parse a raw selector entry. A leading `=` escapes sentinel grammar so
+/// names like `all`, `none`, or `!Drafts` can be selected literally.
+fn selector_token<'a>(raw: &'a str, flag: &str) -> anyhow::Result<SelectorToken<'a>> {
+    if let Some(literal) = raw.strip_prefix('=') {
+        anyhow::ensure!(
+            !literal.is_empty(),
+            "--{flag} literal value must not be empty"
+        );
+        return Ok(SelectorToken {
+            name: literal,
+            exclude: false,
+            escaped: true,
+        });
+    }
+
+    let (name, exclude) = raw.strip_prefix('!').map_or((raw, false), |r| (r, true));
+    anyhow::ensure!(!name.is_empty(), "--{flag} value must not be empty");
+    anyhow::ensure!(
+        !name.starts_with('='),
+        "`!=value` is not supported for --{flag}; use `=value` for a literal value or `!value` for an exclusion"
+    );
+    Ok(SelectorToken {
+        name,
+        exclude,
+        escaped: false,
+    })
+}
+
+fn escape_if_needed(name: &str, sentinels: &[&str]) -> String {
+    if name.starts_with('!')
+        || name.starts_with('=')
+        || sentinels.iter().any(|s| name.eq_ignore_ascii_case(s))
+    {
+        format!("={name}")
+    } else {
+        name.to_string()
+    }
 }
 
 /// Insert into a BTreeSet, bailing if the value was already present. The
@@ -179,20 +219,21 @@ pub(crate) fn parse_album_selector(
     for entry in raw {
         let trimmed = entry.trim();
         anyhow::ensure!(!trimmed.is_empty(), "--album value must not be empty");
-        let (name, is_exclude) = split_exclusion(trimmed);
-        if name.eq_ignore_ascii_case("all") {
+        let token = selector_token(trimmed, "album")?;
+        let name = token.name;
+        if name.eq_ignore_ascii_case("all") && !token.escaped {
             anyhow::ensure!(
-                !is_exclude,
+                !token.exclude,
                 "'!all' is not a valid --album value; pass --album none instead"
             );
             has_all = true;
-        } else if name.eq_ignore_ascii_case("none") {
+        } else if name.eq_ignore_ascii_case("none") && !token.escaped {
             anyhow::ensure!(
-                !is_exclude,
+                !token.exclude,
                 "'!none' is not a valid --album value; just omit it"
             );
             has_none = true;
-        } else if is_exclude {
+        } else if token.exclude {
             insert_unique(&mut excluded, name.to_string(), "album", || {
                 format!("!{name}")
             })?;
@@ -245,20 +286,24 @@ pub(crate) fn parse_smart_folder_selector(raw: &[String]) -> anyhow::Result<Smar
             !trimmed.is_empty(),
             "--smart-folder value must not be empty"
         );
-        let (name, is_exclude) = split_exclusion(trimmed);
-        if name.eq_ignore_ascii_case("all") {
-            anyhow::ensure!(!is_exclude, "'!all' is not a valid --smart-folder value");
+        let token = selector_token(trimmed, "smart-folder")?;
+        let name = token.name;
+        if name.eq_ignore_ascii_case("all") && !token.escaped {
+            anyhow::ensure!(!token.exclude, "'!all' is not a valid --smart-folder value");
             has_all = true;
-        } else if name.eq_ignore_ascii_case("all-with-sensitive") {
+        } else if name.eq_ignore_ascii_case("all-with-sensitive") && !token.escaped {
             anyhow::ensure!(
-                !is_exclude,
+                !token.exclude,
                 "'!all-with-sensitive' is not a valid --smart-folder value"
             );
             has_all_sensitive = true;
-        } else if name.eq_ignore_ascii_case("none") {
-            anyhow::ensure!(!is_exclude, "'!none' is not a valid --smart-folder value");
+        } else if name.eq_ignore_ascii_case("none") && !token.escaped {
+            anyhow::ensure!(
+                !token.exclude,
+                "'!none' is not a valid --smart-folder value"
+            );
             has_none = true;
-        } else if is_exclude {
+        } else if token.exclude {
             insert_unique(&mut excluded, name.to_string(), "smart-folder", || {
                 format!("!{name}")
             })?;
@@ -327,7 +372,8 @@ pub(crate) fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySe
     for entry in raw {
         let trimmed = entry.trim();
         anyhow::ensure!(!trimmed.is_empty(), "--library value must not be empty");
-        let (name, is_exclude) = split_exclusion(trimmed);
+        let token = selector_token(trimmed, "library")?;
+        let name = token.name;
         // CloudKit zone names use `-`, never `:`. The `:` forms are an old
         // friendly-alias surface ("shared:Owner Name") that kei does not
         // resolve. Bail at parse time with the supported alternatives so
@@ -338,29 +384,29 @@ pub(crate) fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySe
                  friendly forms like '{name}' are not supported. Run `kei list libraries` to see every zone."
             );
         }
-        if name.eq_ignore_ascii_case("all") {
-            anyhow::ensure!(!is_exclude, "'!all' is not a valid --library value");
+        if name.eq_ignore_ascii_case("all") && !token.escaped {
+            anyhow::ensure!(!token.exclude, "'!all' is not a valid --library value");
             has_all = true;
-        } else if name.eq_ignore_ascii_case("none") {
-            anyhow::ensure!(!is_exclude, "'!none' is not a valid --library value");
+        } else if name.eq_ignore_ascii_case("none") && !token.escaped {
+            anyhow::ensure!(!token.exclude, "'!none' is not a valid --library value");
             has_none = true;
-        } else if name.eq_ignore_ascii_case("primary") {
-            if is_exclude {
+        } else if name.eq_ignore_ascii_case("primary") && !token.escaped {
+            if token.exclude {
                 insert_unique(&mut sel.excluded, "primary".to_string(), "library", || {
                     "!primary".to_string()
                 })?;
             } else {
                 sel.primary = true;
             }
-        } else if name.eq_ignore_ascii_case("shared") {
-            if is_exclude {
+        } else if name.eq_ignore_ascii_case("shared") && !token.escaped {
+            if token.exclude {
                 insert_unique(&mut sel.excluded, "shared".to_string(), "library", || {
                     "!shared".to_string()
                 })?;
             } else {
                 sel.shared_all = true;
             }
-        } else if is_exclude {
+        } else if token.exclude {
             insert_unique(&mut sel.excluded, name.to_string(), "library", || {
                 format!("!{name}")
             })?;
@@ -443,7 +489,7 @@ impl AlbumSelector {
                 .collect(),
             Self::Named { included, excluded } => included
                 .iter()
-                .cloned()
+                .map(|n| escape_if_needed(n, &["all", "none"]))
                 .chain(excluded.iter().map(|n| format!("!{n}")))
                 .collect(),
         }
@@ -469,7 +515,7 @@ impl SmartFolderSelector {
             }
             Self::Named { included, excluded } => included
                 .iter()
-                .cloned()
+                .map(|n| escape_if_needed(n, &["all", "all-with-sensitive", "none"]))
                 .chain(excluded.iter().map(|n| format!("!{n}")))
                 .collect(),
         }
@@ -489,7 +535,7 @@ impl LibrarySelector {
                 out.push("shared".to_string());
             }
             for n in &self.named {
-                out.push(n.clone());
+                out.push(escape_if_needed(n, &["primary", "shared", "all", "none"]));
             }
         }
         for n in &self.excluded {
@@ -652,6 +698,21 @@ mod tests {
         assert!(err.to_string().contains("'!all'"));
     }
 
+    #[test]
+    fn album_escape_selects_literal_sentinel_names() {
+        for (raw, expected) in [("=all", "all"), ("=none", "none"), ("=!Drafts", "!Drafts")] {
+            let r = parse_album_selector(&s(&[raw]), false).unwrap();
+            assert_eq!(
+                r,
+                AlbumSelector::Named {
+                    included: set(&[expected]),
+                    excluded: BTreeSet::new(),
+                },
+                "raw: {raw}"
+            );
+        }
+    }
+
     /// CG-8 (2026-05-03 test review): cross-category sentinel collision.
     /// `primary` and `shared` are sentinels in `--library`, not `--album`.
     /// A user with an iCloud album literally named `Primary` (or `primary`,
@@ -782,6 +843,26 @@ mod tests {
         assert!(err.to_string().contains("'--smart-folder none'"));
     }
 
+    #[test]
+    fn smart_folder_escape_selects_literal_sentinel_names() {
+        for (raw, expected) in [
+            ("=all", "all"),
+            ("=all-with-sensitive", "all-with-sensitive"),
+            ("=none", "none"),
+            ("=!Hidden", "!Hidden"),
+        ] {
+            let r = parse_smart_folder_selector(&s(&[raw])).unwrap();
+            assert_eq!(
+                r,
+                SmartFolderSelector::Named {
+                    included: set(&[expected]),
+                    excluded: BTreeSet::new(),
+                },
+                "raw: {raw}"
+            );
+        }
+    }
+
     // ── LibrarySelector ────────────────────────────────────────────────
 
     #[test]
@@ -831,6 +912,31 @@ mod tests {
         let r = parse_library_selector(&s(&["SharedSync-A1B2C3D4"])).unwrap();
         assert!(!r.primary);
         assert_eq!(r.named, set(&["SharedSync-A1B2C3D4"]));
+    }
+
+    #[test]
+    fn library_escape_selects_literal_sentinel_names() {
+        for (raw, expected) in [
+            ("=primary", "primary"),
+            ("=shared", "shared"),
+            ("=all", "all"),
+            ("=none", "none"),
+        ] {
+            let r = parse_library_selector(&s(&[raw])).unwrap();
+            assert_eq!(
+                r.named,
+                set(&[expected]),
+                "raw {raw} should be a named zone"
+            );
+            assert!(!r.primary);
+            assert!(!r.shared_all);
+        }
+    }
+
+    #[test]
+    fn bang_equals_escape_form_is_rejected() {
+        let err = parse_library_selector(&s(&["!=primary"])).unwrap_err();
+        assert!(err.to_string().contains("not supported"));
     }
 
     #[test]
@@ -972,6 +1078,21 @@ mod tests {
     }
 
     #[test]
+    fn selection_album_to_raw_escapes_literal_sentinel_names() {
+        let original = AlbumSelector::Named {
+            included: set(&["all", "none", "!Drafts", "=Pinned"]),
+            excluded: BTreeSet::new(),
+        };
+        let raw = original.to_raw();
+        let parsed = parse_album_selector(&raw, false).unwrap();
+        assert_eq!(parsed, original);
+        assert!(raw.iter().any(|r| r == "=all"), "raw: {raw:?}");
+        assert!(raw.iter().any(|r| r == "=none"), "raw: {raw:?}");
+        assert!(raw.iter().any(|r| r == "=!Drafts"), "raw: {raw:?}");
+        assert!(raw.iter().any(|r| r == "==Pinned"), "raw: {raw:?}");
+    }
+
+    #[test]
     fn selection_smart_folder_to_raw_round_trips_named_with_excludes() {
         let original = SmartFolderSelector::Named {
             included: set(&["Favorites", "Videos"]),
@@ -997,6 +1118,23 @@ mod tests {
             raw.iter().any(|r| r == "all-with-sensitive"),
             "all-with-sensitive sentinel must serialize verbatim; got {raw:?}"
         );
+    }
+
+    #[test]
+    fn selection_smart_folder_to_raw_escapes_literal_sentinel_names() {
+        let original = SmartFolderSelector::Named {
+            included: set(&["all", "all-with-sensitive", "none"]),
+            excluded: BTreeSet::new(),
+        };
+        let raw = original.to_raw();
+        let parsed = parse_smart_folder_selector(&raw).unwrap();
+        assert_eq!(parsed, original);
+        assert!(raw.iter().any(|r| r == "=all"), "raw: {raw:?}");
+        assert!(
+            raw.iter().any(|r| r == "=all-with-sensitive"),
+            "raw: {raw:?}"
+        );
+        assert!(raw.iter().any(|r| r == "=none"), "raw: {raw:?}");
     }
 
     #[test]
@@ -1031,6 +1169,23 @@ mod tests {
         // Pin the wire shape so the `["all", "!Foo"]` collapsing branch
         // can't silently drop the `all` sentinel or reorder.
         assert_eq!(raw, vec!["all".to_string(), "!Foo".to_string()]);
+    }
+
+    #[test]
+    fn selection_library_to_raw_escapes_literal_sentinel_names() {
+        let original = LibrarySelector {
+            primary: false,
+            shared_all: false,
+            named: set(&["primary", "shared", "all", "none"]),
+            excluded: BTreeSet::new(),
+        };
+        let raw = original.to_raw();
+        let parsed = parse_library_selector(&raw).unwrap();
+        assert_eq!(parsed, original);
+        assert!(raw.iter().any(|r| r == "=primary"), "raw: {raw:?}");
+        assert!(raw.iter().any(|r| r == "=shared"), "raw: {raw:?}");
+        assert!(raw.iter().any(|r| r == "=all"), "raw: {raw:?}");
+        assert!(raw.iter().any(|r| r == "=none"), "raw: {raw:?}");
     }
 
     #[test]
