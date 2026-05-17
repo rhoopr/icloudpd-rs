@@ -943,9 +943,8 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         }
     }
 
-    // Performance. Ranges mirror clap's runtime parsers in `src/cli.rs`
-    // (`--threads` is `1..=64`, `--max-retries` is `0..=100`) so the wizard
-    // rejects values the runtime would also reject.
+    // Performance. Ranges mirror runtime config validation so the wizard
+    // rejects values the sync path would also reject.
     println!();
     let threads: u16 = Input::new()
         .with_prompt("Concurrent download threads (1..=64)")

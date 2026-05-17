@@ -101,7 +101,7 @@ pub struct SyncStats {
     /// Number of tasks that observed at least one HTTP 429 / 503 response
     /// during retry. A high ratio of rate_limited / assets_seen signals the
     /// sync is running against a back-pressured account; operators should
-    /// either raise --watch-with-interval or lower --threads.
+    /// either raise `[watch] interval` or lower `[download] threads`.
     pub rate_limited: usize,
     /// Photos downloaded this run (`MediaType::Photo` and
     /// `MediaType::LivePhotoImage`). Sums to `downloaded` together with

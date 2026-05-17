@@ -53,6 +53,37 @@ kei_album() {
     printf '%s' "${KEI_TEST_ALBUM:-kei-test}"
 }
 
+kei_toml_string() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '"%s"' "$s"
+}
+
+kei_write_sync_config() {
+    local data_dir="${1:?data dir required}"
+    local download_dir="${2:?download dir required}"
+    local download_extra="${KEI_SYNC_DOWNLOAD_TOML:-}"
+    local filters_extra="${KEI_SYNC_FILTERS_TOML:-}"
+    local photos_extra="${KEI_SYNC_PHOTOS_TOML:-}"
+    local config="$data_dir/.kei-shell-sync-$$.toml"
+    mkdir -p "$data_dir"
+    {
+        echo "[download]"
+        printf 'directory = %s\n' "$(kei_toml_string "$download_dir")"
+        printf '%s' "$download_extra"
+        echo "[filters]"
+        printf 'albums = [%s]\n' "$(kei_toml_string "$(kei_album)")"
+        echo "unfiled = false"
+        printf '%s' "$filters_extra"
+        if [ -n "$photos_extra" ]; then
+            echo "[photos]"
+            printf '%s' "$photos_extra"
+        fi
+    } > "$config"
+    printf '%s' "$config"
+}
+
 kei_docker_image() {
     printf '%s' "${KEI_DOCKER_IMAGE:-kei:latest}"
 }

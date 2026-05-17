@@ -118,6 +118,7 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
             "Building import-existing fixture: --recent {FIXTURE_RECENT} into {}",
             download_dir.display()
         );
+        let config_path = write_kei_toml(&data_dir, &download_dir, "");
         let output = common::cmd()
             .args([
                 "sync",
@@ -127,8 +128,8 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
                 &password,
                 "--data-dir",
                 data_dir.to_str().unwrap(),
-                "--download-dir",
-                download_dir.to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
                 "--recent",
                 &FIXTURE_RECENT.to_string(),
                 "--no-progress-bar",
@@ -781,8 +782,9 @@ fn run_sync_against_fixture(
     password: &str,
     download_dir: &Path,
     data_dir: &Path,
-    extra: &[&str],
+    extra_toml: &str,
 ) -> (u64, u64) {
+    let config_path = write_kei_toml(data_dir, download_dir, extra_toml);
     let mut cmd = common::cmd();
     cmd.args([
         "sync",
@@ -792,13 +794,12 @@ fn run_sync_against_fixture(
         password,
         "--data-dir",
         data_dir.to_str().unwrap(),
-        "--download-dir",
-        download_dir.to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
         "--recent",
         &ROUNDTRIP_RECENT.to_string(),
         "--no-progress-bar",
     ]);
-    cmd.args(extra);
     let output = cmd
         .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
         .assert()
@@ -842,6 +843,7 @@ fn roundtrip_default_layout_sync_skips_after_import() {
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
         let recent = ROUNDTRIP_RECENT.to_string();
+        let toml_path = write_kei_toml(test_data.path(), download_dir, "");
 
         let import = import_cmd(
             &username,
@@ -849,7 +851,7 @@ fn roundtrip_default_layout_sync_skips_after_import() {
             &cookie_dir,
             download_dir,
             test_data.path(),
-            &["--recent", &recent],
+            &["--recent", &recent, "--config", toml_path.to_str().unwrap()],
         )
         .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
         .assert()
@@ -868,7 +870,7 @@ fn roundtrip_default_layout_sync_skips_after_import() {
         // sync emits a per-asset skip tally; both are valid no-download
         // outcomes for the round-trip.
         let (downloaded, _skipped) =
-            run_sync_against_fixture(&username, &password, download_dir, test_data.path(), &[]);
+            run_sync_against_fixture(&username, &password, download_dir, test_data.path(), "");
         assert_eq!(
             downloaded, 0,
             "sync re-downloaded {downloaded} files after import-existing populated state DB; \
@@ -922,7 +924,7 @@ fn roundtrip_name_id7_sync_skips_after_import() {
             &password,
             download_dir,
             test_data.path(),
-            &["--file-match-policy", "name-id7"],
+            "[photos]\nfile_match_policy = \"name-id7\"\n",
         );
         assert_eq!(
             downloaded, 0,
@@ -974,7 +976,7 @@ fn roundtrip_skip_videos_sync_skips_imported_photos() {
         }
 
         let (downloaded, _skipped) =
-            run_sync_against_fixture(&username, &password, download_dir, test_data.path(), &[]);
+            run_sync_against_fixture(&username, &password, download_dir, test_data.path(), "");
         assert_eq!(
             downloaded, 0,
             "sync re-downloaded {downloaded} after skip_videos import; matched={}",

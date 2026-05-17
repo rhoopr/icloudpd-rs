@@ -28,6 +28,10 @@ KEI="$(kei_release_bin)"
 kei_check_init
 
 kei_sync() {
+    local download_dir="${1:?download dir required}"
+    shift
+    local config
+    config="$(kei_write_sync_config "$COOKIES" "$download_dir")"
     # `--unfiled false` keeps the suite scoped to the test album. v0.13's
     # default `--unfiled true` would otherwise enumerate every unfiled
     # photo in the live account on each sync (huge wall time + Apple rate
@@ -37,8 +41,7 @@ kei_sync() {
         --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
         --data-dir "$COOKIES" \
-        --album "$ALBUM" \
-        --unfiled false \
+        --config "$config" \
         --no-progress-bar \
         --log-level info \
         "$@" 2>&1
@@ -66,7 +69,7 @@ echo "=== 1. Clean slate full sync ==="
 kei_db_exec "DELETE FROM metadata WHERE key LIKE '%token%' OR key = 'config_hash'"
 kei_db_exec "DELETE FROM assets"
 echo "  Cleared: tokens=$(token_count), hash=$(get_hash || echo 'none')"
-OUTPUT=$(kei_sync --download-dir "$DIR")
+OUTPUT=$(kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "Incremental|token|Summary|downloaded|completed"
 [ -n "$(get_token)" ]; kei_check "token stored after full sync"
 [ -n "$(get_hash)" ];  kei_check "config hash stored"
@@ -78,7 +81,7 @@ echo "  hash=$BASELINE_HASH"
 # ── 2. Incremental sync: no changes → 0 downloads, token preserved ──────
 echo ""
 echo "=== 2. Incremental sync (no changes) ==="
-OUTPUT=$(kei_sync --download-dir "$DIR")
+OUTPUT=$(kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "incremental|token|change|download|[Cc]ompleted"
 # The incremental path logs "No new photos to download from incremental
 # sync" when the change feed is empty. If the trust-state sample detects
@@ -96,7 +99,7 @@ NEW_DOWNLOADS=$(echo "$OUTPUT" | grep -oE '[0-9]+ downloaded' | head -1 | grep -
 echo ""
 echo "=== 3. Config change clears tokens ==="
 HASH_BEFORE=$(get_hash)
-OUTPUT=$(kei_sync --download-dir "$DIR" --size medium)
+OUTPUT=$(KEI_SYNC_PHOTOS_TOML=$'size = "medium"\n' kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "config|changed|cleared|token|incremental|download|completed"
 HASH_AFTER=$(get_hash)
 TOKEN_AFTER=$(get_token)
@@ -107,7 +110,7 @@ echo "  hash: $HASH_BEFORE -> $HASH_AFTER"
 # ── 4. Restore original config → hash reverts ───────────────────────────
 echo ""
 echo "=== 4. Restore original config ==="
-OUTPUT=$(kei_sync --download-dir "$DIR")
+OUTPUT=$(kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "config|changed|cleared|token|incremental|download|completed"
 [ "$(get_hash)" = "$BASELINE_HASH" ]; kei_check "hash reverted to original"
 [ -n "$(get_token)" ]; kei_check "token stored"
@@ -116,7 +119,7 @@ echo "$OUTPUT" | grep -E "config|changed|cleared|token|incremental|download|comp
 echo ""
 echo "=== 5. reset sync-token ==="
 "$KEI" reset sync-token --yes --username "$ICLOUD_USERNAME" --data-dir "$COOKIES" >/dev/null
-OUTPUT=$(kei_sync --download-dir "$DIR")
+OUTPUT=$(kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "reset|clear|token|Fetching|full|incremental|download|completed"
 echo "$OUTPUT" | grep -qi "Fetching"; kei_check "full enumeration ran"
 [ -n "$(get_token)" ]; kei_check "new token stored"
@@ -127,7 +130,7 @@ echo "=== 6. Corrupt token recovery ==="
 GOOD_TOKEN=$(get_token)
 kei_db_exec "UPDATE metadata SET value = 'CORRUPT_GARBAGE_TOKEN_XYZ' WHERE key = 'sync_token:PrimarySync'"
 echo "  Injected: CORRUPT_GARBAGE_TOKEN_XYZ"
-OUTPUT=$(kei_sync --download-dir "$DIR")
+OUTPUT=$(kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "token|invalid|fallback|full|error|Fetching|incremental|download|completed"
 RECOVERED_TOKEN=$(get_token)
 if echo "$OUTPUT" | grep -qi "fallback\|full enumeration\|Fetching"; then
@@ -159,7 +162,7 @@ delete_and_sync() {
     kei_db_exec "DELETE FROM assets WHERE filename = '$f'"
     rm -f "$path"
     echo "  Deleted from state + disk: $f"
-    out=$(kei_sync --download-dir "$DIR" $mode_flag)
+    out=$(kei_sync "$DIR" $mode_flag)
     echo "$out" | grep -E "incremental|change|download|[Cc]ompleted"
     echo "$out" | grep -qE "[Cc]ompleted in"; kei_check "$label completed without error"
     clean=$(echo "$out" | sed 's/\x1b\[[0-9;]*m//g')
@@ -176,21 +179,21 @@ delete_and_sync "" "full re-enum"
 echo ""
 echo "=== 8. Dry run preserves token ==="
 TOKEN_BEFORE=$(get_token)
-kei_sync --download-dir "$DIR" --dry-run >/dev/null
+kei_sync "$DIR" --dry-run >/dev/null
 [ "$(get_token)" = "$TOKEN_BEFORE" ]; kei_check "token unchanged after dry-run"
 
 # ── 9. Filter flag changes config hash ───────────────────────────────────
 echo ""
 echo "=== 9. Filter flag changes config hash ==="
 HASH_BEFORE=$(get_hash)
-OUTPUT=$(kei_sync --download-dir "$DIR" --skip-videos)
+OUTPUT=$(KEI_SYNC_FILTERS_TOML=$'skip_videos = true\n' kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "config|changed|cleared|token|download|completed"
 [ "$HASH_BEFORE" != "$(get_hash)" ]; kei_check "hash changed with --skip-videos"
 
 # ── 10. Session reuse check ─────────────────────────────────────────────
 echo ""
 echo "=== 10. Session reuse check ==="
-OUTPUT=$(kei_sync --download-dir "$DIR" --log-level debug 2>&1)
+OUTPUT=$(kei_sync "$DIR" --log-level debug 2>&1)
 if echo "$OUTPUT" | grep -q "Existing session token is valid"; then
     kei_check "session reuse (validate_token succeeded)" 0
 elif echo "$OUTPUT" | grep -q "accountLogin succeeded"; then
@@ -205,7 +208,7 @@ else
 fi
 
 # ── Cleanup: restore the original config so future runs start consistent ─
-kei_sync --download-dir "$DIR" >/dev/null 2>&1
+kei_sync "$DIR" >/dev/null 2>&1
 rm -rf "$DIR"
 
 kei_check_summary "STATE-MACHINE RESULTS"

@@ -8,7 +8,7 @@
 #
 # Optional env:
 #   KEI_TEST_DATA_DIR  cookie / db dir (default .test-cookies under repo)
-#   KEI_TEST_ALBUM     album name for sync dry-run (default icloudpd-test)
+#   KEI_TEST_ALBUM     album name for sync dry-run (default kei-test)
 #   KEI_TEST_DOWNLOAD_DIR  scratch dir for sync/import dry-run (default /tmp/codex/photos-test)
 #
 # Adding a new CLI subcommand: add a smoke line below. Don't add destructive
@@ -28,9 +28,26 @@ fi
 
 USR="${ICLOUD_USERNAME:-missing@example.invalid}"
 DD="${KEI_TEST_DATA_DIR:-$repo_root/.test-cookies}"
-ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
+ALBUM="${KEI_TEST_ALBUM:-kei-test}"
 DOWNLOAD_DIR="${KEI_TEST_DOWNLOAD_DIR:-/tmp/codex/photos-test}"
 mkdir -p "$DOWNLOAD_DIR"
+
+toml_string() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+sync_config="$DD/.kei-live-smoke-sync.toml"
+mkdir -p "$DD"
+{
+  echo "[download]"
+  printf 'directory = %s\n' "$(toml_string "$DOWNLOAD_DIR")"
+  echo "[filters]"
+  printf 'albums = [%s]\n' "$(toml_string "$ALBUM")"
+  echo "unfiled = false"
+} > "$sync_config"
 
 run() {
   local phase="$1"; shift
@@ -53,7 +70,7 @@ export USR DD binary
 run live_status            "$binary" status                       --username "$USR" --data-dir "$DD"
 run live_libraries         "$binary" list libraries               --username "$USR" --data-dir "$DD"
 run live_albums            "$binary" list albums                  --username "$USR" --data-dir "$DD"
-run live_dryrun            "$binary" sync --dry-run --recent 5 -a "$ALBUM" --download-dir "$DOWNLOAD_DIR" --username "$USR" --data-dir "$DD"
+run live_dryrun            "$binary" sync --dry-run --recent 5 --config "$sync_config" --username "$USR" --data-dir "$DD"
 run live_config_show       "$binary" config show                  --username "$USR" --data-dir "$DD"
 run live_verify            bash -c verify_wrapper
 run live_reconcile_dryrun  "$binary" reconcile --dry-run          --username "$USR" --data-dir "$DD"

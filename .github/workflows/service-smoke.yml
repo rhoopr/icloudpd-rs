@@ -19,7 +19,7 @@ name: Service smoke
 #
 # That deeper exercise lives in the Rust integration suites
 # (tests/service_linux.rs etc.) and the maintainer's manual real-install
-# flow against the icloudpd-test album.
+# flow against the kei-test album.
 
 on:
   pull_request:

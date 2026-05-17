@@ -4,7 +4,7 @@
 # name is test_shell_<basename-with-dashes-as-underscores>.
 #
 # Required env (set by the orchestrator):
-#   KEI_TEST_ALBUM     default icloudpd-test
+#   KEI_TEST_ALBUM     default kei-test
 #   KEI_DOCKER_IMAGE   default kei:dev (must match Phase 2 build tag)
 #
 # Each shell suite hits Apple via the live binary, so they run as --live
@@ -22,7 +22,7 @@ if [[ ! -d "$shell_dir" ]]; then
   exit 1
 fi
 
-album="${KEI_TEST_ALBUM:-icloudpd-test}"
+album="${KEI_TEST_ALBUM:-kei-test}"
 image="${KEI_DOCKER_IMAGE:-kei:dev}"
 
 for sh in "$shell_dir"/*.sh; do

@@ -58,18 +58,16 @@ fn service_help_lists_run_and_status() {
 }
 
 #[test]
-fn service_run_help_inherits_sync_flags() {
-    // `kei service run` shares SyncArgs, so its help must surface the
-    // same flag vocabulary -- proves the delegation wiring is intact.
+fn service_run_help_inherits_runtime_sync_flags() {
+    // `kei service run` shares the reduced runtime SyncArgs. Durable
+    // settings are TOML-only and should not be exposed here.
     cmd()
         .args(["service", "run", "--help"])
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("--watch-with-interval")
-                .and(predicate::str::contains("--download-dir"))
-                .and(predicate::str::contains("--threads")),
-        );
+        .stdout(predicate::str::contains("--recent"))
+        .stdout(predicate::str::contains("--download-dir").not())
+        .stdout(predicate::str::contains("--threads").not());
 }
 
 #[test]

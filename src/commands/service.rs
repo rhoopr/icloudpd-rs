@@ -1676,43 +1676,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_passes_threading_from_cli_input() {
-        // End-to-end thread of the v0.13 selection flags through the
-        // production parse layer: clap → Cli → Config::build → Selection
-        // → resolve_passes. The cli.rs help-shadow tests for these flags
-        // only exercise the parser; a regression that drops --smart-folder
-        // or flips --unfiled's default between Cli and Selection lands
-        // green there. This test is the one place that drives the runtime
-        // wiring and asserts on the resolved pass list.
-        use crate::cli::{Cli, Command, PasswordArgs};
-        use clap::Parser;
+    async fn resolve_passes_threading_from_toml_input() {
+        // End-to-end thread of persistent selection config through the
+        // production resolver: TOML -> Config::build -> Selection ->
+        // resolve_passes. CLI only exposes per-run sync flags in v0.20, so
+        // persistent album, smart-folder, unfiled, and library policy should
+        // reach the pass planner from TOML.
+        use crate::cli::{PasswordArgs, SyncArgs};
 
         let cookie_dir = tempfile::tempdir().unwrap();
-        let cli = Cli::try_parse_from([
-            "kei",
-            "--username",
-            "u@example.com",
-            "--data-dir",
-            cookie_dir.path().to_str().unwrap(),
-            "sync",
-            "--album",
-            "all",
-            "--smart-folder",
-            "Favorites",
-            "--unfiled",
-            "false",
-            "--library",
-            "shared",
-        ])
-        .unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
-        let globals = crate::config::GlobalArgs::from_cli(&cli);
-        let cfg =
-            crate::config::Config::build(&globals, &PasswordArgs::default(), sync, None).unwrap();
+        let toml: crate::config::TomlConfig = toml::from_str(
+            r#"
+[auth]
+username = "u@example.com"
 
-        // Sanity-check the cli → Selection wiring before pinning the pass list.
+[download]
+directory = "/photos"
+
+[filters]
+albums = ["all"]
+smart_folders = ["Favorites"]
+unfiled = false
+libraries = ["shared"]
+"#,
+        )
+        .unwrap();
+        let globals = crate::config::GlobalArgs {
+            username: None,
+            domain: None,
+            data_dir: Some(cookie_dir.path().to_string_lossy().into_owned()),
+        };
+        let cfg = crate::config::Config::build(
+            &globals,
+            &PasswordArgs::default(),
+            SyncArgs::default(),
+            Some(&toml),
+        )
+        .unwrap();
+
+        // Sanity-check the TOML → Selection wiring before pinning the pass list.
         assert_eq!(cfg.selection.libraries.to_raw(), vec!["shared".to_string()]);
         assert!(matches!(
             cfg.selection.albums,

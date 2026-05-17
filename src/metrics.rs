@@ -1,6 +1,6 @@
 //! HTTP observability server (watch-mode only).
 //!
-//! In watch mode, spawns an axum HTTP server on `--http-port` (default 9091) that serves:
+//! In watch mode, spawns an axum HTTP server on `[server] port` (default 9091) that serves:
 //! - `GET /healthz`  — JSON health status (same data as `health.json`)
 //! - `GET /metrics`  — Prometheus text format
 //!

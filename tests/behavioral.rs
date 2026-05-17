@@ -39,6 +39,21 @@ fn clean_cmd() -> assert_cmd::Command {
     cmd
 }
 
+fn toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn write_sync_config(config_path: &std::path::Path, download_dir: &str) {
+    std::fs::write(
+        config_path,
+        format!(
+            "[download]\ndirectory = \"{}\"\n",
+            toml_escape(download_dir)
+        ),
+    )
+    .unwrap();
+}
+
 /// Sanitize a username the same way the binary does (alphanumeric + underscore).
 fn sanitize_username(username: &str) -> String {
     username
@@ -641,11 +656,13 @@ fn password_clear_on_empty_store_errors() {
 #[test]
 fn sync_requires_username() {
     let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    write_sync_config(&config_path, "/photos");
     clean_cmd()
         .args([
             "sync",
-            "--download-dir",
-            "/photos",
+            "--config",
+            config_path.to_str().unwrap(),
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -667,7 +684,7 @@ fn sync_requires_directory() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("--download-dir is required"));
+        .stderr(predicate::str::contains("[download] directory is required"));
 }
 
 #[test]
@@ -933,8 +950,6 @@ fn first_run_auto_config_creates_file() {
             config_path.to_str().unwrap(),
             "--username",
             "auto@example.com",
-            "--download-dir",
-            "/auto/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -950,10 +965,6 @@ fn first_run_auto_config_creates_file() {
     assert!(
         content.contains("auto@example.com"),
         "auto-config should contain username, got:\n{content}"
-    );
-    assert!(
-        content.contains("/auto/photos"),
-        "auto-config should contain directory, got:\n{content}"
     );
 }
 
@@ -1032,7 +1043,11 @@ fn config_unknown_toml_field() {
 fn config_empty_username_in_toml() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "[auth]\nusername = \"\"\n").unwrap();
+    std::fs::write(
+        &config_path,
+        "[auth]\nusername = \"\"\n\n[download]\ndirectory = \"/photos\"\n",
+    )
+    .unwrap();
 
     // config show calls Config::build which checks for empty username
     // only when a username source is present in TOML. Since TOML sets
@@ -1042,8 +1057,6 @@ fn config_empty_username_in_toml() {
             "sync",
             "--config",
             config_path.to_str().unwrap(),
-            "--download-dir",
-            "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -1060,7 +1073,7 @@ fn config_toml_password_field_rejected() {
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        "[auth]\nusername = \"x@x.com\"\npassword = \"\"\n",
+        "[auth]\nusername = \"x@x.com\"\npassword = \"\"\n\n[download]\ndirectory = \"/photos\"\n",
     )
     .unwrap();
 
@@ -1069,8 +1082,6 @@ fn config_toml_password_field_rejected() {
             "sync",
             "--config",
             config_path.to_str().unwrap(),
-            "--download-dir",
-            "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -1094,7 +1105,7 @@ fn config_multiple_password_sources_in_toml() {
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        "[auth]\nusername = \"x@x.com\"\npassword_file = \"/tmp/pw\"\npassword_command = \"echo hi\"\n",
+        "[auth]\nusername = \"x@x.com\"\npassword_file = \"/tmp/pw\"\npassword_command = \"echo hi\"\n\n[download]\ndirectory = \"/photos\"\n",
     )
     .unwrap();
 
@@ -1103,8 +1114,6 @@ fn config_multiple_password_sources_in_toml() {
             "sync",
             "--config",
             config_path.to_str().unwrap(),
-            "--download-dir",
-            "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -1504,8 +1513,6 @@ fn auto_config_suppressed_by_env() {
             config_path.to_str().unwrap(),
             "--username",
             "suppress@example.com",
-            "--download-dir",
-            "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -1533,8 +1540,6 @@ fn auto_config_has_0600_perms() {
             config_path.to_str().unwrap(),
             "--username",
             "perms@example.com",
-            "--download-dir",
-            "/photos",
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -2297,17 +2302,19 @@ fn exit_1_for_missing_directory_on_sync() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("--download-dir is required"));
+        .stderr(predicate::str::contains("[download] directory is required"));
 }
 
 #[test]
 fn exit_1_for_missing_username_on_sync() {
     let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    write_sync_config(&config_path, "/photos");
     clean_cmd()
         .args([
             "sync",
-            "--download-dir",
-            "/photos",
+            "--config",
+            config_path.to_str().unwrap(),
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -2323,14 +2330,16 @@ fn exit_1_for_missing_username_on_sync() {
 #[test]
 fn log_level_default_info() {
     let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    write_sync_config(&config_path, "/photos");
     // sync with username + directory will fail at auth. Check stderr for INFO.
     let out = clean_cmd()
         .args([
             "sync",
             "--username",
             "x@x.com",
-            "--download-dir",
-            "/photos",
+            "--config",
+            config_path.to_str().unwrap(),
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -2358,6 +2367,8 @@ fn log_level_default_info() {
 fn log_level_debug() {
     let dir = tempfile::tempdir().unwrap();
     let dl_dir = dir.path().join("photos");
+    let config_path = dir.path().join("config.toml");
+    write_sync_config(&config_path, dl_dir.to_str().unwrap());
     let out = clean_cmd()
         .args([
             "--log-level",
@@ -2365,8 +2376,8 @@ fn log_level_debug() {
             "sync",
             "--username",
             "x@x.com",
-            "--download-dir",
-            dl_dir.to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -2384,6 +2395,8 @@ fn log_level_debug() {
 #[test]
 fn log_level_error() {
     let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    write_sync_config(&config_path, "/photos");
     let out = clean_cmd()
         .args([
             "--log-level",
@@ -2391,8 +2404,8 @@ fn log_level_error() {
             "sync",
             "--username",
             "x@x.com",
-            "--download-dir",
-            "/photos",
+            "--config",
+            config_path.to_str().unwrap(),
             "--data-dir",
             dir.path().to_str().unwrap(),
         ])
@@ -2915,8 +2928,6 @@ fn dry_run_and_retry_failed_conflict() {
             "sync",
             "--username",
             "x@x.com",
-            "--download-dir",
-            "/photos",
             "--dry-run",
             "--retry-failed",
             "--data-dir",
@@ -2934,14 +2945,16 @@ fn dry_run_and_retry_failed_conflict() {
 fn dry_run_creates_no_state_db() {
     let data_dir = tempfile::tempdir().unwrap();
     let dl_dir = tempfile::tempdir().unwrap();
+    let config_path = data_dir.path().join("config.toml");
+    write_sync_config(&config_path, dl_dir.path().to_str().unwrap());
 
     clean_cmd()
         .args([
             "sync",
             "--username",
             "drytest@example.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
             "--data-dir",
             data_dir.path().to_str().unwrap(),
             "--dry-run",
@@ -3615,20 +3628,33 @@ fn run_config_show_error(body: &str) -> String {
 }
 
 /// Build a `kei sync` invocation pre-populated with username, fresh tempdir
-/// `--download-dir` / `--data-dir` pair, and `--only-print-filenames` so the
+/// config/data directories, and `--only-print-filenames` so the
 /// run exits before auth. Returns the live `Command` so callers can append
 /// flag-specific args. Tempdirs are leaked into the binary (which never
 /// touches them, as these tests bail in `Config::build`).
 fn sync_cmd_for_validation() -> assert_cmd::Command {
+    sync_cmd_for_config_body("")
+}
+
+fn sync_cmd_for_config_body(body: &str) -> assert_cmd::Command {
     let dir = tempfile::tempdir().unwrap();
     let dl_dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"{}\"\n{body}",
+            toml_escape(dl_dir.path().to_str().unwrap())
+        ),
+    )
+    .unwrap();
     let mut cmd = clean_cmd();
     cmd.args([
         "sync",
         "--username",
         "x@x.com",
-        "--download-dir",
-        dl_dir.path().to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
         "--data-dir",
         dir.path().to_str().unwrap(),
     ]);
@@ -3649,10 +3675,8 @@ fn removed_legacy_album_in_cli_errors() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "'{album}' is not valid in --folder-structure",
-        ))
-        .stderr(predicate::str::contains("--folder-structure-albums"));
+        .stderr(predicate::str::contains("unexpected argument"))
+        .stderr(predicate::str::contains("--folder-structure"));
 }
 
 #[test]
@@ -3666,16 +3690,13 @@ fn removed_legacy_album_in_toml_errors() {
 }
 
 #[test]
-fn removed_legacy_album_in_env_errors() {
+fn removed_legacy_album_env_is_ignored() {
     sync_cmd_for_validation()
         .env("KEI_FOLDER_STRUCTURE", "{album}/%Y")
         .arg("--only-print-filenames")
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "'{album}' is not valid in --folder-structure",
-        ))
-        .stderr(predicate::str::contains("--folder-structure-albums"));
+        .stderr(predicate::str::contains("'{album}' is not valid in --folder-structure").not());
 }
 
 #[test]
@@ -3692,8 +3713,8 @@ fn removed_legacy_album_errors_even_with_user_set_albums_template() {
 
 #[test]
 fn migration_no_warning_when_no_album_token() {
-    sync_cmd_for_validation()
-        .args(["--folder-structure", "%Y/%m/%d", "--only-print-filenames"])
+    sync_cmd_for_config_body("folder_structure = \"%Y/%m/%d\"\n")
+        .arg("--only-print-filenames")
         .assert()
         .stderr(predicate::str::contains("`{album}` in `--folder-structure`").not());
 }
@@ -3704,8 +3725,8 @@ fn migration_no_warning_when_no_album_token() {
 /// would mislead users into thinking their config is a no-op.
 #[test]
 fn smart_folder_flag_does_not_print_unwired_warning() {
-    sync_cmd_for_validation()
-        .args(["--smart-folder", "Favorites", "--only-print-filenames"])
+    sync_cmd_for_config_body("\n[filters]\nsmart_folders = [\"Favorites\"]\n")
+        .arg("--only-print-filenames")
         .assert()
         .stderr(predicate::str::contains("not yet wired").not())
         .stderr(predicate::str::contains("not download smart folders").not());
@@ -3716,8 +3737,8 @@ fn smart_folder_flag_does_not_print_unwired_warning() {
 /// and the cross-album exclusion-set pre-fetch in `resolve_passes`.
 #[test]
 fn unfiled_flag_does_not_print_unwired_warning() {
-    sync_cmd_for_validation()
-        .args(["--unfiled", "false", "--only-print-filenames"])
+    sync_cmd_for_config_body("\n[filters]\nunfiled = false\n")
+        .arg("--only-print-filenames")
         .assert()
         .stderr(predicate::str::contains("not yet wired").not())
         .stderr(predicate::str::contains("legacy unfiled-pass rules").not());
@@ -3745,18 +3766,10 @@ fn unfiled_flag_does_not_print_unwired_warning() {
 /// or stale "not yet wired" disclaimers reach stderr.
 #[test]
 fn sync_validation_accepts_full_selection_combo() {
-    let out = sync_cmd_for_validation()
-        .args([
-            "--album",
-            "none",
-            "--smart-folder",
-            "all",
-            "--unfiled",
-            "false",
-            "--library",
-            "shared",
-            "--only-print-filenames",
-        ])
+    let out = sync_cmd_for_config_body(
+        "\n[filters]\nalbums = [\"none\"]\nsmart_folders = [\"all\"]\nunfiled = false\nlibraries = [\"shared\"]\n",
+    )
+        .arg("--only-print-filenames")
         .assert()
         .get_output()
         .clone();
@@ -3815,8 +3828,7 @@ fn config_show_omits_default_per_category_templates() {
 
 #[test]
 fn sync_bails_on_album_token_in_smart_folders_template() {
-    sync_cmd_for_validation()
-        .args(["--folder-structure-smart-folders", "{album}/%Y"])
+    sync_cmd_for_config_body("folder_structure_smart_folders = \"{album}/%Y\"\n")
         .assert()
         .code(1)
         .stderr(predicate::str::contains("{album}"))
@@ -3825,8 +3837,7 @@ fn sync_bails_on_album_token_in_smart_folders_template() {
 
 #[test]
 fn sync_bails_on_smart_folder_token_in_albums_template() {
-    sync_cmd_for_validation()
-        .args(["--folder-structure-albums", "{smart-folder}/foo"])
+    sync_cmd_for_config_body("folder_structure_albums = \"{smart-folder}/foo\"\n")
         .assert()
         .code(1)
         .stderr(predicate::str::contains("{smart-folder}"))
@@ -3835,8 +3846,7 @@ fn sync_bails_on_smart_folder_token_in_albums_template() {
 
 #[test]
 fn sync_bails_on_library_token_not_first_segment() {
-    sync_cmd_for_validation()
-        .args(["--folder-structure", "%Y/{library}"])
+    sync_cmd_for_config_body("folder_structure = \"%Y/{library}\"\n")
         .assert()
         .code(1)
         .stderr(predicate::str::contains("{library}"))
@@ -3845,8 +3855,7 @@ fn sync_bails_on_library_token_not_first_segment() {
 
 #[test]
 fn sync_bails_on_duplicate_library_token() {
-    sync_cmd_for_validation()
-        .args(["--folder-structure-albums", "{library}/{library}/{album}"])
+    sync_cmd_for_config_body("folder_structure_albums = \"{library}/{library}/{album}\"\n")
         .assert()
         .code(1)
         .stderr(predicate::str::contains("{library}"))
@@ -3855,8 +3864,7 @@ fn sync_bails_on_duplicate_library_token() {
 
 #[test]
 fn sync_bails_on_within_album_contradiction() {
-    sync_cmd_for_validation()
-        .args(["--album", "Family", "--album", "!Family"])
+    sync_cmd_for_config_body("\n[filters]\nalbums = [\"Family\", \"!Family\"]\n")
         .assert()
         .code(1)
         .stderr(predicate::str::contains("include and exclude"))
@@ -3865,11 +3873,10 @@ fn sync_bails_on_within_album_contradiction() {
 
 #[test]
 fn sync_bails_on_library_none() {
-    sync_cmd_for_validation()
-        .args(["--library", "none"])
+    sync_cmd_for_config_body("\n[filters]\nlibraries = [\"none\"]\n")
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("--library none"));
+        .stderr(predicate::str::contains("library none"));
 }
 
 #[test]
@@ -3954,9 +3961,9 @@ fn removed_toml_filter_aliases_error() {
 }
 
 #[test]
-fn env_sync_flags_allowed_with_non_sync_command() {
-    // Regression: issue #385 - sync-only env vars set in Docker Compose
-    // must not block non-sync subcommands like `kei reset`.
+fn removed_sync_env_vars_do_not_block_non_sync_command() {
+    // Regression: issue #385 - stale sync env vars set in old Docker Compose
+    // files must not block non-sync subcommands like `kei reset`.
     let temp = tempfile::tempdir().unwrap();
     let mut cmd = clean_cmd();
     cmd.current_dir(temp.path());
@@ -3973,7 +3980,7 @@ fn env_sync_flags_allowed_with_non_sync_command() {
 }
 
 #[test]
-fn env_sync_flags_allowed_with_service_status() {
+fn removed_sync_env_vars_do_not_block_service_status() {
     // Regression: issue #385 - same class of bug on a different non-sync
     // subcommand (service status does not carry SyncArgs).
     let temp = tempfile::tempdir().unwrap();

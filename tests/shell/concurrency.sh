@@ -26,6 +26,10 @@ KEI="$(kei_release_bin)"
 kei_check_init
 
 kei_sync() {
+    local download_dir="${1:?download dir required}"
+    shift
+    local config
+    config="$(kei_write_sync_config "$COOKIES" "$download_dir")"
     # `--unfiled false` keeps the suite scoped to the test album. v0.13's
     # default `--unfiled true` would also enumerate every unfiled photo in
     # the live account on every concurrency-test sync, blowing wall time
@@ -34,8 +38,7 @@ kei_sync() {
         --username "$ICLOUD_USERNAME" \
         --password "$ICLOUD_PASSWORD" \
         --data-dir "$COOKIES" \
-        --album "$ALBUM" \
-        --unfiled false \
+        --config "$config" \
         --no-progress-bar \
         --log-level info "$@" 2>&1
 }
@@ -54,7 +57,7 @@ echo "=== 1. Concurrent downloads (threads=5) ==="
 DIR1=$(kei_scratch_dir concurrent)
 kei_db_exec "DELETE FROM assets"
 
-OUT=$(kei_sync --download-dir "$DIR1" --threads 5)
+OUT=$(KEI_SYNC_DOWNLOAD_TOML=$'threads = 5\n' kei_sync "$DIR1")
 echo "$OUT" | grep -E "concurrency|downloaded|failed|completed"
 
 FC=$(find "$DIR1" -type f | wc -l | tr -d ' ')
@@ -92,7 +95,7 @@ kei_db_exec "DELETE FROM assets"
 # Session reuse puts auth at ~3s; kill at 4s so we interrupt mid- or
 # just-post-download. Even if all files complete before the kill the
 # resume pass validates idempotency.
-kei_sync --download-dir "$DIR2" --threads 1 &
+KEI_SYNC_DOWNLOAD_TOML=$'threads = 1\n' kei_sync "$DIR2" &
 SYNC_PID=$!
 sleep 4
 kill -9 $SYNC_PID 2>/dev/null
@@ -103,7 +106,7 @@ PART_COUNT=$(find "$DIR2" -name "*.kei-tmp" | wc -l | tr -d ' ')
 FILE_COUNT=$(find "$DIR2" -type f ! -name "*.kei-tmp" | wc -l | tr -d ' ')
 echo "  After interrupt: $FILE_COUNT complete, $PART_COUNT .kei-tmp files"
 
-OUT=$(kei_sync --download-dir "$DIR2" --threads 1)
+OUT=$(KEI_SYNC_DOWNLOAD_TOML=$'threads = 1\n' kei_sync "$DIR2")
 echo "$OUT" | grep -E "downloaded|failed|completed|Skipping"
 
 FINAL_FILES=$(find "$DIR2" -type f ! -name "*.kei-tmp" | wc -l | tr -d ' ')
@@ -124,14 +127,13 @@ kei_db_exec "DELETE FROM assets"
 # Force one of the test album's files to land in a read-only directory.
 # Album passes default to `{album}/` since the per-category template
 # refactor (PR #288), so we explicitly request a date hierarchy and
-# pre-create one date dir as read-only. GOPR0558.JPG in icloudpd-test
+# pre-create one date dir as read-only. GOPR0558.JPG in kei-test
 # is dated 2019-11-09; making that path 555 makes its write fail while
 # the other dates succeed.
 mkdir -p "$DIR3/2019/11/09"
 chmod 555 "$DIR3/2019/11/09" "$DIR3/2019/11" "$DIR3/2019"
 
-kei_sync --download-dir "$DIR3" --threads 1 \
-    --folder-structure-albums "%Y/%m/%d"
+KEI_SYNC_DOWNLOAD_TOML=$'threads = 1\nfolder_structure_albums = "%Y/%m/%d"\n' kei_sync "$DIR3"
 EC=$?
 echo "  Exit code: $EC"
 

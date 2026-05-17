@@ -187,8 +187,9 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
 
 // ── Application Config ──────────────────────────────────────────────
 
-/// Resolve `--library` from CLI > TOML > default (`primary`). The CLI list
-/// and the TOML `[filters].libraries` array share the selector grammar
+/// Resolve library selection from the programmatic override, TOML, or the
+/// default (`primary`). The override and TOML `[filters].libraries` array share
+/// the selector grammar
 /// (`primary` / `shared` / `all` / `none` / `!name` / raw zone names);
 ///
 /// Returns the parsed [`crate::selection::LibrarySelector`]; the matching
@@ -381,10 +382,10 @@ pub(crate) fn should_warn_implicit_unfiled(
 
 fn warn_implicit_unfiled_pass() {
     tracing::warn!(
-        "--unfiled defaults to true in v0.13, so kei is also running an unfiled pass \
+        "[filters] unfiled defaults to true in v0.13, so kei is also running an unfiled pass \
          (every photo not in any user album) alongside the album pass(es). Pass \
-         `--unfiled false` (or `[filters] unfiled = false`) to restrict to just the \
-         album pass(es); pass `--unfiled true` to silence this warning."
+         `[filters] unfiled = false` to restrict to just the album pass(es); pass \
+         `[filters] unfiled = true` to silence this warning."
     );
 }
 
@@ -913,46 +914,22 @@ pub(crate) fn resolve_password_command(
         .or_else(|| toml_auth.and_then(|a| a.password_command.clone()))
 }
 
-pub(crate) const ENV_WATCH_INTERVAL: &str = "KEI_WATCH_WITH_INTERVAL";
-
-/// Parse `KEI_WATCH_WITH_INTERVAL` into an `Option<u64>`. Takes the raw
-/// `Result` so tests can exercise it without mutating the process env (which
-/// would race other `Config::build` callers under `--test-threads > 1`).
-/// Range validation lives in `Config::build_inner` so CLI/TOML/env share it.
-pub(crate) fn parse_env_watch_interval(
-    raw: Result<String, std::env::VarError>,
-) -> anyhow::Result<Option<u64>> {
-    match raw {
-        Ok(s) if s.is_empty() => Ok(None),
-        Ok(s) => Some(s.parse::<u64>().map_err(|e| {
-            anyhow::anyhow!("{ENV_WATCH_INTERVAL} is not a valid integer ({s:?}): {e}")
-        }))
-        .transpose(),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            anyhow::bail!("{ENV_WATCH_INTERVAL} contains non-UTF-8 bytes")
-        }
-    }
-}
-
 impl Config {
     /// Build a Config by merging CLI args with optional TOML config.
-    /// Resolution order: CLI > TOML > env (`KEI_WATCH_WITH_INTERVAL` for the
-    /// watch interval; per-field for others) > hardcoded default.
+    /// Runtime CLI flags override TOML where they remain public. Durable sync
+    /// settings come from TOML and then hardcoded defaults.
     pub fn build(
         globals: &GlobalArgs,
         pw: &crate::cli::PasswordArgs,
         sync: crate::cli::SyncArgs,
         toml: Option<&TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let env_watch_interval = parse_env_watch_interval(std::env::var(ENV_WATCH_INTERVAL))?;
         let friendly_request = toml.and_then(|t| t.ui.as_ref()).and_then(|u| u.friendly);
         Self::build_inner(
             globals,
             pw,
             sync,
             toml,
-            env_watch_interval,
             crate::personality::Mode::Off,
             friendly_request,
         )
@@ -963,7 +940,6 @@ impl Config {
         pw: &crate::cli::PasswordArgs,
         sync: crate::cli::SyncArgs,
         toml: Option<&TomlConfig>,
-        env_watch_interval: Option<u64>,
         personality_mode: crate::personality::Mode,
         friendly_request: Option<bool>,
     ) -> anyhow::Result<Self> {
@@ -1286,8 +1262,7 @@ impl Config {
         // default sits below TOML in the precedence chain. See #293.
         let watch_with_interval = sync
             .watch_with_interval
-            .or_else(|| toml_watch.and_then(|w| w.interval))
-            .or(env_watch_interval);
+            .or_else(|| toml_watch.and_then(|w| w.interval));
         if let Some(n) = watch_with_interval {
             anyhow::ensure!(
                 (60..=86400).contains(&n),
@@ -2263,19 +2238,8 @@ mod tests {
 
     #[test]
     fn config_build_unfiled_bare_flag_resolves_to_true() {
-        // Bare `--unfiled` (no value) sets `cli.sync.unfiled = Some(true)`
-        // via clap's `default_missing_value = "true"`. The cli.rs unit test
-        // pins the parse but the runtime path through Config::build is
-        // untested — a clap-default flip or a derive_selection regression
-        // that dropped the override would silently land. This test drives
-        // the parser through to the resolved Selection.
-        use crate::cli::{Cli, Command};
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from(["kei", "sync", "--unfiled"]).unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
+        let mut sync = default_sync();
+        sync.unfiled = Some(true);
         let mut globals = default_globals();
         globals.username = Some("u@example.com".to_string());
         let cfg = Config::build(&globals, &default_password(), sync, None).unwrap();
@@ -2287,17 +2251,8 @@ mod tests {
 
     #[test]
     fn config_build_unfiled_explicit_false_resolves_to_false() {
-        // Symmetric pin: explicit `--unfiled false` must override the
-        // `true` default. The legacy resolver also defaulted unfiled to
-        // true under most configurations, so a regression that swallowed
-        // the explicit `false` would not show up in any current test.
-        use crate::cli::{Cli, Command};
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from(["kei", "sync", "--unfiled", "false"]).unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
+        let mut sync = default_sync();
+        sync.unfiled = Some(false);
         let mut globals = default_globals();
         globals.username = Some("u@example.com".to_string());
         let cfg = Config::build(&globals, &default_password(), sync, None).unwrap();
@@ -2319,13 +2274,8 @@ mod tests {
 
     #[test]
     fn config_build_smart_folder_resolves_to_named_selector() {
-        use crate::cli::{Cli, Command};
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from(["kei", "sync", "--smart-folder", "Favorites"]).unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
+        let mut sync = default_sync();
+        sync.smart_folders = vec!["Favorites".to_string()];
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(
             cfg.selection.smart_folders.to_raw(),
@@ -2335,21 +2285,8 @@ mod tests {
 
     #[test]
     fn config_build_smart_folder_all_with_sensitive_resolves() {
-        use crate::cli::{Cli, Command};
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from([
-            "kei",
-            "sync",
-            "--smart-folder",
-            "all-with-sensitive",
-            "--smart-folder",
-            "!Hidden",
-        ])
-        .unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
+        let mut sync = default_sync();
+        sync.smart_folders = vec!["all-with-sensitive".to_string(), "!Hidden".to_string()];
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         match cfg.selection.smart_folders {
             crate::selection::SmartFolderSelector::All {
@@ -2371,15 +2308,8 @@ mod tests {
 
     #[test]
     fn config_build_library_repeatable_primary_plus_shared() {
-        use crate::cli::{Cli, Command};
-        use clap::Parser;
-
-        let cli =
-            Cli::try_parse_from(["kei", "sync", "--library", "primary", "--library", "shared"])
-                .unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
+        let mut sync = default_sync();
+        sync.libraries = vec!["primary".to_string(), "shared".to_string()];
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(
             cfg.selection.libraries.primary,
@@ -2399,21 +2329,8 @@ mod tests {
 
     #[test]
     fn config_build_library_repeatable_named_zone_with_primary() {
-        use crate::cli::{Cli, Command};
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from([
-            "kei",
-            "sync",
-            "--library",
-            "primary",
-            "--library",
-            "SharedSync-A1B2C3D4",
-        ])
-        .unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
+        let mut sync = default_sync();
+        sync.libraries = vec!["primary".to_string(), "SharedSync-A1B2C3D4".to_string()];
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let lib = &cfg.selection.libraries;
         assert!(lib.primary, "primary must remain set");
@@ -2427,19 +2344,8 @@ mod tests {
 
     #[test]
     fn config_build_folder_structure_albums_resolves_through_cli() {
-        use crate::cli::{Cli, Command};
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from([
-            "kei",
-            "sync",
-            "--folder-structure-albums",
-            "{album}/%Y/%m/%d",
-        ])
-        .unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
+        let mut sync = default_sync();
+        sync.folder_structure_albums = Some("{album}/%Y/%m/%d".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.folder_structure_albums, "{album}/%Y/%m/%d");
         // Default unfiled / smart-folder templates are untouched.
@@ -2448,19 +2354,8 @@ mod tests {
 
     #[test]
     fn config_build_folder_structure_smart_folders_resolves_through_cli() {
-        use crate::cli::{Cli, Command};
-        use clap::Parser;
-
-        let cli = Cli::try_parse_from([
-            "kei",
-            "sync",
-            "--folder-structure-smart-folders",
-            "{smart-folder}/%Y",
-        ])
-        .unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
+        let mut sync = default_sync();
+        sync.folder_structure_smart_folders = Some("{smart-folder}/%Y".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert_eq!(cfg.folder_structure_smart_folders, "{smart-folder}/%Y");
         assert_eq!(cfg.folder_structure_albums, "{album}");
@@ -2576,20 +2471,9 @@ mod tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
 
-        use crate::cli::{Cli, Command};
-        use clap::Parser;
-        let cli = Cli::try_parse_from([
-            "kei",
-            "sync",
-            "--folder-structure-albums",
-            "{album}/from-cli",
-            "--folder-structure-smart-folders",
-            "{smart-folder}/from-cli",
-        ])
-        .unwrap();
-        let Command::Sync { sync, .. } = cli.effective_command() else {
-            panic!("expected Sync subcommand");
-        };
+        let mut sync = default_sync();
+        sync.folder_structure_albums = Some("{album}/from-cli".to_string());
+        sync.folder_structure_smart_folders = Some("{smart-folder}/from-cli".to_string());
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.folder_structure_albums, "{album}/from-cli");
@@ -3151,7 +3035,7 @@ mod tests {
         assert!(err.contains("not supported on Windows"), "{err}");
     }
 
-    // ── Download directory: --download-dir ─────────────────────────
+    // ── Download directory ─────────────────────────────────────────
 
     #[test]
     fn test_build_download_dir_from_cli() {
@@ -4396,86 +4280,6 @@ mod tests {
         assert_eq!(cfg.watch_with_interval, Some(600));
     }
 
-    // Precedence tests for KEI_WATCH_WITH_INTERVAL inject the env value via
-    // `Config::build_inner` directly, rather than mutating the real process
-    // env, which would race other `Config::build` callers under
-    // `--test-threads > 1`.
-
-    fn build_with_env(
-        sync: SyncArgs,
-        toml: Option<TomlConfig>,
-        env_watch_interval: Option<u64>,
-    ) -> anyhow::Result<Config> {
-        Config::build_inner(
-            &default_globals(),
-            &default_password(),
-            sync,
-            toml.as_ref(),
-            env_watch_interval,
-            crate::personality::Mode::Off,
-            None,
-        )
-    }
-
-    /// Regression test for #293: a `[watch] interval` in TOML must beat the
-    /// `KEI_WATCH_WITH_INTERVAL` env var (notably the docker image's baked
-    /// 24-hour default). Before the fix the env was read by clap and treated
-    /// as equivalent to a CLI flag, so it silently overrode TOML.
-    #[test]
-    fn test_build_watch_interval_toml_overrides_env() {
-        let toml_str = r#"
-            [watch]
-            interval = 3600
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = build_with_env(default_sync(), Some(toml), Some(86400)).unwrap();
-        assert_eq!(cfg.watch_with_interval, Some(3600));
-    }
-
-    #[test]
-    fn test_build_watch_interval_cli_overrides_env() {
-        let mut sync = default_sync();
-        sync.watch_with_interval = Some(600);
-        let cfg = build_with_env(sync, None, Some(86400)).unwrap();
-        assert_eq!(cfg.watch_with_interval, Some(600));
-    }
-
-    #[test]
-    fn test_build_watch_interval_env_only() {
-        let cfg = build_with_env(default_sync(), None, Some(86400)).unwrap();
-        assert_eq!(cfg.watch_with_interval, Some(86400));
-    }
-
-    #[test]
-    fn test_build_watch_interval_env_unset_means_single_shot() {
-        let cfg = build_with_env(default_sync(), None, None).unwrap();
-        assert!(cfg.watch_with_interval.is_none());
-    }
-
-    #[test]
-    fn test_build_watch_interval_env_below_minimum_rejected() {
-        for bad in [0u64, 1, 30, 59] {
-            let err = build_with_env(default_sync(), None, Some(bad)).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("watch interval must be in 60..=86400"),
-                "unexpected error for env={bad}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_watch_interval_env_above_maximum_rejected() {
-        for bad in [86401u64, 100_000, u64::MAX] {
-            let err = build_with_env(default_sync(), None, Some(bad)).unwrap_err();
-            assert!(
-                err.to_string()
-                    .contains("watch interval must be in 60..=86400"),
-                "unexpected error for env={bad}: {err}"
-            );
-        }
-    }
-
     // ── Config::build: reconcile_every_n_cycles ────────────────────
 
     #[test]
@@ -4538,98 +4342,6 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.reconcile_every_n_cycles.is_none());
-    }
-
-    // Pure parser tests use synthetic `Result<String, VarError>` inputs to
-    // avoid mutating the process env.
-
-    #[test]
-    fn test_parse_env_watch_interval_valid_number() {
-        let parsed = parse_env_watch_interval(Ok("3600".to_string())).unwrap();
-        assert_eq!(parsed, Some(3600));
-    }
-
-    #[test]
-    fn test_parse_env_watch_interval_not_present() {
-        let parsed = parse_env_watch_interval(Err(std::env::VarError::NotPresent)).unwrap();
-        assert!(parsed.is_none());
-    }
-
-    // Empty string == unset. Lets `docker run -e KEI_WATCH_WITH_INTERVAL=`
-    // override the image's baked-in 24h default for one-shot invocations.
-    #[test]
-    fn test_parse_env_watch_interval_empty_is_unset() {
-        let parsed = parse_env_watch_interval(Ok(String::new())).unwrap();
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_parse_env_watch_interval_garbage_rejected() {
-        let err = parse_env_watch_interval(Ok("not-a-number".to_string())).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("KEI_WATCH_WITH_INTERVAL is not a valid integer"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_env_watch_interval_negative_rejected() {
-        let err = parse_env_watch_interval(Ok("-1".to_string())).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("KEI_WATCH_WITH_INTERVAL is not a valid integer"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_parse_env_watch_interval_non_unicode_rejected() {
-        let err = parse_env_watch_interval(Err(std::env::VarError::NotUnicode(
-            std::ffi::OsString::from("placeholder"),
-        )))
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("KEI_WATCH_WITH_INTERVAL contains non-UTF-8 bytes"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_build_pid_file_cli_overrides_toml() {
-        let toml_str = r#"
-            [watch]
-            pid_file = "/toml/pid"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let mut sync = default_sync();
-        sync.pid_file = Some(PathBuf::from("/cli/pid"));
-        let cfg =
-            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(cfg.pid_file, Some(PathBuf::from("/cli/pid")));
-    }
-
-    // ── Config::build: notification_script merge ────────────────────
-
-    #[test]
-    fn test_build_notification_script_from_toml() {
-        let toml_str = r#"
-            [notifications]
-            script = "/config/notify.sh"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.notification_script,
-            Some(PathBuf::from("/config/notify.sh"))
-        );
     }
 
     #[test]

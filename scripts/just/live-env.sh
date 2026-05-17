@@ -12,4 +12,4 @@ if [ -z "${ICLOUD_USERNAME:-}" ] && [ -f .env ]; then
 fi
 
 : "${ICLOUD_USERNAME:?ICLOUD_USERNAME must be set (via .env or environment)}"
-export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
+export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-kei-test}"

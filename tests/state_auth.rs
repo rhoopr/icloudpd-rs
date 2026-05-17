@@ -31,6 +31,19 @@ const TIMEOUT_CMD: u64 = 30;
 
 // ── Command builders ──────────────────────────────────────────────────
 
+fn sync_config(
+    data_dir: &Path,
+    dir: &Path,
+    download_extra: &str,
+    filters_extra: &str,
+) -> std::path::PathBuf {
+    let body = format!(
+        "[download]\ndirectory = {}\n{download_extra}[filters]\nalbums = [\"none\"]\n{filters_extra}",
+        common::toml_string(&dir.to_string_lossy())
+    );
+    common::write_toml_config(data_dir, "state-auth-sync", &body)
+}
+
 fn sync_cmd(
     username: &str,
     password: &str,
@@ -44,11 +57,10 @@ fn sync_cmd(
     // under `--recent N` and overrun Apple's rate limits across the
     // suite. The state-DB invariants tested here are pass-shape
     // independent.
+    let config_path = sync_config(cookie_dir, dir, "", "");
     let mut cmd = common::cmd();
     cmd.args([
         "sync",
-        "--album",
-        "none",
         "--recent",
         &recent.to_string(),
         "--username",
@@ -57,8 +69,8 @@ fn sync_cmd(
         password,
         "--data-dir",
         cookie_dir.to_str().unwrap(),
-        "--download-dir",
-        dir.to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
         "--no-progress-bar",
     ]);
     cmd
@@ -131,11 +143,10 @@ fn retry_failed_cmd(
     cookie_dir: &Path,
     dir: &Path,
 ) -> assert_cmd::Command {
+    let config_path = sync_config(cookie_dir, dir, "", "");
     let mut cmd = common::cmd();
     cmd.args([
         "sync",
-        "--album",
-        "none",
         "--retry-failed",
         "--username",
         username,
@@ -143,8 +154,8 @@ fn retry_failed_cmd(
         password,
         "--data-dir",
         cookie_dir.to_str().unwrap(),
-        "--download-dir",
-        dir.to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
         "--no-progress-bar",
         "--log-level",
         "info",
@@ -386,8 +397,22 @@ fn verify_checksums_detects_corruption() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
-            .args(["--skip-videos"])
+        let config_path = sync_config(&cookie_dir, download_dir.path(), "", "skip_videos = true\n");
+        common::cmd()
+            .args([
+                "sync",
+                "--recent",
+                "1",
+                "--username",
+                &username,
+                "--password",
+                &password,
+                "--data-dir",
+                cookie_dir.to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
+                "--no-progress-bar",
+            ])
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -503,8 +528,27 @@ fn import_existing_custom_folder_structure() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
-            .args(["--folder-structure", "%Y"])
+        let config_path = sync_config(
+            &cookie_dir,
+            download_dir.path(),
+            "folder_structure = \"%Y\"\n",
+            "",
+        );
+        common::cmd()
+            .args([
+                "sync",
+                "--recent",
+                "1",
+                "--username",
+                &username,
+                "--password",
+                &password,
+                "--data-dir",
+                cookie_dir.to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
+                "--no-progress-bar",
+            ])
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();

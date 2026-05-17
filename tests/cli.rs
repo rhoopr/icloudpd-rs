@@ -67,7 +67,8 @@ fn sync_help_succeeds() {
         .args(["sync", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--download-dir"));
+        .stdout(predicate::str::contains("--recent"))
+        .stdout(predicate::str::contains("--download-dir").not());
 }
 
 #[test]
@@ -82,12 +83,12 @@ fn sync_help_omits_removed_directory_flag() {
 
 #[test]
 fn sync_help_hides_deprecated_exclude_album_flag() {
-    // `--exclude-album` was removed; users should only see `--album '!NAME'`.
     common::cmd()
         .args(["sync", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--exclude-album").not());
+        .stdout(predicate::str::contains("--exclude-album").not())
+        .stdout(predicate::str::contains("--album").not());
 }
 
 #[test]
@@ -259,7 +260,8 @@ fn short_d_flag_accepted() {
     common::cmd()
         .args(["sync", "-d", "/tmp", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -276,7 +278,8 @@ fn short_a_flag_accepted() {
     common::cmd()
         .args(["sync", "-a", "Favorites", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -323,7 +326,7 @@ fn size_rejects_invalid_variant() {
         .args(["sync", "--username", "x@x.com", "--size", "huge"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -347,7 +350,7 @@ fn live_photo_size_rejects_invalid() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -362,7 +365,7 @@ fn live_photo_mov_filename_policy_rejects_invalid() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -371,7 +374,7 @@ fn align_raw_rejects_invalid() {
         .args(["sync", "--username", "x@x.com", "--align-raw", "bogus"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -386,7 +389,7 @@ fn file_match_policy_rejects_invalid() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 // ── Numeric validation (rejection only — acceptance covered by unit tests)
@@ -397,7 +400,7 @@ fn threads_rejects_zero() {
         .args(["sync", "--username", "x@x.com", "--threads", "0"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -431,47 +434,25 @@ fn import_existing_requires_directory() {
         .stderr(predicate::str::contains("--download-dir is required"));
 }
 
-// ── Boolean flags are accepted ──────────────────────────────────────────
+// ── Removed durable boolean flags fail ─────────────────────────────────
 
 #[test]
-fn boolean_sync_flags_accepted() {
-    let mut flags = vec![
-        "--skip-videos",
-        "--skip-photos",
-        "--force-size",
-        "--dry-run",
-        "--no-progress-bar",
-        "--keep-unicode-in-filenames",
-        "--notify-systemd",
-    ];
-    if cfg!(feature = "xmp") {
-        flags.push("--set-exif-datetime");
-    }
-    for flag in flags {
-        common::cmd()
-            .args(["sync", flag, "--help"])
-            .assert()
-            .success();
-    }
+fn removed_boolean_sync_flag_fails() {
+    common::cmd()
+        .args(["sync", "--skip-videos", "--help"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
-// ── Value flags are accepted ────────────────────────────────────────────
+// ── Kept per-run value flags are accepted ───────────────────────────────
 
 #[test]
 fn value_sync_flags_accepted() {
     let pairs = [
-        ("--download-dir", "/tmp"),
-        ("--folder-structure", "%Y-%m"),
         ("--recent", "10"),
-        ("--threads", "4"),
-        ("--watch-with-interval", "3600"),
-        ("--max-retries", "5"),
-        ("--temp-suffix", ".downloading"),
         ("--skip-created-before", "2024-01-01"),
         ("--skip-created-after", "2025-01-01"),
-        ("--pid-file", "/tmp/test.pid"),
-        ("--notification-script", "/tmp/notify.sh"),
-        ("--library", "SharedSync-ABC"),
     ];
     for (flag, value) in pairs {
         common::cmd()
@@ -484,83 +465,46 @@ fn value_sync_flags_accepted() {
 #[test]
 fn album_flag_accepts_multiple() {
     common::cmd()
-        .args([
-            "sync",
-            "--album",
-            "Favorites",
-            "--album",
-            "Vacation",
-            "--help",
-        ])
+        .args(["sync", "--album", "Favorites", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
 fn smart_folder_flag_accepts_multiple() {
     common::cmd()
-        .args([
-            "sync",
-            "--smart-folder",
-            "Favorites",
-            "--smart-folder",
-            "all",
-            "--smart-folder",
-            "!Hidden",
-            "--help",
-        ])
+        .args(["sync", "--smart-folder", "Favorites", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
 fn library_flag_accepts_repeatable_sentinels() {
     common::cmd()
-        .args([
-            "sync",
-            "--library",
-            "primary",
-            "--library",
-            "shared",
-            "--library",
-            "!SharedSync-AAAA",
-            "--help",
-        ])
+        .args(["sync", "--library", "primary", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
 fn album_flag_accepts_inline_exclusion() {
     common::cmd()
-        .args([
-            "sync", "--album", "all", "--album", "!Family", "--album", "none", "--help",
-        ])
+        .args(["sync", "--album", "!Family", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
 fn album_flag_rejects_duplicates() {
-    // Selector-grammar rejection fires pre-auth, before any data-dir / state
-    // access, so no `--data-dir` or auth setup is needed.
     common::cmd()
-        .args([
-            "sync",
-            "--album",
-            "Vacation",
-            "--album",
-            "Vacation",
-            "--username",
-            "dummy@example.com",
-            "--password",
-            "x",
-        ])
+        .args(["sync", "--album", "Family", "--album", "Family"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "--album 'Vacation' specified more than once",
-        ));
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -573,7 +517,8 @@ fn folder_structure_albums_flag_parses() {
             "--help",
         ])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -586,40 +531,34 @@ fn folder_structure_smart_folders_flag_parses() {
             "--help",
         ])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
 fn unfiled_flag_accepts_bare_and_explicit_value() {
-    common::cmd()
-        .args(["sync", "--unfiled", "--help"])
-        .assert()
-        .success();
-    common::cmd()
-        .args(["sync", "--unfiled", "false", "--help"])
-        .assert()
-        .success();
-    common::cmd()
-        .args(["sync", "--unfiled", "true", "--help"])
-        .assert()
-        .success();
+    for args in [
+        vec!["sync", "--unfiled", "--help"],
+        vec!["sync", "--unfiled", "false", "--help"],
+        vec!["sync", "--unfiled", "true", "--help"],
+    ] {
+        common::cmd()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unexpected argument"));
+    }
 }
 
 // ── Default command (no subcommand = sync) ──────────────────────────────
 
 #[test]
 fn bare_invocation_with_username_and_directory_parses() {
-    // With --help to avoid actually running
     common::cmd()
-        .args([
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            "/photos",
-            "--help",
-        ])
+        .args(["--username", "x@x.com", "--download-dir", "/tmp", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 // ── Global flags work with all subcommands ──────────────────────────────
@@ -900,18 +839,7 @@ fn auth_flags_accepted_on_all_subcommands() {
 #[test]
 fn retry_failed_accepts_sync_flags() {
     common::cmd()
-        .args([
-            "sync",
-            "--retry-failed",
-            "--download-dir",
-            "/tmp",
-            "--recent",
-            "10",
-            "--skip-videos",
-            "--threads",
-            "2",
-            "--help",
-        ])
+        .args(["sync", "--retry-failed", "--recent", "10", "--help"])
         .assert()
         .success();
 }
@@ -992,15 +920,23 @@ fn exit_code_0_on_version() {
 /// Exit code 1 (generic failure) when --username is missing.
 #[test]
 fn exit_code_1_on_missing_username() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[download]\ndirectory = \"/tmp/claude/exit-code-test\"\n",
+    )
+    .unwrap();
+
     common::cmd()
         .env_remove("ICLOUD_USERNAME")
         .env_remove("ICLOUD_PASSWORD")
         .args([
             "sync",
-            "--download-dir",
-            "/tmp/claude/exit-code-test",
+            "--config",
+            config.to_str().unwrap(),
             "--data-dir",
-            "/tmp/claude/exit-code-cookies",
+            dir.path().to_str().unwrap(),
         ])
         .timeout(std::time::Duration::from_secs(30))
         .assert()
@@ -1015,6 +951,12 @@ fn exit_code_1_on_missing_username() {
 #[test]
 fn exit_code_3_on_empty_password_file() {
     let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[download]\ndirectory = \"/tmp/claude/exit-code-test\"\n",
+    )
+    .unwrap();
     let pw_file = dir.path().join("empty-password");
     std::fs::write(&pw_file, "").unwrap();
 
@@ -1025,8 +967,8 @@ fn exit_code_3_on_empty_password_file() {
             "sync",
             "--username",
             "exit-code-test@example.com",
-            "--download-dir",
-            "/tmp/claude/exit-code-test",
+            "--config",
+            config.to_str().unwrap(),
             "--data-dir",
             dir.path().to_str().unwrap(),
             "--password-file",
@@ -1042,6 +984,12 @@ fn exit_code_3_on_empty_password_file() {
 #[test]
 fn exit_code_3_on_newline_only_password_file() {
     let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[download]\ndirectory = \"/tmp/claude/exit-code-test\"\n",
+    )
+    .unwrap();
     let pw_file = dir.path().join("newline-password");
     std::fs::write(&pw_file, "\n").unwrap();
 
@@ -1052,8 +1000,8 @@ fn exit_code_3_on_newline_only_password_file() {
             "sync",
             "--username",
             "exit-code-test@example.com",
-            "--download-dir",
-            "/tmp/claude/exit-code-test",
+            "--config",
+            config.to_str().unwrap(),
             "--data-dir",
             dir.path().to_str().unwrap(),
             "--password-file",
@@ -1246,7 +1194,7 @@ fn retry_failed_conflicts_with_watch() {
         .args(["sync", "--retry-failed", "--watch-with-interval", "300"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 // ── --data-dir global ─────────────────────────────────────────────────
@@ -1272,12 +1220,12 @@ fn data_dir_global_works_with_subcommands() {
 // ── KEI_* env vars ────────────────────────────────────────────────────
 
 #[test]
-fn kei_download_dir_env_var_accepted() {
+fn download_dir_sync_flag_removed() {
     common::cmd()
-        .env("KEI_DOWNLOAD_DIR", "/photos")
-        .args(["sync", "--help"])
+        .args(["sync", "--download-dir", "/photos", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
@@ -1299,7 +1247,7 @@ fn kei_log_level_env_var_accepted() {
 }
 
 #[test]
-fn kei_reconcile_every_n_cycles_env_var_accepted() {
+fn kei_reconcile_every_n_cycles_env_var_ignored_by_help() {
     common::cmd()
         .env("KEI_RECONCILE_EVERY_N_CYCLES", "24")
         .args(["sync", "--help"])
@@ -1392,21 +1340,23 @@ fn submit_code_fails_without_username() {
         .stderr(predicate::str::contains("error").or(predicate::str::contains("required")));
 }
 
-// ── --report-json ────────────────────────────────────────────────────
+// ── --report-json removed from public sync CLI ───────────────────────
 
 #[test]
-fn report_json_flag_accepted() {
+fn report_json_flag_fails() {
     common::cmd()
         .args(["sync", "--report-json", "/tmp/report.json", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]
-fn report_json_visible_in_help() {
-    common::cmd()
-        .args(["sync", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--report-json"));
+fn report_json_not_visible_in_help() {
+    let assert = common::cmd().args(["sync", "--help"]).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        !stdout.contains("\n      --report-json"),
+        "sync help should not expose a --report-json option, got:\n{stdout}"
+    );
 }

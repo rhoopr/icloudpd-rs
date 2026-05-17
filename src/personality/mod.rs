@@ -67,7 +67,7 @@ pub struct Context {
     pub no_progress_bar: bool,
     /// User passed `--only-print-filenames`.
     pub only_print_filenames: bool,
-    /// User passed `--report-json` or another machine-output flag.
+    /// User enabled a machine-output mode such as report JSON.
     pub report_json: bool,
     /// User explicitly set `--log-level` (not the default).
     pub log_level_explicit: bool,

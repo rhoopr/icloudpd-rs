@@ -583,7 +583,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     };
 
     // Resolve friendly mode. The gate has multiple short-circuits (service
-    // context, non-TTY, RUST_LOG, --report-json, ...) so the user-stated
+    // context, non-TTY, RUST_LOG, machine-output mode, ...) so the user-stated
     // preference is a request, not a guarantee.
     //
     // Resolution chain: CLI > TOML > default-on-for-TTY. The gate then
@@ -597,15 +597,20 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // alternative (threading the resolved command through `run`) ripples
     // through every callee. Acceptable.
     let resolved_for_personality = cli.effective_command();
+    let toml_report_json = toml_config
+        .as_ref()
+        .and_then(|t| t.report.as_ref())
+        .and_then(|r| r.json.as_ref())
+        .is_some();
     let (cmd_no_progress_bar, cmd_only_print_filenames, cmd_report_json, cmd_service_run) =
         match &resolved_for_personality {
             cli::Command::Sync { sync, .. } => (
                 sync.no_progress_bar.unwrap_or(false),
                 sync.only_print_filenames,
-                sync.report_json.is_some(),
+                toml_report_json,
                 false,
             ),
-            cli::Command::Service { .. } => (false, false, false, true),
+            cli::Command::Service { .. } => (false, false, toml_report_json, true),
             _ => (false, false, false, false),
         };
     let personality_ctx = personality::Context::detect(

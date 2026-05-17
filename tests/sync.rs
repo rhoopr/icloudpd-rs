@@ -46,6 +46,16 @@ fn album() -> &'static str {
     A.get_or_init(|| std::env::var("KEI_TEST_ALBUM").unwrap_or_else(|_| "kei-test".to_string()))
 }
 
+#[derive(Debug, Default)]
+struct SyncToml<'a> {
+    download: &'a str,
+    filters: &'a str,
+    photos: &'a str,
+    watch: &'a str,
+    notifications: &'a str,
+    report: &'a str,
+}
+
 /// Build a sync command targeting the test album.
 fn album_cmd(
     username: &str,
@@ -53,30 +63,84 @@ fn album_cmd(
     cookie_dir: &std::path::Path,
     download_dir: &std::path::Path,
 ) -> assert_cmd::Command {
-    // `--unfiled false` keeps these tests scoped to the album under test.
+    album_cmd_with_toml(
+        username,
+        password,
+        cookie_dir,
+        download_dir,
+        SyncToml::default(),
+    )
+}
+
+fn album_cmd_with_toml(
+    username: &str,
+    password: &str,
+    cookie_dir: &std::path::Path,
+    download_dir: &std::path::Path,
+    toml: SyncToml<'_>,
+) -> assert_cmd::Command {
+    // `[filters].unfiled = false` keeps these tests scoped to the album under test.
     // v0.13's default is `--unfiled true` regardless of `--album`, which
     // would also enumerate every unfiled photo in the live account on
     // every test invocation -- both blowing up wall time and hitting Apple
     // rate limits. Each individual test asserts album-specific behaviour;
     // the unfiled pass is exercised separately by the no-flag tests.
+    let config_path = album_config(cookie_dir, download_dir, toml);
     let mut cmd = common::cmd();
     cmd.args([
         "sync",
-        "--album",
-        album(),
-        "--unfiled",
-        "false",
         "--username",
         username,
         "--password",
         password,
         "--data-dir",
         cookie_dir.to_str().unwrap(),
-        "--download-dir",
-        download_dir.to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
         "--no-progress-bar",
     ]);
     cmd
+}
+
+fn album_config(
+    data_dir: &std::path::Path,
+    download_dir: &std::path::Path,
+    toml: SyncToml<'_>,
+) -> std::path::PathBuf {
+    let mut body = format!(
+        "[download]\ndirectory = {}\n{}[filters]\n",
+        common::toml_string(&download_dir.to_string_lossy()),
+        toml.download,
+    );
+    if !toml.filters.contains("albums") {
+        body.push_str(&format!("albums = [{}]\n", common::toml_string(album())));
+    }
+    if !toml.filters.contains("unfiled") {
+        body.push_str("unfiled = false\n");
+    }
+    body.push_str(toml.filters);
+    for (section, content) in [
+        ("photos", toml.photos),
+        ("watch", toml.watch),
+        ("notifications", toml.notifications),
+        ("report", toml.report),
+    ] {
+        if !content.is_empty() {
+            body.push_str(&format!("[{section}]\n{content}"));
+        }
+    }
+    common::write_toml_config(data_dir, "sync-live", &body)
+}
+
+fn config_for_download_dir(
+    data_dir: &std::path::Path,
+    download_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    let body = format!(
+        "[download]\ndirectory = {}\n",
+        common::toml_string(&download_dir.to_string_lossy())
+    );
+    common::write_toml_config(data_dir, "sync-live", &body)
 }
 
 // ── Metadata (no downloads) ─────────────────────────────────────────────
@@ -251,11 +315,19 @@ fn sync_skip_videos_excludes_video_files() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--skip-videos"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                filters: "skip_videos = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
         assert!(
@@ -287,11 +359,19 @@ fn sync_skip_photos_excludes_image_files() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--skip-photos"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                filters: "skip_photos = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
         let image_files: Vec<_> = files.iter().filter(|p| is_image_ext(p)).collect();
@@ -318,11 +398,19 @@ fn sync_skip_live_photos_excludes_companions() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--live-photo-mode", "skip"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                photos: "live_photo_mode = \"skip\"\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
 
@@ -345,17 +433,21 @@ fn sync_skip_all_media_rejected_at_startup() {
 
     let download_dir = tempdir().expect("tempdir");
 
-    album_cmd(&username, &password, &cookie_dir, download_dir.path())
-        .args([
-            "--skip-videos",
-            "--skip-photos",
-            "--live-photo-mode",
-            "skip",
-        ])
-        .timeout(Duration::from_secs(TIMEOUT_META))
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("would download nothing"));
+    album_cmd_with_toml(
+        &username,
+        &password,
+        &cookie_dir,
+        download_dir.path(),
+        SyncToml {
+            filters: "skip_videos = true\nskip_photos = true\n",
+            photos: "live_photo_mode = \"skip\"\n",
+            ..SyncToml::default()
+        },
+    )
+    .timeout(Duration::from_secs(TIMEOUT_META))
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("would download nothing"));
 }
 
 /// Date filters with extreme values should filter everything out.
@@ -420,11 +512,20 @@ fn sync_size_medium_produces_smaller_files() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--size", "medium", "--skip-videos"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                filters: "skip_videos = true\n",
+                photos: "size = \"medium\"\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
         assert!(!files.is_empty(), "should download files at medium size");
@@ -458,11 +559,19 @@ fn sync_force_size_succeeds_when_available() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--size", "medium", "--force-size"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                photos: "size = \"medium\"\nforce_size = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
         assert!(
@@ -497,11 +606,19 @@ fn sync_name_id7_appends_asset_id() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--file-match-policy", "name-id7"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                photos: "file_match_policy = \"name-id7\"\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
         assert!(!files.is_empty(), "name-id7 should download files");
@@ -553,11 +670,19 @@ fn sync_custom_folder_structure() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--folder-structure-albums", "%Y"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                download: "folder_structure_albums = \"%Y\"\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
         assert!(!files.is_empty(), "should download files");
@@ -591,11 +716,19 @@ fn sync_keep_unicode_preserves_special_chars() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--keep-unicode-in-filenames"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                photos: "keep_unicode_in_filenames = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
         assert!(
@@ -627,11 +760,20 @@ fn sync_set_exif_datetime_embeds_date() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--set-exif-datetime", "--skip-videos"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                download: "set_exif_datetime = true\n",
+                filters: "skip_videos = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
         let jpeg_files: Vec<_> = files
@@ -675,11 +817,20 @@ fn sync_set_exif_rating_embeds_rating() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--set-exif-rating", "--skip-videos"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                download: "set_exif_rating = true\n",
+                filters: "skip_videos = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let jpeg = first_jpeg(&download_dir.path());
         use xmp_toolkit::{OpenFileOptions, XmpFile};
@@ -705,11 +856,20 @@ fn sync_set_exif_gps_embeds_gps() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--set-exif-gps", "--skip-videos"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                download: "set_exif_gps = true\n",
+                filters: "skip_videos = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let jpeg = first_jpeg(&download_dir.path());
         use xmp_toolkit::{OpenFileOptions, XmpFile};
@@ -735,11 +895,20 @@ fn sync_set_exif_description_embeds_description() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--set-exif-description", "--skip-videos"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                download: "set_exif_description = true\n",
+                filters: "skip_videos = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let jpeg = first_jpeg(&download_dir.path());
         use xmp_toolkit::{OpenFileOptions, XmpFile};
@@ -764,11 +933,20 @@ fn sync_embed_xmp_writes_xmp_packet() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--embed-xmp", "--skip-videos"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                download: "embed_xmp = true\n",
+                filters: "skip_videos = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let jpeg = first_jpeg(&download_dir.path());
         use xmp_toolkit::{OpenFileOptions, XmpFile};
@@ -799,11 +977,20 @@ fn sync_xmp_sidecar_writes_sidecar_file() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--xmp-sidecar", "--skip-videos"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                download: "xmp_sidecar = true\n",
+                filters: "skip_videos = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
         let sidecars: Vec<_> = files
@@ -840,11 +1027,19 @@ fn sync_embed_xmp_on_heic_writes_mime_item() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--embed-xmp"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                download: "embed_xmp = true\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let files = common::walkdir(download_dir.path());
         let heics: Vec<_> = files
@@ -913,11 +1108,19 @@ fn sync_align_raw_controls_raw_naming() {
     common::with_auth_retry(|| {
         for variant in ["as-is", "original", "alternative"] {
             let dir = tempdir().expect("tempdir");
-            album_cmd(&username, &password, &cookie_dir, dir.path())
-                .args(["--align-raw", variant])
-                .timeout(Duration::from_secs(TIMEOUT_SECS))
-                .assert()
-                .success();
+            album_cmd_with_toml(
+                &username,
+                &password,
+                &cookie_dir,
+                dir.path(),
+                SyncToml {
+                    photos: &format!("align_raw = {variant:?}\n"),
+                    ..SyncToml::default()
+                },
+            )
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
 
             let files = common::walkdir(dir.path());
             assert!(
@@ -942,11 +1145,19 @@ fn sync_live_photo_mov_policy_controls_naming() {
     common::with_auth_retry(|| {
         for policy in ["suffix", "original"] {
             let dir = tempdir().expect("tempdir");
-            album_cmd(&username, &password, &cookie_dir, dir.path())
-                .args(["--live-photo-mov-filename-policy", policy])
-                .timeout(Duration::from_secs(TIMEOUT_SECS))
-                .assert()
-                .success();
+            album_cmd_with_toml(
+                &username,
+                &password,
+                &cookie_dir,
+                dir.path(),
+                SyncToml {
+                    photos: &format!("live_photo_mov_filename_policy = {policy:?}\n"),
+                    ..SyncToml::default()
+                },
+            )
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .assert()
+            .success();
 
             let files = common::walkdir(dir.path());
             assert!(
@@ -969,11 +1180,19 @@ fn sync_temp_suffix_leaves_no_remnants() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--temp-suffix", ".downloading"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                download: "temp_suffix = \".downloading\"\n",
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let all_files = common::walkdir(download_dir.path());
         assert!(
@@ -1000,11 +1219,20 @@ fn sync_threads_reflected_in_log() {
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
 
-        let assertion = album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--threads", "1", "--log-level", "info"])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        let assertion = album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                download: "threads = 1\n",
+                ..SyncToml::default()
+            },
+        )
+        .args(["--log-level", "info"])
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let stderr = String::from_utf8_lossy(&assertion.get_output().stderr);
         let clean = common::strip_ansi(&stderr);
@@ -1082,11 +1310,22 @@ fn sync_notification_script_fires_event() {
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--notification-script", script_path.to_str().unwrap()])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                notifications: &format!(
+                    "script = {}\n",
+                    common::toml_string(&script_path.to_string_lossy())
+                ),
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         assert!(
             marker.exists(),
@@ -1112,11 +1351,22 @@ fn sync_pid_file_cleaned_up_after_sync() {
         let pid_dir = tempdir().expect("tempdir");
         let pid_file = pid_dir.path().join("test.pid");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--pid-file", pid_file.to_str().unwrap()])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                watch: &format!(
+                    "pid_file = {}\n",
+                    common::toml_string(&pid_file.to_string_lossy())
+                ),
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         assert!(
             !pid_file.exists(),
@@ -1142,21 +1392,18 @@ fn sync_bare_invocation_works_like_sync() {
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
+        let config_path = album_config(&cookie_dir, download_dir.path(), SyncToml::default());
 
         common::cmd()
             .args([
-                "--album",
-                album(),
-                "--unfiled",
-                "false",
                 "--username",
                 &username,
                 "--password",
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--download-dir",
-                download_dir.path().to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
                 "--no-progress-bar",
             ])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -1182,6 +1429,7 @@ fn sync_bare_invocation_works_like_sync() {
 #[ignore]
 fn sync_without_directory_fails() {
     let (username, password, cookie_dir) = common::require_preauth();
+    let config_path = common::write_toml_config(&cookie_dir, "sync-live-empty", "");
 
     common::cmd()
         .args([
@@ -1192,6 +1440,8 @@ fn sync_without_directory_fails() {
             &password,
             "--data-dir",
             cookie_dir.to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
             "--no-progress-bar",
         ])
         .timeout(Duration::from_secs(TIMEOUT_META))
@@ -1211,20 +1461,26 @@ fn sync_nonexistent_album_fails() {
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
+        let config_path = album_config(
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                filters: "albums = [\"ThisAlbumDefinitelyDoesNotExist999\"]\nunfiled = false\n",
+                ..SyncToml::default()
+            },
+        );
 
         common::cmd()
             .args([
                 "sync",
-                "--album",
-                "ThisAlbumDefinitelyDoesNotExist999",
                 "--username",
                 &username,
                 "--password",
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--download-dir",
-                download_dir.path().to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
                 "--no-progress-bar",
             ])
             .timeout(Duration::from_secs(TIMEOUT_META))
@@ -1241,20 +1497,23 @@ fn sync_nonexistent_library_fails() {
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
+        let body = format!(
+            "[download]\ndirectory = {}\n[filters]\nlibraries = [\"NonExistentLibrary-ZZZZZ\"]\n",
+            common::toml_string(&download_dir.path().to_string_lossy())
+        );
+        let config_path = common::write_toml_config(&cookie_dir, "sync-live", &body);
 
         common::cmd()
             .args([
                 "sync",
-                "--library",
-                "NonExistentLibrary-ZZZZZ",
                 "--username",
                 &username,
                 "--password",
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--download-dir",
-                download_dir.path().to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
                 "--no-progress-bar",
             ])
             .timeout(Duration::from_secs(TIMEOUT_META))
@@ -1321,6 +1580,7 @@ fn sync_retry_failed_flag() {
 
     common::with_auth_retry(|| {
         let download_dir = tempdir().expect("tempdir");
+        let config_path = config_for_download_dir(&cookie_dir, download_dir.path());
 
         // sync --retry-failed with no prior failures should succeed (noop)
         common::cmd()
@@ -1333,8 +1593,8 @@ fn sync_retry_failed_flag() {
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--download-dir",
-                download_dir.path().to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
                 "--no-progress-bar",
             ])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
@@ -1361,25 +1621,8 @@ fn sync_incremental_second_run_skips_download() {
         assert!(first_count >= 3, "first sync should download files");
 
         // Second sync: incremental.
-        let output = common::cmd()
-            .args([
-                "sync",
-                "--album",
-                album(),
-                "--unfiled",
-                "false",
-                "--username",
-                &username,
-                "--password",
-                &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-                "--download-dir",
-                download_dir.path().to_str().unwrap(),
-                "--no-progress-bar",
-                "--log-level",
-                "debug",
-            ])
+        let output = album_cmd(&username, &password, &cookie_dir, download_dir.path())
+            .args(["--log-level", "debug"])
             .timeout(Duration::from_secs(TIMEOUT_SECS))
             .output()
             .unwrap();
@@ -1421,25 +1664,27 @@ fn sync_watch_runs_multiple_cycles() {
         use std::time::Instant;
 
         let download_dir = tempdir().expect("tempdir");
+        let config_path = album_config(
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                watch: "interval = 60\n",
+                ..SyncToml::default()
+            },
+        );
         let bin = env!("CARGO_BIN_EXE_kei");
         let mut child = Command::new(bin)
             .args([
                 "sync",
-                "--album",
-                album(),
-                "--unfiled",
-                "false",
                 "--username",
                 &username,
                 "--password",
                 &password,
                 "--data-dir",
                 cookie_dir.to_str().unwrap(),
-                "--download-dir",
-                download_dir.path().to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
                 "--no-progress-bar",
-                "--watch-with-interval",
-                "60",
                 "--log-level",
                 "info",
             ])
@@ -1526,11 +1771,22 @@ fn sync_report_json_writes_valid_schema() {
         let report_dir = tempdir().expect("tempdir");
         let report_path = report_dir.path().join("report.json");
 
-        album_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--report-json", report_path.to_str().unwrap()])
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .assert()
-            .success();
+        album_cmd_with_toml(
+            &username,
+            &password,
+            &cookie_dir,
+            download_dir.path(),
+            SyncToml {
+                report: &format!(
+                    "json = {}\n",
+                    common::toml_string(&report_path.to_string_lossy())
+                ),
+                ..SyncToml::default()
+            },
+        )
+        .timeout(Duration::from_secs(TIMEOUT_SECS))
+        .assert()
+        .success();
 
         let body = std::fs::read_to_string(&report_path).expect("report file");
         let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
@@ -1676,6 +1932,7 @@ fn sync_truncated_file_does_not_cause_data_loss() {
 fn zz_bad_credentials_fails() {
     let cookie_dir = tempdir().expect("tempdir");
     let download_dir = tempdir().expect("tempdir");
+    let config_path = config_for_download_dir(cookie_dir.path(), download_dir.path());
 
     common::cmd()
         .env_remove("ICLOUD_USERNAME")
@@ -1688,8 +1945,8 @@ fn zz_bad_credentials_fails() {
             "wrong-password",
             "--data-dir",
             cookie_dir.path().to_str().unwrap(),
-            "--download-dir",
-            download_dir.path().to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
             "--no-progress-bar",
         ])
         .timeout(Duration::from_secs(60))

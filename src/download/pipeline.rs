@@ -1281,7 +1281,7 @@ where
             return Err(anyhow::anyhow!(
                 "Insufficient free disk space: only {} bytes available on {}, \
                  need at least {MIN_FREE_BYTES_HARD} bytes. Free up space or choose a \
-                 different --download-dir.",
+                 different [download] directory.",
                 free,
                 config.directory.display(),
             ));
@@ -2496,7 +2496,7 @@ fn maybe_warn_rate_limit_pressure(stats: &super::SyncStats) {
         tracing::warn!(
             rate_limit_observations = stats.rate_limited,
             "Observed HTTP 429/503 rate-limiting before any assets were enumerated — \
-             consider raising --watch-with-interval or lowering --threads"
+             consider raising [watch] interval or lowering [download] threads"
         );
         return;
     }
@@ -2507,7 +2507,7 @@ fn maybe_warn_rate_limit_pressure(stats: &super::SyncStats) {
             assets_seen = stats.assets_seen,
             percent = pct,
             "Observed HTTP 429/503 rate-limiting on >=10% of sync attempts — \
-             consider raising --watch-with-interval or lowering --threads \
+             consider raising [watch] interval or lowering [download] threads \
              to reduce sustained pressure on iCloud"
         );
     }

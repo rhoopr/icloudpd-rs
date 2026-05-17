@@ -75,7 +75,7 @@ current_phase="prereqs"
 
 # Live env exports (lib.sh + just both consult these)
 export ICLOUD_TEST_COOKIE_DIR="$repo_root/.test-cookies"
-export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
+export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-kei-test}"
 export KEI_DOCKER_IMAGE="${KEI_DOCKER_IMAGE:-kei:dev}"
 
 tp() { "$script_dir/time_phase.sh" "$@"; }

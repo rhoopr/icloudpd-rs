@@ -198,246 +198,31 @@ pub struct PasswordArgs {
 /// Arguments for the sync command (also used as default when no subcommand).
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
-    /// Local directory for downloads
-    #[arg(short = 'd', long = "download-dir", env = "KEI_DOWNLOAD_DIR", value_parser = non_empty_string)]
-    pub download_dir: Option<String>,
-
-    /// Album(s) to download. Repeatable; default `all` (every user-created
-    /// album, plus an unfiled pass for photos not in any album). Accepts a
-    /// literal name, the sentinels `all` / `none`, or `!name` to exclude.
-    /// Apple's smart folders like "Favorites" are skipped under `all`; use
-    /// `--smart-folder` to opt them in. `all` cannot be combined with
-    /// specific album names; mix exclusions instead (`--album all '!Foo'`).
-    #[arg(short = 'a', long = "album", env = "KEI_ALBUM", value_parser = non_empty_string)]
-    pub albums: Vec<String>,
-
-    /// Smart folder(s) to download. Repeatable; default `none` (smart folders
-    /// are skipped unless opted in). Accepts the same value grammar as
-    /// `--album`: a name, the sentinel `all` (every smart folder except
-    /// Hidden / Recently Deleted), `all-with-sensitive` (include those two),
-    /// `none`, or `!name` to exclude. Available names: Favorites, Videos,
-    /// Live, Panoramas, Screenshots, Bursts, Slo-mo, Time-lapse, Hidden,
-    /// Recently Deleted.
-    #[arg(long = "smart-folder", env = "KEI_SMART_FOLDER", value_parser = non_empty_string)]
-    pub smart_folders: Vec<String>,
-
-    /// Run a separate pass for photos not in any user album. Default: `true`.
-    /// Pass `--unfiled false` to skip the unfiled pass (e.g. when you only
-    /// want named album passes). Independent of `--album`: `--album Vacation`
-    /// still runs the unfiled pass unless this flag is explicitly disabled.
-    #[arg(long, env = "KEI_UNFILED", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub unfiled: Option<bool>,
-
-    /// Exclude files matching glob pattern(s) (e.g. "*.AAE", "Screenshot*")
-    #[arg(long = "filename-exclude", env = "KEI_FILENAME_EXCLUDE", value_delimiter = ',', value_parser = non_empty_string)]
-    pub filename_exclude: Vec<String>,
-
-    /// Library/libraries to download. Repeatable; default `primary` (the
-    /// PrimarySync zone). Accepts the same value grammar as `--album`: a
-    /// CloudKit zone name (full UUID or the truncated 8-char `SharedSync-`
-    /// prefix that `{library}` renders into paths), the sentinels
-    /// `primary` / `shared` / `all` / `none`, or `!name` to exclude.
-    #[arg(long = "library", env = "KEI_LIBRARY", value_parser = non_empty_string)]
-    pub libraries: Vec<String>,
-
-    /// Image size to download
-    #[arg(long, env = "KEI_SIZE", value_enum)]
-    pub size: Option<VersionSize>,
-
-    /// Live photo video size
-    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum)]
-    pub live_photo_size: Option<LivePhotoSize>,
-
     /// Number of recent photos to download (e.g. `--recent 100`) or a recency
     /// window in days (e.g. `--recent 30d`). Days form maps to
     /// `--skip-created-before` internally.
-    #[arg(long, env = "KEI_RECENT", value_parser = parse_recent_limit)]
+    #[arg(long, value_parser = parse_recent_limit)]
     pub recent: Option<RecentLimit>,
 
-    /// Number of concurrent download threads (default: 10)
-    #[arg(long = "threads", env = "KEI_THREADS", value_parser = clap::value_parser!(u16).range(1..=64))]
-    pub threads: Option<u16>,
-
-    /// Cap total download throughput across all concurrent downloads.
-    /// Accepts human-readable values: `10M` (10 MB/s), `500K` (500 KB/s),
-    /// `1Mi` (1 MiB/s), bare integer = bytes/s. When set without an explicit
-    /// `--threads`, concurrency defaults to 1 to avoid fragmenting the
-    /// capped pipe across many starved connections.
-    #[arg(long = "bandwidth-limit", env = "KEI_BANDWIDTH_LIMIT", value_parser = parse_bandwidth_limit)]
-    pub bandwidth_limit: Option<u64>,
-
-    /// Don't download videos (pass `false` to override config file)
-    #[arg(long, env = "KEI_SKIP_VIDEOS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub skip_videos: Option<bool>,
-
-    /// Don't download photos (pass `false` to override config file)
-    #[arg(long, env = "KEI_SKIP_PHOTOS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub skip_photos: Option<bool>,
-
-    /// Live photo handling: both, image-only, video-only, skip
-    #[arg(long, env = "KEI_LIVE_PHOTO_MODE", value_enum)]
-    pub live_photo_mode: Option<LivePhotoMode>,
-
-    /// Only download requested size (don't fall back to original)
-    #[arg(long, env = "KEI_FORCE_SIZE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub force_size: Option<bool>,
-
-    /// Folder structure for the unfiled pass (default `%Y/%m/%d`; pass
-    /// "none" for a flat layout). Album passes use
-    /// `--folder-structure-albums` (default `{album}`); smart-folder
-    /// passes use `--folder-structure-smart-folders` (default
-    /// `{smart-folder}`). Legacy `{album}` in this template auto-migrates
-    /// to `--folder-structure-albums` with a deprecation warning; that
-    /// compat path is removed in v0.20.
-    #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
-    pub folder_structure: Option<String>,
-
-    /// Folder structure used by every album pass. Default `{album}` (flat
-    /// per-album folders, no inherited date hierarchy). Set to e.g.
-    /// `"{album}/%Y/%m/%d"` to add a date hierarchy inside each album
-    /// folder.
-    #[arg(long, env = "KEI_FOLDER_STRUCTURE_ALBUMS")]
-    pub folder_structure_albums: Option<String>,
-
-    /// Folder structure used by every smart-folder pass. Default
-    /// `{smart-folder}` (flat per-smart-folder folders). Set to e.g.
-    /// `"{smart-folder}/%Y/%m/%d"` to add a date hierarchy.
-    #[arg(long, env = "KEI_FOLDER_STRUCTURE_SMART_FOLDERS")]
-    pub folder_structure_smart_folders: Option<String>,
-
-    /// Write `DateTimeOriginal` EXIF tag if missing
-    #[cfg(feature = "xmp")]
-    #[arg(long, env = "KEI_SET_EXIF_DATETIME", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub set_exif_datetime: Option<bool>,
-
-    /// Write EXIF `Rating` tag (0x4746) for favorited photos (1-5 scale)
-    #[cfg(feature = "xmp")]
-    #[arg(long, env = "KEI_SET_EXIF_RATING", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub set_exif_rating: Option<bool>,
-
-    /// Write EXIF GPS tags from iCloud location metadata (only when the file lacks GPS)
-    #[cfg(feature = "xmp")]
-    #[arg(long, env = "KEI_SET_EXIF_GPS", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub set_exif_gps: Option<bool>,
-
-    /// Write EXIF `ImageDescription` tag from iCloud description / title
-    #[cfg(feature = "xmp")]
-    #[arg(long, env = "KEI_SET_EXIF_DESCRIPTION", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub set_exif_description: Option<bool>,
-
-    /// Embed a full XMP packet (title, keywords, album memberships, people,
-    /// hidden/archived, media subtype, burst id) into downloaded media bytes
-    /// on supported formats (JPEG/HEIC/PNG/TIFF/MP4/MOV)
-    #[cfg(feature = "xmp")]
-    #[arg(long, env = "KEI_EMBED_XMP", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub embed_xmp: Option<bool>,
-
-    /// Write a `.xmp` sidecar file next to each downloaded media file with
-    /// every available metadata field
-    #[cfg(feature = "xmp")]
-    #[arg(long, env = "KEI_XMP_SIDECAR", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub xmp_sidecar: Option<bool>,
-
     /// Do not modify local system or iCloud
-    #[arg(long, conflicts_with = "watch_with_interval")]
+    #[arg(long)]
     pub dry_run: bool,
 
-    /// Run continuously, waiting N seconds between runs (60..=86400).
-    /// Resolution order: this flag > `[watch] interval` in TOML >
-    /// `KEI_WATCH_WITH_INTERVAL` env > unset (single-shot).
-    //
-    // No clap `env =` attribute on purpose. clap collapses env into the
-    // CLI tier, which would override TOML, but the docker image bakes
-    // `KEI_WATCH_WITH_INTERVAL=86400` as a default and we want a user's
-    // TOML to win. The env is parsed manually in `Config::build`.
-    // Regression: #293.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(60..=86400))]
-    pub watch_with_interval: Option<u64>,
-
     /// Disable progress bar
-    #[arg(long, env = "KEI_NO_PROGRESS_BAR", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
     pub no_progress_bar: Option<bool>,
 
-    /// Keep Unicode in filenames
-    #[arg(long, env = "KEI_KEEP_UNICODE_IN_FILENAMES", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub keep_unicode_in_filenames: Option<bool>,
-
-    /// Live photo MOV filename policy
-    #[arg(long, env = "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY", value_enum)]
-    pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-
-    /// RAW treatment policy
-    #[arg(long, env = "KEI_ALIGN_RAW", value_enum)]
-    pub align_raw: Option<RawTreatmentPolicy>,
-
-    /// File matching and dedup policy
-    #[arg(long, env = "KEI_FILE_MATCH_POLICY", value_enum)]
-    pub file_match_policy: Option<FileMatchPolicy>,
-
     /// Skip assets created before this ISO date or interval (e.g., 2025-01-02 or 20d)
-    #[arg(long, env = "KEI_SKIP_CREATED_BEFORE")]
+    #[arg(long)]
     pub skip_created_before: Option<String>,
 
     /// Skip assets created after this ISO date or interval (e.g., 2025-01-02 or 20d)
-    #[arg(long, env = "KEI_SKIP_CREATED_AFTER")]
+    #[arg(long)]
     pub skip_created_after: Option<String>,
 
     /// Only print filenames without downloading
-    #[arg(long, conflicts_with = "watch_with_interval")]
+    #[arg(long)]
     pub only_print_filenames: bool,
-
-    /// Max retries per download (default: 3, 0 = no retries, max: 100)
-    #[arg(long, env = "KEI_MAX_RETRIES", value_parser = clap::value_parser!(u32).range(0..=100))]
-    pub max_retries: Option<u32>,
-
-    /// Temp file suffix for partial downloads (default: .kei-tmp).
-    /// Change if the default conflicts with your filesystem (e.g. Nextcloud rejects .part).
-    #[arg(long, env = "KEI_TEMP_SUFFIX")]
-    pub temp_suffix: Option<String>,
-
-    /// Send systemd `sd_notify` messages (READY, STOPPING, STATUS).
-    /// Auto-detected via `NOTIFY_SOCKET` under `Type=notify` units; pass
-    /// `--notify-systemd=false` to suppress even then.
-    #[arg(long, env = "KEI_NOTIFY_SYSTEMD", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub notify_systemd: Option<bool>,
-
-    /// Write PID to file (for service managers).
-    #[arg(long, env = "KEI_PID_FILE")]
-    pub pid_file: Option<std::path::PathBuf>,
-
-    /// Run a periodic local-vs-state reconciliation walk every Nth watch
-    /// cycle (1 = every cycle, 24 = daily on hourly cycles). Read-only:
-    /// reports missing files via `tracing::warn!` and never auto-marks
-    /// failed in the state DB. Only meaningful with `--watch-with-interval`;
-    /// ignored in single-shot mode. Also configurable via
-    /// `[watch] reconcile_every_n_cycles` in TOML (CLI takes precedence).
-    #[arg(long, env = "KEI_RECONCILE_EVERY_N_CYCLES", value_parser = clap::value_parser!(u64).range(1..))]
-    pub reconcile_every_n_cycles: Option<u64>,
-
-    /// Script to run on events: 2FA required, sync started/complete/failed, session expired.
-    /// Called with `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME` env vars.
-    /// Fire-and-forget: script failures are logged at warn! but never block
-    /// the sync or affect the exit code. Unix only: ignored with a warning on Windows.
-    #[arg(long, env = "KEI_NOTIFICATION_SCRIPT")]
-    pub notification_script: Option<String>,
-
-    /// Write a JSON run report to this path after each sync cycle.
-    /// Also configurable via `[report] json = "..."` in the TOML config.
-    /// In watch mode the file is overwritten every cycle - it reflects the
-    /// most recent cycle only, not a history log. Atomic write (temp + rename).
-    #[arg(long, env = "KEI_REPORT_JSON")]
-    pub report_json: Option<std::path::PathBuf>,
-
-    /// Port for the always-on HTTP server that serves `/healthz` and `/metrics` (default: 9090).
-    /// Set `KEI_HTTP_PORT` to override via environment.
-    #[arg(long, env = "KEI_HTTP_PORT", value_parser = clap::value_parser!(u16).range(1..))]
-    pub http_port: Option<u16>,
-
-    /// Bind address for the HTTP server (default: 0.0.0.0 - all interfaces).
-    /// Set to `127.0.0.1` to restrict to loopback only (desktop use). Also configurable
-    /// via `[server] bind` in TOML. Accepts any IPv4 or IPv6 address.
-    #[arg(long, env = "KEI_HTTP_BIND")]
-    pub http_bind: Option<std::net::IpAddr>,
 
     /// After successful auth, persist the password to the credential store
     /// (OS keyring or encrypted file).
@@ -445,11 +230,93 @@ pub struct SyncArgs {
     pub save_password: bool,
 
     /// Re-sync only previously failed assets
-    #[arg(long, conflicts_with_all = ["dry_run", "watch_with_interval"])]
+    #[arg(long, conflicts_with = "dry_run")]
     pub retry_failed: bool,
 
-    /// Maximum download attempts per asset before skipping (default: 10)
-    #[arg(long, env = "KEI_MAX_DOWNLOAD_ATTEMPTS")]
+    // Durable sync settings are TOML-only in v0.20. These skipped fields keep
+    // internal resolver tests and programmatic call sites able to construct
+    // non-default configs without re-exposing the old public CLI/env mirrors.
+    #[arg(skip)]
+    pub download_dir: Option<String>,
+    #[arg(skip)]
+    pub albums: Vec<String>,
+    #[arg(skip)]
+    pub smart_folders: Vec<String>,
+    #[arg(skip)]
+    pub unfiled: Option<bool>,
+    #[arg(skip)]
+    pub filename_exclude: Vec<String>,
+    #[arg(skip)]
+    pub libraries: Vec<String>,
+    #[arg(skip)]
+    pub size: Option<VersionSize>,
+    #[arg(skip)]
+    pub live_photo_size: Option<LivePhotoSize>,
+    #[arg(skip)]
+    pub threads: Option<u16>,
+    #[arg(skip)]
+    pub bandwidth_limit: Option<u64>,
+    #[arg(skip)]
+    pub skip_videos: Option<bool>,
+    #[arg(skip)]
+    pub skip_photos: Option<bool>,
+    #[arg(skip)]
+    pub live_photo_mode: Option<LivePhotoMode>,
+    #[arg(skip)]
+    pub force_size: Option<bool>,
+    #[arg(skip)]
+    pub folder_structure: Option<String>,
+    #[arg(skip)]
+    pub folder_structure_albums: Option<String>,
+    #[arg(skip)]
+    pub folder_structure_smart_folders: Option<String>,
+    #[cfg(feature = "xmp")]
+    #[arg(skip)]
+    pub set_exif_datetime: Option<bool>,
+    #[cfg(feature = "xmp")]
+    #[arg(skip)]
+    pub set_exif_rating: Option<bool>,
+    #[cfg(feature = "xmp")]
+    #[arg(skip)]
+    pub set_exif_gps: Option<bool>,
+    #[cfg(feature = "xmp")]
+    #[arg(skip)]
+    pub set_exif_description: Option<bool>,
+    #[cfg(feature = "xmp")]
+    #[arg(skip)]
+    pub embed_xmp: Option<bool>,
+    #[cfg(feature = "xmp")]
+    #[arg(skip)]
+    pub xmp_sidecar: Option<bool>,
+    #[arg(skip)]
+    pub watch_with_interval: Option<u64>,
+    #[arg(skip)]
+    pub keep_unicode_in_filenames: Option<bool>,
+    #[arg(skip)]
+    pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
+    #[arg(skip)]
+    pub align_raw: Option<RawTreatmentPolicy>,
+    #[arg(skip)]
+    pub file_match_policy: Option<FileMatchPolicy>,
+    #[arg(skip)]
+    pub max_retries: Option<u32>,
+    #[arg(skip)]
+    pub temp_suffix: Option<String>,
+    #[arg(skip)]
+    pub notify_systemd: Option<bool>,
+    #[arg(skip)]
+    pub pid_file: Option<std::path::PathBuf>,
+    #[arg(skip)]
+    pub reconcile_every_n_cycles: Option<u64>,
+    #[arg(skip)]
+    pub notification_script: Option<String>,
+    #[arg(skip)]
+    pub report_json: Option<std::path::PathBuf>,
+    #[arg(skip)]
+    pub http_port: Option<u16>,
+    #[arg(skip)]
+    pub http_bind: Option<std::net::IpAddr>,
+    #[arg(skip)]
     pub max_download_attempts: Option<u32>,
 }
 
@@ -478,7 +345,7 @@ pub struct ImportArgs {
     pub password: PasswordArgs,
 
     /// Library/libraries to import. Repeatable; default `primary`. Same value
-    /// grammar as `kei sync --library`: a CloudKit zone name (full UUID or
+    /// grammar as `[filters].libraries`: a CloudKit zone name (full UUID or
     /// the truncated 8-char `SharedSync-` prefix that `{library}` renders
     /// into paths), the sentinels `primary` / `shared` / `all` / `none`, or
     /// `!name` to exclude.
@@ -747,7 +614,7 @@ pub enum Command {
 
         /// Library/libraries to list albums from. Repeatable; default
         /// `primary` (the PrimarySync zone). Same value grammar as
-        /// `kei sync --library`: a CloudKit zone name (full UUID or the
+        /// `[filters].libraries`: a CloudKit zone name (full UUID or the
         /// truncated 8-char `SharedSync-` prefix that `{library}` renders
         /// into paths), the sentinels `primary` / `shared` / `all` /
         /// `none`, or `!name` to exclude. Only consulted by
@@ -849,7 +716,7 @@ pub struct Cli {
         env = "KEI_FRIENDLY",
         long_help = "Use friendly progress UI (verb-cycling spinners, curated phase narration, summary card, sign-off). \
                      Default: on for plain TTYs, off in service/container/journal contexts and whenever a \
-                     machine-output flag (`--report-json`, `--only-print-filenames`) or an explicit \
+                     machine-output mode (`--only-print-filenames` or TOML report JSON) or an explicit \
                      `--log-level` / `RUST_LOG` is in play. `--friendly` overrides the TOML `[ui] friendly` \
                      setting and the auto-detected default; environmental hard-off contexts still win."
     )]
@@ -903,92 +770,12 @@ impl SyncArgs {
     /// Merge top-level (fallback) sync args into self.
     /// Subcommand values take precedence; top-level fills in gaps.
     fn merge_from(&mut self, fallback: &Self) {
-        if self.download_dir.is_none() {
-            self.download_dir.clone_from(&fallback.download_dir);
-        }
-        if self.albums.is_empty() {
-            self.albums.clone_from(&fallback.albums);
-        }
-        if self.libraries.is_empty() {
-            self.libraries.clone_from(&fallback.libraries);
-        }
-        if self.size.is_none() {
-            self.size = fallback.size;
-        }
-        if self.live_photo_size.is_none() {
-            self.live_photo_size = fallback.live_photo_size;
-        }
         if self.recent.is_none() {
             self.recent = fallback.recent;
         }
-        if self.threads.is_none() {
-            self.threads = fallback.threads;
-        }
-        if self.bandwidth_limit.is_none() {
-            self.bandwidth_limit = fallback.bandwidth_limit;
-        }
-        if self.unfiled.is_none() {
-            self.unfiled = fallback.unfiled;
-        }
-        if self.skip_videos.is_none() {
-            self.skip_videos = fallback.skip_videos;
-        }
-        if self.skip_photos.is_none() {
-            self.skip_photos = fallback.skip_photos;
-        }
-        if self.force_size.is_none() {
-            self.force_size = fallback.force_size;
-        }
-        if self.folder_structure.is_none() {
-            self.folder_structure.clone_from(&fallback.folder_structure);
-        }
-        if self.folder_structure_albums.is_none() {
-            self.folder_structure_albums
-                .clone_from(&fallback.folder_structure_albums);
-        }
-        if self.folder_structure_smart_folders.is_none() {
-            self.folder_structure_smart_folders
-                .clone_from(&fallback.folder_structure_smart_folders);
-        }
-        #[cfg(feature = "xmp")]
-        {
-            if self.set_exif_datetime.is_none() {
-                self.set_exif_datetime = fallback.set_exif_datetime;
-            }
-            if self.set_exif_rating.is_none() {
-                self.set_exif_rating = fallback.set_exif_rating;
-            }
-            if self.set_exif_gps.is_none() {
-                self.set_exif_gps = fallback.set_exif_gps;
-            }
-            if self.set_exif_description.is_none() {
-                self.set_exif_description = fallback.set_exif_description;
-            }
-            if self.embed_xmp.is_none() {
-                self.embed_xmp = fallback.embed_xmp;
-            }
-            if self.xmp_sidecar.is_none() {
-                self.xmp_sidecar = fallback.xmp_sidecar;
-            }
-        }
         self.dry_run = self.dry_run || fallback.dry_run;
-        if self.watch_with_interval.is_none() {
-            self.watch_with_interval = fallback.watch_with_interval;
-        }
         if self.no_progress_bar.is_none() {
             self.no_progress_bar = fallback.no_progress_bar;
-        }
-        if self.keep_unicode_in_filenames.is_none() {
-            self.keep_unicode_in_filenames = fallback.keep_unicode_in_filenames;
-        }
-        if self.live_photo_mov_filename_policy.is_none() {
-            self.live_photo_mov_filename_policy = fallback.live_photo_mov_filename_policy;
-        }
-        if self.align_raw.is_none() {
-            self.align_raw = fallback.align_raw;
-        }
-        if self.file_match_policy.is_none() {
-            self.file_match_policy = fallback.file_match_policy;
         }
         if self.skip_created_before.is_none() {
             self.skip_created_before
@@ -999,28 +786,6 @@ impl SyncArgs {
                 .clone_from(&fallback.skip_created_after);
         }
         self.only_print_filenames = self.only_print_filenames || fallback.only_print_filenames;
-        if self.max_retries.is_none() {
-            self.max_retries = fallback.max_retries;
-        }
-        if self.temp_suffix.is_none() {
-            self.temp_suffix.clone_from(&fallback.temp_suffix);
-        }
-        if self.notify_systemd.is_none() {
-            self.notify_systemd = fallback.notify_systemd;
-        }
-        if self.pid_file.is_none() {
-            self.pid_file.clone_from(&fallback.pid_file);
-        }
-        if self.reconcile_every_n_cycles.is_none() {
-            self.reconcile_every_n_cycles = fallback.reconcile_every_n_cycles;
-        }
-        if self.notification_script.is_none() {
-            self.notification_script
-                .clone_from(&fallback.notification_script);
-        }
-        if self.report_json.is_none() {
-            self.report_json.clone_from(&fallback.report_json);
-        }
         self.save_password = self.save_password || fallback.save_password;
         self.retry_failed = self.retry_failed || fallback.retry_failed;
     }
@@ -1167,101 +932,14 @@ fn subcommand_display_name(cmd: &Command) -> &'static str {
 fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str> {
     use clap::parser::ValueSource;
     let mut out = Vec::new();
-    if matches.value_source("download_dir") == Some(ValueSource::CommandLine) {
-        out.push("--download-dir");
-    }
-    if matches.value_source("albums") == Some(ValueSource::CommandLine) {
-        out.push("--album");
-    }
-    if matches.value_source("smart_folders") == Some(ValueSource::CommandLine) {
-        out.push("--smart-folder");
-    }
-    if matches.value_source("unfiled") == Some(ValueSource::CommandLine) {
-        out.push("--unfiled");
-    }
-    if matches.value_source("filename_exclude") == Some(ValueSource::CommandLine) {
-        out.push("--filename-exclude");
-    }
-    if matches.value_source("libraries") == Some(ValueSource::CommandLine) {
-        out.push("--library");
-    }
-    if matches.value_source("size") == Some(ValueSource::CommandLine) {
-        out.push("--size");
-    }
-    if matches.value_source("live_photo_size") == Some(ValueSource::CommandLine) {
-        out.push("--live-photo-size");
-    }
     if matches.value_source("recent") == Some(ValueSource::CommandLine) {
         out.push("--recent");
-    }
-    if matches.value_source("threads") == Some(ValueSource::CommandLine) {
-        out.push("--threads");
-    }
-    if matches.value_source("bandwidth_limit") == Some(ValueSource::CommandLine) {
-        out.push("--bandwidth-limit");
-    }
-    if matches.value_source("skip_videos") == Some(ValueSource::CommandLine) {
-        out.push("--skip-videos");
-    }
-    if matches.value_source("skip_photos") == Some(ValueSource::CommandLine) {
-        out.push("--skip-photos");
-    }
-    if matches.value_source("live_photo_mode") == Some(ValueSource::CommandLine) {
-        out.push("--live-photo-mode");
-    }
-    if matches.value_source("force_size") == Some(ValueSource::CommandLine) {
-        out.push("--force-size");
-    }
-    if matches.value_source("folder_structure") == Some(ValueSource::CommandLine) {
-        out.push("--folder-structure");
-    }
-    if matches.value_source("folder_structure_albums") == Some(ValueSource::CommandLine) {
-        out.push("--folder-structure-albums");
-    }
-    if matches.value_source("folder_structure_smart_folders") == Some(ValueSource::CommandLine) {
-        out.push("--folder-structure-smart-folders");
-    }
-    #[cfg(feature = "xmp")]
-    {
-        if matches.value_source("set_exif_datetime") == Some(ValueSource::CommandLine) {
-            out.push("--set-exif-datetime");
-        }
-        if matches.value_source("set_exif_rating") == Some(ValueSource::CommandLine) {
-            out.push("--set-exif-rating");
-        }
-        if matches.value_source("set_exif_gps") == Some(ValueSource::CommandLine) {
-            out.push("--set-exif-gps");
-        }
-        if matches.value_source("set_exif_description") == Some(ValueSource::CommandLine) {
-            out.push("--set-exif-description");
-        }
-        if matches.value_source("embed_xmp") == Some(ValueSource::CommandLine) {
-            out.push("--embed-xmp");
-        }
-        if matches.value_source("xmp_sidecar") == Some(ValueSource::CommandLine) {
-            out.push("--xmp-sidecar");
-        }
     }
     if matches.value_source("dry_run") == Some(ValueSource::CommandLine) {
         out.push("--dry-run");
     }
-    if matches.value_source("watch_with_interval") == Some(ValueSource::CommandLine) {
-        out.push("--watch-with-interval");
-    }
     if matches.value_source("no_progress_bar") == Some(ValueSource::CommandLine) {
         out.push("--no-progress-bar");
-    }
-    if matches.value_source("keep_unicode_in_filenames") == Some(ValueSource::CommandLine) {
-        out.push("--keep-unicode-in-filenames");
-    }
-    if matches.value_source("live_photo_mov_filename_policy") == Some(ValueSource::CommandLine) {
-        out.push("--live-photo-mov-filename-policy");
-    }
-    if matches.value_source("align_raw") == Some(ValueSource::CommandLine) {
-        out.push("--align-raw");
-    }
-    if matches.value_source("file_match_policy") == Some(ValueSource::CommandLine) {
-        out.push("--file-match-policy");
     }
     if matches.value_source("skip_created_before") == Some(ValueSource::CommandLine) {
         out.push("--skip-created-before");
@@ -1272,41 +950,11 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     if matches.value_source("only_print_filenames") == Some(ValueSource::CommandLine) {
         out.push("--only-print-filenames");
     }
-    if matches.value_source("max_retries") == Some(ValueSource::CommandLine) {
-        out.push("--max-retries");
-    }
-    if matches.value_source("temp_suffix") == Some(ValueSource::CommandLine) {
-        out.push("--temp-suffix");
-    }
-    if matches.value_source("notify_systemd") == Some(ValueSource::CommandLine) {
-        out.push("--notify-systemd");
-    }
-    if matches.value_source("pid_file") == Some(ValueSource::CommandLine) {
-        out.push("--pid-file");
-    }
-    if matches.value_source("reconcile_every_n_cycles") == Some(ValueSource::CommandLine) {
-        out.push("--reconcile-every-n-cycles");
-    }
-    if matches.value_source("notification_script") == Some(ValueSource::CommandLine) {
-        out.push("--notification-script");
-    }
-    if matches.value_source("report_json") == Some(ValueSource::CommandLine) {
-        out.push("--report-json");
-    }
-    if matches.value_source("http_port") == Some(ValueSource::CommandLine) {
-        out.push("--http-port");
-    }
-    if matches.value_source("http_bind") == Some(ValueSource::CommandLine) {
-        out.push("--http-bind");
-    }
     if matches.value_source("save_password") == Some(ValueSource::CommandLine) {
         out.push("--save-password");
     }
     if matches.value_source("retry_failed") == Some(ValueSource::CommandLine) {
         out.push("--retry-failed");
-    }
-    if matches.value_source("max_download_attempts") == Some(ValueSource::CommandLine) {
-        out.push("--max-download-attempts");
     }
     out
 }
@@ -1408,6 +1056,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).unwrap()
+    }
+
+    fn assert_removed_sync_flag(args: &[&str]) {
+        let err = Cli::try_parse_from(args).expect_err("removed sync flag must fail to parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    fn assert_removed_sync_option(tail: &[&str]) {
+        let mut args = vec!["kei", "--username", "test@example.com"];
+        args.extend_from_slice(tail);
+        assert_removed_sync_flag(&args);
     }
 
     /// Parse argv into a `Cli` and compute the explicit sync flags list.
@@ -1630,24 +1289,9 @@ mod tests {
         assert!(cli.username.is_none());
         assert!(cli.command.is_none());
     }
-
     #[test]
     fn test_backwards_compatibility_no_subcommand() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "--username",
-            "test@example.com",
-            "--download-dir",
-            "/photos",
-        ])
-        .unwrap();
-        assert!(cli.command.is_none());
-        match cli.effective_command() {
-            Command::Sync { sync, .. } => {
-                assert_eq!(sync.download_dir, Some("/photos".to_string()));
-            }
-            _ => panic!("Expected Sync command"),
-        }
+        assert_removed_sync_option(&["--download-dir", "/photos"]);
     }
 
     // ── New subcommands ───────────────────────────────────────────
@@ -1854,48 +1498,19 @@ mod tests {
             _ => panic!("Expected Config Setup"),
         }
     }
-
     #[test]
     fn test_sync_retry_failed_flag() {
-        let cli =
-            Cli::try_parse_from(["kei", "sync", "--retry-failed", "--download-dir", "/photos"])
-                .unwrap();
-        match cli.effective_command() {
-            Command::Sync { sync, .. } => assert!(sync.retry_failed),
-            _ => panic!("Expected Sync"),
-        }
+        assert_removed_sync_flag(&["kei", "sync", "--retry-failed", "--download-dir", "/photos"]);
     }
 
     // ── Legacy subcommand compat ──────────────────────────────────
-
     #[test]
     fn test_max_download_attempts_cli_parse() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "sync",
-            "--max-download-attempts",
-            "5",
-            "--download-dir",
-            "/photos",
-        ])
-        .unwrap();
-        match cli.effective_command() {
-            Command::Sync { sync, .. } => {
-                assert_eq!(sync.max_download_attempts, Some(5));
-            }
-            _ => panic!("Expected Sync"),
-        }
+        assert_removed_sync_flag(&["kei", "sync", "--max-download-attempts", "5"]);
     }
-
     #[test]
     fn test_max_download_attempts_defaults_to_none() {
-        let cli = Cli::try_parse_from(["kei", "sync", "--download-dir", "/photos"]).unwrap();
-        match cli.effective_command() {
-            Command::Sync { sync, .. } => {
-                assert_eq!(sync.max_download_attempts, None);
-            }
-            _ => panic!("Expected Sync"),
-        }
+        assert_removed_sync_flag(&["kei", "sync", "--max-download-attempts", "5"]);
     }
 
     #[test]
@@ -1975,59 +1590,26 @@ mod tests {
     }
 
     // ── Sync args ─────────────────────────────────────────────────
-
     #[test]
     fn test_library_accepts_custom_value() {
-        let mut args = base_args();
-        args.extend(["--library", "SharedSync-ABCD1234"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.libraries, vec!["SharedSync-ABCD1234".to_string()]);
+        assert_removed_sync_flag(&["kei", "--library", "SharedSync-ABCD1234"]);
     }
-
     #[test]
     fn test_library_repeatable_with_sentinels() {
-        let mut args = base_args();
-        args.extend([
-            "--library",
-            "primary",
-            "--library",
-            "shared",
-            "--library",
-            "!SharedSync-ABCD1234",
-        ]);
-        let cli = parse(&args);
-        assert_eq!(
-            cli.sync.libraries,
-            vec![
-                "primary".to_string(),
-                "shared".to_string(),
-                "!SharedSync-ABCD1234".to_string(),
-            ]
-        );
+        assert_removed_sync_flag(&["kei", "--library", "primary", "--library", "shared"]);
     }
-
     #[test]
     fn test_bandwidth_limit_bare_bytes() {
-        let mut args = base_args();
-        args.extend(["--bandwidth-limit", "1500000"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.bandwidth_limit, Some(1_500_000));
+        assert_removed_sync_option(&["--bandwidth-limit", "1024"]);
     }
-
     #[test]
     fn test_bandwidth_limit_decimal_suffixes() {
-        let mut args = base_args();
-        args.extend(["--bandwidth-limit", "10M"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.bandwidth_limit, Some(10_000_000));
+        assert_removed_sync_option(&["--bandwidth-limit", "1.5M"]);
     }
 
     #[test]
     fn test_bandwidth_limit_binary_suffix() {
-        let mut args = base_args();
-        args.extend(["--bandwidth-limit", "2Mi"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.bandwidth_limit, Some(2 * 1024 * 1024));
+        assert_removed_sync_option(&["--bandwidth-limit", "2Mi"]);
     }
 
     #[test]
@@ -2110,37 +1692,21 @@ mod tests {
         assert!(parse_bandwidth_limit("infM").is_err());
         assert!(parse_bandwidth_limit("inf").is_err());
     }
-
     #[test]
     fn test_max_retries_custom() {
-        let mut args = base_args();
-        args.extend(["--max-retries", "10"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.max_retries, Some(10));
+        assert_removed_sync_option(&["--max-retries", "10"]);
     }
-
     #[test]
     fn test_max_retries_zero_disables() {
-        let mut args = base_args();
-        args.extend(["--max-retries", "0"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.max_retries, Some(0));
+        assert_removed_sync_option(&["--max-retries", "0"]);
     }
-
     #[test]
     fn test_temp_suffix_custom() {
-        let mut args = base_args();
-        args.extend(["--temp-suffix", ".downloading"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.temp_suffix.as_deref(), Some(".downloading"));
+        assert_removed_sync_option(&["--temp-suffix", ".downloading"]);
     }
-
     #[test]
     fn test_skip_videos_flag() {
-        let mut args = base_args();
-        args.push("--skip-videos");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.skip_videos, Some(true));
+        assert_removed_sync_option(&["--skip-videos"]);
     }
 
     #[test]
@@ -2148,89 +1714,51 @@ mod tests {
         let cli = parse(&base_args());
         assert_eq!(cli.sync.unfiled, None);
     }
-
     #[test]
     fn test_unfiled_flag_bare_true() {
-        let mut args = base_args();
-        args.push("--unfiled");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.unfiled, Some(true));
+        assert_removed_sync_option(&["--unfiled"]);
     }
-
     #[test]
     fn test_unfiled_flag_explicit_false() {
-        let mut args = base_args();
-        args.extend(["--unfiled", "false"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.unfiled, Some(false));
+        assert_removed_sync_option(&["--unfiled", "false"]);
     }
 
     #[test]
     fn test_unfiled_flag_explicit_true() {
-        let mut args = base_args();
-        args.extend(["--unfiled", "true"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.unfiled, Some(true));
+        assert_removed_sync_option(&["--unfiled", "true"]);
     }
 
     #[test]
     fn test_skip_videos_explicit_false() {
-        let mut args = base_args();
-        args.extend(["--skip-videos", "false"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.skip_videos, Some(false));
+        assert_removed_sync_option(&["--skip-videos", "false"]);
     }
-
     #[test]
     fn test_skip_photos_flag() {
-        let mut args = base_args();
-        args.push("--skip-photos");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.skip_photos, Some(true));
+        assert_removed_sync_option(&["--skip-photos"]);
     }
-
     #[test]
     fn test_force_size_flag() {
-        let mut args = base_args();
-        args.push("--force-size");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.force_size, Some(true));
+        assert_removed_sync_option(&["--force-size"]);
     }
-
     #[cfg(feature = "xmp")]
     #[test]
     fn test_set_exif_datetime_flag() {
-        let mut args = base_args();
-        args.push("--set-exif-datetime");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.set_exif_datetime, Some(true));
+        assert_removed_sync_option(&["--set-exif-datetime"]);
     }
-
     #[cfg(feature = "xmp")]
     #[test]
     fn test_embed_xmp_flag() {
-        let mut args = base_args();
-        args.push("--embed-xmp");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.embed_xmp, Some(true));
+        assert_removed_sync_option(&["--embed-xmp"]);
     }
-
     #[cfg(feature = "xmp")]
     #[test]
     fn test_embed_xmp_flag_explicit_false() {
-        let mut args = base_args();
-        args.push("--embed-xmp=false");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.embed_xmp, Some(false));
+        assert_removed_sync_option(&["--embed-xmp=false"]);
     }
-
     #[cfg(feature = "xmp")]
     #[test]
     fn test_xmp_sidecar_flag() {
-        let mut args = base_args();
-        args.push("--xmp-sidecar");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.xmp_sidecar, Some(true));
+        assert_removed_sync_option(&["--xmp-sidecar"]);
     }
 
     #[test]
@@ -2240,40 +1768,21 @@ mod tests {
         let cli = parse(&args);
         assert_eq!(cli.sync.no_progress_bar, Some(true));
     }
-
     #[test]
     fn test_keep_unicode_in_filenames_flag() {
-        let mut args = base_args();
-        args.push("--keep-unicode-in-filenames");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.keep_unicode_in_filenames, Some(true));
+        assert_removed_sync_option(&["--keep-unicode-in-filenames"]);
     }
-
     #[test]
     fn test_notify_systemd_flag() {
-        let mut args = base_args();
-        args.push("--notify-systemd");
-        let cli = parse(&args);
-        assert_eq!(cli.sync.notify_systemd, Some(true));
+        assert_removed_sync_option(&["--notify-systemd"]);
     }
-
     #[test]
     fn test_pid_file_flag() {
-        let mut args = base_args();
-        args.extend(["--pid-file", "/tmp/claude/test.pid"]);
-        let cli = parse(&args);
-        assert_eq!(
-            cli.sync.pid_file,
-            Some(std::path::PathBuf::from("/tmp/claude/test.pid"))
-        );
+        assert_removed_sync_option(&["--pid-file", "/tmp/kei.pid"]);
     }
-
     #[test]
     fn test_reconcile_every_n_cycles_flag() {
-        let mut args = base_args();
-        args.extend(["--reconcile-every-n-cycles", "24"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.reconcile_every_n_cycles, Some(24));
+        assert_removed_sync_option(&["--reconcile-every-n-cycles", "24"]);
     }
 
     #[test]
@@ -2287,108 +1796,33 @@ mod tests {
     // non-numeric also fails clap's range parser.
     #[test]
     fn test_reconcile_every_n_cycles_rejects_zero() {
-        let mut args = base_args();
-        args.extend(["--reconcile-every-n-cycles", "0"]);
-        let err = Cli::try_parse_from(&args).unwrap_err();
-        assert!(
-            err.to_string().contains("not in")
-                || err.to_string().contains("range")
-                || err.to_string().contains("invalid value"),
-            "expected range/parse error, got: {err}"
-        );
+        assert_removed_sync_option(&["--reconcile-every-n-cycles", "0"]);
     }
-
     #[test]
     fn test_notification_script_flag() {
-        let mut args = base_args();
-        args.extend(["--notification-script", "/path/to/notify.sh"]);
-        let cli = parse(&args);
-        assert_eq!(
-            cli.sync.notification_script.as_deref(),
-            Some("/path/to/notify.sh")
-        );
+        assert_removed_sync_option(&["--notification-script", "/tmp/notify.sh"]);
     }
-
     #[test]
     fn test_report_json_flag() {
-        let mut args = base_args();
-        args.extend(["--report-json", "/tmp/report.json"]);
-        let cli = parse(&args);
-        assert_eq!(
-            cli.sync.report_json.as_deref(),
-            Some(std::path::Path::new("/tmp/report.json"))
-        );
+        assert_removed_sync_option(&["--report-json", "/tmp/run.json"]);
     }
 
     // ── Enum variants ──────────────────────────────────────────────
-
     #[test]
     fn test_size_all_variants() {
-        for (input, expected) in [
-            ("original", VersionSize::Original),
-            ("medium", VersionSize::Medium),
-            ("thumb", VersionSize::Thumb),
-            ("adjusted", VersionSize::Adjusted),
-            ("alternative", VersionSize::Alternative),
-        ] {
-            let mut args = base_args();
-            args.extend(["--size", input]);
-            let cli = parse(&args);
-            assert_eq!(cli.sync.size, Some(expected), "size variant: {input}");
-        }
+        assert_removed_sync_option(&["--size", "medium"]);
     }
-
     #[test]
     fn test_live_photo_size_all_variants() {
-        for (input, expected) in [
-            ("original", LivePhotoSize::Original),
-            ("medium", LivePhotoSize::Medium),
-            ("thumb", LivePhotoSize::Thumb),
-        ] {
-            let mut args = base_args();
-            args.extend(["--live-photo-size", input]);
-            let cli = parse(&args);
-            assert_eq!(
-                cli.sync.live_photo_size,
-                Some(expected),
-                "live_photo_size variant: {input}"
-            );
-        }
+        assert_removed_sync_option(&["--live-photo-size", "medium"]);
     }
-
     #[test]
     fn test_live_photo_mov_filename_policy_all_variants() {
-        for (input, expected) in [
-            ("suffix", LivePhotoMovFilenamePolicy::Suffix),
-            ("original", LivePhotoMovFilenamePolicy::Original),
-        ] {
-            let mut args = base_args();
-            args.extend(["--live-photo-mov-filename-policy", input]);
-            let cli = parse(&args);
-            assert_eq!(
-                cli.sync.live_photo_mov_filename_policy,
-                Some(expected),
-                "mov policy variant: {input}"
-            );
-        }
+        assert_removed_sync_option(&["--live-photo-mov-filename-policy", "original"]);
     }
-
     #[test]
     fn test_align_raw_all_variants() {
-        for (input, expected) in [
-            ("as-is", RawTreatmentPolicy::Unchanged),
-            ("original", RawTreatmentPolicy::PreferOriginal),
-            ("alternative", RawTreatmentPolicy::PreferAlternative),
-        ] {
-            let mut args = base_args();
-            args.extend(["--align-raw", input]);
-            let cli = parse(&args);
-            assert_eq!(
-                cli.sync.align_raw,
-                Some(expected),
-                "align_raw variant: {input}"
-            );
-        }
+        assert_removed_sync_option(&["--align-raw", "prefer-original"]);
     }
 
     #[test]
@@ -2397,25 +1831,9 @@ mod tests {
         args.extend(["--align-raw", "bogus"]);
         assert!(Cli::try_parse_from(&args).is_err());
     }
-
     #[test]
     fn test_file_match_policy_all_variants() {
-        for (input, expected) in [
-            (
-                "name-size-dedup-with-suffix",
-                FileMatchPolicy::NameSizeDedupWithSuffix,
-            ),
-            ("name-id7", FileMatchPolicy::NameId7),
-        ] {
-            let mut args = base_args();
-            args.extend(["--file-match-policy", input]);
-            let cli = parse(&args);
-            assert_eq!(
-                cli.sync.file_match_policy,
-                Some(expected),
-                "file_match_policy variant: {input}"
-            );
-        }
+        assert_removed_sync_option(&["--file-match-policy", "name-id7"]);
     }
 
     #[test]
@@ -2434,56 +1852,25 @@ mod tests {
     }
 
     // ── Optional value flags ───────────────────────────────────────
-
     #[test]
     fn test_folder_structure_custom() {
-        let mut args = base_args();
-        args.extend(["--folder-structure", "%Y-%m"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.folder_structure.as_deref(), Some("%Y-%m"));
+        assert_removed_sync_option(&["--folder-structure", "%Y-%m"]);
     }
-
     #[test]
     fn test_download_dir_custom() {
-        let mut args = base_args();
-        args.extend(["--download-dir", "/photos"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.download_dir.as_deref(), Some("/photos"));
+        assert_removed_sync_option(&["--download-dir", "/photos"]);
     }
-
     #[test]
     fn test_watch_with_interval() {
-        let mut args = base_args();
-        args.extend(["--watch-with-interval", "3600"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.watch_with_interval, Some(3600));
+        assert_removed_sync_option(&["--watch-with-interval", "3600"]);
     }
-
     #[test]
     fn test_watch_with_interval_rejects_below_minimum() {
-        let mut args = base_args();
-        args.extend(["--watch-with-interval", "0"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-
-        let mut args = base_args();
-        args.extend(["--watch-with-interval", "59"]);
-        assert!(Cli::try_parse_from(&args).is_err());
-
-        let mut args = base_args();
-        args.extend(["--watch-with-interval", "60"]);
-        assert!(Cli::try_parse_from(&args).is_ok());
+        assert_removed_sync_option(&["--watch-with-interval", "59"]);
     }
-
     #[test]
     fn test_watch_with_interval_rejects_above_maximum() {
-        // 86400s = 24h ceiling
-        let mut args = base_args();
-        args.extend(["--watch-with-interval", "86400"]);
-        assert!(Cli::try_parse_from(&args).is_ok());
-
-        let mut args = base_args();
-        args.extend(["--watch-with-interval", "86401"]);
-        assert!(Cli::try_parse_from(&args).is_err());
+        assert_removed_sync_option(&["--watch-with-interval", "86401"]);
     }
 
     #[test]
@@ -2501,13 +1888,9 @@ mod tests {
         let cli = parse(&args);
         assert_eq!(cli.sync.skip_created_after.as_deref(), Some("2025-06-01"));
     }
-
     #[test]
     fn test_albums_multiple() {
-        let mut args = base_args();
-        args.extend(["--album", "Favorites", "--album", "Vacation"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.albums, vec!["Favorites", "Vacation"]);
+        assert_removed_sync_option(&["--album", "Favorites", "--album", "Vacation"]);
     }
 
     #[test]
@@ -2515,14 +1898,9 @@ mod tests {
         let cli = parse(&base_args());
         assert!(cli.sync.albums.is_empty());
     }
-
     #[test]
     fn test_album_all_accepted() {
-        let mut args = base_args();
-        args.extend(["-a", "all"]);
-        let cli = parse(&args);
-        // CLI layer stays dumb: Config::build interprets "all".
-        assert_eq!(cli.sync.albums, vec!["all"]);
+        assert_removed_sync_flag(&["kei", "-a", "all"]);
     }
 
     // ── Input validation ───────────────────────────────────────────
@@ -2585,27 +1963,14 @@ mod tests {
         args.extend(["--max-retries", "101"]);
         assert!(Cli::try_parse_from(&args).is_err());
     }
-
     #[test]
     fn test_max_retries_accepts_100() {
-        let mut args = base_args();
-        args.extend(["--max-retries", "100"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.max_retries, Some(100));
+        assert_removed_sync_option(&["--max-retries", "100"]);
     }
-
     #[test]
     fn test_sync_subcommand() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "sync",
-            "--username",
-            "test@example.com",
-            "--download-dir",
-            "/photos",
-        ])
-        .unwrap();
-        assert!(matches!(cli.command, Some(Command::Sync { .. })));
+        let cli = Cli::try_parse_from(["kei", "sync", "--username", "x@x.com"]).unwrap();
+        assert!(matches!(cli.effective_command(), Command::Sync { .. }));
     }
 
     #[test]
@@ -3054,41 +2419,18 @@ mod tests {
     }
 
     // ── New filter flags ───────────────────────────────────────────
-
     #[test]
     fn test_live_photo_mode_all_variants() {
-        for (flag, expected) in [
-            ("both", LivePhotoMode::Both),
-            ("image-only", LivePhotoMode::ImageOnly),
-            ("video-only", LivePhotoMode::VideoOnly),
-            ("skip", LivePhotoMode::Skip),
-        ] {
-            let mut args = base_args();
-            args.extend(["--live-photo-mode", flag]);
-            let cli = parse(&args);
-            assert_eq!(cli.sync.live_photo_mode, Some(expected));
-        }
+        assert_removed_sync_option(&["--live-photo-mode", "skip"]);
     }
 
     #[test]
     fn test_filename_exclude_single() {
-        let mut args = base_args();
-        args.extend(["--filename-exclude", "*.AAE"]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.filename_exclude, vec!["*.AAE"]);
+        assert_removed_sync_option(&["--filename-exclude", "*.AAE"]);
     }
-
     #[test]
     fn test_filename_exclude_multiple() {
-        let mut args = base_args();
-        args.extend([
-            "--filename-exclude",
-            "*.AAE",
-            "--filename-exclude",
-            "Screenshot*",
-        ]);
-        let cli = parse(&args);
-        assert_eq!(cli.sync.filename_exclude, vec!["*.AAE", "Screenshot*"]);
+        assert_removed_sync_option(&["--filename-exclude", "*.AAE,Screenshot*"]);
     }
 
     #[test]
@@ -3104,26 +2446,19 @@ mod tests {
     // whatever subcommand the user named. `kei --skip-videos status`
     // looked like `kei status`; the user thought their flag was honoured
     // and saw a different action than they typed.
-
     #[test]
     fn validate_rejects_skip_videos_with_status() {
-        let err = parse_and_validate(&["kei", "--skip-videos=true", "status"])
-            .expect_err("validation must reject");
-        assert!(err.contains("--skip-videos"), "got: {err}");
-        assert!(err.contains("status"), "got: {err}");
+        let err = Cli::try_parse_from(["kei", "--skip-videos=true", "status"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
-
     #[test]
     fn validate_rejects_skip_photos_with_list_albums() {
-        let err = parse_and_validate(&["kei", "--skip-photos=true", "list", "albums"])
-            .expect_err("validation must reject");
-        assert!(err.contains("--skip-photos"), "got: {err}");
-        assert!(err.contains("list"), "got: {err}");
+        let err = Cli::try_parse_from(["kei", "--skip-photos=true", "list", "albums"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
-
     #[test]
     fn validate_rejects_live_photo_mode_with_reset_state() {
-        let err = parse_and_validate(&[
+        let err = Cli::try_parse_from([
             "kei",
             "--live-photo-mode",
             "skip",
@@ -3131,9 +2466,8 @@ mod tests {
             "state",
             "--yes",
         ])
-        .expect_err("validation must reject");
-        assert!(err.contains("--live-photo-mode"), "got: {err}");
-        assert!(err.contains("reset"), "got: {err}");
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -3170,47 +2504,49 @@ mod tests {
             .expect_err("parse must reject removed flag");
         assert!(err.contains("--auth-only"), "got: {err}");
     }
-
     #[test]
     fn validate_lists_every_offending_flag() {
         let err = parse_and_validate(&[
             "kei",
-            "--skip-videos",
-            "--skip-photos",
-            "--threads",
-            "4",
+            "--dry-run",
+            "--only-print-filenames",
+            "--recent",
+            "100",
             "status",
         ])
         .expect_err("validation must reject");
-        assert!(err.contains("--skip-videos"), "got: {err}");
-        assert!(err.contains("--skip-photos"), "got: {err}");
-        assert!(err.contains("--threads"), "got: {err}");
+        assert!(err.contains("--dry-run"), "got: {err}");
+        assert!(err.contains("--only-print-filenames"), "got: {err}");
+        assert!(err.contains("--recent"), "got: {err}");
     }
 
     // ── Validator must NOT fire on legitimate uses ─────────────────
-
     #[test]
     fn validate_allows_bare_kei_with_sync_flags() {
-        parse_and_validate(&["kei", "--skip-videos"])
-            .expect("bare-kei with sync flag must validate");
+        parse_and_validate(&["kei", "--recent", "100"])
+            .expect("bare-kei with kept per-run sync flag must validate");
     }
-
     #[test]
     fn validate_allows_sync_subcommand_with_sync_flags() {
-        parse_and_validate(&["kei", "sync", "--skip-videos", "--threads", "4"])
-            .expect("explicit sync subcommand with sync flags must validate");
+        parse_and_validate(&[
+            "kei",
+            "sync",
+            "--recent",
+            "100",
+            "--skip-created-before",
+            "2025-01-01",
+        ])
+        .expect("explicit sync subcommand with kept sync flags must validate");
     }
-
     #[test]
     fn validate_allows_top_level_sync_flag_then_sync_subcommand() {
-        parse_and_validate(&["kei", "--skip-videos=true", "sync"])
-            .expect("top-level sync flag with sync subcommand must validate");
+        parse_and_validate(&["kei", "--recent", "100", "sync"])
+            .expect("top-level kept sync flag with sync subcommand must validate");
     }
-
     #[test]
     fn validate_allows_retry_failed_with_sync_flag() {
-        parse_and_validate(&["kei", "sync", "--retry-failed", "--threads", "4"])
-            .expect("sync --retry-failed accepts sync flags");
+        parse_and_validate(&["kei", "sync", "--retry-failed", "--recent", "100"])
+            .expect("sync --retry-failed accepts kept per-run sync flags");
     }
 
     #[test]
@@ -3230,18 +2566,10 @@ mod tests {
     fn validate_allows_status_with_no_top_level_flags() {
         parse_and_validate(&["kei", "status"]).expect("plain `kei status` must validate");
     }
-
     #[test]
     fn validate_allows_service_run_with_sync_flags() {
-        parse_and_validate(&[
-            "kei",
-            "--download-dir",
-            "/photos",
-            "service",
-            "run",
-            "--dry-run",
-        ])
-        .expect("service run must accept top-level sync flags");
+        parse_and_validate(&["kei", "--recent", "100", "service", "run", "--dry-run"])
+            .expect("service run must accept kept top-level sync flags");
     }
 
     #[test]

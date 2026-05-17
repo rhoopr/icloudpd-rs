@@ -119,7 +119,7 @@ fn should_notify_shared_libraries(
     Some(format!(
         "Detected {shared_count} iCloud shared {word} on this account; only the primary \
          library {verb} being synced. To include shared libraries too, set \
-         `[filters] libraries = [\"all\"]` in config.toml (or pass `--library all`). \
+         `[filters] libraries = [\"all\"]` in config.toml. \
          Run `kei list libraries` to enumerate every zone."
     ))
 }
@@ -186,9 +186,8 @@ async fn maybe_notify_shared_libraries(
     }
 }
 
-/// Default watch interval applied when `kei service run` enters with no
-/// CLI / TOML / env value set. 24 hours, matching the value baked into
-/// the Docker image's `KEI_WATCH_WITH_INTERVAL`.
+/// Default watch interval applied when `kei service run` enters with no TOML
+/// value set. 24 hours, matching the Docker image's always-on service shape.
 pub(crate) const SERVICE_MODE_DEFAULT_WATCH_INTERVAL: u64 = 86400;
 
 /// Decide whether to apply the service-mode watch-interval fallback.
@@ -256,7 +255,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         &pw,
         sync,
         toml_config.as_ref(),
-        config::parse_env_watch_interval(std::env::var(config::ENV_WATCH_INTERVAL))?,
         personality_mode,
         friendly_request,
     )?;
@@ -330,8 +328,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // when the user simply forgot the destination.
     if config.directory.as_os_str().is_empty() {
         anyhow::bail!(
-            "--download-dir is required for downloading \
-             (pass --download-dir on the CLI or set [download] directory in the config file)"
+            "[download] directory is required for downloading \
+             (set it in the config file)"
         );
     }
 
@@ -517,7 +515,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     );
 
     // CloudKit shared zones don't expose smart folders. Catch the
-    // impossible-config case (e.g. `--library shared --smart-folder X`)
+    // impossible-config case (e.g. shared libraries plus a smart-folder selector)
     // here, before any per-library work, so the user gets a clear error
     // instead of a silent zero-pass run with exit code 0.
     validate_smart_folder_fulfillability(&libraries, &config.selection)?;
@@ -1985,14 +1983,14 @@ mod tests {
 
     #[test]
     fn notice_suppressed_when_user_picked_all() {
-        // Anyone who explicitly set `--library all` has already opted in;
+        // Anyone who explicitly set all libraries has already opted in;
         // nothing to tell them.
         assert!(should_notify_shared_libraries(&all_libraries(), 3, false).is_none());
     }
 
     #[test]
     fn notice_suppressed_when_user_picked_shared_zone_explicitly() {
-        // A user who typed out `--library SharedSync-ABCD1234` has also made
+        // A user who configured `SharedSync-ABCD1234` has also made
         // a choice; don't second-guess them.
         assert!(should_notify_shared_libraries(&shared_zone(), 3, false).is_none());
     }
@@ -2014,7 +2012,10 @@ mod tests {
             msg.contains("[filters] libraries = [\"all\"]"),
             "TOML guidance missing: {msg}"
         );
-        assert!(msg.contains("--library all"), "CLI guidance missing: {msg}");
+        assert!(
+            !msg.contains("--library all"),
+            "CLI guidance should be gone: {msg}"
+        );
         assert!(
             msg.contains("kei list libraries"),
             "discovery guidance missing: {msg}"
