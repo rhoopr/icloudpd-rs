@@ -433,7 +433,7 @@ pub(crate) fn resolve_library_selector(
     crate::selection::parse_library_selector(&raw)
 }
 
-fn resolve_media_selection(
+pub(crate) fn resolve_media_selection(
     toml_filters: Option<&TomlFilters>,
     skip_videos_override: Option<bool>,
     skip_photos_override: Option<bool>,

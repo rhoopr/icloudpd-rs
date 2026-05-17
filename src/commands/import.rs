@@ -786,10 +786,12 @@ fn build_import_download_config(
         },
         toml,
     );
+    let media = config::resolve_media_selection(toml.and_then(|t| t.filters.as_ref()), None, None)?;
 
     Ok(download::DownloadConfig::for_path_derivation_only(
         directory,
         path_fields,
+        media,
         args.dry_run,
         args.no_progress_bar,
     ))
@@ -2761,7 +2763,7 @@ mod build_config_tests {
     //! parse path that production uses.
     use super::build_import_download_config;
     use crate::cli::{Cli, Command};
-    use crate::config::{Config, GlobalArgs, TomlConfig, TomlPhotos};
+    use crate::config::{Config, GlobalArgs, MediaKind, TomlConfig, TomlFilters, TomlPhotos};
     use crate::types::{
         AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
         LivePhotoSize, RawTreatmentPolicy, VersionSize,
@@ -2797,6 +2799,12 @@ mod build_config_tests {
     fn toml_with_photos(p: TomlPhotos) -> TomlConfig {
         let mut t = empty_toml();
         t.photos = Some(p);
+        t
+    }
+
+    fn toml_with_filters(f: TomlFilters) -> TomlConfig {
+        let mut t = empty_toml();
+        t.filters = Some(f);
         t
     }
 
@@ -2943,6 +2951,21 @@ mod build_config_tests {
         assert_eq!(cfg.align_raw, RawTreatmentPolicy::PreferOriginal);
         assert!(cfg.force_size);
         assert!(cfg.keep_unicode_in_filenames);
+    }
+
+    #[test]
+    fn build_import_download_config_uses_toml_media_filter() {
+        let args = parse_import_args(&[]);
+        let toml = toml_with_filters(TomlFilters {
+            media: Some(vec![MediaKind::Photos, MediaKind::LivePhotos]),
+            ..TomlFilters::default()
+        });
+
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+
+        assert!(cfg.media.photos);
+        assert!(!cfg.media.videos);
+        assert!(cfg.media.live_photos);
     }
 
     /// CG-1: documented defaults when neither CLI nor TOML set the field.

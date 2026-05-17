@@ -585,6 +585,7 @@ impl DownloadConfig {
     pub(crate) fn for_path_derivation_only(
         directory: Arc<Path>,
         fields: crate::config::PathDerivationFields,
+        media: crate::config::MediaSelection,
         dry_run: bool,
         no_progress_bar: bool,
     ) -> Self {
@@ -597,7 +598,7 @@ impl DownloadConfig {
             ),
             library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
             size: fields.size.into(),
-            media: crate::config::MediaSelection::all(),
+            media,
             skip_created_before: None,
             skip_created_after: None,
             #[cfg(feature = "xmp")]
