@@ -17,7 +17,11 @@ pub(crate) fn run_config_show(
         cli::SyncArgs::default(),
         toml,
     )?;
-    let toml_config = cfg.to_toml();
+    let mut toml_config = cfg.to_toml();
+    if let Some(input) = toml {
+        toml_config.data_dir.clone_from(&input.data_dir);
+        toml_config.log_level = input.log_level;
+    }
     let output = toml::to_string_pretty(&toml_config)
         .map_err(|e| anyhow::anyhow!("failed to serialize config: {e}"))?;
     print!("{output}");

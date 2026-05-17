@@ -412,6 +412,51 @@ threads = 4
         "threads should be 4, stdout: {stdout}"
     );
 }
+
+#[test]
+fn config_show_preserves_top_level_toml_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let data_dir = dir.path().join("data");
+    let data_dir_string = data_dir.to_string_lossy();
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+data_dir = {}
+log_level = "debug"
+
+[auth]
+username = "toml@example.com"
+
+[download]
+directory = "/toml/photos"
+"#,
+            common::toml_string(&data_dir_string)
+        ),
+    )
+    .unwrap();
+
+    let out = clean_cmd()
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: toml::Value = toml::from_str(&stdout).unwrap();
+    assert_eq!(
+        parsed.get("data_dir").and_then(toml::Value::as_str),
+        Some(data_dir_string.as_ref()),
+        "stdout: {stdout}"
+    );
+    assert_eq!(
+        parsed.get("log_level").and_then(toml::Value::as_str),
+        Some("debug"),
+        "stdout: {stdout}"
+    );
+}
+
 #[test]
 fn config_show_emits_unfiled_false_when_explicit() {
     // The cli.rs help-shadow test for --unfiled only verifies clap parses;
