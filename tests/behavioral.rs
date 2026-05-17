@@ -42,16 +42,12 @@ fn clean_cmd() -> assert_cmd::Command {
     cmd
 }
 
-fn toml_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 fn write_sync_config(config_path: &std::path::Path, download_dir: &str) {
     std::fs::write(
         config_path,
         format!(
-            "[download]\ndirectory = \"{}\"\n",
-            toml_escape(download_dir)
+            "[download]\ndirectory = {}\n",
+            common::toml_string(download_dir)
         ),
     )
     .unwrap();
@@ -3001,8 +2997,8 @@ fn sync_cmd_for_config_body(body: &str) -> assert_cmd::Command {
     std::fs::write(
         &config_path,
         format!(
-            "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"{}\"\n{body}",
-            toml_escape(dl_dir.path().to_str().unwrap())
+            "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = {}\n{body}",
+            common::toml_string(dl_dir.path().to_str().unwrap())
         ),
     )
     .unwrap();
