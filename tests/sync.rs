@@ -492,7 +492,7 @@ fn sync_date_filters_exclude_by_creation_date() {
 
 // ── Size and naming ─────────────────────────────────────────────────────
 
-/// --size medium should produce photo files significantly smaller than originals.
+/// `[photos].resolution = "medium"` should produce photo files significantly smaller than originals.
 /// Medium photos (2048px longest edge) should be well under 2MB.
 #[test]
 #[ignore]
@@ -509,7 +509,7 @@ fn sync_size_medium_produces_smaller_files() {
             download_dir.path(),
             SyncToml {
                 filters: "media = [\"photos\", \"live-photos\"]\n",
-                photos: "size = \"medium\"\n",
+                photos: "resolution = \"medium\"\n",
                 ..SyncToml::default()
             },
         )
@@ -540,10 +540,10 @@ fn sync_size_medium_produces_smaller_files() {
     });
 }
 
-/// --force-size with an available size should succeed and download files.
+/// `force_resolution = true` with an available resolution should succeed and download files.
 #[test]
 #[ignore]
-fn sync_force_size_succeeds_when_available() {
+fn sync_force_resolution_succeeds_when_available() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
@@ -555,7 +555,7 @@ fn sync_force_size_succeeds_when_available() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                photos: "size = \"medium\"\nforce_size = true\n",
+                photos: "resolution = \"medium\"\nforce_resolution = true\n",
                 ..SyncToml::default()
             },
         )
@@ -566,10 +566,10 @@ fn sync_force_size_succeeds_when_available() {
         let files = common::walkdir(download_dir.path());
         assert!(
             !files.is_empty(),
-            "--force-size with available size should download files"
+            "force_resolution with available resolution should download files"
         );
 
-        // With --force-size medium, non-RAW photo files should be smaller than originals.
+        // With forced medium resolution, non-RAW photo files should be smaller than originals.
         // Videos don't have meaningful medium alternatives so exclude them too.
         let non_raw_files: Vec<_> = files
             .iter()
@@ -579,7 +579,7 @@ fn sync_force_size_succeeds_when_available() {
             let size = std::fs::metadata(f).unwrap().len();
             assert!(
                 size < 2_097_152,
-                "--force-size medium file should be under 2MB, got {} bytes: {}",
+                "forced medium resolution file should be under 2MB, got {} bytes: {}",
                 size,
                 f.display()
             );
@@ -1087,16 +1087,16 @@ fn first_jpeg(dir: &&std::path::Path) -> std::path::PathBuf {
 
 // ── RAW alignment ───────────────────────────────────────────────────────
 
-/// --align-raw variants should be accepted and sync should succeed.
+/// raw_policy variants should be accepted and sync should succeed.
 /// NOTE: test album has no RAW files -- this verifies the flag is accepted
 /// without errors rather than testing naming behavior.
 #[test]
 #[ignore]
-fn sync_align_raw_controls_raw_naming() {
+fn sync_raw_policy_controls_raw_naming() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
-        for variant in ["as-is", "original", "alternative"] {
+        for variant in ["as-is", "prefer-raw", "prefer-jpeg"] {
             let dir = tempdir().expect("tempdir");
             album_cmd_with_toml(
                 &username,
@@ -1104,7 +1104,7 @@ fn sync_align_raw_controls_raw_naming() {
                 &cookie_dir,
                 dir.path(),
                 SyncToml {
-                    photos: &format!("align_raw = {variant:?}\n"),
+                    photos: &format!("raw_policy = {variant:?}\n"),
                     ..SyncToml::default()
                 },
             )
@@ -1115,7 +1115,7 @@ fn sync_align_raw_controls_raw_naming() {
             let files = common::walkdir(dir.path());
             assert!(
                 files.len() >= 3,
-                "--align-raw {variant} should download files, got {}",
+                "raw_policy {variant} should download files, got {}",
                 files.len()
             );
         }

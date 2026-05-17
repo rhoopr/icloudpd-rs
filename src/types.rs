@@ -75,6 +75,69 @@ pub enum LivePhotoSize {
     Adjusted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize)]
+#[repr(u8)]
+#[serde(rename_all = "lowercase")]
+pub enum PhotoResolution {
+    None = 0,
+    Original = 1,
+    Medium = 2,
+    Thumb = 3,
+}
+
+impl PhotoResolution {
+    pub const fn to_asset_version_size(self) -> Option<AssetVersionSize> {
+        match self {
+            Self::None => None,
+            Self::Original => Some(AssetVersionSize::Original),
+            Self::Medium => Some(AssetVersionSize::Medium),
+            Self::Thumb => Some(AssetVersionSize::Thumb),
+        }
+    }
+}
+
+impl From<VersionSize> for PhotoResolution {
+    fn from(value: VersionSize) -> Self {
+        match value {
+            VersionSize::Original | VersionSize::Adjusted | VersionSize::Alternative => {
+                Self::Original
+            }
+            VersionSize::Medium => Self::Medium,
+            VersionSize::Thumb => Self::Thumb,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize)]
+#[repr(u8)]
+#[serde(rename_all = "lowercase")]
+pub enum LivePhotoResolution {
+    Original = 0,
+    Medium = 1,
+    Thumb = 2,
+}
+
+impl LivePhotoResolution {
+    pub const fn to_asset_version_size(self) -> AssetVersionSize {
+        match self {
+            Self::Original => AssetVersionSize::LiveOriginal,
+            Self::Medium => AssetVersionSize::LiveMedium,
+            Self::Thumb => AssetVersionSize::LiveThumb,
+        }
+    }
+}
+
+impl From<LivePhotoSize> for LivePhotoResolution {
+    fn from(value: LivePhotoSize) -> Self {
+        match value.to_asset_version_size() {
+            AssetVersionSize::LiveOriginal | AssetVersionSize::LiveAdjusted => Self::Original,
+            AssetVersionSize::LiveMedium => Self::Medium,
+            AssetVersionSize::LiveThumb => Self::Thumb,
+            _ => Self::Original,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Domain {
@@ -123,6 +186,30 @@ pub enum RawTreatmentPolicy {
     #[value(name = "alternative")]
     #[serde(rename = "alternative")]
     PreferAlternative = 2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum RawPolicy {
+    #[value(name = "as-is")]
+    #[serde(rename = "as-is")]
+    AsIs = 0,
+    #[value(name = "prefer-raw")]
+    #[serde(rename = "prefer-raw")]
+    PreferRaw = 1,
+    #[value(name = "prefer-jpeg")]
+    #[serde(rename = "prefer-jpeg")]
+    PreferJpeg = 2,
+}
+
+impl From<RawTreatmentPolicy> for RawPolicy {
+    fn from(value: RawTreatmentPolicy) -> Self {
+        match value {
+            RawTreatmentPolicy::Unchanged => Self::AsIs,
+            RawTreatmentPolicy::PreferOriginal => Self::PreferRaw,
+            RawTreatmentPolicy::PreferAlternative => Self::PreferJpeg,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]

@@ -138,6 +138,8 @@ pub struct TestPhotoAsset {
     orig_file_type: String,
     asset_date: f64,
     live_photo: Option<LivePhotoFields>,
+    adjusted_version: Option<AdjustedVersionFields>,
+    live_adjusted: Option<LivePhotoFields>,
     alt_version: Option<AltVersionFields>,
 }
 
@@ -148,6 +150,13 @@ struct LivePhotoFields {
 }
 
 struct AltVersionFields {
+    url: String,
+    checksum: String,
+    size: u64,
+    file_type: String,
+}
+
+struct AdjustedVersionFields {
     url: String,
     checksum: String,
     size: u64,
@@ -166,6 +175,8 @@ impl TestPhotoAsset {
             orig_file_type: "public.jpeg".to_string(),
             asset_date: 1736899200000.0,
             live_photo: None,
+            adjusted_version: None,
+            live_adjusted: None,
             alt_version: None,
         }
     }
@@ -214,6 +225,31 @@ impl TestPhotoAsset {
         self
     }
 
+    pub fn adjusted_version(
+        mut self,
+        url: &str,
+        checksum: &str,
+        size: u64,
+        file_type: &str,
+    ) -> Self {
+        self.adjusted_version = Some(AdjustedVersionFields {
+            url: url.to_string(),
+            checksum: checksum.to_string(),
+            size,
+            file_type: file_type.to_string(),
+        });
+        self
+    }
+
+    pub fn live_adjusted(mut self, url: &str, checksum: &str, size: u64) -> Self {
+        self.live_adjusted = Some(LivePhotoFields {
+            url: url.to_string(),
+            checksum: checksum.to_string(),
+            size,
+        });
+        self
+    }
+
     pub fn alt_version(mut self, url: &str, checksum: &str, size: u64, file_type: &str) -> Self {
         self.alt_version = Some(AltVersionFields {
             url: url.to_string(),
@@ -243,6 +279,24 @@ impl TestPhotoAsset {
                 "fileChecksum": lp.checksum,
             }});
             fields["resOriginalVidComplFileType"] = json!({"value": "com.apple.quicktime-movie"});
+        }
+
+        if let Some(adjusted) = &self.adjusted_version {
+            fields["resJPEGFullRes"] = json!({"value": {
+                "size": adjusted.size,
+                "downloadURL": adjusted.url,
+                "fileChecksum": adjusted.checksum,
+            }});
+            fields["resJPEGFullFileType"] = json!({"value": adjusted.file_type});
+        }
+
+        if let Some(lp) = &self.live_adjusted {
+            fields["resVidFullRes"] = json!({"value": {
+                "size": lp.size,
+                "downloadURL": lp.url,
+                "fileChecksum": lp.checksum,
+            }});
+            fields["resVidFullFileType"] = json!({"value": "com.apple.quicktime-movie"});
         }
 
         if let Some(alt) = &self.alt_version {

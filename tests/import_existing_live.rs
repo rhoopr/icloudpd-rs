@@ -659,14 +659,14 @@ fn import_reads_toml_for_path_derivation() {
             r#"folder_structure = "%Y/%m/%d"
 
 [photos]
-size = "original"
+resolution = "original"
 file_match_policy = "name-size-dedup-with-suffix"
 live_photo_mode = "both"
-live_photo_size = "original"
+live_resolution = "original"
 live_photo_mov_filename_policy = "suffix"
-align_raw = "as-is"
+raw_policy = "as-is"
 keep_unicode_in_filenames = false
-force_size = false
+force_resolution = false
 "#,
         );
 

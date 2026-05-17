@@ -624,7 +624,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .skip_created_after
         .map(|d| d.with_timezone(&chrono::Utc));
     let retry_config = api_retry_config;
-    let live_photo_size = config.photos.live_photo_size.to_asset_version_size();
+    let live_resolution = config.photos.live_resolution.to_asset_version_size();
     // One shared limiter per sync run so the configured cap applies to
     // aggregate throughput across every concurrent download.
     let bandwidth_limiter = config
@@ -662,7 +662,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             folder_structure_albums: Arc::clone(&cfg_folder_structure_albums),
             folder_structure_smart_folders: Arc::clone(&cfg_folder_structure_smart_folders),
             library,
-            size: config.photos.size.into(),
+            resolution: config.photos.resolution,
             media: config.filters.media,
             skip_created_before,
             skip_created_after,
@@ -683,14 +683,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             recent: config.filters.recent,
             retry: retry_config,
             live_photo_mode: config.photos.live_photo_mode,
-            live_photo_size,
+            live_resolution,
             live_photo_mov_filename_policy: config.photos.live_photo_mov_filename_policy,
-            align_raw: config.photos.align_raw,
+            edited: config.photos.edited,
+            alternative: config.photos.alternative,
+            raw_policy: config.photos.raw_policy,
             no_progress_bar: config.download.no_progress_bar,
             only_print_filenames: config.runtime.only_print_filenames,
             personality_mode: config.ui.personality_mode,
             file_match_policy: config.photos.file_match_policy,
-            force_size: config.photos.force_size,
+            force_resolution: config.photos.force_resolution,
             keep_unicode_in_filenames: config.photos.keep_unicode_in_filenames,
             filename_exclude: Arc::clone(&cfg_filename_exclude),
             temp_suffix: Arc::clone(&cfg_temp_suffix),
@@ -1554,8 +1556,9 @@ async fn run_cycle(
     // Check if the download config changed since last sync. If so, clear
     // sync tokens so the subsequent lookup falls back to full enumeration
     // -- the stored incremental token would miss assets that are newly
-    // eligible under the changed config (e.g. a user switching --size or
-    // changing [filters].media). The hash is cycle-invariant across libraries,
+    // eligible under the changed config (e.g. a user switching
+    // [photos].resolution or changing [filters].media). The hash is
+    // cycle-invariant across libraries,
     // so this runs once per cycle, not once per library.
     //
     // The metadata key `enum_config_hash` is distinct from the download

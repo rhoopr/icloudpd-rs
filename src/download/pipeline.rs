@@ -4380,8 +4380,7 @@ mod tests {
         use crate::download::{DownloadConfig, SyncMode};
         use crate::icloud::photos::PhotoAsset;
         use crate::types::{
-            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-            RawTreatmentPolicy,
+            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
         };
         use futures_util::stream;
         use rustc_hash::FxHashSet;
@@ -4408,7 +4407,7 @@ mod tests {
             folder_structure_smart_folders: Arc::from(
                 crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
             ),
-            size: AssetVersionSize::Original,
+            resolution: crate::types::PhotoResolution::Original,
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
@@ -4433,14 +4432,16 @@ mod tests {
                 max_delay_secs: 0,
             },
             live_photo_mode: LivePhotoMode::Both,
-            live_photo_size: AssetVersionSize::LiveOriginal,
+            live_resolution: AssetVersionSize::LiveOriginal,
             live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-            align_raw: RawTreatmentPolicy::Unchanged,
+            edited: false,
+            alternative: false,
+            raw_policy: RawPolicy::AsIs,
             no_progress_bar: true,
             only_print_filenames: false,
             personality_mode: crate::personality::Mode::Off,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
-            force_size: false,
+            force_resolution: false,
             keep_unicode_in_filenames: false,
             filename_exclude: std::sync::Arc::from(Vec::<glob::Pattern>::new()),
             temp_suffix: std::sync::Arc::from(".kei-tmp"),
@@ -4495,8 +4496,7 @@ mod tests {
         use crate::download::{DownloadConfig, SyncMode};
         use crate::icloud::photos::PhotoAsset;
         use crate::types::{
-            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-            RawTreatmentPolicy,
+            AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
         };
         use rustc_hash::FxHashSet;
 
@@ -4509,7 +4509,7 @@ mod tests {
             folder_structure_smart_folders: Arc::from(
                 crate::config::DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS,
             ),
-            size: AssetVersionSize::Original,
+            resolution: crate::types::PhotoResolution::Original,
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
@@ -4530,14 +4530,16 @@ mod tests {
             recent: None,
             retry: RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
-            live_photo_size: AssetVersionSize::LiveOriginal,
+            live_resolution: AssetVersionSize::LiveOriginal,
             live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
-            align_raw: RawTreatmentPolicy::Unchanged,
+            edited: false,
+            alternative: false,
+            raw_policy: RawPolicy::AsIs,
             no_progress_bar: true,
             only_print_filenames: false,
             personality_mode: crate::personality::Mode::Off,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
-            force_size: false,
+            force_resolution: false,
             keep_unicode_in_filenames: false,
             filename_exclude: std::sync::Arc::from(Vec::<glob::Pattern>::new()),
             temp_suffix: std::sync::Arc::from(".kei-tmp"),

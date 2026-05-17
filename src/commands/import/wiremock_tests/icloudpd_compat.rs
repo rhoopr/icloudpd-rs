@@ -783,7 +783,7 @@ async fn kei_uses_fingerprint_filename_when_filename_missing() {
     assert_eq!(stats.matched, 1, "kei must use the fingerprint fallback");
 }
 
-/// `RawTreatmentPolicy::Unchanged` (kei's default) keeps the iCloud-side
+/// `RawPolicy::AsIs` (kei's default) keeps the iCloud-side
 /// `.DNG` extension verbatim and does not pair RAW + JPEG. icloudpd's
 /// `--keep-raw` has different semantics (it changes pairing behavior in
 /// ways kei doesn't replicate). Pin kei's Unchanged shape so a future
@@ -797,8 +797,8 @@ async fn kei_align_raw_unchanged_keeps_dng_extension() {
     std::fs::create_dir_all(&dl).unwrap();
     let config = base_config(&dl);
     assert_eq!(
-        config.align_raw,
-        crate::types::RawTreatmentPolicy::Unchanged,
+        config.raw_policy,
+        crate::types::RawPolicy::AsIs,
         "test depends on the Unchanged default"
     );
 

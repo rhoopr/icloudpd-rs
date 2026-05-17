@@ -93,11 +93,11 @@ NEW_DOWNLOADS=$(echo "$OUTPUT" | grep -oE '[0-9]+ downloaded' | head -1 | grep -
 [ "${NEW_DOWNLOADS:-0}" -eq 0 ]; kei_check "0 new downloads"
 [ "$(get_token)" = "$BASELINE_TOKEN" ]; kei_check "token preserved"
 
-# ── 3. Config change: --size medium → hash changes, tokens cleared ───────
+# ── 3. Config change: medium resolution -> hash changes, tokens cleared ─
 echo ""
 echo "=== 3. Config change clears tokens ==="
 HASH_BEFORE=$(get_hash)
-OUTPUT=$(KEI_SYNC_PHOTOS_TOML=$'size = "medium"\n' kei_sync "$DIR")
+OUTPUT=$(KEI_SYNC_PHOTOS_TOML=$'resolution = "medium"\n' kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "config|changed|cleared|token|incremental|download|completed"
 HASH_AFTER=$(get_hash)
 TOKEN_AFTER=$(get_token)

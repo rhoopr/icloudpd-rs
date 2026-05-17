@@ -325,6 +325,26 @@ pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
     }
 }
 
+/// Add a literal suffix before the file extension.
+///
+/// Unlike [`insert_suffix`], this does not add a hyphen. Use it for suffixes
+/// that already include their separator, such as `_edited`.
+pub(crate) fn insert_literal_suffix(path: &str, suffix: &str) -> String {
+    if let Some(dot_pos) = path.rfind('.') {
+        let (stem, ext) = path.split_at(dot_pos);
+        let mut result = String::with_capacity(stem.len() + suffix.len() + ext.len());
+        result.push_str(stem);
+        result.push_str(suffix);
+        result.push_str(ext);
+        result
+    } else {
+        let mut result = String::with_capacity(path.len() + suffix.len());
+        result.push_str(path);
+        result.push_str(suffix);
+        result
+    }
+}
+
 /// Map UTI `asset_type` strings to standardized uppercase file extensions.
 ///
 /// Matches `icloudpd`'s `ITEM_TYPE_EXTENSIONS` mapping.

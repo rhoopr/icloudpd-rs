@@ -13,8 +13,8 @@ use dialoguer::{Confirm, Input, Password, Select};
 use indicatif::ProgressBar;
 
 use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LogLevel,
-    RawTreatmentPolicy, VersionSize,
+    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LogLevel, PhotoResolution,
+    RawPolicy,
 };
 
 /// Result of the setup wizard — either the user wants to sync now or just exit.
@@ -68,9 +68,9 @@ struct SetupAnswers {
     live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
 
     // Quality
-    size: Option<VersionSize>,
-    force_size: bool,
-    align_raw: Option<RawTreatmentPolicy>,
+    resolution: Option<PhotoResolution>,
+    force_resolution: bool,
+    raw_policy: Option<RawPolicy>,
 
     // Date range
     recent: Option<u32>,
@@ -125,9 +125,9 @@ impl Default for SetupAnswers {
             skip_videos: false,
             live_photo_mode: None,
             live_photo_mov_filename_policy: None,
-            size: None,
-            force_size: false,
-            align_raw: None,
+            resolution: None,
+            force_resolution: false,
+            raw_policy: None,
             recent: None,
             skip_created_before: None,
             skip_created_after: None,
@@ -681,19 +681,19 @@ fn ask_quality(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .default(0)
         .interact()?;
 
-    answers.size = match size {
-        1 => Some(VersionSize::Medium),
-        2 => Some(VersionSize::Thumb),
+    answers.resolution = match size {
+        1 => Some(PhotoResolution::Medium),
+        2 => Some(PhotoResolution::Thumb),
         _ => None, // original is the default
     };
 
     // If not original, ask about fallback
-    if answers.size.is_some() {
+    if answers.resolution.is_some() {
         let fallback = Confirm::new()
             .with_prompt("If that size isn't available, fall back to original?")
             .default(true)
             .interact()?;
-        answers.force_size = !fallback;
+        answers.force_resolution = !fallback;
     }
 
     println!();
@@ -713,9 +713,9 @@ fn ask_quality(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             .items(raw_items)
             .default(0)
             .interact()?;
-        answers.align_raw = match raw_policy {
-            1 => Some(RawTreatmentPolicy::PreferOriginal),
-            2 => Some(RawTreatmentPolicy::PreferAlternative),
+        answers.raw_policy = match raw_policy {
+            1 => Some(RawPolicy::PreferRaw),
+            2 => Some(RawPolicy::PreferJpeg),
             _ => None, // as-is is the default
         };
     }
@@ -1258,11 +1258,11 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         // [photos]
         writeln!(out)?;
         writeln!(out, "[photos]")?;
-        match answers.size {
-            Some(size) => writeln!(out, "size = \"{}\"", version_size_str(size))?,
-            None => writeln!(out, "# size = \"original\"")?,
+        match answers.resolution {
+            Some(size) => writeln!(out, "resolution = \"{}\"", version_size_str(size))?,
+            None => writeln!(out, "# resolution = \"original\"")?,
         };
-        writeln!(out, "# live_photo_size = \"original\"")?;
+        writeln!(out, "# live_resolution = \"original\"")?;
         match answers.live_photo_mode {
             Some(mode) => writeln!(out, "live_photo_mode = \"{}\"", live_photo_mode_str(mode))?,
             None => writeln!(out, "# live_photo_mode = \"both\"")?,
@@ -1275,18 +1275,18 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             )?,
             None => writeln!(out, "# live_photo_mov_filename_policy = \"suffix\"")?,
         };
-        match answers.align_raw {
-            Some(p) => writeln!(out, "align_raw = \"{}\"", raw_policy_str(p))?,
-            None => writeln!(out, "# align_raw = \"as-is\"")?,
+        match answers.raw_policy {
+            Some(p) => writeln!(out, "raw_policy = \"{}\"", raw_policy_str(p))?,
+            None => writeln!(out, "# raw_policy = \"as-is\"")?,
         };
         match answers.file_match_policy {
             Some(p) => writeln!(out, "file_match_policy = \"{}\"", file_match_str(p))?,
             None => writeln!(out, "# file_match_policy = \"name-size-dedup-with-suffix\"")?,
         };
-        if answers.force_size {
-            writeln!(out, "force_size = true")?;
+        if answers.force_resolution {
+            writeln!(out, "force_resolution = true")?;
         } else {
-            writeln!(out, "# force_size = false")?;
+            writeln!(out, "# force_resolution = false")?;
         }
         if answers.keep_unicode_in_filenames {
             writeln!(out, "keep_unicode_in_filenames = true")?;
@@ -1364,13 +1364,12 @@ fn log_level_str(level: LogLevel) -> &'static str {
     }
 }
 
-fn version_size_str(size: VersionSize) -> &'static str {
+fn version_size_str(size: PhotoResolution) -> &'static str {
     match size {
-        VersionSize::Original => "original",
-        VersionSize::Medium => "medium",
-        VersionSize::Thumb => "thumb",
-        VersionSize::Adjusted => "adjusted",
-        VersionSize::Alternative => "alternative",
+        PhotoResolution::None => "none",
+        PhotoResolution::Original => "original",
+        PhotoResolution::Medium => "medium",
+        PhotoResolution::Thumb => "thumb",
     }
 }
 
@@ -1392,11 +1391,11 @@ fn live_photo_mode_str(mode: LivePhotoMode) -> &'static str {
     }
 }
 
-fn raw_policy_str(policy: RawTreatmentPolicy) -> &'static str {
+fn raw_policy_str(policy: RawPolicy) -> &'static str {
     match policy {
-        RawTreatmentPolicy::Unchanged => "as-is",
-        RawTreatmentPolicy::PreferOriginal => "original",
-        RawTreatmentPolicy::PreferAlternative => "alternative",
+        RawPolicy::AsIs => "as-is",
+        RawPolicy::PreferRaw => "prefer-raw",
+        RawPolicy::PreferJpeg => "prefer-jpeg",
     }
 }
 
@@ -1434,7 +1433,7 @@ mod tests {
         // Password should NOT be in the TOML
         assert!(!toml.contains("secret"));
         // Defaults should be commented out
-        assert!(toml.contains("# size = \"original\""));
+        assert!(toml.contains("# resolution = \"original\""));
         assert!(toml.contains("# threads = 10"));
         assert!(toml.contains("# log_level = \"warn\""));
         assert!(toml.contains("# data_dir = \"~/.config/kei\""));
@@ -1536,9 +1535,9 @@ mod tests {
             skip_videos: true,
             live_photo_mode: Some(LivePhotoMode::Both),
             live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-            size: Some(VersionSize::Medium),
-            force_size: true,
-            align_raw: Some(RawTreatmentPolicy::PreferOriginal),
+            resolution: Some(PhotoResolution::Medium),
+            force_resolution: true,
+            raw_policy: Some(RawPolicy::PreferRaw),
             recent: Some(100),
             skip_created_before: Some("2024-01-01".to_string()),
             skip_created_after: Some("2025-01-01".to_string()),
@@ -1574,12 +1573,12 @@ mod tests {
         assert!(toml_str.contains("unfiled = false"));
         assert!(toml_str.contains("filename_exclude = [\"IMG_screenshot*.png\"]"));
         assert!(toml_str.contains("media = [\"photos\", \"live-photos\"]"));
-        assert!(toml_str.contains("size = \"medium\""));
+        assert!(toml_str.contains("resolution = \"medium\""));
         // live_photo_mode = "both" is the default; emitting it explicitly is
         // also fine, but the test above sets `Some(Both)` so we expect it.
         assert!(toml_str.contains("live_photo_mode = \"both\""));
-        assert!(toml_str.contains("force_size = true"));
-        assert!(toml_str.contains("align_raw = \"original\""));
+        assert!(toml_str.contains("force_resolution = true"));
+        assert!(toml_str.contains("raw_policy = \"prefer-raw\""));
         assert!(toml_str.contains("recent = 100"));
         assert!(toml_str.contains("interval = 1800"));
         assert!(toml_str.contains("notify_systemd = true"));
@@ -1621,9 +1620,9 @@ mod tests {
             skip_videos: true,
             live_photo_mode: Some(LivePhotoMode::Skip),
             live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-            size: Some(VersionSize::Thumb),
-            force_size: true,
-            align_raw: Some(RawTreatmentPolicy::PreferAlternative),
+            resolution: Some(PhotoResolution::Thumb),
+            force_resolution: true,
+            raw_policy: Some(RawPolicy::PreferJpeg),
             recent: Some(50),
             skip_created_before: Some("30d".to_string()),
             skip_created_after: Some("2025-06-01".to_string()),
@@ -1700,12 +1699,9 @@ mod tests {
         assert_eq!(filters.skip_created_after.as_deref(), Some("2025-06-01"));
 
         let photos = parsed.photos.unwrap();
-        assert_eq!(photos.size, Some(VersionSize::Thumb));
-        assert_eq!(photos.force_size, Some(true));
-        assert_eq!(
-            photos.align_raw,
-            Some(RawTreatmentPolicy::PreferAlternative)
-        );
+        assert_eq!(photos.resolution, Some(PhotoResolution::Thumb));
+        assert_eq!(photos.force_resolution, Some(true));
+        assert_eq!(photos.raw_policy, Some(RawPolicy::PreferJpeg));
         assert_eq!(
             photos.live_photo_mov_filename_policy,
             Some(LivePhotoMovFilenamePolicy::Original)
@@ -1772,9 +1768,9 @@ mod tests {
                 skip_videos: true,
                 live_photo_mode: Some(LivePhotoMode::Skip),
                 live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-                size: Some(VersionSize::Thumb),
-                force_size: true,
-                align_raw: Some(RawTreatmentPolicy::PreferAlternative),
+                resolution: Some(PhotoResolution::Thumb),
+                force_resolution: true,
+                raw_policy: Some(RawPolicy::PreferJpeg),
                 bandwidth_limit: Some("10MB".to_string()),
                 reconcile_every_n_cycles: Some(24),
                 #[cfg(feature = "xmp")]
@@ -2013,21 +2009,13 @@ mod tests {
     fn test_generate_toml_enum_values() {
         // Verify each enum serializes to the correct TOML string that
         // the config parser expects.
-        assert_eq!(version_size_str(VersionSize::Original), "original");
-        assert_eq!(version_size_str(VersionSize::Medium), "medium");
-        assert_eq!(version_size_str(VersionSize::Thumb), "thumb");
-        assert_eq!(version_size_str(VersionSize::Adjusted), "adjusted");
-        assert_eq!(version_size_str(VersionSize::Alternative), "alternative");
+        assert_eq!(version_size_str(PhotoResolution::Original), "original");
+        assert_eq!(version_size_str(PhotoResolution::Medium), "medium");
+        assert_eq!(version_size_str(PhotoResolution::Thumb), "thumb");
 
-        assert_eq!(raw_policy_str(RawTreatmentPolicy::Unchanged), "as-is");
-        assert_eq!(
-            raw_policy_str(RawTreatmentPolicy::PreferOriginal),
-            "original"
-        );
-        assert_eq!(
-            raw_policy_str(RawTreatmentPolicy::PreferAlternative),
-            "alternative"
-        );
+        assert_eq!(raw_policy_str(RawPolicy::AsIs), "as-is");
+        assert_eq!(raw_policy_str(RawPolicy::PreferRaw), "prefer-raw");
+        assert_eq!(raw_policy_str(RawPolicy::PreferJpeg), "prefer-jpeg");
 
         assert_eq!(
             file_match_str(FileMatchPolicy::NameSizeDedupWithSuffix),

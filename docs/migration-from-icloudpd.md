@@ -174,7 +174,7 @@ password for future runs.
 | `--list-libraries` | `kei list libraries` | The old flag was removed in v0.20. |
 | `--cookie-directory` | `data_dir` | The old flag was removed in v0.20. New default is `~/.config/kei`; `KEI_DATA_DIR` still works for automation. |
 | `--folder-structure "{:%Y/%m/%d}"` | `[download].folder_structure = "%Y/%m/%d"` | Python wrapper syntax is still accepted. Use `folder_structure_albums` and `folder_structure_smart_folders` for the other passes. |
-| `--size original` | `[photos].size = "original"` | Values: `original`, `medium`, `thumb`, `adjusted`, `alternative`. kei accepts one size per run. |
+| `--size original` | `[photos].resolution = "original"` | Values: `original`, `medium`, `thumb`, `none`. Use `edited = true` for adjusted renditions and `alternative = true` for alternative or RAW renditions. |
 | `--threads-num` | `[download].threads` | Default is 10. With `[download].bandwidth_limit` and no explicit thread count, default drops to 1. |
 | `--skip-videos`, `--skip-photos` | `[filters].media` | Use `media = ["photos", "live-photos"]` to skip videos, or `media = ["videos", "live-photos"]` to skip normal photos. |
 | `--skip-live-photos` | `[photos].live_photo_mode = "skip"` | The old flag was removed in v0.20. |
@@ -184,6 +184,7 @@ password for future runs.
 | `--keep-unicode-in-filenames` | `[photos].keep_unicode_in_filenames = true` | Match this during import. |
 | `--live-photo-mov-filename-policy` | `[photos].live_photo_mov_filename_policy` | `suffix` or `original`. |
 | `--file-match-policy` | `[photos].file_match_policy` | `name-size-dedup-with-suffix` or `name-id7`. |
+| `--align-raw` | `[photos].raw_policy` | `as-is`, `prefer-raw`, or `prefer-jpeg`. |
 | `--domain` | `[auth].domain` | `com` or `cn`. |
 | `--watch-with-interval` | `[watch].interval`; Docker uses `kei service run` | Built-in watch mode moved to durable config and service commands. |
 | `--log-level` | `--log-level` or `log_level` | `debug`, `info`, `warn`, `error`. |

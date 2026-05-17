@@ -1,7 +1,7 @@
 use crate::password::SecretString;
 use crate::types::{
-    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
-    RawTreatmentPolicy, VersionSize,
+    Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoResolution,
+    LogLevel, PhotoResolution, RawPolicy,
 };
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
@@ -175,13 +175,15 @@ impl MediaSelection {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlPhotos {
-    pub size: Option<VersionSize>,
-    pub live_photo_size: Option<LivePhotoSize>,
+    pub resolution: Option<PhotoResolution>,
+    pub live_resolution: Option<LivePhotoResolution>,
     pub live_photo_mode: Option<LivePhotoMode>,
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-    pub align_raw: Option<RawTreatmentPolicy>,
+    pub edited: Option<bool>,
+    pub alternative: Option<bool>,
+    pub raw_policy: Option<RawPolicy>,
     pub file_match_policy: Option<FileMatchPolicy>,
-    pub force_size: Option<bool>,
+    pub force_resolution: Option<bool>,
     pub keep_unicode_in_filenames: Option<bool>,
 }
 
@@ -219,14 +221,16 @@ pub(crate) struct SyncConfigOverrides {
     pub unfiled: Option<bool>,
     pub filename_exclude: Vec<String>,
     pub libraries: Vec<String>,
-    pub size: Option<VersionSize>,
-    pub live_photo_size: Option<LivePhotoSize>,
+    pub resolution: Option<PhotoResolution>,
+    pub live_resolution: Option<LivePhotoResolution>,
+    pub edited: Option<bool>,
+    pub alternative: Option<bool>,
     pub threads: Option<u16>,
     pub bandwidth_limit: Option<u64>,
     pub skip_videos: Option<bool>,
     pub skip_photos: Option<bool>,
     pub live_photo_mode: Option<LivePhotoMode>,
-    pub force_size: Option<bool>,
+    pub force_resolution: Option<bool>,
     pub folder_structure: Option<String>,
     pub folder_structure_albums: Option<String>,
     pub folder_structure_smart_folders: Option<String>,
@@ -245,7 +249,7 @@ pub(crate) struct SyncConfigOverrides {
     pub watch_with_interval: Option<u64>,
     pub keep_unicode_in_filenames: Option<bool>,
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-    pub align_raw: Option<RawTreatmentPolicy>,
+    pub raw_policy: Option<RawPolicy>,
     pub file_match_policy: Option<FileMatchPolicy>,
     pub max_retries: Option<u32>,
     pub temp_suffix: Option<String>,
@@ -309,13 +313,15 @@ pub struct FilterConfig {
 
 #[derive(Debug)]
 pub struct PhotoConfig {
-    pub size: VersionSize,
-    pub live_photo_size: LivePhotoSize,
+    pub resolution: PhotoResolution,
+    pub live_resolution: LivePhotoResolution,
     pub live_photo_mode: LivePhotoMode,
     pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
-    pub align_raw: RawTreatmentPolicy,
+    pub edited: bool,
+    pub alternative: bool,
+    pub raw_policy: RawPolicy,
     pub file_match_policy: FileMatchPolicy,
-    pub force_size: bool,
+    pub force_resolution: bool,
     pub keep_unicode_in_filenames: bool,
 }
 
@@ -875,13 +881,15 @@ pub(crate) struct PathDerivationCliArgs {
     pub folder_structure: Option<String>,
     pub folder_structure_albums: Option<String>,
     pub folder_structure_smart_folders: Option<String>,
-    pub size: Option<VersionSize>,
+    pub resolution: Option<PhotoResolution>,
     pub live_photo_mode: Option<LivePhotoMode>,
-    pub live_photo_size: Option<LivePhotoSize>,
+    pub live_resolution: Option<LivePhotoResolution>,
     pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-    pub align_raw: Option<RawTreatmentPolicy>,
+    pub edited: Option<bool>,
+    pub alternative: Option<bool>,
+    pub raw_policy: Option<RawPolicy>,
     pub file_match_policy: Option<FileMatchPolicy>,
-    pub force_size: Option<bool>,
+    pub force_resolution: Option<bool>,
     pub keep_unicode_in_filenames: Option<bool>,
 }
 
@@ -893,24 +901,24 @@ pub(crate) struct PathDerivationFields {
     pub folder_structure: String,
     pub folder_structure_albums: String,
     pub folder_structure_smart_folders: String,
-    pub size: VersionSize,
+    pub resolution: PhotoResolution,
     pub live_photo_mode: LivePhotoMode,
-    pub live_photo_size: LivePhotoSize,
+    pub live_resolution: LivePhotoResolution,
     pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
-    pub align_raw: RawTreatmentPolicy,
+    pub edited: bool,
+    pub alternative: bool,
+    pub raw_policy: RawPolicy,
     pub file_match_policy: FileMatchPolicy,
-    pub force_size: bool,
+    pub force_resolution: bool,
     pub keep_unicode_in_filenames: bool,
 }
 
 /// Resolve the CLI > TOML > default chain for every field that affects
-/// path derivation, shared by sync and import. The smart default for
-/// `live_photo_size` (track `--size adjusted` when the user didn't
-/// override it) lives here so import-existing matches sync.
+/// path derivation, shared by sync and import.
 pub(crate) fn resolve_path_derivation_fields(
     cli: PathDerivationCliArgs,
     toml: Option<&TomlConfig>,
-) -> PathDerivationFields {
+) -> anyhow::Result<PathDerivationFields> {
     let toml_dl = toml.and_then(|t| t.download.as_ref());
     let toml_photos = toml.and_then(|t| t.photos.as_ref());
 
@@ -926,20 +934,15 @@ pub(crate) fn resolve_path_derivation_fields(
         .folder_structure_smart_folders
         .or_else(|| toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()))
         .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string());
-    let size = resolve(
-        cli.size,
-        toml_photos.and_then(|p| p.size),
-        VersionSize::Original,
+    let resolution = resolve(
+        cli.resolution,
+        toml_photos.and_then(|p| p.resolution),
+        PhotoResolution::Original,
     );
-    let default_live_photo_size = if size == VersionSize::Adjusted {
-        LivePhotoSize::Adjusted
-    } else {
-        LivePhotoSize::Original
-    };
-    let live_photo_size = resolve(
-        cli.live_photo_size,
-        toml_photos.and_then(|p| p.live_photo_size),
-        default_live_photo_size,
+    let live_resolution = resolve(
+        cli.live_resolution,
+        toml_photos.and_then(|p| p.live_resolution),
+        LivePhotoResolution::Original,
     );
     let live_photo_mode = resolve(
         cli.live_photo_mode,
@@ -951,35 +954,46 @@ pub(crate) fn resolve_path_derivation_fields(
         toml_photos.and_then(|p| p.live_photo_mov_filename_policy),
         LivePhotoMovFilenamePolicy::Suffix,
     );
-    let align_raw = resolve(
-        cli.align_raw,
-        toml_photos.and_then(|p| p.align_raw),
-        RawTreatmentPolicy::Unchanged,
+    let edited = resolve_flag(cli.edited, toml_photos.and_then(|p| p.edited));
+    let alternative = resolve_flag(cli.alternative, toml_photos.and_then(|p| p.alternative));
+    anyhow::ensure!(
+        resolution != PhotoResolution::None || edited || alternative,
+        "photos.resolution = \"none\" requires photos.edited = true or photos.alternative = true"
+    );
+    let raw_policy = resolve(
+        cli.raw_policy,
+        toml_photos.and_then(|p| p.raw_policy),
+        RawPolicy::AsIs,
     );
     let file_match_policy = resolve(
         cli.file_match_policy,
         toml_photos.and_then(|p| p.file_match_policy),
         FileMatchPolicy::NameSizeDedupWithSuffix,
     );
-    let force_size = resolve_flag(cli.force_size, toml_photos.and_then(|p| p.force_size));
+    let force_resolution = resolve_flag(
+        cli.force_resolution,
+        toml_photos.and_then(|p| p.force_resolution),
+    );
     let keep_unicode_in_filenames = resolve_flag(
         cli.keep_unicode_in_filenames,
         toml_photos.and_then(|p| p.keep_unicode_in_filenames),
     );
 
-    PathDerivationFields {
+    Ok(PathDerivationFields {
         folder_structure,
         folder_structure_albums,
         folder_structure_smart_folders,
-        size,
+        resolution,
         live_photo_mode,
-        live_photo_size,
+        live_resolution,
         live_photo_mov_filename_policy,
-        align_raw,
+        edited,
+        alternative,
+        raw_policy,
         file_match_policy,
-        force_size,
+        force_resolution,
         keep_unicode_in_filenames,
-    }
+    })
 }
 
 /// Bootstrap environment values needed by `resolve_auth` and `Config::build`.
@@ -1457,30 +1471,34 @@ impl Config {
             folder_structure: _,
             folder_structure_albums: _,
             folder_structure_smart_folders: _,
-            size,
+            resolution,
             live_photo_mode,
-            live_photo_size,
+            live_resolution,
             live_photo_mov_filename_policy,
-            align_raw,
+            edited,
+            alternative,
+            raw_policy,
             file_match_policy,
-            force_size,
+            force_resolution,
             keep_unicode_in_filenames,
         } = resolve_path_derivation_fields(
             PathDerivationCliArgs {
                 folder_structure: Some(folder_structure.clone()),
                 folder_structure_albums: Some(folder_structure_albums.clone()),
                 folder_structure_smart_folders: Some(folder_structure_smart_folders.clone()),
-                size: overrides.size,
+                resolution: overrides.resolution,
                 live_photo_mode: live_photo_mode_pre_resolved,
-                live_photo_size: overrides.live_photo_size,
+                live_resolution: overrides.live_resolution,
                 live_photo_mov_filename_policy: overrides.live_photo_mov_filename_policy,
-                align_raw: overrides.align_raw,
+                edited: overrides.edited,
+                alternative: overrides.alternative,
+                raw_policy: overrides.raw_policy,
                 file_match_policy: overrides.file_match_policy,
-                force_size: overrides.force_size,
+                force_resolution: overrides.force_resolution,
                 keep_unicode_in_filenames: overrides.keep_unicode_in_filenames,
             },
             toml,
-        );
+        )?;
 
         let watch_with_interval = overrides
             .watch_with_interval
@@ -1596,13 +1614,15 @@ impl Config {
                 skip_photos,
             },
             photos: PhotoConfig {
-                size,
-                live_photo_size,
+                resolution,
+                live_resolution,
                 live_photo_mode,
                 live_photo_mov_filename_policy,
-                align_raw,
+                edited,
+                alternative,
+                raw_policy,
                 file_match_policy,
-                force_size,
+                force_resolution,
                 keep_unicode_in_filenames,
             },
             retry: ResolvedRetryConfig {
@@ -1820,15 +1840,15 @@ impl Config {
                 skip_created_after: self.filters.persistent_skip_created_after.clone(),
             }),
             photos: Some(TomlPhotos {
-                size: if self.photos.size == VersionSize::Original {
+                resolution: if self.photos.resolution == PhotoResolution::Original {
                     None
                 } else {
-                    Some(self.photos.size)
+                    Some(self.photos.resolution)
                 },
-                live_photo_size: if self.photos.live_photo_size == LivePhotoSize::Original {
+                live_resolution: if self.photos.live_resolution == LivePhotoResolution::Original {
                     None
                 } else {
-                    Some(self.photos.live_photo_size)
+                    Some(self.photos.live_resolution)
                 },
                 live_photo_mode: if self.photos.live_photo_mode == LivePhotoMode::Both {
                     None
@@ -1842,10 +1862,16 @@ impl Config {
                 } else {
                     Some(self.photos.live_photo_mov_filename_policy)
                 },
-                align_raw: if self.photos.align_raw == RawTreatmentPolicy::Unchanged {
+                edited: if self.photos.edited { Some(true) } else { None },
+                alternative: if self.photos.alternative {
+                    Some(true)
+                } else {
+                    None
+                },
+                raw_policy: if self.photos.raw_policy == RawPolicy::AsIs {
                     None
                 } else {
-                    Some(self.photos.align_raw)
+                    Some(self.photos.raw_policy)
                 },
                 file_match_policy: if self.photos.file_match_policy
                     == FileMatchPolicy::NameSizeDedupWithSuffix
@@ -1854,7 +1880,7 @@ impl Config {
                 } else {
                     Some(self.photos.file_match_policy)
                 },
-                force_size: if self.photos.force_size {
+                force_resolution: if self.photos.force_resolution {
                     Some(true)
                 } else {
                     None
@@ -2284,12 +2310,12 @@ mod tests {
             skip_created_after = "2025-01-01"
 
             [photos]
-            size = "original"
-            live_photo_size = "original"
+            resolution = "original"
+            live_resolution = "original"
             live_photo_mov_filename_policy = "suffix"
-            align_raw = "as-is"
+            raw_policy = "as-is"
             file_match_policy = "name-size-dedup-with-suffix"
-            force_size = false
+            force_resolution = false
             keep_unicode_in_filenames = false
 
             [watch]
@@ -2312,8 +2338,8 @@ mod tests {
         assert_eq!(filters.albums, Some(vec!["Favorites".to_string()]));
         assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(500)));
         let photos = config.photos.unwrap();
-        assert_eq!(photos.size, Some(VersionSize::Original));
-        assert_eq!(photos.align_raw, Some(RawTreatmentPolicy::Unchanged));
+        assert_eq!(photos.resolution, Some(PhotoResolution::Original));
+        assert_eq!(photos.raw_policy, Some(RawPolicy::AsIs));
         assert_eq!(
             photos.file_match_policy,
             Some(FileMatchPolicy::NameSizeDedupWithSuffix)
@@ -2336,17 +2362,14 @@ mod tests {
     fn test_toml_parse_enum_values() {
         let toml_str = r#"
             [photos]
-            size = "medium"
-            align_raw = "alternative"
+            resolution = "medium"
+            raw_policy = "prefer-jpeg"
             file_match_policy = "name-id7"
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         let photos = config.photos.unwrap();
-        assert_eq!(photos.size, Some(VersionSize::Medium));
-        assert_eq!(
-            photos.align_raw,
-            Some(RawTreatmentPolicy::PreferAlternative)
-        );
+        assert_eq!(photos.resolution, Some(PhotoResolution::Medium));
+        assert_eq!(photos.raw_policy, Some(RawPolicy::PreferJpeg));
         assert_eq!(photos.file_match_policy, Some(FileMatchPolicy::NameId7));
     }
 
@@ -2415,7 +2438,7 @@ mod tests {
         assert_eq!(cfg.retry.max_retries, 3);
         assert_eq!(cfg.retry.retry_delay_secs, 5);
         assert_eq!(cfg.download.temp_suffix, ".kei-tmp");
-        assert!(matches!(cfg.photos.size, VersionSize::Original));
+        assert!(matches!(cfg.photos.resolution, PhotoResolution::Original));
         assert!(matches!(cfg.auth.domain, Domain::Com));
     }
 
@@ -2778,10 +2801,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.download.threads_num, 10);
-        assert!(matches!(
-            cfg.photos.align_raw,
-            RawTreatmentPolicy::Unchanged
-        ));
+        assert!(matches!(cfg.photos.raw_policy, RawPolicy::AsIs));
     }
 
     #[test]
@@ -3392,38 +3412,36 @@ mod tests {
     // ── TOML enum variant exhaustive tests ─────────────────────────
 
     #[test]
-    fn test_toml_parse_all_size_variants() {
+    fn test_toml_parse_all_resolution_variants() {
         for (input, expected) in [
-            ("original", VersionSize::Original),
-            ("medium", VersionSize::Medium),
-            ("thumb", VersionSize::Thumb),
-            ("adjusted", VersionSize::Adjusted),
-            ("alternative", VersionSize::Alternative),
+            ("original", PhotoResolution::Original),
+            ("medium", PhotoResolution::Medium),
+            ("thumb", PhotoResolution::Thumb),
+            ("none", PhotoResolution::None),
         ] {
-            let toml_str = format!("[photos]\nsize = \"{input}\"");
+            let toml_str = format!("[photos]\nresolution = \"{input}\"\nedited = true");
             let config: TomlConfig = toml::from_str(&toml_str).unwrap();
             assert_eq!(
-                config.photos.unwrap().size,
+                config.photos.unwrap().resolution,
                 Some(expected),
-                "size variant: {input}"
+                "resolution variant: {input}"
             );
         }
     }
 
     #[test]
-    fn test_toml_parse_all_live_photo_size_variants() {
+    fn test_toml_parse_all_live_resolution_variants() {
         for (input, expected) in [
-            ("original", LivePhotoSize::Original),
-            ("medium", LivePhotoSize::Medium),
-            ("thumb", LivePhotoSize::Thumb),
-            ("adjusted", LivePhotoSize::Adjusted),
+            ("original", LivePhotoResolution::Original),
+            ("medium", LivePhotoResolution::Medium),
+            ("thumb", LivePhotoResolution::Thumb),
         ] {
-            let toml_str = format!("[photos]\nlive_photo_size = \"{input}\"");
+            let toml_str = format!("[photos]\nlive_resolution = \"{input}\"");
             let config: TomlConfig = toml::from_str(&toml_str).unwrap();
             assert_eq!(
-                config.photos.unwrap().live_photo_size,
+                config.photos.unwrap().live_resolution,
                 Some(expected),
-                "live_photo_size variant: {input}"
+                "live_resolution variant: {input}"
             );
         }
     }
@@ -3476,18 +3494,18 @@ mod tests {
     }
 
     #[test]
-    fn test_toml_parse_all_align_raw_variants() {
+    fn test_toml_parse_all_raw_policy_variants() {
         for (input, expected) in [
-            ("as-is", RawTreatmentPolicy::Unchanged),
-            ("original", RawTreatmentPolicy::PreferOriginal),
-            ("alternative", RawTreatmentPolicy::PreferAlternative),
+            ("as-is", RawPolicy::AsIs),
+            ("prefer-raw", RawPolicy::PreferRaw),
+            ("prefer-jpeg", RawPolicy::PreferJpeg),
         ] {
-            let toml_str = format!("[photos]\nalign_raw = \"{input}\"");
+            let toml_str = format!("[photos]\nraw_policy = \"{input}\"");
             let config: TomlConfig = toml::from_str(&toml_str).unwrap();
             assert_eq!(
-                config.photos.unwrap().align_raw,
+                config.photos.unwrap().raw_policy,
                 Some(expected),
-                "align_raw variant: {input}"
+                "raw_policy variant: {input}"
             );
         }
     }
@@ -3517,7 +3535,7 @@ mod tests {
     fn test_toml_reject_invalid_enum_value() {
         let toml_str = r#"
             [photos]
-            size = "huge"
+            resolution = "huge"
         "#;
         assert!(toml::from_str::<TomlConfig>(toml_str).is_err());
     }
@@ -3574,7 +3592,7 @@ mod tests {
         assert!(config.auth.unwrap().username.is_none());
         assert!(config.download.unwrap().threads.is_none());
         assert!(config.filters.unwrap().libraries.is_none());
-        assert!(config.photos.unwrap().size.is_none());
+        assert!(config.photos.unwrap().resolution.is_none());
         assert!(config.watch.unwrap().interval.is_none());
         assert!(config.notifications.unwrap().script.is_none());
     }
@@ -3648,25 +3666,25 @@ mod tests {
     fn test_toml_photos_all_fields() {
         let toml_str = r#"
             [photos]
-            size = "thumb"
-            live_photo_size = "medium"
+            resolution = "thumb"
+            live_resolution = "medium"
             live_photo_mov_filename_policy = "original"
-            align_raw = "original"
+            raw_policy = "prefer-raw"
             file_match_policy = "name-id7"
-            force_size = true
+            force_resolution = true
             keep_unicode_in_filenames = true
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         let p = config.photos.unwrap();
-        assert_eq!(p.size, Some(VersionSize::Thumb));
-        assert_eq!(p.live_photo_size, Some(LivePhotoSize::Medium));
+        assert_eq!(p.resolution, Some(PhotoResolution::Thumb));
+        assert_eq!(p.live_resolution, Some(LivePhotoResolution::Medium));
         assert_eq!(
             p.live_photo_mov_filename_policy,
             Some(LivePhotoMovFilenamePolicy::Original)
         );
-        assert_eq!(p.align_raw, Some(RawTreatmentPolicy::PreferOriginal));
+        assert_eq!(p.raw_policy, Some(RawPolicy::PreferRaw));
         assert_eq!(p.file_match_policy, Some(FileMatchPolicy::NameId7));
-        assert_eq!(p.force_size, Some(true));
+        assert_eq!(p.force_resolution, Some(true));
         assert_eq!(p.keep_unicode_in_filenames, Some(true));
     }
 
@@ -3962,24 +3980,21 @@ mod tests {
         assert!(cfg.filters.skip_created_before.is_none());
         assert!(cfg.filters.skip_created_after.is_none());
         // Photos
-        assert!(matches!(cfg.photos.size, VersionSize::Original));
+        assert!(matches!(cfg.photos.resolution, PhotoResolution::Original));
         assert!(matches!(
-            cfg.photos.live_photo_size,
-            LivePhotoSize::Original
+            cfg.photos.live_resolution,
+            LivePhotoResolution::Original
         ));
         assert!(matches!(
             cfg.photos.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Suffix
         ));
-        assert!(matches!(
-            cfg.photos.align_raw,
-            RawTreatmentPolicy::Unchanged
-        ));
+        assert!(matches!(cfg.photos.raw_policy, RawPolicy::AsIs));
         assert!(matches!(
             cfg.photos.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
         ));
-        assert!(!cfg.photos.force_size);
+        assert!(!cfg.photos.force_resolution);
         assert!(!cfg.photos.keep_unicode_in_filenames);
         // Watch
         assert!(cfg.watch.interval.is_none());
@@ -4196,24 +4211,24 @@ mod tests {
     }
 
     #[test]
-    fn test_build_size_cli_overrides_toml() {
+    fn test_build_resolution_cli_overrides_toml() {
         let toml_str = r#"
             [photos]
-            size = "thumb"
+            resolution = "thumb"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
-        sync.config_overrides.size = Some(VersionSize::Medium);
+        sync.config_overrides.resolution = Some(PhotoResolution::Medium);
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert!(matches!(cfg.photos.size, VersionSize::Medium));
+        assert!(matches!(cfg.photos.resolution, PhotoResolution::Medium));
     }
 
     #[test]
-    fn test_build_size_from_toml() {
+    fn test_build_resolution_from_toml() {
         let toml_str = r#"
             [photos]
-            size = "thumb"
+            resolution = "thumb"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -4223,60 +4238,68 @@ mod tests {
             Some(&toml),
         )
         .unwrap();
-        assert!(matches!(cfg.photos.size, VersionSize::Thumb));
+        assert!(matches!(cfg.photos.resolution, PhotoResolution::Thumb));
     }
 
     #[test]
-    fn test_build_live_photo_size_cli_overrides_toml() {
+    fn test_build_live_resolution_cli_overrides_toml() {
         let toml_str = r#"
             [photos]
-            live_photo_size = "thumb"
+            live_resolution = "thumb"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
-        sync.config_overrides.live_photo_size = Some(LivePhotoSize::Medium);
+        sync.config_overrides.live_resolution = Some(LivePhotoResolution::Medium);
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert!(matches!(cfg.photos.live_photo_size, LivePhotoSize::Medium));
-    }
-
-    #[test]
-    fn test_build_live_photo_size_from_toml() {
-        let toml_str = r#"
-            [photos]
-            live_photo_size = "thumb"
-        "#;
-        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
-        let cfg = Config::build(
-            &default_globals(),
-            &default_password(),
-            default_sync(),
-            Some(&toml),
-        )
-        .unwrap();
-        assert!(matches!(cfg.photos.live_photo_size, LivePhotoSize::Thumb));
-    }
-
-    #[test]
-    fn test_build_live_photo_size_defaults_to_adjusted_when_size_adjusted() {
-        let mut sync = default_sync();
-        sync.config_overrides.size = Some(VersionSize::Adjusted);
-        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(matches!(
-            cfg.photos.live_photo_size,
-            LivePhotoSize::Adjusted
+            cfg.photos.live_resolution,
+            LivePhotoResolution::Medium
         ));
     }
 
     #[test]
-    fn test_build_live_photo_size_explicit_overrides_adjusted_default() {
+    fn test_build_live_resolution_from_toml() {
+        let toml_str = r#"
+            [photos]
+            live_resolution = "thumb"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.photos.live_resolution,
+            LivePhotoResolution::Thumb
+        ));
+    }
+
+    #[test]
+    fn test_build_edited_keeps_live_resolution_default() {
         let mut sync = default_sync();
-        sync.config_overrides.size = Some(VersionSize::Adjusted);
-        sync.config_overrides.live_photo_size = Some(LivePhotoSize::Original);
+        sync.config_overrides.resolution = Some(PhotoResolution::Original);
+        sync.config_overrides.edited = Some(true);
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         assert!(matches!(
-            cfg.photos.live_photo_size,
-            LivePhotoSize::Original
+            cfg.photos.live_resolution,
+            LivePhotoResolution::Original
+        ));
+    }
+
+    #[test]
+    fn test_build_live_resolution_explicit_overrides_edited_default() {
+        let mut sync = default_sync();
+        sync.config_overrides.resolution = Some(PhotoResolution::Original);
+        sync.config_overrides.edited = Some(true);
+        sync.config_overrides.live_resolution = Some(LivePhotoResolution::Original);
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert!(matches!(
+            cfg.photos.live_resolution,
+            LivePhotoResolution::Original
         ));
     }
 
@@ -4319,20 +4342,17 @@ mod tests {
     }
 
     #[test]
-    fn test_build_align_raw_cli_overrides_toml() {
+    fn test_build_raw_policy_cli_overrides_toml() {
         let toml_str = r#"
             [photos]
-            align_raw = "original"
+            raw_policy = "prefer-raw"
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
-        sync.config_overrides.align_raw = Some(RawTreatmentPolicy::PreferAlternative);
+        sync.config_overrides.raw_policy = Some(RawPolicy::PreferJpeg);
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert!(matches!(
-            cfg.photos.align_raw,
-            RawTreatmentPolicy::PreferAlternative
-        ));
+        assert!(matches!(cfg.photos.raw_policy, RawPolicy::PreferJpeg));
     }
 
     #[test]
@@ -4379,54 +4399,54 @@ mod tests {
     /// both `sync` and `import-existing` follow when invoked bare.
     #[test]
     fn resolve_path_derivation_all_defaults() {
-        let pd = resolve_path_derivation_fields(PathDerivationCliArgs::default(), None);
+        let pd = resolve_path_derivation_fields(PathDerivationCliArgs::default(), None).unwrap();
         assert_eq!(pd.folder_structure, "%Y/%m/%d");
-        assert_eq!(pd.size, VersionSize::Original);
+        assert_eq!(pd.resolution, PhotoResolution::Original);
         assert_eq!(pd.live_photo_mode, LivePhotoMode::Both);
-        assert_eq!(pd.live_photo_size, LivePhotoSize::Original);
+        assert_eq!(pd.live_resolution, LivePhotoResolution::Original);
         assert_eq!(
             pd.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Suffix
         );
-        assert_eq!(pd.align_raw, RawTreatmentPolicy::Unchanged);
+        assert_eq!(pd.raw_policy, RawPolicy::AsIs);
         assert_eq!(
             pd.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
         );
-        assert!(!pd.force_size);
+        assert!(!pd.force_resolution);
         assert!(!pd.keep_unicode_in_filenames);
     }
 
-    /// `--size adjusted` without explicit `--live-photo-size` must drag
-    /// the live-photo companion size to `adjusted` too. Both sync and
-    /// import inherit this from the shared resolver — pinning here
-    /// catches anyone "simplifying" the smart default away.
+    /// `edited = true` is additive in v0.20: it does not rewrite the
+    /// primary or live-photo resolution. Adjusted stills and videos are
+    /// selected later as extra renditions by the download filter.
     #[test]
-    fn resolve_path_derivation_size_adjusted_drags_live_photo_size() {
+    fn resolve_path_derivation_edited_keeps_live_resolution_default() {
         let cli = PathDerivationCliArgs {
-            size: Some(VersionSize::Adjusted),
+            resolution: Some(PhotoResolution::Original),
+            edited: Some(true),
             ..Default::default()
         };
-        let pd = resolve_path_derivation_fields(cli, None);
-        assert_eq!(pd.size, VersionSize::Adjusted);
+        let pd = resolve_path_derivation_fields(cli, None).unwrap();
+        assert_eq!(pd.resolution, PhotoResolution::Original);
         assert_eq!(
-            pd.live_photo_size,
-            LivePhotoSize::Adjusted,
-            "smart default: --size adjusted should drag live_photo_size"
+            pd.live_resolution,
+            LivePhotoResolution::Original,
+            "edited extras must not rewrite live_resolution"
         );
     }
 
-    /// CLI explicit `--live-photo-size original` must beat the smart
-    /// default so a user can opt out of the size-adjusted drag.
+    /// Explicit live resolution still wins when edited extras are enabled.
     #[test]
-    fn resolve_path_derivation_explicit_live_photo_size_beats_smart_default() {
+    fn resolve_path_derivation_explicit_live_resolution_beats_toml() {
         let cli = PathDerivationCliArgs {
-            size: Some(VersionSize::Adjusted),
-            live_photo_size: Some(LivePhotoSize::Original),
+            resolution: Some(PhotoResolution::Original),
+            edited: Some(true),
+            live_resolution: Some(LivePhotoResolution::Original),
             ..Default::default()
         };
-        let pd = resolve_path_derivation_fields(cli, None);
-        assert_eq!(pd.live_photo_size, LivePhotoSize::Original);
+        let pd = resolve_path_derivation_fields(cli, None).unwrap();
+        assert_eq!(pd.live_resolution, LivePhotoResolution::Original);
     }
 
     /// CLI > TOML > default. The resolver short-circuits on the first
@@ -4437,31 +4457,32 @@ mod tests {
         let toml: TomlConfig = toml::from_str(
             r#"
             [photos]
-            size = "adjusted"
+            resolution = "original"
+            edited = true
             file_match_policy = "name-id7"
-            force_size = true
+            force_resolution = true
             keep_unicode_in_filenames = true
-            align_raw = "original"
+            raw_policy = "prefer-raw"
             "#,
         )
         .unwrap();
         let cli = PathDerivationCliArgs {
-            size: Some(VersionSize::Original),
+            resolution: Some(PhotoResolution::Original),
             file_match_policy: Some(FileMatchPolicy::NameSizeDedupWithSuffix),
-            force_size: Some(false),
+            force_resolution: Some(false),
             keep_unicode_in_filenames: Some(false),
-            align_raw: Some(RawTreatmentPolicy::Unchanged),
+            raw_policy: Some(RawPolicy::AsIs),
             ..Default::default()
         };
-        let pd = resolve_path_derivation_fields(cli, Some(&toml));
-        assert_eq!(pd.size, VersionSize::Original);
+        let pd = resolve_path_derivation_fields(cli, Some(&toml)).unwrap();
+        assert_eq!(pd.resolution, PhotoResolution::Original);
         assert_eq!(
             pd.file_match_policy,
             FileMatchPolicy::NameSizeDedupWithSuffix
         );
-        assert!(!pd.force_size);
+        assert!(!pd.force_resolution);
         assert!(!pd.keep_unicode_in_filenames);
-        assert_eq!(pd.align_raw, RawTreatmentPolicy::Unchanged);
+        assert_eq!(pd.raw_policy, RawPolicy::AsIs);
     }
 
     /// TOML wins when the CLI is silent. Pin this so anyone refactoring
@@ -4474,20 +4495,56 @@ mod tests {
             folder_structure = "%Y/%m"
 
             [photos]
-            size = "adjusted"
+            resolution = "original"
+            edited = true
             live_photo_mode = "skip"
             file_match_policy = "name-id7"
             "#,
         )
         .unwrap();
-        let pd = resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml));
+        let pd =
+            resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml)).unwrap();
         assert_eq!(pd.folder_structure, "%Y/%m");
-        assert_eq!(pd.size, VersionSize::Adjusted);
+        assert_eq!(pd.resolution, PhotoResolution::Original);
         assert_eq!(pd.live_photo_mode, LivePhotoMode::Skip);
         assert_eq!(pd.file_match_policy, FileMatchPolicy::NameId7);
-        // Smart default should still drag here because `--live-photo-size`
-        // wasn't set in either CLI or TOML.
-        assert_eq!(pd.live_photo_size, LivePhotoSize::Adjusted);
+        // Edited extras do not rewrite the live-photo resolution.
+        assert_eq!(pd.live_resolution, LivePhotoResolution::Original);
+    }
+
+    #[test]
+    fn resolve_path_derivation_rejects_resolution_none_without_extras() {
+        let toml: TomlConfig = toml::from_str(
+            r#"
+            [photos]
+            resolution = "none"
+            "#,
+        )
+        .unwrap();
+        let err = resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml))
+            .expect_err("resolution none needs an extra");
+        assert!(
+            err.to_string().contains("requires photos.edited"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn old_photo_toml_names_are_rejected() {
+        for (key, value) in [
+            ("size", "\"original\""),
+            ("live_photo_size", "\"original\""),
+            ("align_raw", "\"as-is\""),
+            ("force_size", "true"),
+        ] {
+            let toml = format!("[photos]\n{key} = {value}\n");
+            let err = toml::from_str::<TomlConfig>(&toml)
+                .expect_err(&format!("old photos.{key} key should hard-error"));
+            assert!(
+                err.message().contains(&format!("unknown field `{key}`")),
+                "unexpected error for {key}: {err}"
+            );
+        }
     }
 
     // ── Config::build: boolean/media merge exhaustive ─────────────
@@ -4508,7 +4565,7 @@ mod tests {
 
             [photos]
             live_photo_mode = "skip"
-            force_size = true
+            force_resolution = true
             keep_unicode_in_filenames = true
 
             [watch]
@@ -4527,7 +4584,7 @@ mod tests {
         assert!(cfg.filters.skip_videos);
         assert!(!cfg.filters.skip_photos);
         assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::Skip);
-        assert!(cfg.photos.force_size);
+        assert!(cfg.photos.force_resolution);
         assert!(cfg.photos.keep_unicode_in_filenames);
         assert!(cfg.watch.notify_systemd);
     }
@@ -4542,7 +4599,7 @@ mod tests {
         sync.no_progress_bar = Some(true);
         sync.config_overrides.skip_videos = Some(true);
         sync.config_overrides.live_photo_mode = Some(LivePhotoMode::Skip);
-        sync.config_overrides.force_size = Some(true);
+        sync.config_overrides.force_resolution = Some(true);
         sync.config_overrides.keep_unicode_in_filenames = Some(true);
         sync.config_overrides.notify_systemd = Some(true);
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
@@ -4551,7 +4608,7 @@ mod tests {
         assert!(cfg.filters.skip_videos);
         assert!(!cfg.filters.skip_photos);
         assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::Skip);
-        assert!(cfg.photos.force_size);
+        assert!(cfg.photos.force_resolution);
         assert!(cfg.photos.keep_unicode_in_filenames);
         assert!(cfg.watch.notify_systemd);
     }
@@ -4862,12 +4919,12 @@ mod tests {
             recent = 50
 
             [photos]
-            size = "medium"
-            live_photo_size = "thumb"
+            resolution = "medium"
+            live_resolution = "thumb"
             live_photo_mov_filename_policy = "original"
-            align_raw = "alternative"
+            raw_policy = "prefer-jpeg"
             file_match_policy = "name-id7"
-            force_size = true
+            force_resolution = true
 
             [watch]
             interval = 900
@@ -4904,21 +4961,21 @@ mod tests {
         );
         assert!(cfg.filters.skip_videos);
         assert_eq!(cfg.filters.recent, Some(50));
-        assert!(matches!(cfg.photos.size, VersionSize::Medium));
-        assert!(matches!(cfg.photos.live_photo_size, LivePhotoSize::Thumb));
+        assert!(matches!(cfg.photos.resolution, PhotoResolution::Medium));
+        assert!(matches!(
+            cfg.photos.live_resolution,
+            LivePhotoResolution::Thumb
+        ));
         assert!(matches!(
             cfg.photos.live_photo_mov_filename_policy,
             LivePhotoMovFilenamePolicy::Original
         ));
-        assert!(matches!(
-            cfg.photos.align_raw,
-            RawTreatmentPolicy::PreferAlternative
-        ));
+        assert!(matches!(cfg.photos.raw_policy, RawPolicy::PreferJpeg));
         assert!(matches!(
             cfg.photos.file_match_policy,
             FileMatchPolicy::NameId7
         ));
-        assert!(cfg.photos.force_size);
+        assert!(cfg.photos.force_resolution);
         assert_eq!(cfg.watch.interval, Some(900));
         assert_eq!(cfg.watch.pid_file, Some(PathBuf::from("/full/pid")));
     }
@@ -5366,8 +5423,8 @@ mod tests {
         let toml = cfg.to_toml();
         // Default domain (com) should be omitted
         assert!(toml.auth.as_ref().unwrap().domain.is_none());
-        // Default size (original) should be omitted
-        assert!(toml.photos.as_ref().unwrap().size.is_none());
+        // Default resolution (original) should be omitted
+        assert!(toml.photos.as_ref().unwrap().resolution.is_none());
         // Default temp_suffix should be omitted
         assert!(toml.download.as_ref().unwrap().temp_suffix.is_none());
     }
@@ -5491,7 +5548,7 @@ mod tests {
         let pw = default_password();
         globals.domain = Some(crate::types::Domain::Cn);
         let mut sync = default_sync();
-        sync.config_overrides.size = Some(crate::types::VersionSize::Medium);
+        sync.config_overrides.resolution = Some(crate::types::PhotoResolution::Medium);
         let cfg = Config::build(&globals, &pw, sync, None).unwrap();
         let toml = cfg.to_toml();
         assert_eq!(
@@ -5499,8 +5556,8 @@ mod tests {
             Some(crate::types::Domain::Cn)
         );
         assert_eq!(
-            toml.photos.as_ref().unwrap().size,
-            Some(crate::types::VersionSize::Medium)
+            toml.photos.as_ref().unwrap().resolution,
+            Some(crate::types::PhotoResolution::Medium)
         );
     }
 
