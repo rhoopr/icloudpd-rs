@@ -60,6 +60,18 @@ kei_toml_string() {
     printf '"%s"' "$s"
 }
 
+kei_append_toml_fragment() {
+    local fragment="$1"
+    if [ -z "$fragment" ]; then
+        return
+    fi
+    printf '%s' "$fragment"
+    case "$fragment" in
+        *$'\n') ;;
+        *) echo ;;
+    esac
+}
+
 kei_write_sync_config() {
     local data_dir="${1:?data dir required}"
     local download_dir="${2:?download dir required}"
@@ -71,14 +83,14 @@ kei_write_sync_config() {
     {
         echo "[download]"
         printf 'directory = %s\n' "$(kei_toml_string "$download_dir")"
-        printf '%s' "$download_extra"
+        kei_append_toml_fragment "$download_extra"
         echo "[filters]"
         printf 'albums = [%s]\n' "$(kei_toml_string "$(kei_album)")"
         echo "unfiled = false"
-        printf '%s' "$filters_extra"
+        kei_append_toml_fragment "$filters_extra"
         if [ -n "$photos_extra" ]; then
             echo "[photos]"
-            printf '%s' "$photos_extra"
+            kei_append_toml_fragment "$photos_extra"
         fi
     } > "$config"
     printf '%s' "$config"

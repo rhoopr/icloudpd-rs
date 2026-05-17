@@ -40,26 +40,14 @@ cp "$COOKIES/".* "$DOCKER_CONFIG/" 2>/dev/null
 # Strip lock files so the container doesn't conflict with the host kei.
 rm -f "$DOCKER_CONFIG/"*.lock "$DOCKER_CONFIG/.lock"
 
-cat >"$DOCKER_CONFIG/config.toml" <<EOF
-[download]
-directory = "/photos"
-
-[filters]
-albums = ["$ALBUM"]
-unfiled = false
-EOF
-
-cat >"$DOCKER_CONFIG/watch-config.toml" <<EOF
-[download]
-directory = "/photos"
-
-[filters]
-albums = ["$ALBUM"]
-unfiled = false
-
-[watch]
-interval = 60
-EOF
+sync_config="$(kei_write_sync_config "$DOCKER_CONFIG" "/photos")"
+cp "$sync_config" "$DOCKER_CONFIG/config.toml"
+{
+    cat "$sync_config"
+    echo ""
+    echo "[watch]"
+    echo "interval = 60"
+} > "$DOCKER_CONFIG/watch-config.toml"
 
 echo "--- 1. Docker sync ($ALBUM album) ---"
 docker run --rm \

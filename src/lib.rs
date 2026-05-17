@@ -670,7 +670,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     // Build non-TOML globals early. In v0.20 these come from the narrow
     // bootstrap env allow-list, not public global CLI flags.
-    let mut globals = config::GlobalArgs::from_cli(&cli);
+    let mut globals = config::GlobalArgs::from_bootstrap_env();
 
     // Dispatch based on command
     let mut command = cli.effective_command();

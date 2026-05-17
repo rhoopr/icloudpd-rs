@@ -855,10 +855,10 @@ pub(crate) fn resolve_path_derivation_fields(
     }
 }
 
-/// Global CLI args needed by `resolve_auth` and `Config::build`.
+/// Bootstrap environment values needed by `resolve_auth` and `Config::build`.
 ///
-/// Bundles the fields that moved from per-command `AuthArgs` to
-/// global options on `Cli`.
+/// These are the narrow env allow-list that remains after v0.20 moved durable
+/// settings out of public global CLI flags.
 #[derive(Debug, Clone)]
 pub(crate) struct GlobalArgs {
     pub username: Option<String>,
@@ -867,7 +867,7 @@ pub(crate) struct GlobalArgs {
 }
 
 impl GlobalArgs {
-    pub fn from_cli(_cli: &crate::cli::Cli) -> Self {
+    pub fn from_bootstrap_env() -> Self {
         Self {
             username: std::env::var("ICLOUD_USERNAME").ok(),
             domain: None,
@@ -1005,16 +1005,6 @@ impl Config {
         toml: Option<&TomlConfig>,
     ) -> anyhow::Result<Self> {
         let overrides = std::mem::take(&mut sync.config_overrides);
-        Self::build_with_overrides(globals, pw, sync, overrides, toml)
-    }
-
-    pub(crate) fn build_with_overrides(
-        globals: &GlobalArgs,
-        pw: &crate::cli::PasswordArgs,
-        sync: crate::cli::SyncArgs,
-        overrides: SyncConfigOverrides,
-        toml: Option<&TomlConfig>,
-    ) -> anyhow::Result<Self> {
         let friendly_request = toml.and_then(|t| t.ui.as_ref()).and_then(|u| u.friendly);
         Self::build_inner(
             globals,

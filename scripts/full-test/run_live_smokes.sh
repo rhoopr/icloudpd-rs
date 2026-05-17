@@ -17,9 +17,12 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+PROJECT_DIR="$repo_root"
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 time_phase="$script_dir/time_phase.sh"
 binary="$repo_root/target/release/kei"
+# shellcheck disable=SC1091
+source "$repo_root/tests/shell/lib.sh"
 
 if [[ ! -x "$binary" ]]; then
   echo "run_live_smokes: missing release binary at $binary (run Phase 1 first)" >&2
@@ -28,26 +31,10 @@ fi
 
 USR="${ICLOUD_USERNAME:-missing@example.invalid}"
 DD="${KEI_TEST_DATA_DIR:-$repo_root/.test-cookies}"
-ALBUM="${KEI_TEST_ALBUM:-kei-test}"
 DOWNLOAD_DIR="${KEI_TEST_DOWNLOAD_DIR:-/tmp/codex/photos-test}"
 mkdir -p "$DOWNLOAD_DIR"
 
-toml_string() {
-  local s="$1"
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  printf '"%s"' "$s"
-}
-
-sync_config="$DD/.kei-live-smoke-sync.toml"
-mkdir -p "$DD"
-{
-  echo "[download]"
-  printf 'directory = %s\n' "$(toml_string "$DOWNLOAD_DIR")"
-  echo "[filters]"
-  printf 'albums = [%s]\n' "$(toml_string "$ALBUM")"
-  echo "unfiled = false"
-} > "$sync_config"
+sync_config="$(kei_write_sync_config "$DD" "$DOWNLOAD_DIR")"
 
 run() {
   local phase="$1"; shift
