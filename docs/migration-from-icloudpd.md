@@ -1,11 +1,11 @@
 # Migrating from `icloudpd`
 
-> Last updated on 5-16-26 for v0.14.2.
+> Last updated on 5-17-26 for v0.20.
 
 This guide is for moving an existing
 [`icloud-photos-downloader`](https://github.com/icloud-photos-downloader/icloud_photos_downloader)
 (`icloudpd`) library to kei without downloading everything again. It matches
-kei 0.14.x.
+kei v0.20.
 
 The short version:
 
@@ -107,11 +107,21 @@ kei import-existing --download-dir ~/Photos/iCloud \
 ### Libraries and albums
 
 kei defaults to the primary iCloud Photos library. If you want shared libraries
-too, import and sync with the same library selector:
+too, import with the same library selector that sync will read from TOML:
 
 ```sh
-kei import-existing --library all --download-dir ~/Photos/iCloud
-kei sync --library all --download-dir ~/Photos/iCloud
+kei import-existing --library all --download-dir ~/Photos/iCloud --config ~/.config/kei/config.toml
+```
+
+```toml
+[filters]
+libraries = ["all"]
+```
+
+Then run sync with that config:
+
+```sh
+kei sync --config ~/.config/kei/config.toml
 ```
 
 For multi-library trees, add `{library}` to the active templates if you want
@@ -156,30 +166,30 @@ password for future runs.
 | `icloudpd` | kei | Notes |
 |---|---|---|
 | `-u`, `--username` | `[auth].username` | `ICLOUD_USERNAME` still works for automation. |
-| `-p`, `--password` | Same | Works, but process lists can expose it. Prefer `kei password set`, `--password-file`, or `--password-command`. |
-| `-d`, `--directory` | `-d`, `--download-dir` | `--directory` was removed in v0.20. |
-| `-a`, `--album` | Same | Repeatable. Default is `all`; use `--album '!Name'` for exclusions. |
-| `--exclude-album NAME` | `--album '!NAME'` | Removed in v0.20. |
+| `-p`, `--password` | `--password`, `[auth].password_file`, `[auth].password_command`, or `kei password set` | Avoid putting passwords in process lists when you can. |
+| `-d`, `--directory` | `import-existing --download-dir`; sync uses `[download].directory` | `--directory` was removed in v0.20. |
+| `-a`, `--album` | `[filters].albums = ["Name"]` | Use `["!Name"]` for exclusions. |
+| `--exclude-album NAME` | `[filters].albums = ["!NAME"]` | Removed in v0.20. |
 | `--list-albums` | `kei list albums` | The old flag was removed in v0.20. |
 | `--list-libraries` | `kei list libraries` | The old flag was removed in v0.20. |
 | `--cookie-directory` | `data_dir` | The old flag was removed in v0.20. New default is `~/.config/kei`; `KEI_DATA_DIR` still works for automation. |
-| `--folder-structure "{:%Y/%m/%d}"` | `--folder-structure "%Y/%m/%d"` | Python wrapper syntax is still accepted. Album and smart-folder templates now have separate flags. |
-| `--size original` | Same | Values: `original`, `medium`, `thumb`, `adjusted`, `alternative`. kei accepts one size per run. |
-| `--threads-num` | `--threads` | The old flag was removed in v0.20. Default is 10. With `--bandwidth-limit` and no explicit thread count, default drops to 1. |
-| `--skip-videos`, `--skip-photos` | Same | Boolean flags also accept explicit false when overriding config. |
-| `--skip-live-photos` | `--live-photo-mode skip` | The old flag was removed in v0.20. |
-| `--recent 100` | Same | Count form works for sync and import. |
-| `--recent 30d` | Same for sync | Import rejects the days form. |
-| `--set-exif-datetime` | Same | kei also has EXIF rating, GPS, and description flags. |
-| `--keep-unicode-in-filenames` | Same | Must match during import. |
-| `--live-photo-mov-filename-policy` | Same | `suffix` or `original`. |
-| `--file-match-policy` | Same | `name-size-dedup-with-suffix` or `name-id7`. |
+| `--folder-structure "{:%Y/%m/%d}"` | `[download].folder_structure = "%Y/%m/%d"` | Python wrapper syntax is still accepted. Use `folder_structure_albums` and `folder_structure_smart_folders` for the other passes. |
+| `--size original` | `[photos].size = "original"` | Values: `original`, `medium`, `thumb`, `adjusted`, `alternative`. kei accepts one size per run. |
+| `--threads-num` | `[download].threads` | Default is 10. With `[download].bandwidth_limit` and no explicit thread count, default drops to 1. |
+| `--skip-videos`, `--skip-photos` | `[filters].skip_videos`, `[filters].skip_photos` | Boolean TOML settings replace the sync flags. |
+| `--skip-live-photos` | `[photos].live_photo_mode = "skip"` | The old flag was removed in v0.20. |
+| `--recent 100` | `--recent 100` | Count form works for sync and import. |
+| `--recent 30d` | `--recent 30d` for sync | Import rejects the days form. |
+| `--set-exif-datetime` | `[download].set_exif_datetime = true` | kei also has EXIF rating, GPS, and description settings. |
+| `--keep-unicode-in-filenames` | `[photos].keep_unicode_in_filenames = true` | Match this during import. |
+| `--live-photo-mov-filename-policy` | `[photos].live_photo_mov_filename_policy` | `suffix` or `original`. |
+| `--file-match-policy` | `[photos].file_match_policy` | `name-size-dedup-with-suffix` or `name-id7`. |
 | `--domain` | `[auth].domain` | `com` or `cn`. |
-| `--watch-with-interval` | Same | Built-in watch mode. |
-| `--log-level` | Same | `debug`, `info`, `warn`, `error`. |
-| `--only-print-filenames` | Same | Prints paths and doesn't download. |
-| `--dry-run` | Same | Doesn't modify local state or iCloud. |
-| `--notification-script` | Same flag | kei sends `KEI_EVENT`, `KEI_MESSAGE`, and `KEI_ICLOUD_USERNAME`. |
+| `--watch-with-interval` | `[watch].interval`; Docker uses `kei service run` | Built-in watch mode moved to durable config and service commands. |
+| `--log-level` | `--log-level` or `log_level` | `debug`, `info`, `warn`, `error`. |
+| `--only-print-filenames` | `--only-print-filenames` | Per-run flag that prints paths and doesn't download. |
+| `--dry-run` | `--dry-run` | Per-run flag that doesn't modify local state or iCloud. |
+| `--notification-script` | `[notifications].script` | kei sends `KEI_EVENT`, `KEI_MESSAGE`, and `KEI_ICLOUD_USERNAME`. |
 
 ## Python flags without a kei equivalent
 
@@ -194,8 +204,9 @@ password for future runs.
 | `--password-provider` | Use `--password-file`, `--password-command`, or `kei password set`. |
 | `--mfa-provider` | Not applicable. Use trusted-device 2FA with `kei login get-code` and `kei login submit-code`. |
 
-`--xmp-sidecar` is implemented in kei, along with `--embed-xmp`. They write
-iCloud metadata that Python didn't handle the same way.
+`[download].xmp_sidecar` is implemented in kei, along with
+`[download].embed_xmp`. They write iCloud metadata that Python didn't handle
+the same way.
 
 ## Useful kei-only options
 
@@ -208,22 +219,22 @@ iCloud metadata that Python didn't handle the same way.
 | `--password-command <cmd>` | Read the password from a shell command. |
 | `kei password set` | Store the password in the OS keyring or encrypted file backend. |
 | `--save-password` | Save the password after a successful auth. |
-| `--library` | Select primary, shared, all, named, or excluded iCloud libraries. |
-| `--smart-folder` | Sync Favorites, Screenshots, Hidden, Recently Deleted, and other Apple smart folders. |
-| `--unfiled false` | Disable the separate pass for photos not in any user album. |
-| `--filename-exclude` | Skip files by glob, such as `*.AAE` or `Screenshot*`. |
-| `--bandwidth-limit` | Cap total download throughput, for example `10M` or `1.5Mi`. |
-| `--set-exif-rating`, `--set-exif-gps`, `--set-exif-description` | Write more iCloud metadata into downloaded media. |
-| `--embed-xmp`, `--xmp-sidecar` | Embed XMP or write `.xmp` sidecars. |
-| `--max-retries` | Retry downloads. Default is 3. |
-| `--temp-suffix` | Temp file suffix for partial downloads. Default is `.kei-tmp`. |
-| `--report-json` | Write the latest sync report atomically as JSON. |
-| `--http-bind`, `--http-port` | Serve `/healthz` and `/metrics` during watch mode. |
+| `[filters].libraries` | Select primary, shared, all, named, or excluded iCloud libraries. |
+| `[filters].smart_folders` | Sync Favorites, Screenshots, Hidden, Recently Deleted, and other Apple smart folders. |
+| `[filters].unfiled = false` | Disable the separate pass for photos not in any user album. |
+| `[filters].filename_exclude` | Skip files by glob, such as `*.AAE` or `Screenshot*`. |
+| `[download].bandwidth_limit` | Cap total download throughput, for example `10M` or `1.5Mi`. |
+| `[download].set_exif_rating`, `.set_exif_gps`, `.set_exif_description` | Write more iCloud metadata into downloaded media. |
+| `[download].embed_xmp`, `[download].xmp_sidecar` | Embed XMP or write `.xmp` sidecars. |
+| `[download.retry].max_retries` | Retry downloads. Default is 3. |
+| `[download].temp_suffix` | Temp file suffix for partial downloads. Default is `.kei-tmp`. |
+| `[report].json` | Write the latest sync report atomically as JSON. |
+| `[server].bind`, `[server].port` | Serve `/healthz` and `/metrics` during watch mode. |
+| `[watch].reconcile_every_n_cycles` | Periodic read-only reconciliation warning pass during watch mode. |
 | `--friendly`, `--no-friendly` | Control the interactive progress UI. |
 | `kei status` | Show database and sync status. |
 | `kei verify` | Check downloaded files exist, with optional checksums. |
 | `kei reconcile` | Mark missing local files as failed so the next sync re-downloads them. |
-| `--reconcile-every-n-cycles` | Periodic read-only reconciliation warning pass during watch mode. |
 
 ## Removed kei compatibility aliases
 
@@ -231,8 +242,8 @@ v0.20 removed the remaining v0.13 compatibility aliases:
 
 | Deprecated | Use |
 |---|---|
-| `--exclude-album`, `KEI_EXCLUDE_ALBUM` | `--album '!NAME'` |
-| `{album}` inside `--folder-structure` | `--folder-structure-albums "{album}/..."` |
+| `--exclude-album`, `KEI_EXCLUDE_ALBUM` | `[filters].albums = ["!NAME"]` |
+| `{album}` inside `--folder-structure` | `[download].folder_structure_albums = "{album}/..."` |
 | `[filters].album` | `[filters].albums = ["NAME"]` |
 | `[filters].exclude_albums` | `[filters].albums = ["!NAME"]` |
 | `[filters].library` | `[filters].libraries` |
@@ -290,8 +301,8 @@ docker exec --user $(id -u):$(id -g) kei kei login submit-code 123456
   lowercased extensions.
 - If Apple doesn't send an original filename, kei falls back to a sanitized
   title when available, then the record name.
-- `--embed-xmp` and `--xmp-sidecar` add metadata that Python-created files
-  won't have.
+- `[download].embed_xmp` and `[download].xmp_sidecar` add metadata that
+  Python-created files won't have.
 
 ## What you don't need to worry about
 
