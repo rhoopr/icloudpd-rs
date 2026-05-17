@@ -458,6 +458,44 @@ directory = "/toml/photos"
 }
 
 #[test]
+fn config_show_omits_derived_top_level_values_when_unset() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let download_dir = dir.path().join("photos");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[auth]
+username = "toml@example.com"
+
+[download]
+directory = {}
+"#,
+            common::toml_string(&download_dir.to_string_lossy())
+        ),
+    )
+    .unwrap();
+
+    let out = clean_cmd()
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: toml::Value = toml::from_str(&stdout).unwrap();
+    assert!(
+        parsed.get("data_dir").is_none(),
+        "config show must not serialize derived data_dir when TOML omitted it; stdout: {stdout}"
+    );
+    assert!(
+        parsed.get("log_level").is_none(),
+        "config show must not serialize default log_level when TOML omitted it; stdout: {stdout}"
+    );
+}
+
+#[test]
 fn config_show_emits_unfiled_false_when_explicit() {
     // The cli.rs help-shadow test for --unfiled only verifies clap parses;
     // it does not pin the resolved value all the way through Config::build
@@ -3351,6 +3389,35 @@ fn removed_sync_env_vars_do_not_block_non_sync_command() {
         .success()
         .stderr(predicate::str::contains("sync-only flag").not());
 }
+
+#[test]
+fn removed_sync_env_vars_do_not_supply_sync_config() {
+    // Removed sync env mirrors must not keep configuring sync after v0.20.
+    // With no TOML [download].directory, this must fail at config resolution
+    // even if a stale KEI_DOWNLOAD_DIR is still present in the environment.
+    let dir = tempfile::tempdir().unwrap();
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .env("KEI_DOWNLOAD_DIR", "/legacy/photos")
+        .env("KEI_ALBUM", "Legacy Album")
+        .env("KEI_THREADS", "4")
+        .args(["sync", "--only-print-filenames"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[download] directory is required"),
+        "stale sync env vars must not provide durable config; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "stale sync env vars should be ignored by clap, not parsed as CLI args; stderr: {stderr}"
+    );
+}
+
 #[test]
 fn removed_sync_env_vars_do_not_block_service_status() {
     // Regression: issue #385 - same class of bug on a different non-sync
