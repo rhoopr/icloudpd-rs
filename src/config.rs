@@ -672,6 +672,7 @@ impl std::fmt::Debug for Config {
             .field("directory", &self.download.directory)
             .field("domain", &self.auth.domain)
             .field("cookie_directory", &self.auth.cookie_directory)
+            .field("metadata", &self.metadata)
             .field("import", &self.import)
             .finish_non_exhaustive()
     }
