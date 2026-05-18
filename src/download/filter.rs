@@ -1210,14 +1210,20 @@ pub(super) fn filter_asset_to_tasks(
         }
     }
 
-    for d in [
-        derive_edited_extra(asset, config, &ctx, &seen_urls),
-        derive_alternative_extra(asset, config, &ctx, &seen_urls),
-        derive_live_edited_extra(asset, config, &ctx, &seen_urls),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    type ExtraDeriver<'a> = fn(
+        &crate::icloud::photos::PhotoAsset,
+        &DownloadConfig,
+        &DerivationContext<'a>,
+        &[Box<str>],
+    ) -> Option<DerivedPath>;
+    for derive_extra in [
+        derive_edited_extra as ExtraDeriver<'_>,
+        derive_alternative_extra as ExtraDeriver<'_>,
+        derive_live_edited_extra as ExtraDeriver<'_>,
+    ] {
+        let Some(d) = derive_extra(asset, config, &ctx, &seen_urls) else {
+            continue;
+        };
         let DerivedPath {
             path,
             filename,
