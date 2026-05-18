@@ -690,20 +690,22 @@ fn import_existing_requires_directory() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "--download-dir is required for import-existing",
+            "[download] directory is required for import-existing",
         ));
 }
 #[test]
 fn import_existing_rejects_nonexistent_directory() {
     let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[download]\ndirectory = \"/does/not/exist/anywhere\"\n",
+    )
+    .unwrap();
     clean_cmd()
         .env("ICLOUD_USERNAME", "test@example.com")
         .env("KEI_DATA_DIR", dir.path())
-        .args([
-            "import-existing",
-            "--download-dir",
-            "/does/not/exist/anywhere",
-        ])
+        .args(["--config", config.to_str().unwrap(), "import-existing"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(

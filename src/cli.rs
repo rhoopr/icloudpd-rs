@@ -1,7 +1,4 @@
-use crate::types::{
-    FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LivePhotoSize, LogLevel,
-    RawTreatmentPolicy, VersionSize,
-};
+use crate::types::LogLevel;
 use clap::{Args, FromArgMatches, Parser, Subcommand};
 
 /// Reject empty strings at CLI parse time.
@@ -268,62 +265,8 @@ pub struct ImportArgs {
     /// the truncated 8-char `SharedSync-` prefix that `{library}` renders
     /// into paths), the sentinels `primary` / `shared` / `all` / `none`, or
     /// `!name` to exclude.
-    #[arg(long = "library", env = "KEI_LIBRARY", value_parser = non_empty_string)]
+    #[arg(long = "library", value_parser = non_empty_string)]
     pub libraries: Vec<String>,
-
-    /// Local directory containing existing downloads
-    #[arg(short = 'd', long = "download-dir", env = "KEI_DOWNLOAD_DIR", value_parser = non_empty_string)]
-    pub download_dir: Option<String>,
-
-    /// Folder structure used by the unfiled pass when matching files on
-    /// disk (must match `--folder-structure` during sync).
-    #[arg(long, env = "KEI_FOLDER_STRUCTURE")]
-    pub folder_structure: Option<String>,
-
-    /// Folder structure used by every album pass when matching files on
-    /// disk (must match `--folder-structure-albums` during sync). Default
-    /// `{album}`.
-    #[arg(long, env = "KEI_FOLDER_STRUCTURE_ALBUMS")]
-    pub folder_structure_albums: Option<String>,
-
-    /// Folder structure used by every smart-folder pass when matching
-    /// files on disk (must match `--folder-structure-smart-folders` during
-    /// sync). Default `{smart-folder}`.
-    #[arg(long, env = "KEI_FOLDER_STRUCTURE_SMART_FOLDERS")]
-    pub folder_structure_smart_folders: Option<String>,
-
-    /// Keep Unicode in filenames (must match what was used during sync)
-    #[arg(long, env = "KEI_KEEP_UNICODE_IN_FILENAMES", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub keep_unicode_in_filenames: Option<bool>,
-
-    /// File matching and dedup policy (must match what was used during sync)
-    #[arg(long, env = "KEI_FILE_MATCH_POLICY", value_enum)]
-    pub file_match_policy: Option<FileMatchPolicy>,
-
-    /// Image size to import (must match what was used during sync). Default: original.
-    #[arg(long, env = "KEI_SIZE", value_enum)]
-    pub size: Option<VersionSize>,
-
-    /// Live photo handling: both, image-only, video-only, skip
-    /// (must match what was used during sync)
-    #[arg(long, env = "KEI_LIVE_PHOTO_MODE", value_enum)]
-    pub live_photo_mode: Option<LivePhotoMode>,
-
-    /// Live photo video size (must match what was used during sync)
-    #[arg(long, env = "KEI_LIVE_PHOTO_SIZE", value_enum)]
-    pub live_photo_size: Option<LivePhotoSize>,
-
-    /// Live photo MOV filename policy (must match what was used during sync)
-    #[arg(long, env = "KEI_LIVE_PHOTO_MOV_FILENAME_POLICY", value_enum)]
-    pub live_photo_mov_filename_policy: Option<LivePhotoMovFilenamePolicy>,
-
-    /// RAW treatment policy (must match what was used during sync)
-    #[arg(long, env = "KEI_ALIGN_RAW", value_enum)]
-    pub align_raw: Option<RawTreatmentPolicy>,
-
-    /// Only check the requested size (don't fall back to original)
-    #[arg(long, env = "KEI_FORCE_SIZE", num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub force_size: Option<bool>,
 
     /// Number of recent photos to check (`--recent 100`). The `--recent Nd`
     /// days form is only supported in `sync`; import-existing errors on use.
@@ -331,8 +274,8 @@ pub struct ImportArgs {
     pub recent: Option<RecentLimit>,
 
     /// Scan and report matches without writing to the state DB. Useful for
-    /// verifying that `--folder-structure` and `--keep-unicode-in-filenames`
-    /// match the tree you're importing before committing.
+    /// verifying that TOML path and filename settings match the tree you're
+    /// importing before committing.
     #[arg(long)]
     pub dry_run: bool,
 
@@ -350,6 +293,10 @@ pub struct ImportArgs {
     /// has data (the prior-row check is global, not per-zone).
     #[arg(long, env = "KEI_FORCE_EMPTY")]
     pub force_empty: bool,
+
+    /// Verify a cloud prefix before adopting a same-name, same-size local file.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 /// Arguments for the verify command.
@@ -1952,13 +1899,11 @@ mod tests {
 
     #[test]
     fn test_import_existing_subcommand() {
-        let cli =
-            Cli::try_parse_from(["kei", "import-existing", "--download-dir", "/photos"]).unwrap();
+        let cli = Cli::try_parse_from(["kei", "import-existing"]).unwrap();
         if let Some(Command::ImportExisting(args)) = cli.command {
-            assert_eq!(args.download_dir.as_deref(), Some("/photos"));
-
-            assert!(args.folder_structure.is_none());
             assert!(args.recent.is_none());
+            assert!(!args.dry_run);
+            assert!(!args.strict);
         } else {
             panic!("Expected ImportExisting command");
         }
@@ -1966,15 +1911,9 @@ mod tests {
 
     #[test]
     fn test_import_existing_library_flag_single() {
-        let cli = Cli::try_parse_from([
-            "kei",
-            "import-existing",
-            "--library",
-            "SharedSync-ABCD1234",
-            "--download-dir",
-            "/photos",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["kei", "import-existing", "--library", "SharedSync-ABCD1234"])
+                .unwrap();
         if let Some(Command::ImportExisting(args)) = cli.command {
             assert_eq!(args.libraries, vec!["SharedSync-ABCD1234".to_string()]);
         } else {
@@ -1984,9 +1923,7 @@ mod tests {
 
     /// Parity check with `kei sync --library`: import-existing's flag is also
     /// repeatable and accepts mixed sentinels, zone names, and `!name`
-    /// exclusions in one invocation. Pre-v0.13 the flag was a single
-    /// `Option<String>` and a second `--library` silently won, so
-    /// multi-library import had to be configured via TOML.
+    /// exclusions in one invocation.
     #[test]
     fn test_import_existing_library_flag_repeatable_with_mixed_grammar() {
         let cli = Cli::try_parse_from([
@@ -1998,8 +1935,6 @@ mod tests {
             "SharedSync-ABCD1234",
             "--library",
             "!SharedSync-Photos",
-            "--download-dir",
-            "/photos",
         ])
         .unwrap();
         let Some(Command::ImportExisting(args)) = cli.command else {
@@ -2015,17 +1950,8 @@ mod tests {
         );
     }
 
-    // ── import-existing path-derivation flags ──────────────────────────
-    //
-    // Each flag here changes how `expected_paths_for` derives the on-disk
-    // path. A regression in the clap value_parser (e.g. mapping `medium` to
-    // `Original`) is silent unless the parsed variant is asserted -- a
-    // `--help`-driven smoke test catches "spelling vanished" but not
-    // "spelling reaches the wrong variant". These tests pin the
-    // CLI-string -> enum mapping for every accepted value.
-
     fn parse_import(extra: &[&str]) -> ImportArgs {
-        let mut args = vec!["kei", "import-existing", "--download-dir", "/tmp"];
+        let mut args = vec!["kei", "import-existing"];
         args.extend(extra.iter().copied());
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
@@ -2035,84 +1961,14 @@ mod tests {
     }
 
     #[test]
-    fn import_existing_size_flag_parses_to_correct_variant() {
-        for (input, expected) in [
-            ("original", VersionSize::Original),
-            ("medium", VersionSize::Medium),
-            ("thumb", VersionSize::Thumb),
-            ("adjusted", VersionSize::Adjusted),
-            ("alternative", VersionSize::Alternative),
-        ] {
-            let args = parse_import(&["--size", input]);
-            assert_eq!(args.size, Some(expected), "size={input}");
-        }
-    }
-
-    #[test]
-    fn import_existing_live_photo_mode_parses_to_correct_variant() {
-        for (input, expected) in [
-            ("both", LivePhotoMode::Both),
-            ("image-only", LivePhotoMode::ImageOnly),
-            ("video-only", LivePhotoMode::VideoOnly),
-            ("skip", LivePhotoMode::Skip),
-        ] {
-            let args = parse_import(&["--live-photo-mode", input]);
-            assert_eq!(args.live_photo_mode, Some(expected), "mode={input}");
-        }
-    }
-
-    #[test]
-    fn import_existing_live_photo_size_parses_to_correct_variant() {
-        for (input, expected) in [
-            ("original", LivePhotoSize::Original),
-            ("medium", LivePhotoSize::Medium),
-            ("thumb", LivePhotoSize::Thumb),
-            ("adjusted", LivePhotoSize::Adjusted),
-        ] {
-            let args = parse_import(&["--live-photo-size", input]);
-            assert_eq!(args.live_photo_size, Some(expected), "size={input}");
-        }
-    }
-
-    #[test]
-    fn import_existing_live_photo_mov_filename_policy_parses_to_correct_variant() {
-        for (input, expected) in [
-            ("suffix", LivePhotoMovFilenamePolicy::Suffix),
-            ("original", LivePhotoMovFilenamePolicy::Original),
-        ] {
-            let args = parse_import(&["--live-photo-mov-filename-policy", input]);
-            assert_eq!(
-                args.live_photo_mov_filename_policy,
-                Some(expected),
-                "policy={input}"
-            );
-        }
-    }
-
-    #[test]
-    fn import_existing_align_raw_parses_to_correct_variant() {
-        for (input, expected) in [
-            ("as-is", RawTreatmentPolicy::Unchanged),
-            ("original", RawTreatmentPolicy::PreferOriginal),
-            ("alternative", RawTreatmentPolicy::PreferAlternative),
-        ] {
-            let args = parse_import(&["--align-raw", input]);
-            assert_eq!(args.align_raw, Some(expected), "policy={input}");
-        }
-    }
-
-    #[test]
-    fn import_existing_force_size_flag_parses_to_true() {
-        let args = parse_import(&["--force-size"]);
-        assert_eq!(args.force_size, Some(true));
+    fn import_existing_strict_flag_parses_to_true() {
+        let args = parse_import(&["--strict"]);
+        assert!(args.strict);
     }
 
     #[test]
     fn import_existing_force_empty_flag_parses_to_true() {
         let _guard = scrub_auth_env();
-        // SAFETY: scrub_auth_env serializes against the env_var test that
-        // also mutates KEI_FORCE_EMPTY. Clearing here protects against a
-        // developer shell that has KEI_FORCE_EMPTY=true exported.
         unsafe {
             std::env::remove_var("KEI_FORCE_EMPTY");
         }
@@ -2123,7 +1979,6 @@ mod tests {
     #[test]
     fn import_existing_force_empty_default_is_false() {
         let _guard = scrub_auth_env();
-        // SAFETY: same rationale as the flag test above.
         unsafe {
             std::env::remove_var("KEI_FORCE_EMPTY");
         }
@@ -2134,14 +1989,10 @@ mod tests {
     #[test]
     fn import_existing_force_empty_env_var_parses_to_true() {
         let _guard = scrub_auth_env();
-        // SAFETY: scrub_auth_env serializes against any other test that
-        // mutates these env vars; KEI_FORCE_EMPTY is read synchronously by
-        // clap during parse below.
         unsafe {
             std::env::set_var("KEI_FORCE_EMPTY", "true");
         }
-        let cli =
-            Cli::try_parse_from(["kei", "import-existing", "--download-dir", "/tmp"]).unwrap();
+        let cli = Cli::try_parse_from(["kei", "import-existing"]).unwrap();
         unsafe {
             std::env::remove_var("KEI_FORCE_EMPTY");
         }
@@ -2152,44 +2003,28 @@ mod tests {
     }
 
     #[test]
-    fn import_existing_keep_unicode_flag_parses_to_true() {
-        let args = parse_import(&["--keep-unicode-in-filenames"]);
-        assert_eq!(args.keep_unicode_in_filenames, Some(true));
-    }
-
-    #[test]
-    fn import_existing_keep_unicode_env_var_parses_to_true() {
-        let _guard = scrub_auth_env();
-        // SAFETY: scrub_auth_env serializes against any other test that
-        // mutates these env vars; KEI_KEEP_UNICODE_IN_FILENAMES is read
-        // synchronously by clap during parse below.
-        unsafe {
-            std::env::set_var("KEI_KEEP_UNICODE_IN_FILENAMES", "true");
-        }
-        let cli =
-            Cli::try_parse_from(["kei", "import-existing", "--download-dir", "/tmp"]).unwrap();
-        unsafe {
-            std::env::remove_var("KEI_KEEP_UNICODE_IN_FILENAMES");
-        }
-        match cli.command {
-            Some(Command::ImportExisting(args)) => {
-                assert_eq!(args.keep_unicode_in_filenames, Some(true));
-            }
-            _ => panic!("Expected ImportExisting command"),
-        }
-    }
-
-    #[test]
-    fn import_existing_file_match_policy_parses_to_correct_variant() {
-        for (input, expected) in [
-            (
-                "name-size-dedup-with-suffix",
-                FileMatchPolicy::NameSizeDedupWithSuffix,
-            ),
-            ("name-id7", FileMatchPolicy::NameId7),
+    fn import_existing_removed_durable_flags_fail() {
+        for (flag, value) in [
+            ("--download-dir", Some("/tmp")),
+            ("-d", Some("/tmp")),
+            ("--folder-structure", Some("%Y/%m")),
+            ("--folder-structure-albums", Some("{album}")),
+            ("--folder-structure-smart-folders", Some("{smart-folder}")),
+            ("--file-match-policy", Some("name-id7")),
+            ("--size", Some("medium")),
+            ("--live-photo-mode", Some("image-only")),
+            ("--live-photo-size", Some("medium")),
+            ("--live-photo-mov-filename-policy", Some("original")),
+            ("--align-raw", Some("original")),
+            ("--force-size", None),
+            ("--keep-unicode-in-filenames", None),
         ] {
-            let args = parse_import(&["--file-match-policy", input]);
-            assert_eq!(args.file_match_policy, Some(expected), "policy={input}");
+            let mut argv = vec!["kei", "import-existing", flag];
+            if let Some(value) = value {
+                argv.push(value);
+            }
+            let err = Cli::try_parse_from(argv).expect_err("removed flag must fail");
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
         }
     }
 

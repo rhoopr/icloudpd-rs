@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
+use futures_util::future::BoxFuture;
 
 use crate::auth;
 use crate::cli;
@@ -50,6 +51,7 @@ pub(crate) struct ImportStats {
     pub matched: u64,
     pub unmatched: u64,
     pub filtered: u64,
+    pub strict_refused: u64,
     pub hash_errors: u64,
     pub skipped_already_imported: u64,
 }
@@ -60,6 +62,7 @@ impl std::ops::AddAssign for ImportStats {
         self.matched += rhs.matched;
         self.unmatched += rhs.unmatched;
         self.filtered += rhs.filtered;
+        self.strict_refused += rhs.strict_refused;
         self.hash_errors += rhs.hash_errors;
         self.skipped_already_imported += rhs.skipped_already_imported;
     }
@@ -67,6 +70,133 @@ impl std::ops::AddAssign for ImportStats {
 
 /// Default cadence for the `import-existing` heartbeat log line.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const STRICT_IMPORT_PREFIX_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StrictImportDecision {
+    Accepted,
+    Refused,
+}
+
+pub(crate) trait StrictImportVerifier {
+    fn verify<'a>(
+        &'a self,
+        local_path: &'a Path,
+        cloud_url: &'a str,
+        expected_size: u64,
+    ) -> BoxFuture<'a, anyhow::Result<StrictImportDecision>>;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImportRunOptions<'a> {
+    pub(crate) dry_run: bool,
+    pub(crate) show_progress: bool,
+    pub(crate) strict_verifier: Option<&'a dyn StrictImportVerifier>,
+}
+
+impl std::fmt::Debug for ImportRunOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportRunOptions")
+            .field("dry_run", &self.dry_run)
+            .field("show_progress", &self.show_progress)
+            .field("strict", &self.strict_verifier.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HttpStrictImportVerifier {
+    client: reqwest::Client,
+}
+
+impl HttpStrictImportVerifier {
+    fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl StrictImportVerifier for HttpStrictImportVerifier {
+    fn verify<'a>(
+        &'a self,
+        local_path: &'a Path,
+        cloud_url: &'a str,
+        expected_size: u64,
+    ) -> BoxFuture<'a, anyhow::Result<StrictImportDecision>> {
+        Box::pin(verify_strict_prefix(
+            &self.client,
+            local_path,
+            cloud_url,
+            expected_size,
+        ))
+    }
+}
+
+async fn verify_strict_prefix(
+    client: &reqwest::Client,
+    local_path: &Path,
+    cloud_url: &str,
+    expected_size: u64,
+) -> anyhow::Result<StrictImportDecision> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncReadExt;
+
+    let prefix_len_u64 = expected_size.min(STRICT_IMPORT_PREFIX_BYTES);
+    let prefix_len = usize::try_from(prefix_len_u64)
+        .context("strict import prefix length does not fit in usize")?;
+    if prefix_len == 0 {
+        return Ok(StrictImportDecision::Accepted);
+    }
+
+    let mut local_prefix = vec![0_u8; prefix_len];
+    let mut local = tokio::fs::File::open(local_path)
+        .await
+        .with_context(|| format!("opening {} for strict import", local_path.display()))?;
+    local
+        .read_exact(&mut local_prefix)
+        .await
+        .with_context(|| format!("reading strict prefix from {}", local_path.display()))?;
+
+    let range_end = prefix_len_u64.saturating_sub(1);
+    let response = client
+        .get(cloud_url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{range_end}"))
+        .send()
+        .await
+        .with_context(|| format!("fetching strict import prefix from {cloud_url}"))?;
+    let status = response.status();
+    if !(status == reqwest::StatusCode::PARTIAL_CONTENT || status == reqwest::StatusCode::OK) {
+        anyhow::bail!("strict import prefix fetch returned HTTP {status}");
+    }
+
+    let mut cloud_prefix = Vec::with_capacity(prefix_len);
+    let mut stream = response.bytes_stream();
+    while cloud_prefix.len() < prefix_len {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let chunk = chunk.context("reading strict import prefix response")?;
+        let remaining = prefix_len - cloud_prefix.len();
+        let take = chunk.len().min(remaining);
+        let Some(prefix) = chunk.get(..take) else {
+            anyhow::bail!("strict import prefix chunk shorter than expected");
+        };
+        cloud_prefix.extend_from_slice(prefix);
+    }
+    if cloud_prefix.len() < prefix_len {
+        anyhow::bail!(
+            "strict import prefix fetch returned {} bytes, expected {prefix_len}",
+            cloud_prefix.len()
+        );
+    }
+
+    if cloud_prefix == local_prefix {
+        Ok(StrictImportDecision::Accepted)
+    } else {
+        Ok(StrictImportDecision::Refused)
+    }
+}
 
 /// Live counters shared between the scan loop and the heartbeat task.
 ///
@@ -82,6 +212,7 @@ struct HeartbeatState {
     matched: std::sync::atomic::AtomicU64,
     unmatched: std::sync::atomic::AtomicU64,
     filtered: std::sync::atomic::AtomicU64,
+    strict_refused: std::sync::atomic::AtomicU64,
     hash_errors: std::sync::atomic::AtomicU64,
     skipped_already_imported: std::sync::atomic::AtomicU64,
     last_seen_id: std::sync::Mutex<Option<String>>,
@@ -95,6 +226,7 @@ impl HeartbeatState {
             matched: self.matched.load(Ordering::Relaxed),
             unmatched: self.unmatched.load(Ordering::Relaxed),
             filtered: self.filtered.load(Ordering::Relaxed),
+            strict_refused: self.strict_refused.load(Ordering::Relaxed),
             hash_errors: self.hash_errors.load(Ordering::Relaxed),
             skipped_already_imported: self.skipped_already_imported.load(Ordering::Relaxed),
             last_seen_id: self.last_seen_id.lock().ok().and_then(|g| g.clone()),
@@ -108,6 +240,7 @@ struct HeartbeatSnapshot {
     matched: u64,
     unmatched: u64,
     filtered: u64,
+    strict_refused: u64,
     hash_errors: u64,
     skipped_already_imported: u64,
     last_seen_id: Option<String>,
@@ -149,6 +282,7 @@ impl HeartbeatGuard {
                             matched = snap.matched,
                             unmatched = snap.unmatched,
                             filtered = snap.filtered,
+                            strict_refused = snap.strict_refused,
                             hash_errors = snap.hash_errors,
                             skipped_already_imported = snap.skipped_already_imported,
                             last_seen_id = snap.last_seen_id.as_deref().unwrap_or("(none)"),
@@ -267,9 +401,8 @@ pub(crate) async fn import_assets<S>(
     db: &dyn StateDb,
     download_config: &download::DownloadConfig,
     library_label: &str,
-    dry_run: bool,
-    show_progress: bool,
     dir_cache: &mut DirCache,
+    options: ImportRunOptions<'_>,
 ) -> anyhow::Result<ImportStats>
 where
     S: futures_util::Stream<Item = anyhow::Result<PhotoAsset>>,
@@ -376,6 +509,7 @@ where
             path: primary_path,
             size: expected_size,
             checksum,
+            url,
             version_size,
         } in expected
         {
@@ -404,7 +538,43 @@ where
                 }
             };
 
-            if !dry_run {
+            if let Some(verifier) = options.strict_verifier {
+                match verifier
+                    .verify(&expected_path, url.as_ref(), expected_size)
+                    .await
+                {
+                    Ok(StrictImportDecision::Accepted) => {}
+                    Ok(StrictImportDecision::Refused) => {
+                        tracing::warn!(
+                            asset_id = %asset.id(),
+                            version = ?version_size,
+                            path = %expected_path.display(),
+                            "Strict import refused same-name, same-size file: local prefix differs from cloud prefix",
+                        );
+                        stats.strict_refused += 1;
+                        heartbeat_state
+                            .strict_refused
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            asset_id = %asset.id(),
+                            version = ?version_size,
+                            path = %expected_path.display(),
+                            error = %e,
+                            "Strict import refused same-name, same-size file: prefix verification failed",
+                        );
+                        stats.strict_refused += 1;
+                        heartbeat_state
+                            .strict_refused
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+            }
+
+            if !options.dry_run {
                 // Skip-rehash short-circuit: if a prior adopt left a row
                 // for this (library, id, version_size) at the same path
                 // with the same on-disk size + mtime, the file hasn't
@@ -435,7 +605,7 @@ where
                     heartbeat_state
                         .skipped_already_imported
                         .fetch_add(1, Ordering::Relaxed);
-                    log_progress_milestone(library_label, stats.matched, show_progress);
+                    log_progress_milestone(library_label, stats.matched, options.show_progress);
                     continue;
                 }
 
@@ -495,7 +665,7 @@ where
 
             stats.matched += 1;
             heartbeat_state.matched.fetch_add(1, Ordering::Relaxed);
-            log_progress_milestone(library_label, stats.matched, show_progress);
+            log_progress_milestone(library_label, stats.matched, options.show_progress);
         }
     }
 
@@ -534,6 +704,8 @@ pub(crate) async fn run_import_existing(
     let db_path = super::super::get_db_path(globals, toml)?;
     let download_config = build_import_download_config(&args, toml)?;
     let directory = Arc::clone(&download_config.directory);
+    let strict_import = resolve_import_strict(&args, toml);
+    let strict_verifier = strict_import.then(HttpStrictImportVerifier::new);
 
     let recent_count: Option<u32> = match args.recent {
         None => None,
@@ -661,9 +833,14 @@ pub(crate) async fn run_import_existing(
                 db.as_ref(),
                 &pass_config,
                 zone,
-                args.dry_run,
-                !args.no_progress_bar,
                 &mut dir_cache,
+                ImportRunOptions {
+                    dry_run: args.dry_run,
+                    show_progress: !args.no_progress_bar,
+                    strict_verifier: strict_verifier
+                        .as_ref()
+                        .map(|v| v as &dyn StrictImportVerifier),
+                },
             )
             .await?;
             totals += stats;
@@ -684,6 +861,7 @@ pub(crate) async fn run_import_existing(
     );
     println!("  Unmatched versions:   {}", totals.unmatched);
     println!("  Filtered (no path):   {}", totals.filtered);
+    println!("  Strict refusals:      {}", totals.strict_refused);
     println!("  Hash errors:          {}", totals.hash_errors);
 
     Ok(())
@@ -746,88 +924,64 @@ fn validate_non_empty_libraries(empty_zones: &[&str], prior_db_total: u64) -> an
     );
 }
 
-/// Resolve a [`download::DownloadConfig`] from import-existing CLI args + TOML.
+fn resolve_import_strict(args: &cli::ImportArgs, toml: Option<&config::TomlConfig>) -> bool {
+    args.strict
+        || toml
+            .and_then(|t| t.import.as_ref())
+            .and_then(|i| i.strict)
+            .unwrap_or(false)
+}
+
+/// Resolve a [`download::DownloadConfig`] from import-existing TOML.
 ///
-/// The resolution mirrors sync's CLI/env > TOML > default chain for every
-/// field that affects path derivation. Fields that don't affect path
-/// derivation (state DB handle, retry config, concurrency, sync mode, ...)
-/// are populated with inert defaults: `import-existing` never instantiates a
-/// download pipeline, so those values are unused.
+/// Persistent path/media/photo settings are shared with sync through the TOML
+/// config. Fields that don't affect path derivation (state DB handle, retry
+/// config, concurrency, sync mode, ...) are populated with inert defaults:
+/// `import-existing` never instantiates a download pipeline, so those values
+/// are unused.
 fn build_import_download_config(
     args: &cli::ImportArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<download::DownloadConfig> {
     let toml_dl = toml.and_then(|t| t.download.as_ref());
 
-    let directory_cli = args.download_dir.clone();
-    let directory_str = directory_cli
-        .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
+    let directory_str = toml_dl
+        .and_then(|d| d.directory.clone())
         .unwrap_or_default();
     if directory_str.is_empty() {
-        anyhow::bail!("--download-dir is required for import-existing");
+        anyhow::bail!("[download] directory is required for import-existing");
     }
     let directory_path = config::expand_tilde(&directory_str);
     config::validate_download_dir(&directory_path)?;
     let directory: Arc<Path> = Arc::from(directory_path.as_path());
 
-    let (resolution, edited_from_size, alternative_from_size) = match args.size {
-        Some(crate::types::VersionSize::Adjusted) => (
-            Some(crate::types::PhotoResolution::None),
-            Some(true),
-            Some(false),
-        ),
-        Some(crate::types::VersionSize::Alternative) => (
-            Some(crate::types::PhotoResolution::None),
-            Some(false),
-            Some(true),
-        ),
-        Some(size) => (Some(size.into()), Some(false), Some(false)),
-        None => (None, None, None),
-    };
-    let live_adjusted_from_size = matches!(args.size, Some(crate::types::VersionSize::Adjusted))
-        && args.live_photo_size.is_none();
-    let live_adjusted_from_live_size = matches!(
-        args.live_photo_size,
-        Some(crate::types::LivePhotoSize::Adjusted)
-    );
-    let live_resolution = match args.live_photo_size {
-        Some(crate::types::LivePhotoSize::Adjusted) => {
-            Some(crate::types::LivePhotoResolution::Original)
-        }
-        Some(size) => Some(size.into()),
-        None => None,
-    };
-    let raw_policy = args.align_raw.map(Into::into);
     let path_fields = config::resolve_path_derivation_fields(
         config::PathDerivationCliArgs {
-            folder_structure: args.folder_structure.clone(),
-            folder_structure_albums: args.folder_structure_albums.clone(),
-            folder_structure_smart_folders: args.folder_structure_smart_folders.clone(),
-            resolution,
-            live_photo_mode: args.live_photo_mode,
-            live_resolution,
-            live_photo_mov_filename_policy: args.live_photo_mov_filename_policy,
-            edited: edited_from_size,
-            alternative: alternative_from_size,
-            raw_policy,
-            file_match_policy: args.file_match_policy,
-            force_resolution: args.force_size,
-            keep_unicode_in_filenames: args.keep_unicode_in_filenames,
+            folder_structure: None,
+            folder_structure_albums: None,
+            folder_structure_smart_folders: None,
+            resolution: None,
+            live_photo_mode: None,
+            live_resolution: None,
+            live_photo_mov_filename_policy: None,
+            edited: None,
+            alternative: None,
+            raw_policy: None,
+            file_match_policy: None,
+            force_resolution: None,
+            keep_unicode_in_filenames: None,
         },
         toml,
     )?;
     let media = config::resolve_media_selection(toml.and_then(|t| t.filters.as_ref()), None, None)?;
 
-    let mut config = download::DownloadConfig::for_path_derivation_only(
+    let config = download::DownloadConfig::for_path_derivation_only(
         directory,
         path_fields,
         media,
         args.dry_run,
         args.no_progress_bar,
     );
-    if live_adjusted_from_size || live_adjusted_from_live_size {
-        config.live_resolution = crate::types::AssetVersionSize::LiveAdjusted;
-    }
     Ok(config)
 }
 
@@ -911,10 +1065,13 @@ mod wiremock_tests {
     use rustc_hash::FxHashSet;
     use serde_json::{json, Value};
     use tempfile::TempDir;
-    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::matchers::{header, method as wm_method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{import_assets, ImportStats};
+    use super::{
+        import_assets, verify_strict_prefix, ImportRunOptions, ImportStats, StrictImportDecision,
+        StrictImportVerifier,
+    };
     use crate::download::filter::expected_paths_for;
     use crate::download::paths::DirCache;
     use crate::download::{AssetGroupings, DownloadConfig, SyncMode};
@@ -1209,6 +1366,13 @@ mod wiremock_tests {
         f.set_len(size).expect("set_len");
     }
 
+    fn stage_file_with_bytes(path: &StdPath, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(path, bytes).expect("write file");
+    }
+
     /// Stage every file `expected_paths_for` would emit for `asset` so
     /// they all match. Returns the list of staged paths.
     fn stage_expected(asset: &PhotoAsset, config: &DownloadConfig) -> Vec<std::path::PathBuf> {
@@ -1231,6 +1395,17 @@ mod wiremock_tests {
         config: &DownloadConfig,
         dry_run: bool,
     ) -> ImportStats {
+        run_import_with_strict(server, assets, db, config, dry_run, None).await
+    }
+
+    async fn run_import_with_strict(
+        server: &MockServer,
+        assets: &[WiremockAsset],
+        db: &dyn StateDb,
+        config: &DownloadConfig,
+        dry_run: bool,
+        strict_verifier: Option<&dyn StrictImportVerifier>,
+    ) -> ImportStats {
         stub_records_query(server, assets).await;
         let album = album_pointed_at(server);
         let (stream, panic_rx) = album.photo_stream(None, None, 1);
@@ -1241,12 +1416,45 @@ mod wiremock_tests {
             db,
             config,
             "test-all",
-            dry_run,
-            false,
             &mut dir_cache,
+            ImportRunOptions {
+                dry_run,
+                show_progress: false,
+                strict_verifier,
+            },
         )
         .await
         .expect("import_assets")
+    }
+
+    #[derive(Debug)]
+    struct TestStrictVerifier {
+        cloud_prefix: Vec<u8>,
+    }
+
+    impl StrictImportVerifier for TestStrictVerifier {
+        fn verify<'a>(
+            &'a self,
+            local_path: &'a StdPath,
+            _cloud_url: &'a str,
+            expected_size: u64,
+        ) -> futures_util::future::BoxFuture<'a, anyhow::Result<StrictImportDecision>> {
+            Box::pin(async move {
+                use tokio::io::AsyncReadExt;
+
+                let prefix_len = usize::try_from(expected_size)
+                    .unwrap_or(usize::MAX)
+                    .min(self.cloud_prefix.len());
+                let mut local_prefix = vec![0_u8; prefix_len];
+                let mut file = tokio::fs::File::open(local_path).await?;
+                file.read_exact(&mut local_prefix).await?;
+                if local_prefix == self.cloud_prefix[..prefix_len] {
+                    Ok(StrictImportDecision::Accepted)
+                } else {
+                    Ok(StrictImportDecision::Refused)
+                }
+            })
+        }
     }
 
     // ── Tests: default flow ───────────────────────────────────────────
@@ -1602,6 +1810,126 @@ mod wiremock_tests {
             all_downloaded(db.as_ref()).await.is_empty(),
             "dry-run must not write rows"
         );
+    }
+
+    #[tokio::test]
+    async fn same_name_same_size_different_content_adopts_without_strict() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("STRICT1", "IMG_0001.JPG", "public.jpeg").orig(
+            4,
+            "ck_s1",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        assert_eq!(expected.len(), 1);
+        stage_file_with_bytes(&expected[0].path, b"bbbb");
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+
+        assert_eq!(stats.matched, 1);
+        assert_eq!(stats.strict_refused, 0);
+        assert_eq!(all_downloaded(db.as_ref()).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn same_name_same_size_different_content_refuses_with_strict() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("STRICT2", "IMG_0002.JPG", "public.jpeg").orig(
+            4,
+            "ck_s2",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        assert_eq!(expected.len(), 1);
+        stage_file_with_bytes(&expected[0].path, b"bbbb");
+        let verifier = TestStrictVerifier {
+            cloud_prefix: b"aaaa".to_vec(),
+        };
+
+        let db = open_db(&tmp).await;
+        let stats = run_import_with_strict(
+            &server,
+            &[asset],
+            db.as_ref(),
+            &config,
+            false,
+            Some(&verifier),
+        )
+        .await;
+
+        assert_eq!(stats.matched, 0);
+        assert_eq!(stats.strict_refused, 1);
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dry_run_strict_reports_refusal_without_writing_db() {
+        let server = MockServer::start().await;
+        let asset = WiremockAsset::new("STRICT3", "IMG_0003.JPG", "public.jpeg").orig(
+            4,
+            "ck_s3",
+            "public.jpeg",
+        );
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        assert_eq!(expected.len(), 1);
+        stage_file_with_bytes(&expected[0].path, b"bbbb");
+        let verifier = TestStrictVerifier {
+            cloud_prefix: b"aaaa".to_vec(),
+        };
+
+        let db = open_db(&tmp).await;
+        let stats = run_import_with_strict(
+            &server,
+            &[asset],
+            db.as_ref(),
+            &config,
+            true,
+            Some(&verifier),
+        )
+        .await;
+
+        assert_eq!(stats.matched, 0);
+        assert_eq!(stats.strict_refused, 1);
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_strict_prefix_verifier_fetches_range_and_accepts_match() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/asset"))
+            .and(header("Range", "bytes=0-3"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(b"abcd".to_vec()))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("IMG_0004.JPG");
+        stage_file_with_bytes(&path, b"abcd");
+
+        let decision = verify_strict_prefix(
+            &reqwest::Client::new(),
+            &path,
+            &format!("{}/asset", server.uri()),
+            4,
+        )
+        .await
+        .expect("strict prefix verify");
+
+        assert_eq!(decision, StrictImportDecision::Accepted);
     }
 
     // ── Tests: idempotency ────────────────────────────────────────────
@@ -2384,9 +2712,12 @@ mod wiremock_tests {
             db.as_ref(),
             &config,
             "test-all",
-            false,
-            false,
             &mut dir_cache,
+            ImportRunOptions {
+                dry_run: false,
+                show_progress: false,
+                strict_verifier: None,
+            },
         )
         .await
         .expect("clean exit must be Ok");
@@ -2417,9 +2748,12 @@ mod wiremock_tests {
             db.as_ref(),
             &config,
             "test-all",
-            false,
-            false,
             &mut dir_cache,
+            ImportRunOptions {
+                dry_run: false,
+                show_progress: false,
+                strict_verifier: None,
+            },
         )
         .await
         .expect_err("must bail on fetcher panic");
@@ -2495,9 +2829,12 @@ mod wiremock_tests {
             db.as_ref(),
             &config,
             "test-all",
-            true,
-            false,
             &mut dir_cache,
+            ImportRunOptions {
+                dry_run: true,
+                show_progress: false,
+                strict_verifier: None,
+            },
         )
         .await
         .expect_err("must bail on fetcher Err");
@@ -2624,9 +2961,12 @@ mod wiremock_tests {
             db.as_ref(),
             &config,
             "PrimarySync",
-            true,
-            false,
             &mut dir_cache,
+            ImportRunOptions {
+                dry_run: true,
+                show_progress: false,
+                strict_verifier: None,
+            },
         )
         .await
         .expect("import_assets");
@@ -2662,9 +3002,12 @@ mod wiremock_tests {
             db.as_ref(),
             &config,
             "PrimarySync",
-            true,
-            false,
             &mut dir_cache,
+            ImportRunOptions {
+                dry_run: true,
+                show_progress: false,
+                strict_verifier: None,
+            },
         )
         .await
         .expect("import_assets");
@@ -2798,15 +3141,14 @@ mod build_config_tests {
     //! parse path that production uses.
     use super::build_import_download_config;
     use crate::cli::{Cli, Command};
-    use crate::config::{Config, GlobalArgs, MediaKind, TomlConfig, TomlFilters, TomlPhotos};
+    use crate::config::{Config, GlobalArgs, TomlConfig};
     use crate::types::{
-        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
-        PhotoResolution, RawPolicy,
+        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
     };
     use clap::Parser;
 
     fn parse_import_args(extra: &[&str]) -> crate::cli::ImportArgs {
-        let mut argv = vec!["kei", "import-existing", "--download-dir", "/photos"];
+        let mut argv = vec!["kei", "import-existing"];
         argv.extend(extra.iter().copied());
         let cli = Cli::try_parse_from(argv).expect("clap parse");
         match cli.command {
@@ -2815,174 +3157,45 @@ mod build_config_tests {
         }
     }
 
-    fn empty_toml() -> TomlConfig {
-        TomlConfig {
-            data_dir: None,
-            log_level: None,
-            auth: None,
-            download: None,
-            filters: None,
-            photos: None,
-            watch: None,
-            notifications: None,
-            server: None,
-            report: None,
-            ui: None,
-        }
+    fn toml_with_download(body: &str) -> TomlConfig {
+        toml::from_str(&format!(
+            r#"
+            [download]
+            directory = "/photos"
+
+            {body}
+            "#
+        ))
+        .expect("parse TOML")
     }
 
-    fn toml_with_photos(p: TomlPhotos) -> TomlConfig {
-        let mut t = empty_toml();
-        t.photos = Some(p);
-        t
-    }
-
-    fn toml_with_filters(f: TomlFilters) -> TomlConfig {
-        let mut t = empty_toml();
-        t.filters = Some(f);
-        t
-    }
-
-    fn empty_photos() -> TomlPhotos {
-        TomlPhotos {
-            resolution: None,
-            live_resolution: None,
-            live_photo_mode: None,
-            live_photo_mov_filename_policy: None,
-            edited: None,
-            alternative: None,
-            raw_policy: None,
-            file_match_policy: None,
-            force_resolution: None,
-            keep_unicode_in_filenames: None,
-        }
-    }
-
-    /// CG-1 / AT-3: CLI value beats TOML value across every photos field.
-    /// Each row plants a different value at each layer; if the resolver
-    /// reverses precedence on any field, exactly that row fails.
+    /// TOML is the only durable import path/photo source in v0.20. This pins
+    /// every field that import-existing needs to stay aligned with sync.
     #[test]
-    fn build_import_download_config_cli_overrides_toml() {
-        // size: CLI=Medium, TOML=Thumb -> Medium
-        let args = parse_import_args(&["--size", "medium"]);
-        let toml = toml_with_photos(TomlPhotos {
-            resolution: Some(crate::types::PhotoResolution::Thumb),
-            ..empty_photos()
-        });
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-        assert_eq!(
-            cfg.resolution,
-            crate::types::PhotoResolution::Medium,
-            "size: CLI must win"
-        );
-
-        // file_match_policy: CLI=NameId7, TOML=NameSizeDedupWithSuffix -> NameId7
-        let args = parse_import_args(&["--file-match-policy", "name-id7"]);
-        let toml = toml_with_photos(TomlPhotos {
-            file_match_policy: Some(FileMatchPolicy::NameSizeDedupWithSuffix),
-            ..empty_photos()
-        });
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-        assert_eq!(
-            cfg.file_match_policy,
-            FileMatchPolicy::NameId7,
-            "file_match_policy: CLI must win"
-        );
-
-        // live_photo_mode: CLI=VideoOnly, TOML=ImageOnly -> VideoOnly
-        let args = parse_import_args(&["--live-photo-mode", "video-only"]);
-        let toml = toml_with_photos(TomlPhotos {
-            live_photo_mode: Some(LivePhotoMode::ImageOnly),
-            ..empty_photos()
-        });
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-        assert_eq!(
-            cfg.live_photo_mode,
-            LivePhotoMode::VideoOnly,
-            "live_photo_mode: CLI must win"
-        );
-
-        // live_resolution: CLI=Medium, TOML=Thumb -> LiveMedium
-        let args = parse_import_args(&["--live-photo-size", "medium"]);
-        let toml = toml_with_photos(TomlPhotos {
-            live_resolution: Some(crate::types::LivePhotoResolution::Thumb),
-            ..empty_photos()
-        });
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-        assert_eq!(
-            cfg.live_resolution,
-            AssetVersionSize::LiveMedium,
-            "live_resolution: CLI must win"
-        );
-
-        // live_photo_mov_filename_policy: CLI=Original, TOML=Suffix -> Original
-        let args = parse_import_args(&["--live-photo-mov-filename-policy", "original"]);
-        let toml = toml_with_photos(TomlPhotos {
-            live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Suffix),
-            ..empty_photos()
-        });
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-        assert_eq!(
-            cfg.live_photo_mov_filename_policy,
-            LivePhotoMovFilenamePolicy::Original,
-            "live_photo_mov_filename_policy: CLI must win"
-        );
-
-        // legacy --align-raw=original maps to raw_policy=PreferRaw and wins over TOML.
-        let args = parse_import_args(&["--align-raw", "original"]);
-        let toml = toml_with_photos(TomlPhotos {
-            raw_policy: Some(RawPolicy::PreferJpeg),
-            ..empty_photos()
-        });
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-        assert_eq!(
-            cfg.raw_policy,
-            RawPolicy::PreferRaw,
-            "raw_policy: CLI must win"
-        );
-
-        // force_resolution: CLI=true, TOML=false -> true
-        let args = parse_import_args(&["--force-size"]);
-        let toml = toml_with_photos(TomlPhotos {
-            force_resolution: Some(false),
-            ..empty_photos()
-        });
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-        assert!(
-            cfg.force_resolution,
-            "force_resolution: CLI true must win over TOML false"
-        );
-
-        // keep_unicode_in_filenames: CLI=true, TOML=false -> true
-        let args = parse_import_args(&["--keep-unicode-in-filenames"]);
-        let toml = toml_with_photos(TomlPhotos {
-            keep_unicode_in_filenames: Some(false),
-            ..empty_photos()
-        });
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-        assert!(
-            cfg.keep_unicode_in_filenames,
-            "keep_unicode_in_filenames: CLI true must win over TOML false"
-        );
-    }
-
-    /// CG-1: TOML value beats default when CLI absent.
-    #[test]
-    fn build_import_download_config_uses_toml_when_cli_absent() {
+    fn build_import_download_config_uses_toml_path_photo_and_media_settings() {
         let args = parse_import_args(&[]);
-        let toml = toml_with_photos(TomlPhotos {
-            resolution: Some(crate::types::PhotoResolution::Medium),
-            file_match_policy: Some(FileMatchPolicy::NameId7),
-            live_photo_mode: Some(LivePhotoMode::VideoOnly),
-            live_resolution: Some(crate::types::LivePhotoResolution::Thumb),
-            live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-            edited: None,
-            alternative: None,
-            raw_policy: Some(RawPolicy::PreferRaw),
-            force_resolution: Some(true),
-            keep_unicode_in_filenames: Some(true),
-        });
+        let toml = toml_with_download(
+            r#"
+            folder_structure = "%Y/%m"
+
+            [photos]
+            resolution = "medium"
+            file_match_policy = "name-id7"
+            live_photo_mode = "video-only"
+            live_resolution = "thumb"
+            live_photo_mov_filename_policy = "original"
+            raw_policy = "prefer-raw"
+            force_resolution = true
+            keep_unicode_in_filenames = true
+
+            [filters]
+            media = ["photos", "live-photos"]
+            "#,
+        );
+
         let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+
+        assert_eq!(cfg.folder_structure, "%Y/%m");
         assert_eq!(cfg.resolution, crate::types::PhotoResolution::Medium);
         assert_eq!(cfg.file_match_policy, FileMatchPolicy::NameId7);
         assert_eq!(cfg.live_photo_mode, LivePhotoMode::VideoOnly);
@@ -2994,30 +3207,18 @@ mod build_config_tests {
         assert_eq!(cfg.raw_policy, RawPolicy::PreferRaw);
         assert!(cfg.force_resolution);
         assert!(cfg.keep_unicode_in_filenames);
-    }
-
-    #[test]
-    fn build_import_download_config_uses_toml_media_filter() {
-        let args = parse_import_args(&[]);
-        let toml = toml_with_filters(TomlFilters {
-            media: Some(vec![MediaKind::Photos, MediaKind::LivePhotos]),
-            ..TomlFilters::default()
-        });
-
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
-
         assert!(cfg.media.photos);
         assert!(!cfg.media.videos);
         assert!(cfg.media.live_photos);
     }
 
-    /// CG-1: documented defaults when neither CLI nor TOML set the field.
-    /// Pinning the *documented* default protects against silent default
-    /// drift (per memory `feedback_default_value_change_test`).
+    /// Documented defaults still apply when TOML only supplies the required
+    /// download directory.
     #[test]
     fn build_import_download_config_falls_through_to_default() {
         let args = parse_import_args(&[]);
-        let cfg = build_import_download_config(&args, None).unwrap();
+        let toml = toml_with_download("");
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
         assert_eq!(cfg.resolution, crate::types::PhotoResolution::Original);
         assert_eq!(
             cfg.file_match_policy,
@@ -3036,80 +3237,27 @@ mod build_config_tests {
     }
 
     #[test]
-    fn build_import_download_config_preserves_legacy_adjusted_flags() {
-        let args = parse_import_args(&["--size", "adjusted"]);
-        let cfg = build_import_download_config(&args, None).unwrap();
-        assert_eq!(cfg.resolution, crate::types::PhotoResolution::None);
-        assert!(cfg.edited);
-        assert!(!cfg.alternative);
-        assert_eq!(cfg.live_resolution, AssetVersionSize::LiveAdjusted);
-
-        let args = parse_import_args(&["--live-photo-size", "adjusted"]);
-        let cfg = build_import_download_config(&args, None).unwrap();
-        assert_eq!(cfg.resolution, crate::types::PhotoResolution::Original);
-        assert!(!cfg.edited);
-        assert_eq!(cfg.live_resolution, AssetVersionSize::LiveAdjusted);
-    }
-
-    #[test]
-    fn build_import_download_config_legacy_size_clears_toml_extras() {
-        let toml = toml_with_photos(TomlPhotos {
-            resolution: Some(crate::types::PhotoResolution::Medium),
-            edited: Some(true),
-            alternative: Some(true),
-            ..empty_photos()
-        });
-
-        for (size, resolution, edited, alternative) in [
-            ("original", PhotoResolution::Original, false, false),
-            ("adjusted", PhotoResolution::None, true, false),
-            ("alternative", PhotoResolution::None, false, true),
-        ] {
-            let cfg =
-                build_import_download_config(&parse_import_args(&["--size", size]), Some(&toml))
-                    .unwrap();
-            assert_eq!(cfg.resolution, resolution, "--size {size}");
-            assert_eq!(cfg.edited, edited, "--size {size}");
-            assert_eq!(cfg.alternative, alternative, "--size {size}");
-        }
-    }
-
-    /// CG-9: empty `directory` after TOML resolve produces the documented
-    /// "is required" error rather than a confusing downstream failure.
-    #[test]
     fn build_import_download_config_empty_directory_bails() {
-        // No --download-dir on the CLI, no TOML directory either: bails.
-        let cli = Cli::try_parse_from([
-            "kei",
-            "import-existing",
-            // explicitly absent --download-dir
-        ])
-        .unwrap();
-        let args = match cli.command {
-            Some(Command::ImportExisting(a)) => a,
-            _ => panic!("expected ImportExisting"),
-        };
+        let args = parse_import_args(&[]);
         let err =
             build_import_download_config(&args, None).expect_err("empty directory should bail");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("--download-dir is required"),
-            "error must name the missing flag, got: {msg}"
+            msg.contains("[download] directory is required for import-existing"),
+            "error must name the missing TOML field, got: {msg}"
         );
     }
 
     /// Sync's `Config::build` and import's `build_import_download_config`
-    /// share `resolve_path_derivation_fields`. For the same CLI/TOML
-    /// inputs the path-derivation knobs they emit must agree
-    /// byte-for-byte. If a future change layers extra logic into either
-    /// path without going through the shared resolver, this test catches
-    /// the drift.
+    /// share `resolve_path_derivation_fields`. For the same TOML inputs the
+    /// path-derivation knobs they emit must agree byte-for-byte.
     #[test]
     fn sync_and_import_agree_on_path_derivation_fields() {
         use crate::cli::SyncArgs;
 
         let toml_str = r#"
             [download]
+            directory = "/photos"
             folder_structure = "%Y/%m"
 
             [photos]
@@ -3123,32 +3271,10 @@ mod build_config_tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
 
-        let import_args = parse_import_args(&[
-            "--folder-structure",
-            "%Y/%m",
-            "--file-match-policy",
-            "name-id7",
-            "--live-photo-mov-filename-policy",
-            "original",
-            "--keep-unicode-in-filenames",
-        ]);
+        let import_args = parse_import_args(&[]);
         let import_cfg = build_import_download_config(&import_args, Some(&toml)).unwrap();
 
-        let sync = SyncArgs {
-            config_overrides: crate::config::SyncConfigOverrides {
-                folder_structure: Some("%Y/%m".to_string()),
-                resolution: Some(crate::types::PhotoResolution::Original),
-                edited: Some(true),
-                file_match_policy: Some(FileMatchPolicy::NameId7),
-                live_photo_mov_filename_policy: Some(LivePhotoMovFilenamePolicy::Original),
-                raw_policy: Some(RawPolicy::PreferRaw),
-                force_resolution: Some(true),
-                keep_unicode_in_filenames: Some(true),
-                download_dir: Some("/photos".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let sync = SyncArgs::default();
         let globals = GlobalArgs {
             username: Some("u@example.com".to_string()),
             domain: None,
@@ -3191,37 +3317,34 @@ mod build_config_tests {
         );
     }
 
-    /// Sync's `Config::build` and import's `build_import_download_config`
-    /// share the same `validate_download_dir` system-directory deny list,
-    /// so a path like `/etc` must be rejected by both with the same error
-    /// shape. If a future refactor bypasses the helper from one path,
-    /// this test catches the drift.
     #[test]
     fn sync_and_import_reject_system_directory_with_same_message() {
         use crate::cli::SyncArgs;
 
-        let import_args = {
-            let mut a = parse_import_args(&[]);
-            a.download_dir = Some("/etc".to_string());
-            a
-        };
-        let import_err = build_import_download_config(&import_args, None)
+        let import_args = parse_import_args(&[]);
+        let toml: TomlConfig = toml::from_str(
+            r#"
+            [download]
+            directory = "/etc"
+            "#,
+        )
+        .unwrap();
+        let import_err = build_import_download_config(&import_args, Some(&toml))
             .expect_err("import: system dir must reject");
 
-        let sync = SyncArgs {
-            config_overrides: crate::config::SyncConfigOverrides {
-                download_dir: Some("/etc".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let sync = SyncArgs::default();
         let globals = GlobalArgs {
             username: Some("u@example.com".to_string()),
             domain: None,
             data_dir: None,
         };
-        let sync_err = Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
-            .expect_err("sync: system dir must reject");
+        let sync_err = Config::build(
+            &globals,
+            &crate::cli::PasswordArgs::default(),
+            sync,
+            Some(&toml),
+        )
+        .expect_err("sync: system dir must reject");
 
         let import_msg = format!("{import_err:#}");
         let sync_msg = format!("{sync_err:#}");
@@ -3231,6 +3354,34 @@ mod build_config_tests {
                 "{label} must name the rejection and the path; got: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_import_strict_uses_toml() {
+        let args = parse_import_args(&[]);
+        let toml: TomlConfig = toml::from_str(
+            r#"
+            [import]
+            strict = true
+            "#,
+        )
+        .unwrap();
+
+        assert!(super::resolve_import_strict(&args, Some(&toml)));
+    }
+
+    #[test]
+    fn resolve_import_strict_cli_overrides_toml_false() {
+        let args = parse_import_args(&["--strict"]);
+        let toml: TomlConfig = toml::from_str(
+            r#"
+            [import]
+            strict = false
+            "#,
+        )
+        .unwrap();
+
+        assert!(super::resolve_import_strict(&args, Some(&toml)));
     }
 
     #[test]

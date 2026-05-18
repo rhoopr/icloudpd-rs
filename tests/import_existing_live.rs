@@ -158,15 +158,18 @@ fn import_cmd(
     // Mirror auth artifacts (not state DB; see fixture()) into the
     // per-test data_dir so import-existing can re-use the trust cookie.
     copy_auth_artifacts(cookie_dir, data_dir);
+    let has_config_override = extra.contains(&"--config");
+    let config_path = (!has_config_override).then(|| write_kei_toml(data_dir, download_dir, ""));
     let mut cmd = common::cmd();
     cmd.env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", data_dir);
+    if let Some(config_path) = &config_path {
+        cmd.args(["--config", config_path.to_str().unwrap()]);
+    }
     cmd.args([
         "import-existing",
         "--password",
         password,
-        "--download-dir",
-        download_dir.to_str().unwrap(),
         "--no-progress-bar",
     ]);
     cmd.args(extra);
@@ -725,11 +728,9 @@ fn write_kei_toml(dir: &Path, download_dir: &Path, extra: &str) -> std::path::Pa
     path
 }
 
-/// Strip every `KEI_*` env var that overrides a TOML-resolved field.
-/// Live test runners often export several of these; without scrubbing,
-/// the env layer (CLI > env > TOML > default) silently shadows TOML
-/// under test. Apply at every TOML-driven test that asserts what TOML
-/// resolves to.
+/// Strip stale `KEI_*` env vars from older durable-config surfaces.
+/// v0.20 ignores these, but clearing them keeps TOML-driven live tests
+/// explicit about the source of truth.
 fn clear_toml_resolved_env(cmd: &mut assert_cmd::Command) {
     for var in [
         "KEI_FILE_MATCH_POLICY",
@@ -886,13 +887,18 @@ fn roundtrip_name_id7_sync_skips_after_import() {
         // the round-trip on a non-applicable layout.
         let test_data = tempdir().unwrap();
         let recent = ROUNDTRIP_RECENT.to_string();
+        let toml_path = write_kei_toml(
+            test_data.path(),
+            download_dir,
+            "[photos]\nfile_match_policy = \"name-id7\"\n",
+        );
         let import_out = import_cmd(
             &username,
             &password,
             &cookie_dir,
             download_dir,
             test_data.path(),
-            &["--recent", &recent, "--file-match-policy", "name-id7"],
+            &["--recent", &recent, "--config", toml_path.to_str().unwrap()],
         )
         .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
         .assert()
@@ -1069,59 +1075,20 @@ fn verify_checksums_passes_after_import() {
 // `import_reads_toml_for_path_derivation` covers the TOML-only happy
 // path. These cover precedence + invalid-input handling.
 
-/// CLI `--file-match-policy` overrides a conflicting TOML entry. Test:
-/// TOML says one policy, CLI flag says the other; the CLI value wins.
-/// Verify by observing import-existing's match behavior, since the two
-/// policies produce different filenames.
+/// The old `--file-match-policy` import override is gone in v0.20. Import
+/// path matching now reads `[photos].file_match_policy` from TOML.
 #[test]
-#[ignore]
-fn toml_file_match_policy_overridden_by_cli_flag() {
-    let (username, password, cookie_dir) = common::require_preauth();
-    let (download_dir, _sync_data_dir) = fixture();
-
-    common::with_auth_retry(|| {
-        let test_data = tempdir().unwrap();
-        let toml_path = write_kei_toml(
-            test_data.path(),
-            download_dir,
-            "[photos]\nfile_match_policy = \"name-id7\"\n",
-        );
-
-        let recent = ROUNDTRIP_RECENT.to_string();
-        // CLI flag forces back to the default policy. Files on disk
-        // were synced with the default, so this should match a healthy
-        // fraction. If the CLI override didn't take, the import would
-        // run name-id7 (matching nothing).
-        let mut cmd = import_cmd(
-            &username,
-            &password,
-            &cookie_dir,
-            download_dir,
-            test_data.path(),
-            &[
-                "--recent",
-                &recent,
-                "--config",
-                toml_path.to_str().unwrap(),
-                "--file-match-policy",
-                "name-size-dedup-with-suffix",
-            ],
-        );
-        clear_toml_resolved_env(&mut cmd);
-        let out = cmd
-            .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
-            .assert()
-            .success()
-            .get_output()
-            .clone();
-        let summary = parse_summary(&String::from_utf8_lossy(&out.stdout));
-        assert!(
-            summary.matched > 0,
-            "CLI override of TOML file_match_policy did not take effect: \
-             matched={} ({summary:?})",
-            summary.matched,
-        );
-    });
+fn import_file_match_policy_cli_flag_is_removed() {
+    common::cmd()
+        .args([
+            "import-existing",
+            "--file-match-policy",
+            "name-size-dedup-with-suffix",
+            "--help",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 /// Default kicks in when neither TOML nor CLI specify a value. With no
@@ -1230,15 +1197,16 @@ fn import_sigint_then_rerun_is_idempotent() {
         copy_auth_artifacts(&cookie_dir, test_data.path());
         let recent = ROUNDTRIP_RECENT.to_string();
 
+        let config_path = write_kei_toml(test_data.path(), download_dir, "");
         let mut child = kei_std_command()
             .env("ICLOUD_USERNAME", &username)
             .env("KEI_DATA_DIR", test_data.path())
             .args([
+                "--config",
+                config_path.to_str().unwrap(),
                 "import-existing",
                 "--password",
                 &password,
-                "--download-dir",
-                download_dir.to_str().unwrap(),
                 "--recent",
                 &recent,
                 "--no-progress-bar",
@@ -1332,16 +1300,17 @@ fn two_concurrent_imports_do_not_both_succeed_silently() {
         copy_auth_artifacts(&cookie_dir, test_data.path());
         let recent = ROUNDTRIP_RECENT.to_string();
 
+        let config_path = write_kei_toml(test_data.path(), download_dir, "");
         let spawn = || {
             kei_std_command()
                 .env("ICLOUD_USERNAME", &username)
                 .env("KEI_DATA_DIR", test_data.path())
                 .args([
+                    "--config",
+                    config_path.to_str().unwrap(),
                     "import-existing",
                     "--password",
                     &password,
-                    "--download-dir",
-                    download_dir.to_str().unwrap(),
                     "--recent",
                     &recent,
                     "--no-progress-bar",

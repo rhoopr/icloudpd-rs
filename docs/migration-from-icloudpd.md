@@ -9,9 +9,9 @@ kei v0.20.
 
 The short version:
 
-1. Run `kei import-existing` against the photo directory you already have.
-2. Use the same path-shaping options Python used.
-3. Run `kei sync` from then on.
+1. Put the existing photo directory in `[download].directory`.
+2. Put the path-shaping options Python used in TOML.
+3. Run `kei import-existing`, then `kei sync` from then on.
 
 kei can't reuse Python's `~/.pyicloud` cookies, so the first run still needs a
 fresh Apple login and 2FA approval. Your local photo files can stay in place.
@@ -20,8 +20,15 @@ fresh Apple login and 2FA approval. Your local photo files can stay in place.
 
 Point kei at the directory that `icloudpd` has been writing to:
 
+```toml
+[download]
+directory = "~/Photos/iCloud"
+```
+
+Then run the import with that config:
+
 ```sh
-ICLOUD_USERNAME=you@example.com kei import-existing --download-dir ~/Photos/iCloud
+ICLOUD_USERNAME=you@example.com kei import-existing --config ~/.config/kei/config.toml
 ```
 
 `import-existing` signs in, enumerates the selected iCloud libraries, computes
@@ -29,10 +36,10 @@ the paths kei would use for each asset, and adopts any local file with the
 right path and size into the SQLite state database. The next `kei sync` skips
 those adopted files and downloads only new or previously failed assets.
 
-Run a dry import first when you're not sure the flags are right:
+Run a dry import first when you're not sure the config matches the old tree:
 
 ```sh
-ICLOUD_USERNAME=you@example.com kei import-existing --download-dir ~/Photos/iCloud --dry-run
+ICLOUD_USERNAME=you@example.com kei import-existing --config ~/.config/kei/config.toml --dry-run
 ```
 
 If most files show as unmatched, stop and fix the path options before running a
@@ -43,62 +50,84 @@ another copy.
 The import is safe to repeat. Re-importing the same files updates the existing
 state rows.
 
+### Strict adoption check
+
+By default, import matches an existing file by expected path and size, then
+stores kei's own SHA-256 for future verification. If you want a safer first
+adoption pass, enable strict mode:
+
+```toml
+[import]
+strict = true
+```
+
+or use it for one run:
+
+```sh
+kei import-existing --config ~/.config/kei/config.toml --strict
+```
+
+Strict mode fetches a small prefix from iCloud and compares it with the local
+file before adopting a same-name, same-size match. Mismatches show up as
+`Strict refusals` in the import summary. `--dry-run --strict` runs the same
+check without writing state rows.
+
 ## Match Python's path layout
 
 Most failed migrations come from one of these differences.
 
 ### Folder structure
 
-Python's default `--folder-structure "{:%Y/%m/%d}"` can be passed to kei as
-either the Python wrapper form or plain strftime:
+Python's default `--folder-structure "{:%Y/%m/%d}"` maps to plain strftime in TOML:
 
-```sh
-kei import-existing --download-dir ~/Photos/iCloud --folder-structure "%Y/%m/%d"
+```toml
+[download]
+directory = "~/Photos/iCloud"
+folder_structure = "%Y/%m/%d"
 ```
 
-kei 0.13 split folder templates by pass type:
+kei splits folder templates by pass type:
 
-| kei flag | Used for | Default |
+| TOML field | Used for | Default |
 |---|---|---|
-| `--folder-structure` | Unfiled photos | `%Y/%m/%d` |
-| `--folder-structure-albums` | User album passes | `{album}` |
-| `--folder-structure-smart-folders` | Smart folder passes | `{smart-folder}` |
+| `[download].folder_structure` | Unfiled photos | `%Y/%m/%d` |
+| `[download].folder_structure_albums` | User album passes | `{album}` |
+| `[download].folder_structure_smart_folders` | Smart folder passes | `{smart-folder}` |
 
-If your Python tree included album names, put the album template on
-`--folder-structure-albums`:
+If your Python tree included album names, put the album template in TOML:
 
-```sh
-ICLOUD_USERNAME=you@example.com kei import-existing --download-dir ~/Photos/iCloud \
-  --folder-structure-albums "{album}/%Y/%m/%d"
+```toml
+[download]
+directory = "~/Photos/iCloud"
+folder_structure_albums = "{album}/%Y/%m/%d"
 ```
 
-On v0.20 and later, `{album}` is only accepted in
-`--folder-structure-albums`.
+On v0.20 and later, `{album}` is only accepted in `folder_structure_albums`.
 
 ### Filename policy
 
-If Python was run with `--file-match-policy name-id7`, import with the same
-policy:
+If Python was run with `--file-match-policy name-id7`, put the same policy in TOML:
 
-```sh
-kei import-existing --download-dir ~/Photos/iCloud --file-match-policy name-id7
+```toml
+[photos]
+file_match_policy = "name-id7"
 ```
 
 kei also matches Python's size-suffixed duplicate fallback, invalid filename
 replacement, RAW naming, live-photo MOV companions, and Unicode stripping by
-default. If you used `--keep-unicode-in-filenames`, pass that to import too.
+default. If you used `--keep-unicode-in-filenames`, set `[photos].keep_unicode_in_filenames = true` before import.
 
 ### Live photos, RAW, and sizes
 
-Use the same media-shaping flags you used with Python:
+Use the same media-shaping settings you used with Python:
 
-```sh
-kei import-existing --download-dir ~/Photos/iCloud \
-  --size original \
-  --live-photo-mode both \
-  --live-photo-size original \
-  --live-photo-mov-filename-policy suffix \
-  --align-raw as-is
+```toml
+[photos]
+resolution = "original"
+live_photo_mode = "both"
+live_resolution = "original"
+live_photo_mov_filename_policy = "suffix"
+raw_policy = "as-is"
 ```
 
 `import-existing --recent 100` is supported. The days form, such as
@@ -110,7 +139,7 @@ kei defaults to the primary iCloud Photos library. If you want shared libraries
 too, import with the same library selector that sync will read from TOML:
 
 ```sh
-kei import-existing --library all --download-dir ~/Photos/iCloud --config ~/.config/kei/config.toml
+kei import-existing --library all --config ~/.config/kei/config.toml
 ```
 
 ```toml
@@ -127,10 +156,11 @@ kei sync --config ~/.config/kei/config.toml
 For multi-library trees, add `{library}` to the active templates if you want
 zone-separated directories:
 
-```sh
-kei import-existing --library all --download-dir ~/Photos/iCloud \
-  --folder-structure "{library}/%Y/%m/%d" \
-  --folder-structure-albums "{library}/{album}/%Y/%m/%d"
+```toml
+[download]
+directory = "~/Photos/iCloud"
+folder_structure = "{library}/%Y/%m/%d"
+folder_structure_albums = "{library}/{album}/%Y/%m/%d"
 ```
 
 `import-existing` doesn't have `--album`, `--smart-folder`, or `--unfiled` CLI
@@ -167,7 +197,7 @@ password for future runs.
 |---|---|---|
 | `-u`, `--username` | `[auth].username` | `ICLOUD_USERNAME` still works for automation. |
 | `-p`, `--password` | `--password`, `[auth].password_file`, `[auth].password_command`, or `kei password set` | Avoid putting passwords in process lists when you can. |
-| `-d`, `--directory` | `import-existing --download-dir`; sync uses `[download].directory` | `--directory` was removed in v0.20. |
+| `-d`, `--directory` | `[download].directory` | Import and sync read the same TOML directory. |
 | `-a`, `--album` | `[filters].albums = ["Name"]` | Use `["!Name"]` for exclusions. |
 | `--exclude-album NAME` | `[filters].albums = ["!NAME"]` | Removed in v0.20. |
 | `--list-albums` | `kei list albums` | The old flag was removed in v0.20. |
@@ -181,7 +211,7 @@ password for future runs.
 | `--recent 100` | `--recent 100` | Count form works for sync and import. |
 | `--recent 30d` | `--recent 30d` for sync | Import rejects the days form. |
 | `--set-exif-datetime` | `[download].set_exif_datetime = true` | kei also has EXIF rating, GPS, and description settings. |
-| `--keep-unicode-in-filenames` | `[photos].keep_unicode_in_filenames = true` | Match this during import. |
+| `--keep-unicode-in-filenames` | `[photos].keep_unicode_in_filenames = true` | Set this before import. |
 | `--live-photo-mov-filename-policy` | `[photos].live_photo_mov_filename_policy` | `suffix` or `original`. |
 | `--file-match-policy` | `[photos].file_match_policy` | `name-size-dedup-with-suffix` or `name-id7`. |
 | `--align-raw` | `[photos].raw_policy` | `as-is`, `prefer-raw`, or `prefer-jpeg`. |
@@ -284,7 +314,7 @@ inside the container if your credential backend supports it.
 For a one-shot import against an existing mounted tree:
 
 ```sh
-docker exec kei kei import-existing --download-dir /photos
+docker exec kei kei import-existing --config /config/config.toml
 ```
 
 For headless 2FA:

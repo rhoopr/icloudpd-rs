@@ -506,6 +506,8 @@ pub(crate) struct ExpectedAssetPath {
     pub(crate) size: u64,
     /// iCloud-side checksum (CloudKit format, not SHA256).
     pub(crate) checksum: Box<str>,
+    /// Signed CDN URL for the selected cloud version.
+    pub(crate) url: Box<str>,
     /// Which version this is (Original, LiveOriginal, Medium, ...). Drives the
     /// state-DB row key and `MediaType` classification.
     pub(crate) version_size: VersionSizeKey,
@@ -914,6 +916,7 @@ pub(crate) fn expected_paths_for(
             path: d.path,
             size: d.size,
             checksum: d.checksum,
+            url: d.url,
             version_size: d.version_size,
         })
         .collect()

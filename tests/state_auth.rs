@@ -44,6 +44,14 @@ fn sync_config(
     common::write_toml_config(data_dir, "state-auth-sync", &body)
 }
 
+fn import_config(data_dir: &Path, dir: &Path, download_extra: &str) -> std::path::PathBuf {
+    let body = format!(
+        "[download]\ndirectory = {}\n{download_extra}",
+        common::toml_string(&dir.to_string_lossy())
+    );
+    common::write_toml_config(data_dir, "state-auth-import", &body)
+}
+
 fn sync_cmd(
     username: &str,
     password: &str,
@@ -104,15 +112,16 @@ fn import_cmd(
     cookie_dir: &Path,
     dir: &Path,
 ) -> assert_cmd::Command {
+    let config_path = import_config(cookie_dir, dir, "");
     let mut cmd = common::cmd();
     cmd.env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
+        "--config",
+        config_path.to_str().unwrap(),
         "import-existing",
         "--password",
         password,
-        "--download-dir",
-        dir.to_str().unwrap(),
     ]);
     cmd
 }
@@ -424,17 +433,22 @@ fn verify_checksums_detects_corruption() {
 #[ignore]
 fn import_existing_with_nonexistent_directory_fails() {
     let (username, password, cookie_dir) = common::require_preauth();
+    let config_path = import_config(
+        &cookie_dir,
+        Path::new("/nonexistent/path/that/does/not/exist"),
+        "",
+    );
 
     common::with_auth_retry(|| {
         common::cmd()
             .env("ICLOUD_USERNAME", &username)
             .env("KEI_DATA_DIR", &cookie_dir)
             .args([
+                "--config",
+                config_path.to_str().unwrap(),
                 "import-existing",
                 "--password",
                 &password,
-                "--download-dir",
-                "/nonexistent/path/that/does/not/exist",
             ])
             .timeout(std::time::Duration::from_secs(60))
             .assert()
@@ -542,8 +556,23 @@ fn import_existing_custom_folder_structure() {
             .assert()
             .success();
 
-        import_cmd(&username, &password, &cookie_dir, download_dir.path())
-            .args(["--folder-structure", "%Y", "--recent", "5"])
+        let import_config = import_config(
+            &cookie_dir,
+            download_dir.path(),
+            "folder_structure = \"%Y\"\n",
+        );
+        common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args([
+                "--config",
+                import_config.to_str().unwrap(),
+                "import-existing",
+                "--password",
+                &password,
+                "--recent",
+                "5",
+            ])
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success()

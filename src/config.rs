@@ -19,6 +19,7 @@ pub(crate) struct TomlConfig {
     pub download: Option<TomlDownload>,
     pub filters: Option<TomlFilters>,
     pub photos: Option<TomlPhotos>,
+    pub import: Option<TomlImport>,
     pub watch: Option<TomlWatch>,
     pub notifications: Option<TomlNotifications>,
     pub server: Option<TomlServer>,
@@ -185,6 +186,12 @@ pub(crate) struct TomlPhotos {
     pub file_match_policy: Option<FileMatchPolicy>,
     pub force_resolution: Option<bool>,
     pub keep_unicode_in_filenames: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TomlImport {
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -379,7 +386,9 @@ pub struct MetadataConfig {
 }
 
 #[derive(Debug)]
-pub struct ImportConfig {}
+pub struct ImportConfig {
+    pub strict: bool,
+}
 
 #[derive(Debug)]
 pub struct RuntimeConfig {
@@ -1246,6 +1255,7 @@ impl Config {
         let toml_retry = toml_dl.and_then(|d| d.retry.as_ref());
         let toml_filters = toml.and_then(|t| t.filters.as_ref());
         let toml_photos = toml.and_then(|t| t.photos.as_ref());
+        let toml_import = toml.and_then(|t| t.import.as_ref());
         let toml_watch = toml.and_then(|t| t.watch.as_ref());
         let toml_server = toml.and_then(|t| t.server.as_ref());
 
@@ -1667,7 +1677,9 @@ impl Config {
                 #[cfg(feature = "xmp")]
                 xmp_sidecar,
             },
-            import: ImportConfig {},
+            import: ImportConfig {
+                strict: toml_import.and_then(|i| i.strict).unwrap_or(false),
+            },
             runtime: RuntimeConfig {
                 dry_run: sync.dry_run,
                 only_print_filenames: sync.only_print_filenames,
@@ -1891,6 +1903,11 @@ impl Config {
                     None
                 },
             }),
+            import: if self.import.strict {
+                Some(TomlImport { strict: Some(true) })
+            } else {
+                None
+            },
             watch: if self.watch.interval.is_some()
                 || self.watch.notify_systemd
                 || self.watch.pid_file.is_some()
@@ -2024,6 +2041,7 @@ pub(crate) fn persist_first_run_config(
         }),
         filters: None,
         photos: None,
+        import: None,
         watch: None,
         notifications: None,
         server: None,
@@ -5461,6 +5479,7 @@ mod tests {
             download: None,
             filters: None,
             photos: None,
+            import: None,
             watch: None,
             notifications: None,
             server: None,
@@ -5494,6 +5513,7 @@ mod tests {
             download: None,
             filters: None,
             photos: None,
+            import: None,
             watch: None,
             notifications: None,
             server: None,
@@ -5761,6 +5781,7 @@ mod tests {
             download: None,
             filters: None,
             photos: None,
+            import: None,
             watch: None,
             notifications: None,
             server: None,
@@ -5786,6 +5807,7 @@ mod tests {
             download: None,
             filters: None,
             photos: None,
+            import: None,
             watch: None,
             notifications: None,
             server: None,

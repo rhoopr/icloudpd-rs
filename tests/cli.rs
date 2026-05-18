@@ -130,7 +130,8 @@ fn import_existing_help_succeeds() {
         .args(["import-existing", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--download-dir"));
+        .stdout(predicate::str::contains("--strict"))
+        .stdout(predicate::str::contains("--download-dir").not());
 }
 
 #[test]
@@ -407,7 +408,7 @@ fn submit_code_requires_code_argument() {
         .stderr(predicate::str::contains("error"));
 }
 
-// ── import-existing requires --download-dir ─────────────────────────────
+// ── import-existing requires TOML directory ─────────────────────────────
 
 #[test]
 fn import_existing_requires_directory() {
@@ -416,7 +417,9 @@ fn import_existing_requires_directory() {
         .args(["import-existing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--download-dir is required"));
+        .stderr(predicate::str::contains(
+            "[download] directory is required for import-existing",
+        ));
 }
 
 // ── Removed durable boolean flags fail ─────────────────────────────────
@@ -571,26 +574,7 @@ fn log_level_global_flag_works_with_all_subcommands() {
 // ── import-existing subcommand-specific flags ───────────────────────────
 
 #[test]
-fn import_existing_folder_structure_flag() {
-    common::cmd()
-        .args([
-            "import-existing",
-            "--download-dir",
-            "/tmp",
-            "--folder-structure",
-            "%Y-%m",
-            "--help",
-        ])
-        .assert()
-        .success();
-}
-
-#[test]
 fn import_existing_library_flag_accepts_repeatable_sentinels() {
-    // --library on import-existing was added on the selection-flags-redesign
-    // branch (commit bcbd5b6) but had no parse test of its own. The flag
-    // shares the v0.13 grammar with `kei sync --library`: bare sentinels,
-    // raw zone names, and `!name` exclusions, all repeatable.
     common::cmd()
         .args([
             "import-existing",
@@ -610,16 +594,8 @@ fn import_existing_library_flag_accepts_repeatable_sentinels() {
 
 #[test]
 fn import_existing_dry_run_flag_parses() {
-    // Covers the new --dry-run flag on import-existing. Must parse; actual
-    // DB-skip behavior is covered by the handler-level integration.
     common::cmd()
-        .args([
-            "import-existing",
-            "--download-dir",
-            "/tmp",
-            "--dry-run",
-            "--help",
-        ])
+        .args(["import-existing", "--dry-run", "--help"])
         .assert()
         .success();
 }
@@ -627,57 +603,79 @@ fn import_existing_dry_run_flag_parses() {
 #[test]
 fn import_existing_recent_flag() {
     common::cmd()
-        .args([
-            "import-existing",
-            "--download-dir",
-            "/tmp",
-            "--recent",
-            "100",
-            "--help",
-        ])
+        .args(["import-existing", "--recent", "100", "--help"])
         .assert()
         .success();
 }
 
 #[test]
-fn import_existing_file_match_policy_all_variants() {
-    for variant in ["name-size-dedup-with-suffix", "name-id7"] {
+fn import_existing_strict_flag_parses() {
+    common::cmd()
+        .args(["import-existing", "--strict", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn import_existing_removed_durable_flags_fail() {
+    for args in [
+        vec!["import-existing", "--download-dir", "/tmp", "--help"],
+        vec!["import-existing", "-d", "/tmp", "--help"],
+        vec!["import-existing", "--folder-structure", "%Y-%m", "--help"],
+        vec![
+            "import-existing",
+            "--folder-structure-albums",
+            "{album}",
+            "--help",
+        ],
+        vec![
+            "import-existing",
+            "--folder-structure-smart-folders",
+            "{smart-folder}",
+            "--help",
+        ],
+        vec![
+            "import-existing",
+            "--file-match-policy",
+            "name-id7",
+            "--help",
+        ],
+        vec!["import-existing", "--size", "medium", "--help"],
+        vec![
+            "import-existing",
+            "--live-photo-mode",
+            "image-only",
+            "--help",
+        ],
+        vec!["import-existing", "--live-photo-size", "medium", "--help"],
+        vec![
+            "import-existing",
+            "--live-photo-mov-filename-policy",
+            "original",
+            "--help",
+        ],
+        vec!["import-existing", "--align-raw", "original", "--help"],
+        vec!["import-existing", "--force-size", "--help"],
+        vec!["import-existing", "--keep-unicode-in-filenames", "--help"],
+    ] {
         common::cmd()
-            .args([
-                "import-existing",
-                "--download-dir",
-                "/tmp",
-                "--file-match-policy",
-                variant,
-                "--help",
-            ])
+            .args(args)
             .assert()
-            .success();
+            .failure()
+            .stderr(predicate::str::contains("unexpected argument"));
     }
 }
 
 #[test]
-fn import_existing_file_match_policy_rejects_invalid() {
-    common::cmd()
-        .args([
-            "import-existing",
-            "--download-dir",
-            "/tmp",
-            "--file-match-policy",
-            "bogus",
-            "--help",
-        ])
-        .assert()
-        .failure();
-}
-
-#[test]
-fn import_existing_file_match_policy_from_env() {
+fn import_existing_removed_durable_env_vars_are_ignored_by_help() {
     common::cmd()
         .env("KEI_FILE_MATCH_POLICY", "name-id7")
-        .args(["import-existing", "--download-dir", "/tmp", "--help"])
+        .env("KEI_DOWNLOAD_DIR", "/tmp")
+        .args(["import-existing", "--help"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("--file-match-policy").not())
+        .stdout(predicate::str::contains("--download-dir").not());
 }
 
 // ── Env var credential passthrough ──────────────────────────────────────
@@ -766,14 +764,15 @@ fn only_print_filenames_visible_in_help() {
         .stdout(predicate::str::contains("--only-print-filenames"));
 }
 
-// ── import-existing short -d flag ───────────────────────────────────────
+// ── import-existing short -d flag removed ───────────────────────────────
 
 #[test]
-fn import_existing_short_d_flag() {
+fn import_existing_short_d_flag_removed() {
     common::cmd()
         .args(["import-existing", "-d", "/tmp", "--help"])
         .assert()
-        .success();
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 // ── Unknown flags on all subcommands ────────────────────────────────────
@@ -855,34 +854,6 @@ fn import_existing_accepts_no_progress_bar() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--no-progress-bar"));
-}
-
-// ── import-existing path-derivation flags ───────────────────────────────
-//
-// The CLI-string -> enum mapping for each flag (--size, --live-photo-mode,
-// --live-photo-size, --live-photo-mov-filename-policy, --align-raw,
-// --force-size, --keep-unicode-in-filenames, --file-match-policy) is pinned
-// by `Cli::try_parse_from`-driven unit tests in src/cli.rs (search for
-// `import_existing_*_parses_to_correct_variant`). Those assert on parsed
-// variants -- which `--help`-driven subprocess tests cannot.
-//
-// The subprocess-level test below stays because it exercises one thing the
-// unit tests can't: that clap's value rejection produces a non-zero subprocess
-// exit code (the contract Docker / systemd consumers rely on).
-
-#[test]
-fn import_existing_file_match_policy_rejects_bogus_value() {
-    common::cmd()
-        .args([
-            "import-existing",
-            "--download-dir",
-            "/tmp",
-            "--file-match-policy",
-            "bogus",
-            "--help",
-        ])
-        .assert()
-        .failure();
 }
 
 // ── exit codes ────────────────────────────────────────────────────────
