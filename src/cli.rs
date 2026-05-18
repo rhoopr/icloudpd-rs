@@ -1627,15 +1627,14 @@ mod tests {
     #[test]
     fn test_no_progress_bar_rejects_value() {
         for value in ["true", "false"] {
+            let flag = format!("--no-progress-bar={value}");
+
             let mut args = base_args();
             args.push("--no-progress-bar");
             args.push(value);
             assert!(Cli::try_parse_from(&args).is_err());
 
-            let flag = format!("--no-progress-bar={value}");
             assert!(Cli::try_parse_from(["kei", "sync", flag.as_str()]).is_err());
-
-            let flag = format!("--no-progress-bar={value}");
             assert!(Cli::try_parse_from(["kei", flag.as_str(), "sync"]).is_err());
         }
     }

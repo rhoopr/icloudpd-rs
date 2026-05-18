@@ -2116,6 +2116,20 @@ mod native_tests {
         path
     }
 
+    fn first_unknown_int16(metadata: &Metadata, tag_id: u16) -> Option<u16> {
+        metadata
+            .get_tag(&ExifTag::UnknownINT16U(
+                Vec::new(),
+                tag_id,
+                ExifTagGroup::GENERIC,
+            ))
+            .next()
+            .and_then(|tag| match tag {
+                ExifTag::UnknownINT16U(values, tag, _) if *tag == tag_id => values.first().copied(),
+                _ => None,
+            })
+    }
+
     #[test]
     fn native_apply_metadata_writes_jpeg_exif_without_xmp_feature() {
         let dir = tempfile::tempdir().unwrap();
@@ -2155,35 +2169,11 @@ mod native_tests {
             });
         assert_eq!(description, Some("Beach day"));
 
-        let rating = metadata
-            .get_tag(&ExifTag::UnknownINT16U(
-                Vec::new(),
-                WINDOWS_RATING_TAG,
-                ExifTagGroup::GENERIC,
-            ))
-            .next()
-            .and_then(|tag| match tag {
-                ExifTag::UnknownINT16U(values, tag, _) if *tag == WINDOWS_RATING_TAG => {
-                    values.first().copied()
-                }
-                _ => None,
-            });
-        assert_eq!(rating, Some(5));
-
-        let rating_percent = metadata
-            .get_tag(&ExifTag::UnknownINT16U(
-                Vec::new(),
-                WINDOWS_RATING_PERCENT_TAG,
-                ExifTagGroup::GENERIC,
-            ))
-            .next()
-            .and_then(|tag| match tag {
-                ExifTag::UnknownINT16U(values, tag, _) if *tag == WINDOWS_RATING_PERCENT_TAG => {
-                    values.first().copied()
-                }
-                _ => None,
-            });
-        assert_eq!(rating_percent, Some(99));
+        assert_eq!(first_unknown_int16(&metadata, WINDOWS_RATING_TAG), Some(5));
+        assert_eq!(
+            first_unknown_int16(&metadata, WINDOWS_RATING_PERCENT_TAG),
+            Some(99)
+        );
     }
 
     #[test]
