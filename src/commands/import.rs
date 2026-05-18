@@ -2800,7 +2800,8 @@ mod build_config_tests {
     use crate::cli::{Cli, Command};
     use crate::config::{Config, GlobalArgs, MediaKind, TomlConfig, TomlFilters, TomlPhotos};
     use crate::types::{
-        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
+        AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
+        PhotoResolution, RawPolicy,
     };
     use clap::Parser;
 
@@ -3059,28 +3060,18 @@ mod build_config_tests {
             ..empty_photos()
         });
 
-        let original =
-            build_import_download_config(&parse_import_args(&["--size", "original"]), Some(&toml))
-                .unwrap();
-        assert_eq!(original.resolution, crate::types::PhotoResolution::Original);
-        assert!(!original.edited);
-        assert!(!original.alternative);
-
-        let adjusted =
-            build_import_download_config(&parse_import_args(&["--size", "adjusted"]), Some(&toml))
-                .unwrap();
-        assert_eq!(adjusted.resolution, crate::types::PhotoResolution::None);
-        assert!(adjusted.edited);
-        assert!(!adjusted.alternative);
-
-        let alternative = build_import_download_config(
-            &parse_import_args(&["--size", "alternative"]),
-            Some(&toml),
-        )
-        .unwrap();
-        assert_eq!(alternative.resolution, crate::types::PhotoResolution::None);
-        assert!(!alternative.edited);
-        assert!(alternative.alternative);
+        for (size, resolution, edited, alternative) in [
+            ("original", PhotoResolution::Original, false, false),
+            ("adjusted", PhotoResolution::None, true, false),
+            ("alternative", PhotoResolution::None, false, true),
+        ] {
+            let cfg =
+                build_import_download_config(&parse_import_args(&["--size", size]), Some(&toml))
+                    .unwrap();
+            assert_eq!(cfg.resolution, resolution, "--size {size}");
+            assert_eq!(cfg.edited, edited, "--size {size}");
+            assert_eq!(cfg.alternative, alternative, "--size {size}");
+        }
     }
 
     /// CG-9: empty `directory` after TOML resolve produces the documented

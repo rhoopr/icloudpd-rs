@@ -38,6 +38,19 @@ const GLOB_CASE_INSENSITIVE: glob::MatchOptions = glob::MatchOptions {
     require_literal_leading_dot: false,
 };
 
+type ExtraDeriver = for<'a> fn(
+    &crate::icloud::photos::PhotoAsset,
+    &DownloadConfig,
+    &DerivationContext<'a>,
+    &[Box<str>],
+) -> Option<DerivedPath>;
+
+const EXTRA_DERIVERS: [ExtraDeriver; 3] = [
+    derive_edited_extra,
+    derive_alternative_extra,
+    derive_live_edited_extra,
+];
+
 /// Determine the media type for an asset based on version size and item type.
 pub(crate) fn determine_media_type(
     version_size: VersionSizeKey,
@@ -859,27 +872,24 @@ pub(super) fn derive_expected_paths(
     config: &DownloadConfig,
 ) -> SmallVec<[DerivedPath; 5]> {
     let ctx = DerivationContext::build(asset, config);
-    let mut out = SmallVec::new();
+    let mut out = SmallVec::<[DerivedPath; 5]>::new();
     let mut seen_urls = SmallVec::<[Box<str>; 4]>::new();
-    let mut primary_filename = None;
+    let mut primary_index: Option<usize> = None;
     if let Some(p) = derive_primary(asset, config, &ctx) {
-        primary_filename = Some(p.filename.clone());
         seen_urls.push(p.url.clone());
         out.push(p);
+        primary_index = Some(out.len() - 1);
     }
-    if let Some(p) = derive_edited_extra(asset, config, &ctx, &seen_urls) {
-        seen_urls.push(p.url.clone());
-        out.push(p);
+    for derive_extra in EXTRA_DERIVERS {
+        if let Some(p) = derive_extra(asset, config, &ctx, &seen_urls) {
+            seen_urls.push(p.url.clone());
+            out.push(p);
+        }
     }
-    if let Some(p) = derive_alternative_extra(asset, config, &ctx, &seen_urls) {
-        seen_urls.push(p.url.clone());
-        out.push(p);
-    }
-    if let Some(p) = derive_live_edited_extra(asset, config, &ctx, &seen_urls) {
-        seen_urls.push(p.url.clone());
-        out.push(p);
-    }
-    if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename.as_deref()) {
+    let primary_filename = primary_index
+        .and_then(|index| out.get(index))
+        .map(|p| p.filename.as_str());
+    if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename) {
         if seen_urls
             .iter()
             .any(|seen| seen.as_ref() == mov.url.as_ref())
@@ -1210,17 +1220,7 @@ pub(super) fn filter_asset_to_tasks(
         }
     }
 
-    type ExtraDeriver<'a> = fn(
-        &crate::icloud::photos::PhotoAsset,
-        &DownloadConfig,
-        &DerivationContext<'a>,
-        &[Box<str>],
-    ) -> Option<DerivedPath>;
-    for derive_extra in [
-        derive_edited_extra as ExtraDeriver<'_>,
-        derive_alternative_extra as ExtraDeriver<'_>,
-        derive_live_edited_extra as ExtraDeriver<'_>,
-    ] {
+    for derive_extra in EXTRA_DERIVERS {
         let Some(d) = derive_extra(asset, config, &ctx, &seen_urls) else {
             continue;
         };
