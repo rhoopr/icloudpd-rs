@@ -666,13 +666,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             media: config.filters.media,
             skip_created_before,
             skip_created_after,
-            #[cfg(feature = "xmp")]
             set_exif_datetime: config.metadata.set_exif_datetime,
-            #[cfg(feature = "xmp")]
             set_exif_rating: config.metadata.set_exif_rating,
-            #[cfg(feature = "xmp")]
             set_exif_gps: config.metadata.set_exif_gps,
-            #[cfg(feature = "xmp")]
             set_exif_description: config.metadata.set_exif_description,
             #[cfg(feature = "xmp")]
             embed_xmp: config.metadata.embed_xmp,

@@ -14,10 +14,9 @@ path = "src/main.rs"
 [features]
 # XMP metadata embedding + sidecar writing. Default-on; build with
 # `--no-default-features` on platforms where Adobe's vendored C++ XMP
-# Toolkit does not compile (notably FreeBSD — see #256). Disabling drops
-# the `--embed-xmp`, `--xmp-sidecar`, and `--set-exif-*` CLI flags and the
-# code paths behind them; HEIC container edits go with it because the
-# XMP packet serializer lives in xmp_toolkit.
+# Toolkit does not compile (notably FreeBSD — see #256). Disabling drops XMP
+# embedding, sidecars, and HEIC container edits; native JPEG/TIFF EXIF writes
+# remain available through little_exif.
 default = ["xmp"]
 xmp = ["dep:xmp_toolkit"]
 # Re-exports parser entry points for cargo-fuzz harnesses (`fuzz/`).
@@ -91,6 +90,10 @@ console = "0.16"
 # Optional (behind the `xmp` feature, default-on) so platforms without a
 # working C++ toolchain for the vendored sources can opt out. See #256.
 xmp_toolkit = { version = "1", optional = true }
+
+# Native EXIF writing used by `set_exif_*` settings, including builds that
+# disable the default `xmp` feature.
+little_exif = "0.6"
 
 # ISO-BMFF (MP4 / HEIF / HEIC) atom parsing + encoding. HEIC's XMP packet
 # lives in a `mime`-type item inside the `meta` box; mp4-atom gives us the

@@ -132,22 +132,10 @@ impl RunOptions {
             media: config.filters.media.to_kinds(),
             skip_videos: config.filters.skip_videos,
             skip_photos: config.filters.skip_photos,
-            #[cfg(feature = "xmp")]
             set_exif_datetime: config.metadata.set_exif_datetime,
-            #[cfg(not(feature = "xmp"))]
-            set_exif_datetime: false,
-            #[cfg(feature = "xmp")]
             set_exif_rating: config.metadata.set_exif_rating,
-            #[cfg(not(feature = "xmp"))]
-            set_exif_rating: false,
-            #[cfg(feature = "xmp")]
             set_exif_gps: config.metadata.set_exif_gps,
-            #[cfg(not(feature = "xmp"))]
-            set_exif_gps: false,
-            #[cfg(feature = "xmp")]
             set_exif_description: config.metadata.set_exif_description,
-            #[cfg(not(feature = "xmp"))]
-            set_exif_description: false,
             #[cfg(feature = "xmp")]
             embed_xmp: config.metadata.embed_xmp,
             #[cfg(not(feature = "xmp"))]

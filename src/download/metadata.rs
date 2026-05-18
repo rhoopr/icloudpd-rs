@@ -1,32 +1,47 @@
 //! Embedded metadata (XMP + native EXIF/IPTC reconciliation).
 //!
-//! For JPEG / PNG / TIFF / MP4 / MOV, the writer runs through
-//! [`xmp_toolkit::XmpFile`] — Adobe's vendored XMPFiles implementation, which
-//! also reconciles XMP with native EXIF/IPTC blocks so consumers that read
-//! only EXIF still see values like `Rating`, GPS, and `DateTimeOriginal`.
+//! With the default `xmp` feature, JPEG / PNG / TIFF / MP4 / MOV run through
+//! Adobe's XMPFiles implementation, which reconciles XMP with native EXIF/IPTC
+//! blocks so EXIF-only consumers still see values like `Rating`, GPS, and
+//! `DateTimeOriginal`. HEIC / HEIF / AVIF route through the ISO-BMFF helper in
+//! [`super::heif`].
 //!
-//! HEIC / HEIF / AVIF have no XMP Toolkit handler, so those formats route
-//! through [`super::heif`], which edits the ISO-BMFF container directly with
-//! [`mp4_atom`]. Both paths build the XMP packet via the same
-//! [`apply_to_xmp`] helper, so the embedded content is identical.
+//! Without the `xmp` feature, kei still writes the native EXIF subset supported
+//! by `little_exif` for JPEG/TIFF and quietly skips formats that need XMP
+//! serialization.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+#[cfg(feature = "xmp")]
 use std::sync::Once;
 
 use anyhow::{Context, Result};
+#[cfg(not(feature = "xmp"))]
+use little_exif::exif_tag::ExifTag;
+#[cfg(not(feature = "xmp"))]
+use little_exif::filetype::FileExtension;
+#[cfg(not(feature = "xmp"))]
+use little_exif::metadata::Metadata;
+#[cfg(not(feature = "xmp"))]
+use little_exif::rational::uR64;
+#[cfg(feature = "xmp")]
 use xmp_toolkit::{xmp_ns, OpenFileOptions, XmpFile, XmpMeta, XmpValue};
 
+#[cfg(feature = "xmp")]
 use super::heif;
 use crate::fs_util::atomic_install;
 
 /// Custom XMP namespace for kei-specific fields that don't fit standard
 /// schemas (`hidden`, `archived`, `mediaSubtype`, `burstId`). Consumers that
 /// care about these know to look for the `kei` prefix.
+#[cfg(feature = "xmp")]
 const KEI_XMP_NS: &str = "https://github.com/rhoopr/kei/ns/1.0/";
+#[cfg(feature = "xmp")]
 const KEI_XMP_PREFIX: &str = "kei";
 
+#[cfg(feature = "xmp")]
 static INIT: Once = Once::new();
 
+#[cfg(feature = "xmp")]
 fn ensure_initialized() {
     INIT.call_once(|| {
         // Registering the same namespace twice is fine; XMP Toolkit returns
@@ -37,7 +52,7 @@ fn ensure_initialized() {
 }
 
 /// Snapshot of existing metadata fields that gate write decisions. Populated
-/// from whatever XMP Toolkit sees in the file (XMP + reconciled EXIF/IPTC).
+/// from XMP Toolkit in default builds or native EXIF in no-`xmp` builds.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExifProbe {
     pub(crate) datetime_original: Option<String>,
@@ -56,6 +71,18 @@ pub(crate) struct ExifProbe {
 /// (today's behavior); callers gate retries on the planned write being
 /// non-empty, so a false-negative probe is recoverable.
 pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
+    #[cfg(feature = "xmp")]
+    {
+        probe_exif_xmp(path)
+    }
+    #[cfg(not(feature = "xmp"))]
+    {
+        Ok(probe_exif_native(path))
+    }
+}
+
+#[cfg(feature = "xmp")]
+fn probe_exif_xmp(path: &Path) -> Result<ExifProbe> {
     ensure_initialized();
     if is_heif_file(path) {
         Ok(probe_exif_heif(path))
@@ -64,6 +91,7 @@ pub(crate) fn probe_exif(path: &Path) -> Result<ExifProbe> {
     }
 }
 
+#[cfg(feature = "xmp")]
 fn probe_exif_xmp_toolkit(path: &Path) -> Result<ExifProbe> {
     let mut file = XmpFile::new().context("creating XmpFile handle")?;
     if file
@@ -78,6 +106,7 @@ fn probe_exif_xmp_toolkit(path: &Path) -> Result<ExifProbe> {
     Ok(probe_from_meta(&meta))
 }
 
+#[cfg(feature = "xmp")]
 fn probe_exif_heif(path: &Path) -> ExifProbe {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -102,12 +131,45 @@ fn probe_exif_heif(path: &Path) -> ExifProbe {
     }
 }
 
+#[cfg(feature = "xmp")]
 fn probe_from_meta(meta: &XmpMeta) -> ExifProbe {
     let datetime_original = meta
         .property(xmp_ns::EXIF, "DateTimeOriginal")
         .map(|v| v.value);
     let has_gps = meta.contains_property(xmp_ns::EXIF, "GPSLatitude")
         || meta.contains_property(xmp_ns::EXIF, "GPSLongitude");
+    ExifProbe {
+        datetime_original,
+        has_gps,
+    }
+}
+
+#[cfg(not(feature = "xmp"))]
+fn probe_exif_native(path: &Path) -> ExifProbe {
+    let Ok(input) = std::fs::read(path) else {
+        return ExifProbe::default();
+    };
+    let Some(file_type) = native_file_type(&input, path) else {
+        return ExifProbe::default();
+    };
+    let Ok(meta) = Metadata::new_from_vec(&input, file_type) else {
+        return ExifProbe::default();
+    };
+    let datetime_original = meta
+        .get_tag(&ExifTag::DateTimeOriginal(String::new()))
+        .next()
+        .and_then(|tag| match tag {
+            ExifTag::DateTimeOriginal(s) => Some(s.clone()),
+            _ => None,
+        });
+    let has_gps = meta
+        .get_tag(&ExifTag::GPSLatitude(Vec::new()))
+        .next()
+        .is_some()
+        || meta
+            .get_tag(&ExifTag::GPSLongitude(Vec::new()))
+            .next()
+            .is_some();
     ExifProbe {
         datetime_original,
         has_gps,
@@ -158,12 +220,13 @@ impl MetadataWrite {
     }
 }
 
-/// Write the requested metadata into the file's XMP packet, with EXIF/IPTC
-/// reconciliation where the container supports it.
+/// Write the requested metadata into the file, using XMP Toolkit/HEIF packet
+/// rewriting in default builds and native EXIF for JPEG/TIFF in no-`xmp`
+/// builds.
 ///
-/// Atomic: we copy the input to a sibling `.meta-tmp`, patch it in place,
-/// then rename over the target. A crash mid-write leaves the original
-/// untouched.
+/// Atomic: we copy the input to a sibling temp file named with `temp_suffix`,
+/// patch it in place, then rename over the target. A crash mid-write leaves the
+/// original untouched.
 ///
 /// Dispatch is content-based: the first 12 bytes are inspected for an
 /// ISO-BMFF `ftyp` box with a HEIF-family brand. The download pipeline
@@ -172,14 +235,19 @@ impl MetadataWrite {
 /// back to extension-based dispatch only when the read itself fails, so
 /// callers operating on a transient/unreadable file degrade to today's
 /// behavior rather than spuriously routing everything to XMP Toolkit.
-pub(crate) fn apply_metadata(path: &Path, write: &MetadataWrite) -> Result<()> {
+pub(crate) fn apply_metadata(path: &Path, write: &MetadataWrite, temp_suffix: &str) -> Result<()> {
     if write.is_empty() {
         return Ok(());
     }
+    #[cfg(not(feature = "xmp"))]
+    {
+        return apply_metadata_native(path, write, temp_suffix);
+    }
+    #[cfg(feature = "xmp")]
     if is_heif_file(path) {
-        apply_metadata_heif(path, write)
+        apply_metadata_heif(path, write, temp_suffix)
     } else {
-        apply_metadata_xmp_toolkit(path, write)
+        apply_metadata_xmp_toolkit(path, write, temp_suffix)
     }
 }
 
@@ -187,6 +255,7 @@ pub(crate) fn apply_metadata(path: &Path, write: &MetadataWrite) -> Result<()> {
 /// On read error, fall back to extension-based detection — preserves the
 /// pre-content-sniff behavior for any caller that hands us an unreadable
 /// path, rather than misclassifying every such call as non-HEIF.
+#[cfg(feature = "xmp")]
 fn is_heif_file(path: &Path) -> bool {
     use std::io::Read;
     let mut head = [0u8; 12];
@@ -200,15 +269,52 @@ fn is_heif_file(path: &Path) -> bool {
 /// can patch. JPEG / PNG / TIFF / MP4 / MOV go through XMP Toolkit;
 /// HEIC / HEIF / AVIF go through [`super::heif`].
 pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
+    let mut head = [0u8; 12];
+    if let Ok(n) = std::fs::File::open(path).and_then(|mut f| {
+        use std::io::Read;
+        f.read(&mut head)
+    }) {
+        let head = head.get(..n).unwrap_or(&[]);
+        if head.starts_with(&[0xff, 0xd8, 0xff])
+            || head.starts_with(b"II*\0")
+            || head.starts_with(b"MM\0*")
+        {
+            return true;
+        }
+        #[cfg(feature = "xmp")]
+        if heif::is_heif_content(head) {
+            return true;
+        }
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if ext
+        .as_deref()
+        .is_some_and(|e| matches!(e, "jpg" | "jpeg" | "tif" | "tiff"))
+    {
+        return true;
+    }
+    #[cfg(feature = "xmp")]
     if heif::is_heif_path(path) {
         return true;
     }
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        matches!(
-            e.to_ascii_lowercase().as_str(),
-            "jpg" | "jpeg" | "png" | "tif" | "tiff" | "mp4" | "mov"
-        )
-    })
+    #[cfg(feature = "xmp")]
+    {
+        ext.as_deref()
+            .is_some_and(|e| matches!(e, "png" | "mp4" | "mov"))
+    }
+    #[cfg(not(feature = "xmp"))]
+    {
+        false
+    }
+}
+
+fn temp_path_for(path: &Path, temp_suffix: &str) -> PathBuf {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(temp_suffix);
+    path.with_file_name(tmp_name)
 }
 
 /// Write `write` as a `.xmp` sidecar next to the media file, atomically.
@@ -218,7 +324,12 @@ pub(crate) fn is_embed_writable_path(path: &Path) -> bool {
 /// rather than overwriting the whole packet. A malformed existing sidecar
 /// falls back to a fresh packet — kei's enriched view wins over a file we
 /// can't parse.
-pub(crate) fn write_sidecar(media_path: &Path, write: &MetadataWrite) -> Result<()> {
+#[cfg(feature = "xmp")]
+pub(crate) fn write_sidecar(
+    media_path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+) -> Result<()> {
     if write.is_empty() {
         return Ok(());
     }
@@ -230,9 +341,7 @@ pub(crate) fn write_sidecar(media_path: &Path, write: &MetadataWrite) -> Result<
     let mut sidecar_name = name.to_os_string();
     sidecar_name.push(".xmp");
     let sidecar_path = media_path.with_file_name(&sidecar_name);
-    let mut tmp_name = sidecar_name;
-    tmp_name.push(".meta-tmp");
-    let tmp_path = sidecar_path.with_file_name(&tmp_name);
+    let tmp_path = temp_path_for(&sidecar_path, temp_suffix);
 
     // Seed the packet with any existing sidecar content so user-authored
     // ratings / keywords / develop settings from another tool survive.
@@ -274,9 +383,8 @@ pub(crate) fn write_sidecar(media_path: &Path, write: &MetadataWrite) -> Result<
     Ok(())
 }
 
-/// Remove the tmp file on drop unless disarmed. Protects `.meta-tmp` against
-/// a panic across the xmp_toolkit FFI boundary; no orphan sweep matches this
-/// suffix.
+/// Remove the tmp file on drop unless disarmed. Protects metadata temp files
+/// against panics or writer failures; no orphan sweep matches this suffix.
 #[derive(Debug)]
 struct TmpGuard<'a> {
     path: &'a Path,
@@ -301,12 +409,11 @@ impl Drop for TmpGuard<'_> {
     }
 }
 
-fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite) -> Result<()> {
+#[cfg(feature = "xmp")]
+fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite, temp_suffix: &str) -> Result<()> {
     ensure_initialized();
 
-    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".meta-tmp");
-    let tmp_path = path.with_file_name(&tmp_name);
+    let tmp_path = temp_path_for(path, temp_suffix);
     std::fs::copy(path, &tmp_path)
         .with_context(|| format!("Copying {} -> {}", path.display(), tmp_path.display()))?;
 
@@ -346,9 +453,106 @@ fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite) -> Result<()> 
     Ok(())
 }
 
+#[cfg(not(feature = "xmp"))]
+fn apply_metadata_native(path: &Path, write: &MetadataWrite, temp_suffix: &str) -> Result<()> {
+    let input = std::fs::read(path)
+        .with_context(|| format!("Reading {} for native EXIF update", path.display()))?;
+    let Some(file_type) = native_file_type(&input, path) else {
+        tracing::debug!(
+            path = %path.display(),
+            "Native EXIF writer supports JPEG/TIFF only; skipping metadata write"
+        );
+        return Ok(());
+    };
+
+    let mut metadata = match Metadata::new_from_vec(&input, file_type) {
+        Ok(metadata) => metadata,
+        Err(e) if e.to_string().contains("No EXIF data found") => Metadata::new(),
+        Err(e) => return Err(e).with_context(|| format!("Reading EXIF from {}", path.display())),
+    };
+    if let Some(dt) = &write.datetime {
+        metadata.set_tag(ExifTag::DateTimeOriginal(dt.clone()));
+        metadata.set_tag(ExifTag::CreateDate(dt.clone()));
+        metadata.set_tag(ExifTag::ModifyDate(dt.clone()));
+    }
+    if let Some(desc) = &write.description {
+        metadata.set_tag(ExifTag::ImageDescription(desc.clone()));
+    }
+    if let Some(gps) = write.gps {
+        metadata.set_tag(ExifTag::GPSLatitudeRef(if gps.latitude >= 0.0 {
+            "N".to_string()
+        } else {
+            "S".to_string()
+        }));
+        metadata.set_tag(ExifTag::GPSLatitude(dms_rational(gps.latitude)));
+        metadata.set_tag(ExifTag::GPSLongitudeRef(if gps.longitude >= 0.0 {
+            "E".to_string()
+        } else {
+            "W".to_string()
+        }));
+        metadata.set_tag(ExifTag::GPSLongitude(dms_rational(gps.longitude)));
+        if let Some(alt) = gps.altitude {
+            metadata.set_tag(ExifTag::GPSAltitudeRef(vec![u8::from(alt < 0.0)]));
+            metadata.set_tag(ExifTag::GPSAltitude(vec![uR64::from(alt.abs())]));
+        }
+    }
+    if write.rating.is_some() {
+        tracing::debug!(
+            path = %path.display(),
+            "Native EXIF writer has no standard rating tag; skipping rating"
+        );
+    }
+
+    let mut output = input;
+    metadata
+        .write_to_vec(&mut output, file_type)
+        .with_context(|| format!("Writing native EXIF into {}", path.display()))?;
+    let tmp_path = temp_path_for(path, temp_suffix);
+    std::fs::write(&tmp_path, &output)
+        .with_context(|| format!("Writing native EXIF temp {}", tmp_path.display()))?;
+    let guard = TmpGuard::new(&tmp_path);
+    atomic_install(&tmp_path, path)
+        .with_context(|| format!("Installing native EXIF {}", path.display()))?;
+    guard.disarm();
+    tracing::debug!(path = %path.display(), "Applied native EXIF metadata");
+    Ok(())
+}
+
+#[cfg(not(feature = "xmp"))]
+fn native_file_type(bytes: &[u8], path: &Path) -> Option<FileExtension> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some(FileExtension::JPEG);
+    }
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return Some(FileExtension::TIFF);
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .and_then(|e| match e.to_ascii_lowercase().as_str() {
+            "jpg" | "jpeg" => Some(FileExtension::JPEG),
+            "tif" | "tiff" => Some(FileExtension::TIFF),
+            _ => None,
+        })
+}
+
+#[cfg(not(feature = "xmp"))]
+fn dms_rational(decimal: f64) -> Vec<uR64> {
+    let abs = decimal.abs();
+    let degrees = abs.floor();
+    let minutes_full = (abs - degrees) * 60.0;
+    let minutes = minutes_full.floor();
+    let seconds = (minutes_full - minutes) * 60.0;
+    vec![
+        uR64::from(degrees),
+        uR64::from(minutes),
+        uR64::from(seconds),
+    ]
+}
+
 /// Apply the requested metadata fields to an `XmpMeta`. Single source of
 /// truth — both the xmp_toolkit-backed and ISO-BMFF-backed writers route
 /// through here so the two paths produce identical XMP content.
+#[cfg(feature = "xmp")]
 fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpResult<()> {
     if let Some(dt) = &write.datetime {
         // XMP uses ISO 8601; our stored form is EXIF-style "YYYY:MM:DD HH:MM:SS".
@@ -446,7 +650,8 @@ fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpRe
 /// insert the resulting packet as a MIME item inside the HEIC's `meta` box.
 /// Operates on file bytes directly via ISO-BMFF atom editing so the encoded
 /// image data in `mdat` stays byte-for-byte identical — invariant 2.
-fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
+#[cfg(feature = "xmp")]
+fn apply_metadata_heif(path: &Path, write: &MetadataWrite, temp_suffix: &str) -> Result<()> {
     ensure_initialized();
 
     let input = std::fs::read(path)
@@ -470,9 +675,7 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
     apply_to_xmp(&mut meta, write)?;
     let xmp_bytes = meta.to_string().into_bytes();
 
-    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".meta-tmp");
-    let tmp_path = path.with_file_name(&tmp_name);
+    let tmp_path = temp_path_for(path, temp_suffix);
 
     // Stream the rewrite straight to disk and keep the descriptor open
     // through the post-rewrite validation: the old Vec<u8> output from
@@ -518,6 +721,7 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite) -> Result<()> {
 /// malformed rewrite never lands on disk. Reads from the still-open
 /// rewrite handle (seeks back to 0) to avoid reopening `tmp_path`
 /// immediately after `sync_all`; the path is only used for diagnostics.
+#[cfg(feature = "xmp")]
 fn validate_heif_post_rewrite(file: &mut std::fs::File, tmp_path: &Path) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     file.seek(SeekFrom::Start(0))
@@ -540,7 +744,7 @@ fn validate_heif_post_rewrite(file: &mut std::fs::File, tmp_path: &Path) -> Resu
 /// Build a standalone XMP packet from a bundle of fields. Thin convenience
 /// over [`apply_to_xmp`] for callers (mostly tests) that want the serialized
 /// packet bytes directly.
-#[cfg(test)]
+#[cfg(all(test, feature = "xmp"))]
 fn build_xmp_packet(write: &MetadataWrite) -> Result<Vec<u8>> {
     let mut meta = XmpMeta::new().context("creating XmpMeta")?;
     apply_to_xmp(&mut meta, write)?;
@@ -554,6 +758,7 @@ fn build_xmp_packet(write: &MetadataWrite) -> Result<Vec<u8>> {
     clippy::indexing_slicing,
     reason = "indices 4, 7, 10 are provably in-bounds under the `bytes.len() == 19` guard"
 )]
+#[cfg(feature = "xmp")]
 fn exif_datetime_to_iso(s: &str) -> String {
     let bytes = s.as_bytes();
     if bytes.len() == 19 && bytes[4] == b':' && bytes[7] == b':' && bytes[10] == b' ' {
@@ -576,6 +781,7 @@ fn exif_datetime_to_iso(s: &str) -> String {
 
 /// Encode decimal degrees in the EXIF-in-XMP form `"DEG,MIN.FRACHEMI"` used
 /// by [Xmp.exif.GPSLatitude] / `Xmp.exif.GPSLongitude`.
+#[cfg(feature = "xmp")]
 fn encode_gps(decimal: f64, pos: char, neg: char) -> String {
     let hemisphere = if decimal >= 0.0 { pos } else { neg };
     let abs = decimal.abs();
@@ -591,6 +797,7 @@ fn encode_gps(decimal: f64, pos: char, neg: char) -> String {
 }
 
 /// XMP `exif:GPSAltitude` is a rational; we use `meters/1` (scale of 1).
+#[cfg(feature = "xmp")]
 fn encode_altitude(meters: f64) -> String {
     #[allow(
         clippy::cast_possible_truncation,
@@ -601,9 +808,24 @@ fn encode_altitude(meters: f64) -> String {
     format!("{scaled}/1000")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "xmp"))]
 #[allow(clippy::unused_result_ok, reason = "test cleanup is best-effort")]
 mod tests {
+    fn apply_metadata_with_default_suffix(
+        path: &std::path::Path,
+        write: &super::MetadataWrite,
+    ) -> super::Result<()> {
+        super::apply_metadata(path, write, ".meta-tmp")
+    }
+
+    #[cfg(feature = "xmp")]
+    fn write_sidecar_with_default_suffix(
+        path: &std::path::Path,
+        write: &super::MetadataWrite,
+    ) -> super::Result<()> {
+        super::write_sidecar(path, write, ".meta-tmp")
+    }
+
     use super::*;
     use std::fs;
     use std::path::PathBuf;
@@ -754,9 +976,38 @@ mod tests {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "noop.jpg");
         let before = fs::read(&path).unwrap();
-        apply_metadata(&path, &MetadataWrite::default()).unwrap();
+        apply_metadata_with_default_suffix(&path, &MetadataWrite::default()).unwrap();
         let after = fs::read(&path).unwrap();
         assert_eq!(before, after, "empty write must not touch the file");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_uses_configured_temp_suffix() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "custom_suffix.jpg");
+        let default_tmp = dir.join("custom_suffix.jpg.meta-tmp");
+        let configured_tmp = dir.join("custom_suffix.jpg.kei-tmp");
+        fs::write(&default_tmp, b"sentinel").unwrap();
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                ..MetadataWrite::default()
+            },
+            ".kei-tmp",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(&default_tmp).unwrap(),
+            b"sentinel",
+            "metadata rewrite must not use the old .meta-tmp suffix"
+        );
+        assert!(
+            !configured_tmp.exists(),
+            "configured metadata temp path must be installed or cleaned up"
+        );
+        fs::remove_file(&default_tmp).ok();
         fs::remove_file(&path).ok();
     }
 
@@ -764,7 +1015,7 @@ mod tests {
     fn apply_metadata_datetime_roundtrips() {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "dt.jpg");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 datetime: Some("2024:06:15 10:00:00".to_string()),
@@ -781,7 +1032,7 @@ mod tests {
     fn apply_metadata_rating_roundtrips() {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "rating.jpg");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(4),
@@ -799,7 +1050,7 @@ mod tests {
     fn apply_metadata_rating_clamps_above_5() {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "rating_clamp.jpg");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(99),
@@ -817,7 +1068,7 @@ mod tests {
     fn apply_metadata_gps_roundtrips() {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "gps.jpg");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 gps: Some(GpsCoords {
@@ -843,7 +1094,7 @@ mod tests {
     fn apply_metadata_description_roundtrips() {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "desc.jpg");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 description: Some("Beach day".to_string()),
@@ -863,7 +1114,7 @@ mod tests {
     fn apply_metadata_title_and_keywords_roundtrip() {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "tags.jpg");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 title: Some("Vacation shot".to_string()),
@@ -892,7 +1143,7 @@ mod tests {
     fn apply_metadata_people_roundtrips() {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "people.jpg");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 people: vec!["Alice".into(), "Bob".into()],
@@ -913,7 +1164,7 @@ mod tests {
     fn apply_metadata_kei_namespace_fields() {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "kei_ns.jpg");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 is_hidden: true,
@@ -942,7 +1193,7 @@ mod tests {
     fn apply_metadata_all_fields_single_pass() {
         let dir = test_tmp_dir("meta_tests");
         let path = fresh_jpeg(&dir, "all.jpg");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 datetime: Some("2024:06:15 10:00:00".to_string()),
@@ -975,7 +1226,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("corrupt.jpg");
         fs::write(&path, b"not a jpeg").unwrap();
-        let result = apply_metadata(
+        let result = apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(3),
@@ -1076,7 +1327,7 @@ mod tests {
     fn apply_metadata_heic_rating_and_title() {
         let dir = test_tmp_dir("meta_heic_tests");
         let path = fresh_heic(&dir, "rating.heic");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(5),
@@ -1099,7 +1350,7 @@ mod tests {
     fn apply_metadata_heic_gps_roundtrips() {
         let dir = test_tmp_dir("meta_heic_tests");
         let path = fresh_heic(&dir, "gps.heic");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 gps: Some(GpsCoords {
@@ -1127,7 +1378,7 @@ mod tests {
         let dir = test_tmp_dir("meta_heic_tests");
         let path = fresh_heic(&dir, "preserve.heic");
         let original_bytes = SAMPLE_HEIC.to_vec();
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(3),
@@ -1167,7 +1418,7 @@ mod tests {
     fn apply_metadata_heic_preserves_existing_xmp_on_rewrite() {
         let dir = test_tmp_dir("meta_heic_tests");
         let path = fresh_heic(&dir, "preserve_xmp.heic");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 title: Some("First".into()),
@@ -1175,7 +1426,7 @@ mod tests {
             },
         )
         .unwrap();
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(4),
@@ -1207,9 +1458,9 @@ mod tests {
             ..MetadataWrite::default()
         };
 
-        apply_metadata(&path, &write).unwrap();
+        apply_metadata_with_default_suffix(&path, &write).unwrap();
         let first = fs::read(&path).unwrap();
-        apply_metadata(&path, &write).unwrap();
+        apply_metadata_with_default_suffix(&path, &write).unwrap();
         let second = fs::read(&path).unwrap();
 
         // Rewriting with the same data must not accumulate XMP items or
@@ -1312,7 +1563,7 @@ mod tests {
     fn probe_exif_heic_reports_datetime_after_apply() {
         let dir = test_tmp_dir("probe_heic_tests");
         let path = fresh_heic(&dir, "probe_dt.heic");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 datetime: Some("2024:06:15 10:00:00".to_string()),
@@ -1337,7 +1588,7 @@ mod tests {
     fn probe_exif_heic_reports_gps_after_apply() {
         let dir = test_tmp_dir("probe_heic_tests");
         let path = fresh_heic(&dir, "probe_gps.heic");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 gps: Some(GpsCoords {
@@ -1390,7 +1641,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC.kei-tmp");
         fs::write(&path, SAMPLE_HEIC).unwrap();
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 datetime: Some("2024:06:15 10:00:00".to_string()),
@@ -1421,7 +1672,7 @@ mod tests {
         // reconciled EXIF datetime — the refactor doesn't regress JPEG.
         let dir = test_tmp_dir("probe_heic_tests");
         let path = fresh_jpeg(&dir, "probe_jpeg_dt.jpg");
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 datetime: Some("2024:06:15 10:00:00".to_string()),
@@ -1457,7 +1708,7 @@ mod tests {
         // suffix shadowing the real `.heic` extension.
         let path = dir.join("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.kei-tmp");
         fs::write(&path, SAMPLE_HEIC).unwrap();
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(4),
@@ -1527,7 +1778,7 @@ mod tests {
         let path = dir.join("uri_infe.heic");
         fs::write(&path, &bytes).unwrap();
 
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(3),
@@ -1553,7 +1804,7 @@ mod tests {
         let path = dir.join("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB.kei-tmp");
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, minimal_jpeg()).unwrap();
-        apply_metadata(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(2),
@@ -1596,7 +1847,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let media_path = dir.join("empty.jpg");
         std::fs::write(&media_path, b"placeholder").unwrap();
-        write_sidecar(&media_path, &MetadataWrite::default()).unwrap();
+        write_sidecar_with_default_suffix(&media_path, &MetadataWrite::default()).unwrap();
         let sidecar = dir.join("empty.jpg.xmp");
         assert!(
             !sidecar.exists(),
@@ -1619,7 +1870,7 @@ mod tests {
             people: vec!["Alice".into()],
             ..MetadataWrite::default()
         };
-        write_sidecar(&media_path, &write).expect("sidecar write");
+        write_sidecar_with_default_suffix(&media_path, &write).expect("sidecar write");
         let sidecar = dir.join("photo.jpg.xmp");
         assert!(sidecar.exists(), "sidecar should be written next to media");
 
@@ -1646,13 +1897,13 @@ mod tests {
             title: Some("Before".into()),
             ..MetadataWrite::default()
         };
-        write_sidecar(&media_path, &first).unwrap();
+        write_sidecar_with_default_suffix(&media_path, &first).unwrap();
 
         let second = MetadataWrite {
             title: Some("After".into()),
             ..MetadataWrite::default()
         };
-        write_sidecar(&media_path, &second).unwrap();
+        write_sidecar_with_default_suffix(&media_path, &second).unwrap();
 
         let sidecar = dir.join("rewrite.jpg.xmp");
         let s = fs::read_to_string(&sidecar).unwrap();
@@ -1696,7 +1947,7 @@ mod tests {
             rating: Some(4),
             ..MetadataWrite::default()
         };
-        write_sidecar(&media_path, &write).expect("sidecar merge");
+        write_sidecar_with_default_suffix(&media_path, &write).expect("sidecar merge");
 
         let merged = fs::read_to_string(&sidecar_path).unwrap();
         assert!(
@@ -1746,7 +1997,7 @@ mod tests {
             keywords: vec!["vacation".to_string()],
             ..MetadataWrite::default()
         };
-        write_sidecar(&media_path, &write).expect("sidecar merge");
+        write_sidecar_with_default_suffix(&media_path, &write).expect("sidecar merge");
 
         let merged = fs::read_to_string(&sidecar_path).unwrap();
         for expected in ["history_end", "xmp_version", "raw_params", "gc5ghbmY2k8"] {
@@ -1783,7 +2034,7 @@ mod tests {
             title: Some("Clean".into()),
             ..MetadataWrite::default()
         };
-        write_sidecar(&media_path, &write).expect("fallback to fresh packet");
+        write_sidecar_with_default_suffix(&media_path, &write).expect("fallback to fresh packet");
 
         let out = fs::read_to_string(&sidecar_path).unwrap();
         assert!(out.contains("Clean"), "fallback write must land: {out}");
@@ -1804,7 +2055,7 @@ mod tests {
             rating: Some(3),
             ..MetadataWrite::default()
         };
-        write_sidecar(&media_path, &write).unwrap();
+        write_sidecar_with_default_suffix(&media_path, &write).unwrap();
 
         let after = fs::read(&media_path).unwrap();
         assert_eq!(
@@ -1816,5 +2067,163 @@ mod tests {
         let sidecar = dir.join("untouched.jpg.xmp");
         fs::remove_file(&sidecar).ok();
         fs::remove_file(&media_path).ok();
+    }
+}
+
+#[cfg(all(test, not(feature = "xmp")))]
+mod native_tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    /// Minimal valid JPEG (SOI + APP0 JFIF + EOI).
+    fn minimal_jpeg() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ]
+    }
+
+    fn fresh_jpeg(dir: &Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, minimal_jpeg()).unwrap();
+        path
+    }
+
+    #[test]
+    fn native_apply_metadata_writes_jpeg_exif_without_xmp_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_jpeg(dir.path(), "native.jpg");
+
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                description: Some("Beach day".to_string()),
+                gps: Some(GpsCoords {
+                    latitude: 37.7749,
+                    longitude: -122.4194,
+                    altitude: Some(17.0),
+                }),
+                rating: Some(5),
+                ..MetadataWrite::default()
+            },
+            ".kei-tmp",
+        )
+        .unwrap();
+
+        let probe = probe_exif(&path).unwrap();
+        assert_eq!(
+            probe.datetime_original.as_deref(),
+            Some("2024:06:15 10:00:00")
+        );
+        assert!(probe.has_gps);
+
+        let metadata = Metadata::new_from_path(&path).unwrap();
+        let description = metadata
+            .get_tag(&ExifTag::ImageDescription(String::new()))
+            .next()
+            .and_then(|tag| match tag {
+                ExifTag::ImageDescription(s) => Some(s.as_str()),
+                _ => None,
+            });
+        assert_eq!(description, Some("Beach day"));
+    }
+
+    #[test]
+    fn native_probe_reads_exif_from_temp_suffix_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_jpeg(dir.path(), "probe.jpg.kei-tmp");
+
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+        )
+        .unwrap();
+
+        let probe = probe_exif(&path).unwrap();
+        assert_eq!(
+            probe.datetime_original.as_deref(),
+            Some("2024:06:15 10:00:00")
+        );
+    }
+
+    #[test]
+    fn native_apply_metadata_uses_configured_temp_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_jpeg(dir.path(), "native_suffix.jpg");
+        let default_tmp = dir.path().join("native_suffix.jpg.meta-tmp");
+        let configured_tmp = dir.path().join("native_suffix.jpg.kei-tmp");
+        fs::write(&default_tmp, b"sentinel").unwrap();
+
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                ..MetadataWrite::default()
+            },
+            ".kei-tmp",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(&default_tmp).unwrap(),
+            b"sentinel",
+            "native metadata rewrite must not use the old .meta-tmp suffix"
+        );
+        assert!(
+            !configured_tmp.exists(),
+            "configured native metadata temp path must be installed or cleaned up"
+        );
+    }
+
+    #[test]
+    fn native_apply_metadata_skips_heic_without_xmp_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.heic");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x18_u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(b"mif1");
+        fs::write(&path, &bytes).unwrap();
+
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".to_string()),
+                ..MetadataWrite::default()
+            },
+            ".kei-tmp",
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "HEIC should be skipped unchanged when XMP support is disabled"
+        );
+        assert!(!dir.path().join("image.heic.kei-tmp").exists());
+    }
+
+    #[test]
+    fn native_tmp_guard_cleans_configured_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guarded.kei-tmp");
+        fs::write(&path, b"pending").unwrap();
+        {
+            let _guard = TmpGuard::new(&path);
+            assert!(path.exists(), "precondition: tmp file exists");
+        }
+        assert!(
+            !path.exists(),
+            "TmpGuard Drop must remove configured metadata temp files"
+        );
     }
 }

@@ -92,7 +92,6 @@ struct SetupAnswers {
     /// `parse_bandwidth_limit` on next sync. Empty = no limit.
     bandwidth_limit: Option<String>,
     keep_unicode_in_filenames: bool,
-    #[cfg(feature = "xmp")]
     set_exif_datetime: bool,
     #[cfg(feature = "xmp")]
     embed_xmp: bool,
@@ -140,7 +139,6 @@ impl Default for SetupAnswers {
             max_retries: None,
             bandwidth_limit: None,
             keep_unicode_in_filenames: false,
-            #[cfg(feature = "xmp")]
             set_exif_datetime: false,
             #[cfg(feature = "xmp")]
             embed_xmp: false,
@@ -1020,13 +1018,13 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         .default(false)
         .interact()?;
 
+    answers.set_exif_datetime = Confirm::new()
+        .with_prompt("Write EXIF date tag if missing from photo?")
+        .default(false)
+        .interact()?;
+
     #[cfg(feature = "xmp")]
     {
-        answers.set_exif_datetime = Confirm::new()
-            .with_prompt("Write EXIF date tag if missing from photo?")
-            .default(false)
-            .interact()?;
-
         answers.embed_xmp = Confirm::new()
             .with_prompt("Embed XMP metadata (rating, GPS, description) into photos?")
             .default(false)
@@ -1156,16 +1154,29 @@ fn generate_toml(answers: &SetupAnswers) -> String {
                 "# bandwidth_limit = \"10MB\"  # blank/comment = no limit"
             )?,
         };
+        writeln!(out, "# temp_suffix = \".kei-tmp\"")?;
+
+        // [download.retry]
+        writeln!(out)?;
+        writeln!(out, "[download.retry]")?;
+        match answers.max_retries {
+            Some(n) => writeln!(out, "per_transfer = {n}")?,
+            None => writeln!(out, "# per_transfer = 3")?,
+        };
+
+        // [metadata]
+        writeln!(out)?;
+        writeln!(out, "[metadata]")?;
+        if answers.set_exif_datetime {
+            writeln!(out, "set_exif_datetime = true")?;
+        } else {
+            writeln!(out, "# set_exif_datetime = false")?;
+        }
+        writeln!(out, "# set_exif_rating = false")?;
+        writeln!(out, "# set_exif_gps = false")?;
+        writeln!(out, "# set_exif_description = false")?;
         #[cfg(feature = "xmp")]
         {
-            if answers.set_exif_datetime {
-                writeln!(out, "set_exif_datetime = true")?;
-            } else {
-                writeln!(out, "# set_exif_datetime = false")?;
-            }
-            writeln!(out, "# set_exif_rating = false")?;
-            writeln!(out, "# set_exif_gps = false")?;
-            writeln!(out, "# set_exif_description = false")?;
             if answers.embed_xmp {
                 writeln!(out, "embed_xmp = true")?;
             } else {
@@ -1177,16 +1188,6 @@ fn generate_toml(answers: &SetupAnswers) -> String {
                 writeln!(out, "# xmp_sidecar = false")?;
             }
         }
-        writeln!(out, "# temp_suffix = \".kei-tmp\"")?;
-        writeln!(out, "# no_progress_bar = false")?;
-
-        // [download.retry]
-        writeln!(out)?;
-        writeln!(out, "[download.retry]")?;
-        match answers.max_retries {
-            Some(n) => writeln!(out, "max_retries = {n}")?,
-            None => writeln!(out, "# max_retries = 3")?,
-        };
 
         // [filters]
         writeln!(out)?;
@@ -1552,7 +1553,6 @@ mod tests {
             max_retries: Some(5),
             bandwidth_limit: Some("10MB".to_string()),
             keep_unicode_in_filenames: true,
-            #[cfg(feature = "xmp")]
             set_exif_datetime: true,
             #[cfg(feature = "xmp")]
             embed_xmp: true,
@@ -1589,9 +1589,9 @@ mod tests {
         assert!(toml_str.contains("bandwidth_limit = \"10MB\""));
         assert!(toml_str.contains("file_match_policy = \"name-id7\""));
         assert!(toml_str.contains("log_level = \"debug\""));
+        assert!(toml_str.contains("set_exif_datetime = true"));
         #[cfg(feature = "xmp")]
         {
-            assert!(toml_str.contains("set_exif_datetime = true"));
             assert!(toml_str.contains("embed_xmp = true"));
             // `xmp_sidecar = false` here means it's commented out, not active.
             assert!(toml_str.contains("# xmp_sidecar = false"));
@@ -1637,7 +1637,6 @@ mod tests {
             max_retries: Some(0),
             bandwidth_limit: Some("1Mi".to_string()),
             keep_unicode_in_filenames: true,
-            #[cfg(feature = "xmp")]
             set_exif_datetime: true,
             #[cfg(feature = "xmp")]
             embed_xmp: true,
@@ -1663,14 +1662,15 @@ mod tests {
         assert_eq!(dl.folder_structure_albums.as_deref(), Some("{album}/%Y-%m"));
         assert_eq!(dl.threads, Some(2));
         assert_eq!(dl.bandwidth_limit.as_deref(), Some("1Mi"));
+        let metadata = parsed.metadata.unwrap();
+        assert_eq!(metadata.set_exif_datetime, Some(true));
         #[cfg(feature = "xmp")]
         {
-            assert_eq!(dl.set_exif_datetime, Some(true));
-            assert_eq!(dl.embed_xmp, Some(true));
-            assert_eq!(dl.xmp_sidecar, Some(true));
+            assert_eq!(metadata.embed_xmp, Some(true));
+            assert_eq!(metadata.xmp_sidecar, Some(true));
         }
         let retry = dl.retry.unwrap();
-        assert_eq!(retry.max_retries, Some(0));
+        assert_eq!(retry.per_transfer, Some(0));
 
         let filters = parsed.filters.unwrap();
         assert_eq!(filters.albums.as_deref(), Some(&["A".to_string()][..]));
@@ -1775,7 +1775,6 @@ mod tests {
                 raw_policy: Some(RawPolicy::PreferJpeg),
                 bandwidth_limit: Some("10MB".to_string()),
                 reconcile_every_n_cycles: Some(24),
-                #[cfg(feature = "xmp")]
                 set_exif_datetime: true,
                 #[cfg(feature = "xmp")]
                 embed_xmp: true,

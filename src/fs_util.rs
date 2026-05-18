@@ -8,10 +8,9 @@ use std::path::Path;
 /// silently dropping errors that violated the "no silent failures"
 /// invariant.
 ///
-/// Gated on the `xmp` feature because the only sync caller is
-/// `download/metadata.rs::TmpGuard::drop`, which is itself xmp-gated.
-/// The async sibling `log_remove_async` is unconditionally compiled.
-#[cfg(feature = "xmp")]
+/// Used by both the default XMP writer and the native no-`xmp` EXIF writer.
+/// The async sibling `log_remove_async` is available for callers already on a
+/// tokio task.
 pub(crate) fn log_remove(path: &Path) {
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {

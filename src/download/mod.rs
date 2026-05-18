@@ -9,7 +9,6 @@ pub(crate) mod filter;
 #[cfg(feature = "xmp")]
 pub(crate) mod heif;
 pub(crate) mod limiter;
-#[cfg(feature = "xmp")]
 pub mod metadata;
 pub mod paths;
 pub(crate) mod pipeline;
@@ -477,13 +476,9 @@ pub(crate) struct DownloadConfig {
     pub(crate) media: crate::config::MediaSelection,
     pub(crate) skip_created_before: Option<DateTime<Utc>>,
     pub(crate) skip_created_after: Option<DateTime<Utc>>,
-    #[cfg(feature = "xmp")]
     pub(crate) set_exif_datetime: bool,
-    #[cfg(feature = "xmp")]
     pub(crate) set_exif_rating: bool,
-    #[cfg(feature = "xmp")]
     pub(crate) set_exif_gps: bool,
-    #[cfg(feature = "xmp")]
     pub(crate) set_exif_description: bool,
     /// Embed the full XMP packet (title, keywords, people, hidden/archived,
     /// media subtype, burst id) into the file bytes on supported formats.
@@ -610,13 +605,9 @@ impl DownloadConfig {
             media,
             skip_created_before: None,
             skip_created_after: None,
-            #[cfg(feature = "xmp")]
             set_exif_datetime: false,
-            #[cfg(feature = "xmp")]
             set_exif_rating: false,
-            #[cfg(feature = "xmp")]
             set_exif_gps: false,
-            #[cfg(feature = "xmp")]
             set_exif_description: false,
             #[cfg(feature = "xmp")]
             embed_xmp: false,
@@ -756,12 +747,12 @@ impl std::fmt::Debug for DownloadConfig {
             .field("media", &self.media)
             .field("skip_created_before", &self.skip_created_before)
             .field("skip_created_after", &self.skip_created_after);
-        #[cfg(feature = "xmp")]
         s.field("set_exif_datetime", &self.set_exif_datetime)
             .field("set_exif_rating", &self.set_exif_rating)
             .field("set_exif_gps", &self.set_exif_gps)
-            .field("set_exif_description", &self.set_exif_description)
-            .field("embed_xmp", &self.embed_xmp)
+            .field("set_exif_description", &self.set_exif_description);
+        #[cfg(feature = "xmp")]
+        s.field("embed_xmp", &self.embed_xmp)
             .field("xmp_sidecar", &self.xmp_sidecar);
         s.field("dry_run", &self.dry_run)
             .field("concurrent_downloads", &self.concurrent_downloads)
@@ -810,13 +801,9 @@ impl DownloadConfig {
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
-            #[cfg(feature = "xmp")]
             set_exif_datetime: false,
-            #[cfg(feature = "xmp")]
             set_exif_rating: false,
-            #[cfg(feature = "xmp")]
             set_exif_gps: false,
-            #[cfg(feature = "xmp")]
             set_exif_description: false,
             #[cfg(feature = "xmp")]
             embed_xmp: false,
@@ -3549,10 +3536,7 @@ mod tests {
         config.force_resolution = true;
         config.keep_unicode_in_filenames = true;
         config.dry_run = true;
-        #[cfg(feature = "xmp")]
-        {
-            config.set_exif_datetime = true;
-        }
+        config.set_exif_datetime = true;
         config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         config.temp_suffix = std::sync::Arc::from(".custom-tmp");
         let derived = config.with_pass(&make_pass(PassKind::Album, "Test"));
@@ -3562,7 +3546,6 @@ mod tests {
         assert!(derived.force_resolution);
         assert!(derived.keep_unicode_in_filenames);
         assert!(derived.dry_run);
-        #[cfg(feature = "xmp")]
         assert!(derived.set_exif_datetime);
         assert_eq!(derived.filename_exclude.len(), 1);
         assert_eq!(&*derived.temp_suffix, ".custom-tmp");

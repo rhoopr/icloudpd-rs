@@ -51,6 +51,7 @@ struct SyncToml<'a> {
     download: &'a str,
     filters: &'a str,
     photos: &'a str,
+    metadata: &'a str,
     watch: &'a str,
     notifications: &'a str,
     report: &'a str,
@@ -119,6 +120,7 @@ fn album_config(
     body.push_str(toml.filters);
     for (section, content) in [
         ("photos", toml.photos),
+        ("metadata", toml.metadata),
         ("watch", toml.watch),
         ("notifications", toml.notifications),
         ("report", toml.report),
@@ -740,7 +742,7 @@ fn sync_keep_unicode_preserves_special_chars() {
 
 // ── EXIF ────────────────────────────────────────────────────────────────
 
-/// --set-exif-datetime should embed DateTimeOriginal in downloaded JPEG files.
+/// [metadata].set_exif_datetime should embed DateTimeOriginal in downloaded JPEG files.
 #[cfg(feature = "xmp")]
 #[test]
 #[ignore]
@@ -756,7 +758,7 @@ fn sync_set_exif_datetime_embeds_date() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                download: "set_exif_datetime = true\n",
+                metadata: "set_exif_datetime = true\n",
                 filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
@@ -786,16 +788,16 @@ fn sync_set_exif_datetime_embeds_date() {
             .expect("open JPEG for XMP read");
         let meta = file
             .xmp()
-            .expect("JPEG should have XMP after --set-exif-datetime");
+            .expect("JPEG should have XMP after set_exif_datetime");
         assert!(
             meta.property(xmp_ns::EXIF, "DateTimeOriginal").is_some()
                 || meta.property(xmp_ns::XMP, "CreateDate").is_some(),
-            "DateTimeOriginal XMP property should be present after --set-exif-datetime"
+            "DateTimeOriginal XMP property should be present after set_exif_datetime"
         );
     });
 }
 
-/// --set-exif-rating should add a Rating property (value depends on the
+/// [metadata].set_exif_rating should add a Rating property (value depends on the
 /// source photo; we assert the sync succeeds and the resulting JPEG has
 /// a writable XMP packet).
 #[cfg(feature = "xmp")]
@@ -813,7 +815,7 @@ fn sync_set_exif_rating_embeds_rating() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                download: "set_exif_rating = true\n",
+                metadata: "set_exif_rating = true\n",
                 filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
@@ -829,12 +831,12 @@ fn sync_set_exif_rating_embeds_rating() {
             .expect("open JPEG for XMP read");
         assert!(
             file.xmp().is_some(),
-            "JPEG should carry an XMP packet after --set-exif-rating"
+            "JPEG should carry an XMP packet after set_exif_rating"
         );
     });
 }
 
-/// --set-exif-gps embeds GPSLatitude/GPSLongitude when the source photo
+/// [metadata].set_exif_gps embeds GPSLatitude/GPSLongitude when the source photo
 /// carries location data. Sync must succeed either way; we only assert
 /// an XMP packet exists.
 #[cfg(feature = "xmp")]
@@ -852,7 +854,7 @@ fn sync_set_exif_gps_embeds_gps() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                download: "set_exif_gps = true\n",
+                metadata: "set_exif_gps = true\n",
                 filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
@@ -868,12 +870,12 @@ fn sync_set_exif_gps_embeds_gps() {
             .expect("open JPEG for XMP read");
         assert!(
             file.xmp().is_some(),
-            "JPEG should carry an XMP packet after --set-exif-gps"
+            "JPEG should carry an XMP packet after set_exif_gps"
         );
     });
 }
 
-/// --set-exif-description embeds a dc:description when the source has
+/// [metadata].set_exif_description embeds a dc:description when the source has
 /// one. Sync must succeed either way; we only assert an XMP packet
 /// exists.
 #[cfg(feature = "xmp")]
@@ -891,7 +893,7 @@ fn sync_set_exif_description_embeds_description() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                download: "set_exif_description = true\n",
+                metadata: "set_exif_description = true\n",
                 filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
@@ -907,12 +909,12 @@ fn sync_set_exif_description_embeds_description() {
             .expect("open JPEG for XMP read");
         assert!(
             file.xmp().is_some(),
-            "JPEG should carry an XMP packet after --set-exif-description"
+            "JPEG should carry an XMP packet after set_exif_description"
         );
     });
 }
 
-/// --embed-xmp writes a full kei-authored XMP packet into the JPEG. Verify
+/// [metadata].embed_xmp writes a full kei-authored XMP packet into the JPEG. Verify
 /// the file carries XMP content that references kei's own namespace URI.
 #[cfg(feature = "xmp")]
 #[test]
@@ -929,7 +931,7 @@ fn sync_embed_xmp_writes_xmp_packet() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                download: "embed_xmp = true\n",
+                metadata: "embed_xmp = true\n",
                 filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
@@ -943,7 +945,7 @@ fn sync_embed_xmp_writes_xmp_packet() {
         let mut file = XmpFile::new().expect("xmp file handle");
         file.open_file(&jpeg, OpenFileOptions::default().for_read())
             .expect("open JPEG for XMP read");
-        let meta = file.xmp().expect("JPEG should carry XMP after --embed-xmp");
+        let meta = file.xmp().expect("JPEG should carry XMP after embed_xmp");
         // kei registers its own namespace (github.com/rhoopr/kei/ns/1.0/)
         // for hidden/archived/mediaSubtype/burstId. Serialize and look for
         // it so we know the packet reached us, not just a remnant from
@@ -956,7 +958,7 @@ fn sync_embed_xmp_writes_xmp_packet() {
     });
 }
 
-/// --xmp-sidecar writes a .xmp sidecar next to every downloaded media file.
+/// [metadata].xmp_sidecar writes a .xmp sidecar next to every downloaded media file.
 /// Verify at least one `.xmp` sits next to a downloaded JPEG.
 #[cfg(feature = "xmp")]
 #[test]
@@ -973,7 +975,7 @@ fn sync_xmp_sidecar_writes_sidecar_file() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                download: "xmp_sidecar = true\n",
+                metadata: "xmp_sidecar = true\n",
                 filters: "media = [\"photos\", \"live-photos\"]\n",
                 ..SyncToml::default()
             },
@@ -993,7 +995,7 @@ fn sync_xmp_sidecar_writes_sidecar_file() {
             .collect();
         assert!(
             !sidecars.is_empty(),
-            "--xmp-sidecar should produce at least one .xmp sidecar, got files: {files:?}"
+            "xmp_sidecar should produce at least one .xmp sidecar, got files: {files:?}"
         );
 
         let bytes = std::fs::read(sidecars[0]).expect("read sidecar");
@@ -1005,10 +1007,11 @@ fn sync_xmp_sidecar_writes_sidecar_file() {
     });
 }
 
-/// --embed-xmp on a HEIC file: kei routes through the mp4-atom HEIC writer
+/// [metadata].embed_xmp on a HEIC file: kei routes through the mp4-atom HEIC writer
 /// rather than xmp_toolkit. The resulting HEIC must carry an XMP packet
 /// as a MIME item inside the `meta` box; we detect it by looking for the
 /// `<x:xmpmeta` magic in the file bytes.
+#[cfg(feature = "xmp")]
 #[test]
 #[ignore]
 fn sync_embed_xmp_on_heic_writes_mime_item() {
@@ -1023,7 +1026,7 @@ fn sync_embed_xmp_on_heic_writes_mime_item() {
             &cookie_dir,
             download_dir.path(),
             SyncToml {
-                download: "embed_xmp = true\n",
+                metadata: "embed_xmp = true\n",
                 ..SyncToml::default()
             },
         )
@@ -1061,7 +1064,7 @@ fn sync_embed_xmp_on_heic_writes_mime_item() {
             .any(|w| w.eq_ignore_ascii_case(needle));
         assert!(
             found,
-            "HEIC `{}` must carry an XMP packet after --embed-xmp",
+            "HEIC `{}` must carry an XMP packet after embed_xmp",
             heics[0].display()
         );
     });

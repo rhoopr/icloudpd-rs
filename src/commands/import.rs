@@ -1313,13 +1313,9 @@ mod wiremock_tests {
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
-            #[cfg(feature = "xmp")]
             set_exif_datetime: false,
-            #[cfg(feature = "xmp")]
             set_exif_rating: false,
-            #[cfg(feature = "xmp")]
             set_exif_gps: false,
-            #[cfg(feature = "xmp")]
             set_exif_description: false,
             #[cfg(feature = "xmp")]
             embed_xmp: false,

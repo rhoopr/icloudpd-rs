@@ -20,6 +20,7 @@ pub(crate) struct TomlConfig {
     pub filters: Option<TomlFilters>,
     pub photos: Option<TomlPhotos>,
     pub import: Option<TomlImport>,
+    pub metadata: Option<TomlMetadata>,
     pub watch: Option<TomlWatch>,
     pub notifications: Option<TomlNotifications>,
     pub server: Option<TomlServer>,
@@ -36,6 +37,9 @@ pub(crate) struct TomlUi {
     /// `--log-level` / `RUST_LOG` contexts. The CLI flags `--friendly` and
     /// `--no-friendly` override this value for one invocation.
     pub friendly: Option<bool>,
+    /// Durable progress-bar default. Defaults to true. The CLI
+    /// `--no-progress-bar` flag remains a one-run disable override.
+    pub progress_bar: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -73,32 +77,31 @@ pub(crate) struct TomlDownload {
     pub threads: Option<u16>,
     pub bandwidth_limit: Option<String>,
     pub temp_suffix: Option<String>,
-    #[cfg(feature = "xmp")]
-    pub set_exif_datetime: Option<bool>,
-    #[cfg(feature = "xmp")]
-    pub set_exif_rating: Option<bool>,
-    #[cfg(feature = "xmp")]
-    pub set_exif_gps: Option<bool>,
-    #[cfg(feature = "xmp")]
-    pub set_exif_description: Option<bool>,
-    #[cfg(feature = "xmp")]
-    pub embed_xmp: Option<bool>,
-    #[cfg(feature = "xmp")]
-    pub xmp_sidecar: Option<bool>,
-    pub no_progress_bar: Option<bool>,
     pub retry: Option<TomlRetry>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlRetry {
-    pub max_retries: Option<u32>,
+    /// Retries within a single transfer.
+    pub per_transfer: Option<u32>,
     /// Lifetime cap on download attempts per asset across syncs (default
-    /// `10`). The same value as the `--max-download-attempts` CLI flag /
-    /// `KEI_MAX_DOWNLOAD_ATTEMPTS` env var; CLI > TOML > default. Distinct
-    /// from `max_retries`, which only caps retries within a single
-    /// download. `0` disables the cap.
-    pub max_download_attempts: Option<u32>,
+    /// `10`). Distinct from `per_transfer`, which only caps retries within a
+    /// single download. `0` disables the cap.
+    pub per_asset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TomlMetadata {
+    pub set_exif_datetime: Option<bool>,
+    pub set_exif_rating: Option<bool>,
+    pub set_exif_gps: Option<bool>,
+    pub set_exif_description: Option<bool>,
+    #[cfg(feature = "xmp")]
+    pub embed_xmp: Option<bool>,
+    #[cfg(feature = "xmp")]
+    pub xmp_sidecar: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -241,13 +244,9 @@ pub(crate) struct SyncConfigOverrides {
     pub folder_structure: Option<String>,
     pub folder_structure_albums: Option<String>,
     pub folder_structure_smart_folders: Option<String>,
-    #[cfg(feature = "xmp")]
     pub set_exif_datetime: Option<bool>,
-    #[cfg(feature = "xmp")]
     pub set_exif_rating: Option<bool>,
-    #[cfg(feature = "xmp")]
     pub set_exif_gps: Option<bool>,
-    #[cfg(feature = "xmp")]
     pub set_exif_description: Option<bool>,
     #[cfg(feature = "xmp")]
     pub embed_xmp: Option<bool>,
@@ -371,13 +370,9 @@ pub struct UiConfig {
 
 #[derive(Debug)]
 pub struct MetadataConfig {
-    #[cfg(feature = "xmp")]
     pub set_exif_datetime: bool,
-    #[cfg(feature = "xmp")]
     pub set_exif_rating: bool,
-    #[cfg(feature = "xmp")]
     pub set_exif_gps: bool,
-    #[cfg(feature = "xmp")]
     pub set_exif_description: bool,
     #[cfg(feature = "xmp")]
     pub embed_xmp: bool,
@@ -1045,13 +1040,13 @@ pub(crate) fn resolve_notify_systemd(
     cli.or(toml).unwrap_or(notify_socket_present)
 }
 
-/// Smart initial retry delay (seconds) derived from `--max-retries`.
+/// Smart initial retry delay (seconds) derived from retry `per_transfer`.
 ///
 /// Higher max implies the user is patient and wants retries to give failing
 /// services time to recover (rate limits, 5xx, slow endpoints). Lower max
 /// implies "fail fast" and retries should be quick.
 ///
-/// `max_retries == 0` means no retries happen so the delay is irrelevant;
+/// `per_transfer == 0` means no retries happen so the delay is irrelevant;
 /// returns 5 (within the validation range) as a non-load-bearing placeholder.
 pub(crate) fn smart_retry_delay(max_retries: u32) -> u64 {
     match max_retries {
@@ -1256,6 +1251,8 @@ impl Config {
         let toml_filters = toml.and_then(|t| t.filters.as_ref());
         let toml_photos = toml.and_then(|t| t.photos.as_ref());
         let toml_import = toml.and_then(|t| t.import.as_ref());
+        let toml_metadata = toml.and_then(|t| t.metadata.as_ref());
+        let toml_ui = toml.and_then(|t| t.ui.as_ref());
         let toml_watch = toml.and_then(|t| t.watch.as_ref());
         let toml_server = toml.and_then(|t| t.server.as_ref());
 
@@ -1319,42 +1316,42 @@ impl Config {
             toml_dl.and_then(|d| d.temp_suffix.clone()),
             ".kei-tmp".to_string(),
         );
-        #[cfg(feature = "xmp")]
         let set_exif_datetime = resolve_flag(
             overrides.set_exif_datetime,
-            toml_dl.and_then(|d| d.set_exif_datetime),
+            toml_metadata.and_then(|m| m.set_exif_datetime),
         );
-        #[cfg(feature = "xmp")]
         let set_exif_rating = resolve_flag(
             overrides.set_exif_rating,
-            toml_dl.and_then(|d| d.set_exif_rating),
+            toml_metadata.and_then(|m| m.set_exif_rating),
         );
-        #[cfg(feature = "xmp")]
-        let set_exif_gps =
-            resolve_flag(overrides.set_exif_gps, toml_dl.and_then(|d| d.set_exif_gps));
-        #[cfg(feature = "xmp")]
+        let set_exif_gps = resolve_flag(
+            overrides.set_exif_gps,
+            toml_metadata.and_then(|m| m.set_exif_gps),
+        );
         let set_exif_description = resolve_flag(
             overrides.set_exif_description,
-            toml_dl.and_then(|d| d.set_exif_description),
+            toml_metadata.and_then(|m| m.set_exif_description),
         );
         #[cfg(feature = "xmp")]
-        let embed_xmp = resolve_flag(overrides.embed_xmp, toml_dl.and_then(|d| d.embed_xmp));
+        let embed_xmp = resolve_flag(overrides.embed_xmp, toml_metadata.and_then(|m| m.embed_xmp));
         #[cfg(feature = "xmp")]
-        let xmp_sidecar = resolve_flag(overrides.xmp_sidecar, toml_dl.and_then(|d| d.xmp_sidecar));
-        let no_progress_bar = resolve_flag(
-            sync.no_progress_bar,
-            toml_dl.and_then(|d| d.no_progress_bar),
+        let xmp_sidecar = resolve_flag(
+            overrides.xmp_sidecar,
+            toml_metadata.and_then(|m| m.xmp_sidecar),
         );
+        let no_progress_bar = sync
+            .no_progress_bar
+            .unwrap_or_else(|| !toml_ui.and_then(|u| u.progress_bar).unwrap_or(true));
 
         // Re-validate; clap range attrs run on CLI only.
         let max_retries = resolve(
             overrides.max_retries,
-            toml_retry.and_then(|r| r.max_retries),
+            toml_retry.and_then(|r| r.per_transfer),
             3,
         );
         anyhow::ensure!(
             max_retries <= 100,
-            "retry max_retries must be <= 100, got {max_retries}"
+            "retry per_transfer must be <= 100, got {max_retries}"
         );
         // Lifetime cap on download attempts per asset (0 disables). CLI >
         // TOML > 10, matching every other resolved value. The runtime
@@ -1362,7 +1359,7 @@ impl Config {
         // when this is 0, so 0 is a valid (cap-off) sentinel.
         let max_download_attempts = resolve(
             overrides.max_download_attempts,
-            toml_retry.and_then(|r| r.max_download_attempts),
+            toml_retry.and_then(|r| r.per_asset),
             10,
         );
         let retry_delay_secs = smart_retry_delay(max_retries);
@@ -1664,13 +1661,9 @@ impl Config {
                 friendly_request,
             },
             metadata: MetadataConfig {
-                #[cfg(feature = "xmp")]
                 set_exif_datetime,
-                #[cfg(feature = "xmp")]
                 set_exif_rating,
-                #[cfg(feature = "xmp")]
                 set_exif_gps,
-                #[cfg(feature = "xmp")]
                 set_exif_description,
                 #[cfg(feature = "xmp")]
                 embed_xmp,
@@ -1742,54 +1735,13 @@ impl Config {
                 } else {
                     Some(self.download.temp_suffix.clone())
                 },
-                #[cfg(feature = "xmp")]
-                set_exif_datetime: if self.metadata.set_exif_datetime {
-                    Some(true)
-                } else {
-                    None
-                },
-                #[cfg(feature = "xmp")]
-                set_exif_rating: if self.metadata.set_exif_rating {
-                    Some(true)
-                } else {
-                    None
-                },
-                #[cfg(feature = "xmp")]
-                set_exif_gps: if self.metadata.set_exif_gps {
-                    Some(true)
-                } else {
-                    None
-                },
-                #[cfg(feature = "xmp")]
-                set_exif_description: if self.metadata.set_exif_description {
-                    Some(true)
-                } else {
-                    None
-                },
-                #[cfg(feature = "xmp")]
-                embed_xmp: if self.metadata.embed_xmp {
-                    Some(true)
-                } else {
-                    None
-                },
-                #[cfg(feature = "xmp")]
-                xmp_sidecar: if self.metadata.xmp_sidecar {
-                    Some(true)
-                } else {
-                    None
-                },
-                no_progress_bar: if self.download.no_progress_bar {
-                    Some(true)
-                } else {
-                    None
-                },
                 retry: Some(TomlRetry {
-                    max_retries: Some(self.retry.max_retries),
-                    // Emit `max_download_attempts` only when the user has
+                    per_transfer: Some(self.retry.max_retries),
+                    // Emit `per_asset` only when the user has
                     // overridden the default of 10. Keeps the round-trip
                     // clean for the common case and surfaces explicit
                     // overrides in `kei config show`.
-                    max_download_attempts: if self.retry.max_download_attempts == 10 {
+                    per_asset: if self.retry.max_download_attempts == 10 {
                         None
                     } else {
                         Some(self.retry.max_download_attempts)
@@ -1908,6 +1860,57 @@ impl Config {
             } else {
                 None
             },
+            metadata: if self.metadata.set_exif_datetime
+                || self.metadata.set_exif_rating
+                || self.metadata.set_exif_gps
+                || self.metadata.set_exif_description
+                || {
+                    #[cfg(feature = "xmp")]
+                    {
+                        self.metadata.embed_xmp || self.metadata.xmp_sidecar
+                    }
+                    #[cfg(not(feature = "xmp"))]
+                    {
+                        false
+                    }
+                } {
+                Some(TomlMetadata {
+                    set_exif_datetime: if self.metadata.set_exif_datetime {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    set_exif_rating: if self.metadata.set_exif_rating {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    set_exif_gps: if self.metadata.set_exif_gps {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    set_exif_description: if self.metadata.set_exif_description {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    #[cfg(feature = "xmp")]
+                    embed_xmp: if self.metadata.embed_xmp {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    #[cfg(feature = "xmp")]
+                    xmp_sidecar: if self.metadata.xmp_sidecar {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                })
+            } else {
+                None
+            },
             watch: if self.watch.interval.is_some()
                 || self.watch.notify_systemd
                 || self.watch.pid_file.is_some()
@@ -1954,13 +1957,20 @@ impl Config {
             report: self.report.json.as_ref().map(|p| TomlReport {
                 json: Some(p.display().to_string()),
             }),
-            // Only emit `[ui]` when the user actually expressed a preference.
-            // Omitting the section when `friendly_request` is `None` keeps
-            // `kei config show` output unchanged for users who never opted
-            // in or out, and lets the default-on-for-TTY policy apply.
-            ui: self.ui.friendly_request.map(|friendly| TomlUi {
-                friendly: Some(friendly),
-            }),
+            // Only emit `[ui]` when the user actually expressed a preference
+            // or disabled the durable progress bar default.
+            ui: if self.ui.friendly_request.is_some() || self.download.no_progress_bar {
+                Some(TomlUi {
+                    friendly: self.ui.friendly_request,
+                    progress_bar: if self.download.no_progress_bar {
+                        Some(false)
+                    } else {
+                        None
+                    },
+                })
+            } else {
+                None
+            },
         }
     }
 }
@@ -2024,24 +2034,12 @@ pub(crate) fn persist_first_run_config(
             threads: None,
             bandwidth_limit: None,
             temp_suffix: None,
-            #[cfg(feature = "xmp")]
-            set_exif_datetime: None,
-            #[cfg(feature = "xmp")]
-            set_exif_rating: None,
-            #[cfg(feature = "xmp")]
-            set_exif_gps: None,
-            #[cfg(feature = "xmp")]
-            set_exif_description: None,
-            #[cfg(feature = "xmp")]
-            embed_xmp: None,
-            #[cfg(feature = "xmp")]
-            xmp_sidecar: None,
-            no_progress_bar: None,
             retry: None,
         }),
         filters: None,
         photos: None,
         import: None,
+        metadata: None,
         watch: None,
         notifications: None,
         server: None,
@@ -2314,10 +2312,9 @@ mod tests {
             folder_structure = "%Y/%m/%d"
             threads = 10
             temp_suffix = ".kei-tmp"
-            no_progress_bar = false
 
             [download.retry]
-            max_retries = 3
+            per_transfer = 3
 
             [filters]
             libraries = ["PrimarySync"]
@@ -2350,7 +2347,7 @@ mod tests {
         assert_eq!(dl.threads, Some(10));
 
         let retry = dl.retry.unwrap();
-        assert_eq!(retry.max_retries, Some(3));
+        assert_eq!(retry.per_transfer, Some(3));
 
         let filters = config.filters.unwrap();
         assert_eq!(filters.albums, Some(vec!["Favorites".to_string()]));
@@ -2395,11 +2392,11 @@ mod tests {
     fn test_toml_nested_retry() {
         let toml_str = r#"
             [download.retry]
-            max_retries = 5
+            per_transfer = 5
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         let retry = config.download.unwrap().retry.unwrap();
-        assert_eq!(retry.max_retries, Some(5));
+        assert_eq!(retry.per_transfer, Some(5));
     }
 
     #[test]
@@ -2973,11 +2970,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "xmp")]
     #[test]
     fn test_build_boolean_flag_from_toml() {
         let toml_str = r#"
-            [download]
+            [metadata]
             set_exif_datetime = true
 
             [filters]
@@ -2999,7 +2995,7 @@ mod tests {
     #[test]
     fn test_build_embed_xmp_and_sidecar_from_toml() {
         let toml_str = r#"
-            [download]
+            [metadata]
             embed_xmp = true
             xmp_sidecar = true
         "#;
@@ -3019,7 +3015,7 @@ mod tests {
     #[test]
     fn test_cli_embed_xmp_overrides_toml() {
         let toml_str = r#"
-            [download]
+            [metadata]
             embed_xmp = true
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
@@ -3213,7 +3209,7 @@ mod tests {
     fn test_build_max_retries_above_upper_bound_from_toml_rejected() {
         let toml_str = r#"
             [download.retry]
-            max_retries = 9999
+            per_transfer = 9999
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let result = Config::build(
@@ -3222,11 +3218,11 @@ mod tests {
             default_sync(),
             Some(&toml),
         );
-        assert!(result.is_err(), "TOML max_retries > 100 must be rejected");
+        assert!(result.is_err(), "TOML per_transfer > 100 must be rejected");
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("max_retries") && msg.contains("100"),
-            "Error should mention max_retries and the bound: {msg}"
+            msg.contains("per_transfer") && msg.contains("100"),
+            "Error should mention per_transfer and the bound: {msg}"
         );
     }
 
@@ -3234,7 +3230,7 @@ mod tests {
     fn test_build_retry_clamp_accepts_upper_bound_from_toml() {
         let toml_str = r#"
             [download.retry]
-            max_retries = 100
+            per_transfer = 100
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -3243,7 +3239,7 @@ mod tests {
             default_sync(),
             Some(&toml),
         )
-        .expect("max_retries=100 must be accepted");
+        .expect("per_transfer=100 must be accepted");
         assert_eq!(cfg.retry.max_retries, 100);
         assert_eq!(cfg.retry.retry_delay_secs, 30);
     }
@@ -3630,7 +3626,6 @@ mod tests {
         assert_eq!(config.auth.unwrap().password.as_deref(), Some("secret"));
     }
 
-    #[cfg(feature = "xmp")]
     #[test]
     fn test_toml_download_all_fields() {
         let toml_str = r#"
@@ -3639,8 +3634,12 @@ mod tests {
             folder_structure = "%Y-%m"
             threads = 4
             temp_suffix = ".part"
+
+            [metadata]
             set_exif_datetime = true
-            no_progress_bar = true
+
+            [ui]
+            progress_bar = false
         "#;
         let config: TomlConfig = toml::from_str(toml_str).unwrap();
         let dl = config.download.unwrap();
@@ -3648,8 +3647,8 @@ mod tests {
         assert_eq!(dl.folder_structure.as_deref(), Some("%Y-%m"));
         assert_eq!(dl.threads, Some(4));
         assert_eq!(dl.temp_suffix.as_deref(), Some(".part"));
-        assert_eq!(dl.set_exif_datetime, Some(true));
-        assert_eq!(dl.no_progress_bar, Some(true));
+        assert_eq!(config.metadata.unwrap().set_exif_datetime, Some(true));
+        assert_eq!(config.ui.unwrap().progress_bar, Some(false));
     }
 
     #[test]
@@ -3975,7 +3974,6 @@ mod tests {
         assert_eq!(cfg.download.folder_structure, "%Y/%m/%d");
         assert_eq!(cfg.download.threads_num, 10);
         assert_eq!(cfg.download.temp_suffix, ".kei-tmp");
-        #[cfg(feature = "xmp")]
         assert!(!cfg.metadata.set_exif_datetime);
         assert!(!cfg.download.no_progress_bar);
         // Retry
@@ -4125,7 +4123,7 @@ mod tests {
     fn test_build_max_retries_cli_overrides_toml() {
         let toml_str = r#"
             [download.retry]
-            max_retries = 5
+            per_transfer = 5
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
@@ -4153,7 +4151,7 @@ mod tests {
         // TOML-only: resolved value matches the TOML setting.
         let toml_str = r#"
             [download.retry]
-            max_download_attempts = 25
+            per_asset = 25
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -4171,7 +4169,7 @@ mod tests {
         // CLI flag wins over TOML, mirroring every other resolved value.
         let toml_str = r#"
             [download.retry]
-            max_download_attempts = 25
+            per_asset = 25
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let mut sync = default_sync();
@@ -4187,7 +4185,7 @@ mod tests {
         // must accept it through TOML the same as through CLI.
         let toml_str = r#"
             [download.retry]
-            max_download_attempts = 0
+            per_asset = 0
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
         let cfg = Config::build(
@@ -4214,7 +4212,7 @@ mod tests {
         assert_eq!(cfg.retry.max_download_attempts, 10);
         let toml = cfg.to_toml();
         let retry = toml.download.unwrap().retry.unwrap();
-        assert_eq!(retry.max_download_attempts, None);
+        assert_eq!(retry.per_asset, None);
     }
 
     #[test]
@@ -4225,7 +4223,7 @@ mod tests {
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let retry = toml.download.unwrap().retry.unwrap();
-        assert_eq!(retry.max_download_attempts, Some(42));
+        assert_eq!(retry.per_asset, Some(42));
     }
 
     #[test]
@@ -4565,18 +4563,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn old_retry_toml_names_are_rejected() {
+        for key in ["max_retries", "max_download_attempts"] {
+            let toml = format!("[download.retry]\n{key} = 3\n");
+            let err = toml::from_str::<TomlConfig>(&toml)
+                .expect_err(&format!("old download.retry.{key} key should hard-error"));
+            assert!(
+                err.message().contains(&format!("unknown field `{key}`")),
+                "unexpected error for {key}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn old_download_metadata_and_progress_names_are_rejected() {
+        for key in [
+            "set_exif_datetime",
+            "set_exif_rating",
+            "set_exif_gps",
+            "set_exif_description",
+            "embed_xmp",
+            "xmp_sidecar",
+            "no_progress_bar",
+        ] {
+            let toml = format!("[download]\n{key} = true\n");
+            let err = toml::from_str::<TomlConfig>(&toml)
+                .expect_err(&format!("old download.{key} key should hard-error"));
+            assert!(
+                err.message().contains(&format!("unknown field `{key}`")),
+                "unexpected error for {key}: {err}"
+            );
+        }
+    }
+
     // ── Config::build: boolean/media merge exhaustive ─────────────
 
-    #[cfg(feature = "xmp")]
     #[test]
     fn test_build_all_boolean_flags_from_toml() {
         // `media` replaces the old durable skip booleans. This keeps the
         // test anchored to the TOML-first filter surface while still checking
         // the derived runtime skip flags.
         let toml_str = r#"
-            [download]
+            [metadata]
             set_exif_datetime = true
-            no_progress_bar = true
+
+            [ui]
+            progress_bar = false
 
             [filters]
             media = ["photos", "live-photos"]
@@ -4607,7 +4640,6 @@ mod tests {
         assert!(cfg.watch.notify_systemd);
     }
 
-    #[cfg(feature = "xmp")]
     #[test]
     fn test_build_all_boolean_flags_cli_overrides() {
         // Programmatic skip overrides still feed the same media owner type
@@ -4924,11 +4956,15 @@ mod tests {
             folder_structure = "%Y"
             threads = 2
             temp_suffix = ".full-tmp"
+
+            [metadata]
             set_exif_datetime = true
-            no_progress_bar = true
+
+            [ui]
+            progress_bar = false
 
             [download.retry]
-            max_retries = 1
+            per_transfer = 1
 
             [filters]
             libraries = ["SharedSync-FULL"]
@@ -5480,12 +5516,14 @@ mod tests {
             filters: None,
             photos: None,
             import: None,
+            metadata: None,
             watch: None,
             notifications: None,
             server: None,
             report: None,
             ui: Some(TomlUi {
                 friendly: Some(true),
+                progress_bar: None,
             }),
         };
         let cfg = Config::build(
@@ -5514,12 +5552,14 @@ mod tests {
             filters: None,
             photos: None,
             import: None,
+            metadata: None,
             watch: None,
             notifications: None,
             server: None,
             report: None,
             ui: Some(TomlUi {
                 friendly: Some(false),
+                progress_bar: None,
             }),
         };
         let cfg = Config::build(
@@ -5538,12 +5578,68 @@ mod tests {
     }
 
     #[test]
+    fn test_config_build_defaults_progress_bar_enabled() {
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !cfg.download.no_progress_bar,
+            "progress bar should be enabled by default"
+        );
+        assert!(
+            cfg.to_toml().ui.is_none(),
+            "default progress-bar behavior should not create [ui]"
+        );
+    }
+
+    #[test]
+    fn test_config_build_captures_toml_progress_bar_false() {
+        let parsed: TomlConfig = toml::from_str("[ui]\nprogress_bar = false\n").unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&parsed),
+        )
+        .unwrap();
+        assert!(
+            cfg.download.no_progress_bar,
+            "[ui].progress_bar = false should durably disable progress"
+        );
+        assert_eq!(
+            cfg.to_toml().ui.and_then(|u| u.progress_bar),
+            Some(false),
+            "to_toml should round-trip the durable progress-bar opt-out"
+        );
+    }
+
+    #[test]
+    fn test_no_progress_bar_cli_overrides_toml_progress_bar_true() {
+        let parsed: TomlConfig = toml::from_str("[ui]\nprogress_bar = true\n").unwrap();
+        let mut sync = default_sync();
+        sync.no_progress_bar = Some(true);
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&parsed)).unwrap();
+        assert!(
+            cfg.download.no_progress_bar,
+            "--no-progress-bar should disable progress for this run even when TOML enables it"
+        );
+    }
+
+    #[test]
     fn test_toml_ui_parses_friendly_key() {
         let parsed: TomlConfig = toml::from_str("[ui]\nfriendly = false\n").unwrap();
         assert_eq!(parsed.ui.unwrap().friendly, Some(false));
 
         let parsed: TomlConfig = toml::from_str("[ui]\nfriendly = true\n").unwrap();
         assert_eq!(parsed.ui.unwrap().friendly, Some(true));
+
+        let parsed: TomlConfig = toml::from_str("[ui]\nprogress_bar = false\n").unwrap();
+        assert_eq!(parsed.ui.unwrap().progress_bar, Some(false));
 
         let empty: TomlConfig = toml::from_str("").unwrap();
         assert!(empty.ui.is_none());
@@ -5782,6 +5878,7 @@ mod tests {
             filters: None,
             photos: None,
             import: None,
+            metadata: None,
             watch: None,
             notifications: None,
             server: None,
@@ -5808,6 +5905,7 @@ mod tests {
             filters: None,
             photos: None,
             import: None,
+            metadata: None,
             watch: None,
             notifications: None,
             server: None,
@@ -6595,7 +6693,7 @@ mod tests {
         assert!(!resolve_notify_systemd(None, None, false));
     }
 
-    // ── Smart retry delay from max_retries ────────────────────────────
+    // ── Smart retry delay from per_transfer ───────────────────────────
 
     #[test]
     fn test_smart_retry_delay_table() {
@@ -6613,7 +6711,7 @@ mod tests {
 
     #[test]
     fn test_build_retry_delay_smart_default_from_max_retries() {
-        // No explicit retry-delay anywhere; max_retries=5 should pull the
+        // No explicit retry-delay anywhere; per_transfer=5 should pull the
         // 4..=6 bucket from the smart table (10s).
         let mut sync = default_sync();
         sync.config_overrides.max_retries = Some(5);
@@ -6639,14 +6737,14 @@ mod tests {
 
     #[test]
     fn test_to_toml_omits_delay_when_matches_smart_default() {
-        // Smart default for max_retries=3 is 5. to_toml should NOT write
+        // Smart default for per_transfer=3 is 5. to_toml should NOT write
         // `delay = 5` back out because it's redundant (and deprecated).
         let mut sync = default_sync();
         sync.config_overrides.max_retries = Some(3);
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
         let toml = cfg.to_toml();
         let retry = toml.download.unwrap().retry.unwrap();
-        assert_eq!(retry.max_retries, Some(3));
+        assert_eq!(retry.per_transfer, Some(3));
     }
 
     #[test]

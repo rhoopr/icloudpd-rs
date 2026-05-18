@@ -342,7 +342,6 @@ async fn update_metadata_marker(
 /// metadata drifted from the stored hash (or that already carries a marker
 /// from a prior sync). No-op when metadata writing is off or the state DB
 /// is absent. Shared by the trust-state and on-disk-skip producer branches.
-#[cfg(feature = "xmp")]
 async fn tag_metadata_rewrites(
     state_db: Option<&dyn StateDb>,
     config: &DownloadConfig,
@@ -350,7 +349,7 @@ async fn tag_metadata_rewrites(
     candidates: &[(VersionSizeKey, &str)],
     ctx: &DownloadContext,
 ) {
-    if !(config.embed_xmp || config.xmp_sidecar) {
+    if MetadataFlags::from(config).is_empty() {
         return;
     }
     let Some(db) = state_db else {
@@ -377,17 +376,6 @@ async fn tag_metadata_rewrites(
             );
         }
     }
-}
-
-/// No-op when the `xmp` feature is disabled at build time.
-#[cfg(not(feature = "xmp"))]
-async fn tag_metadata_rewrites(
-    _state_db: Option<&dyn StateDb>,
-    _config: &DownloadConfig,
-    _asset: &PhotoAsset,
-    _candidates: &[(VersionSizeKey, &str)],
-    _ctx: &DownloadContext,
-) {
 }
 
 /// Retry all pending state writes that failed during the download loop.
@@ -467,7 +455,6 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
 
 /// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case
 /// tail work at sync end; anything beyond this rolls into the next sync.
-#[cfg_attr(not(feature = "xmp"), allow(dead_code))]
 const METADATA_REWRITE_BATCH: usize = 500;
 
 /// Drain persisted metadata-rewrite markers: for each asset whose
@@ -475,10 +462,10 @@ const METADATA_REWRITE_BATCH: usize = 500;
 /// re-apply EXIF/XMP using the stored provider metadata. On success clears
 /// the marker and refreshes `metadata_hash`; on failure leaves the marker so
 /// the next sync retries.
-#[cfg(feature = "xmp")]
 async fn run_metadata_rewrites(
     db: &dyn StateDb,
     metadata_flags: MetadataFlags,
+    temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
 ) {
     let pending = match db
@@ -540,6 +527,7 @@ async fn run_metadata_rewrites(
                 let embed_path = path.clone();
                 let embed_payload = payload.clone();
                 let embed_created = created_local;
+                let embed_temp_suffix = Arc::clone(&temp_suffix);
                 match tokio::task::spawn_blocking(move || {
                     let probe = match super::metadata::probe_exif(&embed_path) {
                         Ok(p) => p,
@@ -557,7 +545,7 @@ async fn run_metadata_rewrites(
                     if write.is_empty() {
                         return Ok::<(), anyhow::Error>(());
                     }
-                    super::metadata::apply_metadata(&embed_path, &write)
+                    super::metadata::apply_metadata(&embed_path, &write, &embed_temp_suffix)
                 })
                 .await
                 {
@@ -584,40 +572,50 @@ async fn run_metadata_rewrites(
                 true
             };
 
-        let sidecar_ok = if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
-            let sidecar_path = path.clone();
-            let sidecar_payload = payload.clone();
-            let sidecar_created = created_local;
-            match tokio::task::spawn_blocking(move || {
-                let write = plan_sidecar_write(&sidecar_payload, &sidecar_created);
-                if write.is_empty() {
-                    return Ok::<(), anyhow::Error>(());
-                }
-                super::metadata::write_sidecar(&sidecar_path, &write)
-            })
-            .await
+        let sidecar_ok = {
+            #[cfg(feature = "xmp")]
             {
-                Ok(Ok(())) => true,
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        asset_id = %record.id,
-                        path = %path.display(),
-                        error = %e,
-                        "Metadata rewrite (sidecar) failed; leaving marker for future retry"
-                    );
-                    false
-                }
-                Err(join_err) => {
-                    tracing::warn!(
-                        asset_id = %record.id,
-                        error = %join_err,
-                        "Metadata rewrite (sidecar) task panicked"
-                    );
-                    false
+                if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
+                    let sidecar_path = path.clone();
+                    let sidecar_payload = payload.clone();
+                    let sidecar_created = created_local;
+                    let sidecar_temp_suffix = Arc::clone(&temp_suffix);
+                    match tokio::task::spawn_blocking(move || {
+                        let write = plan_sidecar_write(&sidecar_payload, &sidecar_created);
+                        if write.is_empty() {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        super::metadata::write_sidecar(&sidecar_path, &write, &sidecar_temp_suffix)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => true,
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                asset_id = %record.id,
+                                path = %path.display(),
+                                error = %e,
+                                "Metadata rewrite (sidecar) failed; leaving marker for future retry"
+                            );
+                            false
+                        }
+                        Err(join_err) => {
+                            tracing::warn!(
+                                asset_id = %record.id,
+                                error = %join_err,
+                                "Metadata rewrite (sidecar) task panicked"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    true
                 }
             }
-        } else {
-            true
+            #[cfg(not(feature = "xmp"))]
+            {
+                true
+            }
         };
 
         if embed_ok && sidecar_ok {
@@ -870,14 +868,13 @@ fn create_progress_bar(
 
 bitflags::bitflags! {
     /// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
-    /// flow; individual flags gate which fields get written in the XMP packet.
+    /// flow; individual flags gate which fields get embedded into the media file.
     ///
     /// `EMBED_XMP` enables the XMP-only fields that have no native EXIF equivalent
     /// (title, keywords, people, hidden/archived, media subtype, burst id).
     /// `XMP_SIDECAR` is orthogonal — it writes a `.xmp` file next to the photo
     /// without touching the photo bytes.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     pub(super) struct MetadataFlags: u8 {
         const DATETIME    = 1 << 0;
         const RATING      = 1 << 1;
@@ -896,30 +893,25 @@ impl MetadataFlags {
     const EMBED_MASK: Self = Self::all().difference(Self::XMP_SIDECAR);
 
     /// Whether any flag needs the downloaded bytes to stay as a `.part` file
-    /// for in-place XMP editing before the atomic rename.
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
+    /// for in-place metadata editing before the atomic rename.
     pub(super) fn any_embed(self) -> bool {
         self.intersects(Self::EMBED_MASK)
     }
 }
 
 impl From<&DownloadConfig> for MetadataFlags {
-    #[cfg(feature = "xmp")]
     fn from(config: &DownloadConfig) -> Self {
         let mut flags = Self::empty();
         flags.set(Self::DATETIME, config.set_exif_datetime);
         flags.set(Self::RATING, config.set_exif_rating);
         flags.set(Self::GPS, config.set_exif_gps);
         flags.set(Self::DESCRIPTION, config.set_exif_description);
-        flags.set(Self::EMBED_XMP, config.embed_xmp);
-        flags.set(Self::XMP_SIDECAR, config.xmp_sidecar);
+        #[cfg(feature = "xmp")]
+        {
+            flags.set(Self::EMBED_XMP, config.embed_xmp);
+            flags.set(Self::XMP_SIDECAR, config.xmp_sidecar);
+        }
         flags
-    }
-
-    /// Build with every flag forced false when the `xmp` feature is off.
-    #[cfg(not(feature = "xmp"))]
-    fn from(_config: &DownloadConfig) -> Self {
-        Self::empty()
     }
 }
 
@@ -1982,11 +1974,16 @@ where
     // from a previous one). This re-applies EXIF/XMP on the existing files
     // without re-downloading bytes; the alternative was to leave markers
     // accumulating in the DB forever.
-    #[cfg(feature = "xmp")]
     if let Some(db) = &state_db {
         let metadata_flags = MetadataFlags::from(config.as_ref());
         if metadata_flags.any_embed() || metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
-            run_metadata_rewrites(db.as_ref(), metadata_flags, &shutdown_token).await;
+            run_metadata_rewrites(
+                db.as_ref(),
+                metadata_flags,
+                Arc::clone(&config.temp_suffix),
+                &shutdown_token,
+            )
+            .await;
         }
     }
 
@@ -2513,7 +2510,6 @@ fn maybe_warn_rate_limit_pressure(stats: &super::SyncStats) {
     }
 }
 
-#[cfg(feature = "xmp")]
 fn gps_from_payload(payload: &MetadataPayload) -> Option<super::metadata::GpsCoords> {
     match (payload.latitude, payload.longitude) {
         (Some(lat), Some(lng)) => Some(super::metadata::GpsCoords {
@@ -2556,7 +2552,6 @@ fn plan_sidecar_write(
 /// - **rating / description**: flag gate only — iCloud is the source of truth.
 /// - **XMP-only fields** (title, keywords, people, hidden/archived,
 ///   media_subtype, burst_id): gated on the `EMBED_XMP` flag.
-#[cfg(feature = "xmp")]
 fn plan_metadata_write(
     flags: MetadataFlags,
     payload: &MetadataPayload,
@@ -2577,6 +2572,7 @@ fn plan_metadata_write(
     if flags.contains(MetadataFlags::DESCRIPTION) {
         write.description.clone_from(&payload.description);
     }
+    #[cfg(feature = "xmp")]
     if flags.contains(MetadataFlags::EMBED_XMP) {
         write.title.clone_from(&payload.title);
         write.keywords.clone_from(&payload.keywords);
@@ -2598,7 +2594,7 @@ async fn download_single_task(
     client: &Client,
     task: &DownloadTask,
     retry_config: &RetryConfig,
-    #[cfg_attr(not(feature = "xmp"), allow(unused_variables))] metadata_flags: MetadataFlags,
+    metadata_flags: MetadataFlags,
     temp_suffix: &str,
     rate_limit_counter: Option<&std::sync::atomic::AtomicUsize>,
     bandwidth_limiter: Option<&super::BandwidthLimiter>,
@@ -2617,14 +2613,11 @@ async fn download_single_task(
     );
 
     // Embed writes happen on the .part file before the atomic rename; sidecar
-    // writes happen after, on the final path. Without the `xmp` feature at
-    // build time there's no writer and no extension gate to consult, so
-    // `needs_exif` is unconditionally false and the embed path is compiled out.
-    #[cfg(feature = "xmp")]
+    // writes happen after, on the final path. The extension gate is based on
+    // the intended final path before download, then the writer sniffs the
+    // downloaded part bytes so the temp suffix does not hide the media type.
     let needs_exif =
         metadata_flags.any_embed() && super::metadata::is_embed_writable_path(&task.download_path);
-    #[cfg(not(feature = "xmp"))]
-    let needs_exif = false;
 
     let bytes_downloaded = Box::pin(super::file::download_file_with_mode(
         client,
@@ -2664,13 +2657,12 @@ async fn download_single_task(
         None
     };
 
-    #[cfg_attr(not(feature = "xmp"), allow(unused_mut))]
     let mut exif_ok = true;
-    #[cfg(feature = "xmp")]
     if let Some(part) = &part_path {
         let exif_path = part.clone();
         let payload = task.metadata.clone();
         let created_local = task.created_local;
+        let metadata_temp_suffix = temp_suffix.to_string();
         // Probe + plan + apply all run on the blocking pool so no file I/O
         // happens on the async runtime's poll thread.
         let exif_result = tokio::task::spawn_blocking(move || {
@@ -2685,7 +2677,9 @@ async fn download_single_task(
             if write.is_empty() {
                 return true;
             }
-            if let Err(e) = super::metadata::apply_metadata(&exif_path, &write) {
+            if let Err(e) =
+                super::metadata::apply_metadata(&exif_path, &write, &metadata_temp_suffix)
+            {
                 tracing::warn!(path = %exif_path.display(), error = %e, "Failed to write metadata");
                 false
             } else {
@@ -2727,12 +2721,15 @@ async fn download_single_task(
         let sidecar_path = task.download_path.clone();
         let payload = task.metadata.clone();
         let created_local = task.created_local;
+        let sidecar_temp_suffix = temp_suffix.to_string();
         let sidecar_result = tokio::task::spawn_blocking(move || {
             let write = plan_sidecar_write(&payload, &created_local);
             if write.is_empty() {
                 return true;
             }
-            if let Err(e) = super::metadata::write_sidecar(&sidecar_path, &write) {
+            if let Err(e) =
+                super::metadata::write_sidecar(&sidecar_path, &write, &sidecar_temp_suffix)
+            {
                 tracing::warn!(path = %sidecar_path.display(), error = %e, "Failed to write XMP sidecar");
                 false
             } else {
@@ -4411,13 +4408,9 @@ mod tests {
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
-            #[cfg(feature = "xmp")]
             set_exif_datetime: false,
-            #[cfg(feature = "xmp")]
             set_exif_rating: false,
-            #[cfg(feature = "xmp")]
             set_exif_gps: false,
-            #[cfg(feature = "xmp")]
             set_exif_description: false,
             #[cfg(feature = "xmp")]
             embed_xmp: false,
@@ -4513,13 +4506,9 @@ mod tests {
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
-            #[cfg(feature = "xmp")]
             set_exif_datetime: false,
-            #[cfg(feature = "xmp")]
             set_exif_rating: false,
-            #[cfg(feature = "xmp")]
             set_exif_gps: false,
-            #[cfg(feature = "xmp")]
             set_exif_description: false,
             #[cfg(feature = "xmp")]
             embed_xmp: false,
@@ -4937,7 +4926,7 @@ mod tests {
 
         let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
         let token = CancellationToken::new();
-        run_metadata_rewrites(&db, flags, &token).await;
+        run_metadata_rewrites(&db, flags, std::sync::Arc::from(".meta-tmp"), &token).await;
 
         // Marker must be gone; row must still be `downloaded`.
         let remaining = db.get_pending_metadata_rewrites(32).await.unwrap();
@@ -5018,7 +5007,7 @@ mod tests {
 
         let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
         let token = CancellationToken::new();
-        run_metadata_rewrites(&db, flags, &token).await;
+        run_metadata_rewrites(&db, flags, std::sync::Arc::from(".meta-tmp"), &token).await;
 
         let still_pending = db.get_pending_metadata_rewrites(32).await.unwrap();
         assert_eq!(
