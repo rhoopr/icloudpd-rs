@@ -165,6 +165,12 @@ enum SetupSecretSource {
     EnvFile,
 }
 
+impl SetupSecretSource {
+    fn needs_password_prompt(&self) -> bool {
+        matches!(self, Self::CredentialStore | Self::EnvFile)
+    }
+}
+
 #[derive(Debug)]
 struct SetupWriteResult {
     credential_backend: Option<CredentialBackend>,
@@ -244,16 +250,19 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
 
     // Step 1: Account
     section_header("Account");
-    ask_account(&mut answers)?;
+    ask_account_identity(&mut answers)?;
     check(&format!("Glad you're here, {}.", answers.username));
 
-    // Step 2: Where to save
-    section_header("Where to save");
-    ask_destination(&mut answers)?;
-
-    // Step 3: Secrets
+    // Step 2: Secrets
     section_header("Secrets");
     ask_secret_source(&mut answers)?;
+    if answers.secret_source.needs_password_prompt() {
+        ask_account_password(&mut answers)?;
+    }
+
+    // Step 3: Where to save
+    section_header("Where to save");
+    ask_destination(&mut answers)?;
 
     // Step 4: What to download
     section_header("What to sync");
@@ -530,7 +539,7 @@ fn check_overwrite(path: &Path) -> anyhow::Result<bool> {
 
 // ── Step 1: Account ────────────────────────────────────────────────
 
-fn ask_account(answers: &mut SetupAnswers) -> anyhow::Result<()> {
+fn ask_account_identity(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     answers.username = Input::new()
         .with_prompt("Apple ID email")
         .validate_with(|input: &String| {
@@ -541,18 +550,6 @@ fn ask_account(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             }
         })
         .interact_text()?;
-
-    // `with_confirmation` re-prompts on mismatch in-place, so a typo costs
-    // one extra round, not a broken config that fails the next sync.
-    answers.password = secrecy::SecretString::from(
-        Password::new()
-            .with_prompt("iCloud password")
-            .with_confirmation(
-                "Re-enter password to confirm",
-                "Passwords didn't match, try again",
-            )
-            .interact()?,
-    );
 
     println!();
     let region_items = ["iCloud.com", "iCloud.com.cn (China)"];
@@ -566,6 +563,22 @@ fn ask_account(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         1 => Some(Domain::Cn),
         _ => None, // com is the default, no need to write it
     };
+
+    Ok(())
+}
+
+fn ask_account_password(answers: &mut SetupAnswers) -> anyhow::Result<()> {
+    // `with_confirmation` re-prompts on mismatch in-place, so a typo costs
+    // one extra round, not a broken config that fails the next sync.
+    answers.password = secrecy::SecretString::from(
+        Password::new()
+            .with_prompt("iCloud password")
+            .with_confirmation(
+                "Re-enter password to confirm",
+                "Passwords didn't match, try again",
+            )
+            .interact()?,
+    );
 
     Ok(())
 }
