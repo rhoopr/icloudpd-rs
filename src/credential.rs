@@ -24,6 +24,22 @@ use secrecy::SecretString;
 /// Service name used for keyring entries.
 const KEYRING_SERVICE: &str = "kei";
 
+/// Backend that accepted a stored credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialBackend {
+    Keyring,
+    EncryptedFile,
+}
+
+impl CredentialBackend {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Keyring => "keyring",
+            Self::EncryptedFile => "encrypted-file",
+        }
+    }
+}
+
 /// Credential store that tries the OS keyring first, falling back to an
 /// AES-256-GCM encrypted file in the config directory.
 #[derive(Debug)]
@@ -41,11 +57,11 @@ impl CredentialStore {
     }
 
     /// Store a password. Tries keyring first, falls back to encrypted file.
-    pub(crate) fn store(&self, password: &str) -> Result<()> {
+    pub(crate) fn store(&self, password: &str) -> Result<CredentialBackend> {
         match self.keyring_store(password) {
             Ok(()) => {
                 tracing::debug!(backend = "keyring", "Credential stored");
-                Ok(())
+                Ok(CredentialBackend::Keyring)
             }
             Err(e) => {
                 tracing::warn!(
@@ -54,7 +70,7 @@ impl CredentialStore {
                 );
                 self.file_store(password)?;
                 tracing::debug!(backend = "encrypted-file", "Credential stored");
-                Ok(())
+                Ok(CredentialBackend::EncryptedFile)
             }
         }
     }

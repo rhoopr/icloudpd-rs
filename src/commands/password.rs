@@ -29,8 +29,8 @@ pub(crate) fn run_password(
             let input = rpassword::prompt_password("iCloud Password: ")
                 .map_err(|e| anyhow::anyhow!("Failed to read password: {e}"))?;
             anyhow::ensure!(!input.is_empty(), "Password must not be empty");
-            store.store(&input)?;
-            println!("Password stored in {} backend.", store.backend_name());
+            let backend = store.store(&input)?;
+            println!("Password stored in {} backend.", backend.as_str());
         }
         cli::PasswordAction::Clear => {
             store.delete()?;

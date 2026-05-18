@@ -670,7 +670,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
 
     // Build non-TOML globals early. In v0.20 these come from the narrow
     // bootstrap env allow-list, not public global CLI flags.
-    let mut globals = config::GlobalArgs::from_bootstrap_env();
+    let globals = config::GlobalArgs::from_bootstrap_env();
 
     // Dispatch based on command
     let mut command = cli.effective_command();
@@ -725,44 +725,12 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 match setup::run_setup(&path)? {
                     setup::SetupResult::SyncNow {
                         config_path: cfg_path,
-                        env_path,
+                        one_shot_password,
                     } => {
-                        // Load .env into process environment for this session
-                        let mut env_username = None;
-                        let mut env_password = None;
-                        if let Ok(contents) = tokio::fs::read_to_string(&env_path).await {
-                            for line in contents.lines() {
-                                if let Some((key, value)) = line.split_once('=') {
-                                    let key = key.trim();
-                                    // Strip surrounding single or double quotes
-                                    // (the setup wizard single-quotes values to
-                                    // prevent shell expansion when sourced).
-                                    let value = value.trim();
-                                    let value = value
-                                        .strip_prefix('\'')
-                                        .and_then(|v| v.strip_suffix('\''))
-                                        .or_else(|| {
-                                            value
-                                                .strip_prefix('"')
-                                                .and_then(|v| v.strip_suffix('"'))
-                                        })
-                                        .unwrap_or(value);
-                                    if key == "ICLOUD_USERNAME" {
-                                        env_username = Some(value.to_string());
-                                    } else if key == "ICLOUD_PASSWORD" {
-                                        env_password = Some(value.to_string());
-                                    }
-                                }
-                            }
-                        }
                         // Reload TOML from the newly written config
                         toml_config = config::load_toml_config(&cfg_path, true)?;
-                        // Override globals with env values from setup
-                        if let Some(u) = env_username {
-                            globals.username = Some(u);
-                        }
                         let sync_pw = cli::PasswordArgs {
-                            password: env_password,
+                            password: one_shot_password.map(|p| p.expose_secret().to_string()),
                             ..cli::PasswordArgs::default()
                         };
                         // Setup "sync now" is a one-shot initial sync, not a daemon.

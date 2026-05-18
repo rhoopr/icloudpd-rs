@@ -5,13 +5,15 @@
 
 use std::fmt::Write as FmtWrite;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use console::Style;
 use dialoguer::{Confirm, Input, Password, Select};
 use indicatif::ProgressBar;
+use secrecy::ExposeSecret;
 
+use crate::credential::{CredentialBackend, CredentialStore};
 use crate::types::{
     Domain, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, LogLevel, PhotoResolution,
     RawPolicy,
@@ -20,10 +22,11 @@ use crate::types::{
 /// Result of the setup wizard — either the user wants to sync now or just exit.
 #[derive(Debug)]
 pub(crate) enum SetupResult {
-    /// User chose to sync now. Contains the config path and env file path.
+    /// User chose to sync now. Contains the config path and any one-shot
+    /// password needed for explicit `.env` fallback.
     SyncNow {
-        config_path: std::path::PathBuf,
-        env_path: std::path::PathBuf,
+        config_path: PathBuf,
+        one_shot_password: Option<secrecy::SecretString>,
     },
     /// User chose not to sync now (or cancelled).
     Done,
@@ -36,6 +39,7 @@ struct SetupAnswers {
     username: String,
     password: secrecy::SecretString,
     domain: Option<Domain>,
+    secret_source: SetupSecretSource,
 
     // Destination. `folder_structure` is the unfiled-pass template;
     // `folder_structure_albums` is the v0.13 per-album template. The wizard
@@ -113,6 +117,7 @@ impl Default for SetupAnswers {
             username: String::new(),
             password: secrecy::SecretString::from(String::new()),
             domain: None,
+            secret_source: SetupSecretSource::CredentialStore,
             directory: "~/Photos/iCloud".to_string(),
             folder_structure: None,
             folder_structure_albums: None,
@@ -150,6 +155,20 @@ impl Default for SetupAnswers {
             ui_friendly: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetupSecretSource {
+    CredentialStore,
+    PasswordFile(String),
+    PasswordCommand(String),
+    EnvFile,
+}
+
+#[derive(Debug)]
+struct SetupWriteResult {
+    credential_backend: Option<CredentialBackend>,
+    env_path: Option<PathBuf>,
 }
 
 // ── Delight helpers ──────────────────────────────────────────────
@@ -232,33 +251,37 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     section_header("Where to save");
     ask_destination(&mut answers)?;
 
-    // Step 3: What to download
+    // Step 3: Secrets
+    section_header("Secrets");
+    ask_secret_source(&mut answers)?;
+
+    // Step 4: What to download
     section_header("What to sync");
     ask_what_to_download(&mut answers)?;
     if !answers.albums.is_empty() {
         check("Keeping it focused.");
     }
 
-    // Step 4: Media types
+    // Step 5: Media types
     section_header("Media types");
     ask_media_types(&mut answers)?;
 
-    // Step 5: Photo quality & RAW
+    // Step 6: Photo quality & RAW
     section_header("Quality");
     ask_quality(&mut answers)?;
 
-    // Step 6: Date range
+    // Step 7: Date range
     section_header("Date range");
     ask_date_range(&mut answers)?;
 
-    // Step 7: Running mode
+    // Step 8: Running mode
     section_header("Running mode");
     ask_running_mode(&mut answers)?;
     if answers.watch_interval.is_some() {
         check("Set-and-forget. Kei will keep an eye on things.");
     }
 
-    // Step 8: Extras
+    // Step 9: Extras
     section_header("Extras");
     ask_extras(&mut answers)?;
 
@@ -292,60 +315,15 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
         }
     }
 
-    // Ensure parent directory exists
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
-    }
-
     // Write files with a spinner for visual closure.
-    let env_path = spinner_for(
-        "Writing your config...",
-        || -> anyhow::Result<std::path::PathBuf> {
-            // Write config
-            std::fs::write(config_path, &toml_content)
-                .with_context(|| format!("Failed to write {}", config_path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))
-                    .with_context(|| {
-                        format!("Failed to set permissions on {}", config_path.display())
-                    })?;
-            }
-
-            // Write .env file
-            let env_path = config_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(".env");
-            // Single-quote values to prevent shell expansion of special characters
-            // ($, `, !, etc.) when the file is sourced. Single quotes inside the
-            // password are escaped as '\'' (end-quote, literal quote, re-open quote).
-            let raw_pass = secrecy::ExposeSecret::expose_secret(&answers.password);
-            let escaped_user = answers.username.replace('\'', "'\\''");
-            let escaped_pass = raw_pass.replace('\'', "'\\''");
-            let env_content =
-                format!("ICLOUD_USERNAME='{escaped_user}'\nICLOUD_PASSWORD='{escaped_pass}'\n",);
-            std::fs::write(&env_path, &env_content)
-                .with_context(|| format!("Failed to write {}", env_path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))
-                    .with_context(|| {
-                        format!("Failed to set permissions on {}", env_path.display())
-                    })?;
-            }
-
-            Ok(env_path)
-        },
-    )?;
+    let write_result = spinner_for("Writing your config...", || {
+        write_setup_files(config_path, &toml_content, &answers)
+    })?;
 
     check("Config saved.");
     println!();
     println!("  Config  →  {}", config_path.display());
-    println!("  Secrets →  {}", env_path.display());
+    print_secret_summary(&answers, &write_result);
     println!();
     let bold = Style::new().bold();
     println!("{}", bold.apply_to("You're all set."));
@@ -365,15 +343,21 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
         .interact()?;
 
     if sync_now {
+        let one_shot_password = match answers.secret_source {
+            SetupSecretSource::EnvFile => Some(answers.password),
+            _ => None,
+        };
         Ok(SetupResult::SyncNow {
             config_path: config_path.to_path_buf(),
-            env_path,
+            one_shot_password,
         })
     } else {
         println!();
         println!("No rush. When you're ready:");
         println!();
-        print_load_env_snippet(&env_path);
+        if let Some(env_path) = &write_result.env_path {
+            print_load_env_snippet(env_path);
+        }
         println!("  kei sync");
         println!();
         Ok(SetupResult::Done)
@@ -404,6 +388,123 @@ fn print_load_env_snippet(env_path: &Path) {
         _ => {
             // bash / zsh / sh / dash / ksh: POSIX `set -a` + source.
             println!("  set -a; source {env_display}; set +a");
+        }
+    }
+}
+
+fn write_setup_files(
+    config_path: &Path,
+    toml_content: &str,
+    answers: &SetupAnswers,
+) -> anyhow::Result<SetupWriteResult> {
+    write_setup_files_with_store(
+        config_path,
+        toml_content,
+        answers,
+        |username, config_dir, pw| CredentialStore::new(username, config_dir).store(pw),
+    )
+}
+
+fn write_setup_files_with_store(
+    config_path: &Path,
+    toml_content: &str,
+    answers: &SetupAnswers,
+    store_password: impl FnOnce(&str, &Path, &str) -> anyhow::Result<CredentialBackend>,
+) -> anyhow::Result<SetupWriteResult> {
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+
+    std::fs::write(config_path, toml_content)
+        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+    #[cfg(unix)]
+    set_restricted_permissions(config_path)?;
+
+    match &answers.secret_source {
+        SetupSecretSource::CredentialStore => {
+            let config_dir = credential_store_dir(answers);
+            let backend = store_password(
+                &answers.username,
+                &config_dir,
+                answers.password.expose_secret(),
+            )?;
+            Ok(SetupWriteResult {
+                credential_backend: Some(backend),
+                env_path: None,
+            })
+        }
+        SetupSecretSource::PasswordFile(_) | SetupSecretSource::PasswordCommand(_) => {
+            Ok(SetupWriteResult {
+                credential_backend: None,
+                env_path: None,
+            })
+        }
+        SetupSecretSource::EnvFile => {
+            let env_path = write_env_file(config_path, answers)?;
+            Ok(SetupWriteResult {
+                credential_backend: None,
+                env_path: Some(env_path),
+            })
+        }
+    }
+}
+
+fn credential_store_dir(answers: &SetupAnswers) -> PathBuf {
+    match &answers.data_dir {
+        Some(dir) => crate::config::expand_tilde(dir),
+        None => crate::config::expand_tilde("~/.config/kei/cookies"),
+    }
+}
+
+fn write_env_file(config_path: &Path, answers: &SetupAnswers) -> anyhow::Result<PathBuf> {
+    let env_path = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".env");
+    let escaped_user = shell_single_quote_escape(&answers.username);
+    let escaped_pass = shell_single_quote_escape(answers.password.expose_secret());
+    let env_content =
+        format!("ICLOUD_USERNAME='{escaped_user}'\nICLOUD_PASSWORD='{escaped_pass}'\n",);
+    std::fs::write(&env_path, &env_content)
+        .with_context(|| format!("Failed to write {}", env_path.display()))?;
+    #[cfg(unix)]
+    set_restricted_permissions(&env_path)?;
+    Ok(env_path)
+}
+
+fn shell_single_quote_escape(value: &str) -> String {
+    value.replace('\'', "'\\''")
+}
+
+#[cfg(unix)]
+fn set_restricted_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("Failed to set permissions on {}", path.display()))
+}
+
+fn print_secret_summary(answers: &SetupAnswers, write_result: &SetupWriteResult) {
+    match &answers.secret_source {
+        SetupSecretSource::CredentialStore => {
+            let backend = write_result
+                .credential_backend
+                .map(CredentialBackend::as_str)
+                .unwrap_or("credential-store");
+            println!("  Secrets →  {backend} backend");
+            println!("             Use `kei password backend` to check it or `kei password set` to change it.");
+        }
+        SetupSecretSource::PasswordFile(path) => {
+            println!("  Secrets →  password file: {path}");
+        }
+        SetupSecretSource::PasswordCommand(_) => {
+            println!("  Secrets →  password command from config");
+        }
+        SetupSecretSource::EnvFile => {
+            if let Some(env_path) = &write_result.env_path {
+                println!("  Secrets →  {}", env_path.display());
+            }
         }
     }
 }
@@ -534,7 +635,66 @@ fn ask_destination(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Step 3: What to download ───────────────────────────────────────
+// ── Step 3: Secrets ────────────────────────────────────────────────
+
+fn ask_secret_source(answers: &mut SetupAnswers) -> anyhow::Result<()> {
+    println!();
+    let use_store = Confirm::new()
+        .with_prompt("Store the password in kei's credential store?")
+        .default(true)
+        .interact()?;
+    if use_store {
+        answers.secret_source = SetupSecretSource::CredentialStore;
+        println!(
+            "  Kei will try the OS keyring first, then encrypted file storage if the keyring is unavailable."
+        );
+        return Ok(());
+    }
+
+    let secret_items = [
+        "Use an existing password file",
+        "Use a password command",
+        "Write a local .env file next to the config (last resort)",
+    ];
+    let choice = Select::new()
+        .with_prompt("How should kei read the password?")
+        .items(secret_items)
+        .default(0)
+        .interact()?;
+    answers.secret_source = match choice {
+        0 => {
+            let path: String = Input::new()
+                .with_prompt("Password file path")
+                .validate_with(|input: &String| {
+                    if input.trim().is_empty() {
+                        Err("password file path cannot be empty")
+                    } else {
+                        Ok(())
+                    }
+                })
+                .interact_text()?;
+            SetupSecretSource::PasswordFile(path.trim().to_string())
+        }
+        1 => {
+            let command: String = Input::new()
+                .with_prompt("Password command")
+                .validate_with(|input: &String| {
+                    if input.trim().is_empty() {
+                        Err("password command cannot be empty")
+                    } else {
+                        Ok(())
+                    }
+                })
+                .interact_text()?;
+            SetupSecretSource::PasswordCommand(command.trim().to_string())
+        }
+        _ => SetupSecretSource::EnvFile,
+    };
+
+    Ok(())
+}
+
+// ── Step 4: What to download ───────────────────────────────────────
 
 fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     println!();
@@ -1105,10 +1265,34 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             "username = \"{}\"",
             escape_toml_string(&answers.username)
         )?;
-        writeln!(
-            out,
-            "# Password is stored in .env file, not here (for security)"
-        )?;
+        match &answers.secret_source {
+            SetupSecretSource::CredentialStore => {
+                writeln!(
+                    out,
+                    "# Password is stored in kei's credential store, not in this file."
+                )?;
+                writeln!(
+                    out,
+                    "# Use `kei password backend` to check it or `kei password set` to change it."
+                )?;
+            }
+            SetupSecretSource::PasswordFile(path) => {
+                writeln!(out, "password_file = \"{}\"", escape_toml_string(path))?;
+            }
+            SetupSecretSource::PasswordCommand(command) => {
+                writeln!(
+                    out,
+                    "password_command = \"{}\"",
+                    escape_toml_string(command)
+                )?;
+            }
+            SetupSecretSource::EnvFile => {
+                writeln!(
+                    out,
+                    "# Password is stored in .env file, not here (last-resort fallback)."
+                )?;
+            }
+        }
         match answers.domain {
             Some(domain) => writeln!(out, "domain = \"{}\"", domain.as_str())?,
             None => writeln!(out, "# domain = \"com\"")?,
@@ -1440,9 +1624,52 @@ mod tests {
         assert!(toml.contains("# threads = 10"));
         assert!(toml.contains("# log_level = \"warn\""));
         assert!(toml.contains("# data_dir = \"~/.config/kei\""));
+        assert!(toml.contains("Password is stored in kei's credential store"));
+        assert!(toml.contains("kei password backend"));
+        assert!(!toml.contains("password_file ="));
+        assert!(!toml.contains("password_command ="));
+        assert!(!toml.contains("ICLOUD_PASSWORD"));
         // Removed v0.20 keys must not appear in the generated config.
         assert!(!toml.contains("cookie_directory"));
         assert!(!toml.contains("skip_live_photos"));
+    }
+
+    #[test]
+    fn test_generate_toml_password_file_secret_source() {
+        let answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("hunter2"),
+            secret_source: SetupSecretSource::PasswordFile("/run/secrets/icloud".to_string()),
+            directory: "~/Photos/iCloud".to_string(),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        assert!(toml_str.contains("password_file = \"/run/secrets/icloud\""));
+        assert!(!toml_str.contains("hunter2"));
+
+        let parsed: TomlConfig = toml::from_str(&toml_str).unwrap();
+        let auth = parsed.auth.unwrap();
+        assert_eq!(auth.password_file.as_deref(), Some("/run/secrets/icloud"));
+        assert!(auth.password.is_none());
+    }
+
+    #[test]
+    fn test_generate_toml_password_command_secret_source() {
+        let answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("hunter2"),
+            secret_source: SetupSecretSource::PasswordCommand("op read item".to_string()),
+            directory: "~/Photos/iCloud".to_string(),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        assert!(toml_str.contains("password_command = \"op read item\""));
+        assert!(!toml_str.contains("hunter2"));
+
+        let parsed: TomlConfig = toml::from_str(&toml_str).unwrap();
+        let auth = parsed.auth.unwrap();
+        assert_eq!(auth.password_command.as_deref(), Some("op read item"));
+        assert!(auth.password.is_none());
     }
 
     // ── [ui] section emission ───────────────────────────────────────
@@ -1522,11 +1749,80 @@ mod tests {
     }
 
     #[test]
+    fn test_write_setup_files_stores_password_and_skips_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let config_path = dir.path().join("config.toml");
+        let answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("secret"),
+            data_dir: Some(data_dir.display().to_string()),
+            directory: "~/Photos/iCloud".to_string(),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+
+        let result = write_setup_files_with_store(
+            &config_path,
+            &toml_str,
+            &answers,
+            |username, credential_dir, password| {
+                assert_eq!(username, "user@example.com");
+                assert_eq!(credential_dir, data_dir.as_path());
+                assert_eq!(password, "secret");
+                Ok(CredentialBackend::Keyring)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.credential_backend, Some(CredentialBackend::Keyring));
+        assert!(result.env_path.is_none());
+        assert!(!dir.path().join(".env").exists());
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!written.contains("secret"));
+        let parsed: TomlConfig = toml::from_str(&written).unwrap();
+        assert!(parsed.auth.unwrap().password.is_none());
+    }
+
+    #[test]
+    fn test_write_setup_files_env_fallback_writes_env_not_toml_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("secret"),
+            secret_source: SetupSecretSource::EnvFile,
+            directory: "~/Photos/iCloud".to_string(),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+
+        let result = write_setup_files_with_store(
+            &config_path,
+            &toml_str,
+            &answers,
+            |_username, _credential_dir, _password| {
+                panic!("env fallback must not touch credential storage");
+            },
+        )
+        .unwrap();
+
+        let env_path = result.env_path.expect("env fallback should write .env");
+        assert_eq!(env_path, dir.path().join(".env"));
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!written.contains("secret"));
+        let env_content = std::fs::read_to_string(&env_path).unwrap();
+        assert!(env_content.contains("ICLOUD_USERNAME='user@example.com'"));
+        assert!(env_content.contains("ICLOUD_PASSWORD='secret'"));
+    }
+
+    #[test]
     fn test_generate_toml_full() {
         let answers = SetupAnswers {
             username: "user@example.com".to_string(),
             password: secrecy::SecretString::from("secret"),
             domain: Some(Domain::Cn),
+            secret_source: SetupSecretSource::CredentialStore,
             directory: "~/photos".to_string(),
             folder_structure: Some("%Y/%m".to_string()),
             folder_structure_albums: Some("{album}/%Y/%m".to_string()),
@@ -1611,6 +1907,7 @@ mod tests {
             username: "test@icloud.com".to_string(),
             password: secrecy::SecretString::from("pw"),
             domain: Some(Domain::Cn),
+            secret_source: SetupSecretSource::CredentialStore,
             directory: "/data/photos".to_string(),
             folder_structure: Some("%Y-%m".to_string()),
             folder_structure_albums: Some("{album}/%Y-%m".to_string()),
@@ -2055,18 +2352,26 @@ mod tests {
     fn test_env_file_created_with_restricted_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir()
-            .join("claude")
-            .join("setup_perm_test")
-            .join(format!("{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let env_path = dir.join(".env");
-        let env_content = "ICLOUD_USERNAME=test@example.com\nICLOUD_PASSWORD=secret\n";
-
-        // Replicate the exact logic from run_setup
-        std::fs::write(&env_path, env_content).unwrap();
-        std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let answers = SetupAnswers {
+            username: "test@example.com".to_string(),
+            password: secrecy::SecretString::from("secret"),
+            secret_source: SetupSecretSource::EnvFile,
+            directory: "~/Photos/iCloud".to_string(),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+        let result = write_setup_files_with_store(
+            &config_path,
+            &toml_str,
+            &answers,
+            |_username, _credential_dir, _password| {
+                panic!("env fallback must not touch credential storage");
+            },
+        )
+        .unwrap();
+        let env_path = result.env_path.unwrap();
 
         // Verify permissions
         let metadata = std::fs::metadata(&env_path).unwrap();
@@ -2078,11 +2383,8 @@ mod tests {
 
         // Verify content
         let content = std::fs::read_to_string(&env_path).unwrap();
-        assert!(content.contains("ICLOUD_USERNAME=test@example.com"));
-        assert!(content.contains("ICLOUD_PASSWORD=secret"));
-
-        // Clean up
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(content.contains("ICLOUD_USERNAME='test@example.com'"));
+        assert!(content.contains("ICLOUD_PASSWORD='secret'"));
     }
 
     // ── Numeric / date wizard-input validators ──────────────────────
