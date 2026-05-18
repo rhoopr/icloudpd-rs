@@ -861,7 +861,9 @@ pub(super) fn derive_expected_paths(
     let ctx = DerivationContext::build(asset, config);
     let mut out = SmallVec::new();
     let mut seen_urls = SmallVec::<[Box<str>; 4]>::new();
+    let mut primary_filename = None;
     if let Some(p) = derive_primary(asset, config, &ctx) {
+        primary_filename = Some(p.filename.clone());
         seen_urls.push(p.url.clone());
         out.push(p);
     }
@@ -877,8 +879,7 @@ pub(super) fn derive_expected_paths(
         seen_urls.push(p.url.clone());
         out.push(p);
     }
-    let primary_filename = out.first().map(|p: &DerivedPath| p.filename.as_str());
-    if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename) {
+    if let Some(mov) = derive_mov_companion(asset, config, &ctx, primary_filename.as_deref()) {
         if seen_urls
             .iter()
             .any(|seen| seen.as_ref() == mov.url.as_ref())
