@@ -546,8 +546,6 @@ fn renameat2_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    const RENAME_NOREPLACE: libc::c_uint = 1;
-
     let part_c = CString::new(part_path.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let final_c = CString::new(final_path.as_os_str().as_bytes())
@@ -563,7 +561,7 @@ fn renameat2_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io
             part_c.as_ptr(),
             libc::AT_FDCWD,
             final_c.as_ptr(),
-            RENAME_NOREPLACE,
+            libc::RENAME_NOREPLACE,
         )
     };
     if rc == 0 {
