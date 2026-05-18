@@ -475,8 +475,8 @@ pub(super) async fn rename_part_to_final(
     part_path: &Path,
     final_path: &Path,
 ) -> anyhow::Result<()> {
-    match fs::rename(part_path, final_path).await {
-        Ok(()) => {
+    match publish_part_no_replace(part_path, final_path).await {
+        Ok(PublishResult::Published) => {
             // ext4 default `data=ordered` does not guarantee directory
             // entry durability after `rename` returns Ok: a power loss
             // between rename and the kernel committing the dir block
@@ -486,11 +486,10 @@ pub(super) async fn rename_part_to_final(
             crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
             Ok(())
         }
-        Err(rename_err) if fs::try_exists(final_path).await.unwrap_or(false) => {
+        Ok(PublishResult::DestinationExists) => {
             // Another task won the race — clean up our .part file.
             tracing::debug!(
                 path = %final_path.display(),
-                error = %rename_err,
                 "Destination already exists, removing redundant .part file"
             );
             if let Err(rm_err) = fs::remove_file(part_path).await {
@@ -509,6 +508,128 @@ pub(super) async fn rename_part_to_final(
                 final_path.display()
             )
         }),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishResult {
+    Published,
+    DestinationExists,
+}
+
+#[cfg(target_os = "linux")]
+async fn publish_part_no_replace(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<PublishResult> {
+    let part = part_path.to_path_buf();
+    let final_path_buf = final_path.to_path_buf();
+    let rename_result =
+        tokio::task::spawn_blocking(move || renameat2_no_replace_blocking(&part, &final_path_buf))
+            .await
+            .map_err(std::io::Error::other)?;
+
+    match rename_result {
+        Ok(()) => Ok(PublishResult::Published),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(PublishResult::DestinationExists)
+        }
+        Err(e) if is_renameat2_unsupported(&e) => publish_part_by_hard_link(part_path, final_path)
+            .await
+            .or_else(|link_err| destination_exists_or(link_err, final_path)),
+        Err(e) => destination_exists_or(e, final_path),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+
+    let part_c = CString::new(part_path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let final_c = CString::new(final_path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: both path arguments are valid NUL-terminated C strings, AT_FDCWD
+    // asks the kernel to resolve them from the current working directory when
+    // they are relative, and RENAME_NOREPLACE is the documented no-overwrite
+    // flag. No Rust references are shared with the kernel after the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            part_c.as_ptr(),
+            libc::AT_FDCWD,
+            final_c.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_renameat2_unsupported(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+    )
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+async fn publish_part_no_replace(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<PublishResult> {
+    publish_part_by_hard_link(part_path, final_path)
+        .await
+        .or_else(|link_err| destination_exists_or(link_err, final_path))
+}
+
+#[cfg(unix)]
+async fn publish_part_by_hard_link(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<PublishResult> {
+    match fs::hard_link(part_path, final_path).await {
+        Ok(()) => {
+            if let Err(rm_err) = fs::remove_file(part_path).await {
+                tracing::warn!(
+                    path = %part_path.display(),
+                    error = %rm_err,
+                    "Failed to remove published .part file after no-overwrite hard link"
+                );
+            }
+            Ok(PublishResult::Published)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(PublishResult::DestinationExists)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(windows)]
+async fn publish_part_no_replace(
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<PublishResult> {
+    match fs::rename(part_path, final_path).await {
+        Ok(()) => Ok(PublishResult::Published),
+        Err(e) => destination_exists_or(e, final_path),
+    }
+}
+
+fn destination_exists_or(err: std::io::Error, final_path: &Path) -> std::io::Result<PublishResult> {
+    if final_path.try_exists().unwrap_or(false) {
+        Ok(PublishResult::DestinationExists)
+    } else {
+        Err(err)
     }
 }
 
@@ -2685,13 +2806,18 @@ mod tests {
         tokio::fs::write(&final_path, b"existing").await.unwrap();
         tokio::fs::write(&part, b"duplicate").await.unwrap();
 
-        // Should succeed regardless of platform behavior:
-        // - Linux: rename atomically overwrites (Ok path)
-        // - Windows: rename fails, guard detects existing file and cleans .part
+        // Should succeed without replacing the existing final file. On Linux,
+        // plain rename(old, new) would overwrite `photo.jpg`; the publish path
+        // must use no-overwrite semantics before cleaning the redundant .part.
         rename_part_to_final(&part, &final_path).await.unwrap();
 
         assert!(!part.exists(), ".part should not remain");
         assert!(final_path.exists(), "final file should exist");
+        assert_eq!(
+            tokio::fs::read(&final_path).await.unwrap(),
+            b"existing",
+            "existing final file must not be replaced by duplicate .part bytes"
+        );
     }
 
     #[tokio::test]
