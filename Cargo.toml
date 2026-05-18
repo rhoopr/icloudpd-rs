@@ -113,8 +113,7 @@ little_exif = "0.6"
 #           metadata embed on HDR HEICs (kei #269, #276)
 #   - #157  bound `Vec::with_capacity` in `parse_vorbis_comment` / `Avcc`,
 #           fixes the fuzz-found OOM (upstream #154)
-#   - #161  drops the unmaintained `paste` dep in favor of `pastey`,
-#           clearing RUSTSEC-2024-0436 (kei #310)
+#   - #161  drops mp4-atom's unmaintained `paste` dep in favor of `pastey`
 # Switch back to a crates.io version once a release containing these ships.
 mp4-atom = { git = "https://github.com/kixelated/mp4-atom", rev = "3366b08671a6d6d7292532b922d1973f6718d5a1" }
 
