@@ -425,7 +425,7 @@ fn write_setup_files_with_store(
             .with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
 
-    match &answers.secret_source {
+    let (credential_backend, write_env) = match &answers.secret_source {
         SetupSecretSource::CredentialStore => {
             let config_dir = credential_store_dir(answers);
             let backend = store_password(
@@ -433,28 +433,22 @@ fn write_setup_files_with_store(
                 &config_dir,
                 answers.password.expose_secret(),
             )?;
-            write_config_file(config_path, toml_content)?;
-            Ok(SetupWriteResult {
-                credential_backend: Some(backend),
-                env_path: None,
-            })
+            (Some(backend), false)
         }
-        SetupSecretSource::PasswordFile(_) | SetupSecretSource::PasswordCommand(_) => {
-            write_config_file(config_path, toml_content)?;
-            Ok(SetupWriteResult {
-                credential_backend: None,
-                env_path: None,
-            })
-        }
-        SetupSecretSource::EnvFile => {
-            write_config_file(config_path, toml_content)?;
-            let env_path = write_env_file(config_path, answers)?;
-            Ok(SetupWriteResult {
-                credential_backend: None,
-                env_path: Some(env_path),
-            })
-        }
-    }
+        SetupSecretSource::PasswordFile(_) | SetupSecretSource::PasswordCommand(_) => (None, false),
+        SetupSecretSource::EnvFile => (None, true),
+    };
+    write_config_file(config_path, toml_content)?;
+    let env_path = if write_env {
+        Some(write_env_file(config_path, answers)?)
+    } else {
+        None
+    };
+
+    Ok(SetupWriteResult {
+        credential_backend,
+        env_path,
+    })
 }
 
 fn write_config_file(config_path: &Path, toml_content: &str) -> anyhow::Result<()> {
