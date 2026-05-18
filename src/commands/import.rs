@@ -771,20 +771,16 @@ fn build_import_download_config(
     let directory: Arc<Path> = Arc::from(directory_path.as_path());
 
     let (resolution, edited_from_size, alternative_from_size) = match args.size {
-        Some(crate::types::VersionSize::Adjusted) => {
-            (
-                Some(crate::types::PhotoResolution::None),
-                Some(true),
-                Some(false),
-            )
-        }
-        Some(crate::types::VersionSize::Alternative) => {
-            (
-                Some(crate::types::PhotoResolution::None),
-                Some(false),
-                Some(true),
-            )
-        }
+        Some(crate::types::VersionSize::Adjusted) => (
+            Some(crate::types::PhotoResolution::None),
+            Some(true),
+            Some(false),
+        ),
+        Some(crate::types::VersionSize::Alternative) => (
+            Some(crate::types::PhotoResolution::None),
+            Some(false),
+            Some(true),
+        ),
         Some(size) => (Some(size.into()), Some(false), Some(false)),
         None => (None, None, None),
     };
@@ -3052,6 +3048,39 @@ mod build_config_tests {
         assert_eq!(cfg.resolution, crate::types::PhotoResolution::Original);
         assert!(!cfg.edited);
         assert_eq!(cfg.live_resolution, AssetVersionSize::LiveAdjusted);
+    }
+
+    #[test]
+    fn build_import_download_config_legacy_size_clears_toml_extras() {
+        let toml = toml_with_photos(TomlPhotos {
+            resolution: Some(crate::types::PhotoResolution::Medium),
+            edited: Some(true),
+            alternative: Some(true),
+            ..empty_photos()
+        });
+
+        let original =
+            build_import_download_config(&parse_import_args(&["--size", "original"]), Some(&toml))
+                .unwrap();
+        assert_eq!(original.resolution, crate::types::PhotoResolution::Original);
+        assert!(!original.edited);
+        assert!(!original.alternative);
+
+        let adjusted =
+            build_import_download_config(&parse_import_args(&["--size", "adjusted"]), Some(&toml))
+                .unwrap();
+        assert_eq!(adjusted.resolution, crate::types::PhotoResolution::None);
+        assert!(adjusted.edited);
+        assert!(!adjusted.alternative);
+
+        let alternative = build_import_download_config(
+            &parse_import_args(&["--size", "alternative"]),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(alternative.resolution, crate::types::PhotoResolution::None);
+        assert!(!alternative.edited);
+        assert!(alternative.alternative);
     }
 
     /// CG-9: empty `directory` after TOML resolve produces the documented

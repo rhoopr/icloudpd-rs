@@ -3034,6 +3034,56 @@ mod tests {
     }
 
     #[test]
+    fn resolution_none_live_edited_keeps_import_and_sync_mov_name_in_parity() {
+        let asset = TestPhotoAsset::new("PR4_NONE_LIVE_EDITED")
+            .filename("IMG_NONE_LIVE.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .adjusted_version(
+                "https://p01.icloud-content.com/edited_image",
+                "edited_image_ck",
+                900,
+                "public.heic",
+            )
+            .live_adjusted(
+                "https://p01.icloud-content.com/edited_mov",
+                "edited_mov_ck",
+                2500,
+            )
+            .live_photo("https://p01.icloud-content.com/live_mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.resolution = crate::types::PhotoResolution::None;
+        config.edited = true;
+
+        let expected = expected_paths_for(&asset, &config);
+        let tasks = filter_asset_fresh(&asset, &config);
+        let expected_mov = expected
+            .iter()
+            .find(|p| p.version_size == VersionSizeKey::LiveOriginal)
+            .expect("expected import MOV path");
+        let task_mov = tasks
+            .iter()
+            .find(|t| t.version_size == VersionSizeKey::LiveOriginal)
+            .expect("expected sync MOV task");
+
+        let expected_name = expected_mov.path.file_name().unwrap().to_string_lossy();
+        let task_name = task_mov
+            .download_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert_eq!(
+            expected_name, task_name,
+            "import-existing and sync must agree on MOV filename when primary is disabled"
+        );
+        assert!(
+            !expected_name.contains("_edited"),
+            "original MOV must not inherit the edited still filename: {expected_name}"
+        );
+    }
+
+    #[test]
     fn duplicate_extra_url_is_not_emitted_twice() {
         let asset = PhotoAsset::new(
             json!({"recordName": "PR4_DEDUP", "fields": {
@@ -3060,6 +3110,50 @@ mod tests {
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].version_size, VersionSizeKey::Original);
+    }
+
+    #[test]
+    fn edited_and_alternative_same_url_keeps_first_extra_only() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "PR4_EXTRA_DEDUP", "fields": {
+                "filenameEnc": {"value": "IMG_EXTRA_DEDUP.JPG", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000_u64,
+                    "downloadURL": "https://p01.icloud-content.com/original",
+                    "fileChecksum": "orig_ck"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "resJPEGFullRes": {"value": {
+                    "size": 900_u64,
+                    "downloadURL": "https://p01.icloud-content.com/same_extra",
+                    "fileChecksum": "extra_ck"
+                }},
+                "resJPEGFullFileType": {"value": "public.jpeg"},
+                "resOriginalAltRes": {"value": {
+                    "size": 900_u64,
+                    "downloadURL": "https://p01.icloud-content.com/same_extra",
+                    "fileChecksum": "extra_ck"
+                }},
+                "resOriginalAltFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1_736_899_200_000.0_f64}}}),
+        );
+        let mut config = test_config();
+        config.edited = true;
+        config.alternative = true;
+
+        let tasks = filter_asset_fresh(&asset, &config);
+        let versions: Vec<VersionSizeKey> = tasks.iter().map(|t| t.version_size).collect();
+        assert_eq!(
+            versions,
+            vec![VersionSizeKey::Original, VersionSizeKey::Adjusted]
+        );
+
+        let expected = expected_paths_for(&asset, &config);
+        let expected_versions: Vec<VersionSizeKey> =
+            expected.iter().map(|p| p.version_size).collect();
+        assert_eq!(expected_versions, versions);
     }
 
     #[test]
