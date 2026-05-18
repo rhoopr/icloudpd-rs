@@ -241,7 +241,7 @@ pub(crate) fn apply_metadata(path: &Path, write: &MetadataWrite, temp_suffix: &s
     }
     #[cfg(not(feature = "xmp"))]
     {
-        return apply_metadata_native(path, write, temp_suffix);
+        apply_metadata_native(path, write, temp_suffix)
     }
     #[cfg(feature = "xmp")]
     if is_heif_file(path) {

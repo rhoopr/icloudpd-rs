@@ -6,6 +6,12 @@
 
 [advisories]
 ignore = [
+    # `paste 1.0.15` is pulled in by little_exif, which backs JPEG/TIFF
+    # EXIF writes when kei is built without the default `xmp` feature.
+    # The advisory is unmaintained-only, not a known vulnerability.
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0436
+    "RUSTSEC-2024-0436",
+
     # `rand 0.9.2` unsound with a custom logger. kei's direct
     # rand=0.10.1 is unaffected; the 0.9.2 copy reaches us only
     # transitively via reqwest -> quinn -> quinn-proto.

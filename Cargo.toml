@@ -23,6 +23,13 @@ xmp = ["dep:xmp_toolkit"]
 # Off by default; production builds never see the `kei::__fuzz` module.
 __fuzz_internals = []
 
+[package.metadata.cargo-udeps.ignore]
+# Used only by no-default-features builds (`#[cfg(not(feature = "xmp"))]`).
+# The unused-deps CI job runs the default feature set, so cargo-udeps cannot
+# see the native EXIF path even though `cargo test --no-default-features`
+# exercises it.
+normal = ["little_exif"]
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
