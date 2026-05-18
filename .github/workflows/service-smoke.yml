@@ -149,15 +149,18 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $kei = Join-Path $PWD 'target\release\kei.exe'
+          function Assert-ServiceNotInstalled($line) {
+              if (-not $line.StartsWith('Service: not installed')) {
+                  throw "expected service line to start with 'Service: not installed', got: $line"
+              }
+          }
 
           # Pre-state: SCM service must not exist.
           $svc = Get-Service com.rhoopr.kei -ErrorAction SilentlyContinue
           if ($null -ne $svc) { throw "service already registered before smoke install" }
 
           $statusPre = & $kei status
-          if ($statusPre[0] -ne 'Service: not installed') {
-              throw "expected 'Service: not installed', got: $($statusPre[0])"
-          }
+          Assert-ServiceNotInstalled $statusPre[0]
 
           # Windows dry-run prints the full SCM call preview (executable
           # path, account, launch arguments, failure-action policy)
@@ -179,6 +182,4 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "kei uninstall on clean host failed" }
 
           $statusPost = & $kei status
-          if ($statusPost[0] -ne 'Service: not installed') {
-              throw "expected 'Service: not installed', got: $($statusPost[0])"
-          }
+          Assert-ServiceNotInstalled $statusPost[0]
