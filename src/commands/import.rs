@@ -68,6 +68,13 @@ impl std::ops::AddAssign for ImportStats {
     }
 }
 
+fn record_strict_refusal(stats: &mut ImportStats, heartbeat_state: &HeartbeatState) {
+    stats.strict_refused += 1;
+    heartbeat_state
+        .strict_refused
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Default cadence for the `import-existing` heartbeat log line.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const STRICT_IMPORT_PREFIX_BYTES: u64 = 64 * 1024;
@@ -551,10 +558,7 @@ where
                             path = %expected_path.display(),
                             "Strict import refused same-name, same-size file: local prefix differs from cloud prefix",
                         );
-                        stats.strict_refused += 1;
-                        heartbeat_state
-                            .strict_refused
-                            .fetch_add(1, Ordering::Relaxed);
+                        record_strict_refusal(&mut stats, &heartbeat_state);
                         continue;
                     }
                     Err(e) => {
@@ -565,10 +569,7 @@ where
                             error = %e,
                             "Strict import refused same-name, same-size file: prefix verification failed",
                         );
-                        stats.strict_refused += 1;
-                        heartbeat_state
-                            .strict_refused
-                            .fetch_add(1, Ordering::Relaxed);
+                        record_strict_refusal(&mut stats, &heartbeat_state);
                         continue;
                     }
                 }
@@ -3131,9 +3132,9 @@ mod wiremock_tests {
 #[cfg(test)]
 mod build_config_tests {
     //! Unit tests for [`build_import_download_config`] -- the
-    //! CLI > TOML > default resolution chain for import-existing's
-    //! path-derivation flags. Each new flag added to import-existing
-    //! needs a row in this test mod or the precedence is unverified.
+    //! TOML > default resolution chain for import-existing's path-derivation
+    //! settings. Each new TOML field consumed by import-existing needs a row
+    //! in this test mod or the resolver is unverified.
     //!
     //! Construction of `ImportArgs` happens through `Cli::try_parse_from`
     //! (rather than struct literals) so a regression that reorders
