@@ -50,12 +50,12 @@ pub(crate) fn is_in_container() -> bool {
 /// Returns the name of the container supervisor when running inside a
 /// container, or `None` on the bare host.
 ///
-/// Used by `kei status` to render `Service: running in container
-/// (process supervisor: docker)` instead of `not installed`, which would
-/// mislead operators on a Docker / Kubernetes host where service
-/// management is the host's job. Two-signal probe: the marker file
-/// Docker drops at `/.dockerenv` (always reads as "docker"), then the
-/// cgroup membership of PID 1 (returns the matched marker). Cgroup
+/// Used by `kei status` to render the service as container-managed instead
+/// of `not installed`, which would mislead operators on a Docker /
+/// Kubernetes host where service management is the host's job.
+/// Two-signal probe: the marker file Docker drops at `/.dockerenv`
+/// (always reads as "docker"), then the cgroup membership of PID 1
+/// (returns the matched marker). Cgroup
 /// parsing is Linux-only; on macOS/Windows only the marker-file check
 /// runs.
 pub(crate) fn container_supervisor() -> Option<&'static str> {

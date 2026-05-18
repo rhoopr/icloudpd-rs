@@ -67,8 +67,25 @@ fn sync_help_succeeds() {
         .args(["sync", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("--friendly"))
         .stdout(predicate::str::contains("--recent"))
         .stdout(predicate::str::contains("--download-dir").not());
+}
+
+#[test]
+fn friendly_flags_are_not_shown_on_non_sync_help() {
+    for args in [
+        &["password", "--help"][..],
+        &["config", "setup", "--help"][..],
+        &["service", "status", "--help"][..],
+    ] {
+        common::cmd()
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--friendly").not())
+            .stdout(predicate::str::contains("--no-friendly").not());
+    }
 }
 
 #[test]

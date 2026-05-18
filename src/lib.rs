@@ -770,7 +770,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                 .await;
             }
         },
-        Command::Sync { password, sync } => (sync.retry_failed, password, sync),
+        Command::Sync { password, sync, .. } => (sync.retry_failed, password, sync),
     };
     sync_loop::run_sync(
         &globals,
