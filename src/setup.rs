@@ -1702,6 +1702,19 @@ mod tests {
         assert!(auth.password.is_none());
     }
 
+    #[test]
+    fn test_password_prompt_only_runs_for_setup_owned_secrets() {
+        assert!(SetupSecretSource::CredentialStore.needs_password_prompt());
+        assert!(SetupSecretSource::EnvFile.needs_password_prompt());
+        assert!(
+            !SetupSecretSource::PasswordFile("/run/secrets/icloud".to_string())
+                .needs_password_prompt()
+        );
+        assert!(
+            !SetupSecretSource::PasswordCommand("op read item".to_string()).needs_password_prompt()
+        );
+    }
+
     // ── [ui] section emission ───────────────────────────────────────
     //
     // The wizard's friendly question is the only opt-out path baked into
@@ -1862,6 +1875,36 @@ mod tests {
         assert!(
             summary[1].contains("kei password set"),
             "summary should point at credential replacement: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn test_write_setup_files_does_not_write_config_when_credential_store_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("secret"),
+            directory: "~/Photos/iCloud".to_string(),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+
+        let err = write_setup_files_with_store(
+            &config_path,
+            &toml_str,
+            &answers,
+            |_username, _credential_dir, _password| anyhow::bail!("store failed"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("store failed"),
+            "expected store failure, got {err}"
+        );
+        assert!(
+            !config_path.exists(),
+            "config must not be committed unless the selected credential store accepts the password"
         );
     }
 
