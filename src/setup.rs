@@ -1262,6 +1262,8 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             Some(size) => writeln!(out, "resolution = \"{}\"", version_size_str(size))?,
             None => writeln!(out, "# resolution = \"original\"")?,
         };
+        writeln!(out, "# edited = false")?;
+        writeln!(out, "# alternative = false")?;
         writeln!(out, "# live_resolution = \"original\"")?;
         match answers.live_photo_mode {
             Some(mode) => writeln!(out, "live_photo_mode = \"{}\"", live_photo_mode_str(mode))?,
