@@ -75,7 +75,7 @@ fn migration_guide_uses_toml_for_durable_sync_settings() {
         "[filters]\nlibraries = [\"all\"]",
         "[watch].interval",
         "[notifications].script",
-        "[download.retry].max_retries",
+        "[download.retry].per_transfer",
     ] {
         assert!(
             guide.contains(expected),
