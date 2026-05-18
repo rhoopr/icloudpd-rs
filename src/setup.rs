@@ -486,24 +486,35 @@ fn set_restricted_permissions(path: &Path) -> anyhow::Result<()> {
 }
 
 fn print_secret_summary(answers: &SetupAnswers, write_result: &SetupWriteResult) {
+    for line in secret_summary_lines(answers, write_result) {
+        println!("{line}");
+    }
+}
+
+fn secret_summary_lines(answers: &SetupAnswers, write_result: &SetupWriteResult) -> Vec<String> {
     match &answers.secret_source {
         SetupSecretSource::CredentialStore => {
             let backend = write_result
                 .credential_backend
                 .map(CredentialBackend::as_str)
                 .unwrap_or("credential-store");
-            println!("  Secrets →  {backend} backend");
-            println!("             Use `kei password backend` to check it or `kei password set` to change it.");
+            vec![
+                format!("  Secrets →  {backend} backend"),
+                "             Use `kei password backend` to check it or `kei password set` to change it."
+                    .to_string(),
+            ]
         }
         SetupSecretSource::PasswordFile(path) => {
-            println!("  Secrets →  password file: {path}");
+            vec![format!("  Secrets →  password file: {path}")]
         }
         SetupSecretSource::PasswordCommand(_) => {
-            println!("  Secrets →  password command from config");
+            vec!["  Secrets →  password command from config".to_string()]
         }
         SetupSecretSource::EnvFile => {
             if let Some(env_path) = &write_result.env_path {
-                println!("  Secrets →  {}", env_path.display());
+                vec![format!("  Secrets →  {}", env_path.display())]
+            } else {
+                Vec::new()
             }
         }
     }
@@ -1778,10 +1789,61 @@ mod tests {
         assert_eq!(result.credential_backend, Some(CredentialBackend::Keyring));
         assert!(result.env_path.is_none());
         assert!(!dir.path().join(".env").exists());
+        let summary = secret_summary_lines(&answers, &result);
+        assert_eq!(summary[0], "  Secrets →  keyring backend");
+        assert!(
+            summary[1].contains("kei password backend"),
+            "summary should point at credential inspection: {summary:?}"
+        );
+        assert!(
+            summary[1].contains("kei password set"),
+            "summary should point at credential replacement: {summary:?}"
+        );
         let written = std::fs::read_to_string(&config_path).unwrap();
         assert!(!written.contains("secret"));
         let parsed: TomlConfig = toml::from_str(&written).unwrap();
         assert!(parsed.auth.unwrap().password.is_none());
+    }
+
+    #[test]
+    fn test_write_setup_files_reports_encrypted_file_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("secret"),
+            directory: "~/Photos/iCloud".to_string(),
+            ..Default::default()
+        };
+        let toml_str = generate_toml(&answers);
+
+        let result = write_setup_files_with_store(
+            &config_path,
+            &toml_str,
+            &answers,
+            |_username, _credential_dir, password| {
+                assert_eq!(password, "secret");
+                Ok(CredentialBackend::EncryptedFile)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.credential_backend,
+            Some(CredentialBackend::EncryptedFile)
+        );
+        assert!(result.env_path.is_none());
+
+        let summary = secret_summary_lines(&answers, &result);
+        assert_eq!(summary[0], "  Secrets →  encrypted-file backend");
+        assert!(
+            summary[1].contains("kei password backend"),
+            "summary should point at credential inspection: {summary:?}"
+        );
+        assert!(
+            summary[1].contains("kei password set"),
+            "summary should point at credential replacement: {summary:?}"
+        );
     }
 
     #[test]
