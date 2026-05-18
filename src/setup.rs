@@ -425,11 +425,6 @@ fn write_setup_files_with_store(
             .with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
 
-    std::fs::write(config_path, toml_content)
-        .with_context(|| format!("Failed to write {}", config_path.display()))?;
-    #[cfg(unix)]
-    set_restricted_permissions(config_path)?;
-
     match &answers.secret_source {
         SetupSecretSource::CredentialStore => {
             let config_dir = credential_store_dir(answers);
@@ -438,18 +433,21 @@ fn write_setup_files_with_store(
                 &config_dir,
                 answers.password.expose_secret(),
             )?;
+            write_config_file(config_path, toml_content)?;
             Ok(SetupWriteResult {
                 credential_backend: Some(backend),
                 env_path: None,
             })
         }
         SetupSecretSource::PasswordFile(_) | SetupSecretSource::PasswordCommand(_) => {
+            write_config_file(config_path, toml_content)?;
             Ok(SetupWriteResult {
                 credential_backend: None,
                 env_path: None,
             })
         }
         SetupSecretSource::EnvFile => {
+            write_config_file(config_path, toml_content)?;
             let env_path = write_env_file(config_path, answers)?;
             Ok(SetupWriteResult {
                 credential_backend: None,
@@ -457,6 +455,14 @@ fn write_setup_files_with_store(
             })
         }
     }
+}
+
+fn write_config_file(config_path: &Path, toml_content: &str) -> anyhow::Result<()> {
+    std::fs::write(config_path, toml_content)
+        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+    #[cfg(unix)]
+    set_restricted_permissions(config_path)?;
+    Ok(())
 }
 
 fn credential_store_dir(answers: &SetupAnswers) -> PathBuf {
