@@ -772,12 +772,20 @@ fn build_import_download_config(
 
     let (resolution, edited_from_size, alternative_from_size) = match args.size {
         Some(crate::types::VersionSize::Adjusted) => {
-            (Some(crate::types::PhotoResolution::None), Some(true), None)
+            (
+                Some(crate::types::PhotoResolution::None),
+                Some(true),
+                Some(false),
+            )
         }
         Some(crate::types::VersionSize::Alternative) => {
-            (Some(crate::types::PhotoResolution::None), None, Some(true))
+            (
+                Some(crate::types::PhotoResolution::None),
+                Some(false),
+                Some(true),
+            )
         }
-        Some(size) => (Some(size.into()), None, None),
+        Some(size) => (Some(size.into()), Some(false), Some(false)),
         None => (None, None, None),
     };
     let live_adjusted_from_size = matches!(args.size, Some(crate::types::VersionSize::Adjusted))
