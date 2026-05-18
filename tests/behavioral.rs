@@ -47,6 +47,15 @@ fn clean_cmd() -> assert_cmd::Command {
     cmd
 }
 
+#[test]
+fn auth_retry_detects_cloudkit_401_as_stale_session() {
+    let msg = "import scan aborted: fetcher returned error: HTTP 401 for https://p121-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/private/records/query";
+    assert!(
+        common::is_retryable_auth_failure(msg),
+        "CloudKit 401 should refresh auth and retry the live command"
+    );
+}
+
 fn write_sync_config(config_path: &std::path::Path, download_dir: &str) {
     std::fs::write(
         config_path,

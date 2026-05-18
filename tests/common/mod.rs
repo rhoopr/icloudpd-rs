@@ -10,6 +10,7 @@ static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
 
 const RATE_LIMIT_MARKER: &str = "503 Service Temporarily Unavailable";
 const AUTH_FAILURE_MARKER: &str = "Invalid email/password combination";
+const CLOUDKIT_STALE_SESSION_MARKER: &str = "HTTP 401 for https://";
 
 /// Cached auth credentials for reactive session refresh mid-run.
 static AUTH_CREDS: OnceLock<(String, String, PathBuf)> = OnceLock::new();
@@ -263,7 +264,7 @@ pub fn with_auth_retry(f: impl Fn()) {
                 .or_else(|| payload.downcast_ref::<&str>().copied())
                 .unwrap_or("");
 
-            if !msg.contains(AUTH_FAILURE_MARKER) {
+            if !is_retryable_auth_failure(msg) {
                 resume_unwind(payload);
             }
 
@@ -280,7 +281,7 @@ pub fn with_auth_retry(f: impl Fn()) {
                         .or_else(|| retry_payload.downcast_ref::<&str>().copied())
                         .unwrap_or("");
 
-                    if retry_msg.contains(AUTH_FAILURE_MARKER) {
+                    if is_retryable_auth_failure(retry_msg) {
                         eprintln!(
                             "\n*** ABORTING: Auth failure persists after session refresh ***"
                         );
@@ -292,6 +293,13 @@ pub fn with_auth_retry(f: impl Fn()) {
             }
         }
     }
+}
+
+/// Return true for stale-auth failures where a refreshed session plus a
+/// whole-command retry is expected to recover.
+#[allow(dead_code)]
+pub(crate) fn is_retryable_auth_failure(msg: &str) -> bool {
+    msg.contains(AUTH_FAILURE_MARKER) || msg.contains(CLOUDKIT_STALE_SESSION_MARKER)
 }
 
 /// Require a pre-authenticated session. Returns `(username, password, cookie_dir)`.
