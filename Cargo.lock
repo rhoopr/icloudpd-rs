@@ -1687,7 +1687,7 @@ dependencies = [
 [[package]]
 name = "mp4-atom"
 version = "0.10.1"
-source = "git+https://github.com/kixelated/mp4-atom?rev=3366b08671a6d6d7292532b922d1973f6718d5a1#3366b08671a6d6d7292532b922d1973f6718d5a1"
+source = "git+https://github.com/kixelated/mp4-atom?rev=42da2bc6bdac7a0d762a2b7c14b2f98524cd384d#42da2bc6bdac7a0d762a2b7c14b2f98524cd384d"
 dependencies = [
  "derive_more",
  "num",

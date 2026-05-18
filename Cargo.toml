@@ -114,8 +114,10 @@ little_exif = "0.6"
 #   - #157  bound `Vec::with_capacity` in `parse_vorbis_comment` / `Avcc`,
 #           fixes the fuzz-found OOM (upstream #154)
 #   - #161  drops mp4-atom's unmaintained `paste` dep in favor of `pastey`
+#   - #163  returns Err instead of panicking on reserved iloc *_size nibbles
+#           found by fuzzing (upstream #158)
 # Switch back to a crates.io version once a release containing these ships.
-mp4-atom = { git = "https://github.com/kixelated/mp4-atom", rev = "3366b08671a6d6d7292532b922d1973f6718d5a1" }
+mp4-atom = { git = "https://github.com/kixelated/mp4-atom", rev = "42da2bc6bdac7a0d762a2b7c14b2f98524cd384d" }
 
 # Error handling
 anyhow = "1"
