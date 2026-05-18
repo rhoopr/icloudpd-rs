@@ -601,7 +601,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let (cmd_no_progress_bar, cmd_only_print_filenames, cmd_report_json, cmd_service_run) =
         match &resolved_for_personality {
             cli::Command::Sync { sync, .. } => (
-                sync.no_progress_bar.unwrap_or(false),
+                sync.no_progress_bar,
                 sync.only_print_filenames,
                 toml_report_json,
                 false,

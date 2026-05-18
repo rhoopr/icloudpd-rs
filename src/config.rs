@@ -1339,9 +1339,8 @@ impl Config {
             overrides.xmp_sidecar,
             toml_metadata.and_then(|m| m.xmp_sidecar),
         );
-        let no_progress_bar = sync
-            .no_progress_bar
-            .unwrap_or_else(|| !toml_ui.and_then(|u| u.progress_bar).unwrap_or(true));
+        let no_progress_bar =
+            sync.no_progress_bar || !toml_ui.and_then(|u| u.progress_bar).unwrap_or(true);
 
         // Re-validate; clap range attrs run on CLI only.
         let max_retries = resolve(
@@ -4646,7 +4645,7 @@ mod tests {
         // for tests and internal call sites.
         let mut sync = default_sync();
         sync.config_overrides.set_exif_datetime = Some(true);
-        sync.no_progress_bar = Some(true);
+        sync.no_progress_bar = true;
         sync.config_overrides.skip_videos = Some(true);
         sync.config_overrides.live_photo_mode = Some(LivePhotoMode::Skip);
         sync.config_overrides.force_resolution = Some(true);
@@ -5621,7 +5620,7 @@ mod tests {
     fn test_no_progress_bar_cli_overrides_toml_progress_bar_true() {
         let parsed: TomlConfig = toml::from_str("[ui]\nprogress_bar = true\n").unwrap();
         let mut sync = default_sync();
-        sync.no_progress_bar = Some(true);
+        sync.no_progress_bar = true;
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&parsed)).unwrap();
         assert!(

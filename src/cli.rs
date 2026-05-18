@@ -206,8 +206,8 @@ pub struct SyncArgs {
     pub dry_run: bool,
 
     /// Disable progress bar
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide_possible_values = true)]
-    pub no_progress_bar: Option<bool>,
+    #[arg(long)]
+    pub no_progress_bar: bool,
 
     /// Skip assets created before this ISO date or interval (e.g., 2025-01-02 or 20d)
     #[arg(long)]
@@ -627,9 +627,7 @@ impl SyncArgs {
             self.recent = fallback.recent;
         }
         self.dry_run = self.dry_run || fallback.dry_run;
-        if self.no_progress_bar.is_none() {
-            self.no_progress_bar = fallback.no_progress_bar;
-        }
+        self.no_progress_bar = self.no_progress_bar || fallback.no_progress_bar;
         if self.skip_created_before.is_none() {
             self.skip_created_before
                 .clone_from(&fallback.skip_created_before);
@@ -1624,7 +1622,19 @@ mod tests {
         let mut args = base_args();
         args.push("--no-progress-bar");
         let cli = parse(&args);
-        assert_eq!(cli.sync.no_progress_bar, Some(true));
+        assert!(cli.sync.no_progress_bar);
+    }
+    #[test]
+    fn test_no_progress_bar_rejects_value() {
+        for value in ["true", "false"] {
+            let mut args = base_args();
+            args.push("--no-progress-bar");
+            args.push(value);
+            assert!(Cli::try_parse_from(&args).is_err());
+
+            let flag = format!("--no-progress-bar={value}");
+            assert!(Cli::try_parse_from(["kei", "sync", flag.as_str()]).is_err());
+        }
     }
     #[test]
     fn test_keep_unicode_in_filenames_flag() {
@@ -2315,9 +2325,6 @@ mod tests {
     // are added: every flag in this list must (a) be parseable at the
     // top level, and (b) be rejected when combined with `status`.
     //
-    // Boolean flags declared with `num_args = 0..=1` must use the `=value`
-    // form when followed by a subcommand, otherwise clap eats the
-    // subcommand name as the flag's value.
     #[test]
     fn validate_rejects_each_sync_only_flag_with_status() {
         let cases: &[(&str, &[&str])] = &[
@@ -2325,7 +2332,7 @@ mod tests {
             ("skip_photos", &["--skip-photos=true"]),
             ("unfiled", &["--unfiled=true"]),
             ("force_size", &["--force-size=true"]),
-            ("no_progress_bar", &["--no-progress-bar=true"]),
+            ("no_progress_bar", &["--no-progress-bar"]),
             ("keep_unicode", &["--keep-unicode-in-filenames=true"]),
             ("notify_systemd", &["--notify-systemd=true"]),
             ("dry_run", &["--dry-run"]),

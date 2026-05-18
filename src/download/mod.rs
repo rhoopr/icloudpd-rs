@@ -2699,7 +2699,7 @@ mod tests {
                     resolution: Some(crate::types::PhotoResolution::Original),
                     ..Default::default()
                 },
-                no_progress_bar: Some(true),
+                no_progress_bar: true,
                 ..Default::default()
             },
             None,
