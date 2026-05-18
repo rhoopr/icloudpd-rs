@@ -617,9 +617,50 @@ async fn publish_part_no_replace(
     part_path: &Path,
     final_path: &Path,
 ) -> std::io::Result<PublishResult> {
-    match fs::rename(part_path, final_path).await {
+    let part = part_path.to_path_buf();
+    let final_path_buf = final_path.to_path_buf();
+    let rename_result =
+        tokio::task::spawn_blocking(move || move_file_no_replace_blocking(&part, &final_path_buf))
+            .await
+            .map_err(std::io::Error::other)?;
+
+    match rename_result {
         Ok(()) => Ok(PublishResult::Published),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(PublishResult::DestinationExists)
+        }
         Err(e) => destination_exists_or(e, final_path),
+    }
+}
+
+#[cfg(windows)]
+fn move_file_no_replace_blocking(part_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    fn nul_terminated(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains NUL",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let part = nul_terminated(part_path)?;
+    let final_path = nul_terminated(final_path)?;
+    // SAFETY: both path arguments are valid NUL-terminated Windows strings.
+    // MOVEFILE_WRITE_THROUGH keeps the existing durable-publish intent, and
+    // omitting MOVEFILE_REPLACE_EXISTING gives this promotion no-overwrite
+    // semantics.
+    let rc = unsafe { MoveFileExW(part.as_ptr(), final_path.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if rc != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 

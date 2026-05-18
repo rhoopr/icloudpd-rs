@@ -164,7 +164,7 @@ windows-service = "0.7"
 # Used only for the named ERROR_* constants returned by windows-service
 # error variants (1060, 1063). 0.52 matches the version windows-service
 # 0.7 already brings in transitively, so no extra version in the build.
-windows-sys = { version = "0.52", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 assert_cmd = "2"
