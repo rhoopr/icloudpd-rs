@@ -20,6 +20,8 @@ use little_exif::exif_tag::ExifTag;
 #[cfg(not(feature = "xmp"))]
 use little_exif::filetype::FileExtension;
 #[cfg(not(feature = "xmp"))]
+use little_exif::ifd::ExifTagGroup;
+#[cfg(not(feature = "xmp"))]
 use little_exif::metadata::Metadata;
 #[cfg(not(feature = "xmp"))]
 use little_exif::rational::uR64;
@@ -496,11 +498,18 @@ fn apply_metadata_native(path: &Path, write: &MetadataWrite, temp_suffix: &str) 
             metadata.set_tag(ExifTag::GPSAltitude(vec![uR64::from(alt.abs())]));
         }
     }
-    if write.rating.is_some() {
-        tracing::debug!(
-            path = %path.display(),
-            "Native EXIF writer has no standard rating tag; skipping rating"
-        );
+    if let Some(rating) = write.rating {
+        let rating = u16::from(rating.min(5));
+        metadata.set_tag(ExifTag::UnknownINT16U(
+            vec![rating],
+            WINDOWS_RATING_TAG,
+            ExifTagGroup::GENERIC,
+        ));
+        metadata.set_tag(ExifTag::UnknownINT16U(
+            vec![windows_rating_percent(rating)],
+            WINDOWS_RATING_PERCENT_TAG,
+            ExifTagGroup::GENERIC,
+        ));
     }
 
     let mut output = input;
@@ -547,6 +556,23 @@ fn dms_rational(decimal: f64) -> Vec<uR64> {
         uR64::from(minutes),
         uR64::from(seconds),
     ]
+}
+
+#[cfg(not(feature = "xmp"))]
+const WINDOWS_RATING_TAG: u16 = 0x4746;
+#[cfg(not(feature = "xmp"))]
+const WINDOWS_RATING_PERCENT_TAG: u16 = 0x4749;
+
+#[cfg(not(feature = "xmp"))]
+const fn windows_rating_percent(rating: u16) -> u16 {
+    match rating {
+        0 => 0,
+        1 => 1,
+        2 => 25,
+        3 => 50,
+        4 => 75,
+        _ => 99,
+    }
 }
 
 /// Apply the requested metadata fields to an `XmpMeta`. Single source of
