@@ -452,9 +452,11 @@ pub struct UninstallArgs {
 
 /// Arguments for `kei service run`.
 ///
-/// Identical to `kei sync` arguments; carried as its own struct so the
-/// surrounding [`ServiceAction`] enum does not balloon by ~600 bytes
-/// (the size of `SyncArgs`) on the unrelated `Status` variant.
+/// Shares the reduced runtime [`SyncArgs`] with `kei sync`, but omits
+/// friendly-mode toggles because service mode forces friendly output off.
+/// Carried as its own struct so the surrounding [`ServiceAction`] enum
+/// does not balloon by ~600 bytes (the size of `SyncArgs`) on the
+/// unrelated `Status` variant.
 #[derive(Args, Debug, Clone)]
 pub struct ServiceRunArgs {
     #[command(flatten)]
@@ -770,7 +772,7 @@ impl Cli {
                 if invalid.is_empty() {
                     Ok(())
                 } else {
-                    Err(sync_only_flags_error("service run", &invalid))
+                    Err(service_run_friendly_flags_error(&invalid))
                 }
             }
             _ if explicit_sync_flags.is_empty() => Ok(()),
@@ -787,6 +789,15 @@ fn sync_only_flags_error(cmd_name: &str, flags: &[&'static str]) -> String {
     format!(
         "the following sync-only flag{plural} cannot be combined with `kei {cmd_name}`: {flag_list}\n\
          bare-kei (no subcommand) is shorthand for `kei sync`; sync-only flags are only valid there or under `kei sync`",
+        plural = if flags.len() == 1 { "" } else { "s" },
+    )
+}
+
+fn service_run_friendly_flags_error(flags: &[&'static str]) -> String {
+    let flag_list = flags.join(", ");
+    format!(
+        "friendly-mode flag{plural} cannot be combined with `kei service run`: {flag_list}\n\
+         service mode always disables friendly output",
         plural = if flags.len() == 1 { "" } else { "s" },
     )
 }
@@ -2380,6 +2391,10 @@ mod tests {
         let err = parse_and_validate(&["kei", "--friendly", "service", "run"])
             .expect_err("service run forces friendly mode off");
         assert!(err.contains("--friendly"), "got: {err}");
+        assert!(
+            err.contains("service mode always disables friendly output"),
+            "got: {err}",
+        );
     }
 
     #[test]
