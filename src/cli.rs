@@ -1634,6 +1634,9 @@ mod tests {
 
             let flag = format!("--no-progress-bar={value}");
             assert!(Cli::try_parse_from(["kei", "sync", flag.as_str()]).is_err());
+
+            let flag = format!("--no-progress-bar={value}");
+            assert!(Cli::try_parse_from(["kei", flag.as_str(), "sync"]).is_err());
         }
     }
     #[test]
