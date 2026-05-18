@@ -29,17 +29,17 @@
 > kei is pre-release software under active development, and minor versions may contain breaking changes. We follow a deprecate-then-remove practice, but always check CHANGELOG when updating.
 
 > [!IMPORTANT]
-> v0.13 reshaped selection and folder-structure flags. `--exclude-album NAME` is now `--album '!NAME'`. `--library` accepts multiple values. `kei sync` with no flags runs per-album passes plus an unfiled pass. On v0.20 and later, put `{album}` in `--folder-structure-albums`, not `--folder-structure`. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md).
+> v0.20 makes TOML the primary config surface. Put persistent settings in `config.toml`; keep CLI flags for one-off actions and env vars for secrets/runtime glue. Full migration guide: [docs/v0.20-migration.md](docs/v0.20-migration.md). Full config dictionary: [example.config.toml](example.config.toml).
 >
-> | Flag | Default |
+> | TOML key | Default |
 > |---|---|
-> | `--album` | `all` |
-> | `--smart-folder` | `none` |
-> | `--library` | `primary` |
-> | `--unfiled` | `true` |
-> | `--folder-structure` | `%Y/%m/%d` |
-> | `--folder-structure-albums` | `{album}` |
-> | `--folder-structure-smart-folders` | `{smart-folder}` |
+> | `[filters].albums` | `["all"]` |
+> | `[filters].smart_folders` | `["none"]` |
+> | `[filters].libraries` | `["primary"]` |
+> | `[filters].unfiled` | `true` |
+> | `[download].folder_structure` | `%Y/%m/%d` |
+> | `[download].folder_structure_albums` | `{album}` |
+> | `[download].folder_structure_smart_folders` | `{smart-folder}` |
 
 
 ---
@@ -64,12 +64,23 @@ Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](http
 ## Quick start
 
 ```sh
-kei sync -u you@example.com -d ~/Photos/iCloud --save-password
+kei config setup
+kei sync
 ```
 
-You'll be prompted for your password, then asked to approve 2FA on a trusted device. Downloads start right after. After the first run, just `kei sync` - username, directory, and password are all remembered.
+`kei config setup` writes a TOML config and can store your password in the OS
+keyring or encrypted fallback store. You'll still approve 2FA on a trusted
+device the first time.
 
-For a guided walkthrough, run `kei config setup` instead.
+Minimal config:
+
+```toml
+[auth]
+username = "you@example.com"
+
+[download]
+directory = "~/Photos/iCloud"
+```
 
 > [!TIP]
 > Coming from `icloudpd`? The [Migration Guide](docs/migration-from-icloudpd.md) shows how to `kei sync` without re-downloading.
@@ -80,8 +91,8 @@ For a guided walkthrough, run `kei config setup` instead.
 
 Sync scope:
 
-- Choose albums with `--album`, smart folders with `--smart-folder`, and source libraries with `--library`.
-- Use `--unfiled` for photos that don't belong to a user album.
+- Choose albums with `[filters].albums`, smart folders with `[filters].smart_folders`, and source libraries with `[filters].libraries`.
+- Use `[filters].unfiled = true` for photos that don't belong to a user album.
 - Filter by media type, filename glob, creation date, or recent count/window.
 - Keep multi-library trees separate with `{library}` in folder templates.
 
@@ -89,9 +100,9 @@ Download behavior:
 
 - Full scan on first run, CloudKit syncToken deltas after that.
 - Parallel workers, resumable temp files, checksum checks, retry limits, and failed-asset retry.
-- Optional bandwidth cap with `--bandwidth-limit`.
+- Optional bandwidth cap with `[download].bandwidth_limit`.
 - `--dry-run` and `--only-print-filenames` for planning without writes.
-- Watch mode with `--watch-with-interval`.
+- Watch mode with `[watch].interval` or `kei service run`.
 
 Media and metadata:
 
@@ -109,7 +120,7 @@ Operations:
 - `kei import-existing` adopts an existing local photo tree.
 - `kei install`, `kei uninstall`, and `kei service status` manage the [background service](https://github.com/rhoopr/kei/wiki/Service) on Linux, macOS, and Windows.
 - Friendly output is on by default on plain TTYs. Use `--no-friendly` for structured logs, or `--friendly` to opt in where hard-off contexts don't apply.
-- `--report-json` writes an atomic per-cycle sync report.
+- `[report].json` writes an atomic per-cycle sync report.
 - Watch mode serves `/healthz` and `/metrics` on the configured HTTP bind and port.
 - Docker runs watch mode by default and supports `PUID`/`PGID` ownership for NAS deployments.
 - Passwords can come from the OS keyring, encrypted file fallback, environment, file, or command.
@@ -126,6 +137,8 @@ Everything lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CLI ref
 - [Docker](https://github.com/rhoopr/kei/wiki/Docker) - Compose files and headless 2FA
 - [Synology](https://github.com/rhoopr/kei/wiki/Synology) - Container Manager setup, PUID/PGID, Synology Photos integration
 - [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) - keyring, encrypted file, password files and commands
+- [v0.20 Migration Guide](docs/v0.20-migration.md)
+- [Complete example config](example.config.toml)
 - [Changelog](CHANGELOG.md)
 - [How iCloud's Incremental Sync Works](https://robhooper.xyz/blog-synctoken) - deep dive on CloudKit syncTokens
 

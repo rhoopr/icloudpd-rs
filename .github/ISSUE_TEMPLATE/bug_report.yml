@@ -42,7 +42,7 @@ body:
         ```
 
         ```sh
-        kei sync --directory /photos ...
+        kei sync --config ~/.config/kei/config.toml ...
         ```
       render: markdown
     validations:

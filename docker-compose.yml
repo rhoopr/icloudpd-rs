@@ -5,12 +5,22 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     environment:
-      - ICLOUD_USERNAME=${ICLOUD_USERNAME}
-      - KEI_DATA_DIR=/config
       - TZ=${TZ:-UTC}
-      # Option 1: Password via environment variable (least secure — visible in
-      # `docker inspect`). Removed by kei from the process environment after
-      # reading.
+      # Put persistent settings in ./config/config.toml:
+      #
+      # [auth]
+      # username = "you@example.com"
+      #
+      # [download]
+      # directory = "/photos"
+      #
+      # ICLOUD_USERNAME remains supported for automation if you prefer env for
+      # the account name:
+      # - ICLOUD_USERNAME=${ICLOUD_USERNAME}
+      #
+      # Password via environment variable is least secure because it is visible
+      # in `docker inspect`. kei removes it from the process environment after
+      # reading, but prefer one of the credential options below.
       # - ICLOUD_PASSWORD=${ICLOUD_PASSWORD}
       #
       # PUID/PGID: drop privileges to the host user that owns ./config
@@ -24,6 +34,10 @@ services:
     volumes:
       - ./config:/config
       - /path/to/photos:/photos
+
+    # Default command:
+    #   kei service run --config /config/config.toml
+    # service run uses a 24h watch fallback when [watch].interval is unset.
 
     # ── Credential options (pick one) ──────────────────────────────
     #

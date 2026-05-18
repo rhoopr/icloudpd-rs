@@ -2109,6 +2109,39 @@ mod tests {
     use super::*;
     use crate::cli::SyncArgs;
 
+    #[test]
+    fn example_config_toml_parses() {
+        let raw = include_str!("../example.config.toml");
+        #[cfg(feature = "xmp")]
+        let body = raw.to_string();
+        #[cfg(not(feature = "xmp"))]
+        let body = raw
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("embed_xmp") && !trimmed.starts_with("xmp_sidecar")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config: TomlConfig = toml::from_str(&body).unwrap();
+
+        for (section, present) in [
+            ("auth", config.auth.is_some()),
+            ("download", config.download.is_some()),
+            ("filters", config.filters.is_some()),
+            ("photos", config.photos.is_some()),
+            ("metadata", config.metadata.is_some()),
+            ("watch", config.watch.is_some()),
+            ("notifications", config.notifications.is_some()),
+            ("report", config.report.is_some()),
+            ("server", config.server.is_some()),
+            ("ui", config.ui.is_some()),
+            ("import", config.import.is_some()),
+        ] {
+            assert!(present, "example config should include [{section}]");
+        }
+    }
+
     // ── validate_template_tokens ─────────────────────────────────────
 
     #[test]

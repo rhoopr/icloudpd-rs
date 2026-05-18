@@ -78,5 +78,7 @@ HEALTHCHECK --interval=60s --timeout=5s --start-period=15m --retries=3 \
 # deployments where files must be host-user-owned (Synology Photos,
 # Unraid, TrueNAS Scale).
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# Container runtime glue: keep sessions, state DB, and credentials on the
+# mounted /config volume. Persistent user settings live in /config/config.toml.
 ENV KEI_DATA_DIR=/config
 CMD ["service", "run", "--config", "/config/config.toml"]

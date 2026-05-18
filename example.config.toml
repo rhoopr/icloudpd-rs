@@ -1,0 +1,83 @@
+# Complete kei config dictionary for v0.20.
+#
+# Copy this to ~/.config/kei/config.toml or mount it at /config/config.toml in
+# Docker, then edit the values for your account and paths. Most defaults are
+# active below. Keys whose default is "unset" stay commented so copying this
+# file doesn't accidentally enable a feature or write to the wrong path.
+
+# data_dir = "~/.config/kei" # default: parent directory of the config file; Docker image sets KEI_DATA_DIR=/config
+log_level = "info" # options: debug, info, warn, error
+
+[auth]
+# username = "you@example.com" # default: unset; ICLOUD_USERNAME also works for automation
+# password_file = "/run/secrets/icloud_password" # default: unset; Docker secrets and chmod-protected files
+# password_command = "op read 'op://vault/icloud/password'" # default: unset; Unix only; conflicts with password_file
+domain = "com" # options: com, cn
+# Plaintext [auth].password is not supported. Use kei password set, password_file, or password_command.
+
+[download]
+# directory = "/photos" # default: unset; required for sync/import
+folder_structure = "%Y/%m/%d" # default unfiled template; supports strftime and {library}
+folder_structure_albums = "{album}" # default album template; supports strftime, {library}, {album}
+folder_structure_smart_folders = "{smart-folder}" # default smart-folder template; supports strftime, {library}, {smart-folder}
+threads = 10 # range: 1..64; default becomes 1 when bandwidth_limit is set and threads is unset
+# bandwidth_limit = "10M" # default: unset; examples: 500K, 10M, 2Mi, or bare bytes/sec
+temp_suffix = ".kei-tmp" # temp suffix for partial downloads and metadata rewrites
+
+[download.retry]
+per_transfer = 3 # range: 0..100; retries inside one transfer
+per_asset = 10 # 0 disables lifetime attempt cap; default: 10
+
+[filters]
+libraries = ["primary"] # selectors: primary, shared, all, none, zone name, !name, =literal
+albums = ["all"] # selectors: all, none, album name, !name, =literal
+smart_folders = ["none"] # selectors: none, all, all-with-sensitive, folder name, !name, =literal
+unfiled = true # true also syncs photos that are not in a user album
+media = ["photos", "videos", "live-photos"] # options: photos, videos, live-photos
+filename_exclude = [] # glob patterns, for example ["*.AAE", "Screenshot*"]
+# recent = 100 # default: unset; count like 100 or window like "30d"
+# skip_created_before = "2024-01-01" # default: unset; ISO date/datetime or interval like "30d"
+# skip_created_after = "2024-12-31" # default: unset; ISO date/datetime or interval like "7d"
+
+[photos]
+resolution = "original" # options: original, medium, thumb, none
+live_resolution = "original" # options: original, medium, thumb
+live_photo_mode = "both" # options: both, image-only, video-only, skip
+live_photo_mov_filename_policy = "suffix" # options: suffix, original
+edited = false # true also downloads adjusted/edited stills and videos
+alternative = false # true also downloads alternative/RAW sibling resources
+raw_policy = "as-is" # options: as-is, prefer-raw, prefer-jpeg
+file_match_policy = "name-size-dedup-with-suffix" # options: name-size-dedup-with-suffix, name-id7
+force_resolution = false # true skips assets missing the selected primary resolution
+keep_unicode_in_filenames = false # false matches icloudpd-style ASCII-safe names
+
+[metadata]
+set_exif_datetime = false # writes capture date into JPEG/TIFF EXIF
+set_exif_rating = false # writes favorite/rating metadata where supported
+set_exif_gps = false # writes GPS metadata where supported
+set_exif_description = false # writes description metadata where supported
+embed_xmp = false # requires default xmp feature; embeds XMP in supported media
+xmp_sidecar = false # requires default xmp feature; writes .xmp sidecars
+
+[watch]
+# interval = 86400 # default: unset for kei sync; kei service run falls back to 86400 seconds
+# notify_systemd = false # default: auto-detects NOTIFY_SOCKET when unset; set false to force off
+# pid_file = "/run/kei.pid" # default: unset
+reconcile_every_n_cycles = 0 # 0 or unset disables periodic read-only reconcile
+
+[notifications]
+# script = "/config/notify.sh" # default: unset; receives KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME
+
+[report]
+# json = "/config/sync_report.json" # default: unset; latest sync report path
+
+[server]
+bind = "0.0.0.0" # default: 0.0.0.0; use 127.0.0.1 for local-only
+port = 9090 # /healthz and /metrics port
+
+[ui]
+# friendly = true # default: auto on plain TTYs, off in service/container/machine-output contexts
+progress_bar = true # false is the durable form of --no-progress-bar
+
+[import]
+strict = false # true verifies a cloud prefix before adopting same-name, same-size files

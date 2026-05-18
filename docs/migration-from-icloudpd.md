@@ -210,7 +210,7 @@ password for future runs.
 | `--skip-live-photos` | `[photos].live_photo_mode = "skip"` | The old flag was removed in v0.20. |
 | `--recent 100` | `--recent 100` | Count form works for sync and import. |
 | `--recent 30d` | `--recent 30d` for sync | Import rejects the days form. |
-| `--set-exif-datetime` | `[download].set_exif_datetime = true` | kei also has EXIF rating, GPS, and description settings. |
+| `--set-exif-datetime` | `[metadata].set_exif_datetime = true` | kei also has EXIF rating, GPS, and description settings. |
 | `--keep-unicode-in-filenames` | `[photos].keep_unicode_in_filenames = true` | Set this before import. |
 | `--live-photo-mov-filename-policy` | `[photos].live_photo_mov_filename_policy` | `suffix` or `original`. |
 | `--file-match-policy` | `[photos].file_match_policy` | `name-size-dedup-with-suffix` or `name-id7`. |
@@ -235,8 +235,8 @@ password for future runs.
 | `--password-provider` | Use `--password-file`, `--password-command`, or `kei password set`. |
 | `--mfa-provider` | Not applicable. Use trusted-device 2FA with `kei login get-code` and `kei login submit-code`. |
 
-`[download].xmp_sidecar` is implemented in kei, along with
-`[download].embed_xmp`. They write iCloud metadata that Python didn't handle
+`[metadata].xmp_sidecar` is implemented in kei, along with
+`[metadata].embed_xmp`. They write iCloud metadata that Python didn't handle
 the same way.
 
 ## Useful kei-only options
@@ -255,9 +255,10 @@ the same way.
 | `[filters].unfiled = false` | Disable the separate pass for photos not in any user album. |
 | `[filters].filename_exclude` | Skip files by glob, such as `*.AAE` or `Screenshot*`. |
 | `[download].bandwidth_limit` | Cap total download throughput, for example `10M` or `1.5Mi`. |
-| `[download].set_exif_rating`, `.set_exif_gps`, `.set_exif_description` | Write more iCloud metadata into downloaded media. |
-| `[download].embed_xmp`, `[download].xmp_sidecar` | Embed XMP or write `.xmp` sidecars. |
-| `[download.retry].max_retries` | Retry downloads. Default is 3. |
+| `[metadata].set_exif_rating`, `.set_exif_gps`, `.set_exif_description` | Write more iCloud metadata into downloaded media. |
+| `[metadata].embed_xmp`, `[metadata].xmp_sidecar` | Embed XMP or write `.xmp` sidecars. |
+| `[download.retry].per_transfer` | Retry downloads inside one transfer. Default is 3. |
+| `[download.retry].per_asset` | Cap lifetime attempts per asset. Default is 10; 0 disables the cap. |
 | `[download].temp_suffix` | Temp file suffix for partial downloads. Default is `.kei-tmp`. |
 | `[report].json` | Write the latest sync report atomically as JSON. |
 | `[server].bind`, `[server].port` | Serve `/healthz` and `/metrics` during watch mode. |
@@ -283,8 +284,9 @@ v0.20 removed the remaining v0.13 compatibility aliases:
 
 The official image is `ghcr.io/rhoopr/kei:latest`. It uses `/config` and
 `/photos` volumes. The image runs `kei service run --config /config/config.toml`
-by default, with `KEI_DATA_DIR=/config`. Set `[download].directory = "/photos"`
-in the config file.
+by default, with `KEI_DATA_DIR=/config` as container runtime glue. Set
+`[download].directory = "/photos"` in the config file. `service run` uses a
+24-hour watch fallback when `[watch].interval` is unset.
 
 A minimal compose file:
 
@@ -332,7 +334,7 @@ docker exec --user $(id -u):$(id -g) kei kei login submit-code 123456
   lowercased extensions.
 - If Apple doesn't send an original filename, kei falls back to a sanitized
   title when available, then the record name.
-- `[download].embed_xmp` and `[download].xmp_sidecar` add metadata that
+- `[metadata].embed_xmp` and `[metadata].xmp_sidecar` add metadata that
   Python-created files won't have.
 
 ## What you don't need to worry about
