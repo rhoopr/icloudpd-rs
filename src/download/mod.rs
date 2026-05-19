@@ -2229,7 +2229,6 @@ async fn download_photos_incremental(
     );
 
     // Run the download pass on the collected tasks
-    let pass_shutdown_token = shutdown_token.clone();
     let pass_config = PassConfig {
         client: download_client,
         retry_config: &config.retry,
@@ -2237,7 +2236,7 @@ async fn download_photos_incremental(
         concurrency: config.concurrent_downloads,
         reporting: controls.reporting,
         temp_suffix: Arc::clone(&config.temp_suffix),
-        shutdown_token: pass_shutdown_token,
+        shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
         rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         bandwidth_limiter: config.bandwidth_limiter.clone(),

@@ -2725,26 +2725,16 @@ mod tests {
             .expect("full album page records")
             .clone();
 
-        crate::icloud::photos::PhotoAlbum::new(
-            crate::icloud::photos::PhotoAlbumConfig {
-                params: Arc::new(std::collections::HashMap::new()),
-                service_endpoint: Arc::from("https://example.com"),
-                name: Arc::from("TestAlbum"),
-                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
-                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
-                query_filter: None,
-                page_size: 100,
-                zone_id: Arc::new(json!({"zoneName": zone})),
-                retry_config: retry::RetryConfig::default(),
-            },
-            Box::new(crate::test_helpers::MockPhotosSession::new().ok(json!({
+        make_full_album_with_session(
+            zone,
+            crate::test_helpers::MockPhotosSession::new().ok(json!({
                 "zones": [{
                     "zoneID": {"zoneName": zone, "ownerRecordName": "_defaultOwner"},
                     "syncToken": zone_sync_token,
                     "moreComing": false,
                     "records": records
                 }]
-            }))),
+            })),
         )
     }
 
