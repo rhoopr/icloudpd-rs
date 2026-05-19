@@ -922,6 +922,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 if !cycle_result.session_expired
                     && cycle_result.failed_count == 0
                     && !cycle_result.stats.interrupted
+                    && cycle_result.db_sync_token_advance_safe
                 {
                     if let Some(db) = state_db.as_deref() {
                         store_db_sync_token(db, token).await;
@@ -1313,6 +1314,7 @@ struct CycleResult {
     failed_count: usize,
     session_expired: bool,
     stats: download::SyncStats,
+    db_sync_token_advance_safe: bool,
 }
 
 /// Re-authenticate via SRP after a session-error signature from CloudKit.
@@ -1607,6 +1609,7 @@ async fn run_cycle(
              token will not advance this cycle"
         );
     }
+    let mut db_sync_token_advance_safe = !config.runtime.dry_run && !cycle_has_stale_plan;
 
     // Check if the download config changed since last sync. If so, clear
     // sync tokens so the subsequent lookup falls back to full enumeration
@@ -1691,16 +1694,32 @@ async fn run_cycle(
             cycle_has_stale_plan,
         );
         if should_store_token {
-            if let Some(token) = &sync_result.sync_token {
-                if let Some(db) = state_db {
+            match (&sync_result.sync_token, state_db) {
+                (Some(token), Some(db)) => {
                     if let Err(e) = db.set_metadata(&lib_state.sync_token_key, token).await {
+                        db_sync_token_advance_safe = false;
                         tracing::warn!(error = %e, "Failed to store sync token");
                     } else {
                         tracing::debug!(zone = %lib_state.zone_name, "Stored sync token for next incremental sync");
                     }
                 }
+                (Some(_), None) => {
+                    db_sync_token_advance_safe = false;
+                    tracing::debug!(
+                        zone = %lib_state.zone_name,
+                        "Sync token available but no state DB is configured"
+                    );
+                }
+                (None, _) => {
+                    db_sync_token_advance_safe = false;
+                    tracing::debug!(
+                        zone = %lib_state.zone_name,
+                        "Sync token unavailable after successful sync"
+                    );
+                }
             }
         } else if sync_result.sync_token.is_some() {
+            db_sync_token_advance_safe = false;
             tracing::info!(
                 zone = %lib_state.zone_name,
                 "Sync token NOT advanced (incomplete sync -- will replay changes next cycle)"
@@ -1731,6 +1750,7 @@ async fn run_cycle(
         failed_count: cycle_failed_count,
         session_expired: cycle_session_expired,
         stats: cycle_stats,
+        db_sync_token_advance_safe,
     })
 }
 
