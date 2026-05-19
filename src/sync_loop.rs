@@ -2655,6 +2655,84 @@ mod tests {
         }
     }
 
+    fn make_incremental_album(zone_sync_token: &str) -> crate::icloud::photos::PhotoAlbum {
+        use serde_json::json;
+        crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("TestAlbum"),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
+                retry_config: retry::RetryConfig::default(),
+            },
+            Box::new(crate::test_helpers::MockPhotosSession::new().ok(json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": zone_sync_token,
+                    "moreComing": false,
+                    "records": []
+                }]
+            }))),
+        )
+    }
+
+    fn make_run_cycle_library_state(
+        zone: &str,
+        sync_token_key: &str,
+        zone_sync_token: &str,
+    ) -> LibraryState {
+        LibraryState {
+            library: crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+                Box::new(crate::test_helpers::MockPhotosSession::new()),
+                zone,
+            ),
+            zone_name: zone.to_string(),
+            sync_token_key: sync_token_key.to_string(),
+            plan: crate::commands::AlbumPlan {
+                passes: vec![crate::commands::AlbumPass {
+                    kind: crate::commands::PassKind::Unfiled,
+                    album: make_incremental_album(zone_sync_token),
+                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                }],
+            },
+            plan_is_stale: false,
+            plan_needs_refresh: false,
+        }
+    }
+
+    async fn make_shared_session_for_run_cycle() -> (tempfile::TempDir, auth::SharedSession) {
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let session = auth::session::Session::new(
+            dir.path(),
+            "test@example.com",
+            "https://example.com",
+            None,
+        )
+        .await
+        .expect("test session");
+        (dir, Arc::new(tokio::sync::RwLock::new(session)))
+    }
+
+    fn make_run_cycle_config() -> config::Config {
+        let data_dir = tempfile::tempdir().expect("config data dir");
+        let globals = config::GlobalArgs {
+            username: Some("test@example.com".to_string()),
+            domain: None,
+            data_dir: Some(data_dir.path().to_string_lossy().into_owned()),
+        };
+        config::Config::build(
+            &globals,
+            &cli::PasswordArgs::default(),
+            cli::SyncArgs::default(),
+            None,
+        )
+        .expect("test config")
+    }
+
     #[test]
     fn count_passes_empty_plan_is_all_zero() {
         let plan = crate::commands::AlbumPlan { passes: Vec::new() };
@@ -2724,6 +2802,341 @@ mod tests {
 
     fn make_state_db() -> Arc<dyn state::StateDb> {
         Arc::new(state::SqliteStateDb::open_in_memory().expect("open in-memory state DB"))
+    }
+
+    struct FailingSyncTokenSetDb {
+        inner: Arc<dyn state::StateDb>,
+    }
+
+    impl std::fmt::Debug for FailingSyncTokenSetDb {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FailingSyncTokenSetDb")
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl state::StateDb for FailingSyncTokenSetDb {
+        #[cfg(test)]
+        async fn should_download(
+            &self,
+            library: &str,
+            id: &str,
+            version_size: &str,
+            checksum: &str,
+            local_path: &std::path::Path,
+        ) -> Result<bool, state::error::StateError> {
+            self.inner
+                .should_download(library, id, version_size, checksum, local_path)
+                .await
+        }
+
+        async fn upsert_seen(
+            &self,
+            record: &state::types::AssetRecord,
+        ) -> Result<(), state::error::StateError> {
+            self.inner.upsert_seen(record).await
+        }
+
+        async fn mark_downloaded(
+            &self,
+            library: &str,
+            id: &str,
+            version_size: &str,
+            local_path: &std::path::Path,
+            local_checksum: &str,
+            download_checksum: Option<&str>,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .mark_downloaded(
+                    library,
+                    id,
+                    version_size,
+                    local_path,
+                    local_checksum,
+                    download_checksum,
+                )
+                .await
+        }
+
+        async fn import_adopt(
+            &self,
+            record: &state::types::AssetRecord,
+            local_path: &std::path::Path,
+            local_checksum: &str,
+            imported_size: u64,
+            imported_mtime: Option<i64>,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .import_adopt(
+                    record,
+                    local_path,
+                    local_checksum,
+                    imported_size,
+                    imported_mtime,
+                )
+                .await
+        }
+
+        async fn mark_failed(
+            &self,
+            library: &str,
+            id: &str,
+            version_size: &str,
+            error: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .mark_failed(library, id, version_size, error)
+                .await
+        }
+
+        async fn get_failed(
+            &self,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_failed().await
+        }
+
+        async fn get_failed_sample(
+            &self,
+            limit: u32,
+        ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError> {
+            self.inner.get_failed_sample(limit).await
+        }
+
+        async fn get_pending(
+            &self,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_pending().await
+        }
+
+        async fn get_summary(&self) -> Result<state::types::SyncSummary, state::error::StateError> {
+            self.inner.get_summary().await
+        }
+
+        async fn get_downloaded_page(
+            &self,
+            offset: u64,
+            limit: u32,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_downloaded_page(offset, limit).await
+        }
+
+        async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
+            self.inner.start_sync_run().await
+        }
+
+        async fn complete_sync_run(
+            &self,
+            run_id: i64,
+            stats: &state::types::SyncRunStats,
+        ) -> Result<(), state::error::StateError> {
+            self.inner.complete_sync_run(run_id, stats).await
+        }
+
+        async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
+            self.inner.promote_orphaned_sync_runs().await
+        }
+
+        async fn begin_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
+            self.inner.begin_enum_progress(zone).await
+        }
+
+        async fn end_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
+            self.inner.end_enum_progress(zone).await
+        }
+
+        async fn list_interrupted_enumerations(
+            &self,
+        ) -> Result<Vec<String>, state::error::StateError> {
+            self.inner.list_interrupted_enumerations().await
+        }
+
+        async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
+            self.inner.reset_failed().await
+        }
+
+        async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), state::error::StateError> {
+            self.inner.prepare_for_retry().await
+        }
+
+        async fn promote_pending_to_failed(
+            &self,
+            seen_since: i64,
+        ) -> Result<u64, state::error::StateError> {
+            self.inner.promote_pending_to_failed(seen_since).await
+        }
+
+        async fn get_downloaded_ids(
+            &self,
+        ) -> Result<std::collections::HashSet<(String, String, String)>, state::error::StateError>
+        {
+            self.inner.get_downloaded_ids().await
+        }
+
+        async fn get_all_known_ids(
+            &self,
+        ) -> Result<std::collections::HashSet<String>, state::error::StateError> {
+            self.inner.get_all_known_ids().await
+        }
+
+        async fn get_downloaded_checksums(
+            &self,
+        ) -> Result<
+            std::collections::HashMap<(String, String, String), String>,
+            state::error::StateError,
+        > {
+            self.inner.get_downloaded_checksums().await
+        }
+
+        async fn get_attempt_counts(
+            &self,
+        ) -> Result<std::collections::HashMap<String, u32>, state::error::StateError> {
+            self.inner.get_attempt_counts().await
+        }
+
+        async fn get_metadata(
+            &self,
+            key: &str,
+        ) -> Result<Option<String>, state::error::StateError> {
+            self.inner.get_metadata(key).await
+        }
+
+        async fn set_metadata(
+            &self,
+            key: &str,
+            value: &str,
+        ) -> Result<(), state::error::StateError> {
+            if key.starts_with(SYNC_TOKEN_PREFIX) {
+                Err(state::error::StateError::LockPoisoned(
+                    "simulated sync-token write failure".into(),
+                ))
+            } else {
+                self.inner.set_metadata(key, value).await
+            }
+        }
+
+        async fn delete_metadata_by_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<u64, state::error::StateError> {
+            self.inner.delete_metadata_by_prefix(prefix).await
+        }
+
+        async fn touch_last_seen_many(
+            &self,
+            library: &str,
+            asset_ids: &[&str],
+        ) -> Result<(), state::error::StateError> {
+            self.inner.touch_last_seen_many(library, asset_ids).await
+        }
+
+        async fn add_asset_album(
+            &self,
+            library: &str,
+            asset_id: &str,
+            album_name: &str,
+            source: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .add_asset_album(library, asset_id, album_name, source)
+                .await
+        }
+
+        async fn get_all_asset_albums(
+            &self,
+            library: &str,
+        ) -> Result<Vec<(String, String)>, state::error::StateError> {
+            self.inner.get_all_asset_albums(library).await
+        }
+
+        async fn get_all_asset_people(
+            &self,
+            library: &str,
+        ) -> Result<Vec<(String, String)>, state::error::StateError> {
+            self.inner.get_all_asset_people(library).await
+        }
+
+        async fn mark_soft_deleted(
+            &self,
+            library: &str,
+            asset_id: &str,
+            deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .mark_soft_deleted(library, asset_id, deleted_at)
+                .await
+        }
+
+        async fn mark_hidden_at_source(
+            &self,
+            library: &str,
+            asset_id: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner.mark_hidden_at_source(library, asset_id).await
+        }
+
+        async fn record_metadata_write_failure(
+            &self,
+            library: &str,
+            asset_id: &str,
+            version_size: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .record_metadata_write_failure(library, asset_id, version_size)
+                .await
+        }
+
+        async fn get_downloaded_metadata_hashes(
+            &self,
+        ) -> Result<
+            std::collections::HashMap<(String, String, String), String>,
+            state::error::StateError,
+        > {
+            self.inner.get_downloaded_metadata_hashes().await
+        }
+
+        async fn get_metadata_retry_markers(
+            &self,
+        ) -> Result<std::collections::HashSet<(String, String, String)>, state::error::StateError>
+        {
+            self.inner.get_metadata_retry_markers().await
+        }
+
+        async fn get_pending_metadata_rewrites(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_pending_metadata_rewrites(limit).await
+        }
+
+        async fn update_metadata_hash(
+            &self,
+            library: &str,
+            asset_id: &str,
+            version_size: &str,
+            metadata_hash: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .update_metadata_hash(library, asset_id, version_size, metadata_hash)
+                .await
+        }
+
+        async fn clear_metadata_write_failure(
+            &self,
+            library: &str,
+            asset_id: &str,
+            version_size: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .clear_metadata_write_failure(library, asset_id, version_size)
+                .await
+        }
+
+        async fn has_downloaded_without_metadata_hash(
+            &self,
+        ) -> Result<bool, state::error::StateError> {
+            self.inner.has_downloaded_without_metadata_hash().await
+        }
     }
 
     /// `is_retry_failed=true` MUST force `SyncMode::Full` even when a
@@ -4092,6 +4505,131 @@ mod tests {
         // Only (Success, dry_run=false, stale=false) advances.
         assert!(should_store_sync_token_for_cycle(&success, false, false));
         assert!(!should_store_sync_token_for_cycle(&success, false, true));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_stale_plan_blocks_database_precheck_token() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let mut lib_state =
+            make_run_cycle_library_state("PrimarySync", "sync_token:PrimarySync", "zone-tok-new");
+        lib_state.plan_is_stale = true;
+        let states = vec![&lib_state];
+        let build_db = Arc::clone(&db);
+        let build_download_config = |sync_mode,
+                                     exclude_asset_ids,
+                                     asset_groupings,
+                                     library|
+         -> Arc<download::DownloadConfig> {
+            let mut config = download::DownloadConfig::test_default();
+            config.directory = Arc::from(download_dir.path());
+            config.folder_structure = "%Y/%m/%d".to_string();
+            config.folder_structure_albums = Arc::from("%Y/%m/%d");
+            config.folder_structure_smart_folders = Arc::from("%Y/%m/%d");
+            config.state_db = Some(Arc::clone(&build_db));
+            config.sync_mode = sync_mode;
+            config.exclude_asset_ids = exclude_asset_ids;
+            config.asset_groupings = asset_groupings;
+            config.library = library;
+            Arc::new(config)
+        };
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "database precheck token must wait until stale plans stop suppressing zone tokens"
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "stale plan must leave the old zone token in place for replay"
+        );
+        assert!(!config.runtime.dry_run);
+    }
+
+    #[tokio::test]
+    async fn run_cycle_zone_token_write_failure_blocks_database_precheck_token() {
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let db: Arc<dyn state::StateDb> = Arc::new(FailingSyncTokenSetDb {
+            inner: Arc::clone(&inner),
+        });
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let lib_state =
+            make_run_cycle_library_state("PrimarySync", "sync_token:PrimarySync", "zone-tok-new");
+        let states = vec![&lib_state];
+        let build_db = Arc::clone(&db);
+        let build_download_config = |sync_mode,
+                                     exclude_asset_ids,
+                                     asset_groupings,
+                                     library|
+         -> Arc<download::DownloadConfig> {
+            let mut config = download::DownloadConfig::test_default();
+            config.directory = Arc::from(download_dir.path());
+            config.folder_structure = "%Y/%m/%d".to_string();
+            config.folder_structure_albums = Arc::from("%Y/%m/%d");
+            config.folder_structure_smart_folders = Arc::from("%Y/%m/%d");
+            config.state_db = Some(Arc::clone(&build_db));
+            config.sync_mode = sync_mode;
+            config.exclude_asset_ids = exclude_asset_ids;
+            config.asset_groupings = asset_groupings;
+            config.library = library;
+            Arc::new(config)
+        };
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "database precheck token must not advance after a zone-token write failure"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "failed zone-token write must leave old token in place for replay"
+        );
     }
 
     // Periodic reconciliation cadence. The watch loop calls
