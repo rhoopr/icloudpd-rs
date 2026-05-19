@@ -38,6 +38,9 @@ services:
     # Default command:
     #   kei service run --config /config/config.toml
     # service run uses a 24h watch fallback when [watch].interval is unset.
+    # If Apple returns a terminal account-lock auth error, kei exits 4 and
+    # prints the iforgot.apple.com and stored-password recovery steps. Supervisors
+    # that branch on exit codes can alert on 4 instead of retrying forever.
 
     # ── Credential options (pick one) ──────────────────────────────
     #

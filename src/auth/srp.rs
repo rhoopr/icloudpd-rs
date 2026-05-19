@@ -10,10 +10,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::endpoints::Endpoints;
+use super::responses::AppleServiceError;
 use super::session::Session;
 use super::twofa::{check_rscd_from_headers, rscd_service_error};
 use super::AUTH_RETRY_CONFIG;
-use crate::auth::error::AuthError;
+use crate::auth::error::{AuthError, APPLE_ACCOUNT_LOCKED_CODE};
 use crate::retry::parse_retry_after_header;
 
 /// Buffered HTTP response for SRP authentication steps.
@@ -45,6 +46,30 @@ impl SrpResponse {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SrpServiceErrorBody {
+    #[serde(default, alias = "service_errors")]
+    service_errors: Vec<AppleServiceError>,
+}
+
+fn terminal_apple_auth_from_body(response: &SrpResponse) -> Option<AuthError> {
+    let body: SrpServiceErrorBody = response.json().ok()?;
+    let err = body
+        .service_errors
+        .iter()
+        .find(|err| err.code == APPLE_ACCOUNT_LOCKED_CODE)?;
+    let raw_message = err.message.trim();
+    let message = if raw_message.is_empty() {
+        err.title
+            .as_deref()
+            .unwrap_or("Apple reported a terminal authentication error")
+    } else {
+        raw_message
+    };
+    Some(AuthError::terminal_apple_auth(&err.code, message))
 }
 
 /// Abstracts the HTTP transport used by SRP authentication.
@@ -488,6 +513,10 @@ pub async fn authenticate_srp(
 
     if let Some(rscd) = check_rscd_from_headers(&response.headers) {
         return Err(rscd_service_error(rscd, &response.text()).into());
+    }
+
+    if let Some(err) = terminal_apple_auth_from_body(&response) {
+        return Err(err.into());
     }
 
     if response.status == 409 {
@@ -1135,6 +1164,50 @@ mod tests {
             matches!(auth_err, AuthError::ApiError { code: 403, .. }),
             "403 on complete must be ApiError, not FailedLogin, got: {auth_err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn srp_complete_403_service_error_20209_is_terminal_apple_auth() {
+        let body = br#"{
+            "hasError": true,
+            "serviceErrors": [
+                {
+                    "code": "-20209",
+                    "message": "This Apple Account has been locked for security reasons."
+                }
+            ]
+        }"#;
+        let err = run_srp(vec![valid_init_response(), response(403, body.to_vec())])
+            .await
+            .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        match auth_err {
+            AuthError::TerminalAppleAuth { code, message } => {
+                assert_eq!(code, APPLE_ACCOUNT_LOCKED_CODE);
+                assert!(message.contains("locked for security reasons"));
+            }
+            other => panic!("expected TerminalAppleAuth, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn srp_complete_200_service_error_20209_is_terminal_apple_auth() {
+        let body = br#"{
+            "service_errors": [
+                {"code": "-20209", "message": "", "title": "Account locked"}
+            ]
+        }"#;
+        let err = run_srp(vec![valid_init_response(), response(200, body.to_vec())])
+            .await
+            .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        match auth_err {
+            AuthError::TerminalAppleAuth { code, message } => {
+                assert_eq!(code, APPLE_ACCOUNT_LOCKED_CODE);
+                assert_eq!(message, "Account locked");
+            }
+            other => panic!("expected TerminalAppleAuth, got: {other:?}"),
+        }
     }
 
     /// 429 at /signin/complete must be reported as rate-limited, not as a

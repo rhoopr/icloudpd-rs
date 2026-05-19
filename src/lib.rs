@@ -209,6 +209,8 @@ fn harden_process() {
 const EXIT_PARTIAL: u8 = 2;
 /// Exit code for authentication failures.
 const EXIT_AUTH: u8 = 3;
+/// Exit code for terminal Apple authentication states that need operator action.
+const EXIT_TERMINAL_AUTH: u8 = 4;
 
 /// Returned when some (but not all) downloads failed during a sync.
 #[derive(Debug, thiserror::Error)]
@@ -225,6 +227,7 @@ enum ExitClassification {
     TwoFactorRequired,
     Partial,
     Auth,
+    TerminalAuth,
     Other,
 }
 
@@ -234,6 +237,7 @@ impl ExitClassification {
             Self::TwoFactorRequired => 0,
             Self::Partial => EXIT_PARTIAL,
             Self::Auth => EXIT_AUTH,
+            Self::TerminalAuth => EXIT_TERMINAL_AUTH,
             Self::Other => 1,
         }
     }
@@ -248,6 +252,11 @@ fn classify_exit_error(e: &anyhow::Error) -> ExitClassification {
         .is_some_and(auth::error::AuthError::is_two_factor_required)
     {
         ExitClassification::TwoFactorRequired
+    } else if e
+        .downcast_ref::<auth::error::AuthError>()
+        .is_some_and(auth::error::AuthError::is_terminal_apple_auth)
+    {
+        ExitClassification::TerminalAuth
     } else if e.downcast_ref::<PartialSyncError>().is_some() {
         ExitClassification::Partial
     } else if e.downcast_ref::<auth::error::AuthError>().is_some() {
@@ -1335,6 +1344,20 @@ mod tests {
     }
 
     #[test]
+    fn classify_exit_error_terminal_auth_uses_exit_terminal_auth() {
+        let e: anyhow::Error = auth::error::AuthError::terminal_apple_auth(
+            auth::error::APPLE_ACCOUNT_LOCKED_CODE,
+            "Account locked",
+        )
+        .into();
+        let c = classify_exit_error(&e);
+        assert_eq!(c, ExitClassification::TerminalAuth);
+        assert_eq!(c.exit_code(), EXIT_TERMINAL_AUTH);
+        assert_eq!(c.exit_code(), 4);
+        assert!(c.should_log());
+    }
+
+    #[test]
     fn classify_exit_error_generic_uses_failure() {
         let e = anyhow::anyhow!("disk on fire");
         let c = classify_exit_error(&e);
@@ -1358,6 +1381,14 @@ mod tests {
         let e: anyhow::Error =
             anyhow::Error::from(PartialSyncError(3)).context("after final retry pass");
         assert_eq!(classify_exit_error(&e), ExitClassification::Partial);
+
+        let e: anyhow::Error = anyhow::Error::from(auth::error::AuthError::terminal_apple_auth(
+            auth::error::APPLE_ACCOUNT_LOCKED_CODE,
+            "Account locked",
+        ))
+        .context("while completing SRP login")
+        .context("during startup");
+        assert_eq!(classify_exit_error(&e), ExitClassification::TerminalAuth);
     }
 
     #[test]
@@ -1366,6 +1397,7 @@ mod tests {
             ExitClassification::TwoFactorRequired.exit_code(),
             ExitClassification::Partial.exit_code(),
             ExitClassification::Auth.exit_code(),
+            ExitClassification::TerminalAuth.exit_code(),
             ExitClassification::Other.exit_code(),
         ];
         let mut sorted: Vec<u8> = codes.to_vec();
