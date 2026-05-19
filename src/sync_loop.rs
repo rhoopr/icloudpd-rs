@@ -1551,20 +1551,43 @@ pub(crate) enum EnumConfigHashOutcome {
     /// have written.
     Initial,
     Unchanged,
-    /// Hash drifted; sync tokens cleared and new hash persisted so the
-    /// next cycle falls back to full enumeration.
+    /// Hash drifted; sync tokens cleared and new hash persisted so this
+    /// cycle falls back to full enumeration.
     Changed,
+    /// Hash drift was detected, but the stale sync-token rows could not be
+    /// cleared. The new hash was not persisted, and the current cycle must
+    /// force full enumeration rather than trusting any surviving tokens.
+    ChangedTokenPurgeFailed,
+    /// The stored hash could not be read, so the cycle cannot prove whether
+    /// existing sync tokens still match the current config.
+    ReadFailed,
+}
+
+impl EnumConfigHashOutcome {
+    fn must_force_full_sync(self) -> bool {
+        matches!(
+            self,
+            Self::Changed | Self::ChangedTokenPurgeFailed | Self::ReadFailed
+        )
+    }
 }
 
 /// Compare the current download-config hash against the one stored in
 /// the state DB and react to drift. Storage failures are logged at warn
-/// and swallowed (a partial write here can't corrupt the user's data;
-/// next cycle re-tries).
+/// and swallowed, but the new hash is never persisted unless stale sync
+/// tokens were cleared first. Otherwise a failed purge could leave old
+/// tokens behind while the updated hash makes later cycles trust them.
 pub(crate) async fn check_and_persist_enum_config_hash(
     db: &dyn state::StateDb,
     current_hash: &str,
 ) -> EnumConfigHashOutcome {
-    let stored_hash = db.get_metadata(ENUM_CONFIG_HASH_KEY).await.unwrap_or(None);
+    let stored_hash = match db.get_metadata(ENUM_CONFIG_HASH_KEY).await {
+        Ok(hash) => hash,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to read enum_config_hash");
+            return EnumConfigHashOutcome::ReadFailed;
+        }
+    };
     let outcome = match stored_hash.as_deref() {
         Some(h) if h == current_hash => return EnumConfigHashOutcome::Unchanged,
         Some(_) => EnumConfigHashOutcome::Changed,
@@ -1580,8 +1603,9 @@ pub(crate) async fn check_and_persist_enum_config_hash(
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "Failed to clear sync tokens"
+                    "Failed to clear sync tokens; enum_config_hash will not advance"
                 );
+                return EnumConfigHashOutcome::ChangedTokenPurgeFailed;
             }
             _ => {}
         }
@@ -1622,9 +1646,10 @@ async fn run_cycle(
         );
     }
     let mut db_sync_token_advance_safe = !config.runtime.dry_run && !cycle_has_stale_plan;
+    let mut force_full_for_config_hash = false;
 
     // Check if the download config changed since last sync. If so, clear
-    // sync tokens so the subsequent lookup falls back to full enumeration
+    // sync tokens and force full enumeration for this cycle
     // -- the stored incremental token would miss assets that are newly
     // eligible under the changed config (e.g. a user switching
     // [photos].resolution or changing [filters].media). The hash is
@@ -1638,7 +1663,14 @@ async fn run_cycle(
     if !config.runtime.dry_run {
         if let Some(db) = state_db {
             let config_hash = download::compute_config_hash(config);
-            let _ = check_and_persist_enum_config_hash(db, &config_hash).await;
+            let config_hash_outcome = check_and_persist_enum_config_hash(db, &config_hash).await;
+            force_full_for_config_hash = config_hash_outcome.must_force_full_sync();
+            if matches!(
+                config_hash_outcome,
+                EnumConfigHashOutcome::ChangedTokenPurgeFailed | EnumConfigHashOutcome::ReadFailed
+            ) {
+                db_sync_token_advance_safe = false;
+            }
         }
     }
 
@@ -1651,14 +1683,22 @@ async fn run_cycle(
         // retry-failed must always use full enumeration: incremental
         // sync only returns NEW iCloud changes, missing previously-
         // failed assets that were already enumerated but not downloaded.
-        let sync_mode = determine_sync_mode(
-            is_retry_failed,
-            library_states.len(),
-            state_db,
-            &lib_state.sync_token_key,
-            &lib_state.zone_name,
-        )
-        .await;
+        let sync_mode = if force_full_for_config_hash {
+            tracing::debug!(
+                zone = %lib_state.zone_name,
+                "Forcing full sync because config-hash validation invalidated stored sync tokens"
+            );
+            download::SyncMode::Full
+        } else {
+            determine_sync_mode(
+                is_retry_failed,
+                library_states.len(),
+                state_db,
+                &lib_state.sync_token_key,
+                &lib_state.zone_name,
+            )
+            .await
+        };
 
         let sync_mode_label = match &sync_mode {
             download::SyncMode::Full => "full",
@@ -2940,6 +2980,27 @@ mod tests {
         }
     }
 
+    fn make_recording_run_cycle_download_config_builder(
+        download_dir: &std::path::Path,
+        db: Arc<dyn state::StateDb>,
+        observed_modes: Arc<std::sync::Mutex<Vec<download::SyncMode>>>,
+    ) -> impl Fn(
+        download::SyncMode,
+        Arc<rustc_hash::FxHashSet<String>>,
+        Arc<download::AssetGroupings>,
+        Arc<str>,
+    ) -> Arc<download::DownloadConfig>
+           + '_ {
+        let build_download_config = make_run_cycle_download_config_builder(download_dir, db);
+        move |sync_mode, exclude_asset_ids, asset_groupings, library| {
+            observed_modes
+                .lock()
+                .expect("recorded modes lock")
+                .push(sync_mode.clone());
+            build_download_config(sync_mode, exclude_asset_ids, asset_groupings, library)
+        }
+    }
+
     fn make_run_cycle_config() -> config::Config {
         let data_dir = tempfile::tempdir().expect("config data dir");
         let globals = config::GlobalArgs {
@@ -3108,6 +3169,7 @@ mod tests {
     struct FailingMetadataSetDb {
         inner: Arc<dyn state::StateDb>,
         failure: MetadataSetFailure,
+        delete_prefix_failure: Option<&'static str>,
         message: &'static str,
         cancel_on_upsert: Option<CancellationToken>,
     }
@@ -3116,8 +3178,35 @@ mod tests {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("FailingMetadataSetDb")
                 .field("failure", &self.failure)
+                .field("delete_prefix_failure", &self.delete_prefix_failure)
                 .field("message", &self.message)
                 .finish_non_exhaustive()
+        }
+    }
+
+    impl FailingMetadataSetDb {
+        fn new(
+            inner: Arc<dyn state::StateDb>,
+            failure: MetadataSetFailure,
+            message: &'static str,
+        ) -> Self {
+            Self {
+                inner,
+                failure,
+                delete_prefix_failure: None,
+                message,
+                cancel_on_upsert: None,
+            }
+        }
+
+        fn with_delete_prefix_failure(mut self, prefix: &'static str) -> Self {
+            self.delete_prefix_failure = Some(prefix);
+            self
+        }
+
+        fn with_cancel_on_upsert(mut self, token: CancellationToken) -> Self {
+            self.cancel_on_upsert = Some(token);
+            self
         }
     }
 
@@ -3329,7 +3418,11 @@ mod tests {
             &self,
             prefix: &str,
         ) -> Result<u64, state::error::StateError> {
-            self.inner.delete_metadata_by_prefix(prefix).await
+            if self.delete_prefix_failure == Some(prefix) {
+                Err(state::error::StateError::LockPoisoned(self.message.into()))
+            } else {
+                self.inner.delete_metadata_by_prefix(prefix).await
+            }
         }
 
         async fn touch_last_seen_many(
@@ -4125,12 +4218,11 @@ mod tests {
             .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("seed token");
-        let db: Arc<dyn state::StateDb> = Arc::new(FailingMetadataSetDb {
+        let db: Arc<dyn state::StateDb> = Arc::new(FailingMetadataSetDb::new(
             inner,
-            failure: MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY),
-            message: "simulated db_sync_token write failure",
-            cancel_on_upsert: None,
-        });
+            MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY),
+            "simulated db_sync_token write failure",
+        ));
 
         let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
             "syncToken": "db-tok-bad-write",
@@ -4610,12 +4702,11 @@ mod tests {
             .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("seed zone token");
-        let db: Arc<dyn state::StateDb> = Arc::new(FailingMetadataSetDb {
-            inner: Arc::clone(&inner),
-            failure: MetadataSetFailure::Prefix(SYNC_TOKEN_PREFIX),
-            message: "simulated sync-token write failure",
-            cancel_on_upsert: None,
-        });
+        let db: Arc<dyn state::StateDb> = Arc::new(FailingMetadataSetDb::new(
+            Arc::clone(&inner),
+            MetadataSetFailure::Prefix(SYNC_TOKEN_PREFIX),
+            "simulated sync-token write failure",
+        ));
         let download_dir = tempfile::tempdir().expect("download tempdir");
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
@@ -4655,6 +4746,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_config_hash_purge_failure_forces_full_without_persisting_hash() {
+        let config = make_run_cycle_config();
+        let current_hash = download::compute_config_hash(&config);
+        assert_ne!(current_hash, "old-hash");
+
+        let inner = make_state_db();
+        inner
+            .set_metadata(ENUM_CONFIG_HASH_KEY, "old-hash")
+            .await
+            .expect("seed enum hash");
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let db: Arc<dyn state::StateDb> = Arc::new(
+            FailingMetadataSetDb::new(
+                Arc::clone(&inner),
+                MetadataSetFailure::Exact("__unused_metadata_key__"),
+                "simulated token purge failure",
+            )
+            .with_delete_prefix_failure(SYNC_TOKEN_PREFIX),
+        );
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let lib_state = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_empty_full_album("zone-tok-new"),
+        );
+        let states = vec![&lib_state];
+        let observed_modes = Arc::new(std::sync::Mutex::new(Vec::<download::SyncMode>::new()));
+        let build_download_config = make_recording_run_cycle_download_config_builder(
+            download_dir.path(),
+            Arc::clone(&db),
+            Arc::clone(&observed_modes),
+        );
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(
+            observed_modes
+                .lock()
+                .expect("recorded modes lock")
+                .as_slice(),
+            &[download::SyncMode::Full],
+            "config drift must not trust a surviving old incremental token in this cycle"
+        );
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "database precheck token must not advance until config-hash invalidation can persist safely"
+        );
+        assert_eq!(
+            inner
+                .get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .expect("read enum hash")
+                .as_deref(),
+            Some("old-hash"),
+            "new hash must not be persisted when the stale-token purge failed"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-new"),
+            "the forced full pass should still refresh the selected zone token after success"
+        );
+    }
+
+    #[tokio::test]
     async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() {
         let config = make_run_cycle_config();
         let inner = make_state_db();
@@ -4663,12 +4839,14 @@ mod tests {
             .await
             .expect("seed zone token");
         let shutdown_token = CancellationToken::new();
-        let db: Arc<dyn state::StateDb> = Arc::new(FailingMetadataSetDb {
-            inner: Arc::clone(&inner),
-            failure: MetadataSetFailure::Exact("__unused_metadata_key__"),
-            message: "unused",
-            cancel_on_upsert: Some(shutdown_token.clone()),
-        });
+        let db: Arc<dyn state::StateDb> = Arc::new(
+            FailingMetadataSetDb::new(
+                Arc::clone(&inner),
+                MetadataSetFailure::Exact("__unused_metadata_key__"),
+                "unused",
+            )
+            .with_cancel_on_upsert(shutdown_token.clone()),
+        );
         let download_dir = tempfile::tempdir().expect("download tempdir");
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
@@ -5099,6 +5277,49 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn enum_config_hash_purge_failure_keeps_old_hash_and_tokens() {
+        let inner = make_state_db();
+        inner
+            .set_metadata(ENUM_CONFIG_HASH_KEY, "old-hash")
+            .await
+            .expect("seed enum hash");
+        inner
+            .set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "old-zone-token")
+            .await
+            .expect("seed zone token");
+        let db: Arc<dyn state::StateDb> = Arc::new(
+            FailingMetadataSetDb::new(
+                Arc::clone(&inner),
+                MetadataSetFailure::Exact("__unused_metadata_key__"),
+                "simulated token purge failure",
+            )
+            .with_delete_prefix_failure(SYNC_TOKEN_PREFIX),
+        );
+
+        let outcome = check_and_persist_enum_config_hash(db.as_ref(), "new-hash").await;
+
+        assert_eq!(outcome, EnumConfigHashOutcome::ChangedTokenPurgeFailed);
+        assert_eq!(
+            inner
+                .get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .expect("read enum hash")
+                .as_deref(),
+            Some("old-hash"),
+            "new hash must not be persisted while old sync tokens may still exist"
+        );
+        assert_eq!(
+            inner
+                .get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("old-zone-token"),
+            "the test must prove the stale token survived the failed purge"
+        );
     }
 
     #[tokio::test]
