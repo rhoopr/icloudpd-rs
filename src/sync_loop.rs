@@ -1660,7 +1660,6 @@ async fn run_cycle(
             &lib_state.zone_name,
         )
         .await;
-        full_enumeration_ran |= matches!(sync_mode, download::SyncMode::Full);
 
         let sync_mode_label = match &sync_mode {
             download::SyncMode::Full => "full",
@@ -1742,6 +1741,7 @@ async fn run_cycle(
         }
 
         // Accumulate stats across libraries.
+        full_enumeration_ran |= sync_result.full_enumeration_ran;
         cycle_stats.accumulate(&sync_result.stats);
 
         match sync_result.outcome {
