@@ -252,6 +252,8 @@ impl LivePhotoSize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::DeserializeOwned;
+    use std::fmt::Debug;
 
     #[test]
     fn test_live_photo_size_to_asset_version_size() {
@@ -397,6 +399,29 @@ mod tests {
                 serde_json::from_str(&json).expect("deserialize LivePhotoMovFilenamePolicy");
             assert_eq!(parsed, variant);
         }
+    }
+
+    fn assert_serde_string_rejected<T>(value: &str)
+    where
+        T: Debug + DeserializeOwned,
+    {
+        let json = serde_json::to_string(value).expect("serialize test string");
+        serde_json::from_str::<T>(&json).expect_err("invalid enum value should be rejected");
+    }
+
+    #[test]
+    fn durable_config_enums_reject_unknown_serde_strings() {
+        assert_serde_string_rejected::<VersionSize>("full");
+        assert_serde_string_rejected::<LivePhotoSize>("live-original");
+        assert_serde_string_rejected::<PhotoResolution>("adjusted");
+        assert_serde_string_rejected::<LivePhotoResolution>("adjusted");
+        assert_serde_string_rejected::<Domain>("icloud.com");
+        assert_serde_string_rejected::<LogLevel>("warning");
+        assert_serde_string_rejected::<FileMatchPolicy>("name-size");
+        assert_serde_string_rejected::<RawTreatmentPolicy>("prefer-raw");
+        assert_serde_string_rejected::<RawPolicy>("original");
+        assert_serde_string_rejected::<LivePhotoMovFilenamePolicy>("mov");
+        assert_serde_string_rejected::<LivePhotoMode>("video_only");
     }
 
     #[test]

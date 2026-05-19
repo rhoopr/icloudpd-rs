@@ -897,6 +897,26 @@ pub(crate) struct PathDerivationCliArgs {
     pub keep_unicode_in_filenames: Option<bool>,
 }
 
+impl PathDerivationCliArgs {
+    fn from_overrides(overrides: &SyncConfigOverrides) -> Self {
+        Self {
+            folder_structure: overrides.folder_structure.clone(),
+            folder_structure_albums: overrides.folder_structure_albums.clone(),
+            folder_structure_smart_folders: overrides.folder_structure_smart_folders.clone(),
+            resolution: overrides.resolution,
+            live_photo_mode: overrides.live_photo_mode,
+            live_resolution: overrides.live_resolution,
+            live_photo_mov_filename_policy: overrides.live_photo_mov_filename_policy,
+            edited: overrides.edited,
+            alternative: overrides.alternative,
+            raw_policy: overrides.raw_policy,
+            file_match_policy: overrides.file_match_policy,
+            force_resolution: overrides.force_resolution,
+            keep_unicode_in_filenames: overrides.keep_unicode_in_filenames,
+        }
+    }
+}
+
 /// Resolved path-derivation fields used by both `Config::build` (sync) and
 /// `build_import_download_config` (import-existing) so the two code paths
 /// derive identical expected file paths for the same inputs.
@@ -926,18 +946,21 @@ pub(crate) fn resolve_path_derivation_fields(
     let toml_dl = toml.and_then(|t| t.download.as_ref());
     let toml_photos = toml.and_then(|t| t.photos.as_ref());
 
-    let folder_structure = cli
-        .folder_structure
-        .or_else(|| toml_dl.and_then(|d| d.folder_structure.clone()))
-        .unwrap_or_else(|| "%Y/%m/%d".to_string());
-    let folder_structure_albums = cli
-        .folder_structure_albums
-        .or_else(|| toml_dl.and_then(|d| d.folder_structure_albums.clone()))
-        .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string());
-    let folder_structure_smart_folders = cli
-        .folder_structure_smart_folders
-        .or_else(|| toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()))
-        .unwrap_or_else(|| DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string());
+    let folder_structure = resolve_ref(
+        cli.folder_structure.as_ref(),
+        toml_dl.and_then(|d| d.folder_structure.as_ref()),
+        "%Y/%m/%d".to_string(),
+    );
+    let folder_structure_albums = resolve_ref(
+        cli.folder_structure_albums.as_ref(),
+        toml_dl.and_then(|d| d.folder_structure_albums.as_ref()),
+        DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
+    );
+    let folder_structure_smart_folders = resolve_ref(
+        cli.folder_structure_smart_folders.as_ref(),
+        toml_dl.and_then(|d| d.folder_structure_smart_folders.as_ref()),
+        DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string(),
+    );
     let resolution = resolve(
         cli.resolution,
         toml_photos.and_then(|p| p.resolution),
@@ -1249,12 +1272,12 @@ impl Config {
         let toml_dl = toml.and_then(|t| t.download.as_ref());
         let toml_retry = toml_dl.and_then(|d| d.retry.as_ref());
         let toml_filters = toml.and_then(|t| t.filters.as_ref());
-        let toml_photos = toml.and_then(|t| t.photos.as_ref());
         let toml_import = toml.and_then(|t| t.import.as_ref());
         let toml_metadata = toml.and_then(|t| t.metadata.as_ref());
         let toml_ui = toml.and_then(|t| t.ui.as_ref());
         let toml_watch = toml.and_then(|t| t.watch.as_ref());
         let toml_server = toml.and_then(|t| t.server.as_ref());
+        let path_derivation_args = PathDerivationCliArgs::from_overrides(&overrides);
 
         // Download
         let directory = overrides
@@ -1265,21 +1288,6 @@ impl Config {
         if !directory.as_os_str().is_empty() {
             validate_download_dir(&directory)?;
         }
-        let folder_structure = resolve(
-            overrides.folder_structure,
-            toml_dl.and_then(|d| d.folder_structure.clone()),
-            "%Y/%m/%d".to_string(),
-        );
-        let folder_structure_albums = resolve(
-            overrides.folder_structure_albums,
-            toml_dl.and_then(|d| d.folder_structure_albums.clone()),
-            DEFAULT_FOLDER_STRUCTURE_ALBUMS.to_string(),
-        );
-        let folder_structure_smart_folders = resolve(
-            overrides.folder_structure_smart_folders,
-            toml_dl.and_then(|d| d.folder_structure_smart_folders.clone()),
-            DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS.to_string(),
-        );
         // Resolve bandwidth limit (CLI bytes/sec > TOML human-readable string > None).
         let bandwidth_limit: Option<u64> = if let Some(n) = overrides.bandwidth_limit {
             Some(n)
@@ -1316,6 +1324,21 @@ impl Config {
             toml_dl.and_then(|d| d.temp_suffix.clone()),
             ".kei-tmp".to_string(),
         );
+        let PathDerivationFields {
+            folder_structure,
+            folder_structure_albums,
+            folder_structure_smart_folders,
+            resolution,
+            live_photo_mode,
+            live_resolution,
+            live_photo_mov_filename_policy,
+            edited,
+            alternative,
+            raw_policy,
+            file_match_policy,
+            force_resolution,
+            keep_unicode_in_filenames,
+        } = resolve_path_derivation_fields(path_derivation_args, toml)?;
         let set_exif_datetime = resolve_flag(
             overrides.set_exif_datetime,
             toml_metadata.and_then(|m| m.set_exif_datetime),
@@ -1379,9 +1402,6 @@ impl Config {
             resolve_media_selection(toml_filters, overrides.skip_videos, overrides.skip_photos)?;
         let skip_videos = media.skip_videos();
         let skip_photos = media.skip_photos();
-        let live_photo_mode_pre_resolved: Option<LivePhotoMode> = overrides
-            .live_photo_mode
-            .or_else(|| toml_photos.and_then(|p| p.live_photo_mode));
         let raw_smart_folders = resolve_vec(
             overrides.smart_folders,
             toml_filters.and_then(|f| f.smart_folders.clone()),
@@ -1469,42 +1489,6 @@ impl Config {
                 );
             }
         }
-
-        // Path-derivation knobs (CLI > TOML > default). `folder_structure`
-        // was already resolved above for `resolve_album_selection`; pass
-        // it through so the resolver short-circuits.
-        let PathDerivationFields {
-            folder_structure: _,
-            folder_structure_albums: _,
-            folder_structure_smart_folders: _,
-            resolution,
-            live_photo_mode,
-            live_resolution,
-            live_photo_mov_filename_policy,
-            edited,
-            alternative,
-            raw_policy,
-            file_match_policy,
-            force_resolution,
-            keep_unicode_in_filenames,
-        } = resolve_path_derivation_fields(
-            PathDerivationCliArgs {
-                folder_structure: Some(folder_structure.clone()),
-                folder_structure_albums: Some(folder_structure_albums.clone()),
-                folder_structure_smart_folders: Some(folder_structure_smart_folders.clone()),
-                resolution: overrides.resolution,
-                live_photo_mode: live_photo_mode_pre_resolved,
-                live_resolution: overrides.live_resolution,
-                live_photo_mov_filename_policy: overrides.live_photo_mov_filename_policy,
-                edited: overrides.edited,
-                alternative: overrides.alternative,
-                raw_policy: overrides.raw_policy,
-                file_match_policy: overrides.file_match_policy,
-                force_resolution: overrides.force_resolution,
-                keep_unicode_in_filenames: overrides.keep_unicode_in_filenames,
-            },
-            toml,
-        )?;
 
         let watch_with_interval = overrides
             .watch_with_interval
@@ -4531,6 +4515,42 @@ mod tests {
         assert!(!pd.force_resolution);
         assert!(!pd.keep_unicode_in_filenames);
         assert_eq!(pd.raw_policy, RawPolicy::AsIs);
+    }
+
+    #[test]
+    fn config_build_uses_path_derivation_overlay_once() {
+        let toml: TomlConfig = toml::from_str(
+            r#"
+            [download]
+            folder_structure = "%Y/%m"
+            folder_structure_albums = "{album}/toml"
+            folder_structure_smart_folders = "{smart-folder}/toml"
+
+            [photos]
+            resolution = "medium"
+            live_photo_mode = "skip"
+            live_resolution = "thumb"
+            raw_policy = "prefer-raw"
+            "#,
+        )
+        .unwrap();
+        let mut sync = default_sync();
+        sync.config_overrides.folder_structure_albums = Some("{album}/cli".to_string());
+        sync.config_overrides.live_photo_mode = Some(LivePhotoMode::ImageOnly);
+
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+
+        assert_eq!(cfg.download.folder_structure, "%Y/%m");
+        assert_eq!(cfg.download.folder_structure_albums, "{album}/cli");
+        assert_eq!(
+            cfg.download.folder_structure_smart_folders,
+            "{smart-folder}/toml"
+        );
+        assert_eq!(cfg.photos.resolution, PhotoResolution::Medium);
+        assert_eq!(cfg.photos.live_photo_mode, LivePhotoMode::ImageOnly);
+        assert_eq!(cfg.photos.live_resolution, LivePhotoResolution::Thumb);
+        assert_eq!(cfg.photos.raw_policy, RawPolicy::PreferRaw);
     }
 
     /// TOML wins when the CLI is silent. Pin this so anyone refactoring
