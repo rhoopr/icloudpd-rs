@@ -907,6 +907,14 @@ mod tests {
         authenticate_srp(&mut t, &ep, "u@test.com", "p", "c", "com").await
     }
 
+    async fn run_srp_complete_error(status: u16, body: &[u8]) -> AuthError {
+        run_srp(vec![valid_init_response(), response(status, body.to_vec())])
+            .await
+            .unwrap_err()
+            .downcast::<AuthError>()
+            .expect("typed AuthError")
+    }
+
     /// 401 at /signin/init is not a bad-password signal — Apple hasn't yet
     /// verified the M1 proof. Expect a typed `ApiError` so the caller doesn't
     /// tell the user their password is wrong for a transient auth-CDN issue.
@@ -1198,11 +1206,7 @@ mod tests {
                 }
             ]
         }"#;
-        let err = run_srp(vec![valid_init_response(), response(403, body.to_vec())])
-            .await
-            .unwrap_err();
-        let auth_err = err.downcast_ref::<AuthError>().unwrap();
-        match auth_err {
+        match run_srp_complete_error(403, body).await {
             AuthError::TerminalAppleAuth { code, message } => {
                 assert_eq!(code, APPLE_ACCOUNT_LOCKED_CODE);
                 assert!(message.contains("locked for security reasons"));
@@ -1218,11 +1222,7 @@ mod tests {
                 {"code": "-20209", "message": "", "title": "Account locked"}
             ]
         }"#;
-        let err = run_srp(vec![valid_init_response(), response(200, body.to_vec())])
-            .await
-            .unwrap_err();
-        let auth_err = err.downcast_ref::<AuthError>().unwrap();
-        match auth_err {
+        match run_srp_complete_error(200, body).await {
             AuthError::TerminalAppleAuth { code, message } => {
                 assert_eq!(code, APPLE_ACCOUNT_LOCKED_CODE);
                 assert_eq!(message, "Account locked");
@@ -1238,11 +1238,7 @@ mod tests {
                 {"code": "AUTH-401", "message": "Authentication required"}
             ]
         }"#;
-        let err = run_srp(vec![valid_init_response(), response(200, body.to_vec())])
-            .await
-            .unwrap_err();
-        let auth_err = err.downcast_ref::<AuthError>().unwrap();
-        match auth_err {
+        match run_srp_complete_error(200, body).await {
             AuthError::ServiceError { code, message } => {
                 assert_eq!(code, "AUTH-401");
                 assert!(message.contains("Authentication required"));
@@ -1254,11 +1250,7 @@ mod tests {
     #[tokio::test]
     async fn srp_complete_200_bare_has_error_is_service_error() {
         let body = br#"{"hasError": true}"#;
-        let err = run_srp(vec![valid_init_response(), response(200, body.to_vec())])
-            .await
-            .unwrap_err();
-        let auth_err = err.downcast_ref::<AuthError>().unwrap();
-        match auth_err {
+        match run_srp_complete_error(200, body).await {
             AuthError::ServiceError { code, message } => {
                 assert_eq!(code, "unknown");
                 assert!(message.contains("Apple reported an error"));
