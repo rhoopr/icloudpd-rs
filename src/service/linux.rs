@@ -416,21 +416,26 @@ fn is_root() -> bool {
     effective_uid() == 0
 }
 
-fn sudo_user_or_bail() -> Result<String> {
-    match std::env::var("SUDO_USER") {
-        Ok(u) if !u.is_empty() && u != "root" => Ok(u),
-        _ => bail!(
-            "$SUDO_USER not set; rerun via `sudo kei install --system` so the service \
-             can be configured to run as your account rather than root"
-        ),
+fn non_root_env_user(key: &str) -> Option<String> {
+    match std::env::var(key) {
+        Ok(user) if !user.is_empty() && user != "root" => Some(user),
+        _ => None,
     }
 }
 
+fn sudo_user_or_bail() -> Result<String> {
+    if let Some(user) = non_root_env_user("SUDO_USER") {
+        return Ok(user);
+    }
+    bail!(
+        "$SUDO_USER not set; rerun via `sudo kei install --system` so the service \
+         can be configured to run as your account rather than root"
+    )
+}
+
 fn system_preview_user() -> Result<String> {
-    if let Ok(user) = std::env::var("SUDO_USER") {
-        if !user.is_empty() && user != "root" {
-            return Ok(user);
-        }
+    if let Some(user) = non_root_env_user("SUDO_USER") {
+        return Ok(user);
     }
 
     if is_root() {
@@ -441,10 +446,8 @@ fn system_preview_user() -> Result<String> {
     }
 
     for key in ["USER", "LOGNAME"] {
-        if let Ok(user) = std::env::var(key) {
-            if !user.is_empty() && user != "root" {
-                return Ok(user);
-            }
+        if let Some(user) = non_root_env_user(key) {
+            return Ok(user);
         }
     }
     bail!(

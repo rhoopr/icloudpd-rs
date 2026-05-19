@@ -402,6 +402,11 @@ service-smoke:
     # placeholder so the smoke does not depend on the operator's .env
     # or saved config.
     export ICLOUD_USERNAME="service-smoke@example.invalid"
+    assert_service_not_installed() {
+        local status
+        status=$("$KEI" status)
+        printf '%s\n' "$status" | grep -q '^Service: not installed'
+    }
     case "$(uname -s)" in
         Linux)
             UNIT="$HOME/.config/systemd/user/kei.service"
@@ -410,26 +415,26 @@ service-smoke:
             # pre-state assertion is meaningful.
             rm -f "$UNIT" "$UNIT_PREVIEW"
             test ! -e "$UNIT"
-            status_pre=$("$KEI" status); printf '%s\n' "$status_pre" | grep -q '^Service: not installed'
+            assert_service_not_installed
             "$KEI" install --user --dry-run > "$UNIT_PREVIEW"
             test ! -e "$UNIT"
             systemd-analyze --user verify "$UNIT_PREVIEW"
             "$KEI" uninstall
             test ! -e "$UNIT"
-            status_post=$("$KEI" status); printf '%s\n' "$status_post" | grep -q '^Service: not installed'
+            assert_service_not_installed
             ;;
         Darwin)
             PLIST="$HOME/Library/LaunchAgents/com.rhoopr.kei.plist"
             PLIST_PREVIEW="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/com.rhoopr.kei.plist"
             rm -f "$PLIST" "$PLIST_PREVIEW"
             test ! -e "$PLIST"
-            status_pre=$("$KEI" status); printf '%s\n' "$status_pre" | grep -q '^Service: not installed'
+            assert_service_not_installed
             "$KEI" install --dry-run > "$PLIST_PREVIEW"
             test ! -e "$PLIST"
             plutil -lint "$PLIST_PREVIEW"
             "$KEI" uninstall
             test ! -e "$PLIST"
-            status_post=$("$KEI" status); printf '%s\n' "$status_post" | grep -q '^Service: not installed'
+            assert_service_not_installed
             ;;
         *)
             echo "service-smoke is Linux/macOS only; Windows runs in CI" >&2
