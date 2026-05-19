@@ -13,6 +13,12 @@ fn format_fido_keys(keys: &[String]) -> String {
 
 /// Apple service error code for an account lock that requires operator action.
 pub(crate) const APPLE_ACCOUNT_LOCKED_CODE: &str = "-20209";
+/// Apple service error code for credentials rejected by SRP complete.
+pub(crate) const APPLE_INVALID_CREDENTIALS_CODE: &str = "-20101";
+
+const ACCOUNT_LOCKED_RECOVERY: &str =
+    "Visit https://iforgot.apple.com, update kei's stored password, then restart kei.";
+const INVALID_CREDENTIALS_RECOVERY: &str = "Update kei's stored password, then restart kei.";
 
 /// Custom error types for iCloud authentication.
 #[derive(Debug, Error)]
@@ -33,8 +39,8 @@ pub enum AuthError {
     ServiceError { code: String, message: String },
 
     #[error(
-        "Terminal Apple authentication error ({code}): {message}. \
-         Visit https://iforgot.apple.com, update kei's stored password, then restart kei."
+        "Terminal Apple authentication error ({code}): {message}. {}",
+        terminal_apple_auth_recovery(code)
     )]
     TerminalAppleAuth { code: String, message: String },
 
@@ -164,6 +170,18 @@ impl AuthError {
     }
 }
 
+pub(crate) fn is_terminal_apple_auth_code(code: &str) -> bool {
+    code == APPLE_ACCOUNT_LOCKED_CODE || code == APPLE_INVALID_CREDENTIALS_CODE
+}
+
+fn terminal_apple_auth_recovery(code: &str) -> &'static str {
+    if code == APPLE_ACCOUNT_LOCKED_CODE {
+        ACCOUNT_LOCKED_RECOVERY
+    } else {
+        INVALID_CREDENTIALS_RECOVERY
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,11 +197,10 @@ mod tests {
         assert!(!AuthError::TwoFactorFailed("test".into()).is_two_factor_required());
         assert!(!AuthError::InvalidToken("test".into()).is_two_factor_required());
         assert!(!AuthError::LockContention("test".into()).is_two_factor_required());
-        assert!(!AuthError::TerminalAppleAuth {
-            code: APPLE_ACCOUNT_LOCKED_CODE.into(),
-            message: "locked".into()
-        }
-        .is_two_factor_required());
+        assert!(
+            !AuthError::terminal_apple_auth(APPLE_ACCOUNT_LOCKED_CODE, "locked")
+                .is_two_factor_required()
+        );
         assert!(!AuthError::ApiError {
             code: 401,
             message: "test".into()
@@ -291,6 +308,18 @@ mod tests {
     }
 
     #[test]
+    fn terminal_invalid_credentials_display_skips_iforgot() {
+        let err =
+            AuthError::terminal_apple_auth(APPLE_INVALID_CREDENTIALS_CODE, "Incorrect password");
+        let msg = err.to_string();
+        assert!(msg.contains(APPLE_INVALID_CREDENTIALS_CODE));
+        assert!(msg.contains("Incorrect password"));
+        assert!(!msg.contains("iforgot.apple.com"));
+        assert!(msg.contains("Update kei's stored password"));
+        assert!(msg.contains("restart kei"));
+    }
+
+    #[test]
     fn service_error_is_not_two_factor_required() {
         let err = AuthError::ServiceError {
             code: "test".into(),
@@ -390,11 +419,10 @@ mod tests {
         assert!(!AuthError::TwoFactorFailed("test".into()).is_transient_apple_failure());
         assert!(!AuthError::TwoFactorRequired.is_transient_apple_failure());
         assert!(!AuthError::LockContention("test".into()).is_transient_apple_failure());
-        assert!(!AuthError::TerminalAppleAuth {
-            code: APPLE_ACCOUNT_LOCKED_CODE.into(),
-            message: "locked".into()
-        }
-        .is_transient_apple_failure());
+        assert!(
+            !AuthError::terminal_apple_auth(APPLE_ACCOUNT_LOCKED_CODE, "locked")
+                .is_transient_apple_failure()
+        );
     }
 
     #[test]
@@ -524,11 +552,10 @@ mod tests {
         assert!(!AuthError::TwoFactorFailed("test".into()).is_misdirected_request());
         assert!(!AuthError::TwoFactorRequired.is_misdirected_request());
         assert!(!AuthError::LockContention("test".into()).is_misdirected_request());
-        assert!(!AuthError::TerminalAppleAuth {
-            code: APPLE_ACCOUNT_LOCKED_CODE.into(),
-            message: "locked".into()
-        }
-        .is_misdirected_request());
+        assert!(
+            !AuthError::terminal_apple_auth(APPLE_ACCOUNT_LOCKED_CODE, "locked")
+                .is_misdirected_request()
+        );
     }
 
     #[test]

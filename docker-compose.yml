@@ -38,10 +38,10 @@ services:
     # Default command:
     #   kei service run --config /config/config.toml
     # service run uses a 24h watch fallback when [watch].interval is unset.
-    # If Apple returns a terminal account-lock auth error during SRP sign-in,
-    # kei exits 4 and prints the iforgot.apple.com and stored-password recovery
-    # steps. This sample still restarts because restart: unless-stopped is set
-    # above; use external monitoring if you want to alert on exit 4.
+    # If Apple returns a terminal auth error during SRP sign-in, kei exits 4
+    # and prints the account recovery or stored-password update steps. This
+    # sample still restarts because restart: unless-stopped is set above; use
+    # external monitoring if you want to alert on exit 4.
 
     # ── Credential options (pick one) ──────────────────────────────
     #

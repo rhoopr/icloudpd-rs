@@ -131,7 +131,7 @@ Operations:
 - `[report].json` writes an atomic per-cycle sync report.
 - Watch mode serves `/healthz` and `/metrics` on the configured HTTP bind and port.
 - Docker runs watch mode by default and supports `PUID`/`PGID` ownership for NAS deployments.
-- Apple account-lock errors during SRP sign-in exit 4 after pointing you to iforgot.apple.com and the stored-password update step.
+- Terminal Apple auth errors during SRP sign-in exit 4 with the account recovery or stored-password update step.
 - Passwords can come from the OS keyring, encrypted file fallback, environment, file, or command.
 - Notification scripts can run on 2FA, sync start, sync success, sync failure, and session expiry.
 

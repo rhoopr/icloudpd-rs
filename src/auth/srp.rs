@@ -14,7 +14,7 @@ use super::responses::AppleServiceError;
 use super::session::Session;
 use super::twofa::{check_rscd_from_headers, rscd_service_error};
 use super::AUTH_RETRY_CONFIG;
-use crate::auth::error::{AuthError, APPLE_ACCOUNT_LOCKED_CODE};
+use crate::auth::error::{is_terminal_apple_auth_code, AuthError};
 use crate::retry::parse_retry_after_header;
 
 /// Buffered HTTP response for SRP authentication steps.
@@ -71,7 +71,7 @@ fn apple_auth_error_from_body(response: &SrpResponse) -> Option<AuthError> {
     if let Some(err) = body
         .service_errors
         .iter()
-        .find(|err| err.code == APPLE_ACCOUNT_LOCKED_CODE)
+        .find(|err| is_terminal_apple_auth_code(&err.code))
     {
         return Some(AuthError::terminal_apple_auth(
             &err.code,
@@ -742,6 +742,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::error::{APPLE_ACCOUNT_LOCKED_CODE, APPLE_INVALID_CREDENTIALS_CODE};
 
     #[test]
     fn test_derive_apple_password_s2k() {
@@ -1226,6 +1227,25 @@ mod tests {
             AuthError::TerminalAppleAuth { code, message } => {
                 assert_eq!(code, APPLE_ACCOUNT_LOCKED_CODE);
                 assert_eq!(message, "Account locked");
+            }
+            other => panic!("expected TerminalAppleAuth, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn srp_complete_401_service_error_20101_is_terminal_apple_auth() {
+        let body = br#"{
+            "serviceErrors": [
+                {
+                    "code": "-20101",
+                    "message": "Enter the email or phone number and password for your Apple Account."
+                }
+            ]
+        }"#;
+        match run_srp_complete_error(401, body).await {
+            AuthError::TerminalAppleAuth { code, message } => {
+                assert_eq!(code, APPLE_INVALID_CREDENTIALS_CODE);
+                assert!(message.contains("email or phone number and password"));
             }
             other => panic!("expected TerminalAppleAuth, got: {other:?}"),
         }
