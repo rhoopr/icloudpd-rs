@@ -138,6 +138,11 @@ impl DownloadControls {
     pub(crate) const fn download_hidden() -> Self {
         Self::new(DownloadRunMode::Download, DownloadReporting::hidden())
     }
+
+    #[cfg(test)]
+    pub(crate) const fn dry_run_hidden() -> Self {
+        Self::new(DownloadRunMode::DryRun, DownloadReporting::hidden())
+    }
 }
 
 /// Result of a sync cycle, including the optional new syncToken.

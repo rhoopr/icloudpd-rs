@@ -4593,10 +4593,7 @@ mod tests {
             &reqwest::Client::new(),
             stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
             &config,
-            DownloadControls::new(
-                super::super::DownloadRunMode::DryRun,
-                DownloadReporting::hidden(),
-            ),
+            DownloadControls::dry_run_hidden(),
             1,
             CancellationToken::new(),
             None,
@@ -4623,18 +4620,16 @@ mod tests {
         let mut config = DownloadConfig::test_default();
         config.directory = std::sync::Arc::from(dir.path());
         let config = Arc::new(config);
-        let controls = DownloadControls::new(
-            super::super::DownloadRunMode::DryRun,
-            DownloadReporting::hidden(),
-        );
+        let controls = DownloadControls::dry_run_hidden();
         let asset = TestPhotoAsset::new("DRY_RUN_PARTIAL")
             .orig_size(123)
             .orig_url("https://p01.icloud-content.com/dry-run-partial.jpg")
             .orig_checksum("ck_dry_run_partial")
             .build();
+        let client = reqwest::Client::new();
 
         let streaming_result = stream_and_download_from_stream(
-            &reqwest::Client::new(),
+            &client,
             stream::iter(vec![
                 Ok::<PhotoAsset, anyhow::Error>(asset),
                 Err(anyhow::anyhow!("malformed page")),
@@ -4649,7 +4644,7 @@ mod tests {
         .await
         .expect("dry run should continue past enumeration errors");
         let (outcome, stats) = build_download_outcome(
-            &reqwest::Client::new(),
+            &client,
             &[],
             &config,
             controls,
@@ -5171,10 +5166,7 @@ mod tests {
             &client,
             &[],
             &config,
-            DownloadControls::new(
-                super::super::DownloadRunMode::DryRun,
-                DownloadReporting::hidden(),
-            ),
+            DownloadControls::dry_run_hidden(),
             streaming_result,
             Instant::now(),
             CancellationToken::new(),
