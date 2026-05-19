@@ -24,6 +24,8 @@ fi
 
 album="${KEI_TEST_ALBUM:-kei-test}"
 image="${KEI_DOCKER_IMAGE:-kei:dev}"
+shell_scratch="${KEI_TEST_SCRATCH_DIR:-$repo_root/.scratch/full-test-shell}"
+mkdir -p "$shell_scratch"
 
 for sh in "$shell_dir"/*.sh; do
   [[ -f "$sh" ]] || continue
@@ -31,5 +33,9 @@ for sh in "$shell_dir"/*.sh; do
   [[ "$base" == "lib" ]] && continue
   phase="test_shell_${base//-/_}"
   "$time_phase" --live "$phase" -- \
-    env KEI_TEST_ALBUM="$album" KEI_DOCKER_IMAGE="$image" "$sh"
+    env \
+      KEI_TEST_ALBUM="$album" \
+      KEI_DOCKER_IMAGE="$image" \
+      KEI_TEST_SCRATCH_DIR="$shell_scratch" \
+      "$sh"
 done
