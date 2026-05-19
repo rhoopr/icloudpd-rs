@@ -1725,7 +1725,8 @@ async fn run_cycle(
             &sync_result.outcome,
             config.runtime.dry_run,
             cycle_has_stale_plan,
-        );
+        ) && !sync_result.stats.interrupted
+            && !shutdown_token.is_cancelled();
         if should_store_token {
             match (&sync_result.sync_token, state_db) {
                 (Some(token), Some(db)) => {
@@ -2713,6 +2714,40 @@ mod tests {
         )
     }
 
+    fn make_one_photo_incremental_album_for_zone(
+        zone: &str,
+        zone_sync_token: &str,
+    ) -> crate::icloud::photos::PhotoAlbum {
+        use serde_json::json;
+        let page = full_album_page(zone, &format!("master-{zone}"), zone_sync_token);
+        let records = page
+            .get("records")
+            .expect("full album page records")
+            .clone();
+
+        crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("TestAlbum"),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(json!({"zoneName": zone})),
+                retry_config: retry::RetryConfig::default(),
+            },
+            Box::new(crate::test_helpers::MockPhotosSession::new().ok(json!({
+                "zones": [{
+                    "zoneID": {"zoneName": zone, "ownerRecordName": "_defaultOwner"},
+                    "syncToken": zone_sync_token,
+                    "moreComing": false,
+                    "records": records
+                }]
+            }))),
+        )
+    }
+
     fn album_count_response(count: u64) -> serde_json::Value {
         serde_json::json!({
             "batch": [{"records": [{"fields": {"itemCount": {"value": count}}}]}]
@@ -3084,6 +3119,7 @@ mod tests {
         inner: Arc<dyn state::StateDb>,
         failure: MetadataSetFailure,
         message: &'static str,
+        cancel_on_upsert: Option<CancellationToken>,
     }
 
     impl std::fmt::Debug for FailingMetadataSetDb {
@@ -3115,7 +3151,13 @@ mod tests {
             &self,
             record: &state::types::AssetRecord,
         ) -> Result<(), state::error::StateError> {
-            self.inner.upsert_seen(record).await
+            let result = self.inner.upsert_seen(record).await;
+            if result.is_ok() {
+                if let Some(token) = &self.cancel_on_upsert {
+                    token.cancel();
+                }
+            }
+            result
         }
 
         async fn mark_downloaded(
@@ -4097,6 +4139,7 @@ mod tests {
             inner,
             failure: MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY),
             message: "simulated db_sync_token write failure",
+            cancel_on_upsert: None,
         });
 
         let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
@@ -4581,6 +4624,7 @@ mod tests {
             inner: Arc::clone(&inner),
             failure: MetadataSetFailure::Prefix(SYNC_TOKEN_PREFIX),
             message: "simulated sync-token write failure",
+            cancel_on_upsert: None,
         });
         let download_dir = tempfile::tempdir().expect("download tempdir");
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -4617,6 +4661,70 @@ mod tests {
                 .as_deref(),
             Some("zone-tok-prev"),
             "failed zone-token write must leave old token in place for replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() {
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let shutdown_token = CancellationToken::new();
+        let db: Arc<dyn state::StateDb> = Arc::new(FailingMetadataSetDb {
+            inner: Arc::clone(&inner),
+            failure: MetadataSetFailure::Exact("__unused_metadata_key__"),
+            message: "unused",
+            cancel_on_upsert: Some(shutdown_token.clone()),
+        });
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let lib_state = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_one_photo_incremental_album_for_zone("PrimarySync", "zone-tok-new"),
+        );
+        let states = vec![&lib_state];
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &shutdown_token,
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert!(
+            result.stats.interrupted,
+            "cancellation before the download pass must be visible in cycle stats"
+        );
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "database precheck token must not advance after an interrupted download cycle"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "interrupted cycle must leave the old zone token in place for replay"
+        );
+        assert!(
+            !download_dir.path().join("2023/11/14/photo.jpg").exists(),
+            "test must not pass by completing the download before cancellation"
         );
     }
 
