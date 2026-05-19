@@ -321,15 +321,13 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                 records.retain(|r| r.get("serverErrorCode").and_then(Value::as_str).is_none());
                 let valid_count = records.len();
                 if valid_count == 0 {
-                    // Control only reaches here because the loop above walked
-                    // at least one record with `serverErrorCode` set, which
-                    // always assigns `last_ck_err`. The expect encodes that
-                    // invariant — it cannot fire at runtime.
-                    #[allow(
-                        clippy::expect_used,
-                        reason = "invariant: valid_count==0 implies the errored loop ran and assigned last_ck_err"
-                    )]
-                    return Err(last_ck_err.expect("errored is non-empty").into());
+                    let Some(last_ck_err) = last_ck_err else {
+                        anyhow::bail!(
+                            "CloudKit response contained no valid records, \
+                             but no per-record server error was available"
+                        );
+                    };
+                    return Err(last_ck_err.into());
                 }
                 tracing::warn!(
                     errored = total - valid_count,

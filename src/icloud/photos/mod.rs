@@ -150,15 +150,9 @@ impl PhotosService {
             let libs = self.fetch_libraries("private").await?;
             self.private_libraries = Some(libs);
         }
-        // Safe: we just ensured private_libraries is Some above
-        #[allow(
-            clippy::unreachable,
-            reason = "private_libraries was set to Some on the line above; None is impossible here"
-        )]
-        Ok(self
-            .private_libraries
+        self.private_libraries
             .as_ref()
-            .unwrap_or_else(|| unreachable!("private_libraries was just set to Some")))
+            .context("internal error: private libraries were not cached")
     }
 
     /// Fetch shared libraries (lazily, first call triggers the HTTP request).
@@ -169,15 +163,9 @@ impl PhotosService {
             let libs = self.fetch_libraries("shared").await?;
             self.shared_libraries = Some(libs);
         }
-        // Safe: we just ensured shared_libraries is Some above
-        #[allow(
-            clippy::unreachable,
-            reason = "shared_libraries was set to Some on the line above; None is impossible here"
-        )]
-        Ok(self
-            .shared_libraries
+        self.shared_libraries
             .as_ref()
-            .unwrap_or_else(|| unreachable!("shared_libraries was just set to Some")))
+            .context("internal error: shared libraries were not cached")
     }
 
     async fn fetch_libraries(

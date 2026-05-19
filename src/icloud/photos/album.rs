@@ -476,22 +476,22 @@ impl PhotoAlbum {
 
         // Use 2x concurrency for enumeration fetchers — Apple's CloudKit
         // doesn't throttle at these levels and it halves enumeration time.
-        let num_fetchers = match effective_total {
+        let (num_fetchers, parallel_total) = match effective_total {
             Some(total) if concurrency > 1 => {
-                determine_fetcher_count(total, page_size, concurrency * 2)
+                let num_fetchers = determine_fetcher_count(total, page_size, concurrency * 2);
+                if num_fetchers > 1 {
+                    (num_fetchers, Some(total))
+                } else {
+                    (1, None)
+                }
             }
-            _ => 1,
+            _ => (1, None),
         };
 
         let (tx, rx) =
             mpsc::channel::<anyhow::Result<PhotoAsset>>((page_size * num_fetchers).min(500));
 
-        if num_fetchers > 1 {
-            #[allow(
-                clippy::expect_used,
-                reason = "effective_total is unconditionally set when num_fetchers > 1 (see compute above)"
-            )]
-            let total = effective_total.expect("effective_total set when num_fetchers > 1");
+        if let Some(total) = parallel_total {
             // Partition offset range into non-overlapping chunks aligned to
             // page_size boundaries so each fetcher starts on a clean page.
             let chunk_size_items = {

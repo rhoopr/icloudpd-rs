@@ -325,7 +325,7 @@ fn prompt_windows_password(user: &str) -> Result<String> {
 #[cfg(target_os = "windows")]
 mod scm_impl {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
     use windows_service::{
         define_windows_service,
         service::{
@@ -358,6 +358,19 @@ mod scm_impl {
     struct ScmPayload {
         globals: crate::config::GlobalArgs,
         sync: crate::sync_loop::SyncArgs,
+    }
+
+    fn lock_scm_payload() -> Result<MutexGuard<'static, Option<ScmPayload>>> {
+        SCM_PAYLOAD
+            .lock()
+            .map_err(|_| anyhow!("internal: SCM payload mutex poisoned"))
+    }
+
+    fn lock_scm_shutdown_tx(
+    ) -> Result<MutexGuard<'static, Option<tokio::sync::oneshot::Sender<()>>>> {
+        SCM_SHUTDOWN_TX
+            .lock()
+            .map_err(|_| anyhow!("internal: SCM shutdown mutex poisoned"))
     }
 
     /// Owned form of [`ServiceInfoInputs`] -- crosses the spawn_blocking
@@ -535,7 +548,7 @@ mod scm_impl {
     ) -> Result<()> {
         // Stash payload before the dispatcher attempt so the SCM-spawned
         // service-main thread cannot observe an empty slot.
-        *SCM_PAYLOAD.lock().unwrap() = Some(ScmPayload { globals, sync });
+        *lock_scm_payload()? = Some(ScmPayload { globals, sync });
 
         let dispatcher_result = tokio::task::spawn_blocking(|| {
             service_dispatcher::start(SERVICE_NAME, ffi_service_main)
@@ -553,10 +566,9 @@ mod scm_impl {
                     service = SERVICE_NAME,
                     "kei service run invoked outside SCM; running in foreground"
                 );
-                let payload =
-                    SCM_PAYLOAD.lock().unwrap().take().ok_or_else(|| {
-                        anyhow!("internal: SCM payload missing on foreground path")
-                    })?;
+                let payload = lock_scm_payload()?
+                    .take()
+                    .ok_or_else(|| anyhow!("internal: SCM payload missing on foreground path"))?;
                 crate::sync_loop::run_sync(&payload.globals, payload.sync).await
             }
             Err(e) => Err(anyhow!("StartServiceCtrlDispatcher failed: {e}")),
@@ -571,13 +583,21 @@ mod scm_impl {
 
     fn service_main_inner() -> Result<()> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        *SCM_SHUTDOWN_TX.lock().unwrap() = Some(shutdown_tx);
+        *lock_scm_shutdown_tx()? = Some(shutdown_tx);
 
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
             match control_event {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
-                    if let Some(tx) = SCM_SHUTDOWN_TX.lock().unwrap().take() {
-                        let _ = tx.send(());
+                    match lock_scm_shutdown_tx() {
+                        Ok(mut guard) => {
+                            if let Some(tx) = guard.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to signal SCM shutdown");
+                            return ServiceControlHandlerResult::Other(1);
+                        }
                     }
                     ServiceControlHandlerResult::NoError
                 }
@@ -609,9 +629,7 @@ mod scm_impl {
     }
 
     fn run_payload_under_scm(mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
-        let payload = SCM_PAYLOAD
-            .lock()
-            .unwrap()
+        let payload = lock_scm_payload()?
             .take()
             .ok_or_else(|| anyhow!("kei service main started without a stashed payload"))?;
 
