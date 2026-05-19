@@ -2102,7 +2102,7 @@ pub(super) async fn build_download_outcome(
         } else {
             tracing::info!("No new photos to download");
         }
-        if (retry_exhausted > 0 || enumeration_errors > 0) && !run_mode.is_dry_run() {
+        if retry_exhausted > 0 || enumeration_errors > 0 {
             return Ok((
                 DownloadOutcome::PartialFailure {
                     failed_count: retry_exhausted + enumeration_errors,
@@ -2117,6 +2117,7 @@ pub(super) async fn build_download_outcome(
         let stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
+            enumeration_errors,
             skipped: skip_breakdown,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
@@ -2130,6 +2131,14 @@ pub(super) async fn build_download_outcome(
         }
         tracing::info!(destination = %config.directory.display(), "  destination");
         tracing::info!(concurrency = config.concurrent_downloads, "  concurrency");
+        if enumeration_errors > 0 {
+            return Ok((
+                DownloadOutcome::PartialFailure {
+                    failed_count: enumeration_errors,
+                },
+                stats,
+            ));
+        }
         return Ok((DownloadOutcome::Success, stats));
     }
 
@@ -4604,6 +4613,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dry_run_mode_reports_enumeration_errors_without_downloading() {
+        use crate::download::{DownloadConfig, DownloadOutcome};
+        use crate::icloud::photos::PhotoAsset;
+        use futures_util::stream;
+
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        let config = Arc::new(config);
+        let controls = DownloadControls::new(
+            super::super::DownloadRunMode::DryRun,
+            DownloadReporting::hidden(),
+        );
+        let asset = TestPhotoAsset::new("DRY_RUN_PARTIAL")
+            .orig_size(123)
+            .orig_url("https://p01.icloud-content.com/dry-run-partial.jpg")
+            .orig_checksum("ck_dry_run_partial")
+            .build();
+
+        let streaming_result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![
+                Ok::<PhotoAsset, anyhow::Error>(asset),
+                Err(anyhow::anyhow!("malformed page")),
+            ]),
+            &config,
+            controls,
+            2,
+            CancellationToken::new(),
+            None,
+            None,
+        )
+        .await
+        .expect("dry run should continue past enumeration errors");
+        let (outcome, stats) = build_download_outcome(
+            &reqwest::Client::new(),
+            &[],
+            &config,
+            controls,
+            streaming_result,
+            Instant::now(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dry-run outcome should build");
+
+        assert!(
+            matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 1 }),
+            "dry-run enumeration errors must produce PartialFailure, got {outcome:?}"
+        );
+        assert_eq!(stats.downloaded, 1);
+        assert_eq!(stats.enumeration_errors, 1);
+        assert!(
+            fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "dry-run mode must not create downloaded files"
+        );
+    }
+
     /// End-to-end regression for issue #211. A pending row carried over from
     /// a prior sync, combined with a filter that excludes the asset in the
     /// current sync, must not have its `last_seen_at` bumped by the producer.
@@ -5087,6 +5155,37 @@ mod tests {
             "expected PartialFailure with failed_count=3, got {outcome:?}"
         );
         assert_eq!(stats.enumeration_errors, 3);
+    }
+
+    #[tokio::test]
+    async fn dry_run_zero_downloads_with_enumeration_errors_returns_partial_failure() {
+        use crate::download::{DownloadConfig, DownloadOutcome};
+
+        let streaming_result = StreamingResult {
+            enumeration_errors: 2,
+            ..StreamingResult::default()
+        };
+        let client = reqwest::Client::new();
+        let config = Arc::new(DownloadConfig::test_default());
+        let (outcome, stats) = build_download_outcome(
+            &client,
+            &[],
+            &config,
+            DownloadControls::new(
+                super::super::DownloadRunMode::DryRun,
+                DownloadReporting::hidden(),
+            ),
+            streaming_result,
+            Instant::now(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("should not error");
+        assert!(
+            matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 2 }),
+            "expected dry-run PartialFailure with failed_count=2, got {outcome:?}"
+        );
+        assert_eq!(stats.enumeration_errors, 2);
     }
 
     /// When SIGTERM fires mid-sync, the .part files must not be promoted
