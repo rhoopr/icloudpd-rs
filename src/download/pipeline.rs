@@ -229,6 +229,12 @@ struct PendingStateWrite {
 const STATE_WRITE_MAX_RETRIES: u32 = 6;
 const _: () = assert!(STATE_WRITE_MAX_RETRIES <= 32, "shift overflow in backoff");
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StateWriteFlush {
+    attempted: usize,
+    failures: usize,
+}
+
 /// Bounded retry attempts for `add_asset_album`. SQLite-busy under WAL
 /// contention is the dominant transient failure; three attempts at
 /// 200ms / 400ms / 800ms cover the common case while staying short enough
@@ -380,6 +386,102 @@ async fn tag_metadata_rewrites(
     }
 }
 
+async fn retry_pending_state_write(
+    db: &dyn StateDb,
+    write: &PendingStateWrite,
+    pending_count: usize,
+) -> bool {
+    use rand::RngExt;
+
+    for attempt in 1..=STATE_WRITE_MAX_RETRIES {
+        match db
+            .mark_downloaded(
+                &write.library,
+                &write.asset_id,
+                write.version_size.as_str(),
+                &write.download_path,
+                &write.local_checksum,
+                write.download_checksum.as_deref(),
+            )
+            .await
+        {
+            Ok(()) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        asset_id = %write.asset_id,
+                        pending_count,
+                        attempt,
+                        "Recovered deferred state write"
+                    );
+                }
+                return true;
+            }
+            Err(e) => {
+                if attempt < STATE_WRITE_MAX_RETRIES {
+                    tracing::info!(
+                        asset_id = %write.asset_id,
+                        pending_count,
+                        attempt,
+                        error = %e,
+                        "State write retry failed, will retry"
+                    );
+                    let base_ms = 200 * u64::from(1u32 << (attempt - 1));
+                    let jitter_ms = rand::rng().random_range(0..base_ms.max(1) / 4);
+                    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+                } else {
+                    tracing::error!(
+                        asset_id = %write.asset_id,
+                        path = %write.download_path.display(),
+                        error = %e,
+                        "State write failed after {STATE_WRITE_MAX_RETRIES} attempts - \
+                         file on disk but untracked; next sync will detect it via \
+                         filesystem check and skip re-download"
+                    );
+                }
+            }
+        }
+    }
+    false
+}
+
+async fn flush_pending_state_writes_retaining_failures(
+    db: &dyn StateDb,
+    pending: &mut Vec<PendingStateWrite>,
+) -> StateWriteFlush {
+    if pending.is_empty() {
+        return StateWriteFlush::default();
+    }
+    let pending_count = pending.len();
+    tracing::info!(pending_count, "Retrying deferred state writes");
+
+    let mut failed = Vec::new();
+    for write in pending.drain(..) {
+        if !retry_pending_state_write(db, &write, pending_count).await {
+            failed.push(write);
+        }
+    }
+
+    let flush = StateWriteFlush {
+        attempted: pending_count,
+        failures: failed.len(),
+    };
+    *pending = failed;
+
+    if flush.failures > 0 {
+        tracing::warn!(
+            failures = flush.failures,
+            total = flush.attempted,
+            "Some state writes could not be saved"
+        );
+    } else {
+        tracing::debug!(
+            count = flush.attempted,
+            "All deferred state writes recovered"
+        );
+    }
+    flush
+}
+
 /// Retry all pending state writes that failed during the download loop.
 ///
 /// Each write is attempted up to [`STATE_WRITE_MAX_RETRIES`] times with
@@ -391,68 +493,19 @@ async fn tag_metadata_rewrites(
 ///
 /// Returns the number of writes that still failed after all retries.
 async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWrite]) -> usize {
-    use rand::RngExt;
     if pending.is_empty() {
         return 0;
     }
     let pending_count = pending.len();
     tracing::info!(pending_count, "Retrying deferred state writes");
+
     let mut failures = 0;
     for write in pending {
-        let mut succeeded = false;
-        for attempt in 1..=STATE_WRITE_MAX_RETRIES {
-            match db
-                .mark_downloaded(
-                    &write.library,
-                    &write.asset_id,
-                    write.version_size.as_str(),
-                    &write.download_path,
-                    &write.local_checksum,
-                    write.download_checksum.as_deref(),
-                )
-                .await
-            {
-                Ok(()) => {
-                    if attempt > 1 {
-                        tracing::info!(
-                            asset_id = %write.asset_id,
-                            pending_count,
-                            attempt,
-                            "Recovered deferred state write"
-                        );
-                    }
-                    succeeded = true;
-                    break;
-                }
-                Err(e) => {
-                    if attempt < STATE_WRITE_MAX_RETRIES {
-                        tracing::info!(
-                            asset_id = %write.asset_id,
-                            pending_count,
-                            attempt,
-                            error = %e,
-                            "State write retry failed, will retry"
-                        );
-                        let base_ms = 200 * u64::from(1u32 << (attempt - 1));
-                        let jitter_ms = rand::rng().random_range(0..base_ms.max(1) / 4);
-                        tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
-                    } else {
-                        tracing::error!(
-                            asset_id = %write.asset_id,
-                            path = %write.download_path.display(),
-                            error = %e,
-                            "State write failed after {STATE_WRITE_MAX_RETRIES} attempts — \
-                             file on disk but untracked; next sync will detect it via \
-                             filesystem check and skip re-download"
-                        );
-                    }
-                }
-            }
-        }
-        if !succeeded {
+        if !retry_pending_state_write(db, write, pending_count).await {
             failures += 1;
         }
     }
+
     if failures > 0 {
         tracing::warn!(
             failures,
@@ -463,6 +516,33 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
         tracing::debug!(count = pending.len(), "All deferred state writes recovered");
     }
     failures
+}
+
+fn state_write_circuit_breaker_tripped(flush: &StateWriteFlush) -> bool {
+    flush.attempted >= STATE_DB_UNWRITABLE_THRESHOLD && flush.failures == flush.attempted
+}
+
+fn state_db_unwritable_error(pending_total: usize) -> anyhow::Error {
+    anyhow::anyhow!(
+        "State DB appears unwritable: all {pending_total} deferred state writes failed after \
+         {STATE_WRITE_MAX_RETRIES} retries each. Check disk space and permissions on the state \
+         DB file; halting sync to avoid re-downloading into an untracked tree."
+    )
+}
+
+async fn check_state_write_circuit_breaker(
+    db: &dyn StateDb,
+    pending: &mut Vec<PendingStateWrite>,
+) -> Option<anyhow::Error> {
+    if pending.len() < STATE_DB_UNWRITABLE_THRESHOLD {
+        return None;
+    }
+
+    let flush = flush_pending_state_writes_retaining_failures(db, pending).await;
+    if state_write_circuit_breaker_tripped(&flush) {
+        return Some(state_db_unwritable_error(flush.attempted));
+    }
+    None
 }
 
 /// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case
@@ -1292,12 +1372,13 @@ where
             ));
         }
     }
+    let pipeline_shutdown = shutdown_token.child_token();
     let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let producer_config = Arc::clone(config);
     let producer_state_db = state_db.clone();
-    let producer_shutdown = shutdown_token.clone();
+    let producer_shutdown = pipeline_shutdown.clone();
     let producer_pb = pb.clone();
     let producer = tokio::spawn(async move {
         let config = &producer_config;
@@ -1754,7 +1835,7 @@ where
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
-            let shutdown_token = shutdown_token.clone();
+            let shutdown_token = pipeline_shutdown.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -1783,8 +1864,9 @@ where
     // ending this stream). The 30s watchdog in shutdown.rs is the backstop
     // if a hung download blocks the drain.
     let mut drain_logged = false;
+    let mut state_write_circuit_error: Option<anyhow::Error> = None;
     while let Some((task, result)) = download_stream.next().await {
-        if shutdown_token.is_cancelled() && !drain_logged {
+        if pipeline_shutdown.is_cancelled() && !drain_logged {
             pb.suspend(|| tracing::info!("Shutdown requested, draining in-flight downloads..."));
             drain_logged = true;
         }
@@ -1858,6 +1940,23 @@ where
                             local_checksum,
                             download_checksum,
                         });
+                        if state_write_circuit_error.is_none() {
+                            if let Some(err) = check_state_write_circuit_breaker(
+                                db.as_ref(),
+                                &mut pending_state_writes,
+                            )
+                            .await
+                            {
+                                pb.suspend(|| {
+                                    tracing::error!(
+                                        error = %err,
+                                        "State write circuit breaker opened; halting downloads"
+                                    );
+                                });
+                                state_write_circuit_error = Some(err);
+                                pipeline_shutdown.cancel();
+                            }
+                        }
                     } else {
                         // Bytes landed and the state row reflects it. Keep
                         // or drop the rewrite marker based on whether the
@@ -1959,7 +2058,7 @@ where
                 enum_errors.load(std::sync::atomic::Ordering::Relaxed),
             )
             .unwrap_or(u64::MAX),
-            interrupted: shutdown_token.is_cancelled()
+            interrupted: pipeline_shutdown.is_cancelled()
                 || auth_errors >= AUTH_ERROR_THRESHOLD
                 || producer_panicked,
         };
@@ -1982,43 +2081,47 @@ where
     // landed on disk before the panic are recorded in state; otherwise the
     // next sync re-downloads them and the pending-retry safety net becomes
     // a no-op on panic paths.
-    let pending_total = pending_state_writes.len();
-    let state_write_failures = if let Some(db) = &state_db {
-        flush_pending_state_writes(db.as_ref(), &pending_state_writes).await
-            + usize::from(complete_sync_failed)
+    let final_state_flush = if let Some(db) = &state_db {
+        if state_write_circuit_error.is_some() {
+            StateWriteFlush {
+                attempted: pending_state_writes.len(),
+                failures: pending_state_writes.len(),
+            }
+        } else {
+            flush_pending_state_writes_retaining_failures(db.as_ref(), &mut pending_state_writes)
+                .await
+        }
     } else {
-        usize::from(complete_sync_failed)
+        StateWriteFlush::default()
     };
+    let state_write_failures = final_state_flush.failures + usize::from(complete_sync_failed);
+    if state_write_circuit_error.is_none()
+        && state_write_circuit_breaker_tripped(&final_state_flush)
+    {
+        state_write_circuit_error = Some(state_db_unwritable_error(final_state_flush.attempted));
+    }
 
     // Drain metadata-rewrite markers set earlier in this cycle (or left over
     // from a previous one). This re-applies EXIF/XMP on the existing files
     // without re-downloading bytes; the alternative was to leave markers
     // accumulating in the DB forever.
-    if let Some(db) = &state_db {
-        let metadata_flags = MetadataFlags::from(config.as_ref());
-        if metadata_flags.any_embed() || metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
-            run_metadata_rewrites(
-                db.as_ref(),
-                metadata_flags,
-                Arc::clone(&config.temp_suffix),
-                &shutdown_token,
-            )
-            .await;
+    if state_write_circuit_error.is_none() {
+        if let Some(db) = &state_db {
+            let metadata_flags = MetadataFlags::from(config.as_ref());
+            if metadata_flags.any_embed() || metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
+                run_metadata_rewrites(
+                    db.as_ref(),
+                    metadata_flags,
+                    Arc::clone(&config.temp_suffix),
+                    &pipeline_shutdown,
+                )
+                .await;
+            }
         }
     }
 
-    // If every deferred write failed and there was a non-trivial queue,
-    // the state DB is probably fundamentally unwritable (full disk, readonly
-    // mount, corruption). Bail the whole call so the outer loop stops
-    // downloading into a DB that won't record anything — otherwise watch
-    // mode spins on an infinite rewrite pattern. The threshold avoids
-    // false-positives when just one or two writes race a transient lock.
-    if pending_total >= STATE_DB_UNWRITABLE_THRESHOLD && state_write_failures == pending_total {
-        return Err(anyhow::anyhow!(
-            "State DB appears unwritable: all {pending_total} deferred state writes failed after \
-             {STATE_WRITE_MAX_RETRIES} retries each. Check disk space and permissions on the state \
-             DB file; halting sync to avoid re-downloading into an untracked tree."
-        ));
+    if let Some(err) = state_write_circuit_error {
+        return Err(err);
     }
 
     if producer_panicked {
@@ -2334,7 +2437,7 @@ pub(super) async fn run_download_pass(
     let retry_config = config.retry_config;
     let metadata_flags = config.metadata;
     let state_db = config.state_db.clone();
-    let shutdown_token = config.shutdown_token.clone();
+    let pass_shutdown = config.shutdown_token.child_token();
     let concurrency = config.concurrency;
     let temp_suffix: Arc<str> = config.temp_suffix;
     let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
@@ -2343,13 +2446,13 @@ pub(super) async fn run_download_pass(
     let mode = config.reporting.personality_mode;
 
     let mut download_stream = stream::iter(tasks)
-        .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
+        .take_while(|_| std::future::ready(!pass_shutdown.is_cancelled()))
         .map(|task| {
             let client = client.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
-            let shutdown_token = shutdown_token.clone();
+            let shutdown_token = pass_shutdown.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -2379,6 +2482,7 @@ pub(super) async fn run_download_pass(
     let mut photos_downloaded = 0usize;
     let mut videos_downloaded = 0usize;
     let mut recap = super::recap::RunRecap::default();
+    let mut state_write_circuit_open = false;
     // Cleanup pass doesn't carry an album label (it's a flat retry list);
     // recap.observe gets the library name so a recovered asset still
     // counts toward the per-album newest tracker rather than vanishing.
@@ -2439,6 +2543,23 @@ pub(super) async fn run_download_pass(
                             local_checksum: local_checksum.clone(),
                             download_checksum: download_checksum.clone(),
                         });
+                        if !state_write_circuit_open {
+                            if let Some(err) = check_state_write_circuit_breaker(
+                                db.as_ref(),
+                                &mut pending_state_writes,
+                            )
+                            .await
+                            {
+                                pb.suspend(|| {
+                                    tracing::error!(
+                                        error = %err,
+                                        "State write circuit breaker opened; halting cleanup downloads"
+                                    );
+                                });
+                                state_write_circuit_open = true;
+                                pass_shutdown.cancel();
+                            }
+                        }
                     } else {
                         update_metadata_marker(
                             db.as_ref(),
@@ -2495,7 +2616,11 @@ pub(super) async fn run_download_pass(
 
     // Retry any state writes that failed during the pass
     let state_write_failures = if let Some(db) = &state_db {
-        flush_pending_state_writes(db.as_ref(), &pending_state_writes).await
+        if state_write_circuit_open {
+            pending_state_writes.len()
+        } else {
+            flush_pending_state_writes(db.as_ref(), &pending_state_writes).await
+        }
     } else {
         0
     };
@@ -3967,6 +4092,7 @@ mod tests {
     /// of times before succeeding. All other methods panic (unused).
     struct FailingStateDb {
         remaining_failures: AtomicUsize,
+        calls: AtomicUsize,
         successes: AtomicUsize,
         fail_metadata_clear: bool,
         fail_complete_sync_run: bool,
@@ -3976,6 +4102,7 @@ mod tests {
         fn new(fail_count: usize) -> Self {
             Self {
                 remaining_failures: AtomicUsize::new(fail_count),
+                calls: AtomicUsize::new(0),
                 successes: AtomicUsize::new(0),
                 fail_metadata_clear: false,
                 fail_complete_sync_run: false,
@@ -3996,6 +4123,10 @@ mod tests {
 
         fn success_count(&self) -> usize {
             self.successes.load(Ordering::Relaxed)
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
         }
     }
 
@@ -4024,6 +4155,7 @@ mod tests {
             _: &str,
             _: Option<&str>,
         ) -> Result<(), StateError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             let prev = self.remaining_failures.fetch_sub(1, Ordering::Relaxed);
             if prev > 0 {
                 Err(StateError::LockPoisoned("simulated failure".into()))
@@ -4449,6 +4581,126 @@ mod tests {
         let failures = flush_pending_state_writes(&db, &pending).await;
         assert_eq!(failures, 0, "all 5 writes should eventually succeed");
         assert_eq!(db.success_count(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_pending_state_writes_retains_only_persistent_failures() {
+        let db = FailingStateDb::new(STATE_WRITE_MAX_RETRIES as usize + 1);
+        let mut pending = vec![
+            PendingStateWrite {
+                library: "PrimarySync".into(),
+                asset_id: "A1".into(),
+                version_size: VersionSizeKey::Original,
+                download_path: PathBuf::from("/tmp/claude/photo1.jpg"),
+                local_checksum: "abc".into(),
+                download_checksum: None,
+            },
+            PendingStateWrite {
+                library: "PrimarySync".into(),
+                asset_id: "A2".into(),
+                version_size: VersionSizeKey::Original,
+                download_path: PathBuf::from("/tmp/claude/photo2.jpg"),
+                local_checksum: "def".into(),
+                download_checksum: None,
+            },
+        ];
+
+        let flush = flush_pending_state_writes_retaining_failures(&db, &mut pending).await;
+
+        assert_eq!(
+            flush,
+            StateWriteFlush {
+                attempted: 2,
+                failures: 1,
+            }
+        );
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].asset_id.as_ref(), "A1");
+        assert_eq!(db.success_count(), 1);
+    }
+
+    #[test]
+    fn state_write_circuit_breaker_requires_threshold_and_all_failures() {
+        assert!(!state_write_circuit_breaker_tripped(&StateWriteFlush {
+            attempted: STATE_DB_UNWRITABLE_THRESHOLD - 1,
+            failures: STATE_DB_UNWRITABLE_THRESHOLD - 1,
+        }));
+        assert!(!state_write_circuit_breaker_tripped(&StateWriteFlush {
+            attempted: STATE_DB_UNWRITABLE_THRESHOLD,
+            failures: STATE_DB_UNWRITABLE_THRESHOLD - 1,
+        }));
+        assert!(state_write_circuit_breaker_tripped(&StateWriteFlush {
+            attempted: STATE_DB_UNWRITABLE_THRESHOLD,
+            failures: STATE_DB_UNWRITABLE_THRESHOLD,
+        }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
+        use base64::Engine as _;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(jpeg_body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(FailingStateDb::new(usize::MAX / 2));
+        let state_db: Arc<dyn StateDb> = db.clone();
+        let client = Client::new();
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+
+        let checksum = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+        let tasks: Vec<DownloadTask> = (0..STATE_DB_UNWRITABLE_THRESHOLD + 3)
+            .map(|i| DownloadTask {
+                url: format!("{}/photo_{i}.jpg", server.uri()).into(),
+                download_path: dir.path().join(format!("photo_{i}.jpg")),
+                checksum: checksum.clone().into(),
+                asset_id: format!("CIRCUIT_{i}").into(),
+                metadata: Arc::new(MetadataPayload::default()),
+                size: jpeg_body.len() as u64,
+                created_local: chrono::Local::now(),
+                version_size: VersionSizeKey::Original,
+                media_type: crate::state::MediaType::Photo,
+            })
+            .collect();
+
+        let result = run_download_pass(
+            PassConfig {
+                client: &client,
+                retry_config: &retry,
+                metadata: MetadataFlags::default(),
+                concurrency: 1,
+                reporting: DownloadReporting::hidden(),
+                temp_suffix: std::sync::Arc::from(".kei-tmp"),
+                shutdown_token: CancellationToken::new(),
+                state_db: Some(state_db),
+                rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                bandwidth_limiter: None,
+                library: std::sync::Arc::from("PrimarySync"),
+            },
+            tasks,
+        )
+        .await;
+
+        assert_eq!(result.state_write_failures, STATE_DB_UNWRITABLE_THRESHOLD);
+        assert_eq!(db.success_count(), 0);
+        assert!(
+            db.call_count() > STATE_DB_UNWRITABLE_THRESHOLD,
+            "deferred writes must be retried before opening the circuit"
+        );
     }
 
     /// T-11: When the API returns the same asset ID on two different pages,
