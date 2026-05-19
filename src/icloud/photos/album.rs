@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use anyhow::Context;
 use serde_json::{json, Value};
@@ -73,6 +73,30 @@ fn log_fetcher_response(album: &str, response: &Value) {
         response = %response,
         "Fetcher response body",
     );
+}
+
+/// Return a full-enumeration sync token only when every fetcher that reported
+/// one agreed. A single overwritten token is unsafe: if two parallel fetchers
+/// observed different zone tokens, advancing either token could skip records
+/// that were not present in the other fetcher's snapshot.
+fn unanimous_fetcher_sync_token(album: &str, tokens: &[String]) -> Option<String> {
+    let first = tokens.first()?;
+    if tokens.iter().all(|token| token == first) {
+        return Some(first.clone());
+    }
+
+    let mut unique_tokens = FxHashSet::default();
+    for token in tokens {
+        unique_tokens.insert(token.as_str());
+    }
+    tracing::warn!(
+        album,
+        token_count = tokens.len(),
+        unique_token_count = unique_tokens.len(),
+        "Full enumeration syncToken mismatch across parallel fetchers; \
+         blocking sync token advancement"
+    );
+    None
 }
 
 /// Configuration for creating a `PhotoAlbum`, bundling all non-session fields.
@@ -267,15 +291,16 @@ impl PhotoAlbum {
         concurrency: usize,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
-        let shared_sync_token: Arc<tokio::sync::Mutex<Option<String>>> =
-            Arc::new(tokio::sync::Mutex::new(None));
+        let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
         let (stream, handles) = self.photo_stream_inner(
             limit,
             total_count,
             concurrency,
-            Some(shared_sync_token.clone()),
+            Some(fetcher_sync_tokens.clone()),
         );
+        let album_name = Arc::clone(&self.name);
 
         // Spawn a monitor task that waits for all fetcher tasks to complete,
         // then delivers the captured syncToken through the oneshot channel.
@@ -289,7 +314,8 @@ impl PhotoAlbum {
             let final_token = if fetcher_panicked {
                 None
             } else {
-                shared_sync_token.lock().await.clone()
+                let tokens = fetcher_sync_tokens.lock().await;
+                unanimous_fetcher_sync_token(&album_name, &tokens)
             };
             let _ = token_tx.send(final_token);
         });
@@ -429,8 +455,8 @@ impl PhotoAlbum {
 
     /// Shared implementation for `photo_stream` and `photo_stream_with_token`.
     ///
-    /// When `shared_sync_token` is `Some`, each fetcher writes its last
-    /// observed `syncToken` into the shared mutex.
+    /// When `fetcher_sync_tokens` is `Some`, each fetcher appends its last
+    /// observed `syncToken` to the shared token list.
     ///
     /// Returns the stream and all spawned fetcher `JoinHandle`s.
     fn photo_stream_inner(
@@ -438,7 +464,7 @@ impl PhotoAlbum {
         limit: Option<u32>,
         total_count: Option<u64>,
         concurrency: usize,
-        shared_sync_token: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+        fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
     ) -> (PhotoStream, Vec<JoinHandle<()>>) {
         let page_size = self.page_size;
         let mut handles = Vec::new();
@@ -507,7 +533,7 @@ impl PhotoAlbum {
                     start,
                     end,
                     fetcher_limit,
-                    shared_sync_token.clone(),
+                    fetcher_sync_tokens.clone(),
                 ));
             }
             // Drop our sender so channel closes when all fetchers finish.
@@ -515,7 +541,7 @@ impl PhotoAlbum {
         } else {
             tracing::info!("Fetching photos from iCloud...");
             // Move tx directly — no clone needed for a single fetcher.
-            handles.push(self.spawn_fetcher(tx, 0, u64::MAX, limit, shared_sync_token));
+            handles.push(self.spawn_fetcher(tx, 0, u64::MAX, limit, fetcher_sync_tokens));
         }
 
         (
@@ -532,16 +558,16 @@ impl PhotoAlbum {
     /// - the per-fetcher `limit` is reached
     /// - the receiver is dropped
     ///
-    /// If `shared_sync_token` is provided, the fetcher writes the last non-None
-    /// `syncToken` from each `QueryResponse` page into it. Because the token is
-    /// a zone-level invariant, any fetcher's final value is correct.
+    /// If `fetcher_sync_tokens` is provided, the fetcher appends the last
+    /// non-None `syncToken` it observed. The monitor task compares every
+    /// fetcher's final token before allowing token advancement.
     fn spawn_fetcher(
         &self,
         tx: mpsc::Sender<anyhow::Result<PhotoAsset>>,
         start_offset: u64,
         end_offset: u64,
         limit: Option<u32>,
-        shared_sync_token: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+        fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
     ) -> JoinHandle<()> {
         let session = self.session.clone_box();
         let service_endpoint = Arc::clone(&self.service_endpoint);
@@ -556,6 +582,7 @@ impl PhotoAlbum {
         tokio::spawn(async move {
             let mut offset = start_offset;
             let mut total_sent: u64 = 0;
+            let mut last_sync_token: Option<String> = None;
             let mut pending_masters: FxHashMap<String, super::cloudkit::Record> =
                 FxHashMap::default();
             let mut consecutive_empty_pages: u32 = 0;
@@ -616,10 +643,8 @@ impl PhotoAlbum {
                 };
 
                 // Capture the zone-level syncToken from each page response.
-                if let Some(shared) = &shared_sync_token {
-                    if let Some(token) = &query.sync_token {
-                        *shared.lock().await = Some(token.clone());
-                    }
+                if let Some(token) = &query.sync_token {
+                    last_sync_token = Some(token.clone());
                 }
 
                 let records = query.records;
@@ -759,6 +784,10 @@ impl PhotoAlbum {
                 for id in pending_masters.keys() {
                     tracing::debug!(master_id = %id, "Unpaired CPLMaster");
                 }
+            }
+
+            if let (Some(shared), Some(token)) = (&fetcher_sync_tokens, last_sync_token) {
+                shared.lock().await.push(token);
             }
         })
     }
@@ -1184,6 +1213,94 @@ mod tests {
 
         let token = token_rx.await.expect("oneshot should not be dropped");
         assert_eq!(token.as_deref(), Some("st-second"));
+    }
+
+    async fn drain_photo_stream_count(stream: PhotoStream) -> u32 {
+        use tokio_stream::StreamExt;
+
+        tokio::pin!(stream);
+        let mut count = 0u32;
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+            count += 1;
+        }
+        count
+    }
+
+    #[derive(Clone, Debug)]
+    struct TokenByOffsetSession {
+        tokens_by_offset: Arc<HashMap<u64, &'static str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for TokenByOffsetSession {
+        async fn post(
+            &self,
+            _url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let request: Value = serde_json::from_str(&body)?;
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .and_then(|filters| {
+                    filters.iter().find_map(|filter| {
+                        (filter["fieldName"] == "startRank")
+                            .then(|| filter["fieldValue"]["value"].as_u64())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+
+            Ok(self.tokens_by_offset.get(&offset).map_or_else(
+                || json!({"records": []}),
+                |token| canned_page(&format!("master-{offset}"), Some(token)),
+            ))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn token_by_offset_session(tokens: &[(u64, &'static str)]) -> TokenByOffsetSession {
+        TokenByOffsetSession {
+            tokens_by_offset: Arc::new(tokens.iter().copied().collect()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_photo_stream_with_token_parallel_fetchers_agree() {
+        let album = make_album_with_session(
+            1,
+            Box::new(token_by_offset_session(&[(0, "st-same"), (1, "st-same")])),
+        );
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(2), 2);
+        assert_eq!(drain_photo_stream_count(stream).await, 2);
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(token.as_deref(), Some("st-same"));
+    }
+
+    #[tokio::test]
+    async fn test_photo_stream_with_token_parallel_fetchers_disagree_suppresses_token() {
+        let album = make_album_with_session(
+            1,
+            Box::new(token_by_offset_session(&[
+                (0, "st-first"),
+                (1, "st-second"),
+            ])),
+        );
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(2), 2);
+        assert_eq!(drain_photo_stream_count(stream).await, 2);
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(
+            token, None,
+            "mismatched parallel fetcher tokens must block advancement"
+        );
     }
 
     #[tokio::test]

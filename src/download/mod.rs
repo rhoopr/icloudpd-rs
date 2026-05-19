@@ -1632,6 +1632,29 @@ fn classify_pagination_shortfall(total: u64, seen: u64) -> PaginationShortfall {
     }
 }
 
+/// Resolve the zone sync token from every full-enumeration pass that reported
+/// one. All passes for a zone must agree before the token can advance; picking
+/// the first completed pass would hide snapshot drift between album-scoped
+/// enumerations.
+fn unanimous_pass_sync_token(tokens: &[String]) -> Option<String> {
+    let first = tokens.first()?;
+    if tokens.iter().all(|token| token == first) {
+        return Some(first.clone());
+    }
+
+    let mut unique_tokens = FxHashSet::default();
+    for token in tokens {
+        unique_tokens.insert(token.as_str());
+    }
+    tracing::warn!(
+        token_count = tokens.len(),
+        unique_token_count = unique_tokens.len(),
+        "Full enumeration syncToken mismatch across passes; blocking sync \
+         token advancement"
+    );
+    None
+}
+
 /// Full enumeration with syncToken capture.
 ///
 /// Uses `photo_stream_with_token` to capture the zone-level syncToken
@@ -1873,19 +1896,23 @@ async fn download_photos_full_with_token(
         false
     };
 
-    // Collect the sync token from any album's token receiver.
-    // In practice, all albums share the same zone so any token suffices.
+    // Collect the sync token from every album's token receiver and require
+    // agreement before advancing. In practice, all passes for a zone should
+    // report the same token; disagreement means the full enumeration did not
+    // observe one coherent snapshot.
     // Don't advance the token for read-only operations, or when pagination
     // was incomplete (would permanently skip missed assets).
-    let mut sync_token = None;
-    if !controls.run_mode.only_print_filenames() && !pagination_undercount {
+    let sync_token = if !controls.run_mode.only_print_filenames() && !pagination_undercount {
+        let mut tokens = Vec::new();
         for rx in token_receivers {
             if let Ok(Some(token)) = rx.await {
-                sync_token = Some(token);
-                break;
+                tokens.push(token);
             }
         }
-    }
+        unanimous_pass_sync_token(&tokens)
+    } else {
+        None
+    };
 
     // Capture the enumeration-complete signal before
     // `build_download_outcome` consumes `streaming_result`. The marker
@@ -4203,6 +4230,27 @@ mod tests {
 
         assert_eq!(counts, vec![0, 0]);
         assert_eq!(errors, 2);
+    }
+
+    #[test]
+    fn unanimous_pass_sync_token_returns_token_when_passes_agree() {
+        let tokens = vec!["zone-token".to_string(), "zone-token".to_string()];
+
+        assert_eq!(
+            unanimous_pass_sync_token(&tokens).as_deref(),
+            Some("zone-token")
+        );
+    }
+
+    #[test]
+    fn unanimous_pass_sync_token_suppresses_disagreement() {
+        let tokens = vec!["zone-token-a".to_string(), "zone-token-b".to_string()];
+
+        assert_eq!(
+            unanimous_pass_sync_token(&tokens),
+            None,
+            "mismatched full-enumeration pass tokens must block advancement"
+        );
     }
 
     /// Per-pass mode AND-folds `enumeration_complete` across passes.
