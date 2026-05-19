@@ -31,6 +31,7 @@ kei_sync() {
     local download_dir="${1:?download dir required}"
     shift
     local config
+    local log_level="${KEI_SYNC_LOG_LEVEL:-info}"
     config="$(kei_write_sync_config "$COOKIES" "$download_dir")"
     # `--unfiled false` keeps the suite scoped to the test album. v0.13's
     # default `--unfiled true` would otherwise enumerate every unfiled
@@ -41,12 +42,12 @@ kei_sync() {
         --password "$ICLOUD_PASSWORD" \
         --config "$config" \
         --no-progress-bar \
-        --log-level info \
+        --log-level "$log_level" \
         "$@" 2>&1
 }
 
 get_token() { kei_db_query "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'"; }
-get_hash()  { kei_db_query "SELECT value FROM metadata WHERE key = 'config_hash'"; }
+get_enum_hash() { kei_db_query "SELECT value FROM metadata WHERE key = 'enum_config_hash'"; }
 token_count() { kei_db_query "SELECT COUNT(*) FROM metadata WHERE key LIKE '%token%'"; }
 
 kei_suite_banner "STATE-MACHINE VALIDATION"
@@ -57,24 +58,24 @@ kei_preflight_session
 
 DIR=$(kei_scratch_dir state)
 
-# ── 1. Clean slate: full sync, verify token + config hash stored ─────────
+# ── 1. Clean slate: full sync, verify token + enum config hash stored ────
 echo ""
 echo "=== 1. Clean slate full sync ==="
-# Wipe both the metadata table (tokens, config hash) AND the assets table
+# Wipe both the metadata table (tokens, config hashes) AND the assets table
 # so the next sync starts from zero. Stale `assets` rows from prior runs
 # leave dangling on-disk paths that the incremental trust-state sample
 # treats as missing, forcing a fall-back to full enumeration in test 2.
-kei_db_exec "DELETE FROM metadata WHERE key LIKE '%token%' OR key = 'config_hash'"
+kei_db_exec "DELETE FROM metadata WHERE key LIKE '%token%' OR key IN ('config_hash', 'enum_config_hash')"
 kei_db_exec "DELETE FROM assets"
-echo "  Cleared: tokens=$(token_count), hash=$(get_hash || echo 'none')"
+echo "  Cleared: tokens=$(token_count), enum_hash=$(get_enum_hash || echo 'none')"
 OUTPUT=$(kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "Incremental|token|Summary|downloaded|completed"
 [ -n "$(get_token)" ]; kei_check "token stored after full sync"
-[ -n "$(get_hash)" ];  kei_check "config hash stored"
+[ -n "$(get_enum_hash)" ]; kei_check "enum config hash stored"
 [ "$(find "$DIR" -type f | wc -l | tr -d ' ')" -ge 1 ]; kei_check "files downloaded"
-BASELINE_HASH=$(get_hash)
+BASELINE_ENUM_HASH=$(get_enum_hash)
 BASELINE_TOKEN=$(get_token)
-echo "  hash=$BASELINE_HASH"
+echo "  enum_hash=$BASELINE_ENUM_HASH"
 
 # ── 2. Incremental sync: no changes → 0 downloads, token preserved ──────
 echo ""
@@ -87,22 +88,22 @@ echo "$OUTPUT" | grep -E "incremental|token|change|download|[Cc]ompleted"
 # scratch dirs) it falls back to a full enumeration that logs the
 # shorter "No new photos to download" instead. Both indicate "nothing
 # to do"; either is acceptable here.
-DL_LINE=$(echo "$OUTPUT" | grep -E "No new photos to download|0 downloaded")
+DL_LINE=$(echo "$OUTPUT" | grep -E "No new photos to download|All incremental assets already downloaded|0 downloaded")
 [ -n "$DL_LINE" ]; kei_check "sync reported no-op"
 NEW_DOWNLOADS=$(echo "$OUTPUT" | grep -oE '[0-9]+ downloaded' | head -1 | grep -oE '^[0-9]+')
 [ "${NEW_DOWNLOADS:-0}" -eq 0 ]; kei_check "0 new downloads"
 [ "$(get_token)" = "$BASELINE_TOKEN" ]; kei_check "token preserved"
 
-# ── 3. Config change: medium resolution -> hash changes, tokens cleared ─
+# ── 3. Config change: medium resolution -> enum hash changes ─────────────
 echo ""
 echo "=== 3. Config change clears tokens ==="
-HASH_BEFORE=$(get_hash)
+ENUM_HASH_BEFORE=$(get_enum_hash)
 OUTPUT=$(KEI_SYNC_PHOTOS_TOML=$'resolution = "medium"\n' kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "config|changed|cleared|token|incremental|download|completed"
-HASH_AFTER=$(get_hash)
+ENUM_HASH_AFTER=$(get_enum_hash)
 TOKEN_AFTER=$(get_token)
-[ "$HASH_BEFORE" != "$HASH_AFTER" ]; kei_check "config hash changed"
-echo "  hash: $HASH_BEFORE -> $HASH_AFTER"
+[ "$ENUM_HASH_BEFORE" != "$ENUM_HASH_AFTER" ]; kei_check "enum config hash changed"
+echo "  enum_hash: $ENUM_HASH_BEFORE -> $ENUM_HASH_AFTER"
 [ -n "$TOKEN_AFTER" ]; kei_check "new token stored"
 
 # ── 4. Restore original config → hash reverts ───────────────────────────
@@ -110,16 +111,16 @@ echo ""
 echo "=== 4. Restore original config ==="
 OUTPUT=$(kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "config|changed|cleared|token|incremental|download|completed"
-[ "$(get_hash)" = "$BASELINE_HASH" ]; kei_check "hash reverted to original"
+[ "$(get_enum_hash)" = "$BASELINE_ENUM_HASH" ]; kei_check "enum hash reverted to original"
 [ -n "$(get_token)" ]; kei_check "token stored"
 
 # ── 5. reset sync-token forces full enumeration ─────────────────────
 echo ""
 echo "=== 5. reset sync-token ==="
 KEI_DATA_DIR="$COOKIES" "$KEI" reset sync-token --yes >/dev/null
-OUTPUT=$(kei_sync "$DIR")
+OUTPUT=$(KEI_SYNC_LOG_LEVEL=debug kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "reset|clear|token|Fetching|full|incremental|download|completed"
-echo "$OUTPUT" | grep -qi "Fetching"; kei_check "full enumeration ran"
+echo "$OUTPUT" | grep -qi "Fetching\|full enumeration"; kei_check "full enumeration ran"
 [ -n "$(get_token)" ]; kei_check "new token stored"
 
 # ── 6. Corrupt token → fallback to full enumeration ──────────────────────
@@ -128,7 +129,7 @@ echo "=== 6. Corrupt token recovery ==="
 GOOD_TOKEN=$(get_token)
 kei_db_exec "UPDATE metadata SET value = 'CORRUPT_GARBAGE_TOKEN_XYZ' WHERE key = 'sync_token:PrimarySync'"
 echo "  Injected: CORRUPT_GARBAGE_TOKEN_XYZ"
-OUTPUT=$(kei_sync "$DIR")
+OUTPUT=$(KEI_SYNC_LOG_LEVEL=debug kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "token|invalid|fallback|full|error|Fetching|incremental|download|completed"
 RECOVERED_TOKEN=$(get_token)
 if echo "$OUTPUT" | grep -qi "fallback\|full enumeration\|Fetching"; then
@@ -180,13 +181,13 @@ TOKEN_BEFORE=$(get_token)
 kei_sync "$DIR" --dry-run >/dev/null
 [ "$(get_token)" = "$TOKEN_BEFORE" ]; kei_check "token unchanged after dry-run"
 
-# ── 9. Filter flag changes config hash ───────────────────────────────────
+# ── 9. Filter flag changes enum config hash ──────────────────────────────
 echo ""
-echo "=== 9. Filter flag changes config hash ==="
-HASH_BEFORE=$(get_hash)
+echo "=== 9. Filter flag changes enum config hash ==="
+ENUM_HASH_BEFORE=$(get_enum_hash)
 OUTPUT=$(KEI_SYNC_FILTERS_TOML=$'media = ["photos", "live-photos"]\n' kei_sync "$DIR")
 echo "$OUTPUT" | grep -E "config|changed|cleared|token|download|completed"
-[ "$HASH_BEFORE" != "$(get_hash)" ]; kei_check "hash changed with media filter"
+[ "$ENUM_HASH_BEFORE" != "$(get_enum_hash)" ]; kei_check "enum hash changed with media filter"
 
 # ── 10. Session reuse check ─────────────────────────────────────────────
 echo ""
