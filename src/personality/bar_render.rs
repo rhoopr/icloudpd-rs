@@ -91,13 +91,6 @@ impl BarSmoother {
         }
         self.displayed
     }
-
-    /// Return the most recently displayed fraction without advancing.
-    #[allow(dead_code, reason = "introspection helper, used by tests")]
-    #[must_use]
-    pub fn displayed(&self) -> f64 {
-        self.displayed
-    }
 }
 
 /// Render the bar at `fraction` over `width` cells with sub-cell partial
@@ -379,10 +372,10 @@ mod tests {
         let mut sm = BarSmoother::new();
         let start = Instant::now();
         sm.tick_at(0.3, start);
+        let mut f = 0.0;
         for i in 1..50 {
-            sm.tick_at(0.3, start + std::time::Duration::from_millis(100 * i));
+            f = sm.tick_at(0.3, start + std::time::Duration::from_millis(100 * i));
         }
-        let f = sm.displayed();
         assert!(
             (f - 0.3).abs() < 1e-3,
             "displayed should converge to target, got {f}",

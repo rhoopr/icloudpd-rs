@@ -854,7 +854,7 @@ fn create_progress_bar(
             // rotation at the 10Hz steady-tick cadence) — slow enough to read
             // as "loading" rather than "frantic". The trailing space is
             // indicatif's "finished" frame.
-            style = style.tick_chars("◐◐◐◐◓◓◓◓◑◑◑◑◒◒◒◒ ");
+            style = style.tick_chars(crate::personality::theme::FRIENDLY_TICK_CHARS);
         }
         pb.set_style(style);
     }
@@ -1026,7 +1026,6 @@ where
         pb.clone(),
         config.pass_label().to_string(),
         config.personality_mode,
-        crate::personality::verbs::Phase::Listing,
     );
 
     if config.only_print_filenames {

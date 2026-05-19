@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use indicatif::ProgressBar;
 
-use crate::personality::verbs::{Phase, VerbPool};
+use crate::personality::verbs::VerbPool;
 use crate::personality::Mode;
 
 /// Default cadence between verb advances. Slow enough to be readable; fast
@@ -45,8 +45,8 @@ impl PhaseCycler {
     /// task. In off mode, seeds a static "<label> · scanning..." and returns
     /// a no-op cycler whose `cancel` and `Drop` are no-ops.
     #[must_use]
-    pub fn spawn(pb: ProgressBar, pass_label: String, mode: Mode, phase: Phase) -> Self {
-        Self::spawn_with_interval(pb, pass_label, mode, phase, DEFAULT_INTERVAL)
+    pub fn spawn(pb: ProgressBar, pass_label: String, mode: Mode) -> Self {
+        Self::spawn_with_interval(pb, pass_label, mode, DEFAULT_INTERVAL)
     }
 
     /// Seed-and-spawn, parameterised on cycle interval. Tests use this with
@@ -56,7 +56,6 @@ impl PhaseCycler {
         pb: ProgressBar,
         pass_label: String,
         mode: Mode,
-        phase: Phase,
         interval: Duration,
     ) -> Self {
         if !mode.is_friendly() {
@@ -67,7 +66,7 @@ impl PhaseCycler {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
-        let mut pool = VerbPool::new(phase);
+        let mut pool = VerbPool::new();
         // Seed synchronously so the bar's first frame already shows a verb,
         // even if cancellation or runtime shutdown beats the first interval
         // tick.
@@ -109,15 +108,13 @@ impl Drop for PhaseCycler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::personality::verbs::Phase;
     use crate::personality::Mode;
     use indicatif::ProgressBar;
 
     #[tokio::test]
     async fn off_mode_seeds_scanning_string_and_does_not_cycle() {
         let pb = ProgressBar::hidden();
-        let cycler =
-            PhaseCycler::spawn(pb.clone(), "unfiled".to_string(), Mode::Off, Phase::Listing);
+        let cycler = PhaseCycler::spawn(pb.clone(), "unfiled".to_string(), Mode::Off);
         assert_eq!(pb.message(), "unfiled \u{00b7} scanning...");
         // Off mode must not spawn a cycling task. Wait long enough that any
         // friendly-mode cycler would have ticked, then assert the message
@@ -139,7 +136,6 @@ mod tests {
             pb.clone(),
             "unfiled".to_string(),
             Mode::Friendly,
-            Phase::Listing,
             Duration::from_millis(50),
         );
         // The seed happens inside spawn before the task runs, so the first
@@ -153,8 +149,7 @@ mod tests {
             msg, "unfiled \u{00b7} scanning...",
             "friendly mode must never use the static scanning seed",
         );
-        let first_verb = Phase::Listing.pool()[0];
-        assert_eq!(msg, format!("unfiled \u{00b7} {first_verb}"));
+        assert_eq!(msg, "unfiled \u{00b7} looking around");
         cycler.cancel();
     }
 
@@ -165,7 +160,6 @@ mod tests {
             pb.clone(),
             "trip 2024".to_string(),
             Mode::Friendly,
-            Phase::Listing,
             Duration::from_millis(20),
         );
         let initial = pb.message().to_string();
@@ -200,7 +194,6 @@ mod tests {
             pb.clone(),
             "unfiled".to_string(),
             Mode::Friendly,
-            Phase::Listing,
             Duration::from_millis(10),
         );
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -224,7 +217,6 @@ mod tests {
             pb.clone(),
             "unfiled".to_string(),
             Mode::Friendly,
-            Phase::Listing,
             Duration::from_millis(50),
         );
         // Mirrors the per-file consumer path: cancel called every iteration
@@ -242,7 +234,6 @@ mod tests {
                 pb.clone(),
                 "unfiled".to_string(),
                 Mode::Friendly,
-                Phase::Listing,
                 Duration::from_millis(10),
             );
             tokio::time::sleep(Duration::from_millis(40)).await;

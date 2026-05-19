@@ -146,46 +146,11 @@ impl SparklineState {
         out
     }
 
-    /// ASCII fallback for terminals that fail Unicode width detection.
-    /// Always `capacity` chars wide; left-padded with spaces during fill.
-    #[allow(dead_code, reason = "fallback hook reserved for delight-B")]
-    #[must_use]
-    pub fn render_ascii(&self) -> String {
-        let pad = self.capacity.saturating_sub(self.samples.len());
-        let mut out = String::with_capacity(self.capacity);
-        for _ in 0..pad {
-            out.push(' ');
-        }
-        for &rate in &self.samples {
-            out.push(if rate < RATE_RENDER_FLOOR { ' ' } else { '#' });
-        }
-        out
-    }
-
     /// Latest smoothed per-second rate. Drives the "X.X/s" label paired with
     /// the chart so the number and the chart agree on what's happening.
     #[must_use]
     pub fn rate_per_sec(&self) -> f64 {
         self.smoothed_rate
-    }
-
-    /// Number of retained samples (capped at `capacity`).
-    #[allow(
-        dead_code,
-        reason = "introspection helper, used by tests and delight-B"
-    )]
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.samples.len()
-    }
-
-    #[allow(
-        dead_code,
-        reason = "introspection helper, used by tests and delight-B"
-    )]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.samples.is_empty()
     }
 }
 
@@ -202,8 +167,7 @@ mod tests {
     #[test]
     fn new_buffer_is_empty() {
         let s = SparklineState::new(12);
-        assert!(s.is_empty());
-        assert_eq!(s.len(), 0);
+        assert!(s.samples.is_empty());
         assert_eq!(s.render(), "            "); // 12 spaces
     }
 
@@ -213,7 +177,7 @@ mod tests {
         let mut t = ticks();
         s.sample_at(100, t.next().unwrap());
         // First sample never produces a delta; buffer stays empty.
-        assert!(s.is_empty());
+        assert!(s.samples.is_empty());
     }
 
     #[test]
@@ -222,7 +186,7 @@ mod tests {
         let mut t = ticks();
         s.sample_at(100, t.next().unwrap());
         s.sample_at(105, t.next().unwrap());
-        assert_eq!(s.len(), 1);
+        assert_eq!(s.samples.len(), 1);
     }
 
     #[test]
@@ -233,7 +197,7 @@ mod tests {
         for i in 1..=10u64 {
             s.sample_at(i * 10, t.next().unwrap());
         }
-        assert_eq!(s.len(), 4);
+        assert_eq!(s.samples.len(), 4);
     }
 
     #[test]
@@ -296,21 +260,6 @@ mod tests {
             assert_eq!(c, ' ', "cell {i} should be space (padding)");
         }
         assert_ne!(chars[7], ' ', "rightmost cell should carry the new sample");
-    }
-
-    #[test]
-    fn render_ascii_falls_back_to_hash_and_space() {
-        let mut s = SparklineState::new(4);
-        let mut t = ticks();
-        s.sample_at(0, t.next().unwrap());
-        s.sample_at(0, t.next().unwrap());
-        s.sample_at(5, t.next().unwrap());
-        s.sample_at(0, t.next().unwrap());
-        s.sample_at(10, t.next().unwrap());
-        let r = s.render_ascii();
-        assert_eq!(r.len(), 4);
-        assert!(r.contains('#'));
-        assert!(r.contains(' '));
     }
 
     #[test]
@@ -402,7 +351,7 @@ mod tests {
         let mut t = ticks();
         s.sample_at(100, t.next().unwrap());
         s.sample_at(50, t.next().unwrap());
-        assert_eq!(s.len(), 1);
+        assert_eq!(s.samples.len(), 1);
     }
 
     #[test]
@@ -413,7 +362,7 @@ mod tests {
         s.sample_at(5, t.next().unwrap());
         s.sample_at(10, t.next().unwrap());
         s.sample_at(15, t.next().unwrap());
-        assert_eq!(s.len(), 1);
+        assert_eq!(s.samples.len(), 1);
         assert_eq!(s.render().chars().count(), 1);
     }
 

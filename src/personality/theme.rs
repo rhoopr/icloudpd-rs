@@ -1,41 +1,14 @@
-//! Visual theme: spinner glyphs, bar templates, semantic color roles.
+//! Visual theme: progress glyphs, bar templates, semantic color roles.
 //!
-//! All glyph sets and templates are static, so the theme can be tested
-//! without a live terminal. Color is applied at render time via
-//! `console::Style`, which honours `NO_COLOR` and TTY detection on its own.
+//! All templates are static, so the theme can be tested without a live
+//! terminal. Color is applied at render time via `console::Style`, which
+//! honours `NO_COLOR` and TTY detection on its own.
 
 use crate::personality::Mode;
 
-/// Spinner glyph set per phase. Indicatif consumes a `&[&str]` of frames.
-#[allow(
-    dead_code,
-    reason = "spinner sets land in delight-B/C with auth/2FA/watch wires"
-)]
-pub mod spinners {
-    /// Auth / session check (Dots, ~80ms).
-    pub const AUTH: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-    /// Listing iCloud (Dots2, ~80ms).
-    pub const LISTING: &[&str] = &["⠋", "⠙", "⠚", "⠞", "⠖", "⠦", "⠴", "⠲", "⠳", "⠓"];
-
-    /// Verify / hash pass (Dots3, ~120ms).
-    pub const VERIFY: &[&str] = &["⡀", "⡄", "⡆", "⡇", "⠇", "⠃", "⠁", "⠀"];
-
-    /// EXIF / sidecar write (block oscillator, ~100ms).
-    pub const EXIF: &[&str] = &[
-        "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█", "▉", "▊", "▋", "▌", "▍", "▎", "▏", " ",
-    ];
-
-    /// 2FA wait (slow breathing dots, 4-frame ~400ms).
-    pub const TWOFA: &[&str] = &["⠁", "⠂", "⠄", "⠂"];
-
-    /// Watch idle (static dot; included as a single-frame "set" for API
-    /// consistency).
-    pub const WATCH_IDLE: &[&str] = &["·"];
-
-    /// ASCII fallback for terminals that fail Unicode width detection.
-    pub const ASCII: &[&str] = &["|", "/", "-", "\\"];
-}
+/// Friendly bar spinner glyphs. Each visible glyph is repeated four times so
+/// the 10Hz redraw cadence advances one visible phase roughly every 400ms.
+pub(crate) const FRIENDLY_TICK_CHARS: &str = "◐◐◐◐◓◓◓◓◑◑◑◑◒◒◒◒ ";
 
 /// Width tier for adaptive bar templates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,12 +126,8 @@ pub fn download_bar_template(
             top_rule: String::new(),
             bottom_rule: String::new(),
         },
-        (Mode::Friendly, WidthTier::Wide) => {
-            friendly_card(cols, total, friendly_bar_width(cols), true, source)
-        }
-        (Mode::Friendly, WidthTier::Medium) => {
-            friendly_card(cols, total, friendly_bar_width(cols), false, source)
-        }
+        (Mode::Friendly, WidthTier::Wide) => friendly_card(cols, total, true, source),
+        (Mode::Friendly, WidthTier::Medium) => friendly_card(cols, total, false, source),
         (Mode::Friendly, WidthTier::Narrow) => BarTemplate {
             template: "{bar:16.cyan/blue} {pos}/{len}".to_string(),
             top_rule: String::new(),
@@ -203,13 +172,7 @@ pub fn friendly_sparkline_width(cols: u16) -> u16 {
 /// Returns the indicatif template (referencing custom keys `{top_rule}`,
 /// `{bottom_rule}`, `{bar_animated}`, `{spinner}`) plus the rendered rule
 /// strings the closures will pulse-color on each redraw.
-fn friendly_card(
-    cols: u16,
-    total: u64,
-    bar_width: u16,
-    with_smart_eta: bool,
-    source: Source,
-) -> BarTemplate {
+fn friendly_card(cols: u16, total: u64, with_smart_eta: bool, source: Source) -> BarTemplate {
     // Rule width: cols - 1 so a final newline / cursor reset doesn't bump the
     // bar onto a phantom line on terminals that auto-wrap at exactly cols.
     let rule_total = cols.saturating_sub(1).max(20) as usize;
@@ -228,21 +191,12 @@ fn friendly_card(
     // ` 1/30` and `30/30` so the counter doesn't shift when crossing a
     // power of ten.
     //
-    // bar_width passes through to the animated-bar custom key (which reads
-    // it from a closure), but indicatif's measure-text-width still reads the
-    // bar's slot in the template, so we encode the width in the placeholder
-    // name itself: `{bar_animated:N}` where N is the visual width. The
-    // closure parses the suffix back out via state metadata.
     let pos_width = total.checked_ilog10().map_or(1, |n| n + 1) as usize;
 
-    // Bar width carries via the closure capture in pipeline.rs; the template
-    // just references the custom key by name. `{bar_animated}` and other
-    // custom keys (`{top_rule}`, `{bottom_rule}`, `{rate_sparkline}`,
-    // `{smart_eta}`) are registered there. `{spinner}` is an indicatif
-    // built-in that animates against the bar's tick chars.
-    //
-    // We embed bar_width into the placeholder name so a future caller could
-    // look it up if needed; the closure ignores it but it documents intent.
+    // `{bar_animated}` and other custom keys (`{top_rule}`, `{bottom_rule}`,
+    // `{rate_sparkline}`, `{smart_eta}`) are registered in pipeline.rs.
+    // `{spinner}` is an indicatif built-in that animates against the bar's
+    // tick chars.
     // Leading `\n` on the template gives the card one blank line of
     // breathing room above the top rule, separating it from prior
     // scrollback (greeting, narration, the previous cycle's sign-off)
@@ -258,7 +212,6 @@ fn friendly_card(
             "\n{{top_rule}}\n│  {{wide_msg}}\n│  {{bar_animated}} {{percent:>3}}% {{spinner}}\n│  {{rate_sparkline}}  {{pos:>{pos_width}}}/{{len}}\n{{bottom_rule}}"
         )
     };
-    let _ = bar_width; // captured via pipeline.rs closure; no template slot.
     BarTemplate {
         template,
         top_rule: top,
@@ -292,6 +245,12 @@ mod tests {
         assert!(chars.contains('█'));
         assert!(chars.contains('▏'));
         assert!(chars.ends_with(' '));
+    }
+
+    #[test]
+    fn friendly_tick_chars_include_finished_frame() {
+        assert!(FRIENDLY_TICK_CHARS.contains('◐'));
+        assert!(FRIENDLY_TICK_CHARS.ends_with(' '));
     }
 
     #[test]
@@ -505,23 +464,5 @@ mod tests {
         assert!(!template.contains("{smart_eta}"));
         assert!(medium.top_rule.starts_with('╭') && medium.top_rule.ends_with('╮'));
         assert!(medium.bottom_rule.starts_with('╰') && medium.bottom_rule.ends_with('╯'));
-    }
-
-    #[test]
-    fn spinner_sets_are_non_empty() {
-        for set in [
-            spinners::AUTH,
-            spinners::LISTING,
-            spinners::VERIFY,
-            spinners::EXIF,
-            spinners::TWOFA,
-            spinners::WATCH_IDLE,
-            spinners::ASCII,
-        ] {
-            assert!(!set.is_empty(), "spinner set must have at least one frame");
-            for frame in set {
-                assert!(!frame.is_empty(), "spinner frame must be non-empty");
-            }
-        }
     }
 }
