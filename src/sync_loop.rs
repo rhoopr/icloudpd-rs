@@ -730,7 +730,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             embed_xmp: config.metadata.embed_xmp,
             #[cfg(feature = "xmp")]
             xmp_sidecar: config.metadata.xmp_sidecar,
-            dry_run: config.runtime.dry_run,
             concurrent_downloads: config.download.threads_num as usize,
             recent: config.filters.recent,
             retry: retry_config,
@@ -740,9 +739,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             edited: config.photos.edited,
             alternative: config.photos.alternative,
             raw_policy: config.photos.raw_policy,
-            no_progress_bar: config.download.no_progress_bar,
-            only_print_filenames: config.runtime.only_print_filenames,
-            personality_mode: config.ui.personality_mode,
             file_match_policy: config.photos.file_match_policy,
             force_resolution: config.photos.force_resolution,
             keep_unicode_in_filenames: config.photos.keep_unicode_in_filenames,
@@ -758,6 +754,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             bandwidth_limiter: bandwidth_limiter.clone(),
         })
     };
+    let run_mode = if config.runtime.only_print_filenames {
+        download::DownloadRunMode::PrintFilenames
+    } else if config.runtime.dry_run {
+        download::DownloadRunMode::DryRun
+    } else {
+        download::DownloadRunMode::Download
+    };
+    let download_controls = download::DownloadControls::new(
+        run_mode,
+        download::DownloadReporting::new(
+            config.download.no_progress_bar,
+            config.ui.personality_mode,
+        ),
+    );
 
     let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
 
@@ -913,6 +923,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 state_db.as_deref(),
                 is_retry_failed,
                 &build_download_config,
+                download_controls,
                 &shared_session,
                 &shutdown_token,
             )
@@ -1588,6 +1599,7 @@ async fn run_cycle(
     state_db: Option<&dyn state::StateDb>,
     is_retry_failed: bool,
     build_download_config: &BuildDownloadConfigFn<'_>,
+    download_controls: download::DownloadControls,
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
 ) -> anyhow::Result<CycleResult> {
@@ -1677,6 +1689,7 @@ async fn run_cycle(
             &download_client,
             &lib_state.plan.passes,
             download_config,
+            download_controls,
             shutdown_token.clone(),
         )
         .await?;
@@ -4310,6 +4323,7 @@ mod tests {
             Some(db.as_ref()),
             false,
             &build_download_config,
+            download::DownloadControls::download_hidden(),
             &shared_session,
             &CancellationToken::new(),
         )
@@ -4360,6 +4374,7 @@ mod tests {
             Some(db.as_ref()),
             false,
             &build_download_config,
+            download::DownloadControls::download_hidden(),
             &shared_session,
             &CancellationToken::new(),
         )

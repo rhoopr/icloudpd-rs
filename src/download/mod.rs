@@ -71,6 +71,75 @@ pub enum SyncMode {
     },
 }
 
+/// One-shot runtime behavior for a sync pass.
+///
+/// Kept outside [`DownloadConfig`] so path/filter/download decisions do not
+/// grow presentation-only flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DownloadRunMode {
+    Download,
+    DryRun,
+    PrintFilenames,
+}
+
+impl DownloadRunMode {
+    pub(crate) fn is_dry_run(self) -> bool {
+        matches!(self, Self::DryRun)
+    }
+
+    pub(crate) fn only_print_filenames(self) -> bool {
+        matches!(self, Self::PrintFilenames)
+    }
+}
+
+/// Presentation knobs for the download pipeline.
+///
+/// The core config owns what to download. This owns how progress and friendly
+/// narration are shown while that work runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DownloadReporting {
+    pub(crate) no_progress_bar: bool,
+    pub(crate) personality_mode: crate::personality::Mode,
+}
+
+impl DownloadReporting {
+    pub(crate) const fn new(
+        no_progress_bar: bool,
+        personality_mode: crate::personality::Mode,
+    ) -> Self {
+        Self {
+            no_progress_bar,
+            personality_mode,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn hidden() -> Self {
+        Self::new(true, crate::personality::Mode::Off)
+    }
+}
+
+/// Per-run behavior that does not affect download path or filter decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DownloadControls {
+    pub(crate) run_mode: DownloadRunMode,
+    pub(crate) reporting: DownloadReporting,
+}
+
+impl DownloadControls {
+    pub(crate) const fn new(run_mode: DownloadRunMode, reporting: DownloadReporting) -> Self {
+        Self {
+            run_mode,
+            reporting,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn download_hidden() -> Self {
+        Self::new(DownloadRunMode::Download, DownloadReporting::hidden())
+    }
+}
+
 /// Result of a sync cycle, including the optional new syncToken.
 #[derive(Debug)]
 pub struct SyncResult {
@@ -488,7 +557,6 @@ pub(crate) struct DownloadConfig {
     /// the same composed XMP packet.
     #[cfg(feature = "xmp")]
     pub(crate) xmp_sidecar: bool,
-    pub(crate) dry_run: bool,
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
     pub(crate) retry: RetryConfig,
@@ -498,12 +566,6 @@ pub(crate) struct DownloadConfig {
     pub(crate) edited: bool,
     pub(crate) alternative: bool,
     pub(crate) raw_policy: RawPolicy,
-    pub(crate) no_progress_bar: bool,
-    pub(crate) only_print_filenames: bool,
-    /// Friendly UX mode: drives bar template / spinner glyphs / progress chars.
-    /// Defaults to `Mode::Off` so existing callers see v0.13 behaviour
-    /// byte-for-byte until they opt in.
-    pub(crate) personality_mode: crate::personality::Mode,
     pub(crate) file_match_policy: FileMatchPolicy,
     pub(crate) force_resolution: bool,
     pub(crate) keep_unicode_in_filenames: bool,
@@ -590,8 +652,6 @@ impl DownloadConfig {
         directory: Arc<Path>,
         fields: crate::config::PathDerivationFields,
         media: crate::config::MediaSelection,
-        dry_run: bool,
-        no_progress_bar: bool,
     ) -> Self {
         Self {
             directory,
@@ -613,7 +673,6 @@ impl DownloadConfig {
             embed_xmp: false,
             #[cfg(feature = "xmp")]
             xmp_sidecar: false,
-            dry_run,
             concurrent_downloads: 1,
             recent: None,
             retry: RetryConfig::default(),
@@ -623,9 +682,6 @@ impl DownloadConfig {
             edited: fields.edited,
             alternative: fields.alternative,
             raw_policy: fields.raw_policy,
-            no_progress_bar,
-            only_print_filenames: false,
-            personality_mode: crate::personality::Mode::Off,
             file_match_policy: fields.file_match_policy,
             force_resolution: fields.force_resolution,
             keep_unicode_in_filenames: fields.keep_unicode_in_filenames,
@@ -754,8 +810,7 @@ impl std::fmt::Debug for DownloadConfig {
         #[cfg(feature = "xmp")]
         s.field("embed_xmp", &self.embed_xmp)
             .field("xmp_sidecar", &self.xmp_sidecar);
-        s.field("dry_run", &self.dry_run)
-            .field("concurrent_downloads", &self.concurrent_downloads)
+        s.field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
             .field("retry", &self.retry)
             .field("live_photo_mode", &self.live_photo_mode)
@@ -767,8 +822,6 @@ impl std::fmt::Debug for DownloadConfig {
             .field("edited", &self.edited)
             .field("alternative", &self.alternative)
             .field("raw_policy", &self.raw_policy)
-            .field("no_progress_bar", &self.no_progress_bar)
-            .field("only_print_filenames", &self.only_print_filenames)
             .field("file_match_policy", &self.file_match_policy)
             .field("force_resolution", &self.force_resolution)
             .field("keep_unicode_in_filenames", &self.keep_unicode_in_filenames)
@@ -809,7 +862,6 @@ impl DownloadConfig {
             embed_xmp: false,
             #[cfg(feature = "xmp")]
             xmp_sidecar: false,
-            dry_run: false,
             concurrent_downloads: 1,
             recent: None,
             retry: crate::retry::RetryConfig::default(),
@@ -819,9 +871,6 @@ impl DownloadConfig {
             edited: false,
             alternative: false,
             raw_policy: RawPolicy::AsIs,
-            no_progress_bar: true,
-            only_print_filenames: false,
-            personality_mode: crate::personality::Mode::Off,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_resolution: false,
             keep_unicode_in_filenames: false,
@@ -1349,6 +1398,7 @@ pub async fn download_photos_with_sync(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
     config: Arc<DownloadConfig>,
+    controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let sync_started_at = chrono::Utc::now().timestamp();
@@ -1386,6 +1436,7 @@ pub async fn download_photos_with_sync(
                 download_client,
                 passes,
                 &config,
+                controls,
                 shutdown_token.clone(),
             )
             .await
@@ -1405,6 +1456,7 @@ pub async fn download_photos_with_sync(
                 download_client,
                 passes,
                 &config,
+                controls,
                 shutdown_token.clone(),
             )
             .await
@@ -1421,6 +1473,7 @@ pub async fn download_photos_with_sync(
                 download_client,
                 passes,
                 &config,
+                controls,
                 shutdown_token.clone(),
             )
             .await
@@ -1432,6 +1485,7 @@ pub async fn download_photos_with_sync(
                 passes,
                 &config,
                 &token,
+                controls,
                 shutdown_token.clone(),
             )
             .await
@@ -1464,6 +1518,7 @@ pub async fn download_photos_with_sync(
                             download_client,
                             passes,
                             &config,
+                            controls,
                             shutdown_token.clone(),
                         )
                         .await
@@ -1575,6 +1630,7 @@ async fn download_photos_full_with_token(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
@@ -1651,7 +1707,7 @@ async fn download_photos_full_with_token(
             })
             .collect();
         let divider = crate::personality::album_divider::AlbumDivider::new(
-            config.personality_mode,
+            controls.reporting.personality_mode,
             &pass_labels,
         );
 
@@ -1674,16 +1730,17 @@ async fn download_photos_full_with_token(
             // in scrollback so completed albums don't disappear.
             let pass_start = Instant::now();
             let (pass_pb, pass_bytes) = crate::download::pipeline::create_progress_bar_for_passes(
-                config.no_progress_bar,
-                config.only_print_filenames,
+                controls.reporting.no_progress_bar,
+                controls.run_mode.only_print_filenames(),
                 count,
-                config.personality_mode,
+                controls.reporting.personality_mode,
             );
 
             let result = stream_and_download_from_stream(
                 download_client,
                 stream,
                 pass_config,
+                controls,
                 count,
                 shutdown_token.clone(),
                 Some(pass_pb.clone()),
@@ -1746,6 +1803,7 @@ async fn download_photos_full_with_token(
             download_client,
             combined,
             &merged_config,
+            controls,
             total,
             shutdown_token.clone(),
             None,
@@ -1773,7 +1831,10 @@ async fn download_photos_full_with_token(
     // suppression because the recorded `total` is missing those passes.
     let pagination_undercount = if len_errors > 0 {
         true
-    } else if total > 0 && !config.only_print_filenames && !config.dry_run {
+    } else if total > 0
+        && !controls.run_mode.only_print_filenames()
+        && !controls.run_mode.is_dry_run()
+    {
         let decision = classify_pagination_shortfall(total, streaming_result.assets_seen);
         match decision {
             PaginationShortfall::Match => false,
@@ -1806,7 +1867,7 @@ async fn download_photos_full_with_token(
     // Don't advance the token for read-only operations, or when pagination
     // was incomplete (would permanently skip missed assets).
     let mut sync_token = None;
-    if !config.only_print_filenames && !pagination_undercount {
+    if !controls.run_mode.only_print_filenames() && !pagination_undercount {
         for rx in token_receivers {
             if let Ok(Some(token)) = rx.await {
                 sync_token = Some(token);
@@ -1826,6 +1887,7 @@ async fn download_photos_full_with_token(
         download_client,
         passes,
         config,
+        controls,
         streaming_result,
         started,
         shutdown_token,
@@ -1864,6 +1926,7 @@ async fn download_photos_incremental(
     passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
     zone_sync_token: &str,
+    controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
@@ -2121,7 +2184,7 @@ async fn download_photos_incremental(
         });
     }
 
-    if config.only_print_filenames {
+    if controls.run_mode.only_print_filenames() {
         #[allow(
             clippy::print_stdout,
             reason = "--only-print-filenames writes target paths to stdout so callers can pipe to xargs/etc"
@@ -2154,8 +2217,7 @@ async fn download_photos_incremental(
         retry_config: &config.retry,
         metadata: MetadataFlags::from(config.as_ref()),
         concurrency: config.concurrent_downloads,
-        no_progress_bar: config.no_progress_bar,
-        personality_mode: config.personality_mode,
+        reporting: controls.reporting,
         temp_suffix: Arc::clone(&config.temp_suffix),
         shutdown_token,
         state_db: config.state_db.clone(),
@@ -2364,10 +2426,8 @@ mod tests {
     fn test_hash_download_config_ignores_unrelated_fields() {
         let mut config1 = test_config();
         config1.concurrent_downloads = 1;
-        config1.dry_run = false;
         let mut config2 = test_config();
         config2.concurrent_downloads = 16;
-        config2.dry_run = true;
         // These fields don't affect download paths, so hash should be the same
         assert_eq!(
             hash_download_config(&config1),
@@ -3535,7 +3595,6 @@ mod tests {
         config.live_photo_mode = LivePhotoMode::ImageOnly;
         config.force_resolution = true;
         config.keep_unicode_in_filenames = true;
-        config.dry_run = true;
         config.set_exif_datetime = true;
         config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
         config.temp_suffix = std::sync::Arc::from(".custom-tmp");
@@ -3545,7 +3604,6 @@ mod tests {
         assert_eq!(derived.live_photo_mode, LivePhotoMode::ImageOnly);
         assert!(derived.force_resolution);
         assert!(derived.keep_unicode_in_filenames);
-        assert!(derived.dry_run);
         assert!(derived.set_exif_datetime);
         assert_eq!(derived.filename_exclude.len(), 1);
         assert_eq!(&*derived.temp_suffix, ".custom-tmp");

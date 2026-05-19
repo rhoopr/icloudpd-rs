@@ -703,7 +703,7 @@ pub(crate) async fn run_import_existing(
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<()> {
     let db_path = super::super::get_db_path(globals, toml)?;
-    let download_config = build_import_download_config(&args, toml)?;
+    let download_config = build_import_download_config(toml)?;
     let directory = Arc::clone(&download_config.directory);
     let strict_import = resolve_import_strict(&args, toml);
     let strict_verifier = strict_import.then(HttpStrictImportVerifier::new);
@@ -941,7 +941,6 @@ fn resolve_import_strict(args: &cli::ImportArgs, toml: Option<&config::TomlConfi
 /// `import-existing` never instantiates a download pipeline, so those values
 /// are unused.
 fn build_import_download_config(
-    args: &cli::ImportArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<download::DownloadConfig> {
     let toml_dl = toml.and_then(|t| t.download.as_ref());
@@ -976,13 +975,7 @@ fn build_import_download_config(
     )?;
     let media = config::resolve_media_selection(toml.and_then(|t| t.filters.as_ref()), None, None)?;
 
-    let config = download::DownloadConfig::for_path_derivation_only(
-        directory,
-        path_fields,
-        media,
-        args.dry_run,
-        args.no_progress_bar,
-    );
+    let config = download::DownloadConfig::for_path_derivation_only(directory, path_fields, media);
     Ok(config)
 }
 
@@ -1321,7 +1314,6 @@ mod wiremock_tests {
             embed_xmp: false,
             #[cfg(feature = "xmp")]
             xmp_sidecar: false,
-            dry_run: false,
             concurrent_downloads: 1,
             recent: None,
             retry: RetryConfig::default(),
@@ -1331,9 +1323,6 @@ mod wiremock_tests {
             edited: false,
             alternative: false,
             raw_policy: RawPolicy::AsIs,
-            no_progress_bar: true,
-            only_print_filenames: false,
-            personality_mode: crate::personality::Mode::Off,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_resolution: false,
             keep_unicode_in_filenames: false,
@@ -3170,7 +3159,6 @@ mod build_config_tests {
     /// every field that import-existing needs to stay aligned with sync.
     #[test]
     fn build_import_download_config_uses_toml_path_photo_and_media_settings() {
-        let args = parse_import_args(&[]);
         let toml = toml_with_download(
             r#"
             folder_structure = "%Y/%m"
@@ -3190,7 +3178,7 @@ mod build_config_tests {
             "#,
         );
 
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        let cfg = build_import_download_config(Some(&toml)).unwrap();
 
         assert_eq!(cfg.folder_structure, "%Y/%m");
         assert_eq!(cfg.resolution, crate::types::PhotoResolution::Medium);
@@ -3213,9 +3201,8 @@ mod build_config_tests {
     /// download directory.
     #[test]
     fn build_import_download_config_falls_through_to_default() {
-        let args = parse_import_args(&[]);
         let toml = toml_with_download("");
-        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+        let cfg = build_import_download_config(Some(&toml)).unwrap();
         assert_eq!(cfg.resolution, crate::types::PhotoResolution::Original);
         assert_eq!(
             cfg.file_match_policy,
@@ -3235,9 +3222,7 @@ mod build_config_tests {
 
     #[test]
     fn build_import_download_config_empty_directory_bails() {
-        let args = parse_import_args(&[]);
-        let err =
-            build_import_download_config(&args, None).expect_err("empty directory should bail");
+        let err = build_import_download_config(None).expect_err("empty directory should bail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("[download] directory is required for import-existing"),
@@ -3268,8 +3253,7 @@ mod build_config_tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
 
-        let import_args = parse_import_args(&[]);
-        let import_cfg = build_import_download_config(&import_args, Some(&toml)).unwrap();
+        let import_cfg = build_import_download_config(Some(&toml)).unwrap();
 
         let sync = SyncArgs::default();
         let globals = GlobalArgs {
@@ -3318,7 +3302,6 @@ mod build_config_tests {
     fn sync_and_import_reject_system_directory_with_same_message() {
         use crate::cli::SyncArgs;
 
-        let import_args = parse_import_args(&[]);
         let toml: TomlConfig = toml::from_str(
             r#"
             [download]
@@ -3326,8 +3309,8 @@ mod build_config_tests {
             "#,
         )
         .unwrap();
-        let import_err = build_import_download_config(&import_args, Some(&toml))
-            .expect_err("import: system dir must reject");
+        let import_err =
+            build_import_download_config(Some(&toml)).expect_err("import: system dir must reject");
 
         let sync = SyncArgs::default();
         let globals = GlobalArgs {

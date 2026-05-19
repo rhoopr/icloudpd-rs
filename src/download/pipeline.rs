@@ -28,7 +28,9 @@ use super::filter::{
     determine_media_type, extract_skip_candidates, filter_asset_to_tasks, is_asset_filtered,
     pre_ensure_asset_dir, DownloadTask, FilterReason, NormalizedPath,
 };
-use super::{paths, DownloadConfig, DownloadContext, DownloadOutcome};
+use super::{
+    paths, DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome, DownloadReporting,
+};
 
 /// Outcome of `batch_forecast_decision` — either keep queueing, emit a
 /// one-shot warn, or stop enqueuing so the caller cancels the sync.
@@ -921,8 +923,7 @@ pub(super) struct PassConfig<'a> {
     pub(super) retry_config: &'a RetryConfig,
     pub(super) metadata: MetadataFlags,
     pub(super) concurrency: usize,
-    pub(super) no_progress_bar: bool,
-    pub(super) personality_mode: crate::personality::Mode,
+    pub(super) reporting: DownloadReporting,
     pub(super) temp_suffix: Arc<str>,
     pub(super) shutdown_token: CancellationToken,
     pub(super) state_db: Option<Arc<dyn StateDb>>,
@@ -941,7 +942,7 @@ impl std::fmt::Debug for PassConfig<'_> {
         f.debug_struct("PassConfig")
             .field("metadata", &self.metadata)
             .field("concurrency", &self.concurrency)
-            .field("no_progress_bar", &self.no_progress_bar)
+            .field("reporting", &self.reporting)
             .field("temp_suffix", &self.temp_suffix)
             .field("state_db", &self.state_db.as_ref().map(|_| ".."))
             .finish_non_exhaustive()
@@ -977,6 +978,7 @@ pub(super) async fn stream_and_download_from_stream<S>(
     download_client: &Client,
     combined: S,
     config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
     total: u64,
     shutdown_token: CancellationToken,
     shared_pb: Option<ProgressBar>,
@@ -987,6 +989,8 @@ where
         + Send
         + 'static,
 {
+    let reporting = controls.reporting;
+
     // When the caller passes a `shared_pb`, they own its lifecycle (we only
     // advance position and update the message). Otherwise we create our own
     // bar and finish_and_clear it before returning. The shared-bar path is
@@ -1003,10 +1007,10 @@ where
         shared_bytes.unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let pb = shared_pb.unwrap_or_else(|| {
         create_progress_bar(
-            config.no_progress_bar,
-            config.only_print_filenames,
+            reporting.no_progress_bar,
+            controls.run_mode.only_print_filenames(),
             total,
-            config.personality_mode,
+            reporting.personality_mode,
             Some(std::sync::Arc::clone(&bytes_counter)),
         )
     });
@@ -1025,10 +1029,10 @@ where
     let listing_cycler = crate::personality::cycler::PhaseCycler::spawn(
         pb.clone(),
         config.pass_label().to_string(),
-        config.personality_mode,
+        reporting.personality_mode,
     );
 
-    if config.only_print_filenames {
+    if controls.run_mode.only_print_filenames() {
         // Load state DB context so we skip already-downloaded assets,
         // matching the incremental path's behavior.
         let download_ctx = if let Some(db) = &config.state_db {
@@ -1104,7 +1108,7 @@ where
         });
     }
 
-    if config.dry_run {
+    if controls.run_mode.is_dry_run() {
         tokio::pin!(combined);
         let mut count = 0usize;
         let mut enum_errors = 0usize;
@@ -1152,7 +1156,7 @@ where
     let metadata_flags = MetadataFlags::from(config.as_ref());
     let concurrency = config.concurrent_downloads;
     let state_db = config.state_db.clone();
-    let mode = config.personality_mode;
+    let mode = reporting.personality_mode;
 
     // Pre-load download context for O(1) skip decisions
     let download_ctx = if let Some(db) = &state_db {
@@ -2041,10 +2045,12 @@ pub(super) async fn build_download_outcome(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
     streaming_result: StreamingResult,
     started: Instant,
     shutdown_token: CancellationToken,
 ) -> Result<(DownloadOutcome, super::SyncStats)> {
+    let run_mode = controls.run_mode;
     let downloaded = streaming_result.downloaded;
     let mut exif_failures = streaming_result.exif_failures;
     let failed_tasks = streaming_result.failed;
@@ -2089,14 +2095,14 @@ pub(super) async fn build_download_outcome(
             interrupted: shutdown_token.is_cancelled(),
             ..super::SyncStats::default()
         };
-        if config.dry_run {
+        if run_mode.is_dry_run() {
             tracing::info!("── Dry Run Summary ──");
             tracing::info!("  0 files would be downloaded");
             tracing::info!(destination = %config.directory.display(), "  destination");
         } else {
             tracing::info!("No new photos to download");
         }
-        if (retry_exhausted > 0 || enumeration_errors > 0) && !config.dry_run {
+        if (retry_exhausted > 0 || enumeration_errors > 0) && !run_mode.is_dry_run() {
             return Ok((
                 DownloadOutcome::PartialFailure {
                     failed_count: retry_exhausted + enumeration_errors,
@@ -2107,7 +2113,7 @@ pub(super) async fn build_download_outcome(
         return Ok((DownloadOutcome::Success, stats));
     }
 
-    if config.dry_run {
+    if run_mode.is_dry_run() {
         let stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
@@ -2187,8 +2193,7 @@ pub(super) async fn build_download_outcome(
         retry_config: &config.retry,
         metadata: MetadataFlags::from(config.as_ref()),
         concurrency: cleanup_concurrency,
-        no_progress_bar: config.no_progress_bar,
-        personality_mode: config.personality_mode,
+        reporting: controls.reporting,
         temp_suffix: Arc::clone(&config.temp_suffix),
         shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
@@ -2296,10 +2301,10 @@ pub(super) async fn run_download_pass(
     // average, so the bandwidth display reads as the cleanup-only rate.
     let cleanup_bytes_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let pb = create_progress_bar(
-        config.no_progress_bar,
+        config.reporting.no_progress_bar,
         false,
         tasks.len() as u64,
-        config.personality_mode,
+        config.reporting.personality_mode,
         Some(std::sync::Arc::clone(&cleanup_bytes_counter)),
     );
     let client = config.client.clone();
@@ -2312,7 +2317,7 @@ pub(super) async fn run_download_pass(
     let rate_limit_counter = Arc::clone(&config.rate_limit_counter);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
     let library: Arc<str> = Arc::clone(&config.library);
-    let mode = config.personality_mode;
+    let mode = config.reporting.personality_mode;
 
     let mut download_stream = stream::iter(tasks)
         .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
@@ -3698,8 +3703,7 @@ mod tests {
                             retry_config: &retry,
                             metadata: MetadataFlags::default(),
                             concurrency: 1,
-                            no_progress_bar: true,
-                            personality_mode: crate::personality::Mode::Off,
+                            reporting: DownloadReporting::hidden(),
                             temp_suffix: std::sync::Arc::from(".kei-tmp"),
                             shutdown_token: token,
                             state_db: None,
@@ -3753,8 +3757,7 @@ mod tests {
                             retry_config: &retry,
                             metadata: MetadataFlags::default(),
                             concurrency: 1,
-                            no_progress_bar: true,
-                            personality_mode: crate::personality::Mode::Off,
+                            reporting: DownloadReporting::hidden(),
                             temp_suffix: std::sync::Arc::from(".kei-tmp"),
                             shutdown_token: token,
                             state_db: None,
@@ -4415,7 +4418,6 @@ mod tests {
             embed_xmp: false,
             #[cfg(feature = "xmp")]
             xmp_sidecar: false,
-            dry_run: false,
             concurrent_downloads: 10,
             recent: None,
             retry: crate::retry::RetryConfig {
@@ -4429,9 +4431,6 @@ mod tests {
             edited: false,
             alternative: false,
             raw_policy: RawPolicy::AsIs,
-            no_progress_bar: true,
-            only_print_filenames: false,
-            personality_mode: crate::personality::Mode::Off,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_resolution: false,
             keep_unicode_in_filenames: false,
@@ -4465,6 +4464,7 @@ mod tests {
             &client,
             asset_stream,
             &config,
+            DownloadControls::download_hidden(),
             10_000,
             shutdown_token,
             None,
@@ -4513,7 +4513,6 @@ mod tests {
             embed_xmp: false,
             #[cfg(feature = "xmp")]
             xmp_sidecar: false,
-            dry_run: false,
             concurrent_downloads: 1,
             recent: None,
             retry: RetryConfig::default(),
@@ -4523,9 +4522,6 @@ mod tests {
             edited: false,
             alternative: false,
             raw_policy: RawPolicy::AsIs,
-            no_progress_bar: true,
-            only_print_filenames: false,
-            personality_mode: crate::personality::Mode::Off,
             file_match_policy: FileMatchPolicy::NameSizeDedupWithSuffix,
             force_resolution: false,
             keep_unicode_in_filenames: false,
@@ -4555,6 +4551,7 @@ mod tests {
             &client,
             panicking_stream,
             &config,
+            DownloadControls::download_hidden(),
             0,
             shutdown_token,
             None,
@@ -4565,6 +4562,45 @@ mod tests {
         assert!(
             err.to_string().contains("producer panicked"),
             "Expected producer panic error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_mode_uses_stream_pipeline_without_downloading() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use futures_util::stream;
+
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        let config = Arc::new(config);
+        let asset = TestPhotoAsset::new("DRY_RUN_MODE")
+            .orig_size(123)
+            .orig_url("https://p01.icloud-content.com/dry-run.jpg")
+            .orig_checksum("ck_dry_run")
+            .build();
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            &config,
+            DownloadControls::new(
+                super::super::DownloadRunMode::DryRun,
+                DownloadReporting::hidden(),
+            ),
+            1,
+            CancellationToken::new(),
+            None,
+            None,
+        )
+        .await
+        .expect("dry run should scan through the real stream pipeline");
+
+        assert_eq!(result.downloaded, 1);
+        assert!(result.failed.is_empty());
+        assert!(
+            fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "dry-run mode must not create downloaded files"
         );
     }
 
@@ -4624,6 +4660,7 @@ mod tests {
             &client,
             stream1,
             &config,
+            DownloadControls::download_hidden(),
             1,
             CancellationToken::new(),
             None,
@@ -4651,6 +4688,7 @@ mod tests {
             &client,
             stream2,
             &config,
+            DownloadControls::download_hidden(),
             1,
             CancellationToken::new(),
             None,
@@ -4739,6 +4777,7 @@ mod tests {
             &client,
             stream1,
             &config,
+            DownloadControls::download_hidden(),
             1,
             CancellationToken::new(),
             None,
@@ -4836,6 +4875,7 @@ mod tests {
             &client,
             stream1,
             &config,
+            DownloadControls::download_hidden(),
             1,
             CancellationToken::new(),
             None,
@@ -5035,6 +5075,7 @@ mod tests {
             &client,
             &[],
             &config,
+            DownloadControls::download_hidden(),
             streaming_result,
             Instant::now(),
             CancellationToken::new(),
