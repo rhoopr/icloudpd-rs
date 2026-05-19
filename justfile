@@ -405,26 +405,28 @@ service-smoke:
     case "$(uname -s)" in
         Linux)
             UNIT="$HOME/.config/systemd/user/kei.service"
+            UNIT_PREVIEW="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/kei.service"
             # Clean any leftover from a previous failed run so the
             # pre-state assertion is meaningful.
-            rm -f "$UNIT"
+            rm -f "$UNIT" "$UNIT_PREVIEW"
             test ! -e "$UNIT"
             status_pre=$("$KEI" status); printf '%s\n' "$status_pre" | grep -q '^Service: not installed'
-            "$KEI" install --user --dry-run
-            test -f "$UNIT"
-            systemd-analyze --user verify "$UNIT"
+            "$KEI" install --user --dry-run > "$UNIT_PREVIEW"
+            test ! -e "$UNIT"
+            systemd-analyze --user verify "$UNIT_PREVIEW"
             "$KEI" uninstall
             test ! -e "$UNIT"
             status_post=$("$KEI" status); printf '%s\n' "$status_post" | grep -q '^Service: not installed'
             ;;
         Darwin)
             PLIST="$HOME/Library/LaunchAgents/com.rhoopr.kei.plist"
-            rm -f "$PLIST"
+            PLIST_PREVIEW="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/com.rhoopr.kei.plist"
+            rm -f "$PLIST" "$PLIST_PREVIEW"
             test ! -e "$PLIST"
             status_pre=$("$KEI" status); printf '%s\n' "$status_pre" | grep -q '^Service: not installed'
-            "$KEI" install --dry-run
-            test -f "$PLIST"
-            plutil -lint "$PLIST"
+            "$KEI" install --dry-run > "$PLIST_PREVIEW"
+            test ! -e "$PLIST"
+            plutil -lint "$PLIST_PREVIEW"
             "$KEI" uninstall
             test ! -e "$PLIST"
             status_post=$("$KEI" status); printf '%s\n' "$status_post" | grep -q '^Service: not installed'
