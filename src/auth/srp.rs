@@ -51,25 +51,46 @@ impl SrpResponse {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SrpServiceErrorBody {
+    #[serde(default, alias = "has_error")]
+    has_error: bool,
     #[serde(default, alias = "service_errors")]
     service_errors: Vec<AppleServiceError>,
 }
 
-fn terminal_apple_auth_from_body(response: &SrpResponse) -> Option<AuthError> {
-    let body: SrpServiceErrorBody = response.json().ok()?;
-    let err = body
-        .service_errors
-        .iter()
-        .find(|err| err.code == APPLE_ACCOUNT_LOCKED_CODE)?;
+fn srp_service_error_message<'a>(err: &'a AppleServiceError, fallback: &'static str) -> &'a str {
     let raw_message = err.message.trim();
-    let message = if raw_message.is_empty() {
-        err.title
-            .as_deref()
-            .unwrap_or("Apple reported a terminal authentication error")
+    if raw_message.is_empty() {
+        err.title.as_deref().unwrap_or(fallback)
     } else {
         raw_message
-    };
-    Some(AuthError::terminal_apple_auth(&err.code, message))
+    }
+}
+
+fn apple_auth_error_from_body(response: &SrpResponse) -> Option<AuthError> {
+    let body: SrpServiceErrorBody = response.json().ok()?;
+    if let Some(err) = body
+        .service_errors
+        .iter()
+        .find(|err| err.code == APPLE_ACCOUNT_LOCKED_CODE)
+    {
+        return Some(AuthError::terminal_apple_auth(
+            &err.code,
+            srp_service_error_message(err, "Apple reported a terminal authentication error"),
+        ));
+    }
+    if let Some(err) = body.service_errors.first() {
+        return Some(AuthError::service_error(
+            &err.code,
+            srp_service_error_message(err, "Apple reported an error"),
+        ));
+    }
+    if body.has_error {
+        return Some(AuthError::ServiceError {
+            code: "unknown".to_string(),
+            message: "Apple reported an error but provided no details".to_string(),
+        });
+    }
+    None
 }
 
 /// Abstracts the HTTP transport used by SRP authentication.
@@ -515,7 +536,7 @@ pub async fn authenticate_srp(
         return Err(rscd_service_error(rscd, &response.text()).into());
     }
 
-    if let Some(err) = terminal_apple_auth_from_body(&response) {
+    if let Some(err) = apple_auth_error_from_body(&response) {
         return Err(err.into());
     }
 
