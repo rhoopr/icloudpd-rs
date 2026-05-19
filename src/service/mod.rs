@@ -9,6 +9,7 @@
 
 pub(crate) mod env;
 pub(crate) mod install;
+pub(crate) mod plan;
 pub(crate) mod run;
 pub(crate) mod status;
 pub(crate) mod uninstall;

@@ -30,11 +30,12 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::cli::{InstallArgs, UninstallArgs};
+use crate::cli::UninstallArgs;
 use crate::service::env::{
     current_executable, kei_state_dir_dotted, purge_kei_state, SERVICE_DESCRIPTION,
     SERVICE_IDENTIFIER,
 };
+use crate::service::plan::{self, InstallPlan};
 use crate::service::status::ServiceState;
 
 /// SCM service name (matches `SERVICE_IDENTIFIER` so `sc.exe query
@@ -54,7 +55,7 @@ const FAILURE_RESET_PERIOD: Duration = Duration::from_secs(86_400);
 
 /// Top-level entry for `kei install` (also the bare default; on Windows
 /// `--user` and the default both produce the same per-user SCM entry).
-pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Result<()> {
+pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Result<()> {
     let exe = current_executable()?;
     let user = current_user_name()
         .context("could not resolve current Windows user (USERNAME / USERPROFILE unset?)")?;
@@ -65,7 +66,7 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
         account_user: &user,
     };
 
-    if args.dry_run {
+    if plan.is_preview() {
         let preview = render_service_info_preview(&inputs);
         tracing::info!(
             service = SERVICE_NAME,
@@ -99,12 +100,8 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
 /// (no user keyring) or a virtual `NT SERVICE\kei` account (no
 /// Credential Manager). Both break the "credentials follow the
 /// operator" contract the per-user form provides.
-pub(crate) fn install_system(_args: &InstallArgs, _config_path: &Path) -> Result<()> {
-    bail!(
-        "`kei install --system` is not supported on Windows; \
-         use `kei install` (per-user) so the service shares your Credential Manager vault \
-         and `~/.config/kei` state directory"
-    )
+pub(crate) fn install_system(_plan: InstallPlan, _config_path: &Path) -> Result<()> {
+    plan::reject_windows_system_install()
 }
 
 /// Top-level entry for `kei uninstall`.

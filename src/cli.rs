@@ -428,7 +428,7 @@ pub struct InstallArgs {
     pub user: bool,
 
     /// Install system-wide (Linux only; requires root). On macOS and
-    /// Windows the per-platform default is used regardless of this flag.
+    /// Windows this is rejected with a pointer to the per-user install.
     #[arg(long, conflicts_with = "user")]
     pub system: bool,
 

@@ -15,6 +15,7 @@ use anyhow::Result;
 
 use crate::cli::InstallArgs;
 use crate::service::env::is_in_container;
+use crate::service::plan::{InstallPlan, InstallScope};
 
 pub(crate) async fn run(args: InstallArgs, config_path: &Path) -> Result<()> {
     if is_in_container() {
@@ -25,41 +26,39 @@ pub(crate) async fn run(args: InstallArgs, config_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    dispatch(args, config_path).await
+    let plan = InstallPlan::from_args(&args);
+    dispatch(plan, config_path).await
 }
 
 #[cfg(target_os = "linux")]
-async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
+async fn dispatch(plan: InstallPlan, config_path: &Path) -> Result<()> {
     use crate::service::linux;
-    if args.system {
-        linux::install_system(&args, config_path).await
-    } else {
-        linux::install_user(&args, config_path).await
+    match plan.scope() {
+        InstallScope::User => linux::install_user(plan, config_path).await,
+        InstallScope::System => linux::install_system(plan, config_path).await,
     }
 }
 
 #[cfg(target_os = "macos")]
-async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
+async fn dispatch(plan: InstallPlan, config_path: &Path) -> Result<()> {
     use crate::service::macos;
-    if args.system {
-        macos::install_system(&args, config_path)
-    } else {
-        macos::install_user(&args, config_path).await
+    match plan.scope() {
+        InstallScope::User => macos::install_user(plan, config_path).await,
+        InstallScope::System => macos::install_system(plan, config_path),
     }
 }
 
 #[cfg(target_os = "windows")]
-async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
+async fn dispatch(plan: InstallPlan, config_path: &Path) -> Result<()> {
     use crate::service::windows;
-    if args.system {
-        windows::install_system(&args, config_path)
-    } else {
-        windows::install_user(&args, config_path).await
+    match plan.scope() {
+        InstallScope::User => windows::install_user(plan, config_path).await,
+        InstallScope::System => windows::install_system(plan, config_path),
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
+async fn dispatch(plan: InstallPlan, config_path: &Path) -> Result<()> {
     use crate::service::env::{current_executable, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER};
     let exe = current_executable()?;
     tracing::info!(
@@ -67,9 +66,8 @@ async fn dispatch(args: InstallArgs, config_path: &Path) -> Result<()> {
         description = SERVICE_DESCRIPTION,
         executable = %exe.display(),
         config = %config_path.display(),
-        user = args.user,
-        system = args.system,
-        dry_run = args.dry_run,
+        scope = ?plan.scope(),
+        effect = ?plan.effect(),
         "preparing to install kei service",
     );
     Err(anyhow::anyhow!(

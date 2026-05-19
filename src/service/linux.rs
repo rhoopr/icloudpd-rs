@@ -30,10 +30,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use tokio::process::Command;
 
-use crate::cli::{InstallArgs, UninstallArgs};
+use crate::cli::UninstallArgs;
 use crate::service::env::{
     current_executable, effective_uid, purge_kei_state, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER,
 };
+use crate::service::plan::{self, InstallPlan};
 use crate::service::status::ServiceState;
 
 const UNIT_FILE_NAME: &str = "kei.service";
@@ -121,10 +122,10 @@ fn system_unit_path() -> PathBuf {
 
 /// Top-level entry for `kei install --user` (and the bare `kei install`
 /// default on Linux).
-pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Result<()> {
+pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Result<()> {
     let exe = current_executable()?;
     let contents = render_user_unit(&exe, config_path);
-    if args.dry_run {
+    if plan.is_preview() {
         print!("{contents}");
         tracing::info!("dry run: rendered per-user systemd unit; no files written");
         return Ok(());
@@ -154,9 +155,9 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
 }
 
 /// Top-level entry for `kei install --system`.
-pub(crate) async fn install_system(args: &InstallArgs, config_path: &Path) -> Result<()> {
-    if args.dry_run {
-        let user = system_preview_user()?;
+pub(crate) async fn install_system(plan: InstallPlan, config_path: &Path) -> Result<()> {
+    let user = plan::linux_system_user(plan, config_path)?;
+    if plan.is_preview() {
         let exe = current_executable()?;
         let contents = render_system_unit(&exe, config_path, &user);
         print!("{contents}");
@@ -167,15 +168,6 @@ pub(crate) async fn install_system(args: &InstallArgs, config_path: &Path) -> Re
         return Ok(());
     }
 
-    if !is_root() {
-        bail!(
-            "`kei install --system` must be run as root (EUID=0); \
-             rerun:  sudo kei install --system --config {}  \
-             Or use `kei install --user` for a per-user install.",
-            config_path.display()
-        );
-    }
-    let user = sudo_user_or_bail()?;
     let exe = current_executable()?;
     let unit_path = system_unit_path();
     let contents = render_system_unit(&exe, config_path, &user);
@@ -414,46 +406,6 @@ fn remove_unit_file(path: &Path) -> Result<()> {
 
 fn is_root() -> bool {
     effective_uid() == 0
-}
-
-fn non_root_env_user(key: &str) -> Option<String> {
-    match std::env::var(key) {
-        Ok(user) if !user.is_empty() && user != "root" => Some(user),
-        _ => None,
-    }
-}
-
-fn sudo_user_or_bail() -> Result<String> {
-    if let Some(user) = non_root_env_user("SUDO_USER") {
-        return Ok(user);
-    }
-    bail!(
-        "$SUDO_USER not set; rerun via `sudo kei install --system` so the service \
-         can be configured to run as your account rather than root"
-    )
-}
-
-fn system_preview_user() -> Result<String> {
-    if let Some(user) = non_root_env_user("SUDO_USER") {
-        return Ok(user);
-    }
-
-    if is_root() {
-        bail!(
-            "$SUDO_USER not set; rerun via `sudo kei install --system --dry-run` so the service \
-             can be previewed for your account rather than root"
-        );
-    }
-
-    for key in ["USER", "LOGNAME"] {
-        if let Some(user) = non_root_env_user(key) {
-            return Ok(user);
-        }
-    }
-    bail!(
-        "could not determine which user the system unit would run as; \
-         set SUDO_USER or USER before running `kei install --system --dry-run`"
-    )
 }
 
 async fn daemon_reload_user() -> Result<()> {

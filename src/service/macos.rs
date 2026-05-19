@@ -34,10 +34,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use plist::{Dictionary, Value as PlistValue};
 use tokio::process::Command;
 
-use crate::cli::{InstallArgs, UninstallArgs};
+use crate::cli::UninstallArgs;
 use crate::service::env::{
     current_executable, effective_uid, purge_kei_state, SERVICE_DESCRIPTION, SERVICE_IDENTIFIER,
 };
+use crate::service::plan::{self, InstallPlan};
 use crate::service::status::ServiceState;
 
 const PLIST_FILE_NAME: &str = "com.rhoopr.kei.plist";
@@ -134,7 +135,7 @@ fn kei_state_dir() -> Option<PathBuf> {
     crate::service::env::kei_state_dir_dotted()
 }
 
-pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Result<()> {
+pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Result<()> {
     let exe = current_executable()?;
     let home = dirs::home_dir().ok_or_else(|| {
         anyhow!("could not resolve $HOME; required for plist + LaunchAgents path")
@@ -149,7 +150,7 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
         home: &home,
     });
     let xml = serialize_plist(&dict)?;
-    if args.dry_run {
+    if plan.is_preview() {
         print!("{xml}");
         tracing::info!("dry run: rendered per-user launchd plist; no files written");
         return Ok(());
@@ -182,11 +183,8 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
 /// security review (system-context FDA, keychain access constraints) that
 /// kei does not currently support. Errors with a pointer at the supported
 /// flag rather than silently downgrading.
-pub(crate) fn install_system(_args: &InstallArgs, _config_path: &Path) -> Result<()> {
-    bail!(
-        "macOS only ships a per-user LaunchAgent; \
-         rerun without --system (or with --user) to install."
-    )
+pub(crate) fn install_system(_plan: InstallPlan, _config_path: &Path) -> Result<()> {
+    plan::reject_macos_system_install()
 }
 
 pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
