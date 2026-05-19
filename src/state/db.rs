@@ -14,13 +14,13 @@ use super::types::{
     AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, SyncSummary, VersionSizeKey,
 };
 
-/// Fallback provider identifier when `AssetMetadata::source` is unset.
+/// Fallback source identifier when `AssetMetadata::source` is unset.
 ///
 /// The `assets.source` column is NOT NULL (v5 migration defaults pre-existing
 /// rows to "icloud"). Test fixtures and legacy call sites that don't populate
 /// metadata get the same value written here so that inserts always succeed.
-/// Real provider adapters (iCloud, Takeout, etc.) set `source` explicitly;
-/// this fallback is a safety net, not the intended write path.
+/// CloudKit parsing sets `source` explicitly; this fallback is a safety net,
+/// not the intended write path.
 const DEFAULT_SOURCE: &str = "icloud";
 
 /// Snapshot of an already-imported asset, returned by
@@ -309,8 +309,8 @@ pub trait StateDb: Send + Sync {
     ///
     /// Called during album enumeration when an asset is seen in an album. The
     /// `(library, asset_id, album_name, source)` composite key namespaces
-    /// memberships per library and per provider so multi-library accounts
-    /// don't cross-attribute and multiple providers can coexist.
+    /// memberships per library and source so multi-library accounts don't
+    /// cross-attribute album rows.
     async fn add_asset_album(
         &self,
         library: &str,
@@ -375,8 +375,8 @@ pub trait StateDb: Send + Sync {
 
     /// Pre-load the set of `(library, asset_id, version_size)` triples that
     /// have a non-null `metadata_write_failed_at`. These need a metadata
-    /// rewrite on the next sync regardless of whether the provider reports
-    /// a hash change.
+    /// rewrite on the next sync regardless of whether CloudKit reports a hash
+    /// change.
     async fn get_metadata_retry_markers(
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError>;
@@ -4774,7 +4774,7 @@ mod tests {
         db.add_asset_album("PrimarySync", "A1", "Favorites", "icloud")
             .await
             .unwrap();
-        db.add_asset_album("PrimarySync", "A1", "Favorites", "takeout")
+        db.add_asset_album("PrimarySync", "A1", "Favorites", "external-import")
             .await
             .unwrap();
         let conn = db.acquire_lock("test").unwrap();
@@ -4831,10 +4831,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_all_asset_people_returns_every_pair() {
-        // asset_people has no production writer yet (reserved for future
-        // provider adapters); insert test rows via raw SQL so this covers
-        // the read path without adding a trait method that would sit unused
-        // in production builds.
+        // asset_people has no production writer yet; insert test rows via raw
+        // SQL so this covers the read path without adding a trait method that
+        // would sit unused in production builds.
         let db = SqliteStateDb::open_in_memory().unwrap();
         {
             let conn = db.acquire_lock("seed").unwrap();

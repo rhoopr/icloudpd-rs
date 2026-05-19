@@ -143,7 +143,7 @@ pub(super) struct MetadataPayload {
     pub(super) title: Option<String>,
     /// Image description text (prefers `description`, falls back to `title`).
     pub(super) description: Option<String>,
-    /// `dc:subject` tags — provider keywords plus album memberships merge here.
+    /// `dc:subject` tags - source keywords plus album memberships merge here.
     pub(super) keywords: Vec<String>,
     /// MWG-RS person names for `iptcExt:PersonInImage`.
     pub(super) people: Vec<String>,
@@ -153,7 +153,7 @@ pub(super) struct MetadataPayload {
     pub(super) is_archived: bool,
     /// Media subtype (panorama, screenshot, burst, slo_mo, …).
     pub(super) media_subtype: Option<String>,
-    /// Opaque provider burst grouping id.
+    /// Opaque source burst grouping id.
     pub(super) burst_id: Option<String>,
 }
 

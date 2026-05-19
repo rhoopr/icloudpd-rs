@@ -1,7 +1,7 @@
 //! Global interner for high-cardinality-but-small short strings.
 //!
 //! Used for values with ~10-20 unique strings across 100k+ allocations per sync cycle:
-//! iCloud UTI asset types (public.jpeg, public.heic, …) and provider source names.
+//! iCloud UTI asset types (public.jpeg, public.heic, ...) and source labels.
 
 use std::sync::{Arc, OnceLock};
 

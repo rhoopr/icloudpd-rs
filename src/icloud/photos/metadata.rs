@@ -1,7 +1,7 @@
-//! Extract provider-agnostic metadata from iCloud CloudKit records.
+//! Extract metadata from iCloud CloudKit records.
 //!
 //! Maps iCloud-specific fields (e.g. `isFavorite`, `captionEnc`, `locationEnc`,
-//! `assetSubtype`) into the canonical `AssetMetadata` schema. Provider-specific
+//! `assetSubtype`) into the canonical `AssetMetadata` schema. Source-native
 //! fields that don't fit the canonical schema are preserved verbatim in
 //! `provider_data` so that invariant 4 (capture everything available) holds.
 
@@ -12,7 +12,7 @@ use crate::state::AssetMetadata;
 use super::asset::f64_to_millis_datetime;
 use super::enc;
 
-/// Provider identifier stored on every iCloud-sourced asset record.
+/// Source identifier stored on every iCloud-sourced asset record.
 pub const SOURCE: &str = "icloud";
 
 /// Fields whose raw values we preserve in `provider_data` for fidelity to the

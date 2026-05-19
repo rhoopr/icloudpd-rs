@@ -513,8 +513,8 @@ directory = {}
 fn config_show_emits_unfiled_false_when_explicit() {
     // The cli.rs help-shadow test for --unfiled only verifies clap parses;
     // it does not pin the resolved value all the way through Config::build
-    // → Selection → to_toml. A clap-default flip (or a derive_selection
-    // regression) that swallowed the explicit `false` would land green
+    // → Selection → to_toml. A clap-default flip or selector regression
+    // that swallowed the explicit `false` would land green
     // there. `to_toml()` only emits `unfiled` when the resolved value
     // differs from the `true` default, so an explicit `false` is the case
     // we can observe directly in `kei config show` output.

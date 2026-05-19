@@ -106,7 +106,7 @@ const SCHEMA_V4: &str = "ALTER TABLE assets ADD COLUMN download_checksum TEXT;";
 
 /// V5 metadata columns added to the `assets` table.
 ///
-/// `source` records which provider ingested the asset. `DEFAULT 'icloud'` is
+/// `source` records where the asset came from. `DEFAULT 'icloud'` is
 /// correct for migration because every pre-v5 row came from iCloud sync; new
 /// inserts always set `source` explicitly.
 const V5_ASSET_COLUMNS: &[(&str, &str)] = &[

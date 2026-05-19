@@ -551,7 +551,7 @@ const METADATA_REWRITE_BATCH: usize = 500;
 
 /// Drain persisted metadata-rewrite markers: for each asset whose
 /// `metadata_write_failed_at` is set and whose local file is still on disk,
-/// re-apply EXIF/XMP using the stored provider metadata. On success clears
+/// re-apply EXIF/XMP using the stored metadata. On success clears
 /// the marker and refreshes `metadata_hash`; on failure leaves the marker so
 /// the next sync retries.
 async fn run_metadata_rewrites(

@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 /// Whether an asset is an image or a video.
-///
-/// Provider-agnostic — each provider adapter maps its native classification
-/// (e.g., iCloud UTI strings) into this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssetItemType {
     Image,
@@ -13,7 +10,6 @@ pub enum AssetItemType {
 /// Version size key for asset versions.
 ///
 /// Uses `#[repr(u8)]` to guarantee 1-byte size for better struct packing.
-/// Provider-agnostic — maps to every provider's concept of resolution tiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum AssetVersionSize {
@@ -41,16 +37,13 @@ impl From<VersionSize> for AssetVersionSize {
 }
 
 /// Reason for a record change in a delta/incremental sync response.
-///
-/// Provider-agnostic — each provider maps its native change types into
-/// these categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeReason {
     /// New or modified record (state DB determines which).
     Created,
     /// Soft-deleted (moved to trash / recently deleted).
     SoftDeleted,
-    /// Permanently purged from the provider.
+    /// Permanently purged from the source.
     HardDeleted,
     /// Hidden from the main library view.
     Hidden,

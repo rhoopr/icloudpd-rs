@@ -943,11 +943,11 @@ struct DownloadContext {
     /// All key levels use borrowed `&str` lookups for zero-allocation probes.
     downloaded_ids: LibraryAssetVersionSet,
     /// Nested map: `library` -> `asset_id` -> (`version_size` -> checksum).
-    /// Used to detect checksum changes (provider asset updated) without DB queries.
+    /// Used to detect checksum changes (CloudKit asset updated) without DB queries.
     downloaded_checksums: LibraryAssetVersionValueMap,
     /// Nested map: `library` -> `asset_id` -> (`version_size` -> metadata_hash).
     /// Used to detect metadata-only changes (favorite toggle, keywords, GPS
-    /// edit, etc.) when file bytes are unchanged but the provider has newer
+    /// edit, etc.) when file bytes are unchanged but CloudKit has newer
     /// metadata.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     downloaded_metadata_hashes: LibraryAssetVersionValueMap,
@@ -2926,7 +2926,7 @@ mod tests {
     fn needs_metadata_rewrite_refreshes_null_stored_hash() {
         // Pre-v5 downloaded rows have metadata_hash IS NULL; even without a
         // retry marker, a fresh hash should trigger a rewrite so the XMP
-        // gets the provider state this tree has never recorded.
+        // gets the source state this tree has never recorded.
         let ctx = DownloadContext::default();
         assert!(ctx.needs_metadata_rewrite(
             "PrimarySync",

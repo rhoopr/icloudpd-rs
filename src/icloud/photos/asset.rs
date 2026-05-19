@@ -328,7 +328,7 @@ impl PhotoAsset {
         }
     }
 
-    /// Provider-agnostic metadata extracted at construction time.
+    /// Metadata extracted at construction time.
     pub fn metadata(&self) -> &AssetMetadata {
         &self.asset_metadata
     }

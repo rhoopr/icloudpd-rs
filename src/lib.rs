@@ -1,11 +1,9 @@
-//! kei: media sync engine.
+//! kei: iCloud Photos sync engine.
 //!
-//! Moves photos and videos between cloud services and local storage as a
-//! transparent layer: provider-agnostic core with provider-specific adapters.
-//! iCloud is the first source: authentication uses SRP-6a with Apple's custom
-//! variant followed by optional 2FA, and assets are streamed from `CloudKit`
-//! with exponential-backoff retries on transient failures. Additional sources
-//! (Google Takeout, Immich, Nextcloud, ...) plug into the same pipeline.
+//! Moves photos and videos from iCloud Photos to local storage. Authentication
+//! uses SRP-6a with Apple's custom variant followed by optional 2FA, and assets
+//! are streamed from `CloudKit` with exponential-backoff retries on transient
+//! failures.
 //!
 //! Lint configuration lives in `[lints.clippy]` in `Cargo.toml`.
 

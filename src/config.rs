@@ -295,16 +295,6 @@ pub struct DownloadSettings {
 
 #[derive(Debug)]
 pub struct FilterConfig {
-    #[allow(
-        dead_code,
-        reason = "legacy album shape stays during v0.20 migration while runtime uses Selection"
-    )]
-    pub albums: AlbumSelection,
-    #[allow(
-        dead_code,
-        reason = "legacy album exclude shape stays during v0.20 migration while runtime uses Selection"
-    )]
-    pub exclude_albums: Vec<String>,
     pub selection: crate::selection::Selection,
     pub media: MediaSelection,
     pub skip_created_before: Option<DateTime<Local>>,
@@ -496,50 +486,6 @@ const fn media_kind_name(kind: MediaKind) -> &'static str {
     }
 }
 
-/// Which albums to sync.
-///
-/// v0.13 default is `All`. `-a all` (explicit), no `-a` flag, and the
-/// auto-promotion from `{album}` in `--folder-structure` (deprecated) all
-/// resolve here. The unfiled pass is independent of `AlbumSelection`: by
-/// default it always runs, and `--unfiled false` is the only way to disable
-/// it (see `unfiled_default`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AlbumSelection {
-    /// `-a none`: no album passes. Useful when paired with `--smart-folder`
-    /// or when the user wants only the unfiled pass.
-    LibraryOnly,
-    /// Explicit list of album names to sync.
-    Named(Vec<String>),
-    /// `-a all` (explicit), no `-a` flag (v0.13 default), or the legacy
-    /// `{album}`-in-template auto-promotion: every discovered album.
-    All,
-}
-
-impl AlbumSelection {
-    /// Serialize to a `Vec<String>` for TOML persistence and JSON reports.
-    #[allow(
-        dead_code,
-        reason = "legacy report/test helper kept while runtime selection uses Selection::to_raw"
-    )]
-    pub fn to_vec(&self) -> Vec<String> {
-        match self {
-            Self::LibraryOnly => Vec::new(),
-            Self::All => vec!["all".to_string()],
-            Self::Named(v) => v.clone(),
-        }
-    }
-}
-
-impl std::fmt::Display for AlbumSelection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::LibraryOnly => f.write_str("<library-only>"),
-            Self::All => f.write_str("all"),
-            Self::Named(names) => f.write_str(&names.join(", ")),
-        }
-    }
-}
-
 /// Default template for album passes: a flat per-album folder. Users opt
 /// into a date hierarchy by passing `--folder-structure-albums "{album}/%Y..."`.
 pub(crate) const DEFAULT_FOLDER_STRUCTURE_ALBUMS: &str = "{album}";
@@ -683,96 +629,6 @@ fn warn_implicit_unfiled_pass() {
          `[filters] unfiled = false` to restrict to just the album pass(es); pass \
          `[filters] unfiled = true` to silence this warning."
     );
-}
-
-/// Translate the internal `(AlbumSelection, exclude_albums)` tuple plus the
-/// parsed library/smart-folder selectors into the
-/// [`crate::selection::Selection`]. Pure function so the truth table is
-/// testable without `Config::build`.
-///
-/// Lowering for album fields:
-/// - `AlbumSelection::LibraryOnly` maps to `AlbumSelector::None`. Set when
-///   the user passed `--album none`; produces no album passes (unfiled
-///   alone covers the library).
-/// - `AlbumSelection::Named(v)` maps to `AlbumSelector::Named { v, exclude }`.
-/// - `AlbumSelection::All` (the no-flag default and the `-a all` case) maps
-///   to `AlbumSelector::All { exclude }`.
-///
-/// Library and smart-folder selectors are passed through directly — their
-/// new-grammar parsing already happened in `Config::build`.
-///
-/// `unfiled_override` is `Some(b)` when the user passed `--unfiled` (or set
-/// `[filters].unfiled` in TOML) and `None` otherwise. When `None`, unfiled
-/// defaults to `true` regardless of `--album` (v0.13 semantics).
-#[allow(
-    dead_code,
-    reason = "kept as a pure adapter for selection truth-table tests and future config refactors"
-)]
-pub(crate) fn derive_selection(
-    albums: &AlbumSelection,
-    exclude_albums: &[String],
-    library: &crate::selection::LibrarySelector,
-    raw_smart_folders: &[String],
-    unfiled_override: Option<bool>,
-) -> anyhow::Result<crate::selection::Selection> {
-    // Build the raw album list as if the user had written it on the CLI.
-    // Feeds through `parse_album_selector` so the production path exercises
-    // every sentinel/exclusion code path the tests cover.
-    //
-    // Edge case: legacy `LibraryOnly + exclude_albums` has no clean mapping
-    // in the new grammar (Selector::None doesn't take excludes; the new
-    // model expects `--album all '!Family'` for that intent). The legacy
-    // resolver still handles excludes for `LibraryOnly` correctly, so we
-    // drop them here from the Selection-side preview without changing
-    // observable behaviour.
-    let raw_albums: Vec<String> = match albums {
-        AlbumSelection::LibraryOnly => vec!["none".to_string()],
-        AlbumSelection::Named(names) => names
-            .iter()
-            .cloned()
-            .chain(exclude_albums.iter().map(|n| format!("!{n}")))
-            .collect(),
-        AlbumSelection::All => std::iter::once("all".to_string())
-            .chain(exclude_albums.iter().map(|n| format!("!{n}")))
-            .collect(),
-    };
-
-    let unfiled = unfiled_override.unwrap_or_else(unfiled_default);
-
-    Ok(crate::selection::Selection {
-        albums: crate::selection::parse_album_selector(&raw_albums, true)?,
-        smart_folders: crate::selection::parse_smart_folder_selector(raw_smart_folders)?,
-        libraries: library.clone(),
-        unfiled,
-    })
-}
-
-/// Convert a raw `Vec<String>` (from CLI or TOML, with optional `!name`
-/// exclusions and `all`/`none` sentinels) into the legacy
-/// `(AlbumSelection, exclude_albums)` pair. Validates the new v0.13 grammar
-/// (contradictions, sentinel rules) by routing through
-/// [`crate::selection::parse_album_selector`], then lowers back into the
-/// legacy shape that `compute_config_hash` and `report.rs` still consume.
-/// Pass execution itself runs off `Selection.albums` via `resolve_passes`.
-fn resolve_album_selection(raw: &[String]) -> anyhow::Result<(AlbumSelection, Vec<String>)> {
-    if raw.is_empty() {
-        // v0.13+ default: `--album all`. No-flag `kei sync` enumerates every
-        // user album and (with `unfiled = true`) runs an unfiled pass for
-        // photos in no album.
-        return Ok((AlbumSelection::All, Vec::new()));
-    }
-
-    let selector = crate::selection::parse_album_selector(raw, true)?;
-    Ok(match selector {
-        crate::selection::AlbumSelector::None => (AlbumSelection::LibraryOnly, Vec::new()),
-        crate::selection::AlbumSelector::All { excluded } => {
-            (AlbumSelection::All, excluded.into_iter().collect())
-        }
-        crate::selection::AlbumSelector::Named { included, excluded } => (
-            AlbumSelection::Named(included.into_iter().collect()),
-            excluded.into_iter().collect(),
-        ),
-    })
 }
 
 /// Application configuration.
@@ -1390,7 +1246,6 @@ impl Config {
         let library_selector = resolve_library_selector(overrides.libraries, toml_filters)?;
         let toml_albums = toml_filters.and_then(|f| f.albums.clone());
         let raw_albums = resolve_vec(overrides.albums, toml_albums);
-        let (albums, exclude_albums) = resolve_album_selection(&raw_albums)?;
 
         // The base template is for unfiled/library-only paths. Album-specific
         // paths must use `folder_structure_albums`.
@@ -1411,11 +1266,6 @@ impl Config {
             .unfiled
             .or_else(|| toml_filters.and_then(|f| f.unfiled));
 
-        // Build the [`Selection`] that the pass resolver consumes directly
-        // from raw TOML/override values. Keep the legacy `albums` /
-        // `exclude_albums` fields for report compatibility, but don't route
-        // TOML serialization through them: that would erase escaped literal
-        // sentinel names such as `=all`.
         let selection = crate::selection::Selection {
             albums: crate::selection::parse_album_selector(&raw_albums, true)?,
             smart_folders: crate::selection::parse_smart_folder_selector(&raw_smart_folders)?,
@@ -1590,8 +1440,6 @@ impl Config {
                 no_progress_bar,
             },
             filters: FilterConfig {
-                albums,
-                exclude_albums,
                 selection,
                 media,
                 skip_created_before,
@@ -2450,6 +2298,14 @@ mod tests {
         SyncArgs::default()
     }
 
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn assert_album_raw(config: &Config, expected: &[&str]) {
+        assert_eq!(config.filters.selection.albums.to_raw(), strings(expected));
+    }
+
     #[test]
     fn test_build_defaults_no_toml() {
         let cfg = Config::build(
@@ -3155,10 +3011,7 @@ mod tests {
             Some(&toml),
         )
         .unwrap();
-        assert_eq!(
-            cfg.filters.albums,
-            AlbumSelection::Named(vec!["Favorites".to_string(), "Vacation".to_string()])
-        );
+        assert_album_raw(&cfg, &["Favorites", "Vacation"]);
     }
 
     #[test]
@@ -3172,10 +3025,7 @@ mod tests {
         sync.config_overrides.albums = vec!["Screenshots".to_string()];
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
-        assert_eq!(
-            cfg.filters.albums,
-            AlbumSelection::Named(vec!["Screenshots".to_string()])
-        );
+        assert_album_raw(&cfg, &["Screenshots"]);
     }
 
     #[test]
@@ -4000,7 +3850,7 @@ mod tests {
             cfg.filters.selection.libraries.to_raw(),
             vec!["primary".to_string()]
         );
-        assert_eq!(cfg.filters.albums, AlbumSelection::All);
+        assert_album_raw(&cfg, &["all"]);
         assert!(
             cfg.filters.selection.unfiled,
             "v0.13 default: unfiled = true"
@@ -5061,10 +4911,7 @@ mod tests {
             cfg.filters.selection.libraries.to_raw(),
             vec!["SharedSync-FULL".to_string()]
         );
-        assert_eq!(
-            cfg.filters.albums,
-            AlbumSelection::Named(vec!["Album1".to_string()])
-        );
+        assert_album_raw(&cfg, &["Album1"]);
         assert!(cfg.filters.skip_videos);
         assert_eq!(cfg.filters.recent, Some(50));
         assert!(matches!(cfg.photos.resolution, PhotoResolution::Medium));
@@ -5191,7 +5038,7 @@ mod tests {
             Some(&toml),
         )
         .unwrap();
-        assert_eq!(cfg.filters.albums, AlbumSelection::All);
+        assert_album_raw(&cfg, &["all"]);
         assert!(cfg.filters.selection.unfiled);
     }
 
@@ -5205,28 +5052,18 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(cfg.filters.albums, AlbumSelection::All);
+        assert_album_raw(&cfg, &["all"]);
         assert!(cfg.filters.selection.unfiled);
     }
 
-    #[test]
-    fn test_album_selection_to_vec_roundtrip() {
-        assert!(AlbumSelection::LibraryOnly.to_vec().is_empty());
-        assert_eq!(AlbumSelection::All.to_vec(), vec!["all".to_string()]);
-        assert_eq!(
-            AlbumSelection::Named(vec!["A".into(), "B".into()]).to_vec(),
-            vec!["A".to_string(), "B".to_string()]
-        );
-    }
-
-    // ── AlbumSelection resolution tests ────────────────────────────
+    // ── Album selector resolution tests ─────────────────────────────
 
     #[test]
     fn test_build_album_all_maps_to_all_variant() {
         let mut sync = default_sync();
         sync.config_overrides.albums = vec!["all".to_string()];
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.filters.albums, AlbumSelection::All);
+        assert_album_raw(&cfg, &["all"]);
     }
 
     #[test]
@@ -5236,9 +5073,9 @@ mod tests {
             sync.config_overrides.albums = vec![raw.to_string()];
             let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
             assert_eq!(
-                cfg.filters.albums,
-                AlbumSelection::All,
-                "'{raw}' should resolve to AlbumSelection::All"
+                cfg.filters.selection.albums.to_raw(),
+                strings(&["all"]),
+                "'{raw}' should resolve to AlbumSelector::All"
             );
         }
     }
@@ -5269,7 +5106,7 @@ mod tests {
             Some(&toml),
         )
         .unwrap();
-        assert_eq!(cfg.filters.albums, AlbumSelection::All);
+        assert_album_raw(&cfg, &["all"]);
     }
 
     #[test]
@@ -5277,7 +5114,7 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.folder_structure_albums = Some("{album}/%Y/%m".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.filters.albums, AlbumSelection::All);
+        assert_album_raw(&cfg, &["all"]);
     }
 
     #[test]
@@ -5288,7 +5125,7 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.folder_structure = Some("%Y/%m/%d".to_string());
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.filters.albums, AlbumSelection::All);
+        assert_album_raw(&cfg, &["all"]);
         assert!(cfg.filters.selection.unfiled);
     }
 
@@ -5300,10 +5137,7 @@ mod tests {
         // Names are normalised through the v0.13 selector grammar, which uses
         // a BTreeSet for deterministic ordering — alphabetical, regardless of
         // CLI input order.
-        assert_eq!(
-            cfg.filters.albums,
-            AlbumSelection::Named(vec!["Trip".to_string(), "Vacation".to_string()])
-        );
+        assert_album_raw(&cfg, &["Trip", "Vacation"]);
     }
 
     #[test]
@@ -5313,8 +5147,7 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.albums = vec!["!Family".to_string()];
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.filters.albums, AlbumSelection::All);
-        assert_eq!(cfg.filters.exclude_albums, vec!["Family".to_string()]);
+        assert_album_raw(&cfg, &["all", "!Family"]);
     }
 
     #[test]
@@ -5322,8 +5155,7 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.albums = vec!["all".to_string(), "!Family".to_string()];
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.filters.albums, AlbumSelection::All);
-        assert_eq!(cfg.filters.exclude_albums, vec!["Family".to_string()]);
+        assert_album_raw(&cfg, &["all", "!Family"]);
     }
 
     #[test]
@@ -5331,11 +5163,7 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.albums = vec!["Vacation".to_string(), "!Family".to_string()];
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(
-            cfg.filters.albums,
-            AlbumSelection::Named(vec!["Vacation".to_string()])
-        );
-        assert_eq!(cfg.filters.exclude_albums, vec!["Family".to_string()]);
+        assert_album_raw(&cfg, &["Vacation", "!Family"]);
     }
 
     #[test]
@@ -5343,7 +5171,10 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.albums = vec!["none".to_string()];
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
-        assert_eq!(cfg.filters.albums, AlbumSelection::LibraryOnly);
+        assert_eq!(
+            cfg.filters.selection.albums,
+            crate::selection::AlbumSelector::None
+        );
     }
 
     #[test]

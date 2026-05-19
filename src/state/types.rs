@@ -152,23 +152,22 @@ impl MediaType {
     }
 }
 
-/// Provider-agnostic metadata for an asset.
+/// Metadata captured for an asset.
 ///
-/// Every field is optional or has a safe default: providers populate what they
-/// can, consumers handle missing values. Mapping from provider-specific fields
-/// (iCloud `isFavorite`, Takeout `favorited`, etc.) lives in provider adapters.
+/// Every field is optional or has a safe default: CloudKit parsing populates
+/// what Apple returns, and consumers handle missing values.
 ///
 /// `metadata_hash` is computed from the metadata fields and stored alongside
 /// them so that incremental sync can detect metadata-only changes in O(1).
 #[derive(Debug, Clone, Default)]
 pub struct AssetMetadata {
-    /// Provider that created this record ("icloud", "takeout", etc.).
+    /// Source label for this record. Currently "icloud".
     /// Uses `Arc<str>` so repeated source names share a single allocation
     /// via the global string interner.
     pub source: Option<Arc<str>>,
-    /// Provider-native favorite/heart flag.
+    /// Favorite/heart flag from iCloud Photos.
     pub is_favorite: bool,
-    /// 1-5 star rating (providers with boolean favorites set 5).
+    /// 1-5 star rating. Boolean favorites set 5.
     pub rating: Option<u8>,
     /// Latitude in decimal degrees, WGS84.
     pub latitude: Option<f64>,
@@ -200,13 +199,13 @@ pub struct AssetMetadata {
     pub is_hidden: bool,
     /// Archived (hidden from main timeline but retained).
     pub is_archived: bool,
-    /// When metadata was last edited at source (provider-supplied only).
+    /// When metadata was last edited at source.
     pub modified_at: Option<DateTime<Utc>>,
     /// Soft-deleted at source.
     pub is_deleted: bool,
     /// When the asset was deleted/expunged at source.
     pub deleted_at: Option<DateTime<Utc>>,
-    /// Opaque JSON blob for provider-specific fields that don't fit the
+    /// Opaque JSON blob for source-native fields that don't fit the
     /// canonical schema (invariant 4: capture everything available).
     pub provider_data: Option<String>,
     /// SHA-256 of the metadata fields above, for change detection.
@@ -355,7 +354,7 @@ pub struct AssetRecord {
     /// Current status of the asset.
     pub status: AssetStatus,
 
-    /// Provider-agnostic metadata captured from the source (v5+).
+    /// Metadata captured from the source (v5+).
     ///
     /// Behind `Arc` so `PhotoAsset` → `AssetRecord` (the producer hot
     /// loop) shares the same allocation instead of deep-cloning every
@@ -644,7 +643,7 @@ mod tests {
         }
         .compute_hash();
         let b = AssetMetadata {
-            source: Some("takeout".into()),
+            source: Some("external-import".into()),
             metadata_hash: Some("also_ignored".into()),
             is_favorite: true,
             ..AssetMetadata::default()
