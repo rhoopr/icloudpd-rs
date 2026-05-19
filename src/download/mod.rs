@@ -90,6 +90,10 @@ impl DownloadRunMode {
     pub(crate) fn only_print_filenames(self) -> bool {
         matches!(self, Self::PrintFilenames)
     }
+
+    pub(crate) fn downloads_files(self) -> bool {
+        matches!(self, Self::Download)
+    }
 }
 
 /// Presentation knobs for the download pipeline.

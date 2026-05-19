@@ -1606,7 +1606,6 @@ async fn run_cycle(
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
-    let mut full_enumeration_ran = false;
 
     // If ANY library entered the cycle with a stale plan (the prior
     // album refresh failed and the previous plan is being reused), suppress
@@ -1695,6 +1694,27 @@ async fn run_cycle(
         )
         .await?;
 
+        let library_completed_without_errors = matches!(
+            &sync_result.outcome,
+            download::DownloadOutcome::Success
+        ) && !sync_result.stats.interrupted
+            && sync_result.stats.enumeration_errors == 0
+            && !shutdown_token.is_cancelled();
+        if sync_result.full_enumeration_ran
+            && library_completed_without_errors
+            && download_controls.run_mode.downloads_files()
+            && !is_retry_failed
+            && sync_result.stats.assets_seen == 0
+        {
+            tracing::warn!(
+                library = %lib_state.zone_name,
+                library_count = library_states.len(),
+                assets_seen = sync_result.stats.assets_seen,
+                "Sync completed after enumerating zero assets; check iCloud library \
+                 access and filters if this was unexpected"
+            );
+        }
+
         // Store sync token only when all downloads succeeded.
         // For full sync this is safe (state DB tracks individual failures for retry).
         // For incremental sync, advancing the token on partial failure would lose
@@ -1741,7 +1761,6 @@ async fn run_cycle(
         }
 
         // Accumulate stats across libraries.
-        full_enumeration_ran |= sync_result.full_enumeration_ran;
         cycle_stats.accumulate(&sync_result.stats);
 
         match sync_result.outcome {
@@ -1759,24 +1778,6 @@ async fn run_cycle(
                 cycle_failed_count += failed_count;
             }
         }
-    }
-
-    let completed_without_errors = cycle_failed_count == 0
-        && !cycle_session_expired
-        && !cycle_stats.interrupted
-        && cycle_stats.enumeration_errors == 0
-        && !shutdown_token.is_cancelled();
-    if full_enumeration_ran
-        && completed_without_errors
-        && !is_retry_failed
-        && cycle_stats.assets_seen == 0
-    {
-        tracing::warn!(
-            library_count = library_states.len(),
-            assets_seen = cycle_stats.assets_seen,
-            "Sync completed after enumerating zero assets; check iCloud library \
-             access and filters if this was unexpected"
-        );
     }
 
     Ok(CycleResult {
