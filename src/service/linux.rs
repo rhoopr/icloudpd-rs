@@ -427,9 +427,22 @@ fn sudo_user_or_bail() -> Result<String> {
 }
 
 fn system_preview_user() -> Result<String> {
-    for key in ["SUDO_USER", "USER", "LOGNAME"] {
+    if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() && user != "root" {
+            return Ok(user);
+        }
+    }
+
+    if is_root() {
+        bail!(
+            "$SUDO_USER not set; rerun via `sudo kei install --system --dry-run` so the service \
+             can be previewed for your account rather than root"
+        );
+    }
+
+    for key in ["USER", "LOGNAME"] {
         if let Ok(user) = std::env::var(key) {
-            if !user.is_empty() {
+            if !user.is_empty() && user != "root" {
                 return Ok(user);
             }
         }

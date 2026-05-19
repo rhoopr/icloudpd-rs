@@ -162,6 +162,21 @@ fn dry_run_install_system_prints_unit_without_requiring_root() {
 }
 
 #[test]
+fn dry_run_install_system_rejects_root_preview_user() {
+    let home = TempDir::new().unwrap();
+    let mut cmd = cmd_with_home(&home);
+    cmd.env("USER", "root");
+    cmd.env_remove("LOGNAME");
+
+    cmd.args(["install", "--system", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "could not determine which user the system unit would run as",
+        ));
+}
+
+#[test]
 fn install_system_without_root_fails_clearly() {
     // CI runs as a non-root user, which is exactly the condition this
     // test wants to exercise. Skipping when EUID==0 (rare local-dev
