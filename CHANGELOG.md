@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **README scope refreshed.** The README now leads with the current iCloud sync, media, operations, service, Docker, and planned-backend scope, then moves the longer capability list into a `Features` section. The command links now include `reconcile`.
 - **v0.20 deprecation cleanup.** Removed the remaining v0.13 compatibility aliases: `--exclude-album` / `KEI_EXCLUDE_ALBUM`, `{album}` in the base `--folder-structure`, implicit `--album all` promotion from that token, `[filters].album`, `[filters].exclude_albums`, and `[filters].library`. Use `--album '!NAME'`, `--folder-structure-albums`, and the `[filters].albums` / `[filters].libraries` arrays.
 - **`import-existing` is TOML-first.** Import now reads persistent path, photo, and media matching settings from the same TOML config as sync. The old import-only durable flags and env mirrors are gone; keep `--library`, `--recent`, `--dry-run`, `--force-empty`, `--no-progress-bar`, and new `--strict` for one-off import behavior. `[import].strict = true` or `--strict` verifies a small iCloud prefix before adopting a same-name, same-size local file, and the summary reports strict refusals. ([#314])
+- **Operator visibility for suspicious successful syncs.** Deferred state-write retries now log at info level with retry metadata, and a completed full sync that enumerates zero assets warns without changing the exit code. `sync --retry-failed` no-op runs stay quiet. ([#279], [#280])
 
+[#279]: https://github.com/rhoopr/kei/issues/279
+[#280]: https://github.com/rhoopr/kei/issues/280
 [#314]: https://github.com/rhoopr/kei/issues/314
 
 ---

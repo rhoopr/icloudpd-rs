@@ -395,7 +395,8 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
     if pending.is_empty() {
         return 0;
     }
-    tracing::debug!(count = pending.len(), "Retrying deferred state writes");
+    let pending_count = pending.len();
+    tracing::info!(pending_count, "Retrying deferred state writes");
     let mut failures = 0;
     for write in pending {
         let mut succeeded = false;
@@ -412,13 +413,22 @@ async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWri
                 .await
             {
                 Ok(()) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            asset_id = %write.asset_id,
+                            pending_count,
+                            attempt,
+                            "Recovered deferred state write"
+                        );
+                    }
                     succeeded = true;
                     break;
                 }
                 Err(e) => {
                     if attempt < STATE_WRITE_MAX_RETRIES {
-                        tracing::debug!(
+                        tracing::info!(
                             asset_id = %write.asset_id,
+                            pending_count,
                             attempt,
                             error = %e,
                             "State write retry failed, will retry"
@@ -4261,6 +4271,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn flush_pending_state_writes_recovers_after_transient_failure() {
         // Fail the first attempt, succeed on retry
         let db = FailingStateDb::new(1);
@@ -4275,6 +4286,26 @@ mod tests {
         let failures = flush_pending_state_writes(&db, &pending).await;
         assert_eq!(failures, 0);
         assert_eq!(db.success_count(), 1);
+        assert!(
+            logs_contain("State write retry failed, will retry"),
+            "retry attempt should be visible at info level"
+        );
+        assert!(
+            logs_contain("Recovered deferred state write"),
+            "successful retry should log a recovery breadcrumb"
+        );
+        assert!(
+            logs_contain("pending_count=1"),
+            "retry logs must carry pending_count"
+        );
+        assert!(
+            logs_contain("attempt=1"),
+            "retry logs must carry the failed attempt number"
+        );
+        assert!(
+            logs_contain("attempt=2"),
+            "recovery logs must carry the successful attempt number"
+        );
     }
 
     #[tokio::test]

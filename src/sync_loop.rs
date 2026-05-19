@@ -1606,6 +1606,7 @@ async fn run_cycle(
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
+    let mut full_enumeration_ran = false;
 
     // If ANY library entered the cycle with a stale plan (the prior
     // album refresh failed and the previous plan is being reused), suppress
@@ -1659,6 +1660,7 @@ async fn run_cycle(
             &lib_state.zone_name,
         )
         .await;
+        full_enumeration_ran |= matches!(sync_mode, download::SyncMode::Full);
 
         let sync_mode_label = match &sync_mode {
             download::SyncMode::Full => "full",
@@ -1757,6 +1759,24 @@ async fn run_cycle(
                 cycle_failed_count += failed_count;
             }
         }
+    }
+
+    let completed_without_errors = cycle_failed_count == 0
+        && !cycle_session_expired
+        && !cycle_stats.interrupted
+        && cycle_stats.enumeration_errors == 0
+        && !shutdown_token.is_cancelled();
+    if full_enumeration_ran
+        && completed_without_errors
+        && !is_retry_failed
+        && cycle_stats.assets_seen == 0
+    {
+        tracing::warn!(
+            library_count = library_states.len(),
+            assets_seen = cycle_stats.assets_seen,
+            "Sync completed after enumerating zero assets; check iCloud library \
+             access and filters if this was unexpected"
+        );
     }
 
     Ok(CycleResult {
@@ -2693,10 +2713,50 @@ mod tests {
         )
     }
 
+    fn album_count_response(count: u64) -> serde_json::Value {
+        serde_json::json!({
+            "batch": [{"records": [{"fields": {"itemCount": {"value": count}}}]}]
+        })
+    }
+
+    fn make_empty_full_album(zone_sync_token: &str) -> crate::icloud::photos::PhotoAlbum {
+        use serde_json::json;
+        crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("TestAlbum"),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
+                retry_config: retry::RetryConfig::default(),
+            },
+            Box::new(
+                crate::test_helpers::MockPhotosSession::new()
+                    .ok(album_count_response(0))
+                    .ok(json!({"records": [], "syncToken": zone_sync_token})),
+            ),
+        )
+    }
+
     fn make_run_cycle_library_state(
         zone: &str,
         sync_token_key: &str,
         zone_sync_token: &str,
+    ) -> LibraryState {
+        make_run_cycle_library_state_with_album(
+            zone,
+            sync_token_key,
+            make_incremental_album(zone_sync_token),
+        )
+    }
+
+    fn make_run_cycle_library_state_with_album(
+        zone: &str,
+        sync_token_key: &str,
+        album: crate::icloud::photos::PhotoAlbum,
     ) -> LibraryState {
         LibraryState {
             library: crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
@@ -2708,7 +2768,7 @@ mod tests {
             plan: crate::commands::AlbumPlan {
                 passes: vec![crate::commands::AlbumPass {
                     kind: crate::commands::PassKind::Unfiled,
-                    album: make_incremental_album(zone_sync_token),
+                    album,
                     exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
                 }],
             },
@@ -2769,6 +2829,35 @@ mod tests {
             None,
         )
         .expect("test config")
+    }
+
+    async fn run_empty_full_cycle(is_retry_failed: bool) -> CycleResult {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let lib_state = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_empty_full_album("zone-tok-empty"),
+        );
+        let states = vec![&lib_state];
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            is_retry_failed,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle")
     }
 
     #[test]
@@ -4394,6 +4483,40 @@ mod tests {
                 .as_deref(),
             Some("zone-tok-prev"),
             "failed zone-token write must leave old token in place for replay"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn run_cycle_full_zero_assets_warns_once() {
+        let result = run_empty_full_cycle(false).await;
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.assets_seen, 0);
+        assert!(
+            logs_contain("Sync completed after enumerating zero assets"),
+            "completed full sync with zero assets should be visible in normal logs"
+        );
+        assert!(
+            logs_contain("library_count=1"),
+            "zero-asset warning should carry structured library_count"
+        );
+        assert!(
+            logs_contain("assets_seen=0"),
+            "zero-asset warning should carry structured assets_seen"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn run_cycle_retry_failed_zero_assets_does_not_warn() {
+        let result = run_empty_full_cycle(true).await;
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.assets_seen, 0);
+        assert!(
+            !logs_contain("Sync completed after enumerating zero assets"),
+            "retry-failed no-op cycles must stay quiet"
         );
     }
 
