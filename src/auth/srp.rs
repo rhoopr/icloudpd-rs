@@ -1231,6 +1231,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn srp_complete_200_non_terminal_service_error_is_service_error() {
+        let body = br#"{
+            "serviceErrors": [
+                {"code": "AUTH-401", "message": "Authentication required"}
+            ]
+        }"#;
+        let err = run_srp(vec![valid_init_response(), response(200, body.to_vec())])
+            .await
+            .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        match auth_err {
+            AuthError::ServiceError { code, message } => {
+                assert_eq!(code, "AUTH-401");
+                assert!(message.contains("Authentication required"));
+            }
+            other => panic!("expected ServiceError, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn srp_complete_200_bare_has_error_is_service_error() {
+        let body = br#"{"hasError": true}"#;
+        let err = run_srp(vec![valid_init_response(), response(200, body.to_vec())])
+            .await
+            .unwrap_err();
+        let auth_err = err.downcast_ref::<AuthError>().unwrap();
+        match auth_err {
+            AuthError::ServiceError { code, message } => {
+                assert_eq!(code, "unknown");
+                assert!(message.contains("Apple reported an error"));
+            }
+            other => panic!("expected ServiceError, got: {other:?}"),
+        }
+    }
+
     /// 429 at /signin/complete must be reported as rate-limited, not as a
     /// password failure. Retries inside srp_post handle transient cases; this
     /// path covers exhaustion.
