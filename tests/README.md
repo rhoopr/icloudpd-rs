@@ -177,12 +177,31 @@ happens:
 - **`service-smoke` workflow** - per-platform CI smoke for `kei install`
   / `kei uninstall`. Builds the release binary on
   `ubuntu-latest`/`macos-latest`/`windows-latest`, runs `kei install
-  --dry-run` to render the platform artifact (systemd unit, launchd
-  plist, or Windows SCM preview) without invoking the service manager,
-  validates the artifact with the platform-native linter
-  (`systemd-analyze verify`, `plutil -lint`, or `Get-Service`), then
-  runs `kei uninstall` and asserts the artifact is gone. Catches
-  rendering and path-resolution regressions; doesn't exercise the
-  actual service-manager handoff (that needs credentials and is left
-  to manual real-install testing). Mirrored by `just service-smoke` on
-  Linux and macOS.
+  --dry-run` to print the platform artifact (systemd unit, launchd
+  plist, or Windows SCM preview) without writing files or invoking the
+  service manager, validates the artifact or no-op contract with
+  platform-native checks (`systemd-analyze verify`, `plutil -lint`, or
+  `Get-Service`), then runs `kei uninstall` against a clean host.
+  Catches renderer, dry-run, and shared dispatcher regressions; doesn't
+  exercise the actual service-manager handoff.
+
+## Service testing contract
+
+Automated coverage:
+
+- CLI parse/help for `kei install`, `kei uninstall`, and `kei service`.
+- Pure systemd, launchd, Windows SCM renderers and status formatters.
+- `kei install --dry-run` prints the service artifact and writes nothing.
+- Linux/macOS/Windows smoke validates dry-run output syntax and clean
+  uninstall behavior.
+- Docker packaging defaults to `kei service run` so containers keep the
+  24-hour watch fallback when `[watch].interval` is unset.
+
+Manual real-install coverage:
+
+- `systemctl enable --now` and systemd restart behavior.
+- `launchctl bootstrap` / `bootout` against a live GUI domain.
+- Windows SCM `CreateServiceW`, account password handoff, and service
+  control dispatcher startup.
+- Boot/reboot persistence and a real long-running sync against the
+  `kei-test` album.

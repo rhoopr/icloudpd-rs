@@ -1,6 +1,6 @@
 //! macOS backend for `kei install` / `kei uninstall` / `kei service status`.
 //!
-//! Per-user LaunchAgent only. v0.14 deliberately ships no LaunchDaemon
+//! Per-user LaunchAgent only. kei does not ship a LaunchDaemon
 //! (`/Library/LaunchDaemons/`) path because that would require root and
 //! brings a different threat model than the keychain-protected per-user
 //! flow. `--system` therefore errors with a pointer at `--user`.
@@ -19,9 +19,9 @@
 //! entry go too (matching the linux backend).
 //!
 //! Plist rendering is pulled out as a pure function so tests can assert
-//! key shape without spawning launchctl. The actual `launchctl bootstrap
-//! / bootout` calls are exercised by PR 8's macOS smoke matrix; faithful
-//! local mocking would require a live launchd domain.
+//! key shape without spawning launchctl. CI covers dry-run rendering and
+//! plist syntax; real `launchctl bootstrap` / `bootout` handoff needs a
+//! live launchd domain.
 
 #![allow(
     clippy::print_stdout,
@@ -142,9 +142,6 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
     let plist_path = home.join(LAUNCH_AGENTS_SUBDIR).join(PLIST_FILE_NAME);
     let log_dir = home.join(LOG_SUBDIR);
 
-    std::fs::create_dir_all(&log_dir)
-        .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
-
     let dict = render_user_plist(PlistInputs {
         exec: &exe,
         config: config_path,
@@ -152,6 +149,15 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
         home: &home,
     });
     let xml = serialize_plist(&dict)?;
+    if args.dry_run {
+        print!("{xml}");
+        tracing::info!("dry run: rendered per-user launchd plist; no files written");
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
+
     write_plist(&plist_path, &xml)?;
     tracing::info!(
         service = SERVICE_IDENTIFIER,
@@ -159,17 +165,8 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
         executable = %exe.display(),
         config = %config_path.display(),
         log_dir = %log_dir.display(),
-        dry_run = args.dry_run,
         "wrote per-user launchd plist",
     );
-
-    if args.dry_run {
-        tracing::info!(
-            "dry run: skipped launchctl bootstrap (use `launchctl bootstrap gui/$(id -u) {}` to load manually)",
-            plist_path.display(),
-        );
-        return Ok(());
-    }
 
     bootstrap_or_load(&plist_path).await?;
 
@@ -183,13 +180,12 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
 
 /// `--system` rejection. macOS LaunchDaemons require root and a different
 /// security review (system-context FDA, keychain access constraints) that
-/// is explicitly out of scope for v0.14. Errors with a pointer at the
-/// supported flag rather than silently downgrading.
+/// kei does not currently support. Errors with a pointer at the supported
+/// flag rather than silently downgrading.
 pub(crate) fn install_system(_args: &InstallArgs, _config_path: &Path) -> Result<()> {
     bail!(
-        "macOS only ships a per-user LaunchAgent in v0.14; \
-         rerun without --system (or with --user) to install. \
-         System-wide LaunchDaemons (root, /Library/LaunchDaemons) are tracked for a future release."
+        "macOS only ships a per-user LaunchAgent; \
+         rerun without --system (or with --user) to install."
     )
 }
 

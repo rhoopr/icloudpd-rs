@@ -1,10 +1,10 @@
 //! macOS-specific integration tests for `kei install` / `kei uninstall`.
 //!
 //! Exercises the plist rendering pipeline end-to-end via `--dry-run`,
-//! which writes the launchd property list and creates the log directory
-//! but skips the `launchctl bootstrap` side effect. Faithful coverage of
-//! the bootstrap / bootout / load-fallback path requires a live launchd
-//! GUI domain, so those land in PR 8's per-platform smoke matrix.
+//! which prints the launchd property list without writing files or
+//! invoking `launchctl`. Faithful coverage of the bootstrap / bootout /
+//! load-fallback path requires a live launchd GUI domain, so that stays
+//! in the manual real-install path.
 
 #![cfg(target_os = "macos")]
 #![allow(
@@ -50,26 +50,57 @@ fn kei_state_dir(home: &TempDir) -> std::path::PathBuf {
     home.path().join(".config/kei")
 }
 
+fn write_user_plist_fixture(home: &TempDir) -> std::path::PathBuf {
+    let plist = user_plist_path(home);
+    std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    std::fs::write(
+        &plist,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rhoopr.kei</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/kei</string>
+    <string>service</string>
+    <string>run</string>
+  </array>
+</dict>
+</plist>
+"#,
+    )
+    .unwrap();
+    plist
+}
+
 #[test]
-fn dry_run_install_user_writes_plist_with_expected_keys() {
+fn dry_run_install_user_prints_plist_without_writing_file() {
     let home = TempDir::new().unwrap();
-    cmd_with_home(&home)
+    let assert = cmd_with_home(&home)
         .args(["install", "--user", "--dry-run"])
         .assert()
         .success();
+    let output = assert.get_output();
 
     let plist_path = user_plist_path(&home);
     assert!(
-        plist_path.exists(),
-        "expected plist at {}",
+        !plist_path.exists(),
+        "dry-run must not write plist at {}",
         plist_path.display(),
+    );
+    assert!(
+        !user_log_dir(&home).exists(),
+        "dry-run must not create {}",
+        user_log_dir(&home).display(),
     );
 
     // Spot-check via the plist crate so we're asserting the parsed
     // structure rather than substring-matching XML. The renderer's
     // detailed shape is covered by unit tests in src/service/macos.rs.
     let dict: plist::Dictionary =
-        plist::from_file(&plist_path).expect("plist must parse as a dictionary");
+        plist::from_bytes(&output.stdout).expect("plist must parse as a dictionary");
     assert_eq!(
         dict.get("Label").and_then(|v| v.as_string()),
         Some("com.rhoopr.kei"),
@@ -93,17 +124,11 @@ fn dry_run_install_user_writes_plist_with_expected_keys() {
         "ProgramArguments must carry `service run --config`: {strings:?}",
     );
 
-    // Log directory must be materialized at install time so launchd has
-    // somewhere to redirect stdout/stderr the first time it spawns kei.
-    assert!(
-        user_log_dir(&home).is_dir(),
-        "install must create {}",
-        user_log_dir(&home).display(),
-    );
+    assert!(!output.stdout.is_empty(), "dry-run must print plist XML");
 }
 
 #[test]
-fn dry_run_install_user_is_idempotent() {
+fn dry_run_install_user_is_repeatable_without_writing_file() {
     let home = TempDir::new().unwrap();
     for _ in 0..2 {
         cmd_with_home(&home)
@@ -111,12 +136,13 @@ fn dry_run_install_user_is_idempotent() {
             .assert()
             .success();
     }
-    assert!(user_plist_path(&home).exists());
+    assert!(!user_plist_path(&home).exists());
+    assert!(!user_log_dir(&home).exists());
 }
 
 #[test]
 fn install_system_is_rejected_with_clear_message() {
-    // macOS deliberately does not ship a LaunchDaemon path in v0.14.
+    // macOS deliberately does not ship a LaunchDaemon path.
     // The user-facing error must point operators at `--user` rather than
     // silently downgrading.
     let home = TempDir::new().unwrap();
@@ -128,14 +154,9 @@ fn install_system_is_rejected_with_clear_message() {
 }
 
 #[test]
-fn uninstall_removes_plist_after_dry_run_install() {
+fn uninstall_removes_plist() {
     let home = TempDir::new().unwrap();
-    cmd_with_home(&home)
-        .args(["install", "--user", "--dry-run"])
-        .assert()
-        .success();
-    let plist_path = user_plist_path(&home);
-    assert!(plist_path.exists(), "precondition: plist written");
+    let plist_path = write_user_plist_fixture(&home);
 
     // Bare `uninstall` (no --purge) should remove the plist file. It
     // also tries `launchctl bootout`, which will fail in a
@@ -166,10 +187,7 @@ fn uninstall_purge_removes_kei_state_dir_when_present() {
 
     // Install a plist so uninstall has something to do too — but the
     // assertion is on the purge path.
-    cmd_with_home(&home)
-        .args(["install", "--user", "--dry-run"])
-        .assert()
-        .success();
+    write_user_plist_fixture(&home);
 
     cmd_with_home(&home)
         .args(["uninstall", "--purge"])

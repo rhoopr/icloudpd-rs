@@ -418,10 +418,9 @@ pub enum ConfigAction {
 /// Arguments for `kei install`.
 ///
 /// Per-platform defaults: Linux installs a per-user systemd unit unless
-/// `--system` is passed; macOS installs a per-user launchd agent (system
-/// daemons require root and are out of scope for v0.14); Windows registers
-/// a system service via the Service Control Manager (per-user services
-/// are not a Windows concept).
+/// `--system` is passed; macOS installs a per-user launchd agent; Windows
+/// registers the service with the Service Control Manager under the
+/// current user's account.
 #[derive(Args, Debug, Clone)]
 pub struct InstallArgs {
     /// Install per-user (Linux/macOS default; ignored on Windows).
@@ -433,10 +432,10 @@ pub struct InstallArgs {
     #[arg(long, conflicts_with = "user")]
     pub system: bool,
 
-    /// Render the service file and report what would happen, without
-    /// invoking the platform service manager (no `systemctl daemon-reload`,
-    /// no `launchctl bootstrap`, no SCM `CreateService`). The unit file is
-    /// still written to disk so it can be inspected.
+    /// Render the service artifact and report what would happen, without
+    /// writing files or invoking the platform service manager (no
+    /// `systemctl daemon-reload`, no `launchctl bootstrap`, no SCM
+    /// `CreateService`).
     #[arg(long)]
     pub dry_run: bool,
 }

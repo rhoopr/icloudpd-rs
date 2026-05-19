@@ -1,10 +1,10 @@
 //! Linux-specific integration tests for `kei install` / `kei uninstall`.
 //!
 //! Exercises the unit-file rendering pipeline end-to-end via `--dry-run`,
-//! which writes the systemd unit file but skips the `systemctl` /
-//! `loginctl` side effects. Faithful coverage of the daemon-reload /
-//! enable / linger steps requires an active user session, so those land
-//! in PR 8's per-platform smoke matrix instead of here.
+//! which prints the systemd unit without writing files or invoking
+//! `systemctl` / `loginctl`. Faithful coverage of the daemon-reload /
+//! enable / linger steps requires an active user session, so that stays
+//! in the manual real-install path.
 
 #![cfg(target_os = "linux")]
 #![allow(
@@ -43,44 +43,62 @@ fn user_unit_path(home: &TempDir) -> std::path::PathBuf {
     home.path().join(".config/systemd/user/kei.service")
 }
 
+fn write_user_unit_fixture(home: &TempDir) -> std::path::PathBuf {
+    let unit = user_unit_path(home);
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(
+        &unit,
+        "[Unit]\nDescription=kei Media Sync Engine\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=default.target\n",
+    )
+    .unwrap();
+    unit
+}
+
 #[test]
-fn dry_run_install_user_writes_unit_file_with_expected_keys() {
+fn dry_run_install_user_prints_unit_without_writing_file() {
     let home = TempDir::new().unwrap();
-    cmd_with_home(&home)
+    let assert = cmd_with_home(&home)
         .args(["install", "--user", "--dry-run"])
         .assert()
         .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
 
     let unit = user_unit_path(&home);
-    assert!(unit.exists(), "expected unit at {}", unit.display());
-    let body = std::fs::read_to_string(&unit).unwrap();
+    assert!(
+        !unit.exists(),
+        "dry-run must not write unit file at {}",
+        unit.display()
+    );
 
     // Spot-check the load-bearing keys; the renderer's full shape is
     // covered by unit tests in src/service/linux.rs.
-    assert!(body.contains("[Unit]"), "missing [Unit]:\n{body}");
-    assert!(body.contains("[Service]"), "missing [Service]:\n{body}");
-    assert!(body.contains("[Install]"), "missing [Install]:\n{body}");
-    assert!(body.contains("Type=notify"), "missing Type=notify:\n{body}");
+    assert!(stdout.contains("[Unit]"), "missing [Unit]:\n{stdout}");
+    assert!(stdout.contains("[Service]"), "missing [Service]:\n{stdout}");
+    assert!(stdout.contains("[Install]"), "missing [Install]:\n{stdout}");
     assert!(
-        body.contains("Description=kei Media Sync Engine"),
-        "missing Description:\n{body}"
+        stdout.contains("Type=notify"),
+        "missing Type=notify:\n{stdout}"
     );
     assert!(
-        body.contains("WantedBy=default.target"),
-        "missing WantedBy:\n{body}"
+        stdout.contains("Description=kei Media Sync Engine"),
+        "missing Description:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("WantedBy=default.target"),
+        "missing WantedBy:\n{stdout}"
     );
 
     // ExecStart must point at an absolute path (the actual kei binary
     // canonicalized by current_executable). Verifying the prefix is
     // enough — the path itself is environment-dependent.
     assert!(
-        body.contains("ExecStart=/") && body.contains(" service run --config "),
-        "ExecStart not absolute or missing flags:\n{body}"
+        stdout.contains("ExecStart=/") && stdout.contains(" service run --config "),
+        "ExecStart not absolute or missing flags:\n{stdout}"
     );
 }
 
 #[test]
-fn dry_run_install_user_is_idempotent() {
+fn dry_run_install_user_is_repeatable_without_writing_file() {
     let home = TempDir::new().unwrap();
     for _ in 0..2 {
         cmd_with_home(&home)
@@ -88,14 +106,11 @@ fn dry_run_install_user_is_idempotent() {
             .assert()
             .success();
     }
-    assert!(user_unit_path(&home).exists());
+    assert!(!user_unit_path(&home).exists());
 }
 
 #[test]
-fn dry_run_install_user_writes_to_xdg_config_home_override() {
-    // Ensures we honor XDG_CONFIG_HOME rather than always landing under
-    // $HOME/.config — the systemd convention is XDG-first, and a user
-    // who relocates their config would expect kei to follow.
+fn dry_run_install_user_does_not_write_to_xdg_config_home_override() {
     let home = TempDir::new().unwrap();
     let xdg = TempDir::new().unwrap();
     let mut cmd = common::cmd();
@@ -113,13 +128,36 @@ fn dry_run_install_user_writes_to_xdg_config_home_override() {
     let xdg_unit = xdg.path().join("systemd/user/kei.service");
     let home_unit = home.path().join(".config/systemd/user/kei.service");
     assert!(
-        xdg_unit.exists(),
-        "expected unit under XDG_CONFIG_HOME at {}",
+        !xdg_unit.exists(),
+        "dry-run must not write unit under XDG_CONFIG_HOME at {}",
         xdg_unit.display()
     );
     assert!(
         !home_unit.exists(),
-        "must not fall through to $HOME/.config when XDG_CONFIG_HOME is set"
+        "dry-run must not write unit under $HOME at {}",
+        home_unit.display()
+    );
+}
+
+#[test]
+fn dry_run_install_system_prints_unit_without_requiring_root() {
+    let home = TempDir::new().unwrap();
+    let mut cmd = cmd_with_home(&home);
+    cmd.env("USER", "kei-preview-user");
+
+    let assert = cmd
+        .args(["install", "--system", "--dry-run"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    assert!(
+        stdout.contains("User=kei-preview-user"),
+        "system dry-run must show target user:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("WantedBy=multi-user.target"),
+        "system dry-run must render system install target:\n{stdout}"
     );
 }
 
@@ -136,21 +174,16 @@ fn install_system_without_root_fails_clearly() {
 
     let home = TempDir::new().unwrap();
     cmd_with_home(&home)
-        .args(["install", "--system", "--dry-run"])
+        .args(["install", "--system"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("must be run as root"));
 }
 
 #[test]
-fn uninstall_removes_unit_file_after_dry_run_install() {
+fn uninstall_removes_unit_file() {
     let home = TempDir::new().unwrap();
-    cmd_with_home(&home)
-        .args(["install", "--user", "--dry-run"])
-        .assert()
-        .success();
-    let unit = user_unit_path(&home);
-    assert!(unit.exists(), "precondition: unit file written");
+    let unit = write_user_unit_fixture(&home);
 
     // Bare `uninstall` (no --purge) should remove the unit file. It
     // also tries `systemctl --user disable --now`, which is a no-op /
@@ -177,10 +210,7 @@ fn uninstall_purge_removes_kei_state_dir_when_present() {
 
     // Install a unit so uninstall has something to do too — but the
     // assertion is on the purge path.
-    cmd_with_home(&home)
-        .args(["install", "--user", "--dry-run"])
-        .assert()
-        .success();
+    write_user_unit_fixture(&home);
 
     cmd_with_home(&home)
         .args(["uninstall", "--purge"])
