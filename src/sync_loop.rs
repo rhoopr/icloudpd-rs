@@ -47,6 +47,59 @@ struct LibraryState {
     /// change events those assets generated and leave `asset_albums`
     /// permanently incomplete.
     plan_is_stale: bool,
+    /// True after an idle watch sleep. Refreshing only when a later
+    /// `changes/database` pre-check finds relevant work avoids burning album
+    /// listing calls on quiet watch cycles.
+    plan_needs_refresh: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WatchPrecheck {
+    SkipAll,
+    Proceed {
+        changed_zones: Option<rustc_hash::FxHashSet<String>>,
+        db_sync_token_after_success: Option<String>,
+    },
+}
+
+impl WatchPrecheck {
+    fn proceed_all() -> Self {
+        Self::Proceed {
+            changed_zones: None,
+            db_sync_token_after_success: None,
+        }
+    }
+
+    fn changed_zones(&self) -> Option<&rustc_hash::FxHashSet<String>> {
+        match self {
+            Self::SkipAll => None,
+            Self::Proceed { changed_zones, .. } => changed_zones.as_ref(),
+        }
+    }
+
+    fn db_sync_token_after_success(&self) -> Option<&str> {
+        match self {
+            Self::SkipAll => None,
+            Self::Proceed {
+                db_sync_token_after_success,
+                ..
+            } => db_sync_token_after_success.as_deref(),
+        }
+    }
+
+    fn should_sync_zone(&self, zone_name: &str) -> bool {
+        match self {
+            Self::SkipAll => false,
+            Self::Proceed {
+                changed_zones: Some(zones),
+                ..
+            } => zones.contains(zone_name),
+            Self::Proceed {
+                changed_zones: None,
+                ..
+            } => true,
+        }
+    }
 }
 
 /// State-DB metadata key for the first-sync shared-library notice. Bumping
@@ -65,6 +118,9 @@ const ENUM_CONFIG_HASH_KEY: &str = "enum_config_hash";
 /// table. Cleared en masse when [`ENUM_CONFIG_HASH_KEY`] changes so the
 /// next cycle falls back to full enumeration.
 const SYNC_TOKEN_PREFIX: &str = "sync_token:";
+
+/// Metadata key for the database-level token used by `/changes/database`.
+const DB_SYNC_TOKEN_KEY: &str = "db_sync_token";
 
 /// Classify whether an error from `init_photos_service` or
 /// `resolve_libraries` indicates a stale session / routing state that
@@ -743,6 +799,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             sync_token_key,
             plan,
             plan_is_stale: false,
+            plan_needs_refresh: false,
         });
     }
     warn_if_multi_library_paths_commingle(
@@ -807,16 +864,16 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         cycle_index = cycle_index.saturating_add(1);
 
         // In watch mode with incremental sync, use changes/database as a
-        // cheap pre-check to skip cycles when nothing has changed.
-        // Only used for single-library mode; multi-library skips this optimization.
-        let skip_cycle = match library_states.as_slice() {
-            [only] if is_watch_mode => {
-                check_changes_database(state_db.as_deref(), only, &mut photos_service).await
-            }
-            _ => false,
+        // cheap pre-check before refreshing album plans or running a sync.
+        // No-change cycles should cost one CloudKit request, not a full
+        // album/pass refresh per selected library.
+        let watch_precheck = if is_watch_mode {
+            check_changes_database(state_db.as_deref(), &library_states, &mut photos_service).await
+        } else {
+            WatchPrecheck::proceed_all()
         };
 
-        if skip_cycle {
+        if matches!(watch_precheck, WatchPrecheck::SkipAll) {
             // Skipped cycle (no changes detected) -- still update health so
             // Docker HEALTHCHECK doesn't mark the container unhealthy after
             // the 2-hour staleness window when no new photos are uploaded.
@@ -827,6 +884,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 handle.update_health_only(&health).await;
             }
         } else {
+            refresh_needed_library_plans(
+                &mut library_states,
+                &config.filters.selection,
+                watch_precheck.changed_zones(),
+                &mut consecutive_album_refresh_failures,
+            )
+            .await;
+            let cycle_library_states: Vec<&LibraryState> = library_states
+                .iter()
+                .filter(|s| watch_precheck.should_sync_zone(&s.zone_name))
+                .collect();
+            debug_assert!(!cycle_library_states.is_empty());
+
             sd_notifier.notify_status("Syncing...");
             sd_notifier.notify_watchdog();
             notifier.notify(
@@ -838,7 +908,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             let cycle_started_at = std::time::Instant::now();
             let cycle_result = run_cycle(
-                &library_states,
+                &cycle_library_states,
                 &config,
                 state_db.as_deref(),
                 is_retry_failed,
@@ -847,6 +917,21 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &shutdown_token,
             )
             .await?;
+
+            if let Some(token) = watch_precheck.db_sync_token_after_success() {
+                if !cycle_result.session_expired
+                    && cycle_result.failed_count == 0
+                    && !cycle_result.stats.interrupted
+                {
+                    if let Some(db) = state_db.as_deref() {
+                        store_db_sync_token(db, token).await;
+                    }
+                } else {
+                    tracing::debug!(
+                        "changes/database token not advanced because the sync cycle did not complete cleanly"
+                    );
+                }
+            }
 
             // One state-DB summary per cycle (friendly mode only). Powers
             // the `Downloaded N new (X → Y)` phase line, the summary
@@ -1182,38 +1267,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             // Validate session before next cycle; re-authenticate if expired.
             reacquire_session(&shared_session, &config, &password_provider).await;
 
-            // Re-resolve albums per-library to discover newly created iCloud albums.
-            // The unfiled pass re-fetches each selected album's IDs to refresh the
-            // exclusion set; for libraries with many albums this can be slow under
-            // watch mode. PR12+ may add per-album sync-token caching.
+            // Mark album/pass plans stale after an idle sleep, but defer the
+            // CloudKit refresh until `changes/database` says a selected
+            // library actually has work. Quiet watch cycles can then go back
+            // to sleep without listing albums for every selected library.
             for lib_state in &mut library_states {
-                match resolve_passes(&lib_state.library, &config.filters.selection).await {
-                    Ok(refreshed) => {
-                        lib_state.plan = refreshed;
-                        lib_state.plan_is_stale = false;
-                        consecutive_album_refresh_failures = 0;
-                    }
-                    Err(e) => {
-                        consecutive_album_refresh_failures += 1;
-                        // Mark the plan stale so the NEXT cycle's token
-                        // storage gate can suppress advancement.
-                        lib_state.plan_is_stale = true;
-                        if consecutive_album_refresh_failures >= 3 {
-                            tracing::error!(
-                                zone = %lib_state.zone_name,
-                                error = %e,
-                                consecutive_failures = consecutive_album_refresh_failures,
-                                "Repeated album refresh failures, reusing previous set"
-                            );
-                        } else {
-                            tracing::warn!(
-                                zone = %lib_state.zone_name,
-                                error = %e,
-                                "Failed to refresh albums, reusing previous set"
-                            );
-                        }
-                    }
-                }
+                lib_state.plan_needs_refresh = true;
             }
         } else {
             break;
@@ -1522,7 +1581,7 @@ pub(crate) async fn check_and_persist_enum_config_hash(
 
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
 async fn run_cycle(
-    library_states: &[LibraryState],
+    library_states: &[&LibraryState],
     config: &config::Config,
     state_db: Option<&dyn state::StateDb>,
     is_retry_failed: bool,
@@ -1713,49 +1772,127 @@ async fn preload_asset_groupings(
     Arc::new(groupings)
 }
 
+async fn refresh_needed_library_plans(
+    library_states: &mut [LibraryState],
+    selection: &crate::selection::Selection,
+    changed_zones: Option<&rustc_hash::FxHashSet<String>>,
+    consecutive_album_refresh_failures: &mut u32,
+) {
+    for lib_state in library_states {
+        if !lib_state.plan_needs_refresh {
+            continue;
+        }
+        if changed_zones.is_some_and(|zones| !zones.contains(&lib_state.zone_name)) {
+            continue;
+        }
+
+        // Re-resolve albums per-library to discover newly created iCloud albums.
+        // The unfiled pass re-fetches each selected album's IDs to refresh the
+        // exclusion set. This is intentionally delayed until a selected zone has
+        // changes so quiet watch cycles avoid the album-listing traffic.
+        match resolve_passes(&lib_state.library, selection).await {
+            Ok(refreshed) => {
+                lib_state.plan = refreshed;
+                lib_state.plan_is_stale = false;
+                lib_state.plan_needs_refresh = false;
+                *consecutive_album_refresh_failures = 0;
+            }
+            Err(e) => {
+                *consecutive_album_refresh_failures += 1;
+                lib_state.plan_is_stale = true;
+                lib_state.plan_needs_refresh = true;
+                if *consecutive_album_refresh_failures >= 3 {
+                    tracing::error!(
+                        zone = %lib_state.zone_name,
+                        error = %e,
+                        consecutive_failures = *consecutive_album_refresh_failures,
+                        "Repeated album refresh failures, reusing previous set"
+                    );
+                } else {
+                    tracing::warn!(
+                        zone = %lib_state.zone_name,
+                        error = %e,
+                        "Failed to refresh albums, reusing previous set"
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn store_db_sync_token(db: &dyn state::StateDb, token: &str) {
+    if let Err(e) = db.set_metadata(DB_SYNC_TOKEN_KEY, token).await {
+        tracing::warn!(error = %e, "Failed to store db_sync_token");
+    }
+}
+
 async fn check_changes_database(
     state_db: Option<&dyn state::StateDb>,
-    lib_state: &LibraryState,
+    library_states: &[LibraryState],
     photos_service: &mut crate::icloud::photos::PhotosService,
-) -> bool {
+) -> WatchPrecheck {
     let Some(db) = state_db else {
-        return false;
+        return WatchPrecheck::proceed_all();
     };
-    let has_token = db
-        .get_metadata(&lib_state.sync_token_key)
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|t| !t.is_empty());
-    if !has_token {
-        return false;
+    if library_states.is_empty() {
+        return WatchPrecheck::SkipAll;
+    }
+    for lib_state in library_states {
+        let has_token = db
+            .get_metadata(&lib_state.sync_token_key)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|t| !t.is_empty());
+        if !has_token {
+            return WatchPrecheck::proceed_all();
+        }
     }
     let db_token = db
-        .get_metadata("db_sync_token")
+        .get_metadata(DB_SYNC_TOKEN_KEY)
         .await
         .ok()
         .flatten()
         .filter(|t| !t.is_empty());
     match photos_service.changes_database(db_token.as_deref()).await {
         Ok(db_resp) => {
-            if let Err(e) = db.set_metadata("db_sync_token", &db_resp.sync_token).await {
-                tracing::warn!(error = %e, "Failed to store db_sync_token");
-            }
+            let selected_zones: rustc_hash::FxHashSet<&str> = library_states
+                .iter()
+                .map(|s| s.zone_name.as_str())
+                .collect();
+            let mut changed_selected_zones = rustc_hash::FxHashSet::default();
             if db_resp.more_coming {
                 tracing::debug!("changes/database has more pages (moreComing=true)");
             }
-            if db_resp.zones.is_empty() && !db_resp.more_coming {
-                tracing::info!("No changes detected (changes/database), skipping cycle");
-                true
-            } else {
-                for z in &db_resp.zones {
-                    tracing::debug!(
-                        zone = %z.zone_id.zone_name,
-                        zone_sync_token = %z.sync_token,
-                        "changes/database: zone has changes"
-                    );
+            for z in &db_resp.zones {
+                tracing::debug!(
+                    zone = %z.zone_id.zone_name,
+                    zone_sync_token = %z.sync_token,
+                    "changes/database: zone has changes"
+                );
+                if selected_zones.contains(z.zone_id.zone_name.as_str()) {
+                    changed_selected_zones.insert(z.zone_id.zone_name.clone());
                 }
-                false
+            }
+
+            if changed_selected_zones.is_empty() {
+                store_db_sync_token(db, &db_resp.sync_token).await;
+                if db_resp.more_coming {
+                    return WatchPrecheck::proceed_all();
+                }
+                tracing::info!(
+                    "No selected library changes detected (changes/database), skipping cycle"
+                );
+                return WatchPrecheck::SkipAll;
+            }
+
+            WatchPrecheck::Proceed {
+                changed_zones: if db_resp.more_coming {
+                    None
+                } else {
+                    Some(changed_selected_zones)
+                },
+                db_sync_token_after_success: Some(db_resp.sync_token),
             }
         }
         Err(e) => {
@@ -1763,7 +1900,7 @@ async fn check_changes_database(
                 error = %e,
                 "changes/database pre-check failed, proceeding with sync"
             );
-            false
+            WatchPrecheck::proceed_all()
         }
     }
 }
@@ -2938,7 +3075,32 @@ mod tests {
             sync_token_key: sync_token_key.to_string(),
             plan: crate::commands::AlbumPlan { passes: Vec::new() },
             plan_is_stale: false,
+            plan_needs_refresh: false,
         }
+    }
+
+    fn assert_proceed_changed(precheck: &WatchPrecheck, expected_zone: &str, expected_db: &str) {
+        let WatchPrecheck::Proceed {
+            changed_zones: Some(zones),
+            db_sync_token_after_success: Some(db_token),
+        } = precheck
+        else {
+            panic!("expected changed-zone proceed, got {precheck:?}");
+        };
+        assert_eq!(zones.len(), 1);
+        assert!(
+            zones.contains(expected_zone),
+            "missing zone {expected_zone}"
+        );
+        assert_eq!(db_token, expected_db);
+    }
+
+    async fn check_single_library_changes_database(
+        db: Option<&dyn state::StateDb>,
+        lib_state: &LibraryState,
+        svc: &mut crate::icloud::photos::PhotosService,
+    ) -> WatchPrecheck {
+        check_changes_database(db, std::slice::from_ref(lib_state), svc).await
     }
 
     /// `more_coming=true` with empty zones must NOT skip the cycle.
@@ -2968,16 +3130,23 @@ mod tests {
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+        let precheck =
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
 
         assert!(
-            !skip,
+            matches!(
+                precheck,
+                WatchPrecheck::Proceed {
+                    changed_zones: None,
+                    db_sync_token_after_success: None
+                }
+            ),
             "more_coming=true must not skip the cycle (more pages pending)"
         );
         // db_sync_token should have been persisted so the next cycle
         // continues paging from where we left off.
         let stored = db
-            .get_metadata("db_sync_token")
+            .get_metadata(DB_SYNC_TOKEN_KEY)
             .await
             .expect("read db_sync_token")
             .expect("token persisted");
@@ -3009,14 +3178,19 @@ mod tests {
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+        let precheck =
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
 
-        assert!(skip, "empty zones + more_coming=false must skip the cycle");
+        assert_eq!(
+            precheck,
+            WatchPrecheck::SkipAll,
+            "empty zones + more_coming=false must skip the cycle"
+        );
         // The new db_sync_token must still be persisted even on skip:
         // otherwise the next call re-asks from scratch and we'd get an
         // unbounded list of all zones.
         let stored = db
-            .get_metadata("db_sync_token")
+            .get_metadata(DB_SYNC_TOKEN_KEY)
             .await
             .expect("read db_sync_token")
             .expect("token persisted on skip");
@@ -3049,8 +3223,86 @@ mod tests {
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
-        assert!(!skip, "zones-present response must not skip the cycle");
+        let precheck =
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+        assert_proceed_changed(&precheck, "PrimarySync", "db-tok-4");
+        assert!(
+            db.get_metadata(DB_SYNC_TOKEN_KEY)
+                .await
+                .expect("read db_sync_token")
+                .is_none(),
+            "changed-zone precheck must not advance db_sync_token before the sync succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_changes_database_multi_library_runs_only_changed_selected_zone() {
+        use serde_json::json;
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-tok-shared",
+            "moreComing": false,
+            "zones": [
+                {"zoneID": {"zoneName": "SharedSync-ABCD"}, "syncToken": "shared-tok-new"}
+            ]
+        }));
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let db: Arc<dyn state::StateDb> = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "primary-tok-prev")
+            .await
+            .expect("set primary token");
+        db.set_metadata("sync_token:SharedSync-ABCD", "shared-tok-prev")
+            .await
+            .expect("set shared token");
+        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
+            .await
+            .expect("set db token");
+
+        let states = vec![
+            make_library_state("PrimarySync", "sync_token:PrimarySync"),
+            make_library_state("SharedSync-ABCD", "sync_token:SharedSync-ABCD"),
+        ];
+
+        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc).await;
+        assert_proceed_changed(&precheck, "SharedSync-ABCD", "db-tok-shared");
+    }
+
+    #[tokio::test]
+    async fn check_changes_database_unselected_zone_change_skips_selected_libraries() {
+        use serde_json::json;
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-tok-unselected",
+            "moreComing": false,
+            "zones": [
+                {"zoneID": {"zoneName": "SharedSync-ABCD"}, "syncToken": "shared-tok-new"}
+            ]
+        }));
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+
+        let db: Arc<dyn state::StateDb> = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "primary-tok-prev")
+            .await
+            .expect("set primary token");
+        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
+            .await
+            .expect("set db token");
+
+        let states = vec![make_library_state("PrimarySync", "sync_token:PrimarySync")];
+
+        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc).await;
+        assert_eq!(precheck, WatchPrecheck::SkipAll);
+        let stored = db
+            .get_metadata(DB_SYNC_TOKEN_KEY)
+            .await
+            .expect("read db_sync_token")
+            .expect("token persisted");
+        assert_eq!(stored, "db-tok-unselected");
     }
 
     /// No stored sync token at all must return false (don't
@@ -3069,11 +3321,54 @@ mod tests {
         let db: Arc<dyn state::StateDb> = make_state_db();
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        let skip = check_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
-        assert!(!skip, "no stored token must skip-result false (continue)");
+        let precheck =
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+        assert!(
+            matches!(
+                precheck,
+                WatchPrecheck::Proceed {
+                    changed_zones: None,
+                    db_sync_token_after_success: None
+                }
+            ),
+            "no stored token must continue without a changes/database call"
+        );
     }
 
-    /// A `set_metadata("db_sync_token", ...)` write failure must
+    #[tokio::test]
+    async fn refresh_needed_library_plans_filters_to_changed_zones() {
+        let mut states = vec![
+            make_library_state("PrimarySync", "sync_token:PrimarySync"),
+            make_library_state("SharedSync-ABCD", "sync_token:SharedSync-ABCD"),
+        ];
+        for state in &mut states {
+            state.plan_needs_refresh = true;
+        }
+        let mut changed_zones = rustc_hash::FxHashSet::default();
+        changed_zones.insert("PrimarySync".to_string());
+        let selection = crate::selection::Selection {
+            albums: crate::selection::AlbumSelector::None,
+            smart_folders: crate::selection::SmartFolderSelector::None,
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: false,
+        };
+        let mut failures = 0;
+
+        refresh_needed_library_plans(&mut states, &selection, Some(&changed_zones), &mut failures)
+            .await;
+
+        assert!(
+            !states[0].plan_needs_refresh,
+            "changed zone should refresh before syncing"
+        );
+        assert!(
+            states[1].plan_needs_refresh,
+            "unchanged zone must not refresh albums on this cycle"
+        );
+        assert_eq!(failures, 0);
+    }
+
+    /// A `set_metadata(DB_SYNC_TOKEN_KEY, ...)` write failure must
     /// NOT break the cycle. The current implementation logs a warning and
     /// continues. A regression that propagated the error would crash watch
     /// mode whenever a sqlite hiccup hit that single write.
@@ -3081,7 +3376,7 @@ mod tests {
     async fn check_changes_database_token_persist_failure_does_not_skip() {
         use serde_json::json;
         // StateDb that succeeds on get_metadata("sync_token:...") but
-        // fails on set_metadata("db_sync_token", ...) — the only write
+        // fails on set_metadata(DB_SYNC_TOKEN_KEY, ...) — the only write
         // path inside `check_changes_database`.
         struct PartiallyFailingDb {
             inner: Arc<dyn state::StateDb>,
@@ -3237,7 +3532,7 @@ mod tests {
                 key: &str,
                 _value: &str,
             ) -> Result<(), state::error::StateError> {
-                if key == "db_sync_token" {
+                if key == DB_SYNC_TOKEN_KEY {
                     Err(state::error::StateError::LockPoisoned(
                         "simulated db_sync_token write failure".into(),
                     ))
@@ -3369,13 +3664,12 @@ mod tests {
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
-        // The function logs the write failure and continues. zones non-empty
-        // means it must return false (don't skip).
-        let skip = check_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
-        assert!(
-            !skip,
-            "db_sync_token write failure must not propagate as a skip"
-        );
+        // Zone changes hold db_sync_token advancement until after the sync
+        // succeeds, so a db token write failure here must not affect the
+        // pre-check decision.
+        let precheck =
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+        assert_proceed_changed(&precheck, "PrimarySync", "db-tok-bad-write");
     }
 
     // ── preload_asset_groupings ──────────────────────────────────────
