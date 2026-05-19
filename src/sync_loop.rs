@@ -1694,12 +1694,11 @@ async fn run_cycle(
         )
         .await?;
 
-        let library_completed_without_errors = matches!(
-            &sync_result.outcome,
-            download::DownloadOutcome::Success
-        ) && !sync_result.stats.interrupted
-            && sync_result.stats.enumeration_errors == 0
-            && !shutdown_token.is_cancelled();
+        let library_completed_without_errors =
+            matches!(&sync_result.outcome, download::DownloadOutcome::Success)
+                && !sync_result.stats.interrupted
+                && sync_result.stats.enumeration_errors == 0
+                && !shutdown_token.is_cancelled();
         if sync_result.full_enumeration_ran
             && library_completed_without_errors
             && download_controls.run_mode.downloads_files()
@@ -2720,7 +2719,51 @@ mod tests {
         })
     }
 
-    fn make_empty_full_album(zone_sync_token: &str) -> crate::icloud::photos::PhotoAlbum {
+    fn full_album_page(zone: &str, record_name: &str, sync_token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "records": [
+                {
+                    "recordName": record_name,
+                    "recordType": "CPLMaster",
+                    "fields": {
+                        "filenameEnc": {"value": "cGhvdG8uanBn", "type": "STRING"},
+                        "resOriginalRes": {
+                            "value": {
+                                "downloadURL": "https://p01.icloud-content.com/photo.jpg",
+                                "size": 1024,
+                                "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                            }
+                        },
+                        "resOriginalWidth": {"value": 100, "type": "INT64"},
+                        "resOriginalHeight": {"value": 100, "type": "INT64"},
+                        "resOriginalFileType": {"value": "public.jpeg"},
+                        "itemType": {"value": "public.jpeg"},
+                        "adjustmentRenderType": {"value": 0, "type": "INT64"}
+                    },
+                    "recordChangeTag": "ct-master"
+                },
+                {
+                    "recordName": format!("asset-{record_name}"),
+                    "recordType": "CPLAsset",
+                    "fields": {
+                        "masterRef": {
+                            "value": {"recordName": record_name, "zoneID": {"zoneName": zone}},
+                            "type": "REFERENCE"
+                        },
+                        "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                        "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                    },
+                    "recordChangeTag": "ct-asset"
+                }
+            ],
+            "syncToken": sync_token
+        })
+    }
+
+    fn make_full_album_with_session(
+        zone: &str,
+        session: crate::test_helpers::MockPhotosSession,
+    ) -> crate::icloud::photos::PhotoAlbum {
         use serde_json::json;
         crate::icloud::photos::PhotoAlbum::new(
             crate::icloud::photos::PhotoAlbumConfig {
@@ -2731,14 +2774,42 @@ mod tests {
                 obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
                 query_filter: None,
                 page_size: 100,
-                zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
+                zone_id: Arc::new(json!({"zoneName": zone})),
                 retry_config: retry::RetryConfig::default(),
             },
-            Box::new(
-                crate::test_helpers::MockPhotosSession::new()
-                    .ok(album_count_response(0))
-                    .ok(json!({"records": [], "syncToken": zone_sync_token})),
-            ),
+            Box::new(session),
+        )
+    }
+
+    fn make_empty_full_album(zone_sync_token: &str) -> crate::icloud::photos::PhotoAlbum {
+        make_empty_full_album_for_zone("PrimarySync", zone_sync_token)
+    }
+
+    fn make_empty_full_album_for_zone(
+        zone: &str,
+        zone_sync_token: &str,
+    ) -> crate::icloud::photos::PhotoAlbum {
+        make_full_album_with_session(
+            zone,
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(0))
+                .ok(serde_json::json!({"records": [], "syncToken": zone_sync_token})),
+        )
+    }
+
+    fn make_one_photo_full_album_for_zone(
+        zone: &str,
+        zone_sync_token: &str,
+    ) -> crate::icloud::photos::PhotoAlbum {
+        make_full_album_with_session(
+            zone,
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(full_album_page(
+                    zone,
+                    &format!("master-{zone}"),
+                    zone_sync_token,
+                )),
         )
     }
 
@@ -2791,9 +2862,33 @@ mod tests {
         (dir, Arc::new(tokio::sync::RwLock::new(session)))
     }
 
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct RunCycleDownloadConfigOptions {
+        media: config::MediaSelection,
+        per_pass_paths: bool,
+    }
+
     fn make_run_cycle_download_config_builder(
         download_dir: &std::path::Path,
         db: Arc<dyn state::StateDb>,
+    ) -> impl Fn(
+        download::SyncMode,
+        Arc<rustc_hash::FxHashSet<String>>,
+        Arc<download::AssetGroupings>,
+        Arc<str>,
+    ) -> Arc<download::DownloadConfig>
+           + '_ {
+        make_run_cycle_download_config_builder_with_options(
+            download_dir,
+            db,
+            RunCycleDownloadConfigOptions::default(),
+        )
+    }
+
+    fn make_run_cycle_download_config_builder_with_options(
+        download_dir: &std::path::Path,
+        db: Arc<dyn state::StateDb>,
+        options: RunCycleDownloadConfigOptions,
     ) -> impl Fn(
         download::SyncMode,
         Arc<rustc_hash::FxHashSet<String>>,
@@ -2807,6 +2902,10 @@ mod tests {
             config.folder_structure = "%Y/%m/%d".to_string();
             config.folder_structure_albums = Arc::from("%Y/%m/%d");
             config.folder_structure_smart_folders = Arc::from("%Y/%m/%d");
+            if options.per_pass_paths {
+                config.folder_structure_albums = Arc::from("{album}");
+            }
+            config.media = options.media;
             config.state_db = Some(Arc::clone(&db));
             config.sync_mode = sync_mode;
             config.exclude_asset_ids = exclude_asset_ids;
@@ -2833,6 +2932,17 @@ mod tests {
     }
 
     async fn run_empty_full_cycle(is_retry_failed: bool) -> CycleResult {
+        run_empty_full_cycle_with_controls(
+            is_retry_failed,
+            download::DownloadControls::download_hidden(),
+        )
+        .await
+    }
+
+    async fn run_empty_full_cycle_with_controls(
+        is_retry_failed: bool,
+        controls: download::DownloadControls,
+    ) -> CycleResult {
         let config = make_run_cycle_config();
         let db = make_state_db();
         let download_dir = tempfile::tempdir().expect("download tempdir");
@@ -2853,7 +2963,38 @@ mod tests {
             Some(db.as_ref()),
             is_retry_failed,
             &build_download_config,
-            download::DownloadControls::download_hidden(),
+            controls,
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle")
+    }
+
+    async fn run_one_photo_full_cycle_with_controls(
+        controls: download::DownloadControls,
+    ) -> CycleResult {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let lib_state = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_one_photo_full_album_for_zone("PrimarySync", "zone-tok-one"),
+        );
+        let states = vec![&lib_state];
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            controls,
             &shared_session,
             &CancellationToken::new(),
         )
@@ -4518,6 +4659,142 @@ mod tests {
         assert!(
             !logs_contain("Sync completed after enumerating zero assets"),
             "retry-failed no-op cycles must stay quiet"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn run_cycle_incremental_fallback_zero_assets_warns() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed sync token");
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let lib_state = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_empty_full_album("zone-tok-empty"),
+        );
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                per_pass_paths: true,
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.assets_seen, 0);
+        assert!(
+            logs_contain("Sync completed after enumerating zero assets"),
+            "incremental requests that fall back to full enumeration must warn"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn run_cycle_warns_for_empty_library_when_another_library_has_assets() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let empty_state = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_empty_full_album_for_zone("PrimarySync", "zone-tok-empty"),
+        );
+        let nonempty_state = make_run_cycle_library_state_with_album(
+            "SharedSync-TEST",
+            "sync_token:SharedSync-TEST",
+            make_one_photo_full_album_for_zone("SharedSync-TEST", "zone-tok-one"),
+        );
+        let states = vec![&empty_state, &nonempty_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: config::MediaSelection {
+                    photos: false,
+                    videos: true,
+                    live_photos: true,
+                },
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.assets_seen, 1);
+        assert!(
+            logs_contain("Sync completed after enumerating zero assets"),
+            "empty library must warn even when the cycle-wide asset count is nonzero"
+        );
+        assert!(
+            logs_contain("library=PrimarySync"),
+            "warning must name the empty library"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn run_cycle_dry_run_nonempty_full_cycle_does_not_warn() {
+        let result =
+            run_one_photo_full_cycle_with_controls(download::DownloadControls::dry_run_hidden())
+                .await;
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.assets_seen, 0);
+        assert!(
+            !logs_contain("Sync completed after enumerating zero assets"),
+            "dry-run asset scans must not warn just because assets_seen stays zero"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn run_cycle_print_filenames_nonempty_full_cycle_does_not_warn() {
+        let controls = download::DownloadControls::new(
+            download::DownloadRunMode::PrintFilenames,
+            download::DownloadReporting::hidden(),
+        );
+        let result = run_one_photo_full_cycle_with_controls(controls).await;
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.assets_seen, 0);
+        assert!(
+            !logs_contain("Sync completed after enumerating zero assets"),
+            "print-only asset scans must not warn just because assets_seen stays zero"
         );
     }
 
