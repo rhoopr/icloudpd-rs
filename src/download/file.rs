@@ -8,6 +8,7 @@ use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 
 use super::error::DownloadError;
 use super::limiter::BandwidthLimiter;
@@ -114,6 +115,7 @@ pub(super) struct DownloadOpts {
 pub(super) struct DownloadLimits<'a> {
     pub rate_limit_counter: Option<&'a std::sync::atomic::AtomicUsize>,
     pub bandwidth_limiter: Option<&'a BandwidthLimiter>,
+    pub shutdown_token: Option<&'a CancellationToken>,
 }
 
 /// Test-only off-mode wrapper. Production calls `download_file_with_mode`
@@ -188,6 +190,7 @@ pub(super) async fn download_file_with_mode<C: DownloadClient>(
                 opts.skip_rename,
                 opts.expected_size,
                 limits.bandwidth_limiter,
+                limits.shutdown_token,
             ))
             .await
         },
@@ -218,6 +221,7 @@ async fn attempt_download<C: DownloadClient>(
     skip_rename: bool,
     expected_size: Option<u64>,
     bandwidth_limiter: Option<&BandwidthLimiter>,
+    shutdown_token: Option<&CancellationToken>,
 ) -> Result<u64, DownloadError> {
     let path_str = download_path.display().to_string();
 
@@ -381,7 +385,25 @@ async fn attempt_download<C: DownloadClient>(
 
     let mut stream = response.stream;
     let stream_result: Result<(), DownloadError> = async {
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next_chunk = if let Some(token) = shutdown_token {
+                tokio::select! {
+                    () = token.cancelled() => {
+                        return Err(DownloadError::Interrupted {
+                            path: path_str.clone().into(),
+                            bytes_written,
+                        });
+                    }
+                    chunk = stream.next() => chunk,
+                }
+            } else {
+                stream.next().await
+            };
+
+            let Some(chunk) = next_chunk else {
+                break;
+            };
+
             let chunk = chunk.map_err(|e| DownloadError::Http {
                 source: e,
                 path: path_str.clone().into(),
@@ -402,10 +424,17 @@ async fn attempt_download<C: DownloadClient>(
     .await;
     drop(file);
     if let Err(e) = stream_result {
-        if !e.is_retryable() {
+        if !e.is_retryable() && !e.is_interrupted() {
             crate::fs_util::log_remove_async(part_path).await;
         }
         return Err(e);
+    }
+
+    if shutdown_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(DownloadError::Interrupted {
+            path: path_str.into(),
+            bytes_written,
+        });
     }
 
     // Verify the server sent the number of bytes it promised.
@@ -1649,6 +1678,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1673,6 +1703,7 @@ mod tests {
             &download_path,
             &part_path,
             true,
+            None,
             None,
             None,
         )
@@ -1704,6 +1735,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1731,6 +1763,7 @@ mod tests {
             false,
             Some(1024),
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1755,6 +1788,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
             None,
         )
@@ -1783,6 +1817,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
             None,
         )
@@ -1820,6 +1855,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1855,6 +1891,7 @@ mod tests {
             &part_path,
             false,
             Some(150), // expected_size signals version A
+            None,
             None,
         )
         .await
@@ -1895,6 +1932,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1919,6 +1957,7 @@ mod tests {
             &part_path,
             false,
             Some(body.len() as u64),
+            None,
             None,
         )
         .await
@@ -1975,6 +2014,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1984,6 +2024,180 @@ mod tests {
             100,
             "client should receive the .part file size as resume offset"
         );
+    }
+
+    #[derive(Debug)]
+    struct InterruptingResumeClient {
+        body: Vec<u8>,
+        first_chunk_len: usize,
+        calls: std::sync::atomic::AtomicUsize,
+        resume_requests: std::sync::Mutex<Vec<Option<u64>>>,
+    }
+
+    impl InterruptingResumeClient {
+        fn new(body: Vec<u8>, first_chunk_len: usize) -> Self {
+            Self {
+                body,
+                first_chunk_len,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                resume_requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn pending_after_first_chunk(&self) -> DownloadResponse {
+            let first_chunk = self.body[..self.first_chunk_len].to_vec();
+            let stream = futures_util::stream::unfold(Some(first_chunk), |next| async move {
+                match next {
+                    Some(chunk) => Some((Ok(Bytes::from(chunk)), None)),
+                    None => std::future::pending().await,
+                }
+            });
+            DownloadResponse {
+                status: 200,
+                content_length: Some(self.body.len() as u64),
+                content_type: Some("image/jpeg".to_string()),
+                stream: Box::pin(stream),
+            }
+        }
+
+        fn remaining_from(&self, resume_from: u64) -> DownloadResponse {
+            let offset = usize::try_from(resume_from).expect("resume offset fits usize");
+            let chunks: Vec<Result<Bytes, BoxError>> =
+                vec![Ok(Bytes::from(self.body[offset..].to_vec()))];
+            DownloadResponse {
+                status: 206,
+                content_length: Some((self.body.len() - offset) as u64),
+                content_type: Some("image/jpeg".to_string()),
+                stream: Box::pin(futures_util::stream::iter(chunks)),
+            }
+        }
+
+        fn resume_requests(&self) -> Vec<Option<u64>> {
+            self.resume_requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DownloadClient for InterruptingResumeClient {
+        async fn fetch(
+            &self,
+            _url: &str,
+            resume_from: Option<u64>,
+        ) -> Result<DownloadResponse, BoxError> {
+            self.resume_requests.lock().unwrap().push(resume_from);
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if call == 0 {
+                self.pending_after_first_chunk()
+            } else {
+                self.remaining_from(resume_from.expect("second request must resume"))
+            })
+        }
+    }
+
+    async fn wait_for_part_len(part_path: &Path, expected_len: u64) {
+        for _ in 0..100 {
+            if std::fs::metadata(part_path).is_ok_and(|meta| meta.len() == expected_len) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!(
+            "part file {} did not reach {expected_len} bytes",
+            part_path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn download_file_interrupted_mid_body_keeps_part_and_resumes() {
+        let mut body = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        body.extend((4..128u8).map(|n| n.wrapping_mul(3)));
+        let client = InterruptingResumeClient::new(body.clone(), 4);
+        let dir = TempDir::new().unwrap();
+        let download_path = dir.path().join("interrupted.jpg");
+        let checksum = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+        let part_path = temp_download_path(&download_path, &checksum, ".kei-tmp").unwrap();
+        let config = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let shutdown_token = CancellationToken::new();
+
+        let first_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let download = download_file(
+                &client,
+                "http://stub/interrupted.jpg",
+                &download_path,
+                &checksum,
+                &config,
+                ".kei-tmp",
+                DownloadOpts {
+                    skip_rename: false,
+                    expected_size: Some(body.len() as u64),
+                },
+                DownloadLimits {
+                    shutdown_token: Some(&shutdown_token),
+                    ..Default::default()
+                },
+            );
+            let cancel_after_partial = async {
+                wait_for_part_len(&part_path, 4).await;
+                shutdown_token.cancel();
+            };
+            let (result, ()) = tokio::join!(download, cancel_after_partial);
+            result
+        })
+        .await
+        .expect("interrupted download should not hang");
+
+        let err = first_result.expect_err("mid-body shutdown must interrupt the download");
+        assert!(
+            matches!(
+                err,
+                DownloadError::Interrupted {
+                    bytes_written: 4,
+                    ..
+                }
+            ),
+            "expected interrupted error after first chunk, got {err:?}"
+        );
+        assert!(
+            !download_path.exists(),
+            "interrupted download must not publish the final path"
+        );
+        assert_eq!(
+            std::fs::metadata(&part_path).unwrap().len(),
+            4,
+            "interrupted download must leave the resumable .part bytes"
+        );
+
+        download_file(
+            &client,
+            "http://stub/interrupted.jpg",
+            &download_path,
+            &checksum,
+            &config,
+            ".kei-tmp",
+            DownloadOpts {
+                skip_rename: false,
+                expected_size: Some(body.len() as u64),
+            },
+            DownloadLimits::default(),
+        )
+        .await
+        .expect("second run should resume and publish");
+
+        assert_eq!(
+            client.resume_requests(),
+            vec![None, Some(4)],
+            "second request must use the partial-file offset"
+        );
+        assert_eq!(std::fs::read(&download_path).unwrap(), body);
+        assert!(!part_path.exists(), "published resume must remove .part");
+
+        use sha2::{Digest, Sha256};
+        let expected_hash = format!("{:x}", Sha256::digest(&body));
+        assert_eq!(compute_sha256(&download_path).await.unwrap(), expected_hash);
     }
 
     // --- download_file retry integration tests ---
@@ -2131,6 +2345,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2163,6 +2378,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2184,6 +2400,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2203,6 +2420,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
             None,
         )
@@ -2887,6 +3105,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -2920,6 +3139,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
             None,
         )
@@ -2965,6 +3185,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2995,6 +3216,7 @@ mod tests {
             &part_path,
             false,
             Some(1024), // API says 1024 but download is 8
+            None,
             None,
         )
         .await
@@ -3077,12 +3299,32 @@ mod tests {
             let dp_a = download_path.clone();
             let pp_a = part_path.clone();
             let task_a = tokio::spawn(async move {
-                attempt_download(&client_a, "http://stub", &dp_a, &pp_a, false, None, None).await
+                attempt_download(
+                    &client_a,
+                    "http://stub",
+                    &dp_a,
+                    &pp_a,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await
             });
             let dp_b = download_path.clone();
             let pp_b = part_path.clone();
             let task_b = tokio::spawn(async move {
-                attempt_download(&client_b, "http://stub", &dp_b, &pp_b, false, None, None).await
+                attempt_download(
+                    &client_b,
+                    "http://stub",
+                    &dp_b,
+                    &pp_b,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
+                .await
             });
 
             let a = task_a.await.unwrap();
@@ -3113,6 +3355,7 @@ mod tests {
             &download_path,
             &part_path,
             false,
+            None,
             None,
             None,
         )

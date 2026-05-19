@@ -32,6 +32,9 @@ pub(crate) enum DownloadError {
     #[error("Invalid content for {path}: {reason}")]
     InvalidContent { path: Box<str>, reason: Box<str> },
 
+    #[error("Download interrupted for {path} after {bytes_written} bytes")]
+    Interrupted { path: Box<str>, bytes_written: u64 },
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -53,7 +56,7 @@ impl DownloadError {
             Self::ContentLengthMismatch { .. }
             | Self::InvalidContent { .. }
             | Self::Http { .. } => true,
-            Self::Disk(_) | Self::Other(_) => false,
+            Self::Disk(_) | Self::Interrupted { .. } | Self::Other(_) => false,
         }
     }
 
@@ -81,6 +84,10 @@ impl DownloadError {
                 ..
             }
         )
+    }
+
+    pub const fn is_interrupted(&self) -> bool {
+        matches!(self, Self::Interrupted { .. })
     }
 }
 
@@ -201,6 +208,22 @@ mod tests {
     fn test_other_not_retryable() {
         let e = DownloadError::Other(anyhow::anyhow!("unknown"));
         assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn interrupted_not_retryable_and_is_classified() {
+        let e = DownloadError::Interrupted {
+            path: "photo.jpg".into(),
+            bytes_written: 512,
+        };
+
+        assert!(!e.is_retryable());
+        assert!(e.is_interrupted());
+        assert!(!e.is_session_expired());
+        assert!(
+            e.to_string().contains("512"),
+            "display should include bytes written"
+        );
     }
 
     #[test]

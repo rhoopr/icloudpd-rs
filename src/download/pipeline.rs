@@ -1754,16 +1754,20 @@ where
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
+            let shutdown_token = shutdown_token.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
                     &task,
                     &retry_config,
                     metadata_flags,
-                    &temp_suffix,
-                    Some(rate_limit_counter.as_ref()),
-                    bandwidth_limiter.as_ref(),
-                    mode,
+                    DownloadSingleContext {
+                        temp_suffix: &temp_suffix,
+                        rate_limit_counter: Some(rate_limit_counter.as_ref()),
+                        bandwidth_limiter: bandwidth_limiter.as_ref(),
+                        shutdown_token: &shutdown_token,
+                        mode,
+                    },
                 ))
                 .await;
                 (task, result)
@@ -1870,7 +1874,10 @@ where
                 }
             }
             Err(e) => {
-                if let Some(download_err) = e.downcast_ref::<DownloadError>() {
+                if is_interrupted_download(&e) {
+                    log_interrupted_download(&pb, &task, &e);
+                    continue;
+                } else if let Some(download_err) = e.downcast_ref::<DownloadError>() {
                     if download_err.is_session_expired() {
                         auth_errors += 1;
                         pb.suspend(|| {
@@ -2345,16 +2352,20 @@ pub(super) async fn run_download_pass(
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
+            let shutdown_token = shutdown_token.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
                     &task,
                     retry_config,
                     metadata_flags,
-                    &temp_suffix,
-                    Some(rate_limit_counter.as_ref()),
-                    bandwidth_limiter.as_ref(),
-                    mode,
+                    DownloadSingleContext {
+                        temp_suffix: &temp_suffix,
+                        rate_limit_counter: Some(rate_limit_counter.as_ref()),
+                        bandwidth_limiter: bandwidth_limiter.as_ref(),
+                        shutdown_token: &shutdown_token,
+                        mode,
+                    },
                 ))
                 .await;
                 (task, result)
@@ -2444,6 +2455,11 @@ pub(super) async fn run_download_pass(
                 }
             }
             Err(e) => {
+                if is_interrupted_download(e) {
+                    log_interrupted_download(&pb, &task, e);
+                    pb.inc(1);
+                    continue;
+                }
                 let is_auth = e
                     .downcast_ref::<DownloadError>()
                     .is_some_and(DownloadError::is_session_expired);
@@ -2613,15 +2629,38 @@ fn plan_metadata_write(
 ///
 /// Returns `Ok(true)` on full success, `Ok(false)` if the download succeeded
 /// but EXIF stamping failed (the file is usable but lacks EXIF metadata).
+#[derive(Debug, Clone, Copy)]
+struct DownloadSingleContext<'a> {
+    temp_suffix: &'a str,
+    rate_limit_counter: Option<&'a std::sync::atomic::AtomicUsize>,
+    bandwidth_limiter: Option<&'a super::BandwidthLimiter>,
+    shutdown_token: &'a CancellationToken,
+    mode: crate::personality::Mode,
+}
+
+fn is_interrupted_download(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<DownloadError>()
+        .is_some_and(DownloadError::is_interrupted)
+}
+
+fn log_interrupted_download(pb: &ProgressBar, task: &DownloadTask, error: &anyhow::Error) {
+    pb.suspend(|| {
+        tracing::info!(
+            asset_id = %task.asset_id,
+            path = %task.download_path.display(),
+            error = %error,
+            "Download interrupted before final publish"
+        );
+    });
+}
+
 async fn download_single_task(
     client: &Client,
     task: &DownloadTask,
     retry_config: &RetryConfig,
     metadata_flags: MetadataFlags,
-    temp_suffix: &str,
-    rate_limit_counter: Option<&std::sync::atomic::AtomicUsize>,
-    bandwidth_limiter: Option<&super::BandwidthLimiter>,
-    mode: crate::personality::Mode,
+    context: DownloadSingleContext<'_>,
 ) -> Result<(bool, String, Option<String>, u64, u64)> {
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -2648,16 +2687,17 @@ async fn download_single_task(
         &task.download_path,
         &task.checksum,
         retry_config,
-        temp_suffix,
+        context.temp_suffix,
         super::file::DownloadOpts {
             skip_rename: needs_exif,
             expected_size: if task.size > 0 { Some(task.size) } else { None },
         },
         super::file::DownloadLimits {
-            rate_limit_counter,
-            bandwidth_limiter,
+            rate_limit_counter: context.rate_limit_counter,
+            bandwidth_limiter: context.bandwidth_limiter,
+            shutdown_token: Some(context.shutdown_token),
         },
-        mode,
+        context.mode,
     ))
     .await?;
 
@@ -2665,8 +2705,12 @@ async fn download_single_task(
     // the atomic rename, preventing silent corruption on power loss / SIGKILL.
     let part_path = if needs_exif {
         Some(
-            super::file::temp_download_path(&task.download_path, &task.checksum, temp_suffix)
-                .context("failed to compute part path")?,
+            super::file::temp_download_path(
+                &task.download_path,
+                &task.checksum,
+                context.temp_suffix,
+            )
+            .context("failed to compute part path")?,
         )
     } else {
         None
@@ -2685,7 +2729,7 @@ async fn download_single_task(
         let exif_path = part.clone();
         let payload = task.metadata.clone();
         let created_local = task.created_local;
-        let metadata_temp_suffix = temp_suffix.to_string();
+        let metadata_temp_suffix = context.temp_suffix.to_string();
         // Probe + plan + apply all run on the blocking pool so no file I/O
         // happens on the async runtime's poll thread.
         let exif_result = tokio::task::spawn_blocking(move || {
@@ -2744,7 +2788,7 @@ async fn download_single_task(
         let sidecar_path = task.download_path.clone();
         let payload = task.metadata.clone();
         let created_local = task.created_local;
-        let sidecar_temp_suffix = temp_suffix.to_string();
+        let sidecar_temp_suffix = context.temp_suffix.to_string();
         let sidecar_result = tokio::task::spawn_blocking(move || {
             let write = plan_sidecar_write(&payload, &created_local);
             if write.is_empty() {
