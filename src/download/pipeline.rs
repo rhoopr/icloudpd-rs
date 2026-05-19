@@ -2107,6 +2107,7 @@ pub(super) async fn build_download_outcome(
         let stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             skipped: skip_breakdown,
+            state_write_failures,
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
@@ -2119,13 +2120,9 @@ pub(super) async fn build_download_outcome(
         } else {
             tracing::info!("No new photos to download");
         }
-        if retry_exhausted > 0 || enumeration_errors > 0 {
-            return Ok((
-                DownloadOutcome::PartialFailure {
-                    failed_count: retry_exhausted + enumeration_errors,
-                },
-                stats,
-            ));
+        let failed_count = state_write_failures + retry_exhausted + enumeration_errors;
+        if failed_count > 0 {
+            return Ok((DownloadOutcome::PartialFailure { failed_count }, stats));
         }
         return Ok((DownloadOutcome::Success, stats));
     }
@@ -3923,6 +3920,25 @@ mod tests {
         assert_eq!(skips.total(), 0);
     }
 
+    async fn build_zero_download_outcome(
+        streaming_result: StreamingResult,
+        controls: DownloadControls,
+    ) -> (crate::download::DownloadOutcome, super::super::SyncStats) {
+        let client = reqwest::Client::new();
+        let config = Arc::new(crate::download::DownloadConfig::test_default());
+        build_download_outcome(
+            &client,
+            &[],
+            &config,
+            controls,
+            streaming_result,
+            Instant::now(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("zero-download outcome should build")
+    }
+
     /// The producer relies on `AssetDisposition` ordering via `.max()` to
     /// pick the highest-priority outcome when an asset has mixed task results.
     /// If variant order changes, `.max()` silently picks the wrong winner.
@@ -3952,7 +3968,8 @@ mod tests {
     struct FailingStateDb {
         remaining_failures: AtomicUsize,
         successes: AtomicUsize,
-        fail_metadata_clear: AtomicBool,
+        fail_metadata_clear: bool,
+        fail_complete_sync_run: bool,
     }
 
     impl FailingStateDb {
@@ -3960,13 +3977,20 @@ mod tests {
             Self {
                 remaining_failures: AtomicUsize::new(fail_count),
                 successes: AtomicUsize::new(0),
-                fail_metadata_clear: AtomicBool::new(false),
+                fail_metadata_clear: false,
+                fail_complete_sync_run: false,
             }
         }
 
         fn with_failing_metadata_clear() -> Self {
-            let s = Self::new(0);
-            s.fail_metadata_clear.store(true, Ordering::Relaxed);
+            let mut s = Self::new(0);
+            s.fail_metadata_clear = true;
+            s
+        }
+
+        fn with_failing_complete_sync_run() -> Self {
+            let mut s = Self::new(0);
+            s.fail_complete_sync_run = true;
             s
         }
 
@@ -4045,10 +4069,16 @@ mod tests {
             unimplemented!()
         }
         async fn start_sync_run(&self) -> Result<i64, StateError> {
-            unimplemented!()
+            Ok(1)
         }
         async fn complete_sync_run(&self, _: i64, _: &SyncRunStats) -> Result<(), StateError> {
-            unimplemented!()
+            if self.fail_complete_sync_run {
+                Err(StateError::LockPoisoned(
+                    "simulated complete_sync_run failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
         async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
             Ok(0)
@@ -4074,27 +4104,27 @@ mod tests {
         async fn get_downloaded_ids(
             &self,
         ) -> Result<HashSet<(String, String, String)>, StateError> {
-            unimplemented!()
+            Ok(HashSet::new())
         }
         async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
-            unimplemented!()
+            Ok(HashSet::new())
         }
         async fn get_downloaded_checksums(
             &self,
         ) -> Result<HashMap<(String, String, String), String>, StateError> {
-            unimplemented!()
+            Ok(HashMap::new())
         }
         async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
             Ok(HashMap::new())
         }
         async fn get_metadata(&self, _: &str) -> Result<Option<String>, StateError> {
-            unimplemented!()
+            Ok(None)
         }
         async fn set_metadata(&self, _: &str, _: &str) -> Result<(), StateError> {
-            unimplemented!()
+            Ok(())
         }
         async fn delete_metadata_by_prefix(&self, _: &str) -> Result<u64, StateError> {
-            unimplemented!()
+            Ok(0)
         }
         async fn touch_last_seen_many(&self, _: &str, _: &[&str]) -> Result<(), StateError> {
             // Unused in these tests; default no-op so they don't bump the
@@ -4141,7 +4171,7 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<(), StateError> {
-            if self.fail_metadata_clear.load(Ordering::Relaxed) {
+            if self.fail_metadata_clear {
                 Err(StateError::LockPoisoned("simulated clear failure".into()))
             } else {
                 Ok(())
@@ -5201,25 +5231,15 @@ mod tests {
     /// sync-token advance and silently skipping the errored assets.
     #[tokio::test]
     async fn zero_downloads_with_enumeration_errors_returns_partial_failure() {
-        use crate::download::{DownloadConfig, DownloadOutcome};
+        use crate::download::DownloadOutcome;
 
         let streaming_result = StreamingResult {
             enumeration_errors: 3,
             ..StreamingResult::default()
         };
-        let client = reqwest::Client::new();
-        let config = Arc::new(DownloadConfig::test_default());
-        let (outcome, stats) = build_download_outcome(
-            &client,
-            &[],
-            &config,
-            DownloadControls::download_hidden(),
-            streaming_result,
-            Instant::now(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("should not error");
+        let (outcome, stats) =
+            build_zero_download_outcome(streaming_result, DownloadControls::download_hidden())
+                .await;
         assert!(
             matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 3 }),
             "expected PartialFailure with failed_count=3, got {outcome:?}"
@@ -5228,26 +5248,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_zero_downloads_with_enumeration_errors_returns_partial_failure() {
-        use crate::download::{DownloadConfig, DownloadOutcome};
+    async fn zero_downloads_with_state_write_failures_returns_partial_failure() {
+        use crate::download::DownloadOutcome;
 
         let streaming_result = StreamingResult {
-            enumeration_errors: 2,
+            state_write_failures: 1,
             ..StreamingResult::default()
         };
+        let (outcome, stats) =
+            build_zero_download_outcome(streaming_result, DownloadControls::download_hidden())
+                .await;
+        assert!(
+            matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 1 }),
+            "expected PartialFailure with failed_count=1, got {outcome:?}"
+        );
+        assert_eq!(stats.state_write_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn complete_sync_run_failure_without_downloads_returns_partial_failure() {
+        use crate::download::{DownloadConfig, DownloadOutcome};
+        use crate::icloud::photos::PhotoAsset;
+        use futures_util::stream;
+
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        config.state_db = Some(Arc::new(FailingStateDb::with_failing_complete_sync_run()));
+        let config = Arc::new(config);
         let client = reqwest::Client::new();
-        let config = Arc::new(DownloadConfig::test_default());
+        let controls = DownloadControls::download_hidden();
+
+        let streaming_result = stream_and_download_from_stream(
+            &client,
+            stream::empty::<anyhow::Result<PhotoAsset>>(),
+            &config,
+            controls,
+            0,
+            CancellationToken::new(),
+            None,
+            None,
+        )
+        .await
+        .expect("empty sync should finish the stream pipeline");
+
+        assert_eq!(streaming_result.downloaded, 0);
+        assert_eq!(streaming_result.state_write_failures, 1);
+
         let (outcome, stats) = build_download_outcome(
             &client,
             &[],
             &config,
-            DownloadControls::dry_run_hidden(),
+            controls,
             streaming_result,
             Instant::now(),
             CancellationToken::new(),
         )
         .await
-        .expect("should not error");
+        .expect("outcome should build");
+
+        assert!(
+            matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 1 }),
+            "complete_sync_run failure must not report Success, got {outcome:?}"
+        );
+        assert_eq!(stats.state_write_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn dry_run_zero_downloads_with_enumeration_errors_returns_partial_failure() {
+        use crate::download::DownloadOutcome;
+
+        let streaming_result = StreamingResult {
+            enumeration_errors: 2,
+            ..StreamingResult::default()
+        };
+        let (outcome, stats) =
+            build_zero_download_outcome(streaming_result, DownloadControls::dry_run_hidden()).await;
         assert!(
             matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 2 }),
             "expected dry-run PartialFailure with failed_count=2, got {outcome:?}"
