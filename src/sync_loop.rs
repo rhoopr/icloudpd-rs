@@ -2931,6 +2931,36 @@ mod tests {
         .expect("test config")
     }
 
+    async fn run_full_cycle_with_album(
+        album: crate::icloud::photos::PhotoAlbum,
+        is_retry_failed: bool,
+        controls: download::DownloadControls,
+    ) -> CycleResult {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            is_retry_failed,
+            &build_download_config,
+            controls,
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle")
+    }
+
     async fn run_empty_full_cycle(is_retry_failed: bool) -> CycleResult {
         run_empty_full_cycle_with_controls(
             is_retry_failed,
@@ -2943,64 +2973,26 @@ mod tests {
         is_retry_failed: bool,
         controls: download::DownloadControls,
     ) -> CycleResult {
-        let config = make_run_cycle_config();
-        let db = make_state_db();
-        let download_dir = tempfile::tempdir().expect("download tempdir");
-        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-
-        let lib_state = make_run_cycle_library_state_with_album(
-            "PrimarySync",
-            "sync_token:PrimarySync",
+        run_full_cycle_with_album(
             make_empty_full_album("zone-tok-empty"),
-        );
-        let states = vec![&lib_state];
-        let build_download_config =
-            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
-
-        run_cycle(
-            &states,
-            &config,
-            Some(db.as_ref()),
             is_retry_failed,
-            &build_download_config,
             controls,
-            &shared_session,
-            &CancellationToken::new(),
         )
         .await
-        .expect("run cycle")
     }
 
     async fn run_one_photo_full_cycle_with_controls(
         controls: download::DownloadControls,
     ) -> CycleResult {
-        let config = make_run_cycle_config();
-        let db = make_state_db();
-        let download_dir = tempfile::tempdir().expect("download tempdir");
-        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-
-        let lib_state = make_run_cycle_library_state_with_album(
-            "PrimarySync",
-            "sync_token:PrimarySync",
+        run_full_cycle_with_album(
             make_one_photo_full_album_for_zone("PrimarySync", "zone-tok-one"),
-        );
-        let states = vec![&lib_state];
-        let build_download_config =
-            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
-
-        run_cycle(
-            &states,
-            &config,
-            Some(db.as_ref()),
             false,
-            &build_download_config,
             controls,
-            &shared_session,
-            &CancellationToken::new(),
         )
         .await
-        .expect("run cycle")
     }
+
+    const ZERO_ASSET_WARNING_PREFIX: &str = "Sync completed after enumerating zero assets";
 
     #[test]
     fn count_passes_empty_plan_is_all_zero() {
@@ -4636,7 +4628,7 @@ mod tests {
         assert_eq!(result.failed_count, 0);
         assert_eq!(result.stats.assets_seen, 0);
         assert!(
-            logs_contain("Sync completed after enumerating zero assets"),
+            logs_contain(ZERO_ASSET_WARNING_PREFIX),
             "completed full sync with zero assets should be visible in normal logs"
         );
         assert!(
@@ -4657,7 +4649,7 @@ mod tests {
         assert_eq!(result.failed_count, 0);
         assert_eq!(result.stats.assets_seen, 0);
         assert!(
-            !logs_contain("Sync completed after enumerating zero assets"),
+            !logs_contain(ZERO_ASSET_WARNING_PREFIX),
             "retry-failed no-op cycles must stay quiet"
         );
     }
@@ -4704,7 +4696,7 @@ mod tests {
         assert_eq!(result.failed_count, 0);
         assert_eq!(result.stats.assets_seen, 0);
         assert!(
-            logs_contain("Sync completed after enumerating zero assets"),
+            logs_contain(ZERO_ASSET_WARNING_PREFIX),
             "incremental requests that fall back to full enumeration must warn"
         );
     }
@@ -4757,7 +4749,7 @@ mod tests {
         assert_eq!(result.failed_count, 0);
         assert_eq!(result.stats.assets_seen, 1);
         assert!(
-            logs_contain("Sync completed after enumerating zero assets"),
+            logs_contain(ZERO_ASSET_WARNING_PREFIX),
             "empty library must warn even when the cycle-wide asset count is nonzero"
         );
         assert!(
@@ -4776,7 +4768,7 @@ mod tests {
         assert_eq!(result.failed_count, 0);
         assert_eq!(result.stats.assets_seen, 0);
         assert!(
-            !logs_contain("Sync completed after enumerating zero assets"),
+            !logs_contain(ZERO_ASSET_WARNING_PREFIX),
             "dry-run asset scans must not warn just because assets_seen stays zero"
         );
     }
@@ -4793,7 +4785,7 @@ mod tests {
         assert_eq!(result.failed_count, 0);
         assert_eq!(result.stats.assets_seen, 0);
         assert!(
-            !logs_contain("Sync completed after enumerating zero assets"),
+            !logs_contain(ZERO_ASSET_WARNING_PREFIX),
             "print-only asset scans must not warn just because assets_seen stays zero"
         );
     }
