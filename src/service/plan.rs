@@ -66,6 +66,10 @@ impl InstallPlan {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "platform backend modules are compiled cross-platform; Windows builds do not call the macOS rejection helper"
+)]
 pub(crate) fn reject_macos_system_install() -> Result<()> {
     bail!(
         "macOS only ships a per-user LaunchAgent; \

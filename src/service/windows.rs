@@ -28,7 +28,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 
 use crate::cli::UninstallArgs;
 use crate::service::env::{
@@ -676,21 +676,21 @@ mod scm_impl {
     use super::*;
 
     pub(super) async fn install(_inputs: &ServiceInfoInputs<'_>, _password: &str) -> Result<()> {
-        bail!(
+        anyhow::bail!(
             "internal error: Windows install path reached on a non-Windows target; \
              this is a build configuration bug"
         )
     }
 
     pub(super) async fn uninstall_existing() -> Result<bool> {
-        bail!(
+        anyhow::bail!(
             "internal error: Windows uninstall path reached on a non-Windows target; \
              this is a build configuration bug"
         )
     }
 
     pub(super) async fn probe() -> Result<StatusInputs> {
-        bail!(
+        anyhow::bail!(
             "internal error: Windows status path reached on a non-Windows target; \
              this is a build configuration bug"
         )
