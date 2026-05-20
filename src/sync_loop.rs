@@ -4166,13 +4166,14 @@ mod tests {
                 .with_download_dir_replaced_on_upsert(download_root.clone()),
         );
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let master_record_name = "master-mid-sync-destination-fault";
         let album = make_full_album_with_session(
             "PrimarySync",
             crate::test_helpers::MockPhotosSession::new()
                 .ok(album_count_response(1))
                 .ok(full_album_page_with_download(
                     "PrimarySync",
-                    "master-mid-sync-destination-fault",
+                    master_record_name,
                     "zone-tok-after-fault",
                     "https://p01.icloud-content.com/mid-sync-destination-unavailable.jpg",
                     8,
@@ -4228,6 +4229,11 @@ mod tests {
         assert!(
             logs_contain("Download failed") && logs_contain(&root),
             "download failure log should include the target path context under {root}"
+        );
+        assert!(
+            logs_contain("Download failed")
+                && logs_contain(&format!("asset_id={master_record_name}")),
+            "download failure log should include structured asset_id={master_record_name}"
         );
 
         if download_root.is_file() {
