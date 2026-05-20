@@ -2632,6 +2632,14 @@ mod tests {
             }
         }
 
+        fn without_set_failure(inner: Arc<dyn state::StateDb>, message: &'static str) -> Self {
+            Self::new(
+                inner,
+                MetadataSetFailure::Exact("__unused_metadata_key__"),
+                message,
+            )
+        }
+
         fn with_get_failure(mut self, failure: MetadataSetFailure) -> Self {
             self.get_failure = Some(failure);
             self
@@ -3625,12 +3633,8 @@ mod tests {
             .await
             .expect("seed token");
         let db: Arc<dyn state::StateDb> = Arc::new(
-            FailingMetadataSetDb::new(
-                inner,
-                MetadataSetFailure::Exact("__unused_metadata_key__"),
-                "simulated zone-token read failure",
-            )
-            .with_get_failure(MetadataSetFailure::Exact("sync_token:PrimarySync")),
+            FailingMetadataSetDb::without_set_failure(inner, "simulated zone-token read failure")
+                .with_get_failure(MetadataSetFailure::Exact("sync_token:PrimarySync")),
         );
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
@@ -3661,12 +3665,8 @@ mod tests {
             .await
             .expect("seed db token");
         let db: Arc<dyn state::StateDb> = Arc::new(
-            FailingMetadataSetDb::new(
-                inner,
-                MetadataSetFailure::Exact("__unused_metadata_key__"),
-                "simulated db-token read failure",
-            )
-            .with_get_failure(MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY)),
+            FailingMetadataSetDb::without_set_failure(inner, "simulated db-token read failure")
+                .with_get_failure(MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY)),
         );
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
@@ -4270,9 +4270,8 @@ mod tests {
             .await
             .expect("seed zone token");
         let db: Arc<dyn state::StateDb> = Arc::new(
-            FailingMetadataSetDb::new(
+            FailingMetadataSetDb::without_set_failure(
                 Arc::clone(&inner),
-                MetadataSetFailure::Exact("__unused_metadata_key__"),
                 "simulated token purge failure",
             )
             .with_delete_prefix_failure(SYNC_TOKEN_PREFIX),
@@ -4349,12 +4348,8 @@ mod tests {
             .expect("seed zone token");
         let shutdown_token = CancellationToken::new();
         let db: Arc<dyn state::StateDb> = Arc::new(
-            FailingMetadataSetDb::new(
-                Arc::clone(&inner),
-                MetadataSetFailure::Exact("__unused_metadata_key__"),
-                "unused",
-            )
-            .with_cancel_on_upsert(shutdown_token.clone()),
+            FailingMetadataSetDb::without_set_failure(Arc::clone(&inner), "unused")
+                .with_cancel_on_upsert(shutdown_token.clone()),
         );
         let download_dir = tempfile::tempdir().expect("download tempdir");
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -4800,9 +4795,8 @@ mod tests {
             .await
             .expect("seed zone token");
         let db: Arc<dyn state::StateDb> = Arc::new(
-            FailingMetadataSetDb::new(
+            FailingMetadataSetDb::without_set_failure(
                 Arc::clone(&inner),
-                MetadataSetFailure::Exact("__unused_metadata_key__"),
                 "simulated token purge failure",
             )
             .with_delete_prefix_failure(SYNC_TOKEN_PREFIX),
