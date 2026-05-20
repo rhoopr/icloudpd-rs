@@ -121,3 +121,21 @@ fn full_test_routes_child_tempdirs_to_repo_scratch() {
         "TMPDIR must be set before live cargo and shell phases allocate tempdirs"
     );
 }
+
+#[test]
+fn live_import_smoke_uses_toml_directory() {
+    let smokes = repo_file("scripts/full-test/run_live_smokes.sh");
+
+    assert!(
+        smokes.contains("import-existing --dry-run --recent 5 --config \"$sync_config\""),
+        "import-existing live smoke must pass the generated TOML config"
+    );
+    assert!(
+        !smokes.contains("import-existing --dry-run --recent 5 --download-dir"),
+        "import-existing live smoke must not use the removed --download-dir flag"
+    );
+    assert!(
+        smokes.contains(r#"${TMPDIR:-$repo_root/.scratch/full-test-tmp}/photos-test"#),
+        "live smoke download scratch should follow full-test's repo-local TMPDIR"
+    );
+}

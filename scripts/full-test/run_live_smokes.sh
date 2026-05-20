@@ -9,7 +9,7 @@
 # Optional env:
 #   KEI_TEST_DATA_DIR  cookie / db dir (default .test-cookies under repo)
 #   KEI_TEST_ALBUM     album name for sync dry-run (default kei-test)
-#   KEI_TEST_DOWNLOAD_DIR  scratch dir for sync/import dry-run (default /tmp/codex/photos-test)
+#   KEI_TEST_DOWNLOAD_DIR  scratch dir for sync/import dry-run (default under TMPDIR)
 #
 # Adding a new CLI subcommand: add a smoke line below. Don't add destructive
 # (reset) or interactive (login) commands -- they're covered elsewhere.
@@ -31,7 +31,7 @@ fi
 
 USR="${ICLOUD_USERNAME:-missing@example.invalid}"
 DD="${KEI_TEST_DATA_DIR:-$repo_root/.test-cookies}"
-DOWNLOAD_DIR="${KEI_TEST_DOWNLOAD_DIR:-/tmp/codex/photos-test}"
+DOWNLOAD_DIR="${KEI_TEST_DOWNLOAD_DIR:-${TMPDIR:-$repo_root/.scratch/full-test-tmp}/photos-test}"
 mkdir -p "$DOWNLOAD_DIR"
 
 sync_config="$(kei_write_sync_config "$DD" "$DOWNLOAD_DIR")"
@@ -62,4 +62,4 @@ run live_config_show       env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binar
 run live_verify            bash -c verify_wrapper
 run live_reconcile_dryrun  env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" reconcile --dry-run
 run live_password_backend  env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" password backend
-run live_import_dryrun     env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" import-existing --dry-run --recent 5 --download-dir "$DOWNLOAD_DIR"
+run live_import_dryrun     env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" import-existing --dry-run --recent 5 --config "$sync_config"
