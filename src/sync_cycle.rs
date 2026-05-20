@@ -322,13 +322,12 @@ pub(crate) async fn run_cycle(
             );
         }
 
-        // Store sync token only when all downloads succeeded.
-        // For full sync this is safe (state DB tracks individual failures for retry).
-        // For incremental sync, advancing the token on partial failure would lose
-        // change events for failed assets -- they'd never appear in the next delta.
-        // Note: the token is stored after download_photos_with_sync returns, which
-        // means all batch flushes are complete. A crash here means the token is
-        // NOT advanced, so assets will replay on next sync (safe, not data loss).
+        // Store the zone token only after the download engine has returned a
+        // clean result and flushed all batch state writes. `Success` excludes
+        // partial failures; the extra interrupted and shutdown gates below
+        // catch cancellation paths that can still carry a token. A crash
+        // before this metadata write leaves the old token in place, so the
+        // zone replays next cycle instead of skipping unfinalized work.
         let should_store_token = should_store_sync_token_for_cycle(
             &sync_result.outcome,
             config.runtime.dry_run,
