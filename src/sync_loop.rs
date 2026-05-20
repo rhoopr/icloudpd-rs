@@ -1364,22 +1364,33 @@ async fn check_changes_database(
         return WatchPrecheck::SkipAll;
     }
     for lib_state in library_states {
-        let has_token = db
-            .get_metadata(&lib_state.sync_token_key)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|t| !t.is_empty());
+        let has_token = match db.get_metadata(&lib_state.sync_token_key).await {
+            Ok(token) => token.is_some_and(|t| !t.is_empty()),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    zone = %lib_state.zone_name,
+                    metadata_key = %lib_state.sync_token_key,
+                    "Failed to read zone sync token; proceeding with sync"
+                );
+                return WatchPrecheck::proceed_all();
+            }
+        };
         if !has_token {
             return WatchPrecheck::proceed_all();
         }
     }
-    let db_token = db
-        .get_metadata(DB_SYNC_TOKEN_KEY)
-        .await
-        .ok()
-        .flatten()
-        .filter(|t| !t.is_empty());
+    let db_token = match db.get_metadata(DB_SYNC_TOKEN_KEY).await {
+        Ok(token) => token.filter(|t| !t.is_empty()),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                metadata_key = DB_SYNC_TOKEN_KEY,
+                "Failed to read changes/database sync token; proceeding with sync"
+            );
+            return WatchPrecheck::proceed_all();
+        }
+    };
     match photos_service.changes_database(db_token.as_deref()).await {
         Ok(db_resp) => {
             let selected_zones: rustc_hash::FxHashSet<&str> = library_states
@@ -2564,6 +2575,7 @@ mod tests {
     struct FailingMetadataSetDb {
         inner: Arc<dyn state::StateDb>,
         failure: MetadataSetFailure,
+        get_failure: Option<MetadataSetFailure>,
         delete_prefix_failure: Option<&'static str>,
         message: &'static str,
         cancel_on_upsert: Option<CancellationToken>,
@@ -2573,6 +2585,7 @@ mod tests {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("FailingMetadataSetDb")
                 .field("failure", &self.failure)
+                .field("get_failure", &self.get_failure)
                 .field("delete_prefix_failure", &self.delete_prefix_failure)
                 .field("message", &self.message)
                 .finish_non_exhaustive()
@@ -2588,10 +2601,16 @@ mod tests {
             Self {
                 inner,
                 failure,
+                get_failure: None,
                 delete_prefix_failure: None,
                 message,
                 cancel_on_upsert: None,
             }
+        }
+
+        fn with_get_failure(mut self, failure: MetadataSetFailure) -> Self {
+            self.get_failure = Some(failure);
+            self
         }
 
         fn with_delete_prefix_failure(mut self, prefix: &'static str) -> Self {
@@ -2794,7 +2813,11 @@ mod tests {
             &self,
             key: &str,
         ) -> Result<Option<String>, state::error::StateError> {
-            self.inner.get_metadata(key).await
+            if self.get_failure.is_some_and(|failure| failure.matches(key)) {
+                Err(state::error::StateError::LockPoisoned(self.message.into()))
+            } else {
+                self.inner.get_metadata(key).await
+            }
         }
 
         async fn set_metadata(
@@ -3563,6 +3586,74 @@ mod tests {
                 }
             ),
             "no stored token must continue without a changes/database call"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_changes_database_zone_token_read_failure_proceeds_without_precheck() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed token");
+        let db: Arc<dyn state::StateDb> = Arc::new(
+            FailingMetadataSetDb::new(
+                inner,
+                MetadataSetFailure::Exact("__unused_metadata_key__"),
+                "simulated zone-token read failure",
+            )
+            .with_get_failure(MetadataSetFailure::Exact("sync_token:PrimarySync")),
+        );
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let precheck =
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+
+        assert_eq!(
+            precheck,
+            WatchPrecheck::proceed_all(),
+            "metadata read failure should fall back to the safe full cycle path"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_changes_database_db_token_read_failure_proceeds_without_precheck() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        inner
+            .set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
+            .await
+            .expect("seed db token");
+        let db: Arc<dyn state::StateDb> = Arc::new(
+            FailingMetadataSetDb::new(
+                inner,
+                MetadataSetFailure::Exact("__unused_metadata_key__"),
+                "simulated db-token read failure",
+            )
+            .with_get_failure(MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY)),
+        );
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let precheck =
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+
+        assert_eq!(
+            precheck,
+            WatchPrecheck::proceed_all(),
+            "db token read failure should fall back to the safe full cycle path"
         );
     }
 
