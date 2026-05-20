@@ -1,0 +1,316 @@
+//! Asset-to-task planning shared by full, incremental, dry-run, and cleanup
+//! paths.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
+
+use crate::icloud::photos::PhotoAsset;
+use crate::state::{AssetRecord, StateDb};
+
+use super::filter::{
+    determine_media_type, filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
+    DownloadTask, FilterReason, NormalizedPath,
+};
+use super::paths;
+use super::DownloadConfig;
+
+/// Mutable path-planning state carried across assets in one pass.
+#[derive(Debug)]
+pub(super) struct TaskPlanner {
+    claimed_paths: FxHashMap<NormalizedPath, u64>,
+    dir_cache: paths::DirCache,
+}
+
+impl TaskPlanner {
+    pub(super) fn new() -> Self {
+        Self {
+            claimed_paths: FxHashMap::default(),
+            dir_cache: paths::DirCache::new(),
+        }
+    }
+
+    /// Convert one asset into download tasks after applying the shared
+    /// asset-level filters and path-aware on-disk checks.
+    pub(super) async fn plan_asset(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> AssetTaskPlan {
+        if let Some(filter_reason) = is_asset_filtered(asset, config) {
+            return AssetTaskPlan {
+                tasks: SmallVec::new(),
+                filter_reason: Some(filter_reason),
+            };
+        }
+
+        pre_ensure_asset_dir(&mut self.dir_cache, asset, config).await;
+        let tasks =
+            filter_asset_to_tasks(asset, config, &mut self.claimed_paths, &mut self.dir_cache);
+        AssetTaskPlan {
+            tasks,
+            filter_reason: None,
+        }
+    }
+
+    pub(super) fn existing_path_match(&mut self, path: &Path) -> ExistingPathMatch {
+        if self.dir_cache.exists(path) {
+            ExistingPathMatch::Exact
+        } else if self.dir_cache.find_ampm_variant(path).is_some() {
+            ExistingPathMatch::AmpmVariant
+        } else {
+            ExistingPathMatch::Missing
+        }
+    }
+}
+
+/// Result of planning a single asset.
+#[derive(Debug)]
+pub(super) struct AssetTaskPlan {
+    pub(super) tasks: SmallVec<[DownloadTask; 5]>,
+    pub(super) filter_reason: Option<FilterReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExistingPathMatch {
+    Exact,
+    AmpmVariant,
+    Missing,
+}
+
+/// Persist the pending state row that a later `mark_downloaded` /
+/// `mark_failed` call will finalize.
+pub(super) async fn upsert_seen_for_task(
+    db: &dyn StateDb,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    task: &DownloadTask,
+) -> Result<(), crate::state::error::StateError> {
+    let media_type = determine_media_type(task.version_size, asset);
+    let record = AssetRecord::new_pending(
+        Arc::clone(&config.library),
+        task.asset_id.to_string(),
+        task.version_size,
+        task.checksum.to_string(),
+        task.download_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("")
+            .to_string(),
+        asset.created(),
+        Some(asset.added_date()),
+        task.size,
+        media_type,
+    )
+    .with_metadata_arc(asset.metadata_arc());
+    db.upsert_seen(&record).await
+}
+
+/// Record an asset's membership in the current concrete album/smart-folder
+/// pass. Returns `Ok(false)` when the pass is not album-scoped.
+pub(super) async fn record_album_membership_if_named(
+    db: &dyn StateDb,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+) -> Result<(), crate::state::error::StateError> {
+    let Some(album_name) = config.album_name.as_deref().filter(|name| !name.is_empty()) else {
+        return Ok(());
+    };
+    add_asset_album_with_retry(db, &config.library, asset.id(), album_name, "icloud").await
+}
+
+/// Bounded retry attempts for `add_asset_album`. SQLite-busy under WAL
+/// contention is the dominant transient failure; three attempts at
+/// 200ms / 400ms / 800ms cover the common case while staying short enough
+/// that a wedged DB doesn't stall the producer indefinitely. After retries
+/// are exhausted the caller logs the persistent failure.
+pub(super) const ADD_ASSET_ALBUM_MAX_RETRIES: u32 = 3;
+
+/// Insert an asset/album row with a bounded inline retry loop. The
+/// underlying call is `INSERT OR IGNORE` so retries are idempotent. Returns
+/// the final result so the caller can log on persistent failure.
+pub(super) async fn add_asset_album_with_retry(
+    db: &dyn StateDb,
+    library: &str,
+    asset_id: &str,
+    album_name: &str,
+    source: &str,
+) -> Result<(), crate::state::error::StateError> {
+    use rand::RngExt;
+    let mut last_err: Option<crate::state::error::StateError> = None;
+    for attempt in 1..=ADD_ASSET_ALBUM_MAX_RETRIES {
+        match db
+            .add_asset_album(library, asset_id, album_name, source)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if attempt < ADD_ASSET_ALBUM_MAX_RETRIES {
+                    tracing::debug!(
+                        asset_id,
+                        album = album_name,
+                        library,
+                        attempt,
+                        error = %e,
+                        "add_asset_album retry"
+                    );
+                    let base_ms = 200u64 * u64::from(1u32 << (attempt - 1));
+                    let jitter_ms = rand::rng().random_range(0..base_ms.max(1) / 4);
+                    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    // ADD_ASSET_ALBUM_MAX_RETRIES is `>= 1` (compile-time-checked below) so
+    // `last_err` is always populated when the loop exits. The fallback to
+    // `LockPoisoned` is a defensive landing the type system cannot otherwise
+    // statically rule out.
+    Err(last_err.unwrap_or_else(|| {
+        crate::state::error::StateError::LockPoisoned(
+            "add_asset_album_with_retry: no attempts ran".into(),
+        )
+    }))
+}
+
+const _: () = assert!(
+    ADD_ASSET_ALBUM_MAX_RETRIES >= 1,
+    "ADD_ASSET_ALBUM_MAX_RETRIES must be at least 1; otherwise the retry helper never calls the DB"
+);
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rustc_hash::FxHashSet;
+    use tempfile::TempDir;
+
+    use crate::commands::{AlbumPass, PassKind};
+    use crate::icloud::photos::PhotoAlbum;
+    use crate::state::{SqliteStateDb, StateDb};
+    use crate::test_helpers::TestPhotoAsset;
+
+    use super::*;
+
+    fn test_config(root: &std::path::Path) -> DownloadConfig {
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(root);
+        config.folder_structure = "%Y/%m/%d".to_string();
+        config.folder_structure_albums = Arc::from("{album}/%Y/%m/%d");
+        config
+    }
+
+    fn make_pass(kind: PassKind, name: &str) -> AlbumPass {
+        AlbumPass {
+            kind,
+            album: PhotoAlbum::stub_for_test(Arc::from(name)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }
+    }
+
+    #[tokio::test]
+    async fn planner_uses_per_pass_album_path() {
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(tmp.path());
+        let pass_config = base.with_pass(&make_pass(PassKind::Album, "Vacation"));
+        let asset = TestPhotoAsset::new("ALBUM_PATH")
+            .filename("IMG_0001.JPG")
+            .build();
+
+        let mut planner = TaskPlanner::new();
+        let plan = planner.plan_asset(&asset, &pass_config).await;
+
+        assert_eq!(plan.filter_reason, None);
+        assert_eq!(plan.tasks.len(), 1);
+        assert!(
+            plan.tasks[0]
+                .download_path
+                .strip_prefix(tmp.path())
+                .unwrap()
+                .starts_with("Vacation"),
+            "album pass must route through the expanded album folder"
+        );
+    }
+
+    #[tokio::test]
+    async fn planner_applies_filename_date_media_and_unfiled_exclusions() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.filename_exclude = Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
+        let asset = TestPhotoAsset::new("FILTERED_NAME")
+            .filename("IMG_0001.AAE")
+            .build();
+        let mut planner = TaskPlanner::new();
+        let plan = planner.plan_asset(&asset, &config).await;
+        assert_eq!(plan.filter_reason, Some(FilterReason::Filename));
+
+        let mut config = test_config(tmp.path());
+        config.media.photos = false;
+        let asset = TestPhotoAsset::new("FILTERED_MEDIA").build();
+        let mut planner = TaskPlanner::new();
+        let plan = planner.plan_asset(&asset, &config).await;
+        assert_eq!(plan.filter_reason, Some(FilterReason::MediaType));
+
+        let mut config = test_config(tmp.path());
+        config.exclude_asset_ids = Arc::new(FxHashSet::from_iter(["EXCLUDED".to_string()]));
+        let asset = TestPhotoAsset::new("EXCLUDED").build();
+        let mut planner = TaskPlanner::new();
+        let plan = planner.plan_asset(&asset, &config).await;
+        assert_eq!(plan.filter_reason, Some(FilterReason::ExcludedAlbum));
+    }
+
+    #[tokio::test]
+    async fn planner_skips_existing_same_size_file_on_disk() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let asset = TestPhotoAsset::new("ON_DISK")
+            .filename("IMG_0002.JPG")
+            .orig_size(1000)
+            .build();
+
+        let mut first = TaskPlanner::new();
+        let plan = first.plan_asset(&asset, &config).await;
+        assert_eq!(plan.tasks.len(), 1);
+        let path = plan.tasks[0].download_path.clone();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, vec![0u8; 1000]).await.unwrap();
+
+        let mut second = TaskPlanner::new();
+        let plan = second.plan_asset(&asset, &config).await;
+        assert_eq!(plan.filter_reason, None);
+        assert!(plan.tasks.is_empty(), "existing same-size file should skip");
+    }
+
+    #[tokio::test]
+    async fn planner_upserts_seen_and_records_album_membership() {
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(tmp.path());
+        let pass_config = base.with_pass(&make_pass(PassKind::Album, "Family"));
+        let asset = TestPhotoAsset::new("STATEFUL")
+            .filename("IMG_0003.JPG")
+            .build();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let mut planner = TaskPlanner::new();
+        let plan = planner.plan_asset(&asset, &pass_config).await;
+        assert_eq!(plan.tasks.len(), 1);
+        upsert_seen_for_task(&db, &pass_config, &asset, &plan.tasks[0])
+            .await
+            .unwrap();
+        record_album_membership_if_named(&db, &pass_config, &asset)
+            .await
+            .unwrap();
+
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id.as_ref(), "STATEFUL");
+        let albums = db.get_all_asset_albums(&pass_config.library).await.unwrap();
+        assert_eq!(albums, vec![("STATEFUL".to_string(), "Family".to_string())]);
+    }
+}

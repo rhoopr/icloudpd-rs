@@ -6,12 +6,14 @@
 pub mod error;
 pub mod file;
 pub(crate) mod filter;
+pub(crate) mod finalize;
 #[cfg(feature = "xmp")]
 pub(crate) mod heif;
 pub(crate) mod limiter;
 pub mod metadata;
 pub mod paths;
 pub(crate) mod pipeline;
+pub(crate) mod planner;
 pub(crate) mod recap;
 
 pub(crate) use limiter::BandwidthLimiter;
@@ -24,7 +26,7 @@ use pipeline::{
 
 pub(crate) use filter::determine_media_type;
 pub(crate) use filter::AssetGroupings;
-use filter::{filter_asset_to_tasks, pre_ensure_asset_dir, DownloadTask, NormalizedPath};
+use filter::DownloadTask;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -40,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::{PhotoAsset, SyncTokenError};
 use crate::retry::RetryConfig;
-use crate::state::{AssetRecord, StateDb, VersionSizeKey};
+use crate::state::{StateDb, VersionSizeKey};
 use crate::types::{
     AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
     RawPolicy,
@@ -275,6 +277,16 @@ impl SkipBreakdown {
         self.duplicates += other.duplicates;
         self.retry_exhausted += other.retry_exhausted;
         self.retry_only += other.retry_only;
+    }
+
+    pub(crate) fn record_filter_reason(&mut self, reason: filter::FilterReason) {
+        match reason {
+            filter::FilterReason::ExcludedAlbum => self.by_excluded_album += 1,
+            filter::FilterReason::MediaType => self.by_media_type += 1,
+            filter::FilterReason::LivePhoto => self.by_live_photo += 1,
+            filter::FilterReason::DateRange => self.by_date_range += 1,
+            filter::FilterReason::Filename => self.by_filename += 1,
+        }
     }
 }
 
@@ -1238,8 +1250,7 @@ async fn build_download_tasks(
         .await;
 
     let mut tasks: Vec<DownloadTask> = Vec::new();
-    let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-    let mut dir_cache = paths::DirCache::new();
+    let mut task_planner = planner::TaskPlanner::new();
     for pass_result in pass_results {
         let (pass_index, assets) = pass_result?;
         #[allow(
@@ -1250,16 +1261,11 @@ async fn build_download_tasks(
         let pass_config = &pass_configs[pass_index];
 
         for asset in &assets {
-            if filter::is_asset_filtered(asset, pass_config).is_some() {
+            let plan = task_planner.plan_asset(asset, pass_config).await;
+            if plan.filter_reason.is_some() {
                 continue;
             }
-            pre_ensure_asset_dir(&mut dir_cache, asset, pass_config).await;
-            tasks.extend(filter_asset_to_tasks(
-                asset,
-                pass_config,
-                &mut claimed_paths,
-                &mut dir_cache,
-            ));
+            tasks.extend(plan.tasks);
         }
     }
 
@@ -2109,8 +2115,7 @@ async fn download_photos_incremental(
     // applied. Configs are cached per pass index to avoid redundant
     // allocations when many assets flow through the same pass.
     let mut tasks: Vec<DownloadTask> = Vec::new();
-    let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-    let mut dir_cache = paths::DirCache::new();
+    let mut task_planner = planner::TaskPlanner::new();
     let mut skip_breakdown = SkipBreakdown::default();
     let pass_configs = build_pass_configs(passes, config);
 
@@ -2122,46 +2127,20 @@ async fn download_photos_incremental(
         )]
         let effective_config = &pass_configs[*pass_index];
 
-        if let Some(reason) = filter::is_asset_filtered(asset, effective_config) {
-            match reason {
-                filter::FilterReason::ExcludedAlbum => skip_breakdown.by_excluded_album += 1,
-                filter::FilterReason::MediaType => skip_breakdown.by_media_type += 1,
-                filter::FilterReason::LivePhoto => skip_breakdown.by_live_photo += 1,
-                filter::FilterReason::DateRange => skip_breakdown.by_date_range += 1,
-                filter::FilterReason::Filename => skip_breakdown.by_filename += 1,
-            }
+        let plan = task_planner.plan_asset(asset, effective_config).await;
+        if let Some(reason) = plan.filter_reason {
+            skip_breakdown.record_filter_reason(reason);
             continue;
         }
-
-        // Path-aware on-disk verification only; a DB-only fast-skip would
-        // miss user-deleted files on the incremental path.
-        pre_ensure_asset_dir(&mut dir_cache, asset, effective_config).await;
-        let asset_tasks =
-            filter_asset_to_tasks(asset, effective_config, &mut claimed_paths, &mut dir_cache);
 
         // Upsert state records so mark_downloaded/mark_failed can find them.
         // Without this, the UPDATE in mark_downloaded matches 0 rows and the
         // file ends up on disk but untracked in the state DB.
         if let Some(db) = &config.state_db {
-            for task in &asset_tasks {
-                let media_type = determine_media_type(task.version_size, asset);
-                let record = AssetRecord::new_pending(
-                    Arc::clone(&config.library),
-                    task.asset_id.to_string(),
-                    task.version_size,
-                    task.checksum.to_string(),
-                    task.download_path
-                        .file_name()
-                        .and_then(|f| f.to_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    asset.created(),
-                    Some(asset.added_date()),
-                    task.size,
-                    media_type,
-                )
-                .with_metadata_arc(asset.metadata_arc());
-                if let Err(e) = db.upsert_seen(&record).await {
+            for task in &plan.tasks {
+                if let Err(e) =
+                    planner::upsert_seen_for_task(db.as_ref(), effective_config, asset, task).await
+                {
                     tracing::warn!(
                         asset_id = %task.asset_id,
                         error = %e,
@@ -2172,20 +2151,11 @@ async fn download_photos_incremental(
             // Record this asset's membership in the current album so
             // consumers (EXIF keywords, XMP sidecars, Immich albums) can
             // reconstruct the logical album graph from the state DB.
-            if let Some(album_name) = effective_config
-                .album_name
-                .as_deref()
-                .filter(|n| !n.is_empty())
+            if let Err(e) =
+                planner::record_album_membership_if_named(db.as_ref(), effective_config, asset)
+                    .await
             {
-                if let Err(e) = pipeline::add_asset_album_with_retry(
-                    db.as_ref(),
-                    &effective_config.library,
-                    asset.id(),
-                    album_name,
-                    "icloud",
-                )
-                .await
-                {
+                if let Some(album_name) = effective_config.album_name.as_deref() {
                     tracing::warn!(
                         asset_id = %asset.id(),
                         album = %album_name,
@@ -2197,10 +2167,10 @@ async fn download_photos_incremental(
             }
         }
 
-        if asset_tasks.is_empty() {
+        if plan.tasks.is_empty() {
             skip_breakdown.on_disk += 1;
         }
-        tasks.extend(asset_tasks);
+        tasks.extend(plan.tasks);
     }
 
     if skip_breakdown.by_state > 0 {

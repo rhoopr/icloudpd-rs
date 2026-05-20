@@ -12,24 +12,36 @@ use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::PhotoAsset;
 use crate::retry::RetryConfig;
-use crate::state::{AssetRecord, StateDb, SyncRunStats, VersionSizeKey};
+use crate::state::{StateDb, SyncRunStats, VersionSizeKey};
 
 use super::error::DownloadError;
 #[cfg_attr(not(feature = "xmp"), allow(unused_imports))]
 use super::filter::MetadataPayload;
-use super::filter::{
-    determine_media_type, extract_skip_candidates, filter_asset_to_tasks, is_asset_filtered,
-    pre_ensure_asset_dir, DownloadTask, FilterReason, NormalizedPath,
+use super::filter::{extract_skip_candidates, is_asset_filtered, DownloadTask};
+#[cfg(test)]
+use super::finalize::update_metadata_marker_for_test as update_metadata_marker;
+use super::finalize::{
+    check_state_write_circuit_breaker, finalize_downloaded, finalize_failed,
+    flush_pending_state_writes, flush_pending_state_writes_retaining_failures,
+    state_db_unwritable_error, state_write_circuit_breaker_tripped, DownloadedFinalization,
+    PendingStateWrite, StateWriteFlush,
 };
+#[cfg(test)]
+use super::finalize::{STATE_DB_UNWRITABLE_THRESHOLD, STATE_WRITE_MAX_RETRIES};
+#[cfg(test)]
+use super::planner::add_asset_album_with_retry;
+#[cfg(test)]
+use super::planner::ADD_ASSET_ALBUM_MAX_RETRIES;
+use super::planner::{self, ExistingPathMatch, TaskPlanner};
 use super::{
-    paths, DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome, DownloadReporting,
+    DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome, DownloadReporting,
 };
 
 /// Outcome of `batch_forecast_decision` — either keep queueing, emit a
@@ -141,6 +153,16 @@ impl ProducerSkipSummary {
             + self.retry_exhausted
             + self.retry_only
     }
+
+    fn record_filter_reason(&mut self, reason: super::filter::FilterReason) {
+        match reason {
+            super::filter::FilterReason::ExcludedAlbum => self.by_excluded_album += 1,
+            super::filter::FilterReason::MediaType => self.by_media_type += 1,
+            super::filter::FilterReason::LivePhoto => self.by_live_photo += 1,
+            super::filter::FilterReason::DateRange => self.by_date_range += 1,
+            super::filter::FilterReason::Filename => self.by_filename += 1,
+        }
+    }
 }
 
 impl std::ops::AddAssign for ProducerSkipSummary {
@@ -213,139 +235,6 @@ pub(super) struct StreamingResult {
 /// Counted cumulatively across both phases (streaming + cleanup).
 pub(super) const AUTH_ERROR_THRESHOLD: usize = 3;
 
-/// A successful download whose state write to SQLite failed on first attempt.
-/// Accumulated during the download loop and retried in a final flush.
-#[derive(Debug)]
-struct PendingStateWrite {
-    library: Arc<str>,
-    asset_id: Arc<str>,
-    version_size: crate::state::VersionSizeKey,
-    download_path: PathBuf,
-    local_checksum: String,
-    download_checksum: Option<String>,
-}
-
-/// Maximum retry attempts for deferred state writes.
-const STATE_WRITE_MAX_RETRIES: u32 = 6;
-const _: () = assert!(STATE_WRITE_MAX_RETRIES <= 32, "shift overflow in backoff");
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct StateWriteFlush {
-    attempted: usize,
-    failures: usize,
-}
-
-/// Bounded retry attempts for `add_asset_album`. SQLite-busy under WAL
-/// contention is the dominant transient failure; three attempts at
-/// 200ms / 400ms / 800ms cover the common case while staying short enough
-/// that a wedged DB doesn't stall the producer indefinitely. After the
-/// retries are exhausted the call falls through to a `warn!` (preserving
-/// existing behaviour) and album membership self-heals on the next
-/// enumeration.
-const ADD_ASSET_ALBUM_MAX_RETRIES: u32 = 3;
-
-/// Insert an asset/album row with a bounded inline retry loop. The
-/// underlying call is `INSERT OR IGNORE` so retries are idempotent. Returns
-/// the final result so the caller can log on persistent failure.
-///
-/// The retry shape mirrors `flush_pending_state_writes` (200ms × 2^attempt
-/// plus 0..base/4 jitter) rather than introducing a new primitive. The
-/// jitter spreads simultaneous retries from concurrent producers so they
-/// don't re-collide on the same SQLite lock.
-pub(super) async fn add_asset_album_with_retry(
-    db: &dyn StateDb,
-    library: &str,
-    asset_id: &str,
-    album_name: &str,
-    source: &str,
-) -> Result<(), crate::state::error::StateError> {
-    use rand::RngExt;
-    let mut last_err: Option<crate::state::error::StateError> = None;
-    for attempt in 1..=ADD_ASSET_ALBUM_MAX_RETRIES {
-        match db
-            .add_asset_album(library, asset_id, album_name, source)
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                if attempt < ADD_ASSET_ALBUM_MAX_RETRIES {
-                    tracing::debug!(
-                        asset_id,
-                        album = album_name,
-                        library,
-                        attempt,
-                        error = %e,
-                        "add_asset_album retry"
-                    );
-                    let base_ms = 200u64 * u64::from(1u32 << (attempt - 1));
-                    let jitter_ms = rand::rng().random_range(0..base_ms.max(1) / 4);
-                    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
-                }
-                last_err = Some(e);
-            }
-        }
-    }
-    // ADD_ASSET_ALBUM_MAX_RETRIES is `>= 1` (compile-time-checked below) so
-    // `last_err` is always populated when the loop exits. The fallback to
-    // `LockPoisoned` is a defensive landing the type system can't otherwise
-    // statically rule out.
-    Err(last_err.unwrap_or_else(|| {
-        crate::state::error::StateError::LockPoisoned(
-            "add_asset_album_with_retry: no attempts ran".into(),
-        )
-    }))
-}
-
-const _: () = assert!(
-    ADD_ASSET_ALBUM_MAX_RETRIES >= 1,
-    "ADD_ASSET_ALBUM_MAX_RETRIES must be at least 1; otherwise the retry helper never calls the DB"
-);
-
-/// Minimum pending-queue size at which a 100% flush failure rate is treated
-/// as "state DB unwritable" rather than a transient lock race. Five is large
-/// enough that a short flurry of lock contention won't trigger a bail, but
-/// small enough that a genuinely-wedged DB is caught before many more cycles
-/// of wasted downloads.
-const STATE_DB_UNWRITABLE_THRESHOLD: usize = 5;
-
-/// Set or clear the metadata-rewrite marker for an asset-version pair
-/// based on whether the EXIF/XMP writer succeeded. Shared by both
-/// mark_downloaded call sites (streaming loop and cleanup pass).
-async fn update_metadata_marker(
-    db: &dyn StateDb,
-    library: &str,
-    asset_id: &str,
-    version_size: &str,
-    exif_ok: bool,
-) {
-    if exif_ok {
-        if let Err(e) = db
-            .clear_metadata_write_failure(library, asset_id, version_size)
-            .await
-        {
-            tracing::warn!(
-                library,
-                asset_id,
-                version_size,
-                error = %e,
-                "Could not clear metadata-write-failed marker; asset will be \
-                 re-rewritten on next sync"
-            );
-        }
-        return;
-    }
-    if let Err(e) = db
-        .record_metadata_write_failure(library, asset_id, version_size)
-        .await
-    {
-        tracing::warn!(
-            asset_id,
-            error = %e,
-            "Could not set metadata-write-failed marker"
-        );
-    }
-}
-
 /// Persist a metadata-rewrite marker for each candidate version whose
 /// metadata drifted from the stored hash (or that already carries a marker
 /// from a prior sync). No-op when metadata writing is off or the state DB
@@ -384,165 +273,6 @@ async fn tag_metadata_rewrites(
             );
         }
     }
-}
-
-async fn retry_pending_state_write(
-    db: &dyn StateDb,
-    write: &PendingStateWrite,
-    pending_count: usize,
-) -> bool {
-    use rand::RngExt;
-
-    for attempt in 1..=STATE_WRITE_MAX_RETRIES {
-        match db
-            .mark_downloaded(
-                &write.library,
-                &write.asset_id,
-                write.version_size.as_str(),
-                &write.download_path,
-                &write.local_checksum,
-                write.download_checksum.as_deref(),
-            )
-            .await
-        {
-            Ok(()) => {
-                if attempt > 1 {
-                    tracing::info!(
-                        asset_id = %write.asset_id,
-                        pending_count,
-                        attempt,
-                        "Recovered deferred state write"
-                    );
-                }
-                return true;
-            }
-            Err(e) => {
-                if attempt < STATE_WRITE_MAX_RETRIES {
-                    tracing::info!(
-                        asset_id = %write.asset_id,
-                        pending_count,
-                        attempt,
-                        error = %e,
-                        "State write retry failed, will retry"
-                    );
-                    let base_ms = 200 * u64::from(1u32 << (attempt - 1));
-                    let jitter_ms = rand::rng().random_range(0..base_ms.max(1) / 4);
-                    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
-                } else {
-                    tracing::error!(
-                        asset_id = %write.asset_id,
-                        path = %write.download_path.display(),
-                        error = %e,
-                        "State write failed after {STATE_WRITE_MAX_RETRIES} attempts - \
-                         file on disk but untracked; next sync will detect it via \
-                         filesystem check and skip re-download"
-                    );
-                }
-            }
-        }
-    }
-    false
-}
-
-async fn flush_pending_state_writes_retaining_failures(
-    db: &dyn StateDb,
-    pending: &mut Vec<PendingStateWrite>,
-) -> StateWriteFlush {
-    if pending.is_empty() {
-        return StateWriteFlush::default();
-    }
-    let pending_count = pending.len();
-    tracing::info!(pending_count, "Retrying deferred state writes");
-
-    let mut failed = Vec::new();
-    for write in pending.drain(..) {
-        if !retry_pending_state_write(db, &write, pending_count).await {
-            failed.push(write);
-        }
-    }
-
-    let flush = StateWriteFlush {
-        attempted: pending_count,
-        failures: failed.len(),
-    };
-    *pending = failed;
-
-    if flush.failures > 0 {
-        tracing::warn!(
-            failures = flush.failures,
-            total = flush.attempted,
-            "Some state writes could not be saved"
-        );
-    } else {
-        tracing::debug!(
-            count = flush.attempted,
-            "All deferred state writes recovered"
-        );
-    }
-    flush
-}
-
-/// Retry all pending state writes that failed during the download loop.
-///
-/// Each write is attempted up to [`STATE_WRITE_MAX_RETRIES`] times with
-/// exponential backoff in the millisecond range (200ms × 2^attempt plus
-/// small jitter to avoid thundering-herd when multiple writes contend
-/// on the same `SQLite` WAL). `RetryConfig::delay_for_retry` is built
-/// for seconds-scale HTTP retries; the state-write grain is finer so
-/// this loop keeps its own scaling.
-///
-/// Returns the number of writes that still failed after all retries.
-async fn flush_pending_state_writes(db: &dyn StateDb, pending: &[PendingStateWrite]) -> usize {
-    if pending.is_empty() {
-        return 0;
-    }
-    let pending_count = pending.len();
-    tracing::info!(pending_count, "Retrying deferred state writes");
-
-    let mut failures = 0;
-    for write in pending {
-        if !retry_pending_state_write(db, write, pending_count).await {
-            failures += 1;
-        }
-    }
-
-    if failures > 0 {
-        tracing::warn!(
-            failures,
-            total = pending.len(),
-            "Some state writes could not be saved"
-        );
-    } else {
-        tracing::debug!(count = pending.len(), "All deferred state writes recovered");
-    }
-    failures
-}
-
-fn state_write_circuit_breaker_tripped(flush: &StateWriteFlush) -> bool {
-    flush.attempted >= STATE_DB_UNWRITABLE_THRESHOLD && flush.failures == flush.attempted
-}
-
-fn state_db_unwritable_error(pending_total: usize) -> anyhow::Error {
-    anyhow::anyhow!(
-        "State DB appears unwritable: all {pending_total} deferred state writes failed after \
-         {STATE_WRITE_MAX_RETRIES} retries each. Check disk space and permissions on the state \
-         DB file; halting sync to avoid re-downloading into an untracked tree."
-    )
-}
-
-async fn check_state_write_circuit_breaker(
-    db: &dyn StateDb,
-    pending: &mut Vec<PendingStateWrite>,
-) -> Option<anyhow::Error> {
-    if pending.len() < STATE_DB_UNWRITABLE_THRESHOLD {
-        return None;
-    }
-
-    let flush = flush_pending_state_writes_retaining_failures(db, pending).await;
-    if state_write_circuit_breaker_tripped(&flush) {
-        return Some(state_db_unwritable_error(flush.attempted));
-    }
-    None
 }
 
 /// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case
@@ -1133,8 +863,7 @@ where
 
         tokio::pin!(combined);
         let mut enum_errors = 0usize;
-        let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-        let mut dir_cache = paths::DirCache::new();
+        let mut task_planner = TaskPlanner::new();
         let mut shutdown_break = false;
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
@@ -1172,14 +901,12 @@ where
                         }
                     }
 
-                    pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
-                    let tasks =
-                        filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
+                    let plan = task_planner.plan_asset(&asset, config).await;
                     #[allow(
                         clippy::print_stdout,
                         reason = "--only-print-filenames writes target paths to stdout so callers can pipe to xargs/etc"
                     )]
-                    for task in &tasks {
+                    for task in &plan.tasks {
                         println!("{}", task.download_path.display());
                     }
                 }
@@ -1202,8 +929,7 @@ where
         tokio::pin!(combined);
         let mut count = 0usize;
         let mut enum_errors = 0usize;
-        let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-        let mut dir_cache = paths::DirCache::new();
+        let mut task_planner = TaskPlanner::new();
         let mut shutdown_break = false;
         while let Some(result) = combined.next().await {
             if shutdown_token.is_cancelled() {
@@ -1213,16 +939,14 @@ where
             }
             match result {
                 Ok(asset) => {
-                    if is_asset_filtered(&asset, config).is_some() {
+                    let plan = task_planner.plan_asset(&asset, config).await;
+                    if plan.filter_reason.is_some() {
                         continue;
                     }
-                    pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
-                    let tasks =
-                        filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
-                    for task in &tasks {
+                    for task in &plan.tasks {
                         tracing::info!(path = %task.download_path.display(), "[DRY RUN] Would download");
                     }
-                    count += tasks.len();
+                    count += plan.tasks.len();
                 }
                 Err(e) => {
                     enum_errors += 1;
@@ -1382,8 +1106,7 @@ where
     let producer_pb = pb.clone();
     let producer = tokio::spawn(async move {
         let config = &producer_config;
-        let mut claimed_paths: FxHashMap<NormalizedPath, u64> = FxHashMap::default();
-        let mut dir_cache = paths::DirCache::new();
+        let mut task_planner = TaskPlanner::new();
         let mut seen_ids: FxHashSet<Arc<str>> = FxHashSet::default();
         // Skipped-asset IDs accumulated across the producer run and
         // flushed to the DB in a single transaction at the end. This
@@ -1495,26 +1218,14 @@ where
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                    if let Some(reason) = is_asset_filtered(&asset, config) {
-                        match reason {
-                            FilterReason::ExcludedAlbum => skips.by_excluded_album += 1,
-                            FilterReason::MediaType => skips.by_media_type += 1,
-                            FilterReason::LivePhoto => skips.by_live_photo += 1,
-                            FilterReason::DateRange => skips.by_date_range += 1,
-                            FilterReason::Filename => skips.by_filename += 1,
-                        }
+                    let plan = task_planner.plan_asset(&asset, config).await;
+                    if let Some(reason) = plan.filter_reason {
+                        skips.record_filter_reason(reason);
                         producer_pb.inc(1);
                         continue;
                     }
 
-                    // Path-aware on-disk verification only; a DB-only fast-skip
-                    // missed user deletions when the startup sample-check
-                    // rolled wrong.
-                    pre_ensure_asset_dir(&mut dir_cache, &asset, config).await;
-
-                    let tasks =
-                        filter_asset_to_tasks(&asset, config, &mut claimed_paths, &mut dir_cache);
-                    if tasks.is_empty() {
+                    if plan.tasks.is_empty() {
                         // No-op for status='downloaded' rows (the common
                         // case). A row left status='pending' by a prior
                         // interrupted sync will be promoted to failed at
@@ -1536,7 +1247,7 @@ where
                     } else {
                         let mut disposition = AssetDisposition::Unresolved;
 
-                        for task in tasks {
+                        for task in plan.tasks {
                             // Mark assets that have exceeded the retry limit as failed.
                             if let Some(&attempts) =
                                 download_ctx.attempt_counts.get(task.asset_id.as_ref())
@@ -1555,14 +1266,13 @@ where
                                             "Exceeded max download attempts ({attempts}/{})",
                                             config.max_download_attempts
                                         );
-                                        if let Err(e) = db
-                                            .mark_failed(
-                                                &config.library,
-                                                &task.asset_id,
-                                                task.version_size.as_str(),
-                                                &error,
-                                            )
-                                            .await
+                                        if let Err(e) = finalize_failed(
+                                            db.as_ref(),
+                                            &config.library,
+                                            &task,
+                                            &error,
+                                        )
+                                        .await
                                         {
                                             tracing::warn!(
                                                 asset_id = %task.asset_id,
@@ -1588,24 +1298,14 @@ where
                             }
 
                             if let Some(db) = &producer_state_db {
-                                let media_type = determine_media_type(task.version_size, &asset);
-                                let record = AssetRecord::new_pending(
-                                    Arc::clone(&config.library),
-                                    task.asset_id.to_string(),
-                                    task.version_size,
-                                    task.checksum.to_string(),
-                                    task.download_path
-                                        .file_name()
-                                        .and_then(|f| f.to_str())
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    asset.created(),
-                                    Some(asset.added_date()),
-                                    task.size,
-                                    media_type,
+                                if let Err(e) = planner::upsert_seen_for_task(
+                                    db.as_ref(),
+                                    config,
+                                    &asset,
+                                    &task,
                                 )
-                                .with_metadata_arc(asset.metadata_arc());
-                                if let Err(e) = db.upsert_seen(&record).await {
+                                .await
+                                {
                                     tracing::warn!(
                                         asset_id = %task.asset_id,
                                         error = %e,
@@ -1616,24 +1316,20 @@ where
                                 // carries the album name so we can record membership.
                                 // In merged-stream mode album is unknown at this point;
                                 // the next incremental sync fills it in.
-                                if let Some(album) = config.album_name.as_deref() {
-                                    if !album.is_empty() {
-                                        if let Err(e) = add_asset_album_with_retry(
-                                            db.as_ref(),
-                                            &config.library,
-                                            asset.id(),
-                                            album,
-                                            "icloud",
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(
-                                                asset_id = %asset.id(),
-                                                album = %album,
-                                                error = %e,
-                                                "Failed to record album membership after retries"
-                                            );
-                                        }
+                                if let Err(e) = planner::record_album_membership_if_named(
+                                    db.as_ref(),
+                                    config,
+                                    &asset,
+                                )
+                                .await
+                                {
+                                    if let Some(album) = config.album_name.as_deref() {
+                                        tracing::warn!(
+                                            asset_id = %asset.id(),
+                                            album = %album,
+                                            error = %e,
+                                            "Failed to record album membership after retries"
+                                        );
                                     }
                                 }
 
@@ -1661,20 +1357,18 @@ where
                                             "Skipping (state confirms no download needed)"
                                         );
                                     }
-                                    None => {
-                                        // Directory was pre-populated above, so these
-                                        // are cache-hits -- no blocking I/O.
-                                        if dir_cache.exists(&task.download_path) {
+                                    None => match task_planner
+                                        .existing_path_match(&task.download_path)
+                                    {
+                                        ExistingPathMatch::Exact => {
                                             disposition = disposition.max(AssetDisposition::OnDisk);
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
                                                 path = %task.download_path.display(),
                                                 "Skipping (already downloaded)"
                                             );
-                                        } else if dir_cache
-                                            .find_ampm_variant(&task.download_path)
-                                            .is_some()
-                                        {
+                                        }
+                                        ExistingPathMatch::AmpmVariant => {
                                             disposition =
                                                 disposition.max(AssetDisposition::AmpmVariant);
                                             tracing::debug!(
@@ -1682,7 +1376,8 @@ where
                                                 path = %task.download_path.display(),
                                                 "Skipping (AM/PM variant exists on disk)"
                                             );
-                                        } else {
+                                        }
+                                        ExistingPathMatch::Missing => {
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
                                                 path = %task.download_path.display(),
@@ -1698,7 +1393,7 @@ where
                                                 return skips;
                                             }
                                         }
-                                    }
+                                    },
                                 }
                             } else {
                                 disposition = disposition.max(AssetDisposition::Forwarded);
@@ -1914,61 +1609,44 @@ where
                     });
                 }
                 if let Some(db) = &state_db {
-                    if let Err(e) = db
-                        .mark_downloaded(
-                            &library,
-                            &task.asset_id,
-                            task.version_size.as_str(),
-                            &task.download_path,
-                            &local_checksum,
-                            download_checksum.as_deref(),
-                        )
-                        .await
+                    match finalize_downloaded(
+                        db.as_ref(),
+                        &library,
+                        &task,
+                        local_checksum,
+                        download_checksum,
+                        exif_ok,
+                    )
+                    .await
                     {
-                        pb.suspend(|| {
-                            tracing::warn!(
-                                asset_id = %task.asset_id,
-                                error = %e,
-                                "State write failed, deferring for retry"
-                            );
-                        });
-                        pending_state_writes.push(PendingStateWrite {
-                            library: Arc::clone(&library),
-                            asset_id: task.asset_id.clone(),
-                            version_size: task.version_size,
-                            download_path: task.download_path.clone(),
-                            local_checksum,
-                            download_checksum,
-                        });
-                        if state_write_circuit_error.is_none() {
-                            if let Some(err) = check_state_write_circuit_breaker(
-                                db.as_ref(),
-                                &mut pending_state_writes,
-                            )
-                            .await
-                            {
-                                pb.suspend(|| {
-                                    tracing::error!(
-                                        error = %err,
-                                        "State write circuit breaker opened; halting downloads"
-                                    );
-                                });
-                                state_write_circuit_error = Some(err);
-                                pipeline_shutdown.cancel();
+                        DownloadedFinalization::Persisted => {}
+                        DownloadedFinalization::Deferred { write, error } => {
+                            pb.suspend(|| {
+                                tracing::warn!(
+                                    asset_id = %task.asset_id,
+                                    error = %error,
+                                    "State write failed, deferring for retry"
+                                );
+                            });
+                            pending_state_writes.push(write);
+                            if state_write_circuit_error.is_none() {
+                                if let Some(err) = check_state_write_circuit_breaker(
+                                    db.as_ref(),
+                                    &mut pending_state_writes,
+                                )
+                                .await
+                                {
+                                    pb.suspend(|| {
+                                        tracing::error!(
+                                            error = %err,
+                                            "State write circuit breaker opened; halting downloads"
+                                        );
+                                    });
+                                    state_write_circuit_error = Some(err);
+                                    pipeline_shutdown.cancel();
+                                }
                             }
                         }
-                    } else {
-                        // Bytes landed and the state row reflects it. Keep
-                        // or drop the rewrite marker based on whether the
-                        // EXIF/XMP writer succeeded.
-                        update_metadata_marker(
-                            db.as_ref(),
-                            &library,
-                            &task.asset_id,
-                            task.version_size.as_str(),
-                            exif_ok,
-                        )
-                        .await;
                     }
                 }
             }
@@ -2007,14 +1685,8 @@ where
                     });
                 }
                 if let Some(db) = &state_db {
-                    if let Err(e) = db
-                        .mark_failed(
-                            &library,
-                            &task.asset_id,
-                            task.version_size.as_str(),
-                            &e.to_string(),
-                        )
-                        .await
+                    if let Err(e) =
+                        finalize_failed(db.as_ref(), &library, &task, &e.to_string()).await
                     {
                         tracing::warn!(
                             asset_id = %task.asset_id,
@@ -2517,58 +2189,44 @@ pub(super) async fn run_download_pass(
                     });
                 }
                 if let Some(db) = &state_db {
-                    if let Err(e) = db
-                        .mark_downloaded(
-                            &library,
-                            &task.asset_id,
-                            task.version_size.as_str(),
-                            &task.download_path,
-                            local_checksum,
-                            download_checksum.as_deref(),
-                        )
-                        .await
+                    match finalize_downloaded(
+                        db.as_ref(),
+                        &library,
+                        &task,
+                        local_checksum.clone(),
+                        download_checksum.clone(),
+                        *exif_ok,
+                    )
+                    .await
                     {
-                        pb.suspend(|| {
-                            tracing::warn!(
-                                asset_id = %task.asset_id,
-                                error = %e,
-                                "State write failed, deferring for retry"
-                            );
-                        });
-                        pending_state_writes.push(PendingStateWrite {
-                            library: Arc::clone(&library),
-                            asset_id: task.asset_id.clone(),
-                            version_size: task.version_size,
-                            download_path: task.download_path.clone(),
-                            local_checksum: local_checksum.clone(),
-                            download_checksum: download_checksum.clone(),
-                        });
-                        if !state_write_circuit_open {
-                            if let Some(err) = check_state_write_circuit_breaker(
-                                db.as_ref(),
-                                &mut pending_state_writes,
-                            )
-                            .await
-                            {
-                                pb.suspend(|| {
-                                    tracing::error!(
-                                        error = %err,
-                                        "State write circuit breaker opened; halting cleanup downloads"
-                                    );
-                                });
-                                state_write_circuit_open = true;
-                                pass_shutdown.cancel();
+                        DownloadedFinalization::Persisted => {}
+                        DownloadedFinalization::Deferred { write, error } => {
+                            pb.suspend(|| {
+                                tracing::warn!(
+                                    asset_id = %task.asset_id,
+                                    error = %error,
+                                    "State write failed, deferring for retry"
+                                );
+                            });
+                            pending_state_writes.push(write);
+                            if !state_write_circuit_open {
+                                if let Some(err) = check_state_write_circuit_breaker(
+                                    db.as_ref(),
+                                    &mut pending_state_writes,
+                                )
+                                .await
+                                {
+                                    pb.suspend(|| {
+                                        tracing::error!(
+                                            error = %err,
+                                            "State write circuit breaker opened; halting cleanup downloads"
+                                        );
+                                    });
+                                    state_write_circuit_open = true;
+                                    pass_shutdown.cancel();
+                                }
                             }
                         }
-                    } else {
-                        update_metadata_marker(
-                            db.as_ref(),
-                            &library,
-                            &task.asset_id,
-                            task.version_size.as_str(),
-                            *exif_ok,
-                        )
-                        .await;
                     }
                 }
             }
@@ -2592,14 +2250,8 @@ pub(super) async fn run_download_pass(
                     });
                 }
                 if let Some(db) = &state_db {
-                    if let Err(e) = db
-                        .mark_failed(
-                            &library,
-                            &task.asset_id,
-                            task.version_size.as_str(),
-                            &e.to_string(),
-                        )
-                        .await
+                    if let Err(e) =
+                        finalize_failed(db.as_ref(), &library, &task, &e.to_string()).await
                     {
                         tracing::warn!(
                             asset_id = %task.asset_id,
