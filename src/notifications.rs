@@ -325,40 +325,54 @@ mod tests {
     /// Write a shell script to a temp dir. No executable permission needed
     /// since `run_script` invokes scripts via `/bin/sh`.
     #[cfg(unix)]
-    fn write_test_script(dir: &std::path::Path, name: &str, body: &[u8]) -> PathBuf {
+    fn write_test_script(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
+        std::fs::write(&path, body).unwrap_or_else(|err| {
+            panic!("write notification test script {}: {err}", path.display())
+        });
         path
+    }
+
+    #[cfg(unix)]
+    fn notification_test_dir(context: &str) -> tempfile::TempDir {
+        tempfile::tempdir().unwrap_or_else(|err| panic!("create temp dir for {context}: {err}"))
+    }
+
+    #[cfg(unix)]
+    fn read_script_output(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!("read notification script output {}: {err}", path.display())
+        })
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn run_script_success() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = notification_test_dir("run_script_success");
         let script = write_test_script(dir.path(), "success.sh", b"#!/bin/sh\nexit 0\n");
 
         let status = run_script(&script, "test_event", "msg", "user", None)
             .await
-            .unwrap();
+            .unwrap_or_else(|err| panic!("run notification script {}: {err}", script.display()));
         assert!(status.success());
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn run_script_nonzero_exit() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = notification_test_dir("run_script_nonzero_exit");
         let script = write_test_script(dir.path(), "fail.sh", b"#!/bin/sh\nexit 1\n");
 
         let status = run_script(&script, "test_event", "msg", "user", None)
             .await
-            .unwrap();
+            .unwrap_or_else(|err| panic!("run notification script {}: {err}", script.display()));
         assert!(!status.success());
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn notify_runs_script_with_env_vars() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = notification_test_dir("notify_runs_script_with_env_vars");
         let output_path = dir.path().join("test_notify_output.txt");
         let body = format!(
             "#!/bin/sh\necho \"$KEI_EVENT|$KEI_MESSAGE|$KEI_ICLOUD_USERNAME\" > {}\n",
@@ -387,14 +401,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let output = std::fs::read_to_string(&output_path).unwrap();
+        let output = read_script_output(&output_path);
         assert_eq!(output.trim(), "2fa_required|Need 2FA code|test@example.com");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn notify_with_sync_data_sets_extended_env_vars() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = notification_test_dir("notify_with_sync_data_sets_extended_env_vars");
         let output_path = dir.path().join("test_data_output.txt");
         let body = format!(
             "#!/bin/sh\necho \"$KEI_DOWNLOADED|$KEI_FAILED|$KEI_SKIPPED|$KEI_BYTES_DOWNLOADED|$KEI_SKIPPED_BY_STATE\" > {}\n",
@@ -426,7 +440,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let output = std::fs::read_to_string(&output_path).unwrap();
+        let output = read_script_output(&output_path);
         assert_eq!(output.trim(), "42|3|100|1500000|80");
     }
 
@@ -449,9 +463,14 @@ mod tests {
     #[cfg(unix)]
     impl BarrierFixture {
         fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = notification_test_dir("barrier notification script");
             let counter_dir = dir.path().join("inflight");
-            std::fs::create_dir_all(&counter_dir).unwrap();
+            std::fs::create_dir_all(&counter_dir).unwrap_or_else(|err| {
+                panic!(
+                    "create notification script counter dir {}: {err}",
+                    counter_dir.display()
+                )
+            });
             let release = dir.path().join("release");
             let invocations = dir.path().join("invocations");
             let body = format!(
@@ -484,7 +503,12 @@ mod tests {
         }
 
         fn release_barrier(&self) {
-            std::fs::write(&self.release, b"").unwrap();
+            std::fs::write(&self.release, b"").unwrap_or_else(|err| {
+                panic!(
+                    "write notification script release file {}: {err}",
+                    self.release.display()
+                )
+            });
         }
 
         async fn wait_until<F: FnMut() -> bool>(&self, timeout: Duration, mut pred: F) {
@@ -607,7 +631,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn notify_without_data_omits_extended_vars() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = notification_test_dir("notify_without_data_omits_extended_vars");
         let output_path = dir.path().join("test_no_data.txt");
         let body = format!(
             "#!/bin/sh\necho \"${{KEI_DOWNLOADED:-unset}}|${{KEI_FAILED:-unset}}\" > {}\n",
@@ -630,7 +654,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let output = std::fs::read_to_string(&output_path).unwrap();
+        let output = read_script_output(&output_path);
         assert_eq!(output.trim(), "unset|unset");
     }
 }
