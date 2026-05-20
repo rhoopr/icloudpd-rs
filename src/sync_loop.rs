@@ -2238,6 +2238,24 @@ mod tests {
     }
 
     fn full_album_page(zone: &str, record_name: &str, sync_token: &str) -> serde_json::Value {
+        full_album_page_with_download(
+            zone,
+            record_name,
+            sync_token,
+            "https://p01.icloud-content.com/photo.jpg",
+            1024,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+    }
+
+    fn full_album_page_with_download(
+        zone: &str,
+        record_name: &str,
+        sync_token: &str,
+        download_url: &str,
+        size: u64,
+        checksum: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "records": [
                 {
@@ -2247,9 +2265,9 @@ mod tests {
                         "filenameEnc": {"value": "cGhvdG8uanBn", "type": "STRING"},
                         "resOriginalRes": {
                             "value": {
-                                "downloadURL": "https://p01.icloud-content.com/photo.jpg",
-                                "size": 1024,
-                                "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                                "downloadURL": download_url,
+                                "size": size,
+                                "fileChecksum": checksum
                             }
                         },
                         "resOriginalWidth": {"value": 100, "type": "INT64"},
@@ -2647,6 +2665,7 @@ mod tests {
         delete_prefix_failure: Option<&'static str>,
         message: &'static str,
         cancel_on_upsert: Option<CancellationToken>,
+        replace_download_dir_on_upsert: Option<std::path::PathBuf>,
     }
 
     impl std::fmt::Debug for FailingMetadataSetDb {
@@ -2673,6 +2692,7 @@ mod tests {
                 delete_prefix_failure: None,
                 message,
                 cancel_on_upsert: None,
+                replace_download_dir_on_upsert: None,
             }
         }
 
@@ -2696,6 +2716,11 @@ mod tests {
 
         fn with_cancel_on_upsert(mut self, token: CancellationToken) -> Self {
             self.cancel_on_upsert = Some(token);
+            self
+        }
+
+        fn with_download_dir_replaced_on_upsert(mut self, path: std::path::PathBuf) -> Self {
+            self.replace_download_dir_on_upsert = Some(path);
             self
         }
     }
@@ -2722,6 +2747,11 @@ mod tests {
         ) -> Result<(), state::error::StateError> {
             let result = self.inner.upsert_seen(record).await;
             if result.is_ok() {
+                if let Some(path) = &self.replace_download_dir_on_upsert {
+                    let _ = std::fs::remove_dir_all(path);
+                    std::fs::write(path, b"destination replaced by fault injection")
+                        .expect("replace download dir with file");
+                }
                 if let Some(token) = &self.cancel_on_upsert {
                     token.cancel();
                 }
@@ -4049,6 +4079,87 @@ mod tests {
             !download_dir.path().join("2023/11/14/photo.jpg").exists(),
             "test must not pass by completing the download before cancellation"
         );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn run_cycle_destination_replaced_after_enumeration_reports_partial_failure() {
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let download_root = download_dir.path().to_path_buf();
+        let db: Arc<dyn state::StateDb> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(Arc::clone(&inner), "unused")
+                .with_download_dir_replaced_on_upsert(download_root.clone()),
+        );
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(full_album_page_with_download(
+                    "PrimarySync",
+                    "master-mid-sync-destination-fault",
+                    "zone-tok-after-fault",
+                    "https://p01.icloud-content.com/mid-sync-destination-unavailable.jpg",
+                    8,
+                    "AAAA",
+                )),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(
+            result.failed_count, 1,
+            "mid-sync destination loss must produce a failed sync result"
+        );
+        assert_eq!(result.stats.failed, 1);
+        assert_eq!(result.stats.downloaded, 0);
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "database precheck token must not advance after a download failure"
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token"),
+            None,
+            "partial sync must not store the post-fault zone token"
+        );
+
+        let failed = db.get_failed().await.expect("read failed assets");
+        assert_eq!(failed.len(), 1, "failed asset should be persisted");
+        let last_error = failed[0].last_error.as_deref().expect("failed asset error");
+        assert!(
+            last_error.contains("Failed to open temp download file")
+                || last_error.contains("failed to create directory"),
+            "failed asset error should name the failing filesystem operation, got: {last_error}"
+        );
+        let root = download_root.display().to_string();
+        assert!(
+            logs_contain("Download failed") && logs_contain(&root),
+            "download failure log should include the target path context under {root}"
+        );
+
+        if download_root.is_file() {
+            std::fs::remove_file(&download_root).expect("remove injected download-root file");
+        }
     }
 
     #[tokio::test]
