@@ -709,6 +709,7 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite, temp_suffix: &str) ->
     // reusing the same fd for the magic-byte probe (below) avoids a
     // second `open()` and the race with whatever interleaves with it.
     // `read(true)` is required because `File::create` opens write-only.
+    let validate_guard = TmpGuard::new(&tmp_path);
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -731,7 +732,6 @@ fn apply_metadata_heif(path: &Path, write: &MetadataWrite, temp_suffix: &str) ->
     // insert_xmp regression that produces non-HEIF output (corrupted
     // ftyp, wrong magic, truncated header) before the corrupt file
     // becomes visible.
-    let validate_guard = TmpGuard::new(&tmp_path);
     validate_heif_post_rewrite(&mut file, &tmp_path)?;
     drop(file);
     std::fs::rename(&tmp_path, path)
@@ -1349,6 +1349,24 @@ mod tests {
         path
     }
 
+    fn heic_with_xmp_packet(xmp: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        heif::insert_xmp(SAMPLE_HEIC, xmp, &mut bytes)
+            .expect("sample HEIC should accept a seed XMP packet");
+        bytes
+    }
+
+    fn heif_ftyp_without_meta() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&24u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"heic");
+        bytes.extend_from_slice(b"mif1");
+        bytes
+    }
+
     #[test]
     fn apply_metadata_heic_rating_and_title() {
         let dir = test_tmp_dir("meta_heic_tests");
@@ -1470,6 +1488,99 @@ mod tests {
         assert!(
             s.contains("xmp:Rating"),
             "second-write rating should be present"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_heic_preserves_fixture_with_seeded_xmp_item() {
+        let seed_xmp = build_xmp_packet(&MetadataWrite {
+            description: Some("Original iOS caption".into()),
+            people: vec!["Casey".into()],
+            media_subtype: Some("portrait".into()),
+            ..MetadataWrite::default()
+        })
+        .expect("seed XMP packet");
+        let source = heic_with_xmp_packet(&seed_xmp);
+
+        let dir = test_tmp_dir("meta_heic_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seeded_xmp.heic");
+        fs::write(&path, &source).unwrap();
+        apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(5),
+                title: Some("Kei rewrite".into()),
+                keywords: vec!["Favorites".into()],
+                ..MetadataWrite::default()
+            },
+        )
+        .expect("HEIC metadata rewrite should preserve seeded XMP");
+
+        let rewritten = fs::read(&path).unwrap();
+        let xmp = extract_xmp_from_heic(&rewritten).expect("XMP missing after rewrite");
+        let s = std::str::from_utf8(&xmp).unwrap();
+        assert!(
+            s.contains("Original iOS caption"),
+            "seeded description should survive rewrite"
+        );
+        assert!(s.contains("Casey"), "seeded person should survive rewrite");
+        assert!(
+            s.contains("portrait"),
+            "seeded kei media subtype should survive rewrite"
+        );
+        assert!(s.contains("xmp:Rating"), "rewrite rating missing");
+        assert!(s.contains("Kei rewrite"), "rewrite title missing");
+        assert!(s.contains("Favorites"), "rewrite keyword missing");
+        assert_eq!(
+            count_xmp_items_in_heic(&rewritten),
+            1,
+            "rewrite must update the existing XMP item instead of appending duplicates"
+        );
+        assert_eq!(
+            find_mdat_bytes(&source),
+            find_mdat_bytes(&rewritten),
+            "HEIC image data must remain byte-for-byte stable"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn apply_metadata_heic_failure_leaves_media_bytes_intact() {
+        let dir = test_tmp_dir("meta_heic_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("missing_meta.heic");
+        let original = heif_ftyp_without_meta();
+        fs::write(&path, &original).unwrap();
+
+        let err = apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(3),
+                ..MetadataWrite::default()
+            },
+        )
+        .expect_err("HEIC without a meta box should reject XMP rewrite");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Inserting XMP into HEIC"),
+            "error should name the failed HEIC rewrite step: {message}"
+        );
+        assert!(
+            message.contains("no `meta` box"),
+            "error should include the structural HEIC failure: {message}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "failed HEIC rewrite must leave original media bytes untouched"
+        );
+        let tmp_path = temp_path_for(&path, ".meta-tmp");
+        assert!(
+            !tmp_path.exists(),
+            "failed HEIC rewrite must not leave a metadata temp file behind"
         );
         fs::remove_file(&path).ok();
     }
