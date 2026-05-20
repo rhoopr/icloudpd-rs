@@ -405,6 +405,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         check_min_disk_space(avail, &config.download.directory)?;
     }
 
+    #[cfg(debug_assertions)]
+    if maybe_write_offline_fake_sync_report(&config, &notifier).await? {
+        return Ok(());
+    }
+
     let cred_store =
         credential::CredentialStore::new(&config.auth.username, &config.auth.cookie_directory);
     let source = password::build_password_source(
@@ -1126,6 +1131,74 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     } else {
         Ok(())
     }
+}
+
+// Debug-only seam for the offline binary-boundary report test. Release builds
+// must never skip authentication or CloudKit work from an environment variable.
+#[cfg(debug_assertions)]
+async fn maybe_write_offline_fake_sync_report(
+    config: &config::Config,
+    notifier: &Notifier,
+) -> anyhow::Result<bool> {
+    const ENV: &str = "KEI_UNSTABLE_FAKE_SYNC_REPORT_FOR_TESTS";
+    if std::env::var(ENV).as_deref() != Ok("1") {
+        return Ok(false);
+    }
+
+    let Some(report_path) = config.report.json.as_deref() else {
+        anyhow::bail!("{ENV}=1 requires [report].json");
+    };
+
+    tracing::warn!(
+        env = ENV,
+        "Offline fake sync report test seam enabled; exiting before authentication"
+    );
+
+    let reporter = crate::cycle_reporter::CycleReporter::<state::SqliteStateDb>::new(
+        crate::cycle_reporter::CycleReporterConfig {
+            username: &config.auth.username,
+            watch_mode: config.watch.interval.is_some(),
+            report_path: Some(report_path),
+            run_options: crate::report::RunOptions::from_config(config),
+            health_dir: &config.auth.cookie_directory,
+            personality_mode: config.ui.personality_mode,
+            state_db: None,
+            metrics_handle: None,
+            notifier,
+        },
+    );
+    let stats = download::SyncStats {
+        assets_seen: 3,
+        downloaded: 2,
+        skipped: download::SkipBreakdown {
+            by_state: 1,
+            ..download::SkipBreakdown::default()
+        },
+        bytes_downloaded: 4096,
+        disk_bytes_written: 4096,
+        elapsed_secs: 0.125,
+        photos_downloaded: 1,
+        videos_downloaded: 1,
+        ..download::SyncStats::default()
+    };
+    let mut health = health::HealthStatus::new();
+    reporter
+        .report_completed_cycle(
+            &mut health,
+            crate::cycle_reporter::CycleReportInput {
+                stats: &stats,
+                failed_count: 0,
+                session_expired: false,
+                elapsed: std::time::Duration::from_millis(125),
+            },
+        )
+        .await;
+
+    if !report_path.is_file() {
+        anyhow::bail!("offline fake sync did not write {}", report_path.display());
+    }
+
+    Ok(true)
 }
 
 /// Re-authenticate via SRP after a session-error signature from CloudKit.
