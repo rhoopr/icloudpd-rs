@@ -4597,6 +4597,155 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generated_collision_sets_are_deterministic_and_non_overwriting() {
+        #[derive(Clone, Copy)]
+        struct CollisionAsset {
+            id: &'static str,
+            filename: &'static str,
+            size: u64,
+            checksum: &'static str,
+        }
+
+        fn run_collision_set(root: &Path, assets: &[CollisionAsset]) -> Vec<Vec<PathBuf>> {
+            let mut config = test_config();
+            config.directory = Arc::from(root);
+            let mut claimed_paths = FxHashMap::default();
+            let mut dir_cache = paths::DirCache::new();
+
+            assets
+                .iter()
+                .map(|case| {
+                    let asset = TestPhotoAsset::new(case.id)
+                        .filename(case.filename)
+                        .orig_size(case.size)
+                        .orig_url(&format!("https://p01.icloud-content.com/{}", case.id))
+                        .orig_checksum(case.checksum)
+                        .build();
+                    filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache)
+                        .into_iter()
+                        .map(|task| task.download_path)
+                        .collect()
+                })
+                .collect()
+        }
+
+        let assets = [
+            CollisionAsset {
+                id: "REP_A",
+                filename: "repeat.JPG",
+                size: 1000,
+                checksum: "ck_rep_a",
+            },
+            CollisionAsset {
+                id: "REP_B",
+                filename: "repeat.JPG",
+                size: 1000,
+                checksum: "ck_rep_b",
+            },
+            CollisionAsset {
+                id: "REP_C",
+                filename: "repeat.JPG",
+                size: 2000,
+                checksum: "ck_rep_c",
+            },
+            CollisionAsset {
+                id: "TRAV_A",
+                filename: "../../etc/passwd.jpg",
+                size: 3000,
+                checksum: "ck_trav_a",
+            },
+            CollisionAsset {
+                id: "TRAV_B",
+                filename: "../../etc/passwd.jpg",
+                size: 4000,
+                checksum: "ck_trav_b",
+            },
+            CollisionAsset {
+                id: "CASE_A",
+                filename: "IMG_0001.JPG",
+                size: 5000,
+                checksum: "ck_case_a",
+            },
+            CollisionAsset {
+                id: "CASE_B",
+                filename: "img_0001.jpg",
+                size: 6000,
+                checksum: "ck_case_b",
+            },
+            CollisionAsset {
+                id: "EMPTY_A",
+                filename: "",
+                size: 7000,
+                checksum: "ck_empty_a",
+            },
+            CollisionAsset {
+                id: "UNICODE_A",
+                filename: "日本語.jpg",
+                size: 8000,
+                checksum: "ck_unicode_a",
+            },
+            CollisionAsset {
+                id: "RESERVED_A",
+                filename: "CON",
+                size: 9000,
+                checksum: "ck_reserved_a",
+            },
+        ];
+
+        let dir = TempDir::new().unwrap();
+        let first = run_collision_set(dir.path(), &assets);
+        let second = run_collision_set(dir.path(), &assets);
+        assert_eq!(first, second, "collision resolution must be deterministic");
+        assert!(
+            first[1].is_empty(),
+            "same filename and same size should be treated as the same on-disk file"
+        );
+        assert!(
+            first[2][0]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("-2000.")),
+            "different-size repeated filename should get a size dedup suffix: {:?}",
+            first[2]
+        );
+
+        let mut exact_paths = FxHashSet::default();
+        let mut normalized_paths = FxHashSet::default();
+        for (asset, paths) in assets.iter().zip(first.iter()) {
+            for path in paths {
+                assert!(
+                    path.starts_with(dir.path()),
+                    "asset {} path escaped root: {}",
+                    asset.id,
+                    path.display()
+                );
+                let relative = path
+                    .strip_prefix(dir.path())
+                    .expect("path starts with root");
+                assert!(
+                    relative
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_))),
+                    "asset {} path contains traversal or root components: {}",
+                    asset.id,
+                    path.display()
+                );
+                assert!(
+                    exact_paths.insert(path.clone()),
+                    "generated collision set produced duplicate path: {}",
+                    path.display()
+                );
+                let normalized = NormalizedPath::new(path);
+                assert!(
+                    normalized_paths.insert(normalized),
+                    "generated collision set produced a normalized duplicate path: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
     // ── Gap: zero-size version triggers dedup, never matches ──────────
 
     #[test]

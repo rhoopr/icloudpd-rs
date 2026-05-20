@@ -1706,6 +1706,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generated_path_derivation_inputs_stay_inside_destination() {
+        let root = Path::new("/photos-root");
+        let date = chrono::Local
+            .with_ymd_and_hms(2025, 6, 15, 14, 30, 0)
+            .unwrap();
+        let folder_structures = [
+            "none",
+            "%Y/%m/%d",
+            "../../%Y/{album}",
+            "{album}/%Y/%m/%d",
+            "{:../%Y/%m/%d}",
+        ];
+        let filenames = [
+            "",
+            "IMG_0001.JPG",
+            "../escape.jpg",
+            "../../etc/passwd",
+            "a/b\\c*d?e\"f<g>h|i.jpg",
+            "日本語.jpg",
+            "CON",
+            "aux.txt",
+            "  ...  ",
+            "photo\nname.jpg",
+            "repeat.JPG",
+            "repeat.JPG",
+        ];
+        let album_names = [
+            None,
+            Some("Vacation"),
+            Some("../etc"),
+            Some("Trip/2024"),
+            Some("日本語"),
+            Some("CON"),
+            Some(""),
+        ];
+
+        for folder_structure in folder_structures {
+            for filename in filenames {
+                for album_name in album_names {
+                    let path =
+                        local_download_path(root, folder_structure, &date, filename, album_name);
+                    assert!(
+                        path.starts_with(root),
+                        "folder={folder_structure:?} filename={filename:?} album={album_name:?}: \
+                         path escaped root: {path:?}"
+                    );
+                    let relative = path
+                        .strip_prefix(root)
+                        .expect("path should start with root");
+                    assert!(
+                        relative.file_name().is_some(),
+                        "folder={folder_structure:?} filename={filename:?} album={album_name:?}: \
+                         path must include a filename: {path:?}"
+                    );
+                    assert!(
+                        relative
+                            .components()
+                            .all(|component| matches!(component, std::path::Component::Normal(_))),
+                        "folder={folder_structure:?} filename={filename:?} album={album_name:?}: \
+                         derived path contains traversal or root components: {path:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Unicode normalization: a filename in NFC form (composed) must
     /// match its NFD form (decomposed) after sanitization. macOS and
     /// Linux use different normalization forms; the sanitizer must
