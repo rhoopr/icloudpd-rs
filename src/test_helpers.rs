@@ -319,6 +319,119 @@ impl TestPhotoAsset {
     }
 }
 
+// ── CloudKit/Photos response flow builder ───────────────────────────
+
+/// Small builder for the queued CloudKit responses used by `MockPhotosSession`.
+///
+/// This intentionally only covers the response shapes current tests repeat:
+/// album-count batches, `/records/query` pages, `/changes/database` pages,
+/// `/changes/zone` pages, and queued transport errors. It is not a fake
+/// CloudKit implementation.
+pub struct MockPhotosFlow {
+    session: MockPhotosSession,
+}
+
+impl MockPhotosFlow {
+    pub fn new() -> Self {
+        Self {
+            session: MockPhotosSession::new(),
+        }
+    }
+
+    pub fn album_count(mut self, count: u64) -> Self {
+        self.session = self.session.ok(json!({
+            "batch": [{"records": [{"fields": {"itemCount": {"value": count}}}]}]
+        }));
+        self
+    }
+
+    pub fn query_page(mut self, records: Vec<Value>, sync_token: Option<&str>) -> Self {
+        let mut page = json!({ "records": records });
+        if let Some(token) = sync_token {
+            page["syncToken"] = json!(token);
+        }
+        self.session = self.session.ok(page);
+        self
+    }
+
+    pub fn empty_query_page(self, sync_token: Option<&str>) -> Self {
+        self.query_page(Vec::new(), sync_token)
+    }
+
+    pub fn changes_database(
+        mut self,
+        sync_token: &str,
+        changed_zones: &[(&str, &str)],
+        more_coming: bool,
+    ) -> Self {
+        let zones: Vec<Value> = changed_zones
+            .iter()
+            .map(|(zone_name, zone_sync_token)| {
+                json!({
+                    "zoneID": {"zoneName": zone_name, "ownerRecordName": "_defaultOwner"},
+                    "syncToken": zone_sync_token,
+                })
+            })
+            .collect();
+        self.session = self.session.ok(json!({
+            "syncToken": sync_token,
+            "moreComing": more_coming,
+            "zones": zones,
+        }));
+        self
+    }
+
+    pub fn changes_zone_page(
+        mut self,
+        records: Vec<Value>,
+        sync_token: &str,
+        more_coming: bool,
+    ) -> Self {
+        self.session = self.session.ok(json!({
+            "zones": [{
+                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                "syncToken": sync_token,
+                "moreComing": more_coming,
+                "records": records,
+            }]
+        }));
+        self
+    }
+
+    pub fn changes_zone_error(
+        mut self,
+        server_error_code: &str,
+        reason: &str,
+        sync_token: &str,
+    ) -> Self {
+        self.session = self.session.ok(json!({
+            "zones": [{
+                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                "syncToken": sync_token,
+                "moreComing": false,
+                "serverErrorCode": server_error_code,
+                "reason": reason,
+            }]
+        }));
+        self
+    }
+
+    pub fn error(mut self, message: &str) -> Self {
+        self.session = self.session.err(message);
+        self
+    }
+
+    pub fn build(self) -> MockPhotosSession {
+        self.session
+    }
+}
+
+impl Default for MockPhotosFlow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Mock PhotosSession ──────────────────────────────────────────────
 
 /// Recorded call to `MockPhotosSession::post()`.
@@ -462,5 +575,38 @@ mod tests {
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].url, "https://example.com/query");
         assert_eq!(calls[1].url, "https://example.com/changes");
+    }
+
+    #[tokio::test]
+    async fn mock_photos_flow_queues_common_cloudkit_shapes() {
+        let mock = MockPhotosFlow::new()
+            .album_count(7)
+            .changes_database("db-token", &[("PrimarySync", "zone-token")], true)
+            .error("transport failure")
+            .build();
+
+        let count = mock
+            .post("https://example.com/count", "{}".to_owned(), &[])
+            .await
+            .expect("count response");
+        assert_eq!(
+            count["batch"][0]["records"][0]["fields"]["itemCount"]["value"],
+            7
+        );
+
+        let changes = mock
+            .post("https://example.com/changes/database", "{}".to_owned(), &[])
+            .await
+            .expect("changes database response");
+        assert_eq!(changes["syncToken"], "db-token");
+        assert_eq!(changes["zones"][0]["zoneID"]["zoneName"], "PrimarySync");
+        assert_eq!(changes["zones"][0]["syncToken"], "zone-token");
+        assert!(changes["moreComing"].as_bool().unwrap_or(false));
+
+        let err = mock
+            .post("https://example.com/fail", "{}".to_owned(), &[])
+            .await
+            .expect_err("queued transport error");
+        assert!(err.to_string().contains("transport failure"));
     }
 }
