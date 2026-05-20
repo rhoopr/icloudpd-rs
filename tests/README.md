@@ -182,7 +182,7 @@ happens:
   service manager, validates the artifact or no-op contract with
   platform-native checks (`systemd-analyze verify`, `plutil -lint`, or
   `Get-Service`), then runs `kei uninstall` against a clean host.
-  Catches renderer, dry-run, and shared service-policy regressions; doesn't
+  Catches renderer, dry-run, and default install regressions; doesn't
   exercise the actual service-manager handoff.
 
 ## Service testing contract
