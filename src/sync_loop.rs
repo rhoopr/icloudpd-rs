@@ -124,6 +124,12 @@ fn should_retry_session_init(err: &anyhow::Error, already_retried: bool) -> bool
     !already_retried && is_session_error(err)
 }
 
+fn take_pending_auth<T>(pending_auth: &mut Option<T>) -> anyhow::Result<T> {
+    pending_auth
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("internal auth retry state missing before attempt"))
+}
+
 /// Given the user's library selector, the count of iCloud shared libraries
 /// on the account, and whether the notice has already fired, return the
 /// warning message to emit, or `None` if no notice is warranted.
@@ -505,13 +511,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let mut pending_auth = Some(auth_result);
     let mut retried_after_session_error = false;
     let (shared_session, mut photos_service, libraries) = loop {
-        #[allow(
-            clippy::expect_used,
-            reason = "pending_auth is re-populated at the end of every retry branch before looping"
-        )]
-        let this_auth = pending_auth
-            .take()
-            .expect("auth_result present at start of attempt");
+        let this_auth = take_pending_auth(&mut pending_auth)?;
         let init_result =
             init_photos_service(this_auth, api_retry_config, config.ui.personality_mode).await;
         let (ss, mut ps) = match init_result {
@@ -2547,6 +2547,27 @@ mod tests {
         let err: anyhow::Error =
             crate::icloud::error::ICloudError::SessionExpired { status: 401 }.into();
         assert!(should_retry_session_init(&err, false));
+    }
+
+    #[test]
+    fn take_pending_auth_returns_value_once() {
+        let mut pending = Some("auth");
+
+        assert_eq!(take_pending_auth(&mut pending).unwrap(), "auth");
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn take_pending_auth_empty_state_returns_error() {
+        let mut pending: Option<&str> = None;
+
+        let err = take_pending_auth(&mut pending).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("internal auth retry state missing before attempt"),
+            "unexpected error: {err}"
+        );
     }
 
     // ── determine_sync_mode ──────────────────────────────────────────
