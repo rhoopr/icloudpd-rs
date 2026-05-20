@@ -147,10 +147,17 @@ fn non_root_env_user(key: &str) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn non_root_user_value(value: Option<String>) -> Option<String> {
-    match value {
-        Some(user) if !user.is_empty() && user != "root" => Some(user),
-        _ => None,
-    }
+    value.filter(|user| is_valid_linux_run_user(user))
+}
+
+#[cfg(target_os = "linux")]
+fn is_valid_linux_run_user(user: &str) -> bool {
+    !user.is_empty()
+        && user != "root"
+        && !user.starts_with('-')
+        && user
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 #[cfg(test)]
@@ -199,9 +206,19 @@ mod tests {
         assert_eq!(non_root_user_value(None), None);
         assert_eq!(non_root_user_value(Some(String::new())), None);
         assert_eq!(non_root_user_value(Some("root".to_string())), None);
+        assert_eq!(non_root_user_value(Some("-alice".to_string())), None);
+        assert_eq!(non_root_user_value(Some("alice bob".to_string())), None);
+        assert_eq!(
+            non_root_user_value(Some("alice\nEnvironment=KEI_INJECTED=1".to_string())),
+            None
+        );
         assert_eq!(
             non_root_user_value(Some("alice".to_string())),
             Some("alice".to_string())
+        );
+        assert_eq!(
+            non_root_user_value(Some("alice.sync-1".to_string())),
+            Some("alice.sync-1".to_string())
         );
     }
 }
