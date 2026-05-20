@@ -1413,10 +1413,13 @@ async fn check_changes_database(
             }
 
             if changed_selected_zones.is_empty() {
-                store_db_sync_token(db, &db_resp.sync_token).await;
                 if db_resp.more_coming {
-                    return WatchPrecheck::proceed_all();
+                    return WatchPrecheck::Proceed {
+                        changed_zones: None,
+                        db_sync_token_after_success: Some(db_resp.sync_token),
+                    };
                 }
+                store_db_sync_token(db, &db_resp.sync_token).await;
                 tracing::info!(
                     "No selected library changes detected (changes/database), skipping cycle"
                 );
@@ -3360,7 +3363,7 @@ mod tests {
     /// `more_coming=true` with empty zones must NOT skip the cycle.
     /// Production logic: `if zones.is_empty() && !more_coming { skip }`.
     /// A regression that flipped the conjunction would silently skip every
-    /// page-bearing wakeup — silent loss of pending changes.
+    /// page-bearing wakeup -- silent loss of pending changes.
     #[tokio::test]
     async fn check_changes_database_more_coming_does_not_skip() {
         use serde_json::json;
@@ -3392,19 +3395,18 @@ mod tests {
                 precheck,
                 WatchPrecheck::Proceed {
                     changed_zones: None,
-                    db_sync_token_after_success: None
-                }
+                    db_sync_token_after_success: Some(ref token)
+                } if token == "db-tok-2"
             ),
             "more_coming=true must not skip the cycle (more pages pending)"
         );
-        // db_sync_token should have been persisted so the next cycle
-        // continues paging from where we left off.
-        let stored = db
-            .get_metadata(DB_SYNC_TOKEN_KEY)
-            .await
-            .expect("read db_sync_token")
-            .expect("token persisted");
-        assert_eq!(stored, "db-tok-2");
+        assert!(
+            db.get_metadata(DB_SYNC_TOKEN_KEY)
+                .await
+                .expect("read db_sync_token")
+                .is_none(),
+            "more_coming=true must defer db_sync_token advancement until the sync cycle succeeds"
+        );
     }
 
     /// Empty zones + `more_coming=false` must return `skip=true`.
