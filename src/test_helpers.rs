@@ -354,8 +354,11 @@ impl MockPhotosFlow {
         self
     }
 
-    pub fn query_photo_page(self, record_name: &str, sync_token: Option<&str>) -> Self {
-        self.query_page(mock_photo_records(record_name), sync_token)
+    pub fn query_photo_page(mut self, record_name: &str, sync_token: Option<&str>) -> Self {
+        self.session = self
+            .session
+            .ok(mock_photo_query_page(record_name, sync_token));
+        self
     }
 
     pub fn empty_query_page(self, sync_token: Option<&str>) -> Self {
@@ -437,6 +440,14 @@ impl MockPhotosFlow {
     pub fn build(self) -> MockPhotosSession {
         self.session
     }
+}
+
+pub(crate) fn mock_photo_query_page(record_name: &str, sync_token: Option<&str>) -> Value {
+    let mut page = json!({ "records": mock_photo_records(record_name) });
+    if let Some(token) = sync_token {
+        page["syncToken"] = json!(token);
+    }
+    page
 }
 
 fn mock_photo_records(record_name: &str) -> Vec<Value> {
