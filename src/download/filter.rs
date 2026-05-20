@@ -1353,6 +1353,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use chrono::Utc;
     use rustc_hash::FxHashSet;
 
     use crate::icloud::photos::PhotoAsset;
@@ -1375,6 +1376,133 @@ mod tests {
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
         filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache)
+    }
+
+    fn plain_photo_asset() -> PhotoAsset {
+        TestPhotoAsset::new("TEST_1").build()
+    }
+
+    fn video_asset() -> PhotoAsset {
+        TestPhotoAsset::new("VID_1")
+            .filename("movie.mov")
+            .item_type("com.apple.quicktime-movie")
+            .orig_file_type("com.apple.quicktime-movie")
+            .orig_size(50_000)
+            .orig_url("https://p01.icloud-content.com/vid")
+            .orig_checksum("vid_ck")
+            .build()
+    }
+
+    fn aae_asset() -> PhotoAsset {
+        TestPhotoAsset::new("EXCL_1")
+            .filename("IMG_0001.AAE")
+            .build()
+    }
+
+    fn lowercase_aae_asset() -> PhotoAsset {
+        TestPhotoAsset::new("EXCL_2").filename("Photo.aae").build()
+    }
+
+    fn excluded_asset() -> PhotoAsset {
+        TestPhotoAsset::new("EXCLUDED_1")
+            .filename("IMG_0001.JPG")
+            .build()
+    }
+
+    fn keep_asset() -> PhotoAsset {
+        TestPhotoAsset::new("KEEP_1")
+            .filename("IMG_0002.JPG")
+            .build()
+    }
+
+    fn old_asset() -> PhotoAsset {
+        TestPhotoAsset::new("OLD_1")
+            .asset_date(1_592_179_200_000.0) // 2020-06-15T00:00:00Z
+            .build()
+    }
+
+    fn new_asset() -> PhotoAsset {
+        TestPhotoAsset::new("NEW_1")
+            .asset_date(1_750_003_200_000.0) // 2025-06-15T00:00:00Z
+            .build()
+    }
+
+    fn date_time(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).expect("test date").into()
+    }
+
+    fn no_config_change(_: &mut DownloadConfig) {}
+
+    fn skip_videos(config: &mut DownloadConfig) {
+        config.media.videos = false;
+    }
+
+    fn skip_photos(config: &mut DownloadConfig) {
+        config.media.photos = false;
+    }
+
+    fn skip_before_february_2025(config: &mut DownloadConfig) {
+        config.skip_created_before = Some(date_time("2025-02-01T00:00:00Z"));
+    }
+
+    fn skip_after_january_2025(config: &mut DownloadConfig) {
+        config.skip_created_after = Some(date_time("2025-01-01T00:00:00Z"));
+    }
+
+    fn skip_before_2024(config: &mut DownloadConfig) {
+        config.skip_created_before = Some(date_time("2024-01-01T00:00:00Z"));
+    }
+
+    fn skip_after_2023(config: &mut DownloadConfig) {
+        config.skip_created_after = Some(date_time("2023-01-01T00:00:00Z"));
+    }
+
+    fn skip_live_photos(config: &mut DownloadConfig) {
+        config.live_photo_mode = LivePhotoMode::Skip;
+    }
+
+    fn live_photo_image_only(config: &mut DownloadConfig) {
+        config.live_photo_mode = LivePhotoMode::ImageOnly;
+    }
+
+    fn live_photo_video_only(config: &mut DownloadConfig) {
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+    }
+
+    fn medium_resolution_with_fallback(config: &mut DownloadConfig) {
+        config.resolution = crate::types::PhotoResolution::Medium;
+        config.force_resolution = false;
+    }
+
+    fn medium_resolution_without_fallback(config: &mut DownloadConfig) {
+        config.resolution = crate::types::PhotoResolution::Medium;
+        config.force_resolution = true;
+    }
+
+    fn live_adjusted_with_fallback(config: &mut DownloadConfig) {
+        config.live_resolution = AssetVersionSize::LiveAdjusted;
+        config.force_resolution = false;
+    }
+
+    fn live_adjusted_without_fallback(config: &mut DownloadConfig) {
+        config.live_resolution = AssetVersionSize::LiveAdjusted;
+        config.force_resolution = true;
+    }
+
+    fn exclude_aae_filenames(config: &mut DownloadConfig) {
+        config.filename_exclude = Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
+    }
+
+    fn exclude_known_asset_id(config: &mut DownloadConfig) {
+        let mut ids = FxHashSet::default();
+        ids.insert("EXCLUDED_1".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
+    }
+
+    fn exclude_other_asset_id(config: &mut DownloadConfig) {
+        let mut ids = FxHashSet::default();
+        ids.insert("OTHER_ID".to_string());
+        config.exclude_asset_ids = Arc::new(ids);
     }
 
     #[test]
@@ -3299,180 +3427,96 @@ mod tests {
 
     // ── extract_skip_candidates tests ──────────────────────────────
 
-    #[test]
-    fn test_extract_skip_candidates_photo() {
-        let asset = TestPhotoAsset::new("TEST_1").build();
-        let config = test_config();
-        let candidates = extract_skip_candidates(&asset, &config);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].0, VersionSizeKey::Original);
-        assert_eq!(candidates[0].1, "abc123");
+    struct SkipCandidateCase {
+        name: &'static str,
+        asset: fn() -> PhotoAsset,
+        configure: fn(&mut DownloadConfig),
+        expected: &'static [(VersionSizeKey, &'static str)],
     }
 
     #[test]
-    fn test_extract_skip_candidates_live_photo() {
-        let asset = test_live_photo_asset();
-        let config = test_config();
-        let candidates = extract_skip_candidates(&asset, &config);
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].0, VersionSizeKey::Original);
-        assert_eq!(candidates[0].1, "heic_ck");
-        assert_eq!(candidates[1].0, VersionSizeKey::LiveOriginal);
-        assert_eq!(candidates[1].1, "mov_ck");
-    }
+    fn extract_skip_candidates_decision_matrix() {
+        let cases = [
+            SkipCandidateCase {
+                name: "plain photo emits original",
+                asset: plain_photo_asset,
+                configure: no_config_change,
+                expected: &[(VersionSizeKey::Original, "abc123")],
+            },
+            SkipCandidateCase {
+                name: "live photo emits primary and mov",
+                asset: test_live_photo_asset,
+                configure: no_config_change,
+                expected: &[
+                    (VersionSizeKey::Original, "heic_ck"),
+                    (VersionSizeKey::LiveOriginal, "mov_ck"),
+                ],
+            },
+            SkipCandidateCase {
+                name: "image-only live photo emits primary only",
+                asset: test_live_photo_asset,
+                configure: live_photo_image_only,
+                expected: &[(VersionSizeKey::Original, "heic_ck")],
+            },
+            SkipCandidateCase {
+                name: "skip mode does not affect non-live photos",
+                asset: plain_photo_asset,
+                configure: skip_live_photos,
+                expected: &[(VersionSizeKey::Original, "abc123")],
+            },
+            SkipCandidateCase {
+                name: "video-only live photo emits mov only",
+                asset: test_live_photo_asset,
+                configure: live_photo_video_only,
+                expected: &[(VersionSizeKey::LiveOriginal, "mov_ck")],
+            },
+            SkipCandidateCase {
+                name: "missing medium resolution falls back to original",
+                asset: plain_photo_asset,
+                configure: medium_resolution_with_fallback,
+                expected: &[(VersionSizeKey::Original, "abc123")],
+            },
+            SkipCandidateCase {
+                name: "force medium resolution prevents fallback",
+                asset: plain_photo_asset,
+                configure: medium_resolution_without_fallback,
+                expected: &[],
+            },
+            SkipCandidateCase {
+                name: "filename exclude no-match still emits original",
+                asset: plain_photo_asset,
+                configure: exclude_aae_filenames,
+                expected: &[(VersionSizeKey::Original, "abc123")],
+            },
+            SkipCandidateCase {
+                name: "missing live adjusted falls back to live original",
+                asset: test_live_photo_asset,
+                configure: live_adjusted_with_fallback,
+                expected: &[
+                    (VersionSizeKey::Original, "heic_ck"),
+                    (VersionSizeKey::LiveOriginal, "mov_ck"),
+                ],
+            },
+            SkipCandidateCase {
+                name: "force live adjusted prevents mov fallback",
+                asset: test_live_photo_asset,
+                configure: live_adjusted_without_fallback,
+                expected: &[(VersionSizeKey::Original, "heic_ck")],
+            },
+        ];
 
-    #[test]
-    fn test_extract_skip_candidates_skip_videos() {
-        let asset = TestPhotoAsset::new("VID_1")
-            .filename("movie.mov")
-            .item_type("com.apple.quicktime-movie")
-            .orig_file_type("com.apple.quicktime-movie")
-            .orig_size(50000)
-            .orig_url("https://p01.icloud-content.com/vid")
-            .orig_checksum("vid_ck")
-            .build();
-        let mut config = test_config();
-        config.media.videos = false;
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::MediaType)
-        );
-    }
+        for case in cases {
+            let asset = (case.asset)();
+            let mut config = test_config();
+            (case.configure)(&mut config);
 
-    #[test]
-    fn test_extract_skip_candidates_skip_photos() {
-        let asset = TestPhotoAsset::new("TEST_1").build();
-        let mut config = test_config();
-        config.media.photos = false;
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::MediaType)
-        );
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_image_only_mode() {
-        let asset = test_live_photo_asset();
-        let mut config = test_config();
-        config.live_photo_mode = LivePhotoMode::ImageOnly;
-        let candidates = extract_skip_candidates(&asset, &config);
-        // Should still have the primary HEIC version, just not the MOV companion
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].0, VersionSizeKey::Original);
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_skip_mode() {
-        let asset = test_live_photo_asset();
-        let mut config = test_config();
-        config.live_photo_mode = LivePhotoMode::Skip;
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::LivePhoto),
-            "Skip mode should exclude live photos entirely"
-        );
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_skip_mode_non_live_passes() {
-        let asset = TestPhotoAsset::new("TEST_1").build();
-        let mut config = test_config();
-        config.live_photo_mode = LivePhotoMode::Skip;
-        let candidates = extract_skip_candidates(&asset, &config);
-        assert_eq!(
-            candidates.len(),
-            1,
-            "Skip mode should not affect non-live photos"
-        );
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_video_only_mode() {
-        let asset = test_live_photo_asset();
-        let mut config = test_config();
-        config.live_photo_mode = LivePhotoMode::VideoOnly;
-        let candidates = extract_skip_candidates(&asset, &config);
-        // Should have only the MOV companion, no primary image
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].0, VersionSizeKey::LiveOriginal);
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_date_before_filter() {
-        let asset = TestPhotoAsset::new("TEST_1").build(); // assetDate = 1736899200000 = 2025-01-15
-        let mut config = test_config();
-        // Set skip_created_before to a date AFTER the asset's creation
-        config.skip_created_before = Some(
-            DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
-                .unwrap()
-                .into(),
-        );
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::DateRange)
-        );
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_date_after_filter() {
-        let asset = TestPhotoAsset::new("TEST_1").build(); // assetDate = 1736899200000 = 2025-01-15
-        let mut config = test_config();
-        // Set skip_created_after to a date BEFORE the asset's creation
-        config.skip_created_after = Some(
-            DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
-                .unwrap()
-                .into(),
-        );
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::DateRange)
-        );
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_size_fallback_to_original() {
-        let asset = TestPhotoAsset::new("TEST_1").build(); // only has resOriginalRes
-        let mut config = test_config();
-        config.resolution = crate::types::PhotoResolution::Medium; // not available
-        config.force_resolution = false;
-        let candidates = extract_skip_candidates(&asset, &config);
-        // Should fall back to Original
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].0, VersionSizeKey::Original);
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_force_resolution_no_fallback() {
-        let asset = TestPhotoAsset::new("TEST_1").build(); // only has resOriginalRes
-        let mut config = test_config();
-        config.resolution = crate::types::PhotoResolution::Medium; // not available
-        config.force_resolution = true;
-        let candidates = extract_skip_candidates(&asset, &config);
-        // force_resolution prevents fallback — no primary version
-        assert!(candidates.is_empty());
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_live_adjusted_falls_back_to_live_original() {
-        let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
-        let mut config = test_config();
-        config.live_resolution = AssetVersionSize::LiveAdjusted;
-        config.force_resolution = false;
-        let candidates = extract_skip_candidates(&asset, &config);
-        // Primary + live companion (fallback to LiveOriginal)
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[1].0, VersionSizeKey::LiveOriginal);
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_live_adjusted_force_resolution_no_fallback() {
-        let asset = test_live_photo_asset(); // has LiveOriginal, no LiveAdjusted
-        let mut config = test_config();
-        config.live_resolution = AssetVersionSize::LiveAdjusted;
-        config.force_resolution = true;
-        let candidates = extract_skip_candidates(&asset, &config);
-        // force_resolution prevents fallback — only primary, no live companion
-        assert_eq!(candidates.len(), 1);
+            let candidates = extract_skip_candidates(&asset, &config);
+            let actual: Vec<_> = candidates
+                .iter()
+                .map(|(version, checksum)| (*version, *checksum))
+                .collect();
+            assert_eq!(actual.as_slice(), case.expected, "{}", case.name);
+        }
     }
 
     #[test]
@@ -4138,73 +4182,56 @@ mod tests {
     // ── Gap coverage: skip_created_before AND skip_created_after ────────
 
     #[test]
-    fn filter_asset_narrowing_date_window_includes_asset_inside() {
-        // Asset date: 2025-01-15 (epoch ms 1736899200000)
-        let asset = TestPhotoAsset::new("TEST_1").build();
-        let mut config = test_config();
-        // Window: 2025-01-01 .. 2025-02-01 — asset at Jan 15 is inside
-        config.skip_created_before = Some(
-            DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
-                .unwrap()
-                .into(),
-        );
-        config.skip_created_after = Some(
-            DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
-                .unwrap()
-                .into(),
-        );
-        let tasks = filter_asset_fresh(&asset, &config);
-        assert_eq!(
-            tasks.len(),
-            1,
-            "Asset inside the date window should produce a task"
-        );
-    }
+    fn filter_asset_narrowing_date_window_matrix() {
+        struct DateWindowCase {
+            name: &'static str,
+            start: &'static str,
+            end: &'static str,
+            expected_filter: Option<FilterReason>,
+        }
 
-    #[test]
-    fn filter_asset_narrowing_date_window_excludes_asset_before() {
-        // Asset date: 2025-01-15
-        let asset = TestPhotoAsset::new("TEST_1").build();
-        let mut config = test_config();
-        // Window: 2025-01-20 .. 2025-02-01 — asset at Jan 15 is before the window
-        config.skip_created_before = Some(
-            DateTime::parse_from_rfc3339("2025-01-20T00:00:00Z")
-                .unwrap()
-                .into(),
-        );
-        config.skip_created_after = Some(
-            DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
-                .unwrap()
-                .into(),
-        );
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::DateRange),
-            "Asset before the date window should be skipped"
-        );
-    }
+        let cases = [
+            DateWindowCase {
+                name: "inside window",
+                start: "2025-01-01T00:00:00Z",
+                end: "2025-02-01T00:00:00Z",
+                expected_filter: None,
+            },
+            DateWindowCase {
+                name: "before window",
+                start: "2025-01-20T00:00:00Z",
+                end: "2025-02-01T00:00:00Z",
+                expected_filter: Some(FilterReason::DateRange),
+            },
+            DateWindowCase {
+                name: "after window",
+                start: "2024-12-01T00:00:00Z",
+                end: "2025-01-10T00:00:00Z",
+                expected_filter: Some(FilterReason::DateRange),
+            },
+        ];
 
-    #[test]
-    fn filter_asset_narrowing_date_window_excludes_asset_after() {
-        // Asset date: 2025-01-15
-        let asset = TestPhotoAsset::new("TEST_1").build();
-        let mut config = test_config();
-        // Window: 2024-12-01 .. 2025-01-10 — asset at Jan 15 is after the window
-        config.skip_created_before = Some(
-            DateTime::parse_from_rfc3339("2024-12-01T00:00:00Z")
-                .unwrap()
-                .into(),
-        );
-        config.skip_created_after = Some(
-            DateTime::parse_from_rfc3339("2025-01-10T00:00:00Z")
-                .unwrap()
-                .into(),
-        );
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::DateRange),
-            "Asset after the date window should be skipped"
-        );
+        for case in cases {
+            let asset = plain_photo_asset();
+            let mut config = test_config();
+            config.skip_created_before = Some(date_time(case.start));
+            config.skip_created_after = Some(date_time(case.end));
+
+            assert_eq!(
+                is_asset_filtered(&asset, &config),
+                case.expected_filter,
+                "{}",
+                case.name
+            );
+            if case.expected_filter.is_none() {
+                assert_eq!(
+                    filter_asset_fresh(&asset, &config).len(),
+                    1,
+                    "{} should produce a task",
+                    case.name
+                );
+            }
+        }
     }
 
     // ── Gap coverage: NameId7 produces task when file at original path ──
@@ -4362,48 +4389,109 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_filter_skip_created_before_excludes_old_asset() {
-        // Asset created 2020-06-15 (epoch ms)
-        let asset = TestPhotoAsset::new("OLD_1")
-            .asset_date(1592179200000.0) // 2020-06-15T00:00:00Z
-            .build();
-        let mut config = test_config();
-        // skip_created_before = 2024-01-01
-        config.skip_created_before = Some(
-            chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc(),
-        );
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::DateRange),
-            "Asset created in 2020 should be excluded by skip_created_before=2024"
-        );
+    struct FilterDecisionCase {
+        name: &'static str,
+        asset: fn() -> PhotoAsset,
+        configure: fn(&mut DownloadConfig),
+        expected: Option<FilterReason>,
     }
 
     #[test]
-    fn test_filter_skip_created_after_excludes_new_asset() {
-        // Asset created 2025-06-15 (epoch ms)
-        let asset = TestPhotoAsset::new("NEW_1")
-            .asset_date(1750003200000.0) // 2025-06-15T00:00:00Z
-            .build();
-        let mut config = test_config();
-        // skip_created_after = 2023-01-01
-        config.skip_created_after = Some(
-            chrono::NaiveDate::from_ymd_opt(2023, 1, 1)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc(),
-        );
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::DateRange),
-            "Asset created in 2025 should be excluded by skip_created_after=2023"
-        );
+    fn is_asset_filtered_decision_matrix() {
+        let cases = [
+            FilterDecisionCase {
+                name: "skip videos rejects movie assets",
+                asset: video_asset,
+                configure: skip_videos,
+                expected: Some(FilterReason::MediaType),
+            },
+            FilterDecisionCase {
+                name: "skip photos rejects still assets",
+                asset: plain_photo_asset,
+                configure: skip_photos,
+                expected: Some(FilterReason::MediaType),
+            },
+            FilterDecisionCase {
+                name: "skip live mode rejects live photos",
+                asset: test_live_photo_asset,
+                configure: skip_live_photos,
+                expected: Some(FilterReason::LivePhoto),
+            },
+            FilterDecisionCase {
+                name: "skip_created_before rejects older asset",
+                asset: plain_photo_asset,
+                configure: skip_before_february_2025,
+                expected: Some(FilterReason::DateRange),
+            },
+            FilterDecisionCase {
+                name: "skip_created_after rejects newer asset",
+                asset: plain_photo_asset,
+                configure: skip_after_january_2025,
+                expected: Some(FilterReason::DateRange),
+            },
+            FilterDecisionCase {
+                name: "skip_created_before rejects old historical asset",
+                asset: old_asset,
+                configure: skip_before_2024,
+                expected: Some(FilterReason::DateRange),
+            },
+            FilterDecisionCase {
+                name: "skip_created_after rejects future asset",
+                asset: new_asset,
+                configure: skip_after_2023,
+                expected: Some(FilterReason::DateRange),
+            },
+            FilterDecisionCase {
+                name: "filename exclude matches uppercase AAE",
+                asset: aae_asset,
+                configure: exclude_aae_filenames,
+                expected: Some(FilterReason::Filename),
+            },
+            FilterDecisionCase {
+                name: "filename exclude is case insensitive",
+                asset: lowercase_aae_asset,
+                configure: exclude_aae_filenames,
+                expected: Some(FilterReason::Filename),
+            },
+            FilterDecisionCase {
+                name: "filename exclude no-match passes",
+                asset: keep_asset,
+                configure: exclude_aae_filenames,
+                expected: None,
+            },
+            FilterDecisionCase {
+                name: "exclude asset ids blocks matching id",
+                asset: excluded_asset,
+                configure: exclude_known_asset_id,
+                expected: Some(FilterReason::ExcludedAlbum),
+            },
+            FilterDecisionCase {
+                name: "exclude asset ids passes non-matching id",
+                asset: keep_asset,
+                configure: exclude_other_asset_id,
+                expected: None,
+            },
+        ];
+
+        for case in cases {
+            let asset = (case.asset)();
+            let mut config = test_config();
+            (case.configure)(&mut config);
+
+            assert_eq!(
+                is_asset_filtered(&asset, &config),
+                case.expected,
+                "{}",
+                case.name
+            );
+            if case.expected.is_none() {
+                assert!(
+                    !filter_asset_fresh(&asset, &config).is_empty(),
+                    "{} should reach task planning",
+                    case.name
+                );
+            }
+        }
     }
 
     #[test]
@@ -4419,19 +4507,7 @@ mod tests {
         );
     }
 
-    // ── LivePhotoMode + filename_exclude filter tests ─────────────
-
-    #[test]
-    fn test_filter_skip_mode_skips_live_photo_entirely() {
-        let asset = test_live_photo_asset();
-        let mut config = test_config();
-        config.live_photo_mode = LivePhotoMode::Skip;
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::LivePhoto),
-            "Skip mode should produce no tasks for live photos"
-        );
-    }
+    // ── LivePhotoMode task shaping ─────────────────────────────────
 
     #[test]
     fn test_filter_video_only_mode_skips_primary_keeps_mov() {
@@ -4442,127 +4518,6 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         // The task should be the MOV companion
         assert!(tasks[0].download_path.to_str().unwrap().contains(".MOV"));
-    }
-
-    #[test]
-    fn test_filter_filename_exclude_matches() {
-        let asset = TestPhotoAsset::new("EXCL_1")
-            .filename("IMG_0001.AAE")
-            .build();
-        let mut config = test_config();
-        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::Filename),
-            "*.AAE pattern should exclude AAE files"
-        );
-    }
-
-    #[test]
-    fn test_filter_filename_exclude_case_insensitive() {
-        let asset = TestPhotoAsset::new("EXCL_2").filename("Photo.aae").build();
-        let mut config = test_config();
-        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::Filename),
-            "Pattern matching should be case-insensitive"
-        );
-    }
-
-    #[test]
-    fn test_filter_filename_exclude_no_match_passes() {
-        let asset = TestPhotoAsset::new("EXCL_3")
-            .filename("IMG_0001.JPG")
-            .build();
-        let mut config = test_config();
-        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
-        let tasks = filter_asset_fresh(&asset, &config);
-        assert!(!tasks.is_empty(), "Non-matching files should pass through");
-    }
-
-    // ── exclude_asset_ids filter tests ─────────────────────────────
-
-    #[test]
-    fn test_filter_exclude_asset_ids_blocks_matching() {
-        let asset = TestPhotoAsset::new("EXCLUDED_1")
-            .filename("IMG_0001.JPG")
-            .build();
-        let mut config = test_config();
-        let mut ids = FxHashSet::default();
-        ids.insert("EXCLUDED_1".to_string());
-        config.exclude_asset_ids = Arc::new(ids);
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::ExcludedAlbum),
-            "Asset in exclude set should be filtered"
-        );
-    }
-
-    #[test]
-    fn test_filter_exclude_asset_ids_passes_non_matching() {
-        let asset = TestPhotoAsset::new("KEEP_1")
-            .filename("IMG_0002.JPG")
-            .build();
-        let mut config = test_config();
-        let mut ids = FxHashSet::default();
-        ids.insert("OTHER_ID".to_string());
-        config.exclude_asset_ids = Arc::new(ids);
-        let tasks = filter_asset_fresh(&asset, &config);
-        assert!(!tasks.is_empty(), "Asset not in exclude set should pass");
-    }
-
-    #[test]
-    fn test_skip_candidates_exclude_asset_ids() {
-        let asset = TestPhotoAsset::new("SKIP_EXCL_1")
-            .filename("IMG_0001.JPG")
-            .build();
-        let mut config = test_config();
-        let mut ids = FxHashSet::default();
-        ids.insert("SKIP_EXCL_1".to_string());
-        config.exclude_asset_ids = Arc::new(ids);
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::ExcludedAlbum),
-            "is_asset_filtered should return true for excluded assets"
-        );
-    }
-
-    // ── extract_skip_candidates: filename_exclude ─────────────────
-
-    #[test]
-    fn test_extract_skip_candidates_filename_exclude_matches() {
-        let asset = TestPhotoAsset::new("TEST_1").filename("photo.AAE").build();
-        let mut config = test_config();
-        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::Filename),
-            "filename_exclude should filter via is_asset_filtered"
-        );
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_filename_exclude_no_match_passes() {
-        let asset = TestPhotoAsset::new("TEST_1").build(); // filename = "test_photo.jpg"
-        let mut config = test_config();
-        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
-        assert!(
-            !extract_skip_candidates(&asset, &config).is_empty(),
-            "non-matching filename should pass through"
-        );
-    }
-
-    #[test]
-    fn test_extract_skip_candidates_filename_exclude_case_insensitive() {
-        let asset = TestPhotoAsset::new("TEST_1").filename("photo.aae").build();
-        let mut config = test_config();
-        config.filename_exclude = std::sync::Arc::from(vec![glob::Pattern::new("*.AAE").unwrap()]);
-        assert_eq!(
-            is_asset_filtered(&asset, &config),
-            Some(FilterReason::Filename),
-            "filename_exclude should be case-insensitive"
-        );
     }
 
     // ── Gap: two assets with same filename, same date, same size ──────
