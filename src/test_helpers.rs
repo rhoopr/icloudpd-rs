@@ -354,6 +354,10 @@ impl MockPhotosFlow {
         self
     }
 
+    pub fn query_photo_page(self, record_name: &str, sync_token: Option<&str>) -> Self {
+        self.query_page(mock_photo_records(record_name), sync_token)
+    }
+
     pub fn empty_query_page(self, sync_token: Option<&str>) -> Self {
         self.query_page(Vec::new(), sync_token)
     }
@@ -398,6 +402,15 @@ impl MockPhotosFlow {
         self
     }
 
+    pub fn changes_photo_page(
+        self,
+        record_name: &str,
+        sync_token: &str,
+        more_coming: bool,
+    ) -> Self {
+        self.changes_zone_page(mock_photo_records(record_name), sync_token, more_coming)
+    }
+
     pub fn changes_zone_error(
         mut self,
         server_error_code: &str,
@@ -424,6 +437,47 @@ impl MockPhotosFlow {
     pub fn build(self) -> MockPhotosSession {
         self.session
     }
+}
+
+fn mock_photo_records(record_name: &str) -> Vec<Value> {
+    vec![
+        json!({
+            "recordName": record_name,
+            "recordType": "CPLMaster",
+            "fields": {
+                "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
+                "resOriginalRes": {
+                    "value": {
+                        "downloadURL": "https://p01.icloud-content.com/photo.jpg",
+                        "size": 1024,
+                        "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                    }
+                },
+                "resOriginalWidth": {"value": 100, "type": "INT64"},
+                "resOriginalHeight": {"value": 100, "type": "INT64"},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "itemType": {"value": "public.jpeg"},
+                "adjustmentRenderType": {"value": 0, "type": "INT64"}
+            },
+            "recordChangeTag": "ct1"
+        }),
+        json!({
+            "recordName": format!("asset-{record_name}"),
+            "recordType": "CPLAsset",
+            "fields": {
+                "masterRef": {
+                    "value": {
+                        "recordName": record_name,
+                        "zoneID": {"zoneName": "PrimarySync"}
+                    },
+                    "type": "REFERENCE"
+                },
+                "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+            },
+            "recordChangeTag": "ct2"
+        }),
+    ]
 }
 
 impl Default for MockPhotosFlow {

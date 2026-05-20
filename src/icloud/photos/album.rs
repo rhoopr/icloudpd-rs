@@ -1233,6 +1233,115 @@ mod tests {
         count
     }
 
+    #[tokio::test]
+    async fn offline_replay_full_pass_fixture() {
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-replay-full", Some("token-full"))
+            .empty_query_page(Some("token-full"))
+            .build();
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+
+        assert_eq!(drain_photo_stream_count(stream).await, 1);
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("token-full")
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_replay_paginated_full_pass_fixture() {
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-replay-page-1", Some("token-page-1"))
+            .query_photo_page("master-replay-page-2", Some("token-page-2"))
+            .empty_query_page(Some("token-page-2"))
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+
+        assert_eq!(drain_photo_stream_count(stream).await, 2);
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("token-page-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_replay_empty_page_probe_fixture() {
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-before-gap", None)
+            .empty_query_page(None)
+            .query_photo_page("master-after-gap", None)
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+
+        assert_eq!(
+            drain_photo_stream_count(stream).await,
+            2,
+            "single empty records/query page must be treated as a gap, not EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_replay_incremental_changes_fixture() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosFlow::new()
+            .changes_photo_page("master-replay-change", "token-incremental", false)
+            .build();
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.changes_stream("token-before");
+        tokio::pin!(stream);
+        let mut events = Vec::new();
+        while let Some(result) = stream.next().await {
+            events.push(result.expect("change event"));
+        }
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(&*events[0].record_name, "master-replay-change");
+        assert!(events[0].asset.is_some());
+        assert_eq!(
+            token_rx.await.expect("sync token sender"),
+            "token-incremental"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_replay_retryable_error_page_fixture() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosFlow::new()
+            .changes_zone_error("RETRY_LATER", "temporary backend issue", "")
+            .build();
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.changes_stream("token-before");
+        tokio::pin!(stream);
+        let mut errors = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Err(error) = result {
+                errors.push(error);
+            }
+        }
+
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].to_string().contains("RETRY_LATER"),
+            "retryable fixture should surface the CloudKit retry code: {}",
+            errors[0]
+        );
+        assert_eq!(
+            token_rx.await.expect("sync token sender"),
+            "token-before",
+            "retryable error must preserve the last-good token"
+        );
+    }
+
     #[derive(Clone, Debug)]
     struct TokenByOffsetSession {
         tokens_by_offset: Arc<HashMap<u64, &'static str>>,

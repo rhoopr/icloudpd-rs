@@ -4411,6 +4411,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn offline_replay_full_pass_reaches_sync_loop_planning_boundary() {
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosFlow::new()
+                .album_count(1)
+                .query_photo_page("master-replay-sync-loop", Some("zone-tok-replay"))
+                .empty_query_page(Some("zone-tok-replay"))
+                .build(),
+        );
+
+        let result =
+            run_full_cycle_with_album(album, false, download::DownloadControls::dry_run_hidden())
+                .await;
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(
+            result.stats.downloaded, 1,
+            "dry-run sync-loop replay must reach download planning"
+        );
+        assert_eq!(result.stats.failed, 0);
+    }
+
     // Periodic reconciliation cadence. The watch loop calls
     // `should_reconcile_this_cycle` once per cycle to decide whether to walk
     // the state DB and warn on missing local files. Tests pin the cadence
