@@ -145,10 +145,13 @@ impl EnumConfigHashOutcome {
 /// and swallowed, but the new hash is never persisted unless stale sync
 /// tokens were cleared first. Otherwise a failed purge could leave old
 /// tokens behind while the updated hash makes later cycles trust them.
-pub(crate) async fn check_and_persist_enum_config_hash(
-    db: &dyn state::StateDb,
+pub(crate) async fn check_and_persist_enum_config_hash<D>(
+    db: &D,
     current_hash: &str,
-) -> EnumConfigHashOutcome {
+) -> EnumConfigHashOutcome
+where
+    D: state::SyncTokenStore + ?Sized,
+{
     let stored_hash = match db.get_metadata(ENUM_CONFIG_HASH_KEY).await {
         Ok(hash) => hash,
         Err(e) => {
@@ -401,10 +404,13 @@ pub(crate) async fn run_cycle(
 /// person memberships across zones (the v9 schema scopes both join tables
 /// per library; this reader honours that scope).
 #[cfg(feature = "xmp")]
-pub(crate) async fn preload_asset_groupings(
-    state_db: Option<&dyn state::StateDb>,
+pub(crate) async fn preload_asset_groupings<D>(
+    state_db: Option<&D>,
     library: &str,
-) -> Arc<download::AssetGroupings> {
+) -> Arc<download::AssetGroupings>
+where
+    D: state::MembershipStore + ?Sized,
+{
     let Some(db) = state_db else {
         return Arc::new(download::AssetGroupings::default());
     };
@@ -431,13 +437,16 @@ pub(crate) async fn preload_asset_groupings(
 }
 
 /// Determine the sync mode for a library: full enumeration or incremental.
-pub(crate) async fn determine_sync_mode(
+pub(crate) async fn determine_sync_mode<D>(
     is_retry_failed: bool,
     library_count: usize,
-    state_db: Option<&dyn state::StateDb>,
+    state_db: Option<&D>,
     sync_token_key: &str,
     zone_name: &str,
-) -> download::SyncMode {
+) -> download::SyncMode
+where
+    D: state::SyncTokenStore + ?Sized,
+{
     if is_retry_failed {
         if library_count == 1 {
             tracing::debug!(

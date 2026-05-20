@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::{PhotoAsset, SyncTokenError};
 use crate::retry::RetryConfig;
-use crate::state::{StateDb, VersionSizeKey};
+use crate::state::{DownloadStateStore, MetadataRewriteStore, StateDb, VersionSizeKey};
 use crate::types::{
     AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
     RawPolicy,
@@ -984,7 +984,10 @@ impl DownloadContext {
     /// Load the download context from the state database. All six queries
     /// are independent and run concurrently so sync start doesn't serialize
     /// on round-trip latency across them.
-    async fn load(db: &dyn StateDb, retry_only: bool) -> Self {
+    async fn load<D>(db: &D, retry_only: bool) -> Self
+    where
+        D: DownloadStateStore + MetadataRewriteStore + ?Sized,
+    {
         let known_ids_fut = async {
             if retry_only {
                 db.get_all_known_ids().await.unwrap_or_else(|e| {

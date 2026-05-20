@@ -5,7 +5,6 @@
 
 use crate::config;
 use crate::state;
-use crate::state::StateDb;
 
 /// Run the reset-state command.
 pub(crate) async fn run_reset_state(

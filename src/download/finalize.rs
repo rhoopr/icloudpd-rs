@@ -4,9 +4,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::state::{StateDb, VersionSizeKey};
+use crate::state::{DownloadStateStore, MetadataRewriteStore, VersionSizeKey};
 
 use super::filter::DownloadTask;
+
+pub(super) trait DownloadFinalizationStore:
+    DownloadStateStore + MetadataRewriteStore
+{
+}
+
+impl<T> DownloadFinalizationStore for T where T: DownloadStateStore + MetadataRewriteStore + ?Sized {}
 
 /// A successful download whose state write to SQLite failed on first attempt.
 /// Accumulated during download loops and retried in a final flush.
@@ -46,14 +53,17 @@ pub(super) enum DownloadedFinalization {
 /// Persist success state for a task that has already landed safely on disk.
 /// On success, metadata retry markers are updated immediately. On failure,
 /// the caller receives a deferred write record for bounded retry.
-pub(super) async fn finalize_downloaded(
-    db: &dyn StateDb,
+pub(super) async fn finalize_downloaded<D>(
+    db: &D,
     library: &Arc<str>,
     task: &DownloadTask,
     local_checksum: String,
     download_checksum: Option<String>,
     exif_ok: bool,
-) -> DownloadedFinalization {
+) -> DownloadedFinalization
+where
+    D: DownloadFinalizationStore + ?Sized,
+{
     match db
         .mark_downloaded(
             library,
@@ -91,25 +101,30 @@ pub(super) async fn finalize_downloaded(
 }
 
 /// Persist failure state for a task that could not be downloaded.
-pub(super) async fn finalize_failed(
-    db: &dyn StateDb,
+pub(super) async fn finalize_failed<D>(
+    db: &D,
     library: &Arc<str>,
     task: &DownloadTask,
     error: &str,
-) -> Result<(), crate::state::error::StateError> {
+) -> Result<(), crate::state::error::StateError>
+where
+    D: DownloadStateStore + ?Sized,
+{
     db.mark_failed(library, &task.asset_id, task.version_size.as_str(), error)
         .await
 }
 
 /// Set or clear the metadata-rewrite marker for an asset-version pair based
 /// on whether the EXIF/XMP writer succeeded.
-async fn update_metadata_marker(
-    db: &dyn StateDb,
+async fn update_metadata_marker<D>(
+    db: &D,
     library: &str,
     asset_id: &str,
     version_size: &str,
     exif_ok: bool,
-) {
+) where
+    D: MetadataRewriteStore + ?Sized,
+{
     if exif_ok {
         if let Err(e) = db
             .clear_metadata_write_failure(library, asset_id, version_size)
@@ -138,11 +153,14 @@ async fn update_metadata_marker(
     }
 }
 
-async fn retry_pending_state_write(
-    db: &dyn StateDb,
+async fn retry_pending_state_write<D>(
+    db: &D,
     write: &PendingStateWrite,
     pending_count: usize,
-) -> bool {
+) -> bool
+where
+    D: DownloadStateStore + ?Sized,
+{
     use rand::RngExt;
 
     for attempt in 1..=STATE_WRITE_MAX_RETRIES {
@@ -196,10 +214,13 @@ async fn retry_pending_state_write(
     false
 }
 
-pub(super) async fn flush_pending_state_writes_retaining_failures(
-    db: &dyn StateDb,
+pub(super) async fn flush_pending_state_writes_retaining_failures<D>(
+    db: &D,
     pending: &mut Vec<PendingStateWrite>,
-) -> StateWriteFlush {
+) -> StateWriteFlush
+where
+    D: DownloadStateStore + ?Sized,
+{
     if pending.is_empty() {
         return StateWriteFlush::default();
     }
@@ -237,10 +258,10 @@ pub(super) async fn flush_pending_state_writes_retaining_failures(
 /// Retry all pending state writes that failed during a download pass.
 ///
 /// Returns the number of writes that still failed after all retries.
-pub(super) async fn flush_pending_state_writes(
-    db: &dyn StateDb,
-    pending: &[PendingStateWrite],
-) -> usize {
+pub(super) async fn flush_pending_state_writes<D>(db: &D, pending: &[PendingStateWrite]) -> usize
+where
+    D: DownloadStateStore + ?Sized,
+{
     if pending.is_empty() {
         return 0;
     }
@@ -278,10 +299,13 @@ pub(super) fn state_db_unwritable_error(pending_total: usize) -> anyhow::Error {
     )
 }
 
-pub(super) async fn check_state_write_circuit_breaker(
-    db: &dyn StateDb,
+pub(super) async fn check_state_write_circuit_breaker<D>(
+    db: &D,
     pending: &mut Vec<PendingStateWrite>,
-) -> Option<anyhow::Error> {
+) -> Option<anyhow::Error>
+where
+    D: DownloadStateStore + ?Sized,
+{
     if pending.len() < STATE_DB_UNWRITABLE_THRESHOLD {
         return None;
     }
@@ -294,13 +318,15 @@ pub(super) async fn check_state_write_circuit_breaker(
 }
 
 #[cfg(test)]
-pub(super) async fn update_metadata_marker_for_test(
-    db: &dyn StateDb,
+pub(super) async fn update_metadata_marker_for_test<D>(
+    db: &D,
     library: &str,
     asset_id: &str,
     version_size: &str,
     exif_ok: bool,
-) {
+) where
+    D: MetadataRewriteStore + ?Sized,
+{
     update_metadata_marker(db, library, asset_id, version_size, exif_ok).await;
 }
 
@@ -312,7 +338,7 @@ mod tests {
     use chrono::Local;
     use tempfile::TempDir;
 
-    use crate::state::{MediaType, SqliteStateDb, StateDb, VersionSizeKey};
+    use crate::state::{MediaType, SqliteStateDb, VersionSizeKey};
     use crate::test_helpers::TestAssetRecord;
 
     use super::super::filter::{DownloadTask, MetadataPayload};

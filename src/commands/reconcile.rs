@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::cli;
 use crate::config;
 use crate::state;
-use crate::state::{StateDb, VersionSizeKey};
+use crate::state::{ReportStateStore, VersionSizeKey};
 
 use super::{print_truncation_tail, LISTING_CAP};
 
@@ -54,11 +54,14 @@ pub(crate) struct ScanCounts {
 
 /// Reads every page before any mutation so later `mark_failed` calls can't
 /// shift OFFSET pagination and skip rows.
-pub(crate) async fn scan_missing(
-    db: &dyn StateDb,
+pub(crate) async fn scan_missing<D>(
+    db: &D,
     mut report_missing: impl FnMut(&MissingAsset),
     mut report_no_path: impl FnMut(&str),
-) -> anyhow::Result<(ScanCounts, Vec<MissingAsset>)> {
+) -> anyhow::Result<(ScanCounts, Vec<MissingAsset>)>
+where
+    D: ReportStateStore + ?Sized,
+{
     let mut counts = ScanCounts::default();
     let mut missing = Vec::new();
 

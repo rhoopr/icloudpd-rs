@@ -24,7 +24,7 @@ use super::types::{
 const DEFAULT_SOURCE: &str = "icloud";
 
 /// Snapshot of an already-imported asset, returned by
-/// [`StateDb::get_imported_record`].
+/// [`ImportStateStore::get_all_imported_records`].
 ///
 /// `import-existing` consults this on every match candidate to decide whether
 /// the on-disk file can be trusted as unchanged since the last adopt. If
@@ -40,10 +40,194 @@ pub struct ImportedRecord {
     pub imported_mtime: Option<i64>,
 }
 
+/// State operations used by the download producer and finalizer.
+#[allow(
+    dead_code,
+    reason = "role traits expose test and command slices that are not all used in the main binary"
+)]
+#[async_trait]
+pub trait DownloadStateStore: Send + Sync {
+    #[cfg(test)]
+    async fn should_download(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        checksum: &str,
+        local_path: &Path,
+    ) -> Result<bool, StateError>;
+
+    async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError>;
+    async fn mark_downloaded(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+    ) -> Result<(), StateError>;
+    async fn mark_failed(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        error: &str,
+    ) -> Result<(), StateError>;
+    async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
+    async fn reset_failed(&self) -> Result<u64, StateError>;
+    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError>;
+    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError>;
+    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError>;
+    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError>;
+    async fn get_downloaded_checksums(
+        &self,
+    ) -> Result<HashMap<(String, String, String), String>, StateError>;
+    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError>;
+    async fn touch_last_seen_many(
+        &self,
+        library: &str,
+        asset_ids: &[&str],
+    ) -> Result<(), StateError>;
+    async fn mark_soft_deleted(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StateError>;
+    async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError>;
+}
+
+/// Import-time adoption and imported-file snapshot reads.
+#[async_trait]
+pub trait ImportStateStore: Send + Sync {
+    async fn import_adopt(
+        &self,
+        record: &AssetRecord,
+        local_path: &Path,
+        local_checksum: &str,
+        imported_size: u64,
+        imported_mtime: Option<i64>,
+    ) -> Result<(), StateError>;
+
+    async fn get_all_imported_records(
+        &self,
+        library: &str,
+    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError>;
+}
+
+/// Summary, status-page, failed-sample, and sync-run ledger reads/writes.
+#[allow(
+    dead_code,
+    reason = "status and test-only readers are part of the report role even when the main binary does not call every method"
+)]
+#[async_trait]
+pub trait ReportStateStore: Send + Sync {
+    async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError>;
+    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError>;
+    async fn get_failed_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError>;
+    async fn get_pending_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError>;
+    async fn get_summary(&self) -> Result<SyncSummary, StateError>;
+    async fn get_downloaded_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError>;
+    async fn start_sync_run(&self) -> Result<i64, StateError>;
+    async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError>;
+    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError>;
+}
+
+/// Metadata key-value operations used for sync tokens and state markers.
+#[allow(
+    dead_code,
+    reason = "startup diagnostics and tests use only part of the sync-token role in some build targets"
+)]
+#[async_trait]
+pub trait SyncTokenStore: Send + Sync {
+    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
+    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError>;
+    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError>;
+    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError>;
+    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError>;
+    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError>;
+}
+
+/// Album and people membership reads/writes.
+#[async_trait]
+pub trait MembershipStore: Send + Sync {
+    async fn add_asset_album(
+        &self,
+        library: &str,
+        asset_id: &str,
+        album_name: &str,
+        source: &str,
+    ) -> Result<(), StateError>;
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
+    async fn get_all_asset_albums(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError>;
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
+    async fn get_all_asset_people(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError>;
+}
+
+/// Metadata rewrite markers and hashes.
+#[async_trait]
+pub trait MetadataRewriteStore: Send + Sync {
+    async fn record_metadata_write_failure(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError>;
+    async fn get_downloaded_metadata_hashes(
+        &self,
+    ) -> Result<HashMap<(String, String, String), String>, StateError>;
+    async fn get_metadata_retry_markers(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError>;
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
+    async fn get_pending_metadata_rewrites(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AssetRecord>, StateError>;
+    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
+    async fn update_metadata_hash(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        metadata_hash: &str,
+    ) -> Result<(), StateError>;
+    async fn clear_metadata_write_failure(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError>;
+    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
+}
+
 /// Trait for state database operations.
 ///
 /// This trait is object-safe and can be used with `Arc<dyn StateDb>` for
 /// shared access across async tasks.
+#[allow(
+    dead_code,
+    reason = "transitional composite trait remains for outer wiring and legacy tests while callers migrate to role traits"
+)]
 #[async_trait]
 pub trait StateDb: Send + Sync {
     /// Check if an asset should be downloaded.
@@ -102,9 +286,10 @@ pub trait StateDb: Send + Sync {
     ///
     /// `imported_size` and `imported_mtime` snapshot the on-disk file's size
     /// (bytes) and modification time (epoch seconds) at adopt time. Subsequent
-    /// `import-existing` runs read these via `get_imported_record` and skip
-    /// the SHA-256 re-read when the file is unchanged. `imported_mtime` is
-    /// `None` only when the host filesystem doesn't expose a usable mtime.
+    /// `import-existing` runs bulk-read these via
+    /// `get_all_imported_records` and skip the SHA-256 re-read when the file
+    /// is unchanged. `imported_mtime` is `None` only when the host filesystem
+    /// doesn't expose a usable mtime.
     async fn import_adopt(
         &self,
         record: &AssetRecord,
@@ -250,7 +435,7 @@ pub trait StateDb: Send + Sync {
 
     // ── Bulk read operations ──
 
-    /// Get all downloaded asset IDs as (id, `version_size`) pairs.
+    /// Get all downloaded asset IDs as (`library`, id, `version_size`) triples.
     ///
     /// Used at sync start to pre-load downloaded state for O(1) skip decisions.
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError>;
@@ -420,6 +605,611 @@ pub trait StateDb: Send + Sync {
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
 }
 
+#[async_trait]
+impl<T> StateDb for T
+where
+    T: DownloadStateStore
+        + ImportStateStore
+        + ReportStateStore
+        + SyncTokenStore
+        + MembershipStore
+        + MetadataRewriteStore,
+{
+    #[cfg(test)]
+    async fn should_download(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        checksum: &str,
+        local_path: &Path,
+    ) -> Result<bool, StateError> {
+        DownloadStateStore::should_download(self, library, id, version_size, checksum, local_path)
+            .await
+    }
+
+    async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
+        DownloadStateStore::upsert_seen(self, record).await
+    }
+
+    async fn mark_downloaded(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+    ) -> Result<(), StateError> {
+        DownloadStateStore::mark_downloaded(
+            self,
+            library,
+            id,
+            version_size,
+            local_path,
+            local_checksum,
+            download_checksum,
+        )
+        .await
+    }
+
+    async fn import_adopt(
+        &self,
+        record: &AssetRecord,
+        local_path: &Path,
+        local_checksum: &str,
+        imported_size: u64,
+        imported_mtime: Option<i64>,
+    ) -> Result<(), StateError> {
+        ImportStateStore::import_adopt(
+            self,
+            record,
+            local_path,
+            local_checksum,
+            imported_size,
+            imported_mtime,
+        )
+        .await
+    }
+
+    async fn get_all_imported_records(
+        &self,
+        library: &str,
+    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
+        ImportStateStore::get_all_imported_records(self, library).await
+    }
+
+    async fn mark_failed(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        error: &str,
+    ) -> Result<(), StateError> {
+        DownloadStateStore::mark_failed(self, library, id, version_size, error).await
+    }
+
+    async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
+        <T as ReportStateStore>::get_failed(self).await
+    }
+
+    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
+        ReportStateStore::get_failed_sample(self, limit).await
+    }
+
+    async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
+        <T as DownloadStateStore>::get_pending(self).await
+    }
+
+    async fn get_failed_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        ReportStateStore::get_failed_page(self, offset, limit).await
+    }
+
+    async fn get_pending_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        ReportStateStore::get_pending_page(self, offset, limit).await
+    }
+
+    async fn get_summary(&self) -> Result<SyncSummary, StateError> {
+        ReportStateStore::get_summary(self).await
+    }
+
+    async fn get_downloaded_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        ReportStateStore::get_downloaded_page(self, offset, limit).await
+    }
+
+    async fn start_sync_run(&self) -> Result<i64, StateError> {
+        ReportStateStore::start_sync_run(self).await
+    }
+
+    async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError> {
+        ReportStateStore::complete_sync_run(self, run_id, stats).await
+    }
+
+    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+        ReportStateStore::promote_orphaned_sync_runs(self).await
+    }
+
+    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+        SyncTokenStore::begin_enum_progress(self, zone).await
+    }
+
+    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+        SyncTokenStore::end_enum_progress(self, zone).await
+    }
+
+    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+        SyncTokenStore::list_interrupted_enumerations(self).await
+    }
+
+    async fn reset_failed(&self) -> Result<u64, StateError> {
+        DownloadStateStore::reset_failed(self).await
+    }
+
+    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+        DownloadStateStore::prepare_for_retry(self).await
+    }
+
+    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
+        DownloadStateStore::promote_pending_to_failed(self, seen_since).await
+    }
+
+    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
+        DownloadStateStore::get_downloaded_ids(self).await
+    }
+
+    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+        DownloadStateStore::get_all_known_ids(self).await
+    }
+
+    async fn get_downloaded_checksums(
+        &self,
+    ) -> Result<HashMap<(String, String, String), String>, StateError> {
+        DownloadStateStore::get_downloaded_checksums(self).await
+    }
+
+    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+        DownloadStateStore::get_attempt_counts(self).await
+    }
+
+    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
+        SyncTokenStore::get_metadata(self, key).await
+    }
+
+    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
+        SyncTokenStore::set_metadata(self, key, value).await
+    }
+
+    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
+        SyncTokenStore::delete_metadata_by_prefix(self, prefix).await
+    }
+
+    async fn touch_last_seen_many(
+        &self,
+        library: &str,
+        asset_ids: &[&str],
+    ) -> Result<(), StateError> {
+        DownloadStateStore::touch_last_seen_many(self, library, asset_ids).await
+    }
+
+    async fn add_asset_album(
+        &self,
+        library: &str,
+        asset_id: &str,
+        album_name: &str,
+        source: &str,
+    ) -> Result<(), StateError> {
+        MembershipStore::add_asset_album(self, library, asset_id, album_name, source).await
+    }
+
+    async fn get_all_asset_albums(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        MembershipStore::get_all_asset_albums(self, library).await
+    }
+
+    async fn get_all_asset_people(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        MembershipStore::get_all_asset_people(self, library).await
+    }
+
+    async fn mark_soft_deleted(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StateError> {
+        DownloadStateStore::mark_soft_deleted(self, library, asset_id, deleted_at).await
+    }
+
+    async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
+        DownloadStateStore::mark_hidden_at_source(self, library, asset_id).await
+    }
+
+    async fn record_metadata_write_failure(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        MetadataRewriteStore::record_metadata_write_failure(self, library, asset_id, version_size)
+            .await
+    }
+
+    async fn get_downloaded_metadata_hashes(
+        &self,
+    ) -> Result<HashMap<(String, String, String), String>, StateError> {
+        MetadataRewriteStore::get_downloaded_metadata_hashes(self).await
+    }
+
+    async fn get_metadata_retry_markers(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
+        MetadataRewriteStore::get_metadata_retry_markers(self).await
+    }
+
+    async fn get_pending_metadata_rewrites(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        MetadataRewriteStore::get_pending_metadata_rewrites(self, limit).await
+    }
+
+    async fn update_metadata_hash(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        metadata_hash: &str,
+    ) -> Result<(), StateError> {
+        MetadataRewriteStore::update_metadata_hash(
+            self,
+            library,
+            asset_id,
+            version_size,
+            metadata_hash,
+        )
+        .await
+    }
+
+    async fn clear_metadata_write_failure(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        MetadataRewriteStore::clear_metadata_write_failure(self, library, asset_id, version_size)
+            .await
+    }
+
+    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+        MetadataRewriteStore::has_downloaded_without_metadata_hash(self).await
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "default StateDb pagination methods use this for non-SQLite test stubs"
+)]
+fn page_from_full(
+    full: Vec<AssetRecord>,
+    offset: u64,
+    limit: u32,
+) -> Result<Vec<AssetRecord>, StateError> {
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(full.len());
+    let take = usize::try_from(limit).unwrap_or(usize::MAX);
+    Ok(full.into_iter().skip(start).take(take).collect())
+}
+
+#[async_trait]
+impl DownloadStateStore for dyn StateDb + '_ {
+    #[cfg(test)]
+    async fn should_download(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        checksum: &str,
+        local_path: &Path,
+    ) -> Result<bool, StateError> {
+        StateDb::should_download(self, library, id, version_size, checksum, local_path).await
+    }
+
+    async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
+        StateDb::upsert_seen(self, record).await
+    }
+
+    async fn mark_downloaded(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+    ) -> Result<(), StateError> {
+        StateDb::mark_downloaded(
+            self,
+            library,
+            id,
+            version_size,
+            local_path,
+            local_checksum,
+            download_checksum,
+        )
+        .await
+    }
+
+    async fn mark_failed(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        error: &str,
+    ) -> Result<(), StateError> {
+        StateDb::mark_failed(self, library, id, version_size, error).await
+    }
+
+    async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
+        StateDb::get_pending(self).await
+    }
+
+    async fn reset_failed(&self) -> Result<u64, StateError> {
+        StateDb::reset_failed(self).await
+    }
+
+    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+        StateDb::prepare_for_retry(self).await
+    }
+
+    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
+        StateDb::promote_pending_to_failed(self, seen_since).await
+    }
+
+    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
+        StateDb::get_downloaded_ids(self).await
+    }
+
+    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+        StateDb::get_all_known_ids(self).await
+    }
+
+    async fn get_downloaded_checksums(
+        &self,
+    ) -> Result<HashMap<(String, String, String), String>, StateError> {
+        StateDb::get_downloaded_checksums(self).await
+    }
+
+    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+        StateDb::get_attempt_counts(self).await
+    }
+
+    async fn touch_last_seen_many(
+        &self,
+        library: &str,
+        asset_ids: &[&str],
+    ) -> Result<(), StateError> {
+        StateDb::touch_last_seen_many(self, library, asset_ids).await
+    }
+
+    async fn mark_soft_deleted(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StateError> {
+        StateDb::mark_soft_deleted(self, library, asset_id, deleted_at).await
+    }
+
+    async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
+        StateDb::mark_hidden_at_source(self, library, asset_id).await
+    }
+}
+
+#[async_trait]
+impl ImportStateStore for dyn StateDb + '_ {
+    async fn import_adopt(
+        &self,
+        record: &AssetRecord,
+        local_path: &Path,
+        local_checksum: &str,
+        imported_size: u64,
+        imported_mtime: Option<i64>,
+    ) -> Result<(), StateError> {
+        StateDb::import_adopt(
+            self,
+            record,
+            local_path,
+            local_checksum,
+            imported_size,
+            imported_mtime,
+        )
+        .await
+    }
+
+    async fn get_all_imported_records(
+        &self,
+        library: &str,
+    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
+        StateDb::get_all_imported_records(self, library).await
+    }
+}
+
+#[async_trait]
+impl ReportStateStore for dyn StateDb + '_ {
+    async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
+        StateDb::get_failed(self).await
+    }
+
+    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
+        StateDb::get_failed_sample(self, limit).await
+    }
+
+    async fn get_failed_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        StateDb::get_failed_page(self, offset, limit).await
+    }
+
+    async fn get_pending_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        StateDb::get_pending_page(self, offset, limit).await
+    }
+
+    async fn get_summary(&self) -> Result<SyncSummary, StateError> {
+        StateDb::get_summary(self).await
+    }
+
+    async fn get_downloaded_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        StateDb::get_downloaded_page(self, offset, limit).await
+    }
+
+    async fn start_sync_run(&self) -> Result<i64, StateError> {
+        StateDb::start_sync_run(self).await
+    }
+
+    async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError> {
+        StateDb::complete_sync_run(self, run_id, stats).await
+    }
+
+    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+        StateDb::promote_orphaned_sync_runs(self).await
+    }
+}
+
+#[async_trait]
+impl SyncTokenStore for dyn StateDb + '_ {
+    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
+        StateDb::get_metadata(self, key).await
+    }
+
+    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
+        StateDb::set_metadata(self, key, value).await
+    }
+
+    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
+        StateDb::delete_metadata_by_prefix(self, prefix).await
+    }
+
+    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+        StateDb::begin_enum_progress(self, zone).await
+    }
+
+    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+        StateDb::end_enum_progress(self, zone).await
+    }
+
+    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+        StateDb::list_interrupted_enumerations(self).await
+    }
+}
+
+#[async_trait]
+impl MembershipStore for dyn StateDb + '_ {
+    async fn add_asset_album(
+        &self,
+        library: &str,
+        asset_id: &str,
+        album_name: &str,
+        source: &str,
+    ) -> Result<(), StateError> {
+        StateDb::add_asset_album(self, library, asset_id, album_name, source).await
+    }
+
+    async fn get_all_asset_albums(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        StateDb::get_all_asset_albums(self, library).await
+    }
+
+    async fn get_all_asset_people(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        StateDb::get_all_asset_people(self, library).await
+    }
+}
+
+#[async_trait]
+impl MetadataRewriteStore for dyn StateDb + '_ {
+    async fn record_metadata_write_failure(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        StateDb::record_metadata_write_failure(self, library, asset_id, version_size).await
+    }
+
+    async fn get_downloaded_metadata_hashes(
+        &self,
+    ) -> Result<HashMap<(String, String, String), String>, StateError> {
+        StateDb::get_downloaded_metadata_hashes(self).await
+    }
+
+    async fn get_metadata_retry_markers(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
+        StateDb::get_metadata_retry_markers(self).await
+    }
+
+    async fn get_pending_metadata_rewrites(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        StateDb::get_pending_metadata_rewrites(self, limit).await
+    }
+
+    async fn update_metadata_hash(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        metadata_hash: &str,
+    ) -> Result<(), StateError> {
+        StateDb::update_metadata_hash(self, library, asset_id, version_size, metadata_hash).await
+    }
+
+    async fn clear_metadata_write_failure(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        StateDb::clear_metadata_write_failure(self, library, asset_id, version_size).await
+    }
+
+    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+        StateDb::has_downloaded_without_metadata_hash(self).await
+    }
+}
+
 /// `SQLite` implementation of the state database.
 pub struct SqliteStateDb {
     /// Wrapped in `Arc<Mutex<...>>` because `rusqlite::Connection` is
@@ -563,24 +1353,6 @@ impl SqliteStateDb {
         })
         .await?
     }
-}
-
-/// Slice a `Vec<AssetRecord>` into a page using the same `(offset, limit)`
-/// semantics as `SqliteStateDb::get_downloaded_page`. Used as the default
-/// `get_failed_page` / `get_pending_page` body so trait mocks that only
-/// implement the unbounded `get_failed` / `get_pending` keep compiling. The
-/// production `SqliteStateDb` impl overrides with a real LIMIT/OFFSET query
-/// and never materializes the full vector.
-fn page_from_full(
-    full: Vec<AssetRecord>,
-    offset: u64,
-    limit: u32,
-) -> Result<Vec<AssetRecord>, StateError> {
-    let start = usize::try_from(offset)
-        .unwrap_or(usize::MAX)
-        .min(full.len());
-    let take = usize::try_from(limit).unwrap_or(usize::MAX);
-    Ok(full.into_iter().skip(start).take(take).collect())
 }
 
 /// Execute the asset UPSERT on `conn` (works against either a `Connection`
@@ -748,10 +1520,9 @@ where
     out
 }
 
-#[async_trait]
-impl StateDb for SqliteStateDb {
+impl SqliteStateDb {
     #[cfg(test)]
-    async fn should_download(
+    pub(crate) async fn should_download(
         &self,
         library: &str,
         id: &str,
@@ -825,7 +1596,7 @@ impl StateDb for SqliteStateDb {
         }
     }
 
-    async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
+    pub(crate) async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
         let record = record.clone();
         self.with_conn("upsert_seen", move |conn| {
             upsert_asset_row(conn, &record, Utc::now().timestamp())
@@ -833,7 +1604,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn mark_downloaded(
+    pub(crate) async fn mark_downloaded(
         &self,
         library: &str,
         id: &str,
@@ -875,7 +1646,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn import_adopt(
+    pub(crate) async fn import_adopt(
         &self,
         record: &AssetRecord,
         local_path: &Path,
@@ -934,7 +1705,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_all_imported_records(
+    pub(crate) async fn get_all_imported_records(
         &self,
         library: &str,
     ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
@@ -979,7 +1750,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn mark_failed(
+    pub(crate) async fn mark_failed(
         &self,
         library: &str,
         id: &str,
@@ -1022,7 +1793,8 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
+    #[cfg(test)]
+    pub(crate) async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
         self.with_conn("get_failed", move |conn| {
             let sql = format!(
                 "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'failed' \
@@ -1043,7 +1815,10 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
+    pub(crate) async fn get_failed_sample(
+        &self,
+        limit: u32,
+    ) -> Result<(Vec<AssetRecord>, u64), StateError> {
         self.with_conn("get_failed_sample", move |conn| {
             let total: i64 = conn
                 .query_row(
@@ -1077,7 +1852,8 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
+    #[cfg(test)]
+    pub(crate) async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
         self.with_conn("get_pending", move |conn| {
             let sql = format!(
                 "SELECT {ASSET_COLUMNS} FROM assets WHERE status = 'pending' \
@@ -1098,7 +1874,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_failed_page(
+    pub(crate) async fn get_failed_page(
         &self,
         offset: u64,
         limit: u32,
@@ -1131,7 +1907,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_pending_page(
+    pub(crate) async fn get_pending_page(
         &self,
         offset: u64,
         limit: u32,
@@ -1164,7 +1940,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_summary(&self) -> Result<SyncSummary, StateError> {
+    pub(crate) async fn get_summary(&self) -> Result<SyncSummary, StateError> {
         self.with_conn("get_summary", move |conn| {
             let (total_assets, downloaded, pending, failed, downloaded_bytes) = conn
                 .query_row(
@@ -1227,7 +2003,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_downloaded_page(
+    pub(crate) async fn get_downloaded_page(
         &self,
         offset: u64,
         limit: u32,
@@ -1255,7 +2031,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn start_sync_run(&self) -> Result<i64, StateError> {
+    pub(crate) async fn start_sync_run(&self) -> Result<i64, StateError> {
         let started_at = Utc::now().timestamp();
         self.with_conn("start_sync_run", move |conn| {
             conn.execute(
@@ -1269,7 +2045,11 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError> {
+    pub(crate) async fn complete_sync_run(
+        &self,
+        run_id: i64,
+        stats: &SyncRunStats,
+    ) -> Result<(), StateError> {
         let completed_at = Utc::now().timestamp();
         let assets_seen = i64::try_from(stats.assets_seen).unwrap_or(i64::MAX);
         let assets_downloaded = i64::try_from(stats.assets_downloaded).unwrap_or(i64::MAX);
@@ -1305,7 +2085,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+    pub(crate) async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
         self.with_conn("promote_orphaned_sync_runs", move |conn| {
             let rows = conn
                 .execute(
@@ -1319,7 +2099,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+    pub(crate) async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
         let key = format!("enum_in_progress:{zone}");
         let now = Utc::now().timestamp().to_string();
         self.with_conn("begin_enum_progress", move |conn| {
@@ -1335,7 +2115,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+    pub(crate) async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
         let key = format!("enum_in_progress:{zone}");
         self.with_conn("end_enum_progress", move |conn| {
             conn.execute("DELETE FROM metadata WHERE key = ?1", [key])
@@ -1345,7 +2125,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+    pub(crate) async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
         self.with_conn("list_interrupted_enumerations", move |conn| {
             let mut stmt = conn
                 .prepare("SELECT key FROM metadata WHERE key LIKE 'enum_in_progress:%'")
@@ -1365,12 +2145,12 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn reset_failed(&self) -> Result<u64, StateError> {
+    pub(crate) async fn reset_failed(&self) -> Result<u64, StateError> {
         let (failed, _, _) = self.prepare_for_retry().await?;
         Ok(failed)
     }
 
-    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+    pub(crate) async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
         self.with_conn("prepare_for_retry", move |conn| {
             let failed = conn
                 .execute(
@@ -1403,7 +2183,10 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
+    pub(crate) async fn promote_pending_to_failed(
+        &self,
+        seen_since: i64,
+    ) -> Result<u64, StateError> {
         self.with_conn("promote_pending_to_failed", move |conn| {
             // Only promote assets the producer dispatched this sync (last_seen_at
             // was bumped by upsert_seen at or after sync_started_at) that never
@@ -1423,7 +2206,9 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
+    pub(crate) async fn get_downloaded_ids(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
         self.with_conn("get_downloaded_ids", move |conn| {
             let count: i64 = conn
                 .query_row(
@@ -1459,7 +2244,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+    pub(crate) async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
         self.with_conn("get_all_known_ids", move |conn| {
             let mut stmt = conn
                 .prepare_cached("SELECT DISTINCT id FROM assets")
@@ -1476,7 +2261,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_downloaded_checksums(
+    pub(crate) async fn get_downloaded_checksums(
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError> {
         self.with_conn("get_downloaded_checksums", move |conn| {
@@ -1520,7 +2305,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+    pub(crate) async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
         self.with_conn("get_attempt_counts", move |conn| {
             let mut stmt = conn
                 .prepare_cached(
@@ -1544,7 +2329,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
+    pub(crate) async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
         let key = key.to_owned();
         self.with_conn("get_metadata", move |conn| {
             let value = conn
@@ -1559,7 +2344,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
+    pub(crate) async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
         let key = key.to_owned();
         let value = value.to_owned();
         self.with_conn("set_metadata", move |conn| {
@@ -1574,7 +2359,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
+    pub(crate) async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
         let prefix = prefix.to_owned();
         self.with_conn("delete_metadata_by_prefix", move |conn| {
             let mut stmt = conn
@@ -1589,7 +2374,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn touch_last_seen_many(
+    pub(crate) async fn touch_last_seen_many(
         &self,
         library: &str,
         asset_ids: &[&str],
@@ -1622,7 +2407,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn add_asset_album(
+    pub(crate) async fn add_asset_album(
         &self,
         library: &str,
         asset_id: &str,
@@ -1645,7 +2430,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_all_asset_albums(
+    pub(crate) async fn get_all_asset_albums(
         &self,
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError> {
@@ -1664,7 +2449,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_all_asset_people(
+    pub(crate) async fn get_all_asset_people(
         &self,
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError> {
@@ -1683,7 +2468,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn mark_soft_deleted(
+    pub(crate) async fn mark_soft_deleted(
         &self,
         library: &str,
         asset_id: &str,
@@ -1703,7 +2488,11 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
+    pub(crate) async fn mark_hidden_at_source(
+        &self,
+        library: &str,
+        asset_id: &str,
+    ) -> Result<(), StateError> {
         let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         self.with_conn("mark_hidden_at_source", move |conn| {
@@ -1717,7 +2506,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn record_metadata_write_failure(
+    pub(crate) async fn record_metadata_write_failure(
         &self,
         library: &str,
         asset_id: &str,
@@ -1739,7 +2528,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn clear_metadata_write_failure(
+    pub(crate) async fn clear_metadata_write_failure(
         &self,
         library: &str,
         asset_id: &str,
@@ -1760,7 +2549,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_downloaded_metadata_hashes(
+    pub(crate) async fn get_downloaded_metadata_hashes(
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError> {
         self.with_conn("get_downloaded_metadata_hashes", move |conn| {
@@ -1793,7 +2582,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_pending_metadata_rewrites(
+    pub(crate) async fn get_pending_metadata_rewrites(
         &self,
         limit: usize,
     ) -> Result<Vec<AssetRecord>, StateError> {
@@ -1821,7 +2610,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn get_metadata_retry_markers(
+    pub(crate) async fn get_metadata_retry_markers(
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError> {
         self.with_conn("get_metadata_retry_markers", move |conn| {
@@ -1850,7 +2639,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn update_metadata_hash(
+    pub(crate) async fn update_metadata_hash(
         &self,
         library: &str,
         asset_id: &str,
@@ -1873,7 +2662,7 @@ impl StateDb for SqliteStateDb {
         .await
     }
 
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+    pub(crate) async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
         self.with_conn("has_downloaded_without_metadata_hash", move |conn| {
             let exists: i64 = conn
                 .query_row(
@@ -1886,6 +2675,300 @@ impl StateDb for SqliteStateDb {
             Ok(exists != 0)
         })
         .await
+    }
+}
+
+#[async_trait]
+impl DownloadStateStore for SqliteStateDb {
+    #[cfg(test)]
+    async fn should_download(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        checksum: &str,
+        local_path: &Path,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::should_download(self, library, id, version_size, checksum, local_path).await
+    }
+
+    async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
+        SqliteStateDb::upsert_seen(self, record).await
+    }
+
+    async fn mark_downloaded(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::mark_downloaded(
+            self,
+            library,
+            id,
+            version_size,
+            local_path,
+            local_checksum,
+            download_checksum,
+        )
+        .await
+    }
+
+    async fn mark_failed(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        error: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::mark_failed(self, library, id, version_size, error).await
+    }
+
+    async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
+        <SqliteStateDb as ReportStateStore>::get_pending_page(self, 0, u32::MAX).await
+    }
+
+    async fn reset_failed(&self) -> Result<u64, StateError> {
+        SqliteStateDb::reset_failed(self).await
+    }
+
+    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+        SqliteStateDb::prepare_for_retry(self).await
+    }
+
+    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
+        SqliteStateDb::promote_pending_to_failed(self, seen_since).await
+    }
+
+    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
+        SqliteStateDb::get_downloaded_ids(self).await
+    }
+
+    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+        SqliteStateDb::get_all_known_ids(self).await
+    }
+
+    async fn get_downloaded_checksums(
+        &self,
+    ) -> Result<HashMap<(String, String, String), String>, StateError> {
+        SqliteStateDb::get_downloaded_checksums(self).await
+    }
+
+    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+        SqliteStateDb::get_attempt_counts(self).await
+    }
+
+    async fn touch_last_seen_many(
+        &self,
+        library: &str,
+        asset_ids: &[&str],
+    ) -> Result<(), StateError> {
+        SqliteStateDb::touch_last_seen_many(self, library, asset_ids).await
+    }
+
+    async fn mark_soft_deleted(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::mark_soft_deleted(self, library, asset_id, deleted_at).await
+    }
+
+    async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
+        SqliteStateDb::mark_hidden_at_source(self, library, asset_id).await
+    }
+}
+
+#[async_trait]
+impl ImportStateStore for SqliteStateDb {
+    async fn import_adopt(
+        &self,
+        record: &AssetRecord,
+        local_path: &Path,
+        local_checksum: &str,
+        imported_size: u64,
+        imported_mtime: Option<i64>,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::import_adopt(
+            self,
+            record,
+            local_path,
+            local_checksum,
+            imported_size,
+            imported_mtime,
+        )
+        .await
+    }
+
+    async fn get_all_imported_records(
+        &self,
+        library: &str,
+    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
+        SqliteStateDb::get_all_imported_records(self, library).await
+    }
+}
+
+#[async_trait]
+impl ReportStateStore for SqliteStateDb {
+    async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
+        <SqliteStateDb as ReportStateStore>::get_failed_page(self, 0, u32::MAX).await
+    }
+
+    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
+        SqliteStateDb::get_failed_sample(self, limit).await
+    }
+
+    async fn get_failed_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        SqliteStateDb::get_failed_page(self, offset, limit).await
+    }
+
+    async fn get_pending_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        SqliteStateDb::get_pending_page(self, offset, limit).await
+    }
+
+    async fn get_summary(&self) -> Result<SyncSummary, StateError> {
+        SqliteStateDb::get_summary(self).await
+    }
+
+    async fn get_downloaded_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        SqliteStateDb::get_downloaded_page(self, offset, limit).await
+    }
+
+    async fn start_sync_run(&self) -> Result<i64, StateError> {
+        SqliteStateDb::start_sync_run(self).await
+    }
+
+    async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError> {
+        SqliteStateDb::complete_sync_run(self, run_id, stats).await
+    }
+
+    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
+        SqliteStateDb::promote_orphaned_sync_runs(self).await
+    }
+}
+
+#[async_trait]
+impl SyncTokenStore for SqliteStateDb {
+    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
+        SqliteStateDb::get_metadata(self, key).await
+    }
+
+    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
+        SqliteStateDb::set_metadata(self, key, value).await
+    }
+
+    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
+        SqliteStateDb::delete_metadata_by_prefix(self, prefix).await
+    }
+
+    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+        SqliteStateDb::begin_enum_progress(self, zone).await
+    }
+
+    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
+        SqliteStateDb::end_enum_progress(self, zone).await
+    }
+
+    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+        SqliteStateDb::list_interrupted_enumerations(self).await
+    }
+}
+
+#[async_trait]
+impl MembershipStore for SqliteStateDb {
+    async fn add_asset_album(
+        &self,
+        library: &str,
+        asset_id: &str,
+        album_name: &str,
+        source: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::add_asset_album(self, library, asset_id, album_name, source).await
+    }
+
+    async fn get_all_asset_albums(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        SqliteStateDb::get_all_asset_albums(self, library).await
+    }
+
+    async fn get_all_asset_people(
+        &self,
+        library: &str,
+    ) -> Result<Vec<(String, String)>, StateError> {
+        SqliteStateDb::get_all_asset_people(self, library).await
+    }
+}
+
+#[async_trait]
+impl MetadataRewriteStore for SqliteStateDb {
+    async fn record_metadata_write_failure(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::record_metadata_write_failure(self, library, asset_id, version_size).await
+    }
+
+    async fn get_downloaded_metadata_hashes(
+        &self,
+    ) -> Result<HashMap<(String, String, String), String>, StateError> {
+        SqliteStateDb::get_downloaded_metadata_hashes(self).await
+    }
+
+    async fn get_metadata_retry_markers(
+        &self,
+    ) -> Result<HashSet<(String, String, String)>, StateError> {
+        SqliteStateDb::get_metadata_retry_markers(self).await
+    }
+
+    async fn get_pending_metadata_rewrites(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AssetRecord>, StateError> {
+        SqliteStateDb::get_pending_metadata_rewrites(self, limit).await
+    }
+
+    async fn update_metadata_hash(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+        metadata_hash: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::update_metadata_hash(self, library, asset_id, version_size, metadata_hash)
+            .await
+    }
+
+    async fn clear_metadata_write_failure(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::clear_metadata_write_failure(self, library, asset_id, version_size).await
+    }
+
+    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
+        SqliteStateDb::has_downloaded_without_metadata_hash(self).await
     }
 }
 

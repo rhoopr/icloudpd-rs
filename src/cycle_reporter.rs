@@ -14,22 +14,25 @@ use crate::metrics::MetricsHandle;
 use crate::notifications::{self, Notifier};
 use crate::personality::Mode;
 use crate::report::{self, RunOptions};
-use crate::state::{self, StateDb};
+use crate::state::{self, ReportStateStore};
 
 /// Stable dependencies and resolved options used by the post-cycle reporter.
-pub(crate) struct CycleReporter<'a> {
+pub(crate) struct CycleReporter<'a, D: ReportStateStore + ?Sized> {
     username: &'a str,
     watch_mode: bool,
     report_path: Option<&'a Path>,
     run_options: RunOptions,
     health_dir: &'a Path,
     personality_mode: Mode,
-    state_db: Option<&'a dyn StateDb>,
+    state_db: Option<&'a D>,
     metrics_handle: Option<&'a MetricsHandle>,
     notifier: &'a Notifier,
 }
 
-impl std::fmt::Debug for CycleReporter<'_> {
+impl<D> std::fmt::Debug for CycleReporter<'_, D>
+where
+    D: ReportStateStore + ?Sized,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CycleReporter")
             .field("username", &self.username)
@@ -46,19 +49,22 @@ impl std::fmt::Debug for CycleReporter<'_> {
 }
 
 /// Constructor input for [`CycleReporter`].
-pub(crate) struct CycleReporterConfig<'a> {
+pub(crate) struct CycleReporterConfig<'a, D: ReportStateStore + ?Sized> {
     pub(crate) username: &'a str,
     pub(crate) watch_mode: bool,
     pub(crate) report_path: Option<&'a Path>,
     pub(crate) run_options: RunOptions,
     pub(crate) health_dir: &'a Path,
     pub(crate) personality_mode: Mode,
-    pub(crate) state_db: Option<&'a dyn StateDb>,
+    pub(crate) state_db: Option<&'a D>,
     pub(crate) metrics_handle: Option<&'a MetricsHandle>,
     pub(crate) notifier: &'a Notifier,
 }
 
-impl std::fmt::Debug for CycleReporterConfig<'_> {
+impl<D> std::fmt::Debug for CycleReporterConfig<'_, D>
+where
+    D: ReportStateStore + ?Sized,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CycleReporterConfig")
             .field("username", &self.username)
@@ -83,8 +89,11 @@ pub(crate) struct CycleReportInput<'a> {
     pub(crate) elapsed: Duration,
 }
 
-impl<'a> CycleReporter<'a> {
-    pub(crate) fn new(config: CycleReporterConfig<'a>) -> Self {
+impl<'a, D> CycleReporter<'a, D>
+where
+    D: ReportStateStore + ?Sized,
+{
+    pub(crate) fn new(config: CycleReporterConfig<'a, D>) -> Self {
         Self {
             username: config.username,
             watch_mode: config.watch_mode,
@@ -357,7 +366,7 @@ mod tests {
         dir: &'a Path,
         report_path: Option<&'a Path>,
         notifier: &'a Notifier,
-    ) -> CycleReporter<'a> {
+    ) -> CycleReporter<'a, state::SqliteStateDb> {
         CycleReporter::new(CycleReporterConfig {
             username: "reporter@example.com",
             watch_mode: false,
@@ -377,7 +386,7 @@ mod tests {
     }
 
     async fn report_cycle(
-        reporter: &CycleReporter<'_>,
+        reporter: &CycleReporter<'_, state::SqliteStateDb>,
         health: &mut HealthStatus,
         stats: &SyncStats,
         failed_count: usize,

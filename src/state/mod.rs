@@ -12,5 +12,10 @@ pub mod error;
 pub mod schema;
 pub mod types;
 
-pub use db::{SqliteStateDb, StateDb};
+#[cfg(test)]
+pub use db::ImportedRecord;
+pub use db::{
+    DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,
+    SqliteStateDb, StateDb, SyncTokenStore,
+};
 pub use types::{AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, VersionSizeKey};

@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::icloud::photos::PhotoAsset;
-use crate::state::{AssetRecord, StateDb};
+use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
 
 use super::filter::{
     determine_media_type, filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
@@ -84,12 +84,15 @@ pub(super) enum ExistingPathMatch {
 
 /// Persist the pending state row that a later `mark_downloaded` /
 /// `mark_failed` call will finalize.
-pub(super) async fn upsert_seen_for_task(
-    db: &dyn StateDb,
+pub(super) async fn upsert_seen_for_task<D>(
+    db: &D,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     task: &DownloadTask,
-) -> Result<(), crate::state::error::StateError> {
+) -> Result<(), crate::state::error::StateError>
+where
+    D: DownloadStateStore + ?Sized,
+{
     let media_type = determine_media_type(task.version_size, asset);
     let record = AssetRecord::new_pending(
         Arc::clone(&config.library),
@@ -113,11 +116,14 @@ pub(super) async fn upsert_seen_for_task(
 /// Record an asset's membership in the current concrete album/smart-folder
 /// pass. Returns `Ok(())` without touching the DB when the pass is not
 /// album-scoped.
-pub(super) async fn record_album_membership_if_named(
-    db: &dyn StateDb,
+pub(super) async fn record_album_membership_if_named<D>(
+    db: &D,
     config: &DownloadConfig,
     asset: &PhotoAsset,
-) -> Result<(), crate::state::error::StateError> {
+) -> Result<(), crate::state::error::StateError>
+where
+    D: MembershipStore + ?Sized,
+{
     let Some(album_name) = config.album_name.as_deref().filter(|name| !name.is_empty()) else {
         return Ok(());
     };
@@ -134,13 +140,16 @@ pub(super) const ADD_ASSET_ALBUM_MAX_RETRIES: u32 = 3;
 /// Insert an asset/album row with a bounded inline retry loop. The
 /// underlying call is `INSERT OR IGNORE` so retries are idempotent. Returns
 /// the final result so the caller can log on persistent failure.
-pub(super) async fn add_asset_album_with_retry(
-    db: &dyn StateDb,
+pub(super) async fn add_asset_album_with_retry<D>(
+    db: &D,
     library: &str,
     asset_id: &str,
     album_name: &str,
     source: &str,
-) -> Result<(), crate::state::error::StateError> {
+) -> Result<(), crate::state::error::StateError>
+where
+    D: MembershipStore + ?Sized,
+{
     use rand::RngExt;
     let mut last_err: Option<crate::state::error::StateError> = None;
     for attempt in 1..=ADD_ASSET_ALBUM_MAX_RETRIES {
@@ -192,7 +201,7 @@ mod tests {
 
     use crate::commands::{AlbumPass, PassKind};
     use crate::icloud::photos::PhotoAlbum;
-    use crate::state::{SqliteStateDb, StateDb};
+    use crate::state::SqliteStateDb;
     use crate::test_helpers::TestPhotoAsset;
 
     use super::*;

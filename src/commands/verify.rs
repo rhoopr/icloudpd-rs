@@ -9,7 +9,6 @@ use crate::cli;
 use crate::config;
 use crate::download;
 use crate::state;
-use crate::state::StateDb;
 
 use super::{print_truncation_tail, LISTING_CAP};
 

@@ -7,7 +7,7 @@ use crate::cli;
 use crate::config;
 use crate::service::status::{render_oneline, service_state};
 use crate::state;
-use crate::state::{AssetRecord, StateDb};
+use crate::state::AssetRecord;
 
 use super::{print_truncation_tail, LISTING_CAP};
 

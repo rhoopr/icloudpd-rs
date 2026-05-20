@@ -18,7 +18,7 @@ use crate::download::paths::{normalize_ampm, DirCache};
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
-use crate::state::StateDb;
+use crate::state::ImportStateStore;
 use crate::types::FileMatchPolicy;
 
 use super::service::{init_photos_service, resolve_libraries, resolve_passes};
@@ -402,10 +402,10 @@ async fn resolve_match_path(
 /// `photo_stream` -- after the stream is drained, we check it and bail
 /// loudly if any fetcher task panicked, since a panicked fetcher closes
 /// the stream early and would otherwise read as a clean enumeration.
-pub(crate) async fn import_assets<S>(
+pub(crate) async fn import_assets<S, D>(
     stream: S,
     panic_rx: tokio::sync::oneshot::Receiver<bool>,
-    db: &dyn StateDb,
+    db: &D,
     download_config: &download::DownloadConfig,
     library_label: &str,
     dir_cache: &mut DirCache,
@@ -413,6 +413,7 @@ pub(crate) async fn import_assets<S>(
 ) -> anyhow::Result<ImportStats>
 where
     S: futures_util::Stream<Item = anyhow::Result<PhotoAsset>>,
+    D: ImportStateStore + ?Sized,
 {
     use futures_util::StreamExt;
     use std::sync::atomic::Ordering;

@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::PhotoAsset;
 use crate::retry::RetryConfig;
-use crate::state::{StateDb, SyncRunStats, VersionSizeKey};
+use crate::state::{MetadataRewriteStore, StateDb, SyncRunStats, VersionSizeKey};
 
 use super::error::DownloadError;
 #[cfg_attr(not(feature = "xmp"), allow(unused_imports))]
@@ -239,13 +239,15 @@ pub(super) const AUTH_ERROR_THRESHOLD: usize = 3;
 /// metadata drifted from the stored hash (or that already carries a marker
 /// from a prior sync). No-op when metadata writing is off or the state DB
 /// is absent. Shared by the trust-state and on-disk-skip producer branches.
-async fn tag_metadata_rewrites(
-    state_db: Option<&dyn StateDb>,
+async fn tag_metadata_rewrites<D>(
+    state_db: Option<&D>,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     candidates: &[(VersionSizeKey, &str)],
     ctx: &DownloadContext,
-) {
+) where
+    D: MetadataRewriteStore + ?Sized,
+{
     if MetadataFlags::from(config).is_empty() {
         return;
     }
@@ -284,12 +286,14 @@ const METADATA_REWRITE_BATCH: usize = 500;
 /// re-apply EXIF/XMP using the stored metadata. On success clears
 /// the marker and refreshes `metadata_hash`; on failure leaves the marker so
 /// the next sync retries.
-async fn run_metadata_rewrites(
-    db: &dyn StateDb,
+async fn run_metadata_rewrites<D>(
+    db: &D,
     metadata_flags: MetadataFlags,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
-) {
+) where
+    D: MetadataRewriteStore + ?Sized,
+{
     let pending = match db
         .get_pending_metadata_rewrites(METADATA_REWRITE_BATCH)
         .await
@@ -2790,7 +2794,10 @@ mod tests {
     use super::*;
     use crate::state::error::StateError;
     use crate::state::types::SyncSummary;
-    use crate::state::{AssetRecord, SyncRunStats, VersionSizeKey};
+    use crate::state::{
+        AssetRecord, DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore,
+        ReportStateStore, SyncRunStats, SyncTokenStore, VersionSizeKey,
+    };
     use crate::test_helpers::TestPhotoAsset;
     use std::collections::{HashMap, HashSet};
     use std::fs;
@@ -2940,7 +2947,7 @@ mod tests {
 
     // ── add_asset_album retry tests ─────────────────────────────────
 
-    /// StateDb stub whose `add_asset_album` returns `LockPoisoned` for the
+    /// Membership store stub whose `add_asset_album` returns `LockPoisoned` for the
     /// first `fail_first` calls, then succeeds. Tracks total call count so
     /// tests can pin the retry-attempt accounting. Other methods panic
     /// because the test path never reaches them.
@@ -2961,102 +2968,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl StateDb for AlbumRetryStubDb {
-        #[cfg(test)]
-        async fn should_download(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &Path,
-        ) -> Result<bool, StateError> {
-            unimplemented!()
-        }
-        async fn upsert_seen(&self, _: &AssetRecord) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn mark_downloaded(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &Path,
-            _: &str,
-            _: Option<&str>,
-        ) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn import_adopt(
-            &self,
-            _: &AssetRecord,
-            _: &Path,
-            _: &str,
-            _: u64,
-            _: Option<i64>,
-        ) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn mark_failed(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
-            unimplemented!()
-        }
-        async fn get_failed_sample(&self, _: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
-            unimplemented!()
-        }
-        async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
-            unimplemented!()
-        }
-        async fn get_summary(&self) -> Result<SyncSummary, StateError> {
-            unimplemented!()
-        }
-        async fn get_downloaded_page(
-            &self,
-            _: u64,
-            _: u32,
-        ) -> Result<Vec<AssetRecord>, StateError> {
-            unimplemented!()
-        }
-        async fn start_sync_run(&self) -> Result<i64, StateError> {
-            unimplemented!()
-        }
-        async fn complete_sync_run(&self, _: i64, _: &SyncRunStats) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
-            unimplemented!()
-        }
-        async fn begin_enum_progress(&self, _: &str) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn end_enum_progress(&self, _: &str) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
-            unimplemented!()
-        }
-        async fn reset_failed(&self) -> Result<u64, StateError> {
-            unimplemented!()
-        }
-        async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
-            unimplemented!()
-        }
-        async fn promote_pending_to_failed(&self, _: i64) -> Result<u64, StateError> {
-            unimplemented!()
-        }
-        async fn get_downloaded_ids(
-            &self,
-        ) -> Result<HashSet<(String, String, String)>, StateError> {
-            unimplemented!()
-        }
-        async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
-            unimplemented!()
-        }
-        async fn touch_last_seen_many(&self, _: &str, _: &[&str]) -> Result<(), StateError> {
-            unimplemented!()
-        }
+    impl MembershipStore for AlbumRetryStubDb {
         async fn add_asset_album(
             &self,
             _library: &str,
@@ -3078,82 +2990,12 @@ mod tests {
                 Ok(())
             }
         }
+
         async fn get_all_asset_albums(&self, _: &str) -> Result<Vec<(String, String)>, StateError> {
             unimplemented!()
         }
+
         async fn get_all_asset_people(&self, _: &str) -> Result<Vec<(String, String)>, StateError> {
-            unimplemented!()
-        }
-        async fn mark_soft_deleted(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<chrono::DateTime<chrono::Utc>>,
-        ) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn mark_hidden_at_source(&self, _: &str, _: &str) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn record_metadata_write_failure(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn clear_metadata_write_failure(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
-            unimplemented!()
-        }
-        async fn get_downloaded_checksums(
-            &self,
-        ) -> Result<HashMap<(String, String, String), String>, StateError> {
-            unimplemented!()
-        }
-        async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
-            unimplemented!()
-        }
-        async fn get_metadata(&self, _: &str) -> Result<Option<String>, StateError> {
-            unimplemented!()
-        }
-        async fn set_metadata(&self, _: &str, _: &str) -> Result<(), StateError> {
-            unimplemented!()
-        }
-        async fn delete_metadata_by_prefix(&self, _: &str) -> Result<u64, StateError> {
-            unimplemented!()
-        }
-        async fn get_downloaded_metadata_hashes(
-            &self,
-        ) -> Result<HashMap<(String, String, String), String>, StateError> {
-            unimplemented!()
-        }
-        async fn get_metadata_retry_markers(
-            &self,
-        ) -> Result<HashSet<(String, String, String)>, StateError> {
-            unimplemented!()
-        }
-        async fn get_pending_metadata_rewrites(
-            &self,
-            _: usize,
-        ) -> Result<Vec<AssetRecord>, StateError> {
-            unimplemented!()
-        }
-        async fn update_metadata_hash(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: &str,
-        ) -> Result<(), StateError> {
             unimplemented!()
         }
     }
@@ -3783,7 +3625,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl StateDb for FailingStateDb {
+    impl DownloadStateStore for FailingStateDb {
         #[cfg(test)]
         async fn should_download(
             &self,
@@ -3795,9 +3637,11 @@ mod tests {
         ) -> Result<bool, StateError> {
             unimplemented!()
         }
+
         async fn upsert_seen(&self, _: &AssetRecord) -> Result<(), StateError> {
             unimplemented!()
         }
+
         async fn mark_downloaded(
             &self,
             _: &str,
@@ -3817,6 +3661,68 @@ mod tests {
                 Ok(())
             }
         }
+
+        async fn mark_failed(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+            unimplemented!()
+        }
+
+        #[cfg(test)]
+        async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+
+        async fn reset_failed(&self) -> Result<u64, StateError> {
+            unimplemented!()
+        }
+
+        async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+            Ok((0, 0, 0))
+        }
+
+        async fn promote_pending_to_failed(&self, _seen_since: i64) -> Result<u64, StateError> {
+            Ok(0)
+        }
+
+        async fn get_downloaded_ids(
+            &self,
+        ) -> Result<HashSet<(String, String, String)>, StateError> {
+            Ok(HashSet::new())
+        }
+
+        async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
+            Ok(HashSet::new())
+        }
+
+        async fn get_downloaded_checksums(
+            &self,
+        ) -> Result<HashMap<(String, String, String), String>, StateError> {
+            Ok(HashMap::new())
+        }
+
+        async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
+            Ok(HashMap::new())
+        }
+
+        async fn touch_last_seen_many(&self, _: &str, _: &[&str]) -> Result<(), StateError> {
+            Ok(())
+        }
+
+        async fn mark_soft_deleted(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+
+        async fn mark_hidden_at_source(&self, _: &str, _: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImportStateStore for FailingStateDb {
         async fn import_adopt(
             &self,
             _: &AssetRecord,
@@ -3827,24 +3733,49 @@ mod tests {
         ) -> Result<(), StateError> {
             unimplemented!()
         }
-        async fn mark_failed(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), StateError> {
-            unimplemented!()
+
+        async fn get_all_imported_records(
+            &self,
+            _: &str,
+        ) -> Result<HashMap<(String, String), crate::state::ImportedRecord>, StateError> {
+            Ok(HashMap::new())
         }
+    }
+
+    #[async_trait::async_trait]
+    impl ReportStateStore for FailingStateDb {
+        #[cfg(test)]
         async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()
         }
+
         async fn get_failed_sample(
             &self,
             _limit: u32,
         ) -> Result<(Vec<AssetRecord>, u64), StateError> {
             Ok((Vec::new(), 0))
         }
-        async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
+
+        async fn get_failed_page(
+            &self,
+            _offset: u64,
+            _limit: u32,
+        ) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()
         }
+
+        async fn get_pending_page(
+            &self,
+            _offset: u64,
+            _limit: u32,
+        ) -> Result<Vec<AssetRecord>, StateError> {
+            unimplemented!()
+        }
+
         async fn get_summary(&self) -> Result<SyncSummary, StateError> {
             unimplemented!()
         }
+
         async fn get_downloaded_page(
             &self,
             _offset: u64,
@@ -3852,9 +3783,11 @@ mod tests {
         ) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()
         }
+
         async fn start_sync_run(&self) -> Result<i64, StateError> {
             Ok(1)
         }
+
         async fn complete_sync_run(&self, _: i64, _: &SyncRunStats) -> Result<(), StateError> {
             if self.fail_complete_sync_run {
                 Err(StateError::LockPoisoned(
@@ -3864,57 +3797,41 @@ mod tests {
                 Ok(())
             }
         }
+
         async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
             Ok(0)
         }
-        async fn begin_enum_progress(&self, _zone: &str) -> Result<(), StateError> {
-            Ok(())
-        }
-        async fn end_enum_progress(&self, _zone: &str) -> Result<(), StateError> {
-            Ok(())
-        }
-        async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
-            Ok(Vec::new())
-        }
-        async fn reset_failed(&self) -> Result<u64, StateError> {
-            unimplemented!()
-        }
-        async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
-            Ok((0, 0, 0))
-        }
-        async fn promote_pending_to_failed(&self, _seen_since: i64) -> Result<u64, StateError> {
-            Ok(0)
-        }
-        async fn get_downloaded_ids(
-            &self,
-        ) -> Result<HashSet<(String, String, String)>, StateError> {
-            Ok(HashSet::new())
-        }
-        async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
-            Ok(HashSet::new())
-        }
-        async fn get_downloaded_checksums(
-            &self,
-        ) -> Result<HashMap<(String, String, String), String>, StateError> {
-            Ok(HashMap::new())
-        }
-        async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
-            Ok(HashMap::new())
-        }
+    }
+
+    #[async_trait::async_trait]
+    impl SyncTokenStore for FailingStateDb {
         async fn get_metadata(&self, _: &str) -> Result<Option<String>, StateError> {
             Ok(None)
         }
+
         async fn set_metadata(&self, _: &str, _: &str) -> Result<(), StateError> {
             Ok(())
         }
+
         async fn delete_metadata_by_prefix(&self, _: &str) -> Result<u64, StateError> {
             Ok(0)
         }
-        async fn touch_last_seen_many(&self, _: &str, _: &[&str]) -> Result<(), StateError> {
-            // Unused in these tests; default no-op so they don't bump the
-            // pipeline's batch-flush path.
+
+        async fn begin_enum_progress(&self, _zone: &str) -> Result<(), StateError> {
             Ok(())
         }
+
+        async fn end_enum_progress(&self, _zone: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+
+        async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MembershipStore for FailingStateDb {
         async fn add_asset_album(
             &self,
             _: &str,
@@ -3924,23 +3841,18 @@ mod tests {
         ) -> Result<(), StateError> {
             Ok(())
         }
+
         async fn get_all_asset_albums(&self, _: &str) -> Result<Vec<(String, String)>, StateError> {
             Ok(Vec::new())
         }
+
         async fn get_all_asset_people(&self, _: &str) -> Result<Vec<(String, String)>, StateError> {
             Ok(Vec::new())
         }
-        async fn mark_soft_deleted(
-            &self,
-            _: &str,
-            _: &str,
-            _: Option<chrono::DateTime<chrono::Utc>>,
-        ) -> Result<(), StateError> {
-            Ok(())
-        }
-        async fn mark_hidden_at_source(&self, _: &str, _: &str) -> Result<(), StateError> {
-            Ok(())
-        }
+    }
+
+    #[async_trait::async_trait]
+    impl MetadataRewriteStore for FailingStateDb {
         async fn record_metadata_write_failure(
             &self,
             _: &str,
@@ -3949,6 +3861,7 @@ mod tests {
         ) -> Result<(), StateError> {
             Ok(())
         }
+
         async fn clear_metadata_write_failure(
             &self,
             _: &str,
@@ -3961,22 +3874,26 @@ mod tests {
                 Ok(())
             }
         }
+
         async fn get_downloaded_metadata_hashes(
             &self,
         ) -> Result<HashMap<(String, String, String), String>, StateError> {
             Ok(HashMap::new())
         }
+
         async fn get_metadata_retry_markers(
             &self,
         ) -> Result<HashSet<(String, String, String)>, StateError> {
             Ok(HashSet::new())
         }
+
         async fn get_pending_metadata_rewrites(
             &self,
             _: usize,
         ) -> Result<Vec<AssetRecord>, StateError> {
             Ok(Vec::new())
         }
+
         async fn update_metadata_hash(
             &self,
             _: &str,
@@ -3986,6 +3903,7 @@ mod tests {
         ) -> Result<(), StateError> {
             Ok(())
         }
+
         async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
             Ok(false)
         }
@@ -4685,7 +4603,7 @@ mod tests {
     async fn ghost_loop_regression_filtered_pending_asset_survives_sync() {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
-        use crate::state::{MediaType, SqliteStateDb, StateDb};
+        use crate::state::{MediaType, SqliteStateDb};
         use chrono::TimeZone;
         use futures_util::stream;
         use std::sync::Arc;
@@ -4793,7 +4711,7 @@ mod tests {
     async fn producer_flushes_touched_ids_so_pending_on_disk_skip_promotes() {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
-        use crate::state::{SqliteStateDb, StateDb};
+        use crate::state::SqliteStateDb;
         use crate::test_helpers::TestAssetRecord;
         use futures_util::stream;
         use std::sync::Arc;
@@ -4885,7 +4803,7 @@ mod tests {
     async fn deleted_downloaded_file_is_forwarded_not_state_skipped() {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
-        use crate::state::{SqliteStateDb, StateDb};
+        use crate::state::SqliteStateDb;
         use futures_util::stream;
         use std::sync::Arc;
 
