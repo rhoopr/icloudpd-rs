@@ -78,6 +78,16 @@ export ICLOUD_TEST_COOKIE_DIR="$repo_root/.test-cookies"
 export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-kei-test}"
 export KEI_DOCKER_IMAGE="${KEI_DOCKER_IMAGE:-kei:dev}"
 
+# Keep child tempdirs on the repo filesystem. The top-level failure log stays
+# in /tmp through the just recipe, but cargo/live/shell phases can create large
+# download roots and should not trip the production 1 GiB free-space guard just
+# because tmpfs is nearly full.
+full_tmp_dir="${KEI_FULL_TEST_TMPDIR:-$repo_root/.scratch/full-test-tmp}"
+mkdir -p "$full_tmp_dir"
+export TMPDIR="$full_tmp_dir"
+export TEMP="$full_tmp_dir"
+export TMP="$full_tmp_dir"
+
 tp() { "$script_dir/time_phase.sh" "$@"; }
 run_phase() {
   current_phase="$1"

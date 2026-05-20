@@ -83,3 +83,41 @@ fn migration_guide_uses_toml_for_durable_sync_settings() {
         );
     }
 }
+
+#[test]
+fn full_test_routes_child_tempdirs_to_repo_scratch() {
+    let run_all = repo_file("scripts/full-test/run_all.sh");
+    let tmp_assignment =
+        "full_tmp_dir=\"${KEI_FULL_TEST_TMPDIR:-$repo_root/.scratch/full-test-tmp}\"";
+    let tmp_export = "export TMPDIR=\"$full_tmp_dir\"";
+    let temp_export = "export TEMP=\"$full_tmp_dir\"";
+    let tmp_windows_export = "export TMP=\"$full_tmp_dir\"";
+
+    for expected in [
+        tmp_assignment,
+        "mkdir -p \"$full_tmp_dir\"",
+        tmp_export,
+        temp_export,
+        tmp_windows_export,
+    ] {
+        assert!(
+            run_all.contains(expected),
+            "full-test orchestrator missing repo-local tempdir setup: {expected}"
+        );
+    }
+
+    let export_pos = run_all
+        .find(tmp_export)
+        .expect("full-test must export TMPDIR before live tests");
+    let live_pos = run_all
+        .find("run_live_phase test_live")
+        .expect("full-test live phase must still exist");
+    let shell_pos = run_all
+        .find("run_shell_suites.sh")
+        .expect("full-test shell phase must still exist");
+
+    assert!(
+        export_pos < live_pos && export_pos < shell_pos,
+        "TMPDIR must be set before live cargo and shell phases allocate tempdirs"
+    );
+}
