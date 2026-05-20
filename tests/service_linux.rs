@@ -177,6 +177,28 @@ fn dry_run_install_system_rejects_root_preview_user() {
 }
 
 #[test]
+fn dry_run_install_system_rejects_control_character_preview_user() {
+    let home = TempDir::new().unwrap();
+    let mut cmd = cmd_with_home(&home);
+    cmd.env("SUDO_USER", "alice\nEnvironment=KEI_INJECTED=1");
+    cmd.env("USER", "root");
+    cmd.env_remove("LOGNAME");
+
+    let assert = cmd
+        .args(["install", "--system", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "could not determine which user the system unit would run as",
+        ));
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains("Environment=KEI_INJECTED"),
+        "system dry-run must not render injected unit directives:\n{stdout}"
+    );
+}
+
+#[test]
 fn install_system_without_root_fails_clearly() {
     // CI runs as a non-root user, which is exactly the condition this
     // test wants to exercise. Skipping when EUID==0 (rare local-dev
