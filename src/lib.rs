@@ -31,6 +31,7 @@ mod cli;
 mod commands;
 mod config;
 mod credential;
+mod cycle_reporter;
 mod download;
 mod fs_util;
 mod health;

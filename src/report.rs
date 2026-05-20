@@ -80,7 +80,7 @@ const fn is_zero_usize(n: &usize) -> bool {
 /// variant will silently change the emitted JSON. When a variant rename
 /// is needed, either keep the old lowercase string here explicitly or
 /// bump the report schema version.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunOptions {
     pub username: String,
     pub download_dir: PathBuf,

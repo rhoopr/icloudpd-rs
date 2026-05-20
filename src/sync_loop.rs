@@ -847,6 +847,18 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     };
 
     let mut health = health::HealthStatus::new();
+    let cycle_reporter =
+        crate::cycle_reporter::CycleReporter::new(crate::cycle_reporter::CycleReporterConfig {
+            username: &config.auth.username,
+            watch_mode: is_watch_mode,
+            report_path: config.report.json.as_deref(),
+            run_options: crate::report::RunOptions::from_config(&config),
+            health_dir: &config.auth.cookie_directory,
+            personality_mode: config.ui.personality_mode,
+            state_db: state_db.as_deref(),
+            metrics_handle: metrics_handle.as_ref(),
+            notifier: &notifier,
+        });
     let mut consecutive_album_refresh_failures = 0u32;
     // 1-based cycle counter for periodic-reconcile cadence. Logged at
     // cycle start so an operator chasing missed reconciliation runs has a
@@ -884,15 +896,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         };
 
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
-            // Skipped cycle (no changes detected) -- still update health so
-            // Docker HEALTHCHECK doesn't mark the container unhealthy after
-            // the 2-hour staleness window when no new photos are uploaded.
-            health.record_success();
-            health.write(&config.auth.cookie_directory);
-            // Refresh health gauges only -- do not reset cycle_duration_seconds.
-            if let Some(ref handle) = metrics_handle {
-                handle.update_health_only(&health).await;
-            }
+            cycle_reporter.report_skipped_watch_cycle(&mut health).await;
         } else {
             refresh_needed_library_plans(
                 &mut library_states,
@@ -945,176 +949,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
             }
 
-            // One state-DB summary per cycle (friendly mode only). Powers
-            // the `Downloaded N new (X → Y)` phase line, the summary
-            // card's library totals, and the metrics gauges below; all
-            // three reuse the same fetch. Off mode skips it entirely so
-            // the v0.13 cycle path stays free of friendly-only DB calls.
-            let library_after_summary = if config.ui.personality_mode.is_friendly() {
-                match state_db.as_deref() {
-                    Some(db) => match db.get_summary().await {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            tracing::debug!(error = %e, "post-cycle summary unavailable; rendering card without library totals");
-                            None
-                        }
+            cycle_reporter
+                .report_completed_cycle(
+                    &mut health,
+                    crate::cycle_reporter::CycleReportInput {
+                        stats: &cycle_result.stats,
+                        failed_count: cycle_result.failed_count,
+                        session_expired: cycle_result.session_expired,
+                        elapsed: cycle_started_at.elapsed(),
                     },
-                    None => None,
-                }
-            } else {
-                None
-            };
-
-            // Friendly-mode phase ✓ lines: scrollback-stable narration that
-            // survives after the bar clears. The Downloaded line derives
-            // `before` by subtracting this cycle's bytes from the
-            // post-cycle library total — saves a second SQL aggregate per
-            // cycle and is exact unless a concurrent reconcile rewrote
-            // the table mid-cycle. Off mode is silent; log_sync_summary
-            // still fires its tracing events for journals.
-            let downloaded_u64 = u64::try_from(cycle_result.stats.downloaded).unwrap_or(u64::MAX);
-            if let Some(library_after) = library_after_summary.as_ref() {
-                let after = library_after.downloaded_bytes;
-                let before = after.saturating_sub(cycle_result.stats.bytes_downloaded);
-                crate::personality::narration::downloaded_phase_to_stderr(
-                    config.ui.personality_mode,
-                    downloaded_u64,
-                    before,
-                    after,
-                );
-            }
-            crate::personality::narration::verified_phase_to_stderr(
-                config.ui.personality_mode,
-                downloaded_u64,
-            );
-            if let Some(library_after) = library_after_summary.as_ref() {
-                let cycle_elapsed = cycle_started_at.elapsed();
-                let stats = &cycle_result.stats;
-                let card = crate::personality::summary::SummaryCard {
-                    photos_new: u64::try_from(stats.photos_downloaded).unwrap_or(u64::MAX),
-                    videos_new: u64::try_from(stats.videos_downloaded).unwrap_or(u64::MAX),
-                    skipped_total: u64::try_from(stats.skipped.total() - stats.skipped.duplicates)
-                        .unwrap_or(u64::MAX),
-                    skipped_already_present: u64::try_from(
-                        stats.skipped.by_state + stats.skipped.on_disk,
-                    )
-                    .unwrap_or(u64::MAX),
-                    failed: u64::try_from(stats.failed).unwrap_or(u64::MAX),
-                    elapsed: cycle_elapsed,
-                    bytes_downloaded: stats.bytes_downloaded,
-                    library_total_assets: library_after.total_assets,
-                    library_total_bytes: library_after.downloaded_bytes,
-                };
-                card.print_to_stderr(config.ui.personality_mode);
-                crate::personality::summary::print_recap_to_stderr(
-                    config.ui.personality_mode,
-                    &cycle_result.stats.recap,
-                );
-            }
-
-            // Friendly-mode signoff line. Off-mode keeps relying on
-            // log_sync_summary for journal output.
-            crate::personality::narration::signoff_to_stderr(
-                config.ui.personality_mode,
-                &crate::personality::narration::CycleSummary {
-                    downloaded: downloaded_u64,
-                    failed: u64::try_from(cycle_result.failed_count).unwrap_or(u64::MAX),
-                    elapsed: cycle_started_at.elapsed(),
-                    watch_mode: is_watch_mode,
-                },
-            );
-
-            // Update health status for Docker HEALTHCHECK observability.
-            if cycle_result.session_expired {
-                health.record_failure("session expired");
-            } else if cycle_result.failed_count > 0 {
-                health.record_failure(&format!("{} downloads failed", cycle_result.failed_count));
-            } else {
-                health.record_success();
-            }
-            health.write(&config.auth.cookie_directory);
-
-            // Update Prometheus metrics if the server is running.
-            if let Some(ref handle) = metrics_handle {
-                if cycle_result.session_expired {
-                    handle.record_session_expiration();
-                }
-                handle.update(&cycle_result.stats, &health).await;
-
-                // Update DB-backed gauges from the state database. Reuse
-                // the post-cycle summary fetched for the friendly card
-                // when it's available, otherwise issue the call here.
-                if let Some(summary) = library_after_summary.as_ref() {
-                    handle.update_db_stats(summary, cycle_result.stats.assets_seen);
-                } else if let Some(ref db) = state_db {
-                    match db.get_summary().await {
-                        Ok(summary) => {
-                            handle.update_db_stats(&summary, cycle_result.stats.assets_seen);
-                        }
-                        Err(e) => {
-                            handle.record_db_summary_failure();
-                            tracing::warn!(error = %e, "Failed to fetch DB summary for metrics; skipping DB gauge update");
-                        }
-                    }
-                }
-            }
-
-            // Write JSON report if configured
-            if let Some(report_path) = &config.report.json {
-                let status = crate::report::sync_status_str(
-                    cycle_result.session_expired,
-                    cycle_result.stats.interrupted,
-                    cycle_result.failed_count,
-                );
-                // Populate failed_assets from the state DB so the report
-                // reflects the final committed set, not mid-sync churn.
-                // get_failed_sample pushes the LIMIT into SQL so an account
-                // with thousands of failures doesn't load every row here.
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "FAILED_ASSETS_CAP is a small compile-time constant well under u32::MAX"
-                )]
-                let cap_u32 = crate::report::FAILED_ASSETS_CAP as u32;
-                let (failed_assets, failed_assets_truncated) = match state_db.as_ref() {
-                    Some(db) => match db.get_failed_sample(cap_u32).await {
-                        Ok((records, total)) => {
-                            #[allow(
-                                clippy::cast_possible_truncation,
-                                reason = "failed-asset totals are persisted counts of per-sync failures, comfortably below usize::MAX on 64-bit"
-                            )]
-                            let total_usize = total as usize;
-                            let truncated =
-                                total_usize.saturating_sub(crate::report::FAILED_ASSETS_CAP);
-                            let entries: Vec<_> = records
-                                .iter()
-                                .map(crate::report::FailedAssetEntry::from_record)
-                                .collect();
-                            (entries, truncated)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "Failed to load failed_assets for sync_report.json"
-                            );
-                            (Vec::new(), 0)
-                        }
-                    },
-                    None => (Vec::new(), 0),
-                };
-                let report = crate::report::SyncReport {
-                    version: "2",
-                    kei_version: env!("CARGO_PKG_VERSION"),
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    status: status.to_string(),
-                    options: crate::report::RunOptions::from_config(&config),
-                    stats: cycle_result.stats.clone(),
-                    failed_assets,
-                    failed_assets_truncated,
-                };
-                if let Err(e) = crate::report::write_report(report_path, &report).await {
-                    tracing::warn!(error = %e, path = %report_path.display(), "Failed to write JSON report");
-                }
-            }
+                )
+                .await;
 
             // Handle aggregate outcome across all libraries
             if cycle_result.session_expired {
@@ -1193,13 +1038,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     }
                 }
             } else if cycle_result.failed_count > 0 {
-                let data = notifications::SyncNotificationData::from(&cycle_result.stats);
-                notifier.notify(
-                    notifications::Event::SyncFailed,
-                    &format!("{} downloads failed", cycle_result.failed_count),
-                    &config.auth.username,
-                    Some(&data),
-                );
                 cumulative_failed_count =
                     cumulative_failed_count.saturating_add(cycle_result.failed_count);
                 if is_watch_mode {
@@ -1213,13 +1051,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
             } else {
                 reauth_attempts = 0;
-                let data = notifications::SyncNotificationData::from(&cycle_result.stats);
-                notifier.notify(
-                    notifications::Event::SyncComplete,
-                    "Sync completed successfully",
-                    &config.auth.username,
-                    Some(&data),
-                );
             }
         }
 
