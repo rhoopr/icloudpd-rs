@@ -52,6 +52,11 @@ impl InstallPlan {
         self.scope
     }
 
+    #[cfg(any(
+        test,
+        target_os = "linux",
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+    ))]
     pub(crate) fn effect(self) -> InstallEffect {
         self.effect
     }
