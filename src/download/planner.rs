@@ -111,7 +111,8 @@ pub(super) async fn upsert_seen_for_task(
 }
 
 /// Record an asset's membership in the current concrete album/smart-folder
-/// pass. Returns `Ok(false)` when the pass is not album-scoped.
+/// pass. Returns `Ok(())` without touching the DB when the pass is not
+/// album-scoped.
 pub(super) async fn record_album_membership_if_named(
     db: &dyn StateDb,
     config: &DownloadConfig,
