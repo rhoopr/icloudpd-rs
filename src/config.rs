@@ -5287,21 +5287,24 @@ mod tests {
     fn test_folder_structure_valid_tokens_accepted() {
         let mut sync = default_sync();
         sync.config_overrides.folder_structure = Some("%Y/%m/%d".to_string());
-        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.download.folder_structure, "%Y/%m/%d");
     }
 
     #[test]
     fn test_folder_structure_all_tokens_accepted() {
         let mut sync = default_sync();
         sync.config_overrides.folder_structure = Some("%Y/%m/%d/%H/%M/%S".to_string());
-        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.download.folder_structure, "%Y/%m/%d/%H/%M/%S");
     }
 
     #[test]
     fn test_folder_structure_none_bypasses_validation() {
         let mut sync = default_sync();
         sync.config_overrides.folder_structure = Some("none".to_string());
-        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.download.folder_structure, "none");
     }
 
     #[test]
@@ -5317,7 +5320,8 @@ mod tests {
     fn test_folder_structure_wrapped_format_accepted() {
         let mut sync = default_sync();
         sync.config_overrides.folder_structure = Some("{:%Y/%m/%d}".to_string());
-        assert!(Config::build(&default_globals(), &default_password(), sync, None).is_ok());
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        assert_eq!(cfg.download.folder_structure, "{:%Y/%m/%d}");
     }
 
     // ── to_toml() tests ─────────────────────────────────────────────

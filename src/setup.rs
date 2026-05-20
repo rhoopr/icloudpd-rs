@@ -1624,6 +1624,30 @@ mod tests {
     use crate::types::LivePhotoMode;
 
     #[test]
+    fn dim_comments_preserves_toml_text_while_styling_comments_and_sections() {
+        let rendered = dim_comments("# comment\n[auth]\nusername = \"u\"");
+
+        assert!(rendered.contains("# comment"));
+        assert!(rendered.contains("[auth]"));
+        assert!(rendered.contains("username = \"u\""));
+        assert_eq!(rendered.lines().count(), 3);
+    }
+
+    #[test]
+    fn setup_secret_source_password_prompt_policy_is_explicit() {
+        assert!(SetupSecretSource::CredentialStore.needs_password_prompt());
+        assert!(SetupSecretSource::EnvFile.needs_password_prompt());
+        assert!(
+            !SetupSecretSource::PasswordFile("/run/secrets/icloud".to_string())
+                .needs_password_prompt()
+        );
+        assert!(
+            !SetupSecretSource::PasswordCommand("op read item kei".to_string())
+                .needs_password_prompt()
+        );
+    }
+
+    #[test]
     fn test_generate_toml_defaults_only() {
         let answers = SetupAnswers {
             username: "user@example.com".to_string(),
@@ -2503,6 +2527,120 @@ mod tests {
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("ICLOUD_USERNAME='test@example.com'"));
         assert!(content.contains("ICLOUD_PASSWORD='secret'"));
+    }
+
+    #[test]
+    fn secret_summary_lines_covers_every_secret_source() {
+        let env_dir = tempfile::tempdir().unwrap();
+        let env_path = env_dir.path().join(".env");
+
+        for (secret_source, write_result, expected) in [
+            (
+                SetupSecretSource::CredentialStore,
+                SetupWriteResult {
+                    credential_backend: None,
+                    env_path: None,
+                },
+                vec![
+                    "  Secrets →  credential-store backend".to_string(),
+                    "             Use `kei password backend` to check it or `kei password set` to change it."
+                        .to_string(),
+                ],
+            ),
+            (
+                SetupSecretSource::PasswordFile("/run/secrets/icloud".to_string()),
+                SetupWriteResult {
+                    credential_backend: None,
+                    env_path: None,
+                },
+                vec!["  Secrets →  password file: /run/secrets/icloud".to_string()],
+            ),
+            (
+                SetupSecretSource::PasswordCommand("op read item kei".to_string()),
+                SetupWriteResult {
+                    credential_backend: None,
+                    env_path: None,
+                },
+                vec!["  Secrets →  password command from config".to_string()],
+            ),
+            (
+                SetupSecretSource::EnvFile,
+                SetupWriteResult {
+                    credential_backend: None,
+                    env_path: Some(env_path.clone()),
+                },
+                vec![format!("  Secrets →  {}", env_path.display())],
+            ),
+        ] {
+            let answers = SetupAnswers {
+                username: "user@example.com".to_string(),
+                password: secrecy::SecretString::from("secret"),
+                secret_source,
+                directory: "/photos".to_string(),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                secret_summary_lines(&answers, &write_result),
+                expected,
+                "unexpected secret summary for {:?}",
+                answers.secret_source
+            );
+        }
+    }
+
+    #[test]
+    fn shell_single_quote_escape_handles_embedded_quotes() {
+        assert_eq!(shell_single_quote_escape("plain"), "plain");
+        assert_eq!(shell_single_quote_escape("don't"), "don'\\''t");
+        assert_eq!(shell_single_quote_escape("a'b'c"), "a'\\''b'\\''c");
+    }
+
+    #[test]
+    fn credential_store_dir_uses_data_dir_or_cookie_default() {
+        let custom = SetupAnswers {
+            data_dir: Some("/var/lib/kei".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(credential_store_dir(&custom), PathBuf::from("/var/lib/kei"));
+
+        let default = SetupAnswers::default();
+        assert_eq!(
+            credential_store_dir(&default),
+            crate::config::expand_tilde("~/.config/kei/cookies")
+        );
+    }
+
+    #[test]
+    fn write_setup_files_with_external_secret_source_writes_only_config() {
+        for secret_source in [
+            SetupSecretSource::PasswordFile("/run/secrets/icloud".to_string()),
+            SetupSecretSource::PasswordCommand("op read item kei".to_string()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("config.toml");
+            let answers = SetupAnswers {
+                username: "user@example.com".to_string(),
+                password: secrecy::SecretString::from("secret"),
+                secret_source,
+                ..Default::default()
+            };
+
+            let result = write_setup_files_with_store(
+                &config_path,
+                "[auth]\nusername = \"user@example.com\"\n",
+                &answers,
+                |_username, _dir, _pw| {
+                    panic!("external secret sources must not write to credential store")
+                },
+            )
+            .expect("setup files");
+
+            assert_eq!(result.credential_backend, None);
+            assert_eq!(result.env_path, None);
+            assert!(config_path.exists());
+            assert!(!dir.path().join(".env").exists());
+        }
     }
 
     // ── Numeric / date wizard-input validators ──────────────────────

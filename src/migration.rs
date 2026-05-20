@@ -156,6 +156,119 @@ fn migrate_directory_contents(src_dir: &Path, dst_dir: &Path) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    fn set_home_for_test(home: &Path) -> HomeGuard {
+        static HOME_LOCK: Mutex<()> = Mutex::new(());
+        let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: this module serializes every test that mutates HOME through
+        // HOME_LOCK, and these tests do not read HOME from other threads.
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
+        HomeGuard {
+            _lock: lock,
+            prev_home,
+        }
+    }
+
+    struct HomeGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev_home: Option<OsString>,
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            if let Some(home) = self.prev_home.take() {
+                // SAFETY: still holding HOME_LOCK, so restoration is serialized
+                // with every test in this module that mutates HOME.
+                unsafe {
+                    std::env::set_var("HOME", home);
+                }
+            } else {
+                // SAFETY: still holding HOME_LOCK, so restoration is serialized
+                // with every test in this module that mutates HOME.
+                unsafe {
+                    std::env::remove_var("HOME");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn migrate_legacy_paths_migrates_config_and_cookie_files_from_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = set_home_for_test(tmp.path());
+        let old_config = tmp.path().join(".config/icloudpd-rs/config.toml");
+        let old_cookie_dir = tmp.path().join(".icloudpd-rs");
+        std::fs::create_dir_all(old_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&old_cookie_dir).unwrap();
+        std::fs::write(&old_config, "username = \"old@example.com\"").unwrap();
+        std::fs::write(old_cookie_dir.join("old.session"), "session").unwrap();
+        std::fs::write(old_cookie_dir.join("old.db"), "db").unwrap();
+
+        let report = migrate_legacy_paths().expect("legacy paths should migrate");
+
+        assert!(report.config_migrated);
+        assert!(report.cookies_migrated);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".config/kei/config.toml")).unwrap(),
+            "username = \"old@example.com\""
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".config/kei/cookies/old.session")).unwrap(),
+            "session"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".config/kei/cookies/old.db")).unwrap(),
+            "db"
+        );
+        assert!(old_config.exists(), "legacy config must be left in place");
+        assert!(
+            old_cookie_dir.exists(),
+            "legacy cookie dir must be left in place"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|line| line.contains("deprecated")),
+            "migration report should tell users to move off old paths: {report:?}"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_paths_skips_when_new_config_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = set_home_for_test(tmp.path());
+        let new_config = tmp.path().join(".config/kei/config.toml");
+        let old_config = tmp.path().join(".config/icloudpd-rs/config.toml");
+        std::fs::create_dir_all(new_config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(old_config.parent().unwrap()).unwrap();
+        std::fs::write(&new_config, "username = \"new@example.com\"").unwrap();
+        std::fs::write(&old_config, "username = \"old@example.com\"").unwrap();
+
+        assert!(migrate_legacy_paths().is_none());
+        assert_eq!(
+            std::fs::read_to_string(&new_config).unwrap(),
+            "username = \"new@example.com\""
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_paths_returns_none_without_legacy_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = set_home_for_test(tmp.path());
+
+        assert!(migrate_legacy_paths().is_none());
+        assert!(
+            !tmp.path().join(".config/kei").exists(),
+            "no legacy inputs should not create new directories"
+        );
+    }
+
     #[test]
     fn migrate_file_copies_to_new_location() {
         let tmp = tempfile::tempdir().unwrap();

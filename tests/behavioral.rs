@@ -669,6 +669,30 @@ fn sync_requires_username() {
         .code(1)
         .stderr(predicate::str::contains("username is required"));
 }
+
+#[test]
+fn service_run_uses_sync_worker_path_and_requires_username() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    write_sync_config(&config_path, "/photos");
+    clean_cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .args([
+            "service",
+            "run",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--no-progress-bar",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("starting kei service worker"))
+        .stderr(predicate::str::contains(
+            "service mode: applied default watch interval",
+        ))
+        .stderr(predicate::str::contains("username is required"));
+}
+
 #[test]
 fn sync_requires_directory() {
     let dir = tempfile::tempdir().unwrap();
@@ -1945,6 +1969,51 @@ fn exit_1_for_missing_directory_on_sync() {
         .code(1)
         .stderr(predicate::str::contains("[download] directory is required"));
 }
+
+#[cfg(unix)]
+#[test]
+fn sync_unwritable_download_directory_errors_before_auth() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root can write through 0o555 directories, so this probe is not
+    // meaningful under root-owned CI containers.
+    // SAFETY: libc::geteuid() is a stateless POSIX call with no
+    // preconditions and no memory-safety implications.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let download_dir = dir.path().join("photos");
+    let config_path = dir.path().join("config.toml");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&download_dir).unwrap();
+    std::fs::set_permissions(&download_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    write_sync_config(&config_path, download_dir.to_str().unwrap());
+
+    clean_cmd()
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", &data_dir)
+        .args([
+            "sync",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--password",
+            "not-used-before-auth",
+            "--no-progress-bar",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("is not writable"));
+
+    std::fs::set_permissions(&download_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        std::fs::read_dir(&data_dir).unwrap().next().is_none(),
+        "unwritable download dir must fail before auth/session state is written"
+    );
+}
+
 #[test]
 fn exit_1_for_missing_username_on_sync() {
     let dir = tempfile::tempdir().unwrap();
@@ -2070,6 +2139,17 @@ fn config_show_help_exits_zero() {
         .args(["config", "show", "--help"])
         .assert()
         .success();
+}
+
+#[test]
+fn config_setup_requires_interactive_terminal() {
+    clean_cmd()
+        .args(["config", "setup"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "The setup wizard requires an interactive terminal",
+        ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════

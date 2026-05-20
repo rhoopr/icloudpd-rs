@@ -79,6 +79,9 @@ pub(super) fn temp_download_path(
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(checksum)
         .context("Failed to decode base64 checksum")?;
+    if decoded.is_empty() {
+        anyhow::bail!("Decoded checksum is empty");
+    }
     let encoded = data_encoding::BASE32_NOPAD.encode(&decoded);
     let download_dir = download_path.parent().unwrap_or_else(|| Path::new("."));
     Ok(download_dir.join(format!("{encoded}{temp_suffix}")))
@@ -1036,17 +1039,15 @@ mod tests {
 
     #[test]
     fn temp_download_path_empty_checksum_fails() {
-        // Empty string is technically valid base64 (decodes to empty bytes),
-        // but produces an empty base32 filename — verify it at least doesn't panic.
-        // An empty checksum decodes to zero bytes, so base32 is also empty.
-        let path = PathBuf::from("/photos/test.jpg");
+        // Empty base64 decodes successfully to zero bytes. That must still
+        // be rejected because accepting it would make every malformed
+        // checksum share the same suffix-only temp path.
+        let path = PathBuf::from("/photos/IMG_0001.JPG");
         let result = temp_download_path(&path, "", ".kei-tmp");
-        // Empty base64 decodes successfully to empty bytes; the path is valid
-        // but the stem is empty — just the suffix. Ensure no error.
-        assert!(result.is_ok());
-        let temp = result.unwrap();
-        // The filename should be just the suffix since the encoded part is empty
-        assert_eq!(temp.file_name().unwrap().to_str().unwrap(), ".kei-tmp");
+        assert!(
+            result.is_err(),
+            "empty checksum must not produce a shared .kei-tmp path"
+        );
     }
 
     /// Robustness regression for downloaded-byte verification. Apple does

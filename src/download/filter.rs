@@ -24,6 +24,7 @@ use super::DownloadConfig;
 /// Reason an asset was filtered out during content/metadata filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FilterReason {
+    MalformedAsset,
     ExcludedAlbum,
     MediaType,
     LivePhoto,
@@ -387,6 +388,10 @@ pub(crate) fn is_asset_filtered(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> Option<FilterReason> {
+    if !asset.has_valid_id() {
+        tracing::warn!("Skipping malformed asset with empty CloudKit recordName");
+        return Some(FilterReason::MalformedAsset);
+    }
     if config.exclude_asset_ids.contains(asset.id()) {
         tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
         return Some(FilterReason::ExcludedAlbum);
@@ -450,6 +455,10 @@ pub(super) fn extract_skip_candidates<'a>(
     asset: &'a crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> SmallVec<[(VersionSizeKey, &'a str); 5]> {
+    if !asset.has_valid_id() {
+        return SmallVec::new();
+    }
+
     let ctx = DerivationContext::build(asset, config);
     let mut result = SmallVec::new();
     let mut seen_urls = SmallVec::<[&str; 4]>::new();
@@ -873,6 +882,10 @@ pub(super) fn derive_expected_paths(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &DownloadConfig,
 ) -> SmallVec<[DerivedPath; 5]> {
+    if !asset.has_valid_id() {
+        return SmallVec::new();
+    }
+
     let ctx = DerivationContext::build(asset, config);
     let mut out = SmallVec::<[DerivedPath; 5]>::new();
     let mut seen_urls = SmallVec::<[Box<str>; 4]>::new();
@@ -1134,6 +1147,10 @@ pub(super) fn filter_asset_to_tasks(
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
 ) -> SmallVec<[DownloadTask; 5]> {
+    if !asset.has_valid_id() {
+        return SmallVec::new();
+    }
+
     // Sync-only fingerprint-fallback exclusion: when `asset.filename()` is
     // None, log the synthesized name and apply `filename_exclude` patterns
     // to it (`is_asset_filtered` only sees real filenames). Import never
@@ -1369,6 +1386,41 @@ mod tests {
         assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/orig");
         assert_eq!(&*tasks[0].checksum, "abc123");
         assert_eq!(tasks[0].size, 1000);
+    }
+
+    #[test]
+    fn empty_record_name_is_filtered_before_path_planning() {
+        let asset = PhotoAsset::new(
+            json!({"recordName": "", "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://p01.icloud-content.com/orig",
+                    "fileChecksum": "abc123"
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+        let config = test_config();
+
+        assert_eq!(
+            is_asset_filtered(&asset, &config),
+            Some(FilterReason::MalformedAsset)
+        );
+        assert!(
+            extract_skip_candidates(&asset, &config).is_empty(),
+            "invalid id must not enter state-skip decisions"
+        );
+        assert!(
+            expected_paths_for(&asset, &config).is_empty(),
+            "invalid id must not derive import/sync paths"
+        );
+        assert!(
+            filter_asset_fresh(&asset, &config).is_empty(),
+            "invalid id must not produce download tasks"
+        );
     }
 
     // ── expected_paths_for tests ────────────────────────────────────────

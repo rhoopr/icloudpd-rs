@@ -198,17 +198,25 @@ fn extract_versions(
             }
         };
 
-        let checksum: Box<str> =
-            if let Some(c) = res_entry.get("fileChecksum").and_then(Value::as_str) {
-                c.into()
-            } else {
+        let checksum: Box<str> = match res_entry.get("fileChecksum").and_then(Value::as_str) {
+            Some(c) if !c.is_empty() => c.into(),
+            Some(_) => {
+                tracing::warn!(
+                    asset = %record_name,
+                    field = format_args!("{res_field}.fileChecksum"),
+                    "Empty fileChecksum, skipping version"
+                );
+                continue;
+            }
+            None => {
                 tracing::warn!(
                     asset = %record_name,
                     field = format_args!("{res_field}.fileChecksum"),
                     "Missing fileChecksum, skipping version"
                 );
                 continue;
-            };
+            }
+        };
 
         let asset_type: std::sync::Arc<str> = match fields
             .get(type_field)
@@ -343,6 +351,15 @@ impl PhotoAsset {
 
     pub fn id(&self) -> &str {
         &self.record_name
+    }
+
+    /// True when the CloudKit record carried a usable recordName.
+    ///
+    /// An empty ID cannot safely key state rows, path fingerprints, retry
+    /// accounting, or metadata rewrite markers, so production planners must
+    /// filter it before deriving any download tasks.
+    pub(crate) fn has_valid_id(&self) -> bool {
+        !self.record_name.is_empty()
     }
 
     /// Shared handle on the record ID. Consumers that want to store the ID
@@ -833,6 +850,26 @@ mod tests {
         );
         // Missing checksum now results in empty versions map (logged at construction)
         assert!(asset.versions().is_empty());
+    }
+
+    #[test]
+    fn test_versions_empty_checksum() {
+        let asset = make_asset(
+            json!({"fields": {
+                "itemType": {"value": "public.jpeg"},
+                "resOriginalRes": {"value": {
+                    "size": 1000,
+                    "downloadURL": "https://p01.icloud-content.com/orig",
+                    "fileChecksum": ""
+                }},
+                "resOriginalFileType": {"value": "public.jpeg"}
+            }}),
+            json!({"fields": {}}),
+        );
+        assert!(
+            asset.versions().is_empty(),
+            "empty checksum must not create a downloadable version"
+        );
     }
 
     #[test]
@@ -1598,10 +1635,14 @@ mod tests {
     // --- Gap tests: API response handling robustness ---
 
     #[test]
-    fn photo_asset_null_record_name_returns_empty_id() {
+    fn photo_asset_null_record_name_is_not_valid_id() {
         // recordName is JSON null rather than missing entirely
         let asset = make_asset(json!({"recordName": null}), json!({}));
         assert_eq!(asset.id(), "");
+        assert!(
+            !asset.has_valid_id(),
+            "null recordName must not be considered downloadable"
+        );
     }
 
     #[test]
@@ -1691,13 +1732,16 @@ mod tests {
     }
 
     #[test]
-    fn asset_empty_record_name_still_exposes_empty_id() {
+    fn asset_empty_record_name_is_not_valid_id() {
         let asset = make_asset(json!({"recordName": ""}), json!({}));
         assert_eq!(
             asset.id(),
             "",
-            "empty recordName must be reflected as empty id so upstream producers \
-             can detect and reject; no silent defaulting to a placeholder"
+            "empty recordName must be reflected as empty id for diagnostics"
+        );
+        assert!(
+            !asset.has_valid_id(),
+            "empty recordName must be filtered before path planning"
         );
     }
 

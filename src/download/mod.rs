@@ -281,6 +281,7 @@ impl SkipBreakdown {
 
     pub(crate) fn record_filter_reason(&mut self, reason: filter::FilterReason) {
         match reason {
+            filter::FilterReason::MalformedAsset => self.by_filename += 1,
             filter::FilterReason::ExcludedAlbum => self.by_excluded_album += 1,
             filter::FilterReason::MediaType => self.by_media_type += 1,
             filter::FilterReason::LivePhoto => self.by_live_photo += 1,
@@ -1174,6 +1175,15 @@ impl DownloadContext {
         checksum: &str,
         trust_state: bool,
     ) -> Option<bool> {
+        if checksum.is_empty() {
+            tracing::warn!(
+                asset_id,
+                version_size = %version_size.as_str(),
+                "Empty remote checksum cannot be trusted for skip decisions"
+            );
+            return Some(true);
+        }
+
         let version_size_str = version_size.as_str();
 
         // Borrowed `&str` keys at every level — no allocation per probe.
@@ -3102,12 +3112,12 @@ mod tests {
 
     // ── Gap coverage: empty versions, path traversal, empty filename ───
 
-    // ── Gap coverage: should_download_fast with empty checksum ──────────
-
     #[test]
-    fn should_download_fast_empty_checksum_string() {
-        // When the stored checksum is empty and the incoming checksum is also
-        // empty, they match — should behave like a normal matching checksum.
+    fn should_download_fast_empty_checksum_never_hard_skips() {
+        // Empty remote checksum is malformed provider input. Even if a stale
+        // DB row also has an empty checksum, this must not turn into a hard
+        // skip: the provider parser rejects new empty checksums, and this
+        // fast path stays defensive for legacy/corrupt state.
         let mut ctx = DownloadContext::default();
         ctx.downloaded_ids
             .entry("PrimarySync".into())
@@ -3122,7 +3132,6 @@ mod tests {
             .or_default()
             .insert("original".into(), "".into());
 
-        // Empty matches empty → trust_state=true gives hard skip
         assert_eq!(
             ctx.should_download_fast(
                 "PrimarySync",
@@ -3131,9 +3140,8 @@ mod tests {
                 "",
                 true
             ),
-            Some(false)
+            Some(true)
         );
-        // Empty matches empty → trust_state=false gives None (needs fs check)
         assert_eq!(
             ctx.should_download_fast(
                 "PrimarySync",
@@ -3142,9 +3150,8 @@ mod tests {
                 "",
                 false
             ),
-            None
+            Some(true)
         );
-        // Non-empty vs empty stored → checksum changed, needs download
         assert_eq!(
             ctx.should_download_fast(
                 "PrimarySync",

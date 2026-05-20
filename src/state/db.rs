@@ -1530,6 +1530,15 @@ impl SqliteStateDb {
         checksum: &str,
         local_path: &Path,
     ) -> Result<bool, StateError> {
+        if checksum.is_empty() {
+            tracing::warn!(
+                id,
+                version_size,
+                "Empty remote checksum cannot be trusted for state skip decisions"
+            );
+            return Ok(true);
+        }
+
         let library_owned = library.to_owned();
         let id_owned = id.to_owned();
         let version_size_owned = version_size.to_owned();
@@ -2063,7 +2072,7 @@ impl SqliteStateDb {
         };
 
         self.with_conn("complete_sync_run", move |conn| {
-            conn.execute(
+            let rows = conn.execute(
                 "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, \
                  assets_failed = ?4, interrupted = ?5, status = ?6, enumeration_errors = ?7 \
                  WHERE id = ?8",
@@ -2079,6 +2088,12 @@ impl SqliteStateDb {
                 ],
             )
             .map_err(|e| StateError::query("complete_sync_run", e))?;
+            if rows == 0 {
+                return Err(StateError::Invariant {
+                    operation: "complete_sync_run",
+                    detail: format!("no sync_runs row for id {run_id}"),
+                });
+            }
 
             Ok(())
         })
@@ -3344,6 +3359,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_download_empty_remote_checksum_does_not_skip_existing_file() {
+        let dir = test_dir();
+        let file_path = dir.path().join("photo.jpg");
+        fs::write(&file_path, b"test content").unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = TestAssetRecord::new("ABC123").checksum("").build();
+
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "ABC123",
+            "original",
+            &file_path,
+            "oldhash",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = db
+            .should_download("PrimarySync", "ABC123", "original", "", &file_path)
+            .await
+            .unwrap();
+        assert!(
+            result,
+            "empty remote checksum must not hard-skip a downloaded row"
+        );
+    }
+
+    #[tokio::test]
     async fn test_mark_failed_and_get_failed() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
@@ -3612,6 +3658,39 @@ mod tests {
             stored, 17,
             "enumeration_errors must round-trip from SyncRunStats to sync_runs row"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_sync_run_unknown_id_returns_error() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let stats = SyncRunStats {
+            assets_seen: 3,
+            assets_downloaded: 2,
+            assets_failed: 1,
+            enumeration_errors: 0,
+            interrupted: false,
+        };
+
+        let err = db
+            .complete_sync_run(999_999, &stats)
+            .await
+            .expect_err("unknown sync_run id must fail loudly");
+        match err {
+            StateError::Invariant { operation, detail } => {
+                assert_eq!(operation, "complete_sync_run");
+                assert!(
+                    detail.contains("999999") || detail.contains("999_999"),
+                    "error detail should name the missing run id, got: {detail}"
+                );
+            }
+            other => panic!("expected StateError::Invariant, got {other:?}"),
+        }
+
+        let conn = db.acquire_lock("unknown_sync_run").unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "unknown completion must not create a row");
     }
 
     #[tokio::test]

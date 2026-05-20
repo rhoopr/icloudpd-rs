@@ -105,7 +105,7 @@ test MODE="":
             ;;
     esac
 
-# Coverage: (none) | html | live | patch [BASE]. `live` merges sync + state_auth into the offline baseline.
+# Coverage: (none) | html | check | live | patch [BASE]. `live` merges sync + state_auth into the offline baseline.
 cov MODE="" BASE="main":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -119,6 +119,9 @@ cov MODE="" BASE="main":
         html)
             cargo llvm-cov --all-features --html
             echo "Report: target/llvm-cov/html/index.html"
+            ;;
+        check)
+            cargo llvm-cov --all-features --summary-only --fail-under-lines 90
             ;;
         live)
             _live_env
@@ -151,7 +154,7 @@ cov MODE="" BASE="main":
             ;;
         *)
             echo "Unknown mode: {{MODE}}" >&2
-            echo "Modes: (none) | html | live | patch [BASE]" >&2
+            echo "Modes: (none) | html | check | live | patch [BASE]" >&2
             exit 1
             ;;
     esac

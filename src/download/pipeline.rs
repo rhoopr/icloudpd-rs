@@ -156,6 +156,7 @@ impl ProducerSkipSummary {
 
     fn record_filter_reason(&mut self, reason: super::filter::FilterReason) {
         match reason {
+            super::filter::FilterReason::MalformedAsset => self.by_filename += 1,
             super::filter::FilterReason::ExcludedAlbum => self.by_excluded_album += 1,
             super::filter::FilterReason::MediaType => self.by_media_type += 1,
             super::filter::FilterReason::LivePhoto => self.by_live_photo += 1,
@@ -3246,6 +3247,33 @@ mod tests {
     }
 
     #[test]
+    fn pass_config_debug_keeps_runtime_handles_out_of_output() {
+        let client = reqwest::Client::new();
+        let retry_config = RetryConfig::default();
+        let config = PassConfig {
+            client: &client,
+            retry_config: &retry_config,
+            metadata: MetadataFlags::DATETIME | MetadataFlags::DESCRIPTION,
+            concurrency: 3,
+            reporting: DownloadReporting::hidden(),
+            temp_suffix: Arc::from(".part"),
+            shutdown_token: CancellationToken::new(),
+            state_db: None,
+            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bandwidth_limiter: None,
+            library: Arc::from("PrimarySync"),
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("metadata"));
+        assert!(rendered.contains("concurrency: 3"));
+        assert!(rendered.contains("temp_suffix: \".part\""));
+        assert!(!rendered.contains("client"));
+        assert!(!rendered.contains("retry_config"));
+        assert!(!rendered.contains("shutdown_token"));
+    }
+
+    #[test]
     fn test_set_file_mtime_positive_timestamp() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("pos.txt");
@@ -3531,6 +3559,55 @@ mod tests {
         assert_eq!(a.retry_exhausted, 10);
         assert_eq!(a.retry_only, 7);
         assert_eq!(a.total(), 53);
+    }
+
+    #[test]
+    fn producer_skip_summary_records_every_filter_reason() {
+        let mut skips = ProducerSkipSummary::default();
+
+        skips.record_filter_reason(super::super::filter::FilterReason::MalformedAsset);
+        skips.record_filter_reason(super::super::filter::FilterReason::ExcludedAlbum);
+        skips.record_filter_reason(super::super::filter::FilterReason::MediaType);
+        skips.record_filter_reason(super::super::filter::FilterReason::LivePhoto);
+        skips.record_filter_reason(super::super::filter::FilterReason::DateRange);
+        skips.record_filter_reason(super::super::filter::FilterReason::Filename);
+
+        assert_eq!(skips.by_filename, 2);
+        assert_eq!(skips.by_excluded_album, 1);
+        assert_eq!(skips.by_media_type, 1);
+        assert_eq!(skips.by_live_photo, 1);
+        assert_eq!(skips.by_date_range, 1);
+        assert_eq!(skips.total(), 6);
+    }
+
+    #[test]
+    fn producer_skip_summary_converts_to_public_skip_breakdown() {
+        let skips = ProducerSkipSummary {
+            by_state: 1,
+            on_disk: 2,
+            ampm_variant: 3,
+            by_media_type: 4,
+            by_date_range: 5,
+            by_live_photo: 6,
+            by_filename: 7,
+            by_excluded_album: 8,
+            duplicates: 9,
+            retry_exhausted: 10,
+            retry_only: 11,
+        };
+
+        let breakdown = super::super::SkipBreakdown::from(skips);
+        assert_eq!(breakdown.by_state, 1);
+        assert_eq!(breakdown.on_disk, 2);
+        assert_eq!(breakdown.ampm_variant, 3);
+        assert_eq!(breakdown.by_media_type, 4);
+        assert_eq!(breakdown.by_date_range, 5);
+        assert_eq!(breakdown.by_live_photo, 6);
+        assert_eq!(breakdown.by_filename, 7);
+        assert_eq!(breakdown.by_excluded_album, 8);
+        assert_eq!(breakdown.duplicates, 9);
+        assert_eq!(breakdown.retry_exhausted, 10);
+        assert_eq!(breakdown.retry_only, 11);
     }
 
     #[test]

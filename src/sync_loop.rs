@@ -1612,6 +1612,50 @@ mod tests {
         assert_eq!(service_mode_default_interval(None, false), None);
     }
 
+    #[test]
+    fn watch_precheck_skip_all_blocks_every_zone_and_token() {
+        let precheck = WatchPrecheck::SkipAll;
+
+        assert!(precheck.changed_zones().is_none());
+        assert!(precheck.db_sync_token_after_success().is_none());
+        assert!(!precheck.should_sync_zone("PrimarySync"));
+        assert!(!precheck.should_sync_zone("SharedSync-123"));
+    }
+
+    #[test]
+    fn watch_precheck_proceed_all_allows_every_zone_without_db_token() {
+        let precheck = WatchPrecheck::proceed_all();
+
+        assert!(precheck.changed_zones().is_none());
+        assert!(precheck.db_sync_token_after_success().is_none());
+        assert!(precheck.should_sync_zone("PrimarySync"));
+        assert!(precheck.should_sync_zone("SharedSync-123"));
+    }
+
+    #[test]
+    fn watch_precheck_changed_zones_scopes_sync_and_carries_db_token() {
+        let mut zones = rustc_hash::FxHashSet::default();
+        zones.insert("PrimarySync".to_string());
+        let precheck = WatchPrecheck::Proceed {
+            changed_zones: Some(zones),
+            db_sync_token_after_success: Some("db-token-after-cycle".to_string()),
+        };
+
+        assert_eq!(
+            precheck.db_sync_token_after_success(),
+            Some("db-token-after-cycle")
+        );
+        assert_eq!(
+            precheck
+                .changed_zones()
+                .expect("changed zone filter should be present")
+                .len(),
+            1
+        );
+        assert!(precheck.should_sync_zone("PrimarySync"));
+        assert!(!precheck.should_sync_zone("SharedSync-123"));
+    }
+
     fn primary() -> crate::selection::LibrarySelector {
         crate::selection::LibrarySelector::default()
     }
@@ -3500,6 +3544,37 @@ mod tests {
         assert!(
             states[1].plan_needs_refresh,
             "unchanged zone must not refresh albums on this cycle"
+        );
+        assert_eq!(failures, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_needed_library_plans_without_zone_filter_refreshes_every_stale_plan() {
+        let mut states = vec![
+            make_library_state("PrimarySync", "sync_token:PrimarySync"),
+            make_library_state("SharedSync-ABCD", "sync_token:SharedSync-ABCD"),
+        ];
+        for state in &mut states {
+            state.plan_needs_refresh = true;
+            state.plan_is_stale = true;
+        }
+        let selection = crate::selection::Selection {
+            albums: crate::selection::AlbumSelector::None,
+            smart_folders: crate::selection::SmartFolderSelector::None,
+            libraries: all_libraries(),
+            unfiled: false,
+        };
+        let mut failures = 2;
+
+        refresh_needed_library_plans(&mut states, &selection, None, &mut failures).await;
+
+        assert!(
+            states.iter().all(|state| !state.plan_needs_refresh),
+            "every stale plan should refresh when no changed-zone precheck filtered the cycle"
+        );
+        assert!(
+            states.iter().all(|state| !state.plan_is_stale),
+            "successful refresh should clear stale-plan token gates"
         );
         assert_eq!(failures, 0);
     }

@@ -600,6 +600,11 @@ fn check_requires_2fa(data: &AccountLoginResponse) -> bool {
 mod tests {
     use super::*;
     use crate::auth::responses::{AccountLoginResponse, DsInfo};
+    use secrecy::SecretString;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     fn make_response(
         hsa_version: i64,
@@ -700,5 +705,84 @@ mod tests {
         let dir = Path::new("/var/cookies");
         let path = session_file_path(dir, "");
         assert_eq!(path, Path::new("/var/cookies/.session"));
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_unsupported_domain_before_password_lookup() {
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_provider = Arc::clone(&called);
+        let provider: crate::password::PasswordProvider = Arc::new(move || {
+            called_for_provider.store(true, Ordering::SeqCst);
+            Some(SecretString::from("should-not-be-read"))
+        });
+
+        let err = authenticate(
+            cookies.path(),
+            "user@example.com",
+            &provider,
+            "unsupported",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("unsupported domain should fail before session auth");
+
+        assert!(
+            err.to_string().contains("not supported"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "password provider must not run when endpoint resolution fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_2fa_push_rejects_unsupported_domain_before_password_lookup() {
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let called = Arc::new(AtomicBool::new(false));
+        let called_for_provider = Arc::clone(&called);
+        let provider: crate::password::PasswordProvider = Arc::new(move || {
+            called_for_provider.store(true, Ordering::SeqCst);
+            Some(SecretString::from("should-not-be-read"))
+        });
+
+        let err = send_2fa_push(cookies.path(), "user@example.com", &provider, "unsupported")
+            .await
+            .expect_err("unsupported domain should fail before SRP");
+
+        assert!(
+            err.to_string().contains("not supported"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "password provider must not run when endpoint resolution fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_result_debug_redacts_session_and_data() {
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let session = Session::new(
+            cookies.path(),
+            "debug@example.com",
+            "https://setup.icloud.com",
+            None,
+        )
+        .await
+        .expect("session");
+        let result = AuthResult {
+            session,
+            data: make_response(2, false, true, true),
+            requires_2fa: false,
+        };
+
+        let rendered = format!("{result:?}");
+        assert!(rendered.contains("session: \"<redacted>\""));
+        assert!(rendered.contains("data: \"<...>\""));
+        assert!(!rendered.contains("debug@example.com"));
     }
 }
