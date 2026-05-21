@@ -1383,8 +1383,9 @@ async fn refresh_needed_library_plans(
         }
 
         // Re-resolve albums per-library to discover newly created iCloud albums.
-        // The unfiled pass re-fetches each selected album's IDs to refresh the
-        // exclusion set. This is intentionally delayed until a selected zone has
+        // Full sync resolves unfiled album-member exclusions in the download
+        // phase; incremental/cleanup paths resolve them before planning tasks.
+        // This refresh is intentionally delayed until a selected zone has
         // changes so quiet watch cycles avoid the album-listing traffic.
         match resolve_passes(&lib_state.library, selection).await {
             Ok(refreshed) => {

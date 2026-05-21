@@ -1,7 +1,5 @@
 use std::path::Path;
 
-use anyhow::Context;
-
 use crate::auth;
 use crate::icloud;
 use crate::retry;
@@ -554,9 +552,10 @@ impl PassKind {
 /// One pass through a specific album (or the library-wide pseudo-album).
 ///
 /// `exclude_ids` is the per-pass set of asset IDs to filter out. Most passes
-/// carry an empty set; the library-wide pass may pre-populate it with every
-/// album member (for the `-a all` + `{album}` unfiled pass) or with excluded
-/// albums' members (for `--exclude-album` without `--album`).
+/// carry an empty set. Full sync resolves the library-wide unfiled pass's
+/// album-member exclusions inside the download phase so album and unfiled
+/// enumeration can overlap; incremental and cleanup paths resolve those
+/// exclusions before planning tasks.
 pub(crate) struct AlbumPass {
     pub kind: PassKind,
     pub album: icloud::photos::PhotoAlbum,
@@ -583,13 +582,15 @@ fn empty_exclude_ids() -> std::sync::Arc<rustc_hash::FxHashSet<String>> {
     std::sync::Arc::new(rustc_hash::FxHashSet::default())
 }
 
-/// Enumerate every asset ID in an album into `into`. Used both for the
-/// legacy `--exclude-album` pre-fetch and for computing the "already in
-/// some album" set that gates the `-a all` + `{album}` unfiled pass.
+/// Enumerate every asset ID in an album into `into`. Kept for resolver tests
+/// that pin the old preflight error behavior; production resolves unfiled
+/// exclusions in the download phase.
+#[cfg(test)]
 async fn collect_album_asset_ids(
     album: &icloud::photos::PhotoAlbum,
     into: &mut rustc_hash::FxHashSet<String>,
 ) -> anyhow::Result<()> {
+    use anyhow::Context;
     use futures_util::StreamExt;
     // Propagate `len()` failures — the count is load-bearing for the
     // `-a all` + `{album}` unfiled pass: a silent 0 here leaves the
@@ -664,12 +665,6 @@ pub(crate) async fn resolve_passes(
     let selected_smart_names =
         pick_smart_folder_names(&selection.smart_folders, &album_map, &smart_names)?;
 
-    let unfiled_exclude_ids = if selection.unfiled {
-        compute_unfiled_exclude_ids(&album_map, &selected_album_names).await?
-    } else {
-        rustc_hash::FxHashSet::default()
-    };
-
     let empty = empty_exclude_ids();
     let mut passes: Vec<AlbumPass> = Vec::new();
 
@@ -694,7 +689,7 @@ pub(crate) async fn resolve_passes(
         passes.push(AlbumPass {
             kind: PassKind::Unfiled,
             album: library.all(),
-            exclude_ids: std::sync::Arc::new(unfiled_exclude_ids),
+            exclude_ids: empty_exclude_ids(),
         });
     }
 
@@ -844,9 +839,9 @@ fn bail_excluded_not_a_smart_folder(
     Ok(())
 }
 
-/// Fetch every selected album's member IDs in parallel. The PhotoAlbums
-/// stay borrowed in the map; callers move them into passes after this
-/// returns. Empty input → empty set, no fetches.
+/// Fetch every selected album's member IDs in parallel. Test-only coverage
+/// for missing-album handling retained from the old preflight resolver.
+#[cfg(test)]
 async fn compute_unfiled_exclude_ids(
     album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
     selected_album_names: &[String],
@@ -1001,41 +996,6 @@ mod tests {
         })
     }
 
-    /// A single paired CPLMaster+CPLAsset page for photo streaming.
-    fn asset_page(record_name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "records": [
-                {
-                    "recordName": record_name,
-                    "recordType": "CPLMaster",
-                    "fields": {
-                        "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
-                        "resOriginalRes": {"value": {
-                            "downloadURL": "https://example.com/photo.jpg",
-                            "size": 1024,
-                            "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-                        }},
-                        "resOriginalFileType": {"value": "public.jpeg"},
-                        "itemType": {"value": "public.jpeg"},
-                        "adjustmentRenderType": {"value": 0, "type": "INT64"}
-                    }
-                },
-                {
-                    "recordName": format!("asset-{record_name}"),
-                    "recordType": "CPLAsset",
-                    "fields": {
-                        "masterRef": {
-                            "value": {"recordName": record_name, "zoneID": {"zoneName": "PrimarySync"}},
-                            "type": "REFERENCE"
-                        },
-                        "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
-                        "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
-                    }
-                }
-            ]
-        })
-    }
-
     /// Batch album count response.
     fn album_count_response(count: u64) -> serde_json::Value {
         serde_json::json!({
@@ -1154,12 +1114,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_passes_all_albums_with_unfiled_excludes_member_ids() {
+    async fn resolve_passes_all_albums_defers_unfiled_excludes_to_download_phase() {
         let mock = MockPhotosSession::new()
-            .ok(serde_json::json!({"records": [folder_record("FOLDER_1", "Vacation")]}))
-            .ok(album_count_response(1))
-            .ok(asset_page("MASTER_1"))
-            .ok(serde_json::json!({"records": []}));
+            .ok(serde_json::json!({"records": [folder_record("FOLDER_1", "Vacation")]}));
         let library = stub_library(mock);
         let sel = selection_with_albums(
             AlbumSelector::All {
@@ -1172,8 +1129,8 @@ mod tests {
         assert_eq!(plan.passes.len(), 2, "1 album pass + 1 unfiled pass");
         assert!(plan.passes[0].exclude_ids.is_empty());
         assert!(
-            plan.passes[1].exclude_ids.contains("MASTER_1"),
-            "unfiled pass excludes the album's member"
+            plan.passes[1].exclude_ids.is_empty(),
+            "full sync resolves unfiled exclusions concurrently in the download phase"
         );
     }
 
