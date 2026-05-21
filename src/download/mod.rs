@@ -20,7 +20,7 @@ pub(crate) use limiter::BandwidthLimiter;
 
 use pipeline::{
     build_download_outcome, format_duration, log_sync_summary, run_download_pass,
-    stream_and_download_from_stream, MetadataFlags, PassConfig, StreamingResult,
+    stream_and_download_from_stream, MetadataFlags, PassConfig, StreamRuntime, StreamingResult,
     AUTH_ERROR_THRESHOLD,
 };
 
@@ -1236,6 +1236,20 @@ impl DownloadContext {
     }
 }
 
+async fn preload_download_context(config: &DownloadConfig) -> Arc<DownloadContext> {
+    let download_ctx = if let Some(db) = &config.state_db {
+        tracing::debug!("Pre-loading download state from database");
+        DownloadContext::load(db.as_ref(), config.retry_only).await
+    } else {
+        DownloadContext::default()
+    };
+    tracing::debug!(
+        downloaded_ids = download_ctx.downloaded_ids.len(),
+        "Download context loaded"
+    );
+    Arc::new(download_ctx)
+}
+
 /// Pre-compute one `Arc<DownloadConfig>` per pass. Each pass_index maps to
 /// a derived config that pre-expands `{album}` and pins the pass's
 /// exclude-asset-ids set. In `{album}` mode passes may legitimately differ
@@ -1332,6 +1346,14 @@ struct CollectedUnfiledStream {
     items: Vec<anyhow::Result<PhotoAsset>>,
 }
 
+struct FullPassStreamOptions {
+    controls: DownloadControls,
+    count: u64,
+    kind: crate::commands::PassKind,
+    shutdown_token: CancellationToken,
+    download_ctx: Option<Arc<DownloadContext>>,
+}
+
 fn deferred_unfiled_index(passes: &[crate::commands::AlbumPass]) -> Option<usize> {
     let has_album_pass = passes
         .iter()
@@ -1373,10 +1395,7 @@ async fn run_full_pass_stream<S>(
     stream: S,
     token_rx: tokio::sync::oneshot::Receiver<Option<String>>,
     pass_config: Arc<DownloadConfig>,
-    controls: DownloadControls,
-    count: u64,
-    kind: crate::commands::PassKind,
-    shutdown_token: CancellationToken,
+    options: FullPassStreamOptions,
 ) -> Result<PerPassStreamingResult>
 where
     S: futures_util::Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static,
@@ -1388,30 +1407,33 @@ where
     // in scrollback so completed albums don't disappear.
     let pass_start = Instant::now();
     let (pass_pb, pass_bytes) = crate::download::pipeline::create_progress_bar_for_passes(
-        controls.reporting.no_progress_bar,
-        controls.run_mode.only_print_filenames(),
-        count,
-        controls.reporting.personality_mode,
+        options.controls.reporting.no_progress_bar,
+        options.controls.run_mode.only_print_filenames(),
+        options.count,
+        options.controls.reporting.personality_mode,
     );
 
     let result = stream_and_download_from_stream(
         &download_client,
         stream,
         &pass_config,
-        controls,
-        count,
-        shutdown_token,
-        Some(pass_pb.clone()),
-        Some(std::sync::Arc::clone(&pass_bytes)),
+        options.controls,
+        options.count,
+        options.shutdown_token,
+        StreamRuntime::with_context(
+            Some(pass_pb.clone()),
+            Some(std::sync::Arc::clone(&pass_bytes)),
+            options.download_ctx,
+        ),
     )
     .await?;
 
     let elapsed = pass_start.elapsed();
     pass_pb.finish_and_clear();
     Ok(PerPassStreamingResult {
-        kind,
+        kind: options.kind,
         label: pass_config.pass_label().to_string(),
-        count,
+        count: options.count,
         elapsed,
         token_rx,
         result,
@@ -1941,6 +1963,11 @@ async fn download_photos_full_with_token(
             config,
             per_pass_download_concurrency,
         );
+        let shared_download_ctx = if controls.run_mode.is_dry_run() {
+            None
+        } else {
+            Some(preload_download_context(config).await)
+        };
 
         // Build per-pass labels for the album divider. Friendly multi-pass
         // syncs print a done line (✓) above the bar after each album
@@ -1975,6 +2002,7 @@ async fn download_photos_full_with_token(
             let shutdown_token = shutdown_token.clone();
             let download_client = download_client.clone();
             let deferred_ids = deferred_ids.clone();
+            let download_ctx = shared_download_ctx.clone();
             async move {
                 let (stream, token_rx) = pass.album.photo_stream_with_token(
                     config.recent,
@@ -1997,10 +2025,13 @@ async fn download_photos_full_with_token(
                             stream,
                             token_rx,
                             pass_config,
-                            controls,
-                            count,
-                            pass.kind,
-                            shutdown_token,
+                            FullPassStreamOptions {
+                                controls,
+                                count,
+                                kind: pass.kind,
+                                shutdown_token,
+                                download_ctx: download_ctx.clone(),
+                            },
                         )
                         .await;
                     }
@@ -2012,10 +2043,13 @@ async fn download_photos_full_with_token(
                     stream,
                     token_rx,
                     pass_config,
-                    controls,
-                    count,
-                    pass.kind,
-                    shutdown_token,
+                    FullPassStreamOptions {
+                        controls,
+                        count,
+                        kind: pass.kind,
+                        shutdown_token,
+                        download_ctx,
+                    },
                 )
                 .await
             }
@@ -2080,10 +2114,13 @@ async fn download_photos_full_with_token(
                         stream::iter(filtered),
                         collected.token_rx,
                         pass_config,
-                        controls,
-                        collected.count,
-                        crate::commands::PassKind::Unfiled,
-                        shutdown_token.clone(),
+                        FullPassStreamOptions {
+                            controls,
+                            count: collected.count,
+                            kind: crate::commands::PassKind::Unfiled,
+                            shutdown_token: shutdown_token.clone(),
+                            download_ctx: shared_download_ctx.clone(),
+                        },
                     )
                     .await?;
                     let downloaded_u64 =
@@ -2140,8 +2177,7 @@ async fn download_photos_full_with_token(
             controls,
             total,
             shutdown_token.clone(),
-            None,
-            None,
+            StreamRuntime::new(None, None),
         )
         .await?;
 

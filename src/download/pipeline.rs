@@ -41,7 +41,8 @@ use super::planner::add_asset_album_with_retry;
 use super::planner::ADD_ASSET_ALBUM_MAX_RETRIES;
 use super::planner::{self, ExistingPathMatch, TaskPlanner};
 use super::{
-    DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome, DownloadReporting,
+    preload_download_context, DownloadConfig, DownloadContext, DownloadControls, DownloadOutcome,
+    DownloadReporting,
 };
 
 /// Outcome of `batch_forecast_decision` — either keep queueing, emit a
@@ -806,8 +807,64 @@ pub(super) async fn stream_and_download_from_stream<S>(
     controls: DownloadControls,
     total: u64,
     shutdown_token: CancellationToken,
+    runtime: StreamRuntime,
+) -> Result<StreamingResult>
+where
+    S: futures_util::Stream<Item = anyhow::Result<crate::icloud::photos::PhotoAsset>>
+        + Send
+        + 'static,
+{
+    stream_and_download_from_stream_with_context(
+        download_client,
+        combined,
+        config,
+        controls,
+        total,
+        shutdown_token,
+        runtime,
+    )
+    .await
+}
+
+pub(super) struct StreamRuntime {
     shared_pb: Option<ProgressBar>,
     shared_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    preloaded_download_ctx: Option<Arc<DownloadContext>>,
+}
+
+impl StreamRuntime {
+    pub(super) fn new(
+        shared_pb: Option<ProgressBar>,
+        shared_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Self {
+        Self {
+            shared_pb,
+            shared_bytes,
+            preloaded_download_ctx: None,
+        }
+    }
+
+    pub(super) fn with_context(
+        shared_pb: Option<ProgressBar>,
+        shared_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+        preloaded_download_ctx: Option<Arc<DownloadContext>>,
+    ) -> Self {
+        Self {
+            shared_pb,
+            shared_bytes,
+            preloaded_download_ctx,
+        }
+    }
+}
+
+pub(super) async fn stream_and_download_from_stream_with_context<S>(
+    download_client: &Client,
+    combined: S,
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    total: u64,
+    shutdown_token: CancellationToken,
+    runtime: StreamRuntime,
 ) -> Result<StreamingResult>
 where
     S: futures_util::Stream<Item = anyhow::Result<crate::icloud::photos::PhotoAsset>>
@@ -827,10 +884,11 @@ where
     // The byte counter follows the same pairing rule: caller-supplied with
     // `shared_pb`, or freshly created for an internal bar. The friendly
     // sparkline / rate display reads from this atomic on each redraw.
-    let owns_pb = shared_pb.is_none();
-    let bytes_counter =
-        shared_bytes.unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
-    let pb = shared_pb.unwrap_or_else(|| {
+    let owns_pb = runtime.shared_pb.is_none();
+    let bytes_counter = runtime
+        .shared_bytes
+        .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
+    let pb = runtime.shared_pb.unwrap_or_else(|| {
         create_progress_bar(
             reporting.no_progress_bar,
             controls.run_mode.only_print_filenames(),
@@ -860,10 +918,9 @@ where
     if controls.run_mode.only_print_filenames() {
         // Load state DB context so we skip already-downloaded assets,
         // matching the incremental path's behavior.
-        let download_ctx = if let Some(db) = &config.state_db {
-            DownloadContext::load(db.as_ref(), false).await
-        } else {
-            DownloadContext::default()
+        let download_ctx = match runtime.preloaded_download_ctx {
+            Some(ctx) => ctx,
+            None => preload_download_context(config).await,
         };
 
         tokio::pin!(combined);
@@ -978,16 +1035,10 @@ where
     let mode = reporting.personality_mode;
 
     // Pre-load download context for O(1) skip decisions
-    let download_ctx = if let Some(db) = &state_db {
-        tracing::debug!("Pre-loading download state from database");
-        DownloadContext::load(db.as_ref(), config.retry_only).await
-    } else {
-        DownloadContext::default()
+    let download_ctx = match runtime.preloaded_download_ctx {
+        Some(ctx) => ctx,
+        None => preload_download_context(config).await,
     };
-    tracing::debug!(
-        downloaded_ids = download_ctx.downloaded_ids.len(),
-        "Download context loaded"
-    );
 
     // On flag drift, clear stored sync tokens so the next cycle falls back
     // to full enumeration and picks up assets the old token would miss
@@ -3665,6 +3716,7 @@ mod tests {
         remaining_failures: AtomicUsize,
         calls: AtomicUsize,
         successes: AtomicUsize,
+        downloaded_id_loads: AtomicUsize,
         fail_metadata_clear: bool,
         fail_complete_sync_run: bool,
     }
@@ -3675,6 +3727,7 @@ mod tests {
                 remaining_failures: AtomicUsize::new(fail_count),
                 calls: AtomicUsize::new(0),
                 successes: AtomicUsize::new(0),
+                downloaded_id_loads: AtomicUsize::new(0),
                 fail_metadata_clear: false,
                 fail_complete_sync_run: false,
             }
@@ -3698,6 +3751,10 @@ mod tests {
 
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::Relaxed)
+        }
+
+        fn downloaded_id_load_count(&self) -> usize {
+            self.downloaded_id_loads.load(Ordering::Relaxed)
         }
     }
 
@@ -3763,6 +3820,7 @@ mod tests {
         async fn get_downloaded_ids(
             &self,
         ) -> Result<HashSet<(String, String, String)>, StateError> {
+            self.downloaded_id_loads.fetch_add(1, Ordering::Relaxed);
             Ok(HashSet::new())
         }
 
@@ -4480,8 +4538,7 @@ mod tests {
             DownloadControls::download_hidden(),
             10_000,
             shutdown_token,
-            None,
-            None,
+            StreamRuntime::new(None, None),
         )
         .await;
         let elapsed = start.elapsed();
@@ -4567,8 +4624,7 @@ mod tests {
             DownloadControls::download_hidden(),
             0,
             shutdown_token,
-            None,
-            None,
+            StreamRuntime::new(None, None),
         )
         .await
         .expect_err("should propagate producer panic");
@@ -4600,8 +4656,7 @@ mod tests {
             DownloadControls::dry_run_hidden(),
             1,
             CancellationToken::new(),
-            None,
-            None,
+            StreamRuntime::new(None, None),
         )
         .await
         .expect("dry run should scan through the real stream pipeline");
@@ -4642,8 +4697,7 @@ mod tests {
             controls,
             2,
             CancellationToken::new(),
-            None,
-            None,
+            StreamRuntime::new(None, None),
         )
         .await
         .expect("dry run should continue past enumeration errors");
@@ -4730,8 +4784,7 @@ mod tests {
             DownloadControls::download_hidden(),
             1,
             CancellationToken::new(),
-            None,
-            None,
+            StreamRuntime::new(None, None),
         )
         .await
         .expect("sync must complete");
@@ -4758,8 +4811,7 @@ mod tests {
             DownloadControls::download_hidden(),
             1,
             CancellationToken::new(),
-            None,
-            None,
+            StreamRuntime::new(None, None),
         )
         .await
         .expect("second sync must complete");
@@ -4847,8 +4899,7 @@ mod tests {
             DownloadControls::download_hidden(),
             1,
             CancellationToken::new(),
-            None,
-            None,
+            StreamRuntime::new(None, None),
         )
         .await
         .expect("sync must complete");
@@ -4945,8 +4996,7 @@ mod tests {
             DownloadControls::download_hidden(),
             1,
             CancellationToken::new(),
-            None,
-            None,
+            StreamRuntime::new(None, None),
         )
         .await
         .expect("sync must complete");
@@ -5185,8 +5235,7 @@ mod tests {
             controls,
             0,
             CancellationToken::new(),
-            None,
-            None,
+            StreamRuntime::new(None, None),
         )
         .await
         .expect("empty sync should finish the stream pipeline");
@@ -5211,6 +5260,41 @@ mod tests {
             "complete_sync_run failure must not report Success, got {outcome:?}"
         );
         assert_eq!(stats.state_write_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_with_preloaded_download_context_does_not_reload_state_db() {
+        let db = Arc::new(FailingStateDb::new(0));
+        let dyn_db: Arc<dyn crate::state::StateDb> = db.clone();
+        let mut raw_config = DownloadConfig::test_default();
+        raw_config.state_db = Some(dyn_db);
+        let config = Arc::new(raw_config);
+        let preloaded = preload_download_context(&config).await;
+        assert_eq!(
+            db.downloaded_id_load_count(),
+            1,
+            "preload should read downloaded IDs once"
+        );
+
+        let client = reqwest::Client::new();
+        let stream = stream::empty::<anyhow::Result<PhotoAsset>>();
+        stream_and_download_from_stream_with_context(
+            &client,
+            stream,
+            &config,
+            DownloadControls::download_hidden(),
+            0,
+            CancellationToken::new(),
+            StreamRuntime::with_context(None, None, Some(preloaded)),
+        )
+        .await
+        .expect("empty stream should complete");
+
+        assert_eq!(
+            db.downloaded_id_load_count(),
+            1,
+            "stream should reuse the preloaded context instead of reloading the DB"
+        );
     }
 
     #[tokio::test]
