@@ -476,22 +476,39 @@ impl PhotoAlbum {
 
         // Use 2x concurrency for enumeration fetchers — Apple's CloudKit
         // doesn't throttle at these levels and it halves enumeration time.
-        let (num_fetchers, parallel_total) = match effective_total {
-            Some(total) if concurrency > 1 => {
-                let num_fetchers = determine_fetcher_count(total, page_size, concurrency * 2);
-                if num_fetchers > 1 {
-                    (num_fetchers, Some(total))
+        //
+        // Even when the count fits in one fetcher, keep the known bound. The
+        // empty-page gap probe is valuable when no count is available, but
+        // after a successful `len()` call it used to spend five extra HTTP
+        // round trips walking the empty tail of every small album.
+        let (num_fetchers, bounded_total) = match effective_total {
+            Some(total) => {
+                let fetchers = if concurrency > 1 {
+                    determine_fetcher_count(total, page_size, concurrency * 2)
                 } else {
-                    (1, None)
-                }
+                    1
+                };
+                // Fetch one page for empty albums so a page syncToken can
+                // still be observed before the stream completes.
+                (fetchers, Some(total.max(1)))
             }
-            _ => (1, None),
+            None => (1, None),
         };
 
+        // Apple's first bounded records/query page can return 199 records:
+        // 99 complete CPLMaster/CPLAsset pairs plus one dangling CPLAsset
+        // whose CPLMaster lives at rank 99. Without this speculative one-rank
+        // probe, the first fetcher has to spend a second full round trip for
+        // that single missing asset after every other fetcher is done. Run the
+        // probe in parallel and shorten the first chunk to keep the asset
+        // range non-overlapping.
+        let initial_boundary_probe = bounded_total
+            .is_some_and(|total| total >= page_size as u64 && page_size > 1 && limit.is_some());
+        let channel_fetchers = num_fetchers + usize::from(initial_boundary_probe);
         let (tx, rx) =
-            mpsc::channel::<anyhow::Result<PhotoAsset>>((page_size * num_fetchers).min(500));
+            mpsc::channel::<anyhow::Result<PhotoAsset>>((page_size * channel_fetchers).min(500));
 
-        if let Some(total) = parallel_total {
+        if let Some(total) = bounded_total {
             // Partition offset range into non-overlapping chunks aligned to
             // page_size boundaries so each fetcher starts on a clean page.
             let chunk_size_items = {
@@ -509,10 +526,25 @@ impl PhotoAlbum {
             );
 
             for i in 0..num_fetchers {
-                let start = i as u64 * chunk_size_items;
-                let end = ((i as u64 + 1) * chunk_size_items).min(total);
+                let mut start = i as u64 * chunk_size_items;
+                let mut end = ((i as u64 + 1) * chunk_size_items).min(total);
                 if start >= total {
                     break;
+                }
+                if initial_boundary_probe && i == 0 {
+                    end = end.min(page_size as u64 - 1);
+                    handles.push(self.spawn_fetcher(
+                        tx.clone(),
+                        page_size as u64 - 1,
+                        (page_size as u64).min(total),
+                        Some(1),
+                        fetcher_sync_tokens.clone(),
+                    ));
+                } else if initial_boundary_probe && i > 0 {
+                    start = start.max(page_size as u64);
+                }
+                if start >= end {
+                    continue;
                 }
                 // Per-fetcher limit: don't exceed the chunk size, and for the
                 // last fetcher also respect the global --recent cap.
@@ -1333,6 +1365,203 @@ mod tests {
         TokenByOffsetSession {
             tokens_by_offset: Arc::new(tokens.iter().copied().collect()),
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CountingSinglePageSession {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for CountingSinglePageSession {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if call == 0 {
+                Ok(mock_photo_query_page(
+                    "master-known-total",
+                    Some("st-known"),
+                ))
+            } else {
+                Ok(json!({"records": []}))
+            }
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn photo_stream_with_known_single_page_total_skips_empty_tail_probes() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let album = make_album_with_session(
+            100,
+            Box::new(CountingSinglePageSession {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(1), 10);
+
+        assert_eq!(drain_photo_stream_count(stream).await, 1);
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("st-known")
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "known single-page totals should not spend extra requests probing the empty tail"
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct InitialBoundarySession {
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        offsets: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl InitialBoundarySession {
+        fn note_start(&self, offset: u64) {
+            self.offsets.lock().expect("offsets lock").push(offset);
+            let current = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let mut observed = self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst);
+            while current > observed {
+                match self.max_in_flight.compare_exchange(
+                    observed,
+                    current,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => observed = next,
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for InitialBoundarySession {
+        async fn post(
+            &self,
+            _url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let request: Value = serde_json::from_str(&body)?;
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .and_then(|filters| {
+                    filters.iter().find_map(|filter| {
+                        (filter["fieldName"] == "startRank")
+                            .then(|| filter["fieldValue"]["value"].as_u64())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            self.note_start(offset);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+            let records = if offset == 0 {
+                let mut records = Vec::new();
+                for i in 0..99 {
+                    records.extend(test_records(&format!("master-{i}")));
+                }
+                records.push(test_asset_record("master-99"));
+                records
+            } else {
+                test_records("master-99")
+            };
+            Ok(json!({"records": records, "syncToken": "st-boundary"}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn test_records(record_name: &str) -> Vec<Value> {
+        vec![
+            test_master_record(record_name),
+            test_asset_record(record_name),
+        ]
+    }
+
+    fn test_master_record(record_name: &str) -> Value {
+        json!({
+            "recordName": record_name,
+            "recordType": "CPLMaster",
+            "fields": {
+                "filenameEnc": {"value": "photo.jpg", "type": "STRING"},
+                "resOriginalRes": {
+                    "value": {
+                        "downloadURL": "https://p01.icloud-content.com/photo.jpg",
+                        "size": 1024,
+                        "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                    }
+                },
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "itemType": {"value": "public.jpeg"}
+            }
+        })
+    }
+
+    fn test_asset_record(record_name: &str) -> Value {
+        json!({
+            "recordName": format!("asset-{record_name}"),
+            "recordType": "CPLAsset",
+            "fields": {
+                "masterRef": {
+                    "value": {
+                        "recordName": record_name,
+                        "zoneID": {"zoneName": "PrimarySync"}
+                    },
+                    "type": "REFERENCE"
+                },
+                "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn photo_stream_initial_boundary_probe_runs_in_parallel() {
+        let session = InitialBoundarySession {
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            offsets: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let album = make_album_with_session(100, Box::new(session.clone()));
+
+        let (stream, token_rx) = album.photo_stream_with_token(Some(100), Some(100), 10);
+
+        assert_eq!(drain_photo_stream_count(stream).await, 100);
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("st-boundary")
+        );
+        assert!(
+            session
+                .max_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "boundary probe should overlap the first page fetch"
+        );
+        let mut offsets = session.offsets.lock().expect("offsets lock").clone();
+        offsets.sort_unstable();
+        assert_eq!(offsets, vec![0, 99]);
     }
 
     #[tokio::test]
