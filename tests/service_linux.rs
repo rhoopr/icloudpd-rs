@@ -80,6 +80,10 @@ fn dry_run_install_user_prints_unit_without_writing_file() {
         "missing Type=notify:\n{stdout}"
     );
     assert!(
+        stdout.contains("Environment=MALLOC_ARENA_MAX=2"),
+        "missing allocator arena limit:\n{stdout}"
+    );
+    assert!(
         stdout.contains("Description=kei Media Sync Engine"),
         "missing Description:\n{stdout}"
     );

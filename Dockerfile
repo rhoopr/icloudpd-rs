@@ -81,4 +81,8 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 # Container runtime glue: keep sessions, state DB, and credentials on the
 # mounted /config volume. Persistent user settings live in /config/config.toml.
 ENV KEI_DATA_DIR=/config
+# Keep glibc from reserving one large malloc arena per worker thread. This
+# lowers virtual memory size for long-running watch containers without changing
+# kei's actual resident memory target.
+ENV MALLOC_ARENA_MAX=2
 CMD ["service", "run", "--config", "/config/config.toml"]

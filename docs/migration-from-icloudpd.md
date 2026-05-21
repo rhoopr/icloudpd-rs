@@ -300,6 +300,8 @@ services:
     environment:
       - ICLOUD_USERNAME=${ICLOUD_USERNAME}
       - TZ=${TZ:-UTC}
+      # Already set by the image. Keep this for lower VSZ in long watch runs.
+      # - MALLOC_ARENA_MAX=2
     volumes:
       - ./config:/config
       - /path/to/photos:/photos
@@ -312,6 +314,12 @@ Avoid `ICLOUD_PASSWORD` in Docker if you can; it shows up in `docker inspect`.
 Use a Docker secret with `--password-file /run/secrets/icloud_password`, an
 external secret manager via `--password-command`, or run `kei password set`
 inside the container if your credential backend supports it.
+
+On glibc systems, long-running multi-threaded processes can reserve large
+virtual malloc arenas even when their resident memory is small. The Docker
+image sets `MALLOC_ARENA_MAX=2`, and `kei install` writes the same setting into
+Linux systemd units. If you run kei from your own service manager and care
+about VSZ, set `MALLOC_ARENA_MAX=2` before `kei service run`.
 
 For a one-shot import against an existing mounted tree:
 

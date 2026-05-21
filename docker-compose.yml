@@ -6,6 +6,10 @@ services:
     stop_grace_period: 30s
     environment:
       - TZ=${TZ:-UTC}
+      # The image sets MALLOC_ARENA_MAX=2 by default. Keep it unless you are
+      # debugging allocator behavior; it keeps long-running watch containers
+      # from reserving large amounts of virtual address space on glibc hosts.
+      # - MALLOC_ARENA_MAX=2
       # Put persistent settings in ./config/config.toml:
       #
       # [auth]

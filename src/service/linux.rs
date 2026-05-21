@@ -120,6 +120,7 @@ fn render_unit(exec_path: &Path, config_path: &Path, kind: UnitKind) -> String {
          [Service]\n\
          Type=notify\n\
          {user_line}\
+         Environment=MALLOC_ARENA_MAX=2\n\
          ExecStart={exec} service run --config {config}\n\
          Restart=on-failure\n\
          RestartSec=10s\n\
@@ -737,6 +738,7 @@ mod tests {
         assert!(unit.contains("Type=notify"));
         assert!(unit.contains("WatchdogSec=120"));
         assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("Environment=MALLOC_ARENA_MAX=2"));
         assert!(unit.contains(
             "ExecStart=/usr/local/bin/kei service run --config /home/alice/.config/kei/config.toml"
         ));
@@ -820,6 +822,7 @@ mod tests {
             unit.contains("ExecStart=/opt/kei/bin/kei service run --config /etc/kei/config.toml")
         );
         assert!(unit.contains("Type=notify"));
+        assert!(unit.contains("Environment=MALLOC_ARENA_MAX=2"));
     }
 
     #[test]
