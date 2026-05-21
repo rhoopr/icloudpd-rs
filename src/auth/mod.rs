@@ -543,8 +543,16 @@ pub async fn send_2fa_push(
 /// validate endpoint. Returns `true` if valid, `false` if expired.
 pub async fn validate_session(session: &mut Session, domain: &str) -> Result<bool> {
     let endpoints = Endpoints::for_domain(domain)?;
+    if recently_validated(session).await {
+        tracing::debug!("Session validated recently, skipping idle re-validation");
+        return Ok(true);
+    }
+
     match twofa::validate_token(session, &endpoints).await {
-        Ok(_) => Ok(true),
+        Ok(d) => {
+            session.save_validation_cache(&d).await;
+            Ok(true)
+        }
         Err(_) => {
             // /validate is strict; try /accountLogin as a lenient fallback.
             // A session is valid if accountLogin succeeds and 2FA is not required
@@ -574,12 +582,21 @@ pub async fn validate_session(session: &mut Session, domain: &str) -> Result<boo
                             return Ok(false);
                         }
                     }
+                    session.save_validation_cache(&d).await;
                     Ok(true)
                 }
                 Err(_) => Ok(false),
             }
         }
     }
+}
+
+async fn recently_validated(session: &Session) -> bool {
+    session.session_data.contains_key("session_token")
+        && session
+            .load_validation_cache(responses::VALIDATION_CACHE_GRACE_SECS)
+            .await
+            .is_some()
 }
 
 /// Apple's HSA2 (two-step verification v2) requires all three conditions:
@@ -760,6 +777,35 @@ mod tests {
         assert!(
             !called.load(Ordering::SeqCst),
             "password provider must not run when endpoint resolution fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn recently_validated_requires_session_token_and_fresh_cache() {
+        let cookies = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::new(
+            cookies.path(),
+            "cached@example.com",
+            "https://setup.icloud.com",
+            None,
+        )
+        .await
+        .expect("session");
+
+        session
+            .save_validation_cache(&make_response(2, false, true, true))
+            .await;
+        assert!(
+            !recently_validated(&session).await,
+            "cache without a session token must not authenticate an empty session"
+        );
+
+        session
+            .session_data
+            .insert("session_token".into(), "token".into());
+        assert!(
+            recently_validated(&session).await,
+            "fresh validation cache should suppress idle re-validation"
         );
     }
 

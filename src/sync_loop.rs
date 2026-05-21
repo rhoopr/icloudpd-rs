@@ -96,6 +96,8 @@ impl WatchPrecheck {
 /// the version suffix (e.g. `_v2`) re-fires the notice for every existing
 /// data dir the next time it's used.
 const SHARED_LIBRARY_NOTICE_KEY: &str = "shared_library_notice_shown_v1";
+const SHARED_LIBRARY_NOTICE_CHECKED_KEY: &str = "shared_library_notice_checked_at_v1";
+const SHARED_LIBRARY_NOTICE_CHECK_TTL_SECS: i64 = 24 * 60 * 60;
 
 /// Metadata key for the database-level token used by `/changes/database`.
 const DB_SYNC_TOKEN_KEY: &str = "db_sync_token";
@@ -164,30 +166,40 @@ fn should_notify_shared_libraries(
     ))
 }
 
+fn shared_library_notice_recently_checked(checked_at: Option<&str>, now_ts: i64) -> bool {
+    let Some(checked_at) = checked_at.and_then(|value| value.parse::<i64>().ok()) else {
+        return false;
+    };
+    now_ts.saturating_sub(checked_at) < SHARED_LIBRARY_NOTICE_CHECK_TTL_SECS
+}
+
 /// Probe + warning for users on the `PrimarySync` default who also have
-/// shared libraries. The marker (stored in the state DB's `metadata` table
-/// under [`SHARED_LIBRARY_NOTICE_KEY`]) is only set after the notice fires,
-/// so accounts with no shared libraries re-probe on every sync and catch a
-/// later-added library. The probe and marker write are best-effort: failures
+/// shared libraries. The notice marker (stored in the state DB's `metadata`
+/// table under [`SHARED_LIBRARY_NOTICE_KEY`]) is set after the notice fires.
+/// A separate short-lived negative cache records "no shared libraries seen"
+/// so accounts without shared libraries do not pay a shared-zone listing on
+/// every one-shot sync. The probe and marker writes are best-effort: failures
 /// degrade to `tracing::debug!` and skip without breaking the sync.
 async fn maybe_notify_shared_libraries(
     selector: &crate::selection::LibrarySelector,
     photos_service: &mut crate::icloud::photos::PhotosService,
     state_db: Option<&dyn state::StateDb>,
 ) {
-    let already_notified = match state_db {
-        Some(db) => match db.get_metadata(SHARED_LIBRARY_NOTICE_KEY).await {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "shared-library notice: metadata read failed; skipping"
-                );
-                return;
-            }
-        },
-        None => false,
+    let Some(db) = state_db else {
+        tracing::debug!("shared-library notice: no state DB available; skipping uncached probe");
+        return;
+    };
+
+    let already_notified = match db.get_metadata(SHARED_LIBRARY_NOTICE_KEY).await {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "shared-library notice: metadata read failed; skipping"
+            );
+            return;
+        }
     };
     if already_notified {
         return;
@@ -198,6 +210,24 @@ async fn maybe_notify_shared_libraries(
     // repeats this check defensively.
     if selector != &crate::selection::LibrarySelector::default() {
         return;
+    }
+
+    match db.get_metadata(SHARED_LIBRARY_NOTICE_CHECKED_KEY).await {
+        Ok(checked_at) => {
+            if shared_library_notice_recently_checked(
+                checked_at.as_deref(),
+                chrono::Utc::now().timestamp(),
+            ) {
+                tracing::debug!("shared-library notice: recent no-shared check cached");
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "shared-library notice: checked-at read failed; probing"
+            );
+        }
     }
 
     let shared_count = match photos_service.fetch_shared_libraries().await {
@@ -212,17 +242,29 @@ async fn maybe_notify_shared_libraries(
     };
 
     let Some(msg) = should_notify_shared_libraries(selector, shared_count, already_notified) else {
+        if shared_count == 0 {
+            if let Err(e) = db
+                .set_metadata(
+                    SHARED_LIBRARY_NOTICE_CHECKED_KEY,
+                    &chrono::Utc::now().timestamp().to_string(),
+                )
+                .await
+            {
+                tracing::debug!(
+                    error = %e,
+                    "shared-library notice: failed to persist no-shared check marker"
+                );
+            }
+        }
         return;
     };
     tracing::warn!(message = %msg, "Shared library notice");
 
-    if let Some(db) = state_db {
-        if let Err(e) = db.set_metadata(SHARED_LIBRARY_NOTICE_KEY, "1").await {
-            tracing::debug!(
-                error = %e,
-                "shared-library notice: failed to persist marker"
-            );
-        }
+    if let Err(e) = db.set_metadata(SHARED_LIBRARY_NOTICE_KEY, "1").await {
+        tracing::debug!(
+            error = %e,
+            "shared-library notice: failed to persist marker"
+        );
     }
 }
 
@@ -1812,6 +1854,93 @@ mod tests {
     fn notice_suppressed_when_both_user_opted_out_and_already_notified() {
         // Belt-and-braces: every suppression condition stacks correctly.
         assert!(should_notify_shared_libraries(&all_libraries(), 0, true).is_none());
+    }
+
+    #[test]
+    fn shared_library_notice_recent_check_uses_ttl() {
+        let now = 1_800_000_000;
+        assert!(shared_library_notice_recently_checked(
+            Some(&(now - 60).to_string()),
+            now
+        ));
+        assert!(!shared_library_notice_recently_checked(
+            Some(&(now - SHARED_LIBRARY_NOTICE_CHECK_TTL_SECS - 1).to_string()),
+            now
+        ));
+        assert!(!shared_library_notice_recently_checked(
+            Some("not-a-ts"),
+            now
+        ));
+    }
+
+    #[derive(Clone)]
+    struct CountingSharedLibrarySession {
+        shared_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for CountingSharedLibrarySession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            if url.contains("/shared/zones/list") {
+                self.shared_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(serde_json::json!({"zones": []}));
+            }
+            anyhow::bail!("unexpected URL: {url}")
+        }
+
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn shared_notice_service(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> crate::icloud::photos::PhotosService {
+        crate::icloud::photos::PhotosService::for_testing(
+            Box::new(CountingSharedLibrarySession {
+                shared_calls: calls,
+            }),
+            std::collections::HashMap::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn shared_library_notice_skips_uncached_dry_run_probe_without_state_db() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut service = shared_notice_service(Arc::clone(&calls));
+
+        maybe_notify_shared_libraries(&primary(), &mut service, None).await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "without a state DB the shared-library probe cannot be cached, so dry-run should not pay the API call"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_library_notice_caches_no_shared_libraries() {
+        let db = make_state_db();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut first = shared_notice_service(Arc::clone(&calls));
+        maybe_notify_shared_libraries(&primary(), &mut first, Some(db.as_ref())).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut second = shared_notice_service(Arc::clone(&calls));
+        maybe_notify_shared_libraries(&primary(), &mut second, Some(db.as_ref())).await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fresh no-shared marker should suppress the next shared-zone listing"
+        );
     }
 
     // The run_sync reauth retry branch keys on whether an error from

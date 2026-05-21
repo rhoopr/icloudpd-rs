@@ -2282,7 +2282,11 @@ async fn download_photos_incremental(
     let mut hidden_count = 0u64;
     let mut total_events = 0u64;
 
-    for (pass_index, pass) in passes.iter().enumerate() {
+    // `changes_stream` is zone-scoped, not album-scoped. Query it once and
+    // fan created assets out through the selected passes locally; querying
+    // once per pass repeats the same `/changes/zone` pages on every watch
+    // cycle with work.
+    if let Some(pass) = passes.first() {
         let (change_stream, token_rx) = pass.album.changes_stream(zone_sync_token);
         tokio::pin!(change_stream);
 
@@ -2296,7 +2300,9 @@ async fn download_photos_incremental(
                 ChangeReason::Created => {
                     created_count += 1;
                     if let Some(asset) = event.asset {
-                        downloadable_assets.push((asset, pass_index));
+                        for pass_index in 0..passes.len() {
+                            downloadable_assets.push((asset.clone(), pass_index));
+                        }
                     }
                 }
                 ChangeReason::SoftDeleted => {
@@ -2355,7 +2361,6 @@ async fn download_photos_incremental(
             }
         }
 
-        // Capture the sync token from this pass
         if let Ok(token) = token_rx.await {
             sync_token = Some(token);
         }
@@ -2611,6 +2616,92 @@ mod tests {
 
     fn test_config() -> DownloadConfig {
         DownloadConfig::test_default()
+    }
+
+    fn changes_album(name: &str, session: CountingChangesZoneSession) -> PhotoAlbum {
+        PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from(name),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
+                retry_config: RetryConfig::default(),
+            },
+            Box::new(session),
+        )
+    }
+
+    #[derive(Clone)]
+    struct CountingChangesZoneSession {
+        changes_zone_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for CountingChangesZoneSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/changes/zone?") {
+                self.changes_zone_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(json!({
+                    "zones": [{
+                        "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                        "syncToken": "zone-token-next",
+                        "moreComing": false,
+                        "records": incremental_photo_records("MASTER_CHANGED"),
+                    }]
+                }));
+            }
+
+            Ok(json!({"records": []}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn incremental_photo_records(record_name: &str) -> Vec<Value> {
+        vec![
+            json!({
+                "recordName": record_name,
+                "recordType": "CPLMaster",
+                "fields": {
+                    "filenameEnc": {"value": "changed.jpg", "type": "STRING"},
+                    "resOriginalRes": {
+                        "value": {
+                            "downloadURL": "https://p01.icloud-content.com/changed.jpg",
+                            "size": 1024,
+                            "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                        }
+                    },
+                    "resOriginalFileType": {"value": "public.jpeg"},
+                    "itemType": {"value": "public.jpeg"}
+                }
+            }),
+            json!({
+                "recordName": format!("asset-{record_name}"),
+                "recordType": "CPLAsset",
+                "fields": {
+                    "masterRef": {
+                        "value": {
+                            "recordName": record_name,
+                            "zoneID": {"zoneName": "PrimarySync"}
+                        },
+                        "type": "REFERENCE"
+                    },
+                    "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                    "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                }
+            }),
+        ]
     }
 
     #[derive(Clone)]
@@ -3323,6 +3414,52 @@ mod tests {
                 false
             ),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_sync_queries_zone_changes_once_per_library() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = CountingChangesZoneSession {
+            changes_zone_calls: Arc::clone(&calls),
+        };
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: changes_album("album_a", session.clone()),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Album,
+                album: changes_album("album_b", session),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("print-only incremental sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            result.sync_token, None,
+            "print-only mode must not advance the sync token"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "changes/zone is zone-scoped; querying once per pass repeats the same delta"
         );
     }
 
