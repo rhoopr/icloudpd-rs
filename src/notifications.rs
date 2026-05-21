@@ -592,10 +592,20 @@ mod tests {
         fixture
             .wait_until(Duration::from_secs(5), || fixture.count_markers() == 0)
             .await;
+        fixture
+            .wait_until(Duration::from_secs(5), || {
+                notifier.concurrency.available_permits() == NOTIFIER_MAX_INFLIGHT
+            })
+            .await;
         assert_eq!(
             fixture.count_markers(),
             0,
             "scripts did not drain after release"
+        );
+        assert_eq!(
+            notifier.concurrency.available_permits(),
+            NOTIFIER_MAX_INFLIGHT,
+            "notification permits did not fully drain after release"
         );
 
         // Dropped events must not retroactively run once permits are free.
