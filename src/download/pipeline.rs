@@ -1085,17 +1085,11 @@ where
     };
 
     // Log a one-time backfill notice when pre-v5 assets still have NULL
-    // metadata_hash. The sync token invalidation in the v5 migration forces
-    // a full enumeration that populates metadata for these rows without
-    // re-downloading files.
-    if let Some(db) = &state_db {
-        match db.has_downloaded_without_metadata_hash().await {
-            Ok(true) => {
-                tracing::info!("Backfilling metadata for existing assets (one-time after upgrade)");
-            }
-            Ok(false) => {}
-            Err(e) => tracing::debug!(error = %e, "Failed to check for metadata backfill"),
-        }
+    // metadata_hash. `download_ctx` already loaded downloaded ids and
+    // non-null metadata hashes, so avoid a redundant SQLite EXISTS scan per
+    // album pass.
+    if download_ctx.has_downloaded_without_metadata_hash() {
+        tracing::info!("Backfilling metadata for existing assets (one-time after upgrade)");
     }
 
     let mut downloaded = 0usize;

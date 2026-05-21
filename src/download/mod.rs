@@ -1234,6 +1234,40 @@ impl DownloadContext {
             None
         }
     }
+
+    fn downloaded_version_count(&self) -> usize {
+        count_version_set_entries(&self.downloaded_ids)
+    }
+
+    fn downloaded_metadata_hash_count(&self) -> usize {
+        count_value_map_entries(&self.downloaded_metadata_hashes)
+    }
+
+    fn has_downloaded_without_metadata_hash(&self) -> bool {
+        self.downloaded_version_count() > self.downloaded_metadata_hash_count()
+    }
+}
+
+fn count_version_set_entries(map: &LibraryAssetVersionSet) -> usize {
+    map.values()
+        .map(|assets| {
+            assets
+                .values()
+                .map(|versions| versions.len())
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+fn count_value_map_entries(map: &LibraryAssetVersionValueMap) -> usize {
+    map.values()
+        .map(|assets| {
+            assets
+                .values()
+                .map(|versions| versions.len())
+                .sum::<usize>()
+        })
+        .sum()
 }
 
 async fn preload_download_context(config: &DownloadConfig) -> Arc<DownloadContext> {
@@ -1369,12 +1403,15 @@ fn deferred_unfiled_index(passes: &[crate::commands::AlbumPass]) -> Option<usize
 async fn collect_unfiled_stream(
     pass: &crate::commands::AlbumPass,
     count: u64,
+    stream_total_count: Option<u64>,
     config: &DownloadConfig,
     shutdown_token: CancellationToken,
 ) -> CollectedUnfiledStream {
-    let (stream, token_rx) =
-        pass.album
-            .photo_stream_with_token(config.recent, Some(count), config.concurrent_downloads);
+    let (stream, token_rx) = pass.album.photo_stream_with_token(
+        config.recent,
+        stream_total_count,
+        config.concurrent_downloads,
+    );
     tokio::pin!(stream);
     let mut items = Vec::new();
     while let Some(item) = stream.next().await {
@@ -1824,6 +1861,63 @@ fn fold_pass_count_results(
     (counts, errors)
 }
 
+#[derive(Debug)]
+struct PassCountPlan {
+    display_counts: Vec<u64>,
+    stream_total_counts: Vec<Option<u64>>,
+    exact_total: Option<u64>,
+    len_errors: usize,
+}
+
+fn should_skip_pass_count_fetch(config: &DownloadConfig, controls: DownloadControls) -> bool {
+    config.recent.is_some()
+        && (controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames())
+}
+
+async fn build_pass_count_plan(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+) -> PassCountPlan {
+    if should_skip_pass_count_fetch(config, controls) {
+        let display_count = config.recent.map(u64::from).unwrap_or(0);
+        return PassCountPlan {
+            display_counts: vec![display_count; passes.len()],
+            stream_total_counts: vec![None; passes.len()],
+            exact_total: None,
+            len_errors: 0,
+        };
+    }
+
+    // Album counts share CloudKit's `/internal/records/query/batch`
+    // endpoint, so the same-library pass set can fetch all counts with one
+    // HTTP call. This matters for default multi-pass syncs and especially
+    // `-a all`, where the old per-pass count probe scaled linearly before
+    // the first byte of the first download.
+    // Capture per-pass `len()` errors instead of swallowing them as zero.
+    // A swallowed `len()` failure converted `total` to 0, which short-circuited
+    // the pagination-undercount check at line ~1450 (it only fires when
+    // `total > 0`); the cycle then returned `Success` with zero assets and the
+    // sync token advanced past un-enumerated change events. Treat any failure
+    // as a per-album enumeration error so token advancement is suppressed.
+    let pass_albums: Vec<&crate::icloud::photos::PhotoAlbum> =
+        passes.iter().map(|pass| &pass.album).collect();
+    let pass_count_results = crate::icloud::photos::PhotoAlbum::len_many(&pass_albums).await;
+    let (display_counts, len_errors) = fold_pass_count_results(pass_count_results, passes);
+    let stream_total_counts = display_counts.iter().copied().map(Some).collect();
+    let mut exact_total: u64 = display_counts.iter().sum();
+    if let Some(recent) = config.recent {
+        exact_total = exact_total.min(u64::from(recent));
+    }
+
+    PassCountPlan {
+        display_counts,
+        stream_total_counts,
+        exact_total: Some(exact_total),
+        len_errors,
+    }
+}
+
 /// Classification of how the producer-observed asset count compared with the
 /// pre-enumeration API total. Drives the two-tier pagination-undercount gate.
 ///
@@ -1915,27 +2009,16 @@ async fn download_photos_full_with_token(
         }
     }
 
-    // `album.len()` is one HTTP call per pass. Serialising it scaled fine
-    // when users typed out a few `-a` flags by hand; with `-a all` it's
-    // routinely 20+ round-trips before the first byte of the first
-    // download. `buffered` (not `buffer_unordered`) preserves pass order
-    // so the `zip(&pass_counts)` below stays aligned.
-    // Capture per-pass `len()` errors instead of swallowing them as zero.
-    // A swallowed `len()` failure converted `total` to 0, which short-circuited
-    // the pagination-undercount check at line ~1450 (it only fires when
-    // `total > 0`); the cycle then returned `Success` with zero assets and the
-    // sync token advanced past un-enumerated change events. Treat any failure
-    // as a per-album enumeration error so token advancement is suppressed.
-    let pass_count_results: Vec<anyhow::Result<u64>> = stream::iter(passes)
-        .map(|pass| async move { pass.album.len().await })
-        .buffered(config.concurrent_downloads)
-        .collect()
-        .await;
-    let (pass_counts, len_errors) = fold_pass_count_results(pass_count_results, passes);
-    let mut total: u64 = pass_counts.iter().sum();
-    if let Some(recent) = config.recent {
-        total = total.min(u64::from(recent));
-    }
+    let pass_count_plan = build_pass_count_plan(passes, config, controls).await;
+    let pass_counts = pass_count_plan.display_counts;
+    let pass_stream_counts = pass_count_plan.stream_total_counts;
+    let exact_total = pass_count_plan.exact_total;
+    let len_errors = pass_count_plan.len_errors;
+    let display_total = pass_counts
+        .iter()
+        .copied()
+        .sum::<u64>()
+        .min(config.recent.map(u64::from).unwrap_or(u64::MAX));
 
     // Pass-specific path mode still needs one derived config per pass so
     // `{album}` / `{smart-folder}` / `{library}` expand correctly, but the
@@ -1995,10 +2078,13 @@ async fn download_photos_full_with_token(
                 .iter()
                 .enumerate()
                 .zip(&pass_counts)
+                .zip(&pass_stream_counts)
                 .zip(pass_configs.iter().cloned())
-                .filter(|(((index, _pass), _count), _config)| Some(*index) != deferred_unfiled),
+                .filter(|((((index, _pass), _count), _total_count), _config)| {
+                    Some(*index) != deferred_unfiled
+                }),
         )
-        .map(|(((index, pass), &count), pass_config)| {
+        .map(|((((index, pass), &count), total_count), pass_config)| {
             let shutdown_token = shutdown_token.clone();
             let download_client = download_client.clone();
             let deferred_ids = deferred_ids.clone();
@@ -2006,7 +2092,7 @@ async fn download_photos_full_with_token(
             async move {
                 let (stream, token_rx) = pass.album.photo_stream_with_token(
                     config.recent,
-                    Some(count),
+                    *total_count,
                     config.concurrent_downloads,
                 );
 
@@ -2061,7 +2147,14 @@ async fn download_photos_full_with_token(
             match deferred_unfiled {
                 Some(index) => match (passes.get(index), pass_counts.get(index).copied()) {
                     (Some(pass), Some(count)) => Some(
-                        collect_unfiled_stream(pass, count, config, shutdown_token.clone()).await,
+                        collect_unfiled_stream(
+                            pass,
+                            count,
+                            pass_stream_counts.get(index).copied().flatten(),
+                            config,
+                            shutdown_token.clone(),
+                        )
+                        .await,
                     ),
                     _ => None,
                 },
@@ -2155,11 +2248,11 @@ async fn download_photos_full_with_token(
         let mut token_receivers = Vec::with_capacity(passes.len());
         let streams: Vec<_> = passes
             .iter()
-            .zip(&pass_counts)
-            .map(|(pass, &count)| {
+            .zip(&pass_stream_counts)
+            .map(|(pass, total_count)| {
                 let (stream, token_rx) = pass.album.photo_stream_with_token(
                     config.recent,
-                    Some(count),
+                    *total_count,
                     config.concurrent_downloads,
                 );
                 token_receivers.push(token_rx);
@@ -2175,7 +2268,7 @@ async fn download_photos_full_with_token(
             combined,
             &merged_config,
             controls,
-            total,
+            display_total,
             shutdown_token.clone(),
             StreamRuntime::new(None, None),
         )
@@ -2201,32 +2294,33 @@ async fn download_photos_full_with_token(
     // suppression because the recorded `total` is missing those passes.
     let pagination_undercount = if len_errors > 0 {
         true
-    } else if total > 0
-        && !controls.run_mode.only_print_filenames()
-        && !controls.run_mode.is_dry_run()
-    {
-        let decision = classify_pagination_shortfall(total, streaming_result.assets_seen);
-        match decision {
-            PaginationShortfall::Match => false,
-            PaginationShortfall::WithinTolerance { shortfall } => {
-                tracing::warn!(
-                    expected = total,
-                    seen = streaming_result.assets_seen,
-                    shortfall,
-                    "Enumeration saw slightly fewer assets than expected; within \
-                     5% tolerance so sync token will still advance"
-                );
-                false
+    } else if !controls.run_mode.only_print_filenames() && !controls.run_mode.is_dry_run() {
+        if let Some(total) = exact_total.filter(|total| *total > 0) {
+            let decision = classify_pagination_shortfall(total, streaming_result.assets_seen);
+            match decision {
+                PaginationShortfall::Match => false,
+                PaginationShortfall::WithinTolerance { shortfall } => {
+                    tracing::warn!(
+                        expected = total,
+                        seen = streaming_result.assets_seen,
+                        shortfall,
+                        "Enumeration saw slightly fewer assets than expected; within \
+                         5% tolerance so sync token will still advance"
+                    );
+                    false
+                }
+                PaginationShortfall::Suppress => {
+                    tracing::warn!(
+                        expected = total,
+                        seen = streaming_result.assets_seen,
+                        "Enumeration saw fewer assets than expected — blocking sync token \
+                         advancement to force full re-enumeration on next run"
+                    );
+                    true
+                }
             }
-            PaginationShortfall::Suppress => {
-                tracing::warn!(
-                    expected = total,
-                    seen = streaming_result.assets_seen,
-                    "Enumeration saw fewer assets than expected — blocking sync token \
-                     advancement to force full re-enumeration on next run"
-                );
-                true
-            }
+        } else {
+            false
         }
     } else {
         false
@@ -3702,6 +3796,34 @@ mod tests {
         assert!(!ctx.known_ids.contains("new_asset"));
     }
 
+    #[test]
+    fn download_context_detects_downloaded_rows_missing_metadata_hashes() {
+        let mut ctx = DownloadContext::default();
+        ctx.downloaded_ids
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("asset_meta".into())
+            .or_default()
+            .insert("original".into());
+
+        assert!(
+            ctx.has_downloaded_without_metadata_hash(),
+            "a downloaded row with no matching metadata hash needs the backfill notice"
+        );
+
+        ctx.downloaded_metadata_hashes
+            .entry("PrimarySync".into())
+            .or_default()
+            .entry("asset_meta".into())
+            .or_default()
+            .insert("original".into(), "metadata_hash".into());
+
+        assert!(
+            !ctx.has_downloaded_without_metadata_hash(),
+            "matching downloaded and metadata-hash sets should avoid the extra SQLite scan"
+        );
+    }
+
     // ── Change event classification tests ───────────────────────────────
 
     #[test]
@@ -4868,6 +4990,72 @@ mod tests {
 
         assert_eq!(counts, vec![0, 0]);
         assert_eq!(errors, 2);
+    }
+
+    #[test]
+    fn read_only_recent_runs_skip_pass_count_fetch() {
+        let mut config = test_config();
+        config.recent = Some(25);
+
+        assert!(
+            should_skip_pass_count_fetch(&config, DownloadControls::dry_run_hidden()),
+            "dry-run recent syncs do not advance tokens, so the pre-count is redundant"
+        );
+        assert!(
+            should_skip_pass_count_fetch(
+                &config,
+                DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden())
+            ),
+            "print-only recent syncs do not advance tokens, so the pre-count is redundant"
+        );
+    }
+
+    #[test]
+    fn download_runs_keep_pass_count_fetch_for_token_safety() {
+        let mut config = test_config();
+        config.recent = Some(25);
+
+        assert!(
+            !should_skip_pass_count_fetch(&config, DownloadControls::download_hidden()),
+            "real downloads need the exact count for pagination-undercount token safety"
+        );
+
+        config.recent = None;
+        assert!(
+            !should_skip_pass_count_fetch(&config, DownloadControls::dry_run_hidden()),
+            "unbounded read-only runs still use the exact count for progress bounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_pass_count_plan_uses_recent_bound_without_exact_counts_for_read_only_runs() {
+        use crate::commands::{AlbumPass, PassKind};
+        use crate::icloud::photos::PhotoAlbum;
+        use rustc_hash::FxHashSet;
+        use std::sync::Arc;
+
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: PhotoAlbum::stub_for_test(Arc::from("album_a")),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Album,
+                album: PhotoAlbum::stub_for_test(Arc::from("album_b")),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+        let mut config = test_config();
+        config.recent = Some(10);
+
+        let plan =
+            build_pass_count_plan(&passes, &config, DownloadControls::dry_run_hidden()).await;
+
+        assert_eq!(plan.display_counts, vec![10, 10]);
+        assert_eq!(plan.stream_total_counts, vec![None, None]);
+        assert_eq!(plan.exact_total, None);
+        assert_eq!(plan.len_errors, 0);
     }
 
     #[test]

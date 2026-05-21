@@ -173,22 +173,7 @@ impl PhotoAlbum {
             encode_params(&self.params)
         );
         let body = json!({
-            "batch": [{
-                "resultsLimit": 1,
-                "query": {
-                    "filterBy": {
-                        "fieldName": "indexCountID",
-                        "fieldValue": {
-                            "type": "STRING_LIST",
-                            "value": [&*self.obj_type]
-                        },
-                        "comparator": "IN",
-                    },
-                    "recordType": "HyperionIndexCountLookup",
-                },
-                "zoneWide": true,
-                "zoneID": *self.zone_id,
-            }]
+            "batch": [Self::count_query(&self.obj_type, &self.zone_id)]
         });
 
         let response = super::session::retry_post(
@@ -202,9 +187,106 @@ impl PhotoAlbum {
 
         let batch: super::cloudkit::BatchQueryResponse =
             serde_json::from_value(response).context("failed to parse album count response")?;
-        let count = batch
-            .batch
-            .first()
+        Ok(Self::count_from_query(batch.batch.first()))
+    }
+
+    /// Return item counts for a same-library pass set with one
+    /// `/internal/records/query/batch` call. Falls back to per-album count
+    /// calls if the albums do not share the same endpoint/params context.
+    pub(crate) async fn len_many(albums: &[&Self]) -> Vec<anyhow::Result<u64>> {
+        let Some(first) = albums.first() else {
+            return Vec::new();
+        };
+        if albums.len() == 1 {
+            return vec![first.len().await];
+        }
+        let can_batch = albums.iter().all(|album| {
+            Arc::ptr_eq(&album.service_endpoint, &first.service_endpoint)
+                && Arc::ptr_eq(&album.params, &first.params)
+        });
+        if !can_batch {
+            let mut results = Vec::with_capacity(albums.len());
+            for album in albums {
+                results.push(album.len().await);
+            }
+            return results;
+        }
+
+        let url = format!(
+            "{}/internal/records/query/batch?{}",
+            first.service_endpoint,
+            encode_params(&first.params)
+        );
+        let batch: Vec<Value> = albums
+            .iter()
+            .map(|album| Self::count_query(&album.obj_type, &album.zone_id))
+            .collect();
+        let body = json!({ "batch": batch });
+
+        let response = match super::session::retry_post(
+            first.session.as_ref(),
+            &url,
+            &body.to_string(),
+            &[("Content-type", "text/plain")],
+            &first.retry_config,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::debug!(error = %e, "Batched album count failed; falling back to per-pass counts");
+                let mut results = Vec::with_capacity(albums.len());
+                for album in albums {
+                    results.push(album.len().await);
+                }
+                return results;
+            }
+        };
+
+        let batch: super::cloudkit::BatchQueryResponse = match serde_json::from_value(response) {
+            Ok(batch) => batch,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to parse batched album count response; falling back to per-pass counts");
+                let mut results = Vec::with_capacity(albums.len());
+                for album in albums {
+                    results.push(album.len().await);
+                }
+                return results;
+            }
+        };
+
+        (0..albums.len())
+            .map(|index| {
+                batch
+                    .batch
+                    .get(index)
+                    .map(|query| Self::count_from_query(Some(query)))
+                    .ok_or_else(|| anyhow::anyhow!("missing batched count result for pass {index}"))
+            })
+            .collect()
+    }
+
+    fn count_query(obj_type: &str, zone_id: &Value) -> Value {
+        json!({
+            "resultsLimit": 1,
+            "query": {
+                "filterBy": {
+                    "fieldName": "indexCountID",
+                    "fieldValue": {
+                        "type": "STRING_LIST",
+                        "value": [obj_type]
+                    },
+                    "comparator": "IN",
+                },
+                "recordType": "HyperionIndexCountLookup",
+            },
+            "zoneWide": true,
+            "zoneID": zone_id,
+        })
+    }
+
+    fn count_from_query(query: Option<&super::cloudkit::QueryResponse>) -> u64 {
+        query
             .and_then(|q| q.records.first())
             .and_then(|r| {
                 r.fields
@@ -212,8 +294,7 @@ impl PhotoAlbum {
                     .and_then(|f| f.get("value"))
                     .and_then(Value::as_u64)
             })
-            .unwrap_or(0);
-        Ok(count)
+            .unwrap_or(0)
     }
 
     /// Convenience wrapper over `photo_stream()` that collects all assets
@@ -948,6 +1029,49 @@ mod tests {
     use super::*;
     use crate::test_helpers::{mock_photo_query_page, MockPhotosFlow, MockPhotosSession};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct BatchCountSession {
+        calls: Arc<AtomicUsize>,
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for BatchCountSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            assert!(
+                url.contains("/internal/records/query/batch"),
+                "unexpected URL: {url}"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let body: Value = serde_json::from_str(&body)?;
+            let batch_len = body["batch"].as_array().map_or(0, Vec::len);
+            self.batch_sizes.lock().unwrap().push(batch_len);
+            let batch: Vec<Value> = (0..batch_len)
+                .map(|index| {
+                    json!({
+                        "records": [{
+                            "fields": {
+                                "itemCount": {"value": ((index + 1) as u64) * 10}
+                            }
+                        }]
+                    })
+                })
+                .collect();
+            Ok(json!({ "batch": batch }))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
 
     fn make_album(
         page_size: usize,
@@ -972,6 +1096,50 @@ mod tests {
 
     fn default_zone() -> Value {
         json!({"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner", "zoneType": "REGULAR_CUSTOM_ZONE"})
+    }
+
+    #[tokio::test]
+    async fn len_many_batches_same_library_count_queries() {
+        let params = Arc::new(HashMap::new());
+        let service_endpoint: Arc<str> = Arc::from("https://example.com");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let session = BatchCountSession {
+            calls: Arc::clone(&calls),
+            batch_sizes: Arc::clone(&batch_sizes),
+        };
+        let make_count_album = |name: &str| {
+            PhotoAlbum::new(
+                PhotoAlbumConfig {
+                    params: Arc::clone(&params),
+                    service_endpoint: Arc::clone(&service_endpoint),
+                    name: Arc::from(name),
+                    list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                    obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                    query_filter: None,
+                    page_size: 100,
+                    zone_id: Arc::new(default_zone()),
+                    retry_config: RetryConfig::default(),
+                },
+                Box::new(session.clone()),
+            )
+        };
+        let albums = [
+            make_count_album("Album A"),
+            make_count_album("Album B"),
+            make_count_album("Album C"),
+        ];
+        let album_refs: Vec<&PhotoAlbum> = albums.iter().collect();
+
+        let counts = PhotoAlbum::len_many(&album_refs)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(counts, vec![10, 20, 30]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*batch_sizes.lock().unwrap(), vec![3]);
     }
 
     #[test]
