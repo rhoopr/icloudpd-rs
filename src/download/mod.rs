@@ -351,6 +351,11 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
     hex
 }
 
+/// Bump this when path derivation changes without a corresponding config
+/// field changing. That forces existing state to revalidate on disk instead
+/// of trusting paths derived under older code.
+const PATH_DERIVATION_HASH_VERSION: u8 = 2;
+
 /// Fields shared between [`hash_download_config`] and [`compute_config_hash`]
 /// that affect path resolution and asset eligibility.
 #[derive(Debug)]
@@ -381,6 +386,7 @@ struct SharedHashFields<'a> {
 fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
     use sha2::Digest;
 
+    hasher.update([PATH_DERIVATION_HASH_VERSION]);
     hash_bytes(hasher, f.directory.as_os_str().as_encoded_bytes());
     hash_bytes(hasher, f.folder_structure.as_bytes());
     hash_bytes(hasher, f.folder_structure_albums.as_bytes());
@@ -3696,7 +3702,7 @@ mod tests {
         let config = test_config();
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "e1d7b3e754d4a359",
+            hash, "c3f2be1a9e394951",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
     }
@@ -3732,7 +3738,7 @@ mod tests {
         ]);
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "3acc9aeed3961f16",
+            hash, "a587ebe7d19e6b41",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
     }
@@ -3743,7 +3749,7 @@ mod tests {
         let config = build_config_with(tmp.path(), "/photos", |_| {});
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "d92ae8f5c7f71f82",
+            hash, "773e1b0c8f0d38a7",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3760,7 +3766,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "7eec7bcafbedaa80",
+            hash, "064b0e3c5a9755d3",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3777,7 +3783,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "1129628630bbb7fb",
+            hash, "80c3ab8109fc5b00",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -3794,7 +3800,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "1c6d29102c9edff1",
+            hash, "3a610f0fe148f38c",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
