@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run a phase, capture wall time + exit code + parsed metrics, and append
-# a JSON line to .scratch/test-runs/.current.jsonl. Per-phase output is
+# a JSON line to the full-test run state dir. Per-phase output is
 # captured to $KEI_FULLTEST_LOG_DIR/full-test-<phase>.log for failure
 # inspection; the terminal gets a compact progress line instead of every
 # individual test line. Set KEI_FULLTEST_VERBOSE=1 to tee full phase output.
@@ -8,8 +8,8 @@
 # Usage: time_phase.sh [--live] <phase-name> -- <command...>
 #
 # --live marks the phase as touching real Apple. Two effects:
-#   1. Before running, check .scratch/test-runs/.live-skipped (prereq fail)
-#      and .scratch/test-runs/.rate-limited (503 hit earlier this run). If
+#   1. Before running, check the run state dir for .live-skipped (prereq fail)
+#      and .rate-limited (503 hit earlier this run). If
 #      either is set, append a `skipped` / `rate_limited` JSON record with
 #      wall_s=0 and exit 0 without running the command.
 #   2. After running, scan the captured log for Apple's 503 signature. If
@@ -51,14 +51,14 @@ phase="$1"
 shift 2
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-runs_dir="$repo_root/.scratch/test-runs"
+runs_dir="${KEI_FULL_TEST_RUNS_DIR:-/tmp/codex/kei/full-test/test-runs}"
 mkdir -p "$runs_dir"
 current="$runs_dir/.current.jsonl"
 lockfile="$runs_dir/.lock"
 rate_flag="$runs_dir/.rate-limited"
 skip_flag="$runs_dir/.live-skipped"
 
-log_dir="${KEI_FULLTEST_LOG_DIR:-/tmp/codex}"
+log_dir="${KEI_FULLTEST_LOG_DIR:-/tmp/codex/kei/full-test/logs}"
 mkdir -p "$log_dir"
 phase_log="$log_dir/full-test-$phase.log"
 

@@ -112,8 +112,8 @@ details are baked into test code.
 | `ICLOUD_TEST_COOKIE_DIR` | `./.test-cookies` | Pre-authenticated session dir |
 | `KEI_TEST_ALBUM` | `kei-test` | Test album name |
 | `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image under test |
-| `KEI_TEST_SCRATCH_DIR` | `/tmp/kei-tests-$USER` | Base dir for shell-suite scratch |
-| `KEI_IMPORT_FIXTURE_DIR` | `/tmp/claude/kei-import-fixture` | Where `import_existing_live.rs` caches its `--recent 100` sync fixture across runs |
+| `KEI_TEST_SCRATCH_DIR` | `/tmp/codex/kei/shell-tests-$USER` | Base dir for standalone shell-suite scratch; `just full-test` overrides this to `/tmp/codex/kei/full-test/shell` |
+| `KEI_IMPORT_FIXTURE_DIR` | `/tmp/codex/kei/import-fixture` | Where `import_existing_live.rs` caches its `--recent 100` sync fixture across runs |
 
 `just test live` applies `KEI_TEST_ALBUM=kei-test` to match this
 repo's maintainer setup. Override in your environment to point at your

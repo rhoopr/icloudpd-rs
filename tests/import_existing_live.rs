@@ -21,7 +21,7 @@
 //!
 //! The fixture is intentionally not cleaned up between runs — the next
 //! invocation can reuse it via `KEI_IMPORT_FIXTURE_DIR`. By default the
-//! fixture lives in `/tmp/claude/kei-import-fixture/`, so a re-run just
+//! fixture lives in `/tmp/codex/kei/import-fixture/`, so a re-run just
 //! polls for new photos via the same `kei sync` command (which is a no-op
 //! when nothing changed).
 
@@ -80,7 +80,7 @@ fn fixture_root() -> PathBuf {
     if let Ok(dir) = std::env::var("KEI_IMPORT_FIXTURE_DIR") {
         return PathBuf::from(dir);
     }
-    PathBuf::from("/tmp/claude/kei-import-fixture")
+    PathBuf::from("/tmp/codex/kei/import-fixture")
 }
 
 /// One-shot ensure-fixture: returns the fixture download dir + the data

@@ -1273,7 +1273,7 @@ mod tests {
     ///   10 GiB                -> ok (well above)
     #[test]
     fn run_sync_low_disk_space_aborts_before_auth() {
-        let dir = std::path::Path::new("/tmp/claude/cg-20-disk");
+        let dir = std::path::Path::new("/tmp/codex/kei/cg-20-disk");
 
         // Below threshold: bail.
         for &low in &[0u64, 1023 * 1024 * 1024] {

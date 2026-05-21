@@ -894,7 +894,7 @@ fn exit_code_1_on_missing_username() {
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,
-        "[download]\ndirectory = \"/tmp/claude/exit-code-test\"\n",
+        "[download]\ndirectory = \"/tmp/codex/kei/exit-code-test\"\n",
     )
     .unwrap();
 
@@ -919,7 +919,7 @@ fn exit_code_3_on_empty_password_file() {
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,
-        "[download]\ndirectory = \"/tmp/claude/exit-code-test\"\n",
+        "[download]\ndirectory = \"/tmp/codex/kei/exit-code-test\"\n",
     )
     .unwrap();
     let pw_file = dir.path().join("empty-password");
@@ -950,7 +950,7 @@ fn exit_code_3_on_newline_only_password_file() {
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,
-        "[download]\ndirectory = \"/tmp/claude/exit-code-test\"\n",
+        "[download]\ndirectory = \"/tmp/codex/kei/exit-code-test\"\n",
     )
     .unwrap();
     let pw_file = dir.path().join("newline-password");

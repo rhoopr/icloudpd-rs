@@ -161,12 +161,12 @@ mod tests {
     #[test]
     fn open_error_display_includes_path() {
         let err = StateError::Open {
-            path: PathBuf::from("/tmp/claude/test.db"),
+            path: PathBuf::from("/tmp/codex/kei/test.db"),
             source: make_rusqlite_error(),
         };
         let display = err.to_string();
         assert!(
-            display.contains("/tmp/claude/test.db"),
+            display.contains("/tmp/codex/kei/test.db"),
             "expected path in display, got: {display}"
         );
         assert!(
@@ -178,12 +178,12 @@ mod tests {
     #[test]
     fn parent_dir_error_display_includes_path() {
         let err = StateError::ParentDir {
-            path: PathBuf::from("/tmp/claude/missing/dir"),
+            path: PathBuf::from("/tmp/codex/kei/missing/dir"),
             source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
         };
         let display = err.to_string();
         assert!(
-            display.contains("/tmp/claude/missing/dir"),
+            display.contains("/tmp/codex/kei/missing/dir"),
             "expected path in display, got: {display}"
         );
         assert!(

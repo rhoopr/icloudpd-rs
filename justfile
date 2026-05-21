@@ -26,11 +26,13 @@ gate:
     bash scripts/check-roundtrip-gate.sh
 
 # Pre-release battery with phase logs, metrics, Docker smokes, and live smokes.
-# Stops on first failure. Keeps a /tmp/kei-full-test-*.log only when failing.
+# Stops on first failure. Keeps a /tmp/codex/kei/full-test/logs/kei-full-test-*.log only when failing.
 full-test:
     #!/usr/bin/env bash
     set -Eeuo pipefail
-    log_path=$(mktemp "/tmp/kei-full-test-$(date +%Y%m%dT%H%M%S)-XXXXXX.log")
+    log_dir="${KEI_FULLTEST_LOG_DIR:-/tmp/codex/kei/full-test/logs}"
+    mkdir -p "$log_dir"
+    log_path=$(mktemp "$log_dir/kei-full-test-$(date +%Y%m%dT%H%M%S)-XXXXXX.log")
     failed_line=""
     failed_command=""
     record_failure() {
@@ -159,7 +161,7 @@ cov MODE="" BASE="main":
             ;;
     esac
 
-# Run any kei subcommand under cargo run with .env + scratch data/photos dirs pre-applied.
+# Run any kei subcommand under cargo run with .env + temp data/photos dirs pre-applied.
 dev CMD *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -169,7 +171,7 @@ dev CMD *ARGS:
     export KEI_DATA_DIR="${KEI_DEV_DATA_DIR:-$HOME/.config/kei}"
     cfg="$(mktemp)"
     trap 'rm -f "$cfg"' EXIT
-    printf 'data_dir = "%s"\n[download]\ndirectory = "%s"\n' "$KEI_DATA_DIR" "${KEI_DEV_PHOTOS_DIR:-/tmp/kei-dev-photos}" > "$cfg"
+    printf 'data_dir = "%s"\n[download]\ndirectory = "%s"\n' "$KEI_DATA_DIR" "${KEI_DEV_PHOTOS_DIR:-/tmp/codex/kei/dev-photos}" > "$cfg"
     cargo run -- {{CMD}} --config "$cfg" {{ARGS}}
 
 # Docker: build | multiarch | run | shell | health.

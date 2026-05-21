@@ -12,7 +12,7 @@
 #   ICLOUD_TEST_COOKIE_DIR      pre-authenticated session dir (default: $PROJECT_DIR/.test-cookies)
 #   KEI_TEST_ALBUM              test album name in iCloud (default: kei-test)
 #   KEI_DOCKER_IMAGE            docker image to test (default: kei:latest)
-#   KEI_TEST_SCRATCH_DIR        base dir for per-suite scratch (default: /tmp/kei-tests-$USER)
+#   KEI_TEST_SCRATCH_DIR        base dir for per-suite scratch (default: /tmp/codex/kei/shell-tests-$USER)
 
 : "${PROJECT_DIR:?PROJECT_DIR must be set by the caller}"
 
@@ -100,14 +100,14 @@ kei_docker_image() {
     printf '%s' "${KEI_DOCKER_IMAGE:-kei:latest}"
 }
 
-# Base dir for per-suite scratch output. Under /tmp so the repo checkout
-# stays clean and parallel suite invocations don't collide through
-# repo-local paths.
+# Base dir for per-suite scratch output. Under /tmp/codex so the repo checkout
+# stays clean and parallel suite invocations don't collide through repo-local
+# paths.
 kei_scratch_base() {
     if [ -n "${KEI_TEST_SCRATCH_DIR:-}" ]; then
         printf '%s' "$KEI_TEST_SCRATCH_DIR"
     else
-        printf '/tmp/kei-tests-%s' "${USER:-$(id -un)}"
+        printf '/tmp/codex/kei/shell-tests-%s' "${USER:-$(id -un)}"
     fi
 }
 
@@ -244,7 +244,7 @@ kei_clear_stale_lock() {
 
 # Install an EXIT trap that removes this PID's scratch dirs. Crashed
 # runs would otherwise accumulate `<base>/<suite>-<pid>` directories
-# under /tmp across a day of development.
+# under /tmp/codex across a day of development.
 kei_install_scratch_cleanup() {
     local base
     base="$(kei_scratch_base)"

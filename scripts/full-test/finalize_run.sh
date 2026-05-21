@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Convert .scratch/test-runs/.current.jsonl into a finalized run record at
-# .scratch/test-runs/<ISO-timestamp>.json with branch/head/rustc metadata
+# Convert the full-test staging JSONL into a finalized run record with
+# branch/head/rustc metadata
 # and run-level metrics from collect_metrics.py.
 #
 # Print the path of the finalized record on stdout.
@@ -8,7 +8,7 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-runs_dir="$repo_root/.scratch/test-runs"
+runs_dir="${KEI_FULL_TEST_RUNS_DIR:-/tmp/codex/kei/full-test/test-runs}"
 current="$runs_dir/.current.jsonl"
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 

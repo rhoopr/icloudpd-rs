@@ -24,7 +24,7 @@ fi
 
 album="${KEI_TEST_ALBUM:-kei-test}"
 image="${KEI_DOCKER_IMAGE:-kei:dev}"
-shell_scratch="${KEI_TEST_SCRATCH_DIR:-$repo_root/.scratch/full-test-shell}"
+shell_scratch="${KEI_TEST_SCRATCH_DIR:-/tmp/codex/kei/full-test/shell}"
 mkdir -p "$shell_scratch"
 
 for sh in "$shell_dir"/*.sh; do

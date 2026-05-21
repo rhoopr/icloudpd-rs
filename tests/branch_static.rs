@@ -85,10 +85,9 @@ fn migration_guide_uses_toml_for_durable_sync_settings() {
 }
 
 #[test]
-fn full_test_routes_child_tempdirs_to_repo_scratch() {
+fn full_test_routes_child_tempdirs_to_tmp_codex() {
     let run_all = repo_file("scripts/full-test/run_all.sh");
-    let tmp_assignment =
-        "full_tmp_dir=\"${KEI_FULL_TEST_TMPDIR:-$repo_root/.scratch/full-test-tmp}\"";
+    let tmp_assignment = "full_tmp_dir=\"${KEI_FULL_TEST_TMPDIR:-/tmp/codex/kei/full-test/tmp}\"";
     let tmp_export = "export TMPDIR=\"$full_tmp_dir\"";
     let temp_export = "export TEMP=\"$full_tmp_dir\"";
     let tmp_windows_export = "export TMP=\"$full_tmp_dir\"";
@@ -102,7 +101,7 @@ fn full_test_routes_child_tempdirs_to_repo_scratch() {
     ] {
         assert!(
             run_all.contains(expected),
-            "full-test orchestrator missing repo-local tempdir setup: {expected}"
+            "full-test orchestrator missing /tmp/codex tempdir setup: {expected}"
         );
     }
 
@@ -135,7 +134,7 @@ fn live_import_smoke_uses_toml_directory() {
         "import-existing live smoke must not use the removed --download-dir flag"
     );
     assert!(
-        smokes.contains(r#"${TMPDIR:-$repo_root/.scratch/full-test-tmp}/photos-test"#),
-        "live smoke download scratch should follow full-test's repo-local TMPDIR"
+        smokes.contains(r#"${TMPDIR:-/tmp/codex/kei/full-test/tmp}/photos-test"#),
+        "live smoke download scratch should follow full-test's TMPDIR"
     );
 }

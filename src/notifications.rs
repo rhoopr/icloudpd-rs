@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn notify_with_nonexistent_script() {
-        let notifier = Notifier::new(Some(PathBuf::from("/tmp/claude/nonexistent_notify.sh")));
+        let notifier = Notifier::new(Some(PathBuf::from("/tmp/codex/kei/nonexistent_notify.sh")));
         // Should not panic, just log a warning (script existence checked synchronously)
         notifier.notify(
             Event::SyncComplete,

@@ -773,7 +773,7 @@ mod tests {
 
     /// Return a unique temp directory for a session test.
     ///
-    /// Uses `tempfile` instead of a fixed `/tmp/claude/...` path so
+    /// Uses `tempfile` instead of a fixed `/tmp/codex/kei/...` path so
     /// parallel test runs (and rapid sequential `cargo test` invocations)
     /// never share lock files.
     ///

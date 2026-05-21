@@ -39,7 +39,7 @@ repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
 }
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 cd "$repo_root"
-runs_dir="$repo_root/.scratch/test-runs"
+runs_dir="${KEI_FULL_TEST_RUNS_DIR:-/tmp/codex/kei/full-test/test-runs}"
 run_started=0
 current_phase="setup"
 summary_path="$runs_dir/.current.jsonl"
@@ -78,11 +78,9 @@ export ICLOUD_TEST_COOKIE_DIR="$repo_root/.test-cookies"
 export KEI_TEST_ALBUM="${KEI_TEST_ALBUM:-kei-test}"
 export KEI_DOCKER_IMAGE="${KEI_DOCKER_IMAGE:-kei:dev}"
 
-# Keep child tempdirs on the repo filesystem. The top-level failure log stays
-# in /tmp through the just recipe, but cargo/live/shell phases can create large
-# download roots and should not trip the production 1 GiB free-space guard just
-# because tmpfs is nearly full.
-full_tmp_dir="${KEI_FULL_TEST_TMPDIR:-$repo_root/.scratch/full-test-tmp}"
+# Keep child tempdirs out of the repo checkout. These are Codex working files,
+# not retained .scratch documents.
+full_tmp_dir="${KEI_FULL_TEST_TMPDIR:-/tmp/codex/kei/full-test/tmp}"
 mkdir -p "$full_tmp_dir"
 export TMPDIR="$full_tmp_dir"
 export TEMP="$full_tmp_dir"
@@ -165,7 +163,7 @@ fi
 
 # --- Cleanup --------------------------------------------------------------
 current_phase="cleanup"
-rm -rf /tmp/codex/photos-test 2>/dev/null || true
+rm -rf "$full_tmp_dir/photos-test" 2>/dev/null || true
 
 # --- Finalize + report ----------------------------------------------------
 current_phase="finalize"

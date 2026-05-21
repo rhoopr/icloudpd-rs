@@ -6524,7 +6524,7 @@ mod tests {
                 "PrimarySync",
                 "NONEXISTENT_42",
                 "original",
-                Path::new("/tmp/claude/photo.jpg"),
+                Path::new("/tmp/codex/kei/photo.jpg"),
                 "abc123hash",
                 None,
             )

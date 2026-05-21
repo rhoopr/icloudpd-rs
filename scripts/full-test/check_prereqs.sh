@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify prerequisites for the live test phases. Emits structured pass/skip
 # lines on stdout. On any failure, writes the reasons to
-# .scratch/test-runs/.live-skipped so downstream live phases self-skip.
+# the full-test run state dir so downstream live phases self-skip.
 #
 # Output format (one line per check):
 #   <check>: pass
@@ -19,7 +19,7 @@
 set -u
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-runs_dir="$repo_root/.scratch/test-runs"
+runs_dir="${KEI_FULL_TEST_RUNS_DIR:-/tmp/codex/kei/full-test/test-runs}"
 mkdir -p "$runs_dir"
 flag="$runs_dir/.live-skipped"
 
