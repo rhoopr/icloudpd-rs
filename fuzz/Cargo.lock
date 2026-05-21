@@ -1596,8 +1596,9 @@ dependencies = [
 
 [[package]]
 name = "mp4-atom"
-version = "0.10.1"
-source = "git+https://github.com/kixelated/mp4-atom?rev=42da2bc6bdac7a0d762a2b7c14b2f98524cd384d#42da2bc6bdac7a0d762a2b7c14b2f98524cd384d"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c6b338be0a8d66954dfb183f8469913c9c435d48885e801debde0953de74563"
 dependencies = [
  "derive_more",
  "num",
