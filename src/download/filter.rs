@@ -552,12 +552,61 @@ fn raw_filename(asset: &crate::icloud::photos::PhotoAsset) -> Cow<'_, str> {
     if let Some(f) = asset.filename() {
         Cow::Borrowed(f)
     } else {
-        let asset_type = asset
-            .versions()
-            .first()
-            .map_or("", |(_, v)| v.asset_type.as_ref());
-        Cow::Owned(paths::generate_fingerprint_filename(asset.id(), asset_type))
+        Cow::Owned(paths::generate_fingerprint_filename(
+            asset.id(),
+            first_version_asset_type(asset),
+        ))
     }
+}
+
+fn first_version_asset_type(asset: &crate::icloud::photos::PhotoAsset) -> &str {
+    asset
+        .versions()
+        .first()
+        .map_or("", |(_, v)| v.asset_type.as_ref())
+}
+
+fn filename_stem_is_empty(filename: &str) -> bool {
+    let cleaned = paths::clean_filename(filename);
+    let stem = cleaned
+        .rsplit_once('.')
+        .map_or(cleaned.as_ref(), |(stem, _)| stem);
+    stem.is_empty()
+}
+
+fn replace_empty_stem_with_fingerprint(
+    asset_id: &str,
+    asset_type: &str,
+    filename: String,
+) -> String {
+    if !filename_stem_is_empty(&filename) {
+        return filename;
+    }
+
+    let fallback = paths::generate_fingerprint_filename(asset_id, asset_type);
+    let Some((fallback_stem, _)) = fallback.rsplit_once('.') else {
+        return fallback;
+    };
+    let Some((_, ext)) = filename.rsplit_once('.').filter(|(_, ext)| !ext.is_empty()) else {
+        return fallback;
+    };
+    format!("{fallback_stem}.{ext}")
+}
+
+fn mapped_version_filename(asset_id: &str, base_filename: &str, asset_type: &str) -> String {
+    let mapped = paths::map_filename_extension(base_filename, asset_type);
+    replace_empty_stem_with_fingerprint(asset_id, asset_type, mapped)
+}
+
+fn usable_asset_base_filename(
+    asset: &crate::icloud::photos::PhotoAsset,
+    ctx: &DerivationContext<'_>,
+) -> String {
+    replace_empty_stem_with_fingerprint(
+        asset.id(),
+        first_version_asset_type(asset),
+        ctx.base_filename.clone(),
+    )
 }
 
 /// Per-asset inputs that don't change between primary and MOV companion
@@ -692,7 +741,7 @@ pub(super) fn derive_primary(
 ) -> Option<DerivedPath> {
     let (version, effective_size) = select_primary(asset, config, ctx)?;
 
-    let mapped = paths::map_filename_extension(&ctx.base_filename, &version.asset_type);
+    let mapped = mapped_version_filename(asset.id(), &ctx.base_filename, &version.asset_type);
     let sized = match effective_size {
         AssetVersionSize::Medium => paths::insert_suffix(&mapped, "medium"),
         AssetVersionSize::Thumb => paths::insert_suffix(&mapped, "thumb"),
@@ -736,7 +785,7 @@ fn derive_suffixed_extra(
     suffix: &str,
     check_ampm_on_disk: bool,
 ) -> DerivedPath {
-    let mapped = paths::map_filename_extension(&ctx.base_filename, &version.asset_type);
+    let mapped = mapped_version_filename(asset.id(), &ctx.base_filename, &version.asset_type);
     let suffixed = paths::insert_literal_suffix(&mapped, suffix);
     let filename = match config.file_match_policy {
         FileMatchPolicy::NameId7 => paths::apply_name_id7(&suffixed, asset.id()),
@@ -839,10 +888,14 @@ pub(super) fn derive_mov_companion(
     let (live_version, effective_live_size) = select_mov_companion(asset, config, ctx, &[])?;
 
     let live_base = match config.file_match_policy {
-        FileMatchPolicy::NameId7 => paths::apply_name_id7(&ctx.base_filename, asset.id()),
-        FileMatchPolicy::NameSizeDedupWithSuffix => primary_effective_filename
-            .unwrap_or(&ctx.base_filename)
-            .to_string(),
+        FileMatchPolicy::NameId7 => {
+            let base = usable_asset_base_filename(asset, ctx);
+            paths::apply_name_id7(&base, asset.id())
+        }
+        FileMatchPolicy::NameSizeDedupWithSuffix => primary_effective_filename.map_or_else(
+            || usable_asset_base_filename(asset, ctx),
+            ToString::to_string,
+        ),
     };
     let mov_filename = match config.live_photo_mov_filename_policy {
         LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
@@ -1804,6 +1857,20 @@ mod tests {
     }
 
     #[test]
+    fn expected_paths_parity_unicode_stripped_fingerprint_fallback() {
+        let asset = TestPhotoAsset::new("PAR_UNI")
+            .filename("日本語.jpg")
+            .build();
+        let config = test_config();
+        assert_path_parity(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+            "unicode stripped fingerprint fallback",
+        );
+    }
+
+    #[test]
     fn expected_paths_parity_name_id7() {
         let asset = TestPhotoAsset::new("PAR_2")
             .filename("IMG_5002.JPG")
@@ -2311,27 +2378,31 @@ mod tests {
         );
     }
 
-    /// Characterization test (current behavior, not desired behavior):
-    /// `日本語.jpg` with `keep_unicode_in_filenames=false` strips to a
-    /// dotfile-shaped `.JPG`. import-existing then scans for a literal
-    /// `.JPG` file, which is a hidden file on Unix and unlikely to
-    /// match anything sync wrote. The fingerprint-fallback only fires
-    /// when `filename()` returns `None`, not when the filename
-    /// degenerates after stripping. If a future change makes
-    /// `expected_paths_for` fall back to a fingerprint name in this
-    /// case, this test should be inverted; see TODO note.
-    // TODO: fall back to fingerprint name when post-strip filename is
-    // dotfile-only (`.<ext>`). Tracked separately from this test PR.
     #[test]
-    fn expected_paths_filename_emptied_by_unicode_strip_characterization() {
+    fn expected_paths_filename_emptied_by_unicode_strip_uses_fingerprint() {
         let asset = TestPhotoAsset::new("UNI_3").filename("日本語.jpg").build();
         let config = test_config();
         let paths = expected_paths_for(&asset, &config);
         assert_eq!(paths.len(), 1);
         let name = paths[0].path.file_name().unwrap().to_string_lossy();
         assert_eq!(
-            name, ".JPG",
-            "current behavior: filename collapses to a dotfile after non-ASCII strip"
+            name,
+            paths::generate_fingerprint_filename("UNI_3", "public.jpeg"),
+            "all-non-ASCII stem must fall back to a visible fingerprint name"
+        );
+    }
+
+    #[test]
+    fn expected_paths_filename_without_extension_emptied_by_unicode_strip_uses_fingerprint() {
+        let asset = TestPhotoAsset::new("UNI_NOEXT").filename("日本語").build();
+        let config = test_config();
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            name,
+            paths::generate_fingerprint_filename("UNI_NOEXT", "public.jpeg"),
+            "all-non-ASCII filename without an extension must use UTI-derived fingerprint name"
         );
     }
 
@@ -3047,6 +3118,41 @@ mod tests {
     }
 
     #[test]
+    fn edited_and_alternative_use_fingerprint_before_suffix_when_unicode_strip_empties_stem() {
+        let asset = TestPhotoAsset::new("UNI_EXTRA")
+            .filename("日本語.jpg")
+            .adjusted_version(
+                "https://p01.icloud-content.com/edited",
+                "edited_ck",
+                900,
+                "public.jpeg",
+            )
+            .alt_version(
+                "https://p01.icloud-content.com/alt",
+                "alt_ck",
+                2000,
+                "public.jpeg",
+            )
+            .build();
+        let mut config = test_config();
+        config.edited = true;
+        config.alternative = true;
+
+        let paths = expected_paths_for(&asset, &config);
+        let names: Vec<String> = paths
+            .iter()
+            .map(|p| p.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        let fingerprint = paths::generate_fingerprint_filename("UNI_EXTRA", "public.jpeg");
+        assert_eq!(names[0], fingerprint);
+        assert_eq!(
+            names[1],
+            paths::insert_literal_suffix(&fingerprint, "_edited")
+        );
+        assert_eq!(names[2], paths::insert_literal_suffix(&fingerprint, "_alt"));
+    }
+
+    #[test]
     fn edited_live_photo_emits_adjusted_image_and_live_adjusted_video() {
         let asset = TestPhotoAsset::new("PR4_LIVE_EDITED")
             .filename("IMG_LIVE.HEIC")
@@ -3087,6 +3193,28 @@ mod tests {
         assert_eq!(names[1], "IMG_LIVE_edited.HEIC");
         assert_eq!(names[2], "IMG_LIVE_edited.MOV");
         assert_eq!(names[3], "IMG_LIVE_HEVC.MOV");
+    }
+
+    #[test]
+    fn video_only_live_photo_uses_fingerprint_mov_when_unicode_strip_empties_stem() {
+        let asset = TestPhotoAsset::new("UNI_LIVE_MOV")
+            .filename("日本語.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 3000)
+            .build();
+        let mut config = test_config();
+        config.live_photo_mode = LivePhotoMode::VideoOnly;
+
+        let paths = expected_paths_for(&asset, &config);
+        assert_eq!(paths.len(), 1);
+        let name = paths[0].path.file_name().unwrap().to_string_lossy();
+        let image_fingerprint = paths::generate_fingerprint_filename("UNI_LIVE_MOV", "public.heic");
+        assert_eq!(
+            name,
+            paths::live_photo_mov_path_suffix(&image_fingerprint),
+            "video-only live companion must not collapse to an extension-only MOV"
+        );
     }
 
     #[test]
@@ -4135,6 +4263,27 @@ mod tests {
         assert!(
             filename.ends_with(".JPG"),
             "fingerprint fallback for public.jpeg must yield .JPG, got: {filename}"
+        );
+    }
+
+    #[test]
+    fn filter_asset_unicode_stripped_empty_stem_uses_fingerprint_fallback() {
+        let asset = TestPhotoAsset::new("UNI_FILTER")
+            .filename("日本語.jpg")
+            .build();
+        let config = test_config();
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        let filename = tasks[0]
+            .download_path
+            .file_name()
+            .expect("download_path must include a filename")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            filename,
+            paths::generate_fingerprint_filename("UNI_FILTER", "public.jpeg"),
+            "sync task path must match the fingerprint fallback used by import"
         );
     }
 
