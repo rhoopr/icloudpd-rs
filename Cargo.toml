@@ -106,8 +106,7 @@ little_exif = "0.6"
 # lives in a `mime`-type item inside the `meta` box; mp4-atom gives us the
 # box primitives to surgically insert it without decoding image data.
 #
-# Rev-tracking upstream main because several fixes we depend on are merged
-# but not yet in a crates.io release (0.11.0 is unreleased):
+# Pinned because kei depends on specific HEIF fixes included in 0.11.0:
 #   - #123  `uri ` infe-item support for iOS 17+ HEICs (kei #274)
 #   - #153  colr cursor advance for `prof` / `rICC` ICC profiles, fixing
 #           metadata embed on HDR HEICs (kei #269, #276)
@@ -116,8 +115,7 @@ little_exif = "0.6"
 #   - #161  drops mp4-atom's unmaintained `paste` dep in favor of `pastey`
 #   - #163  returns Err instead of panicking on reserved iloc *_size nibbles
 #           found by fuzzing (upstream #158)
-# Switch back to a crates.io version once a release containing these ships.
-mp4-atom = { git = "https://github.com/kixelated/mp4-atom", rev = "42da2bc6bdac7a0d762a2b7c14b2f98524cd384d" }
+mp4-atom = "=0.11.0"
 
 # Error handling
 anyhow = "1"
