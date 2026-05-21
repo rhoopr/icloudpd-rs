@@ -36,6 +36,9 @@ tests/
 | `tests/shell/concurrency.sh` | 8 | yes | `just test concurrency` |
 | `tests/shell/state-machine.sh` | 20 | yes | `just test state` |
 | `tests/shell/docker.sh` | 16 | yes | `just test docker` |
+| `scripts/full-test/run_live_import_rehearsal.sh` | 1 | yes | `just full-test` |
+| `scripts/full-test/run_docker_puid_smoke.sh` | 1 | no | `just full-test` |
+| `scripts/full-test/run_release_archive_smoke.sh` | 1 | no | `just full-test` |
 | `.github/workflows/service-smoke.yml` | 3 (linux/macos/windows) | no | `just service-smoke` (linux/macOS) |
 
 Counts are approximate and drift as tests are added.
@@ -51,6 +54,7 @@ just test state       # shell: token + config-hash invariants
 just test docker      # shell: docker container scenarios
 just test PATTERN     # passes through to cargo test PATTERN
 just gate             # full pre-push gate (what CI runs)
+just full-test        # pre-release battery, including Docker and live smokes
 ```
 
 Without `just`, run the raw commands directly:
@@ -114,6 +118,8 @@ details are baked into test code.
 | `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image under test |
 | `KEI_TEST_SCRATCH_DIR` | `/tmp/codex/kei/shell-tests-$USER` | Base dir for standalone shell-suite scratch; `just full-test` overrides this to `/tmp/codex/kei/full-test/shell` |
 | `KEI_IMPORT_FIXTURE_DIR` | `/tmp/codex/kei/import-fixture` | Where `import_existing_live.rs` caches its `--recent 100` sync fixture across runs |
+| `KEI_FULL_TEST_REAL_SERVICE` | unset | Set to `1` to let `just full-test` install, start, status-check, and uninstall a real Linux user systemd service |
+| `KEI_FULL_TEST_EXPECT_VERSION` | unset | Optional exact Cargo package version expected by the release-archive smoke |
 
 `just test live` applies `KEI_TEST_ALBUM=kei-test` to match this
 repo's maintainer setup. Override in your environment to point at your
@@ -174,6 +180,15 @@ happens:
   multiple kei invocations with DB mutation in between.
 - **`shell/docker.sh`** - anything that requires `docker run`, watch
   mode + SIGTERM, healthcheck probes inside the container.
+- **`scripts/full-test/run_release_archive_smoke.sh`** - packages the host
+  release binary into a temp archive, extracts it, and runs basic CLI/config
+  probes against the extracted binary.
+- **`scripts/full-test/run_docker_puid_smoke.sh`** - offline Docker entrypoint
+  checks for PUID/PGID drop, volume chown, root-default behavior, and invalid
+  env rejection.
+- **`scripts/full-test/run_live_import_rehearsal.sh`** - live mini rehearsal
+  for v0.20's TOML-first import path: seed a tiny real tree, import it into a
+  fresh DB, and verify a repeat dry-run stays matched.
 - **`service-smoke` workflow** - per-platform CI smoke for `kei install`
   / `kei uninstall`. Builds the release binary on
   `ubuntu-latest`/`macos-latest`/`windows-latest`, runs `kei install
@@ -205,3 +220,9 @@ Manual real-install coverage:
   control dispatcher startup.
 - Boot/reboot persistence and a real long-running sync against the
   `kei-test` album.
+
+`just full-test` can run the Linux user-service lifecycle with
+`KEI_FULL_TEST_REAL_SERVICE=1`. It refuses to run if `kei.service` already
+exists, and it uninstalls the service before returning. The installer may
+temporarily enable user linger; uninstall restores the prior linger state when
+that state was recorded during install.

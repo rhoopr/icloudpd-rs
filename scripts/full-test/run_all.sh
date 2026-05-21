@@ -13,13 +13,17 @@
 #   0.8  udeps         cargo +nightly udeps --all-targets
 #   0.9  offline_all   cargo test --all-features
 #   1    build_release cargo build --release
+#   1.5  release_archive_smoke
 #   2    docker_build      just docker build
 #   2    docker_multiarch  just docker multiarch
-#   2  docker_version, docker_help, docker_default_cmd
+#   2    docker_puid_smoke
+#   2    docker_version, docker_help, docker_default_cmd
 #   3  test_live       live cargo (just test live)        --live
 #   4  test_shell_*    auto-discovered shell suites       --live
 #   5  live_*          binary smokes (run_live_smokes.sh) --live
+#   5.5  live_import_rehearsal                            --live
 #   6  service_smoke   just service-smoke when supported
+#   opt  real_service_lifecycle when KEI_FULL_TEST_REAL_SERVICE=1 --live
 #   finalize_run + diff_runs on success
 #
 # Live-tagged phases honor .live-skipped (prereq fail) and .rate-limited
@@ -135,7 +139,9 @@ run_phase offline_all -- cargo test --all-features
 
 # --- Phase 1 + 2: release build + docker builds ---------------------------
 run_phase build_release -- cargo build --release
+run_phase release_archive_smoke -- "$script_dir/run_release_archive_smoke.sh"
 run_phase docker_build -- just docker build
+run_phase docker_puid_smoke -- "$script_dir/run_docker_puid_smoke.sh"
 run_phase docker_multiarch -- just docker multiarch
 
 # --- Phase 2 (cont.): docker smokes ---------------------------------------
@@ -153,12 +159,17 @@ current_phase="test_shell"
 # --- Phase 5: live binary smokes ------------------------------------------
 current_phase="live_smokes"
 "$script_dir/run_live_smokes.sh"
+run_live_phase live_import_rehearsal -- "$script_dir/run_live_import_rehearsal.sh"
 
 # --- Phase 6: service smoke ------------------------------------------------
 if ! command -v systemd-analyze >/dev/null 2>&1 && ! command -v plutil >/dev/null 2>&1; then
   "$script_dir/record_skip.sh" service_smoke skipped "not Linux or macOS"
 else
   run_phase service_smoke -- just service-smoke
+fi
+
+if [[ "${KEI_FULL_TEST_REAL_SERVICE:-0}" == "1" ]]; then
+  run_live_phase real_service_lifecycle -- "$script_dir/run_real_service_lifecycle.sh"
 fi
 
 # --- Cleanup --------------------------------------------------------------

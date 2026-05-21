@@ -7,7 +7,8 @@
 //!   `systemctl --user daemon-reload && systemctl --user enable --now`.
 //!   `loginctl enable-linger` is best-effort: a polkit denial logs a
 //!   warning and the install still succeeds, since the unit will work
-//!   for as long as the user is logged in.
+//!   for as long as the user is logged in. The prior linger state is
+//!   recorded in the unit and restored on uninstall when available.
 //! - `--system`: writes `/etc/systemd/system/kei.service` with `User=`
 //!   pointing at `$SUDO_USER`. Refuses without `EUID=0` rather than
 //!   shelling out to `sudo` itself; the operator who chose `--system`
@@ -38,6 +39,7 @@ use crate::service::plan::{self, InstallPlan};
 use crate::service::status::ServiceState;
 
 const UNIT_FILE_NAME: &str = "kei.service";
+const PREVIOUS_LINGER_MARKER: &str = "# X-Kei-Previous-Linger=";
 
 const SYSTEM_UNIT_DIR: &str = "/etc/systemd/system";
 
@@ -49,7 +51,15 @@ const SYSTEM_UNIT_DIR: &str = "/etc/systemd/system";
 /// target for a user unit; `multi-user.target` is reserved for system
 /// units.
 fn render_user_unit(exec_path: &Path, config_path: &Path) -> String {
-    render_unit(exec_path, config_path, UnitKind::User)
+    render_user_unit_with_linger(exec_path, config_path, None)
+}
+
+fn render_user_unit_with_linger(
+    exec_path: &Path,
+    config_path: &Path,
+    previous_linger: Option<LingerState>,
+) -> String {
+    render_unit(exec_path, config_path, UnitKind::User { previous_linger })
 }
 
 /// Renders the system-wide `kei.service` body.
@@ -70,24 +80,38 @@ fn render_system_unit(exec_path: &Path, config_path: &Path, user: &str) -> Strin
 
 #[derive(Debug, Clone)]
 enum UnitKind {
-    User,
-    System { user: String },
+    User {
+        previous_linger: Option<LingerState>,
+    },
+    System {
+        user: String,
+    },
 }
 
 fn render_unit(exec_path: &Path, config_path: &Path, kind: UnitKind) -> String {
     let exec = exec_path.display();
     let config = config_path.display();
     let install_target = match &kind {
-        UnitKind::User => "default.target",
+        UnitKind::User { .. } => "default.target",
         UnitKind::System { .. } => "multi-user.target",
     };
     let user_line = match &kind {
-        UnitKind::User => String::new(),
+        UnitKind::User { .. } => String::new(),
         UnitKind::System { user } => format!("User={user}\n"),
+    };
+    let previous_linger_comment = match &kind {
+        UnitKind::User {
+            previous_linger: Some(state),
+        } => format!("{PREVIOUS_LINGER_MARKER}{}\n", state.as_marker_value()),
+        UnitKind::User {
+            previous_linger: None,
+        }
+        | UnitKind::System { .. } => String::new(),
     };
 
     format!(
         "[Unit]\n\
+         {previous_linger_comment}\
          Description={SERVICE_DESCRIPTION}\n\
          Documentation=https://github.com/rhoopr/kei\n\
          After=network-online.target\n\
@@ -124,13 +148,15 @@ fn system_unit_path() -> PathBuf {
 /// default on Linux).
 pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Result<()> {
     let exe = current_executable()?;
-    let contents = render_user_unit(&exe, config_path);
     if plan.is_preview() {
+        let contents = render_user_unit(&exe, config_path);
         print!("{contents}");
         tracing::info!("dry run: rendered per-user systemd unit; no files written");
         return Ok(());
     }
 
+    let previous_linger = current_linger_state().await;
+    let contents = render_user_unit_with_linger(&exe, config_path, previous_linger);
     let unit_path =
         user_unit_path().ok_or_else(|| anyhow!("could not resolve XDG_CONFIG_HOME or $HOME"))?;
     write_unit(&unit_path, &contents)?;
@@ -206,12 +232,14 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
     }
 
     if let Some(path) = user_path.as_ref() {
+        let previous_linger = read_previous_linger_state(path);
         // disable + daemon-reload may legitimately fail in a non-systemd
         // environment (tempdir-only test, chroot, sysvinit host). The
         // unit-file removal is the load-bearing step; log+proceed.
         let _ = disable_now_user().await;
         remove_unit_file(path)?;
         let _ = daemon_reload_user().await;
+        restore_linger_best_effort(previous_linger).await;
         tracing::info!(path = %path.display(), "removed per-user systemd unit");
     }
 
@@ -408,6 +436,29 @@ fn is_root() -> bool {
     effective_uid() == 0
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LingerState {
+    Enabled,
+    Disabled,
+}
+
+impl LingerState {
+    fn as_marker_value(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn from_marker_value(value: &str) -> Option<Self> {
+        match value.trim() {
+            "enabled" => Some(Self::Enabled),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+}
+
 async fn daemon_reload_user() -> Result<()> {
     run_systemctl(&["--user", "daemon-reload"]).await
 }
@@ -432,9 +483,108 @@ async fn disable_now_system() -> Result<()> {
     run_systemctl(&["disable", "--now", UNIT_FILE_NAME]).await
 }
 
+fn login_user() -> Option<String> {
+    match std::env::var("USER") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => None,
+    }
+}
+
+async fn current_linger_state() -> Option<LingerState> {
+    let Some(user) = login_user() else {
+        tracing::warn!("$USER not set; cannot record prior loginctl linger state");
+        return None;
+    };
+    let output = match Command::new("loginctl")
+        .arg("show-user")
+        .arg(&user)
+        .arg("-p")
+        .arg("Linger")
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::warn!(user, error = %e, "loginctl not found; cannot record prior linger state");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            user,
+            code = output.status.code().unwrap_or(-1),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "loginctl show-user failed; cannot record prior linger state"
+        );
+        return None;
+    }
+    let parsed = parse_linger_state(&String::from_utf8_lossy(&output.stdout));
+    if let Some(state) = parsed {
+        tracing::debug!(user, ?state, "recorded prior loginctl linger state");
+    } else {
+        tracing::warn!(
+            user,
+            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+            "loginctl show-user returned an unrecognized linger state"
+        );
+    }
+    parsed
+}
+
+fn parse_linger_state(stdout: &str) -> Option<LingerState> {
+    stdout.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if key != "Linger" {
+            return None;
+        }
+        match value.trim() {
+            "yes" => Some(LingerState::Enabled),
+            "no" => Some(LingerState::Disabled),
+            _ => None,
+        }
+    })
+}
+
+fn read_previous_linger_state(unit_path: &Path) -> Option<LingerState> {
+    match std::fs::read_to_string(unit_path) {
+        Ok(contents) => previous_linger_state_from_unit(&contents),
+        Err(e) => {
+            tracing::warn!(
+                path = %unit_path.display(),
+                error = %e,
+                "could not read unit file to restore prior linger state"
+            );
+            None
+        }
+    }
+}
+
+fn previous_linger_state_from_unit(contents: &str) -> Option<LingerState> {
+    contents.lines().find_map(|line| {
+        line.strip_prefix(PREVIOUS_LINGER_MARKER)
+            .and_then(LingerState::from_marker_value)
+    })
+}
+
+async fn restore_linger_best_effort(previous_linger: Option<LingerState>) {
+    match previous_linger {
+        Some(LingerState::Disabled) => disable_linger_best_effort().await,
+        Some(LingerState::Enabled) => {
+            tracing::info!(
+                "leaving loginctl linger enabled because it was enabled before kei install"
+            );
+        }
+        None => {
+            tracing::info!(
+                "no prior loginctl linger state was recorded; leaving current linger state unchanged"
+            );
+        }
+    }
+}
+
 async fn enable_linger_best_effort() {
-    let user = match std::env::var("USER") {
-        Ok(u) if !u.is_empty() => u,
+    let user = match login_user() {
+        Some(u) => u,
         _ => {
             tracing::warn!("$USER not set; skipping `loginctl enable-linger`");
             return;
@@ -462,6 +612,39 @@ async fn enable_linger_best_effort() {
         }
         Err(e) => {
             tracing::warn!(error = %e, "loginctl not found; skipping enable-linger");
+        }
+    }
+}
+
+async fn disable_linger_best_effort() {
+    let user = match login_user() {
+        Some(u) => u,
+        _ => {
+            tracing::warn!("$USER not set; skipping `loginctl disable-linger`");
+            return;
+        }
+    };
+    let status = Command::new("loginctl")
+        .arg("disable-linger")
+        .arg(&user)
+        .status()
+        .await;
+    match status {
+        Ok(s) if s.success() => {
+            tracing::info!(
+                user,
+                "restored loginctl linger to disabled because it was disabled before kei install"
+            );
+        }
+        Ok(s) => {
+            tracing::warn!(
+                user,
+                code = s.code().unwrap_or(-1),
+                "loginctl disable-linger failed; linger may remain enabled"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "loginctl not found; skipping disable-linger");
         }
     }
 }
@@ -564,6 +747,64 @@ mod tests {
             !unit.contains("\nUser="),
             "per-user unit must not declare User=:\n{unit}"
         );
+    }
+
+    #[test]
+    fn user_unit_records_previous_linger_state_when_known() {
+        let unit = render_user_unit_with_linger(
+            &PathBuf::from("/usr/local/bin/kei"),
+            &PathBuf::from("/home/alice/.config/kei/config.toml"),
+            Some(LingerState::Disabled),
+        );
+        assert!(unit.contains("# X-Kei-Previous-Linger=disabled\n"));
+        assert_eq!(
+            previous_linger_state_from_unit(&unit),
+            Some(LingerState::Disabled)
+        );
+    }
+
+    #[test]
+    fn user_unit_omits_linger_marker_when_unknown() {
+        let unit = render_user_unit(
+            &PathBuf::from("/usr/local/bin/kei"),
+            &PathBuf::from("/home/alice/.config/kei/config.toml"),
+        );
+        assert!(!unit.contains(PREVIOUS_LINGER_MARKER));
+        assert_eq!(previous_linger_state_from_unit(&unit), None);
+    }
+
+    #[test]
+    fn previous_linger_state_ignores_unknown_marker_values() {
+        assert_eq!(
+            previous_linger_state_from_unit("# X-Kei-Previous-Linger=enabled\n"),
+            Some(LingerState::Enabled)
+        );
+        assert_eq!(
+            previous_linger_state_from_unit("# X-Kei-Previous-Linger=disabled\n"),
+            Some(LingerState::Disabled)
+        );
+        assert_eq!(
+            previous_linger_state_from_unit("# X-Kei-Previous-Linger=maybe\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_linger_state_reads_loginctl_output() {
+        assert_eq!(
+            parse_linger_state("Linger=yes\n"),
+            Some(LingerState::Enabled)
+        );
+        assert_eq!(
+            parse_linger_state("Linger=no\n"),
+            Some(LingerState::Disabled)
+        );
+        assert_eq!(
+            parse_linger_state("Name=alice\nLinger=no\n"),
+            Some(LingerState::Disabled)
+        );
+        assert_eq!(parse_linger_state("Linger=\n"), None);
+        assert_eq!(parse_linger_state("Name=alice\n"), None);
     }
 
     #[test]
