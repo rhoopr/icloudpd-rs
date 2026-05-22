@@ -86,6 +86,15 @@ impl DownloadError {
         )
     }
 
+    /// Whether this error likely means the signed CDN URL expired.
+    ///
+    /// Apple returns HTTP 410 Gone when a previously-issued iCloud content URL
+    /// is no longer valid. Retrying the same URL only burns attempts; callers
+    /// should re-enumerate the asset to get a fresh URL and retry that task.
+    pub const fn is_expired_url(&self) -> bool {
+        matches!(self, Self::HttpStatus { status: 410, .. })
+    }
+
     pub const fn is_interrupted(&self) -> bool {
         matches!(self, Self::Interrupted { .. })
     }
@@ -151,6 +160,17 @@ mod tests {
             path: "x".into(),
         };
         assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn test_http_410_is_expired_url_not_same_url_retryable() {
+        let e = DownloadError::HttpStatus {
+            status: 410,
+            path: "x".into(),
+        };
+        assert!(e.is_expired_url());
+        assert!(!e.is_retryable());
+        assert!(!e.is_session_expired());
     }
 
     #[test]

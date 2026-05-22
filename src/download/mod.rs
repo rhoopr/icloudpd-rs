@@ -1405,13 +1405,23 @@ async fn collect_unfiled_stream(
     count: u64,
     stream_total_count: Option<u64>,
     config: &DownloadConfig,
+    controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> CollectedUnfiledStream {
-    let (stream, token_rx) = pass.album.photo_stream_with_token(
-        config.recent,
-        stream_total_count,
-        config.concurrent_downloads,
-    );
+    let (stream, token_rx) =
+        if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
+            pass.album.photo_stream_with_token(
+                config.recent,
+                stream_total_count,
+                config.concurrent_downloads,
+            )
+        } else {
+            pass.album.photo_stream_with_token_for_download(
+                config.recent,
+                stream_total_count,
+                config.concurrent_downloads,
+            )
+        };
     tokio::pin!(stream);
     let mut items = Vec::new();
     while let Some(item) = stream.next().await {
@@ -1491,10 +1501,49 @@ fn merge_streaming_result(combined: &mut StreamingResult, result: StreamingResul
     combined.enumeration_complete = combined.enumeration_complete && result.enumeration_complete;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RetryTaskKey {
+    asset_id: Arc<str>,
+    version_size: VersionSizeKey,
+    download_path: std::path::PathBuf,
+}
+
+impl From<&DownloadTask> for RetryTaskKey {
+    fn from(task: &DownloadTask) -> Self {
+        Self {
+            asset_id: Arc::clone(&task.asset_id),
+            version_size: task.version_size,
+            download_path: task.download_path.clone(),
+        }
+    }
+}
+
+fn take_matching_retry_tasks<I>(
+    tasks: I,
+    pending_keys: &mut FxHashSet<RetryTaskKey>,
+    out: &mut Vec<DownloadTask>,
+) where
+    I: IntoIterator<Item = DownloadTask>,
+{
+    for task in tasks {
+        let key = RetryTaskKey::from(&task);
+        if pending_keys.remove(&key) {
+            out.push(task);
+            if pending_keys.is_empty() {
+                break;
+            }
+        }
+    }
+}
+
 /// Eagerly enumerate all albums and build a complete task list.
 ///
 /// Used only by the Phase 2 cleanup pass — re-contacts the API so each call
 /// yields fresh CDN URLs that haven't expired during a long download session.
+#[allow(
+    dead_code,
+    reason = "kept for focused tests and future non-selective tooling"
+)]
 async fn build_download_tasks(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
@@ -1526,6 +1575,67 @@ async fn build_download_tasks(
             }
             tasks.extend(plan.tasks);
         }
+    }
+
+    Ok(tasks)
+}
+
+/// Re-enumerate iCloud and rebuild only the failed tasks with fresh CDN URLs.
+///
+/// The first pass may fail because signed content URLs expired before the
+/// worker reached them. Retrying the complete library after that is both slow
+/// and risky: newly-issued URLs for early tasks can age again while unrelated
+/// albums are planned. Limit cleanup to the exact asset/version/path tuples
+/// that failed so the retry pass starts consuming refreshed URLs quickly.
+async fn build_retry_download_tasks(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    failed_tasks: &[DownloadTask],
+    shutdown_token: CancellationToken,
+) -> Result<Vec<DownloadTask>> {
+    if failed_tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut pending_keys: FxHashSet<RetryTaskKey> =
+        failed_tasks.iter().map(RetryTaskKey::from).collect();
+    let requested_count = pending_keys.len();
+    let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
+    let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested_count);
+    let mut task_planner = planner::TaskPlanner::new();
+
+    for (pass_index, pass) in passes.iter().enumerate() {
+        if pending_keys.is_empty() || shutdown_token.is_cancelled() {
+            break;
+        }
+
+        let assets = pass.album.photos(config.recent).await?;
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "pass_index comes from enumerate() over `passes`; pass_configs is \
+                      built 1:1 from the same slice"
+        )]
+        let pass_config = &pass_configs[pass_index];
+
+        for asset in &assets {
+            if pending_keys.is_empty() || shutdown_token.is_cancelled() {
+                break;
+            }
+            let plan = task_planner.plan_asset(asset, pass_config).await;
+            if plan.filter_reason.is_some() {
+                continue;
+            }
+            take_matching_retry_tasks(plan.tasks, &mut pending_keys, &mut tasks);
+        }
+    }
+
+    if !pending_keys.is_empty() {
+        tracing::warn!(
+            requested = requested_count,
+            refreshed = tasks.len(),
+            missing = pending_keys.len(),
+            "Cleanup pass could not refresh every failed task; unmatched failures remain pending"
+        );
     }
 
     Ok(tasks)
@@ -2090,11 +2200,20 @@ async fn download_photos_full_with_token(
             let deferred_ids = deferred_ids.clone();
             let download_ctx = shared_download_ctx.clone();
             async move {
-                let (stream, token_rx) = pass.album.photo_stream_with_token(
-                    config.recent,
-                    *total_count,
-                    config.concurrent_downloads,
-                );
+                let (stream, token_rx) =
+                    if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
+                        pass.album.photo_stream_with_token(
+                            config.recent,
+                            *total_count,
+                            config.concurrent_downloads,
+                        )
+                    } else {
+                        pass.album.photo_stream_with_token_for_download(
+                            config.recent,
+                            *total_count,
+                            pass_config.concurrent_downloads,
+                        )
+                    };
 
                 if pass.kind == crate::commands::PassKind::Album {
                     if let Some(deferred_ids) = deferred_ids {
@@ -2152,6 +2271,7 @@ async fn download_photos_full_with_token(
                             count,
                             pass_stream_counts.get(index).copied().flatten(),
                             config,
+                            controls,
                             shutdown_token.clone(),
                         )
                         .await,
@@ -2250,11 +2370,20 @@ async fn download_photos_full_with_token(
             .iter()
             .zip(&pass_stream_counts)
             .map(|(pass, total_count)| {
-                let (stream, token_rx) = pass.album.photo_stream_with_token(
-                    config.recent,
-                    *total_count,
-                    config.concurrent_downloads,
-                );
+                let (stream, token_rx) =
+                    if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
+                        pass.album.photo_stream_with_token(
+                            config.recent,
+                            *total_count,
+                            config.concurrent_downloads,
+                        )
+                    } else {
+                        pass.album.photo_stream_with_token_for_download(
+                            config.recent,
+                            *total_count,
+                            config.concurrent_downloads,
+                        )
+                    };
                 token_receivers.push(token_rx);
                 stream
             })
@@ -2692,7 +2821,8 @@ async fn download_photos_incremental(
         enumeration_errors: 0,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: shutdown_token.is_cancelled()
-            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
+            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD
+            || pass_result.url_expired_abort,
         rate_limited: pass_result.rate_limit_observations,
         photos_downloaded: pass_result.photos_downloaded,
         videos_downloaded: pass_result.videos_downloaded,
@@ -2746,6 +2876,56 @@ mod tests {
 
     fn test_config() -> DownloadConfig {
         DownloadConfig::test_default()
+    }
+
+    fn retry_test_task(asset_id: &str, version_size: VersionSizeKey, path: &str) -> DownloadTask {
+        DownloadTask {
+            url: format!("https://p01.icloud-content.com/{asset_id}").into(),
+            download_path: Path::new("/tmp/codex/kei/retry-tests").join(path),
+            checksum: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            asset_id: Arc::from(asset_id),
+            metadata: Arc::new(filter::MetadataPayload::default()),
+            size: 1024,
+            created_local: chrono::Local::now(),
+            version_size,
+            media_type: crate::state::MediaType::Photo,
+        }
+    }
+
+    #[test]
+    fn cleanup_retry_filter_keeps_only_exact_failed_task_keys() {
+        let failed = retry_test_task("ASSET_A", VersionSizeKey::Original, "a.jpg");
+        let matching_refresh = DownloadTask {
+            url: "https://p01.icloud-content.com/fresh-a".into(),
+            ..failed.clone()
+        };
+        let wrong_version = retry_test_task("ASSET_A", VersionSizeKey::Medium, "a.jpg");
+        let wrong_path = retry_test_task("ASSET_A", VersionSizeKey::Original, "elsewhere/a.jpg");
+        let unrelated = retry_test_task("ASSET_B", VersionSizeKey::Original, "b.jpg");
+        let mut pending_keys: FxHashSet<RetryTaskKey> =
+            std::iter::once(RetryTaskKey::from(&failed)).collect();
+        let mut out = Vec::new();
+
+        take_matching_retry_tasks(
+            vec![
+                wrong_version,
+                wrong_path,
+                unrelated,
+                matching_refresh.clone(),
+            ],
+            &mut pending_keys,
+            &mut out,
+        );
+
+        assert!(pending_keys.is_empty());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].asset_id.as_ref(), "ASSET_A");
+        assert_eq!(out[0].version_size, VersionSizeKey::Original);
+        assert_eq!(out[0].download_path, matching_refresh.download_path);
+        assert_eq!(
+            out[0].url.as_ref(),
+            "https://p01.icloud-content.com/fresh-a"
+        );
     }
 
     fn changes_album(name: &str, session: CountingChangesZoneSession) -> PhotoAlbum {

@@ -2319,6 +2319,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_file_aborts_on_expired_url_410_for_cleanup_refresh() {
+        let (result, calls, _, _dir) = run_retry_download(1, 410, 3).await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            calls, 1,
+            "410 means the signed URL expired; retrying the same URL is pointless"
+        );
+        assert!(
+            matches!(err, DownloadError::HttpStatus { status: 410, .. }),
+            "expected HttpStatus 410, got: {err:?}"
+        );
+        assert!(err.is_expired_url());
+    }
+
+    #[tokio::test]
     async fn download_file_exhausts_retries_on_persistent_429() {
         let (result, calls, _, _dir) = run_retry_download(10, 429, 2).await;
         let err = result.unwrap_err();

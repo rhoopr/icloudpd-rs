@@ -32,6 +32,18 @@ const MAX_EMPTY_PAGE_PROBES: u32 = 5;
 /// A boxed, pinned stream of photo asset results.
 type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
 
+/// Keep signed CDN URLs close to the download workers that will consume them.
+///
+/// A normal CloudKit page is optimized for fast enumeration, but each
+/// `PhotoAsset` also carries short-lived content URLs. During real downloads,
+/// fetch only a small number of waves ahead of the worker pool so slow media
+/// cannot age thousands of prefetched URLs before transfer starts.
+fn download_stream_page_size(default_page_size: usize, download_concurrency: usize) -> usize {
+    default_page_size
+        .min(download_concurrency.max(1).saturating_mul(2))
+        .max(1)
+}
+
 /// Await all fetcher handles, logging and returning `true` if any panicked.
 async fn await_fetcher_handles(handles: Vec<JoinHandle<()>>) -> bool {
     let mut panicked = false;
@@ -344,7 +356,8 @@ impl PhotoAlbum {
         concurrency: usize,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<bool>) {
         let (panic_tx, panic_rx) = tokio::sync::oneshot::channel();
-        let (stream, handles) = self.photo_stream_inner(limit, total_count, concurrency, None);
+        let (stream, handles) =
+            self.photo_stream_inner_with_page_size(limit, total_count, concurrency, None, None);
         tokio::spawn(async move {
             let panicked = await_fetcher_handles(handles).await;
             let _ = panic_tx.send(panicked);
@@ -371,6 +384,38 @@ impl PhotoAlbum {
         total_count: Option<u64>,
         concurrency: usize,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
+        self.photo_stream_with_token_inner(limit, total_count, concurrency, None)
+    }
+
+    /// Like `photo_stream_with_token`, but tuned for live downloads.
+    ///
+    /// This intentionally gives up parallel page fetchers and shrinks the page
+    /// size so CloudKit content URLs are produced just ahead of the download
+    /// workers instead of in a large, long-lived backlog.
+    pub(crate) fn photo_stream_with_token_for_download(
+        &self,
+        limit: Option<u32>,
+        total_count: Option<u64>,
+        download_concurrency: usize,
+    ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
+        self.photo_stream_with_token_inner(
+            limit,
+            total_count,
+            1,
+            Some(download_stream_page_size(
+                self.page_size,
+                download_concurrency,
+            )),
+        )
+    }
+
+    fn photo_stream_with_token_inner(
+        &self,
+        limit: Option<u32>,
+        total_count: Option<u64>,
+        concurrency: usize,
+        page_size_override: Option<usize>,
+    ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
         let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -380,6 +425,7 @@ impl PhotoAlbum {
             total_count,
             concurrency,
             Some(fetcher_sync_tokens.clone()),
+            page_size_override,
         );
         let album_name = Arc::clone(&self.name);
 
@@ -546,8 +592,26 @@ impl PhotoAlbum {
         total_count: Option<u64>,
         concurrency: usize,
         fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+        page_size_override: Option<usize>,
     ) -> (PhotoStream, Vec<JoinHandle<()>>) {
-        let page_size = self.page_size;
+        self.photo_stream_inner_with_page_size(
+            limit,
+            total_count,
+            concurrency,
+            fetcher_sync_tokens,
+            page_size_override,
+        )
+    }
+
+    fn photo_stream_inner_with_page_size(
+        &self,
+        limit: Option<u32>,
+        total_count: Option<u64>,
+        concurrency: usize,
+        fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+        page_size_override: Option<usize>,
+    ) -> (PhotoStream, Vec<JoinHandle<()>>) {
+        let page_size = page_size_override.unwrap_or(self.page_size).max(1);
         let mut handles = Vec::new();
 
         // Compute effective total, capped by --recent if set.
@@ -1223,6 +1287,14 @@ mod tests {
     }
 
     #[test]
+    fn download_stream_page_size_stays_near_worker_pool() {
+        assert_eq!(download_stream_page_size(100, 1), 2);
+        assert_eq!(download_stream_page_size(100, 4), 8);
+        assert_eq!(download_stream_page_size(100, 50), 100);
+        assert_eq!(download_stream_page_size(0, 4), 1);
+    }
+
+    #[test]
     fn test_fetcher_count_partial_page() {
         // 150 items, page_size 100 → 2 pages, concurrency 10 → 2 fetchers
         assert_eq!(determine_fetcher_count(150, 100, 10), 2);
@@ -1428,7 +1500,7 @@ mod tests {
             .build();
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None, None);
 
         assert_eq!(
             drain_photo_stream_count(stream).await,
@@ -1805,7 +1877,7 @@ mod tests {
             .ok(json!({"records": []}));
         let album = make_album_with_session(100, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(Some(0), Some(10), 1, None);
+        let (stream, _handles) = album.photo_stream_inner(Some(0), Some(10), 1, None, None);
         tokio::pin!(stream);
 
         let items: Vec<_> = stream.collect().await;
@@ -1822,7 +1894,7 @@ mod tests {
             .ok(json!({"records": []}));
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(Some(1), Some(10), 1, None);
+        let (stream, _handles) = album.photo_stream_inner(Some(1), Some(10), 1, None, None);
         tokio::pin!(stream);
 
         let items: Vec<_> = stream.collect().await;
@@ -1868,7 +1940,7 @@ mod tests {
             .ok(json!({"records": []}));
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None, None);
         tokio::pin!(stream);
 
         let mut count = 0u32;
@@ -1901,7 +1973,7 @@ mod tests {
         // consecutive empties to commit to EOF.
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None, None);
         tokio::pin!(stream);
 
         let mut count = 0u32;
@@ -1936,7 +2008,7 @@ mod tests {
             .ok(mock_photo_query_page("master-2", None));
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None, None);
         tokio::pin!(stream);
 
         let mut count = 0u32;
@@ -1974,7 +2046,7 @@ mod tests {
             .ok(mock_photo_query_page("master-unreachable", None));
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None, None);
         tokio::pin!(stream);
 
         let mut count = 0u32;

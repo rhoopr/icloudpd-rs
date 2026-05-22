@@ -217,6 +217,10 @@ pub(super) struct StreamingResult {
     /// Count of 429/503 observations during Phase 1 downloads (per retry
     /// attempt, not per unique task). Feeds SyncStats.rate_limited.
     pub(super) rate_limit_observations: usize,
+    /// True when any worker observed HTTP 410 for a signed CDN URL. Once this
+    /// happens, the rest of the current URL batch is presumed stale too, so
+    /// the pass aborts instead of hammering thousands of expired URLs.
+    pub(super) url_expired_abort: bool,
     /// `true` when the producer reached the natural end of the API
     /// stream (so the `enum_in_progress:<zone>` marker can be cleared even
     /// when downstream downloads partially failed). `false` when the
@@ -785,6 +789,7 @@ pub(super) struct PassResult {
     pub(super) bytes_downloaded: u64,
     pub(super) disk_bytes_written: u64,
     pub(super) rate_limit_observations: usize,
+    pub(super) url_expired_abort: bool,
     /// Photos / videos / recap observed during this pass, mirroring
     /// `StreamingResult`. Folded into the cycle's `SyncStats` at the
     /// caller. Defaults are zero / empty so the existing cleanup-pass
@@ -1099,6 +1104,7 @@ where
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
     let mut bytes_downloaded_total: u64 = 0;
     let mut disk_bytes_total: u64 = 0;
+    let mut url_expired_abort = false;
     let mut photos_downloaded = 0usize;
     let mut videos_downloaded = 0usize;
     let mut recap = super::recap::RunRecap::default();
@@ -1724,6 +1730,18 @@ where
                             });
                             break;
                         }
+                    } else if download_err.is_expired_url() {
+                        url_expired_abort = true;
+                        pb.suspend(|| {
+                            tracing::warn!(
+                                asset_id = %task.asset_id,
+                                path = %task.download_path.display(),
+                                error = %e,
+                                "Download URL expired; aborting current URL batch"
+                            );
+                        });
+                        pipeline_shutdown.cancel();
+                        continue;
                     } else {
                         pb.suspend(|| {
                             tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
@@ -1782,7 +1800,8 @@ where
             .unwrap_or(u64::MAX),
             interrupted: pipeline_shutdown.is_cancelled()
                 || auth_errors >= AUTH_ERROR_THRESHOLD
-                || producer_panicked,
+                || producer_panicked
+                || url_expired_abort,
         };
         if let Err(e) = db.complete_sync_run(run_id, &stats).await {
             tracing::warn!(error = %e, "Failed to complete sync run tracking");
@@ -1877,6 +1896,7 @@ where
         photos_downloaded,
         videos_downloaded,
         recap,
+        url_expired_abort,
     })
 }
 
@@ -1935,7 +1955,7 @@ pub(super) async fn build_download_outcome(
             state_write_failures,
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
-            interrupted: shutdown_token.is_cancelled(),
+            interrupted: shutdown_token.is_cancelled() || streaming_result.url_expired_abort,
             ..super::SyncStats::default()
         };
         if run_mode.is_dry_run() {
@@ -1945,7 +1965,10 @@ pub(super) async fn build_download_outcome(
         } else {
             tracing::info!("No new photos to download");
         }
-        let failed_count = state_write_failures + retry_exhausted + enumeration_errors;
+        let failed_count = state_write_failures
+            + retry_exhausted
+            + enumeration_errors
+            + usize::from(streaming_result.url_expired_abort);
         if failed_count > 0 {
             return Ok((DownloadOutcome::PartialFailure { failed_count }, stats));
         }
@@ -1979,6 +2002,39 @@ pub(super) async fn build_download_outcome(
             ));
         }
         return Ok((DownloadOutcome::Success, stats));
+    }
+
+    if streaming_result.url_expired_abort {
+        let retry_exhausted = skip_breakdown.retry_exhausted;
+        let stats = super::SyncStats {
+            assets_seen: streaming_result.assets_seen,
+            downloaded,
+            failed: failed_tasks.len(),
+            skipped: skip_breakdown,
+            bytes_downloaded: streaming_result.bytes_downloaded,
+            disk_bytes_written: streaming_result.disk_bytes_written,
+            exif_failures,
+            state_write_failures,
+            enumeration_errors,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            interrupted: true,
+            rate_limited: streaming_result.rate_limit_observations,
+            photos_downloaded: streaming_result.photos_downloaded,
+            videos_downloaded: streaming_result.videos_downloaded,
+            recap: streaming_result.recap.clone(),
+        };
+        log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
+        return Ok((
+            DownloadOutcome::PartialFailure {
+                failed_count: failed_tasks.len()
+                    + state_write_failures
+                    + enumeration_errors
+                    + exif_failures
+                    + retry_exhausted
+                    + 1,
+            },
+            stats,
+        ));
     }
 
     if failed_tasks.is_empty() {
@@ -2028,10 +2084,12 @@ pub(super) async fn build_download_outcome(
         "── Cleanup pass: re-fetching URLs and retrying failed downloads ──"
     );
 
-    let fresh_tasks = super::build_download_tasks(passes, config, shutdown_token.clone()).await?;
+    let fresh_tasks =
+        super::build_retry_download_tasks(passes, config, &failed_tasks, shutdown_token.clone())
+            .await?;
     tracing::debug!(
         count = fresh_tasks.len(),
-        "  Re-fetched tasks with fresh URLs"
+        "  Re-fetched failed tasks with fresh URLs"
     );
 
     let phase2_task_count = fresh_tasks.len();
@@ -2116,7 +2174,7 @@ pub(super) async fn build_download_outcome(
         state_write_failures,
         enumeration_errors,
         elapsed_secs: started.elapsed().as_secs_f64(),
-        interrupted: shutdown_token.is_cancelled(),
+        interrupted: shutdown_token.is_cancelled() || pass_result.url_expired_abort,
         rate_limited: streaming_result.rate_limit_observations
             + pass_result.rate_limit_observations,
         photos_downloaded: streaming_result.photos_downloaded + pass_result.photos_downloaded,
@@ -2205,6 +2263,7 @@ pub(super) async fn run_download_pass(
     let mut videos_downloaded = 0usize;
     let mut recap = super::recap::RunRecap::default();
     let mut state_write_circuit_open = false;
+    let mut url_expired_abort = false;
     // Cleanup pass doesn't carry an album label (it's a flat retry list);
     // recap.observe gets the library name so a recovered asset still
     // counts toward the per-album newest tracker rather than vanishing.
@@ -2294,6 +2353,20 @@ pub(super) async fn run_download_pass(
                     pb.suspend(|| {
                         tracing::warn!(path = %task.download_path.display(), error = %e, "Auth error");
                     });
+                } else if e
+                    .downcast_ref::<DownloadError>()
+                    .is_some_and(DownloadError::is_expired_url)
+                {
+                    url_expired_abort = true;
+                    pb.suspend(|| {
+                        tracing::warn!(
+                            asset_id = %task.asset_id,
+                            path = %task.download_path.display(),
+                            error = %e,
+                            "Download URL expired; aborting current URL batch"
+                        );
+                    });
+                    pass_shutdown.cancel();
                 } else {
                     pb.suspend(|| {
                         tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
@@ -2336,6 +2409,7 @@ pub(super) async fn run_download_pass(
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
         rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
+        url_expired_abort,
         photos_downloaded,
         videos_downloaded,
         recap,
@@ -5206,6 +5280,29 @@ mod tests {
             "expected PartialFailure with failed_count=1, got {outcome:?}"
         );
         assert_eq!(stats.state_write_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_url_abort_returns_interrupted_partial_failure() {
+        use crate::download::DownloadOutcome;
+
+        let streaming_result = StreamingResult {
+            downloaded: 1,
+            url_expired_abort: true,
+            ..StreamingResult::default()
+        };
+        let (outcome, stats) =
+            build_zero_download_outcome(streaming_result, DownloadControls::download_hidden())
+                .await;
+        assert!(
+            matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 1 }),
+            "expired CDN URL must stop the batch as an interrupted PartialFailure, got {outcome:?}"
+        );
+        assert_eq!(stats.downloaded, 1);
+        assert!(
+            stats.interrupted,
+            "expired URL aborts must not look like clean syncs"
+        );
     }
 
     #[tokio::test]
