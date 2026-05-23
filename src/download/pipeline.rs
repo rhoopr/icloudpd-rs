@@ -261,7 +261,7 @@ async fn tag_metadata_rewrites<D>(
         return;
     };
     let new_hash = asset.metadata().metadata_hash.as_deref();
-    let library = asset.source_zone().unwrap_or(&config.library);
+    let library = effective_asset_library(asset, config);
     for &(vs, _) in candidates {
         if !ctx.needs_metadata_rewrite(library, asset.id(), vs, new_hash) {
             continue;
@@ -282,6 +282,17 @@ async fn tag_metadata_rewrites<D>(
             );
         }
     }
+}
+
+fn effective_asset_library<'a>(asset: &'a PhotoAsset, config: &'a DownloadConfig) -> &'a str {
+    asset.source_zone().unwrap_or(config.library.as_ref())
+}
+
+fn effective_asset_library_arc(asset: &PhotoAsset, config: &DownloadConfig) -> Arc<str> {
+    asset
+        .source_zone()
+        .map(Arc::from)
+        .unwrap_or_else(|| Arc::clone(&config.library))
 }
 
 /// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case
@@ -951,9 +962,9 @@ where
                     // `{album}` out of `folder_structure` entirely.
                     if config.album_name.is_none() {
                         let candidates = extract_skip_candidates(&asset, config);
+                        let library = effective_asset_library(&asset, config);
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {
-                                let library = asset.source_zone().unwrap_or(&config.library);
                                 matches!(
                                     download_ctx.should_download_fast(
                                         library,
@@ -1297,10 +1308,7 @@ where
                         )
                         .await;
                         if producer_state_db.is_some() {
-                            let library = asset
-                                .source_zone()
-                                .map(Arc::from)
-                                .unwrap_or_else(|| Arc::clone(&config.library));
+                            let library = effective_asset_library_arc(&asset, config);
                             touched_assets.push((library, asset.id_arc()));
                         }
                         skips.on_disk += 1;
