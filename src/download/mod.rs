@@ -1978,17 +1978,22 @@ fn capped_exact_total(counts: &[u64], recent: Option<u32>) -> u64 {
     total.min(recent.map(u64::from).unwrap_or(u64::MAX))
 }
 
-fn should_skip_pass_count_fetch(config: &DownloadConfig, controls: DownloadControls) -> bool {
+fn should_skip_pass_count_fetch(config: &DownloadConfig) -> bool {
+    // A `--recent N` run deliberately enumerates only a prefix of each pass.
+    // The Hyperion count endpoint reports the full pass size, not how many
+    // complete assets will be yielded inside that prefix, so using it as an
+    // exact undercount bound false-fires on live accounts with sparse recent
+    // windows. Recent-limited full syncs suppress the sync token below because
+    // they are not complete zone enumerations.
     config.recent.is_some()
-        && (controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames())
 }
 
 async fn build_pass_count_plan(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
-    controls: DownloadControls,
+    _controls: DownloadControls,
 ) -> PassCountPlan {
-    if should_skip_pass_count_fetch(config, controls) {
+    if should_skip_pass_count_fetch(config) {
         let display_count = config.recent.map(u64::from).unwrap_or(0);
         return PassCountPlan {
             display_counts: vec![display_count; passes.len()],
@@ -2452,7 +2457,12 @@ async fn download_photos_full_with_token(
     // observe one coherent snapshot.
     // Don't advance the token for read-only operations, or when pagination
     // was incomplete (would permanently skip missed assets).
-    let sync_token = if !controls.run_mode.only_print_filenames()
+    // Do not persist a full-enumeration zone token for `--recent N`. The run
+    // intentionally stops before the full pass is drained, so advancing the
+    // token would make older, unenumerated assets invisible to later
+    // incremental syncs.
+    let sync_token = if config.recent.is_none()
+        && !controls.run_mode.only_print_filenames()
         && !pagination_undercount
         && streaming_result.enumeration_errors == 0
     {
@@ -5314,37 +5324,26 @@ mod tests {
     }
 
     #[test]
-    fn read_only_recent_runs_skip_pass_count_fetch() {
+    fn recent_runs_skip_pass_count_fetch() {
         let mut config = test_config();
         config.recent = Some(25);
 
         assert!(
-            should_skip_pass_count_fetch(&config, DownloadControls::dry_run_hidden()),
-            "dry-run recent syncs do not advance tokens, so the pre-count is redundant"
-        );
-        assert!(
-            should_skip_pass_count_fetch(
-                &config,
-                DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden())
-            ),
-            "print-only recent syncs do not advance tokens, so the pre-count is redundant"
+            should_skip_pass_count_fetch(&config),
+            "recent-limited runs are not complete enumerations, so the \
+             full-pass count is not an exact pagination bound"
         );
     }
 
     #[test]
-    fn download_runs_keep_pass_count_fetch_for_token_safety() {
+    fn unbounded_runs_keep_pass_count_fetch() {
         let mut config = test_config();
-        config.recent = Some(25);
-
-        assert!(
-            !should_skip_pass_count_fetch(&config, DownloadControls::download_hidden()),
-            "real downloads need the exact count for pagination-undercount token safety"
-        );
-
         config.recent = None;
+
         assert!(
-            !should_skip_pass_count_fetch(&config, DownloadControls::dry_run_hidden()),
-            "unbounded read-only runs still use the exact count for progress bounds"
+            !should_skip_pass_count_fetch(&config),
+            "unbounded runs still use exact counts for progress bounds and \
+             pagination-underflow detection"
         );
     }
 
@@ -5377,6 +5376,61 @@ mod tests {
         assert_eq!(plan.stream_total_counts, vec![None, None]);
         assert_eq!(plan.exact_total, None);
         assert_eq!(plan.len_errors, 0);
+    }
+
+    #[tokio::test]
+    async fn full_sync_recent_download_suppresses_token_without_shortfall() {
+        let records = mock_photo_records_with_filename("MASTER_RECENT", "recent.jpg");
+        let album_session = MockPhotosFlow::new()
+            .query_page(records.clone(), Some("zone-token"))
+            .empty_query_page(Some("zone-token"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Vacation", album_session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.recent = Some(100);
+
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let pass_config = config.with_pass(&passes[0]);
+        let expected_path = filter::expected_paths_for(&asset, &pass_config)
+            .into_iter()
+            .next()
+            .expect("mock asset should have an expected path");
+        tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
+            .await
+            .expect("create parent dir");
+        tokio::fs::write(&expected_path.path, vec![0u8; 1024])
+            .await
+            .expect("seed existing file");
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("recent full sync should complete");
+
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "a sparse recent window must not be treated as pagination undercount"
+        );
+        assert_eq!(
+            result.stats.enumeration_errors, 0,
+            "recent-limited count shortfalls are not exact enumeration errors"
+        );
+        assert_eq!(
+            result.sync_token, None,
+            "recent-limited full sync must not advance a zone token"
+        );
     }
 
     #[test]
