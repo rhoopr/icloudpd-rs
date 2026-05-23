@@ -3591,6 +3591,27 @@ mod tests {
     }
 
     #[test]
+    fn test_toml_server_port_zero_requests_ephemeral_bind() {
+        let toml_str = r#"
+            [auth]
+            username = "user@example.com"
+            [download]
+            directory = "/photos"
+            [server]
+            port = 0
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(config.server.port, 0);
+    }
+
+    #[test]
     fn test_cli_http_port_overrides_toml() {
         let toml_str = r#"
             [auth]

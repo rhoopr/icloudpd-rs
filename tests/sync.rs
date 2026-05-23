@@ -53,6 +53,7 @@ struct SyncToml<'a> {
     photos: &'a str,
     metadata: &'a str,
     watch: &'a str,
+    server: &'a str,
     notifications: &'a str,
     report: &'a str,
 }
@@ -122,6 +123,7 @@ fn album_config(
         ("photos", toml.photos),
         ("metadata", toml.metadata),
         ("watch", toml.watch),
+        ("server", toml.server),
         ("notifications", toml.notifications),
         ("report", toml.report),
     ] {
@@ -1641,6 +1643,11 @@ fn sync_watch_runs_multiple_cycles() {
             download_dir.path(),
             SyncToml {
                 watch: "interval = 60\n",
+                // Watch mode starts the HTTP health/metrics server. Do not
+                // compete for the production default 9090 during the live
+                // suite; a locally running kei service or another smoke test
+                // may legitimately own it.
+                server: "bind = \"127.0.0.1\"\nport = 0\n",
                 ..SyncToml::default()
             },
         );
