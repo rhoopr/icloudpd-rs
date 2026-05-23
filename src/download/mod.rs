@@ -2031,8 +2031,8 @@ async fn build_pass_count_plan(
 /// Classification of how the producer-observed asset count compared with the
 /// pre-enumeration API total.
 ///
-/// Any shortfall is token-unsafe. The severity split is kept only so logs can
-/// distinguish a small mismatch from a larger truncation.
+/// Any shortfall is token-unsafe. The shortfall count is kept so logs can
+/// report how many assets were missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaginationShortfall {
     Match,

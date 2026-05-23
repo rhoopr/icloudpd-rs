@@ -19,8 +19,13 @@ use crate::types::{
 };
 
 use super::paths;
-use super::planner::MalformedTaskResource;
 use super::DownloadConfig;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MalformedTaskResource {
+    pub(super) field: Box<str>,
+    pub(super) reason: Box<str>,
+}
 
 /// Reason an asset was filtered out during content/metadata filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

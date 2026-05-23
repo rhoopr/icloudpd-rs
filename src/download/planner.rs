@@ -14,7 +14,7 @@ use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
 
 use super::filter::{
     determine_media_type, filter_asset_to_tasks, is_asset_filtered, pre_ensure_asset_dir,
-    DownloadTask, FilterReason, NormalizedPath,
+    DownloadTask, FilterReason, MalformedTaskResource, NormalizedPath,
 };
 use super::paths;
 use super::DownloadConfig;
@@ -81,12 +81,6 @@ pub(super) struct AssetTaskPlan {
     pub(super) tasks: SmallVec<[DownloadTask; 5]>,
     pub(super) filter_reason: Option<FilterReason>,
     pub(super) malformed_resource: Option<MalformedTaskResource>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct MalformedTaskResource {
-    pub(super) field: Box<str>,
-    pub(super) reason: Box<str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
