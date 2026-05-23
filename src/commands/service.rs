@@ -478,6 +478,25 @@ pub(crate) async fn resolve_libraries(
     Ok(chosen)
 }
 
+pub(crate) async fn resolve_cross_zone_libraries_for_album_hydration<Fut>(
+    selection: &crate::selection::Selection,
+    all_libraries: Fut,
+) -> anyhow::Result<Vec<icloud::photos::PhotoLibrary>>
+where
+    Fut: std::future::Future<Output = anyhow::Result<Vec<icloud::photos::PhotoLibrary>>>,
+{
+    use crate::selection::AlbumSelector;
+    use anyhow::Context;
+
+    if matches!(selection.albums, AlbumSelector::None) {
+        return Ok(Vec::new());
+    }
+
+    all_libraries
+        .await
+        .context("failed to resolve cross-zone album hydration libraries")
+}
+
 /// Match a `--library` entry (full zone name or truncated 8-char form)
 /// against a live zone, case-insensitive. The truncated form is what
 /// `{library}` renders into paths, so users can copy a path segment and
@@ -1609,6 +1628,53 @@ mod tests {
 
         let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         assert!(plan.passes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_zone_hydration_libraries_skip_fetch_without_album_selection() {
+        let sel = Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::Named {
+                included: names(&["Favorites"]),
+                excluded: BTreeSet::new(),
+            },
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: false,
+        };
+
+        let libraries = resolve_cross_zone_libraries_for_album_hydration(&sel, async {
+            panic!("all_libraries must not be polled without album selection")
+        })
+        .await
+        .unwrap();
+
+        assert!(libraries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_zone_hydration_libraries_propagate_fetch_failure() {
+        let sel = selection_with_albums(
+            AlbumSelector::Named {
+                included: names(&["Vacation"]),
+                excluded: BTreeSet::new(),
+            },
+            false,
+        );
+
+        let err = resolve_cross_zone_libraries_for_album_hydration(&sel, async {
+            Err::<Vec<PhotoLibrary>, anyhow::Error>(anyhow::anyhow!("library listing failed"))
+        })
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to resolve cross-zone album hydration libraries"),
+            "missing context: {msg}"
+        );
+        assert!(
+            msg.contains("library listing failed"),
+            "missing cause: {msg}"
+        );
     }
 
     #[tokio::test]

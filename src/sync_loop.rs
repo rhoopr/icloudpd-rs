@@ -11,8 +11,9 @@ use anyhow::Context;
 use crate::auth;
 use crate::cli;
 use crate::commands::{
-    attempt_reauth, init_photos_service, resolve_libraries, resolve_passes,
-    validate_smart_folder_fulfillability, wait_and_retry_2fa, MAX_REAUTH_ATTEMPTS,
+    attempt_reauth, init_photos_service, resolve_cross_zone_libraries_for_album_hydration,
+    resolve_libraries, resolve_passes, validate_smart_folder_fulfillability, wait_and_retry_2fa,
+    MAX_REAUTH_ATTEMPTS,
 };
 use crate::config;
 use crate::credential;
@@ -815,20 +816,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // failures behind a clean final cycle.
     let mut cumulative_failed_count = 0usize;
 
-    let cross_zone_libraries = if matches!(
-        config.filters.selection.albums,
-        crate::selection::AlbumSelector::None
-    ) {
-        Vec::new()
-    } else {
-        photos_service.all_libraries().await.unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                "Failed to resolve cross-zone album hydration libraries; album passes will use selected zones only"
-            );
-            libraries.clone()
-        })
-    };
+    let cross_zone_libraries = resolve_cross_zone_libraries_for_album_hydration(
+        &config.filters.selection,
+        photos_service.all_libraries(),
+    )
+    .await?;
 
     let mut library_states: Vec<LibraryState> = Vec::with_capacity(libraries.len());
     for library in &libraries {
