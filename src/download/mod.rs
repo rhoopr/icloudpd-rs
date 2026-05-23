@@ -1375,7 +1375,6 @@ struct PerPassStreamingResult {
 }
 
 struct CollectedUnfiledStream {
-    count: u64,
     token_rx: tokio::sync::oneshot::Receiver<Option<String>>,
     items: Vec<anyhow::Result<PhotoAsset>>,
 }
@@ -1402,7 +1401,6 @@ fn deferred_unfiled_index(passes: &[crate::commands::AlbumPass]) -> Option<usize
 
 async fn collect_unfiled_stream(
     pass: &crate::commands::AlbumPass,
-    count: u64,
     stream_total_count: Option<u64>,
     config: &DownloadConfig,
     controls: DownloadControls,
@@ -1430,11 +1428,7 @@ async fn collect_unfiled_stream(
         }
         items.push(item);
     }
-    CollectedUnfiledStream {
-        count,
-        token_rx,
-        items,
-    }
+    CollectedUnfiledStream { token_rx, items }
 }
 
 async fn run_full_pass_stream<S>(
@@ -1979,6 +1973,11 @@ struct PassCountPlan {
     len_errors: usize,
 }
 
+fn capped_exact_total(counts: &[u64], recent: Option<u32>) -> u64 {
+    let total = counts.iter().sum::<u64>();
+    total.min(recent.map(u64::from).unwrap_or(u64::MAX))
+}
+
 fn should_skip_pass_count_fetch(config: &DownloadConfig, controls: DownloadControls) -> bool {
     config.recent.is_some()
         && (controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames())
@@ -2015,10 +2014,7 @@ async fn build_pass_count_plan(
     let pass_count_results = crate::icloud::photos::PhotoAlbum::len_many(&pass_albums).await;
     let (display_counts, len_errors) = fold_pass_count_results(pass_count_results, passes);
     let stream_total_counts = display_counts.iter().copied().map(Some).collect();
-    let mut exact_total: u64 = display_counts.iter().sum();
-    if let Some(recent) = config.recent {
-        exact_total = exact_total.min(u64::from(recent));
-    }
+    let exact_total = capped_exact_total(&display_counts, config.recent);
 
     PassCountPlan {
         display_counts,
@@ -2110,7 +2106,8 @@ async fn download_photos_full_with_token(
     let pass_count_plan = build_pass_count_plan(passes, config, controls).await;
     let pass_counts = pass_count_plan.display_counts;
     let pass_stream_counts = pass_count_plan.stream_total_counts;
-    let exact_total = pass_count_plan.exact_total;
+    let mut pagination_counts = pass_counts.clone();
+    let mut exact_total = pass_count_plan.exact_total;
     let len_errors = pass_count_plan.len_errors;
     let display_total = pass_counts
         .iter()
@@ -2252,11 +2249,10 @@ async fn download_photos_full_with_token(
 
         let unfiled_collection = async {
             match deferred_unfiled {
-                Some(index) => match (passes.get(index), pass_counts.get(index).copied()) {
-                    (Some(pass), Some(count)) => Some(
+                Some(index) => match passes.get(index) {
+                    Some(pass) => Some(
                         collect_unfiled_stream(
                             pass,
-                            count,
                             pass_stream_counts.get(index).copied().flatten(),
                             config,
                             controls,
@@ -2310,14 +2306,24 @@ async fn download_photos_full_with_token(
                         .map_or(true, |asset| !excluded_ids.contains(asset.id()))
                 });
                 if let Some(pass_config) = pass_configs.get(index).cloned() {
+                    let filtered_items = filtered.collect::<Vec<_>>();
+                    let filtered_count = filtered_items
+                        .iter()
+                        .filter(|item| item.is_ok())
+                        .count()
+                        .try_into()
+                        .unwrap_or(u64::MAX);
+                    if let Some(slot) = pagination_counts.get_mut(index) {
+                        *slot = filtered_count;
+                    }
                     let pass_result = run_full_pass_stream(
                         download_client.clone(),
-                        stream::iter(filtered),
+                        stream::iter(filtered_items),
                         collected.token_rx,
                         pass_config,
                         FullPassStreamOptions {
                             controls,
-                            count: collected.count,
+                            count: filtered_count,
                             kind: crate::commands::PassKind::Unfiled,
                             shutdown_token: shutdown_token.clone(),
                             download_ctx: shared_download_ctx.clone(),
@@ -2403,6 +2409,9 @@ async fn download_photos_full_with_token(
     // stay set even if the producer drained its (possibly truncated) stream.
     if len_errors > 0 {
         streaming_result.enumeration_complete = false;
+    }
+    if exact_total.is_some() {
+        exact_total = Some(capped_exact_total(&pagination_counts, config.recent));
     }
 
     // Check if enumeration saw significantly fewer assets than the API reported.
@@ -3145,6 +3154,47 @@ mod tests {
         )
     }
 
+    fn mock_photo_records_with_filename(record_name: &str, filename: &str) -> Vec<Value> {
+        vec![
+            json!({
+                "recordName": record_name,
+                "recordType": "CPLMaster",
+                "fields": {
+                    "filenameEnc": {"value": filename, "type": "STRING"},
+                    "resOriginalRes": {
+                        "value": {
+                            "downloadURL": "https://p01.icloud-content.com/photo.jpg",
+                            "size": 1024,
+                            "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                        }
+                    },
+                    "resOriginalWidth": {"value": 100, "type": "INT64"},
+                    "resOriginalHeight": {"value": 100, "type": "INT64"},
+                    "resOriginalFileType": {"value": "public.jpeg"},
+                    "itemType": {"value": "public.jpeg"},
+                    "adjustmentRenderType": {"value": 0, "type": "INT64"}
+                },
+                "recordChangeTag": "ct1"
+            }),
+            json!({
+                "recordName": format!("asset-{record_name}"),
+                "recordType": "CPLAsset",
+                "fields": {
+                    "masterRef": {
+                        "value": {
+                            "recordName": record_name,
+                            "zoneID": {"zoneName": "PrimarySync"}
+                        },
+                        "type": "REFERENCE"
+                    },
+                    "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                    "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                },
+                "recordChangeTag": "ct2"
+            }),
+        ]
+    }
+
     #[tokio::test]
     async fn full_sync_per_pass_streams_overlap_when_paths_are_pass_specific() {
         let session = ConcurrentRecordsSession::new(Duration::from_millis(100));
@@ -3233,6 +3283,73 @@ mod tests {
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "filtered duplicate should not make the run partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_deferred_unfiled_write_mode_exclusion_does_not_count_as_shortfall() {
+        let records = mock_photo_records_with_filename("MASTER_1", "test.jpg");
+        let album_session = MockPhotosFlow::new()
+            .album_count(1)
+            .query_page(records.clone(), Some("zone-token"))
+            .build();
+        let unfiled_session = MockPhotosFlow::new()
+            .album_count(1)
+            .query_page(records.clone(), Some("zone-token"))
+            .build();
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: mock_album("Vacation", album_session),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: mock_album("", unfiled_session),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 2;
+
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let album_config = config.with_pass(&passes[0]);
+        let expected_path = filter::expected_paths_for(&asset, &album_config)
+            .into_iter()
+            .next()
+            .expect("mock asset should have an expected path");
+        tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
+            .await
+            .expect("create parent dir");
+        tokio::fs::write(&expected_path.path, vec![0u8; 1024])
+            .await
+            .expect("seed existing file");
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("write-mode full sync should succeed");
+
+        assert_eq!(
+            result.stats.enumeration_errors, 0,
+            "deferred unfiled exclusions are intentional and must not be counted as pagination undercount"
+        );
+        assert_eq!(
+            result.sync_token.as_deref(),
+            Some("zone-token"),
+            "clean write-mode enumeration should still advance the agreed sync token"
+        );
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "filtered duplicate should not make the write-mode run partial"
         );
     }
 
