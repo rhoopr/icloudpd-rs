@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -261,8 +261,9 @@ async fn tag_metadata_rewrites<D>(
         return;
     };
     let new_hash = asset.metadata().metadata_hash.as_deref();
+    let library = asset.source_zone().unwrap_or(&config.library);
     for &(vs, _) in candidates {
-        if !ctx.needs_metadata_rewrite(&config.library, asset.id(), vs, new_hash) {
+        if !ctx.needs_metadata_rewrite(library, asset.id(), vs, new_hash) {
             continue;
         }
         tracing::info!(
@@ -271,7 +272,7 @@ async fn tag_metadata_rewrites<D>(
             "Metadata-only change detected; tagging for rewrite"
         );
         if let Err(e) = db
-            .record_metadata_write_failure(&config.library, asset.id(), vs.as_str())
+            .record_metadata_write_failure(library, asset.id(), vs.as_str())
             .await
         {
             tracing::warn!(
@@ -952,9 +953,10 @@ where
                         let candidates = extract_skip_candidates(&asset, config);
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {
+                                let library = asset.source_zone().unwrap_or(&config.library);
                                 matches!(
                                     download_ctx.should_download_fast(
-                                        &config.library,
+                                        library,
                                         asset.id(),
                                         vs,
                                         cs,
@@ -1108,7 +1110,6 @@ where
     let mut photos_downloaded = 0usize;
     let mut videos_downloaded = 0usize;
     let mut recap = super::recap::RunRecap::default();
-    let library: Arc<str> = Arc::clone(&config.library);
 
     let (task_tx, task_rx) = mpsc::channel::<DownloadTask>(concurrency * 2);
 
@@ -1173,7 +1174,7 @@ where
         // Vec is sufficient: every push is inside a branch predicated on
         // `seen_ids.insert(asset.id_arc())` returning true, so IDs are
         // already unique at this point.
-        let mut touched_ids: Vec<Arc<str>> = Vec::new();
+        let mut touched_assets: Vec<(Arc<str>, Arc<str>)> = Vec::new();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
         // Free-space probe lives in an `AtomicU64` (sentinel
@@ -1296,7 +1297,11 @@ where
                         )
                         .await;
                         if producer_state_db.is_some() {
-                            touched_ids.push(asset.id_arc());
+                            let library = asset
+                                .source_zone()
+                                .map(Arc::from)
+                                .unwrap_or_else(|| Arc::clone(&config.library));
+                            touched_assets.push((library, asset.id_arc()));
                         }
                         skips.on_disk += 1;
                         producer_pb.inc(1);
@@ -1324,7 +1329,7 @@ where
                                         );
                                         if let Err(e) = finalize_failed(
                                             db.as_ref(),
-                                            &config.library,
+                                            &task.library,
                                             &task,
                                             &error,
                                         )
@@ -1390,7 +1395,7 @@ where
                                 }
 
                                 match download_ctx.should_download_fast(
-                                    &config.library,
+                                    &task.library,
                                     &task.asset_id,
                                     task.version_size,
                                     &task.checksum,
@@ -1545,7 +1550,7 @@ where
         // per-asset cost that dominated sync-start on mostly-synced
         // libraries.
         //
-        // touched_ids contains assets the consumer will not finalize this
+        // touched_assets contains assets the consumer will not finalize this
         // sync: trust-state fast-skips (line 1026, status='downloaded')
         // and on-disk skips (line 1053, which the comment at the push
         // site notes can include status='pending' rows carried over from
@@ -1559,17 +1564,25 @@ where
         // promotion is delayed by exactly one sync — the same row hits
         // the same path next run and gets promoted then. No data loss.
         if let Some(db) = &producer_state_db {
-            if !touched_ids.is_empty() {
-                let touched_count = touched_ids.len();
-                let ids: Vec<&str> = touched_ids.iter().map(AsRef::as_ref).collect();
-                if let Err(e) = db.touch_last_seen_many(&config.library, &ids).await {
-                    producer_pb.suspend(|| {
-                        tracing::warn!(
-                            error = %e,
-                            count = touched_count,
-                            "Failed to batch-update last_seen_at for skipped assets"
-                        );
-                    });
+            if !touched_assets.is_empty() {
+                let mut touched_by_library: FxHashMap<Arc<str>, Vec<Arc<str>>> =
+                    FxHashMap::default();
+                for (library, id) in touched_assets {
+                    touched_by_library.entry(library).or_default().push(id);
+                }
+                for (library, ids) in touched_by_library {
+                    let touched_count = ids.len();
+                    let id_refs: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
+                    if let Err(e) = db.touch_last_seen_many(&library, &id_refs).await {
+                        producer_pb.suspend(|| {
+                            tracing::warn!(
+                                error = %e,
+                                count = touched_count,
+                                library = %library,
+                                "Failed to batch-update last_seen_at for skipped assets"
+                            );
+                        });
+                    }
                 }
             }
         }
@@ -1667,7 +1680,7 @@ where
                 if let Some(db) = &state_db {
                     match finalize_downloaded(
                         db.as_ref(),
-                        &library,
+                        &task.library,
                         &task,
                         local_checksum,
                         download_checksum,
@@ -1754,7 +1767,7 @@ where
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) =
-                        finalize_failed(db.as_ref(), &library, &task, &e.to_string()).await
+                        finalize_failed(db.as_ref(), &task.library, &task, &e.to_string()).await
                     {
                         tracing::warn!(
                             asset_id = %task.asset_id,
@@ -2300,7 +2313,7 @@ pub(super) async fn run_download_pass(
                 if let Some(db) = &state_db {
                     match finalize_downloaded(
                         db.as_ref(),
-                        &library,
+                        &task.library,
                         &task,
                         local_checksum.clone(),
                         download_checksum.clone(),
@@ -2374,7 +2387,7 @@ pub(super) async fn run_download_pass(
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) =
-                        finalize_failed(db.as_ref(), &library, &task, &e.to_string()).await
+                        finalize_failed(db.as_ref(), &task.library, &task, &e.to_string()).await
                     {
                         tracing::warn!(
                             asset_id = %task.asset_id,
@@ -3504,6 +3517,7 @@ mod tests {
                                 created_local: chrono::Local::now(),
                                 size: 1000,
                                 asset_id: "ASSET_A".into(),
+                                library: "PrimarySync".into(),
                                 metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
                                 media_type: crate::state::MediaType::Photo,
@@ -3515,6 +3529,7 @@ mod tests {
                                 created_local: chrono::Local::now(),
                                 size: 2000,
                                 asset_id: "ASSET_B".into(),
+                                library: "PrimarySync".into(),
                                 metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
                                 media_type: crate::state::MediaType::Photo,
@@ -3566,6 +3581,7 @@ mod tests {
                             created_local: chrono::Local::now(),
                             size: 500,
                             asset_id: "ASSET_C".into(),
+                            library: "PrimarySync".into(),
                             metadata: Arc::new(MetadataPayload::default()),
                             version_size: VersionSizeKey::Original,
                             media_type: crate::state::MediaType::Photo,
@@ -4442,6 +4458,7 @@ mod tests {
                 download_path: dir.path().join(format!("photo_{i}.jpg")),
                 checksum: checksum.clone().into(),
                 asset_id: format!("CIRCUIT_{i}").into(),
+                library: "PrimarySync".into(),
                 metadata: Arc::new(MetadataPayload::default()),
                 size: jpeg_body.len() as u64,
                 created_local: chrono::Local::now(),
@@ -4891,18 +4908,19 @@ mod tests {
         assert_eq!(summary.failed, 0);
     }
 
-    /// Producer-side regression for the deferred `touched_ids` flush.
+    /// Producer-side regression for the deferred `touched_assets` flush.
     ///
     /// A pending row carried over from a prior interrupted sync, whose
     /// new sync hits the on-disk-skip path (the `tasks.is_empty()`
     /// branch at the producer's filter step), must end the sync as
-    /// `failed` -- the producer task pushes its id into `touched_ids`,
-    /// the deferred `touch_last_seen_many` flush bumps `last_seen_at`,
-    /// and `promote_pending_to_failed` then promotes it. This is
-    /// load-bearing for stuck-pipeline recovery.
+    /// `failed` -- the producer task pushes its source library and id into
+    /// `touched_assets`, the deferred `touch_last_seen_many` flush bumps
+    /// `last_seen_at`, and `promote_pending_to_failed` then promotes it.
+    /// This is load-bearing for stuck-pipeline recovery and for cross-zone
+    /// album members whose owner album pass differs from the asset source zone.
     ///
     /// If a future refactor moves the flush behind a not-always-reached
-    /// path, or moves `touched_ids` writes off the producer's terminal
+    /// path, or moves `touched_assets` writes off the producer's terminal
     /// path, this test fails.
     #[tokio::test]
     async fn producer_flushes_touched_ids_so_pending_on_disk_skip_promotes() {
@@ -4922,12 +4940,14 @@ mod tests {
                 .orig_url("http://127.0.0.1:1/stuck.jpg")
                 .orig_checksum("ck_stuck")
                 .build()
+                .with_source_zone(Arc::from("SharedSync-abc"))
         }
 
         let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
 
         let prior_seen_at = chrono::Utc::now().timestamp() - 86400;
         let record = TestAssetRecord::new("STUCK")
+            .library("SharedSync-abc")
             .checksum("ck_stuck")
             .filename("stuck.jpg")
             .size(1234)
@@ -4980,6 +5000,7 @@ mod tests {
 
         let failed = db.get_failed().await.unwrap();
         assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].library.as_ref(), "SharedSync-abc");
         assert_eq!(&*failed[0].id, "STUCK");
     }
 

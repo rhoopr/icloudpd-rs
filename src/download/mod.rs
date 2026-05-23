@@ -2884,6 +2884,7 @@ mod tests {
             download_path: Path::new("/tmp/codex/kei/retry-tests").join(path),
             checksum: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             asset_id: Arc::from(asset_id),
+            library: Arc::from("PrimarySync"),
             metadata: Arc::new(filter::MetadataPayload::default()),
             size: 1024,
             created_local: chrono::Local::now(),
@@ -2940,6 +2941,8 @@ mod tests {
                 page_size: 100,
                 zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
                 retry_config: RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
             },
             Box::new(session),
         )
@@ -3099,6 +3102,8 @@ mod tests {
                 page_size: 100,
                 zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
                 retry_config: RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
             },
             Box::new(session),
         )
@@ -3116,6 +3121,8 @@ mod tests {
                 page_size: 100,
                 zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
                 retry_config: RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
             },
             Box::new(session),
         )

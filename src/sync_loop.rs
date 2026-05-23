@@ -815,11 +815,27 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // failures behind a clean final cycle.
     let mut cumulative_failed_count = 0usize;
 
+    let cross_zone_libraries = if matches!(
+        config.filters.selection.albums,
+        crate::selection::AlbumSelector::None
+    ) {
+        Vec::new()
+    } else {
+        photos_service.all_libraries().await.unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "Failed to resolve cross-zone album hydration libraries; album passes will use selected zones only"
+            );
+            libraries.clone()
+        })
+    };
+
     let mut library_states: Vec<LibraryState> = Vec::with_capacity(libraries.len());
     for library in &libraries {
         let zone_name = library.zone_name().to_string();
         let sync_token_key = make_sync_token_key(&zone_name);
-        let plan = resolve_passes(library, &config.filters.selection).await?;
+        let plan =
+            resolve_passes(library, &config.filters.selection, &cross_zone_libraries).await?;
         let (album_passes, smart_folder_passes, unfiled) = count_passes(&plan);
         tracing::info!(
             zone = %zone_name,
@@ -830,6 +846,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         );
         library_states.push(LibraryState {
             library: library.clone(),
+            cross_zone_libraries: cross_zone_libraries.clone(),
             zone_name,
             sync_token_key,
             plan,
@@ -1429,7 +1446,13 @@ async fn refresh_needed_library_plans(
         // phase; incremental/cleanup paths resolve them before planning tasks.
         // This refresh is intentionally delayed until a selected zone has
         // changes so quiet watch cycles avoid the album-listing traffic.
-        match resolve_passes(&lib_state.library, selection).await {
+        match resolve_passes(
+            &lib_state.library,
+            selection,
+            &lib_state.cross_zone_libraries,
+        )
+        .await
+        {
             Ok(refreshed) => {
                 lib_state.plan = refreshed;
                 lib_state.plan_is_stale = false;
@@ -2398,6 +2421,8 @@ mod tests {
                 page_size: 100,
                 zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
                 retry_config: retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
             },
             Box::new(crate::test_helpers::MockPhotosSession::new().ok(json!({
                 "zones": [{
@@ -2515,6 +2540,8 @@ mod tests {
                 page_size: 100,
                 zone_id: Arc::new(json!({"zoneName": zone})),
                 retry_config: retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
             },
             Box::new(session),
         )
@@ -2585,6 +2612,7 @@ mod tests {
             },
             plan_is_stale: false,
             plan_needs_refresh: false,
+            cross_zone_libraries: Vec::new(),
         }
     }
 
@@ -3430,6 +3458,7 @@ mod tests {
             plan: crate::commands::AlbumPlan { passes: Vec::new() },
             plan_is_stale: false,
             plan_needs_refresh: false,
+            cross_zone_libraries: Vec::new(),
         }
     }
 

@@ -814,7 +814,7 @@ pub(crate) async fn run_import_existing(
         tracing::debug!(zone = %zone, "Scanning library");
         let library_config = download_config.with_library(zone);
 
-        let plan = resolve_passes(library, &selection).await?;
+        let plan = resolve_passes(library, &selection, &[]).await?;
         if plan.passes.is_empty() {
             tracing::debug!(zone = %zone, "No passes resolved; nothing to import");
             continue;
@@ -1275,6 +1275,8 @@ mod wiremock_tests {
                     base_delay_secs: 0,
                     max_delay_secs: 0,
                 },
+                container_id: None,
+                cross_zone_sources: Vec::new(),
             },
             session,
         )

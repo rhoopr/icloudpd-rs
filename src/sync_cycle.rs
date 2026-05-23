@@ -17,6 +17,7 @@ use crate::state;
 /// Per-library state: zone name, sync token key, and resolved album plan.
 pub(crate) struct LibraryState {
     pub(crate) library: crate::icloud::photos::PhotoLibrary,
+    pub(crate) cross_zone_libraries: Vec<crate::icloud::photos::PhotoLibrary>,
     pub(crate) zone_name: String,
     pub(crate) sync_token_key: String,
     /// Ordered list of download passes. Each pass carries its own

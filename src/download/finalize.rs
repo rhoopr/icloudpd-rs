@@ -352,6 +352,7 @@ mod tests {
             download_path: path,
             checksum: "remote_checksum".into(),
             asset_id: Arc::from(asset_id),
+            library: Arc::from(LIBRARY),
             metadata: Arc::new(MetadataPayload::default()),
             size: 12,
             created_local: Local::now(),

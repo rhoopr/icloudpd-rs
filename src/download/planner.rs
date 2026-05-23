@@ -86,7 +86,7 @@ pub(super) enum ExistingPathMatch {
 /// `mark_failed` call will finalize.
 pub(super) async fn upsert_seen_for_task<D>(
     db: &D,
-    config: &DownloadConfig,
+    _config: &DownloadConfig,
     asset: &PhotoAsset,
     task: &DownloadTask,
 ) -> Result<(), crate::state::error::StateError>
@@ -95,7 +95,7 @@ where
 {
     let media_type = determine_media_type(task.version_size, asset);
     let record = AssetRecord::new_pending(
-        Arc::clone(&config.library),
+        Arc::clone(&task.library),
         task.asset_id.to_string(),
         task.version_size,
         task.checksum.to_string(),
@@ -127,7 +127,8 @@ where
     let Some(album_name) = config.album_name.as_deref().filter(|name| !name.is_empty()) else {
         return Ok(());
     };
-    add_asset_album_with_retry(db, &config.library, asset.id(), album_name, "icloud").await
+    let library = asset.source_zone().unwrap_or(&config.library);
+    add_asset_album_with_retry(db, library, asset.id(), album_name, "icloud").await
 }
 
 /// Bounded retry attempts for `add_asset_album`. SQLite-busy under WAL
@@ -322,5 +323,45 @@ mod tests {
         assert_eq!(pending[0].id.as_ref(), "STATEFUL");
         let albums = db.get_all_asset_albums(&pass_config.library).await.unwrap();
         assert_eq!(albums, vec![("STATEFUL".to_string(), "Family".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn planner_uses_cross_zone_asset_library_for_state_and_membership() {
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(tmp.path());
+        let pass_config = base.with_pass(&make_pass(PassKind::Album, "Family"));
+        let asset = TestPhotoAsset::new("CROSS_ZONE")
+            .filename("IMG_0004.JPG")
+            .build()
+            .with_source_zone(Arc::from("SharedSync-abc"));
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let mut planner = TaskPlanner::new();
+        let plan = planner.plan_asset(&asset, &pass_config).await;
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].library.as_ref(), "SharedSync-abc");
+        upsert_seen_for_task(&db, &pass_config, &asset, &plan.tasks[0])
+            .await
+            .unwrap();
+        record_album_membership_if_named(&db, &pass_config, &asset)
+            .await
+            .unwrap();
+
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].library.as_ref(), "SharedSync-abc");
+        assert_eq!(pending[0].id.as_ref(), "CROSS_ZONE");
+        assert!(
+            db.get_all_asset_albums(&pass_config.library)
+                .await
+                .unwrap()
+                .is_empty(),
+            "album membership must not be recorded under the owner pass zone"
+        );
+        let albums = db.get_all_asset_albums("SharedSync-abc").await.unwrap();
+        assert_eq!(
+            albums,
+            vec![("CROSS_ZONE".to_string(), "Family".to_string())]
+        );
     }
 }

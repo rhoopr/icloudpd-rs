@@ -49,6 +49,8 @@ pub struct ChangeEvent {
 pub struct PhotoAsset {
     // Heap types first
     record_name: Arc<str>,
+    asset_record_name: Arc<str>,
+    source_zone: Option<Arc<str>>,
     filename: Option<Box<str>>,
     // Metadata behind Arc so downstream consumers (AssetRecord, the
     // pipeline's metadata-hash comparisons) can share the same
@@ -293,8 +295,14 @@ impl PhotoAsset {
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
         let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
         let asset_metadata = Arc::new(metadata::extract(&master_fields, &asset_fields));
+        let asset_record_name: Arc<str> = asset_record["recordName"]
+            .as_str()
+            .unwrap_or(record_name.as_ref())
+            .into();
         Self {
             record_name,
+            asset_record_name,
+            source_zone: None,
             filename,
             asset_metadata,
             item_type_val,
@@ -306,6 +314,15 @@ impl PhotoAsset {
 
     /// Construct from typed `Record` structs (used by album pagination).
     pub fn from_records(master: super::cloudkit::Record, asset: &super::cloudkit::Record) -> Self {
+        Self::from_records_in_zone(master, asset, None)
+    }
+
+    /// Construct from typed `Record` structs and pin the CloudKit source zone.
+    pub(crate) fn from_records_in_zone(
+        master: super::cloudkit::Record,
+        asset: &super::cloudkit::Record,
+        source_zone: Option<Arc<str>>,
+    ) -> Self {
         let filename = decode_filename(&master.fields).map(String::into_boxed_str);
         let item_type_val = Some(resolve_item_type(&master.fields, filename.as_deref()));
         let asset_date_ms = asset
@@ -327,6 +344,8 @@ impl PhotoAsset {
         let asset_metadata = Arc::new(metadata::extract(&master.fields, &asset.fields));
         Self {
             record_name: Arc::from(master.record_name),
+            asset_record_name: Arc::from(asset.record_name.as_str()),
+            source_zone,
             filename,
             asset_metadata,
             item_type_val,
@@ -351,6 +370,22 @@ impl PhotoAsset {
 
     pub fn id(&self) -> &str {
         &self.record_name
+    }
+
+    /// Return the CPLAsset record name. Album membership records point at this
+    /// value via `CPLContainerRelation.itemId`.
+    pub(crate) fn asset_record_name(&self) -> &str {
+        &self.asset_record_name
+    }
+
+    /// Return the CloudKit zone that produced this asset when known.
+    pub(crate) fn source_zone(&self) -> Option<&str> {
+        self.source_zone.as_deref()
+    }
+
+    pub(crate) fn with_source_zone(mut self, source_zone: Arc<str>) -> Self {
+        self.source_zone = Some(source_zone);
+        self
     }
 
     /// True when the CloudKit record carried a usable recordName.

@@ -123,6 +123,8 @@ pub struct PhotoAlbumConfig {
     pub page_size: usize,
     pub zone_id: Arc<Value>,
     pub retry_config: RetryConfig,
+    pub container_id: Option<Arc<str>>,
+    pub cross_zone_sources: Vec<PhotoAlbum>,
 }
 
 pub struct PhotoAlbum {
@@ -136,6 +138,8 @@ pub struct PhotoAlbum {
     page_size: usize,
     zone_id: Arc<Value>,
     retry_config: RetryConfig,
+    container_id: Option<Arc<str>>,
+    cross_zone_sources: Vec<PhotoAlbum>,
 }
 
 impl std::fmt::Debug for PhotoAlbum {
@@ -163,6 +167,8 @@ impl PhotoAlbum {
             page_size: config.page_size,
             zone_id: config.zone_id,
             retry_config: config.retry_config,
+            container_id: config.container_id,
+            cross_zone_sources: config.cross_zone_sources,
         }
     }
 
@@ -175,6 +181,19 @@ impl PhotoAlbum {
             .get("zoneName")
             .and_then(|v| v.as_str())
             .unwrap_or("")
+    }
+
+    pub(crate) fn with_cross_zone_sources(mut self, sources: Vec<PhotoAlbum>) -> Self {
+        self.cross_zone_sources = sources;
+        self
+    }
+
+    pub(crate) fn clone_for_cross_zone_source(&self) -> PhotoAlbum {
+        self.clone_for_task_without_sources()
+    }
+
+    fn has_cross_zone_hydration(&self) -> bool {
+        self.container_id.is_some() && !self.cross_zone_sources.is_empty()
     }
 
     /// Return total item count for this album via `HyperionIndexCountLookup`.
@@ -416,6 +435,15 @@ impl PhotoAlbum {
         concurrency: usize,
         page_size_override: Option<usize>,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
+        if self.has_cross_zone_hydration() {
+            return self.photo_stream_with_cross_zone_hydration(
+                limit,
+                total_count,
+                concurrency,
+                page_size_override,
+            );
+        }
+
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
         let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -448,6 +476,320 @@ impl PhotoAlbum {
         });
 
         (stream, token_rx)
+    }
+
+    fn photo_stream_with_cross_zone_hydration(
+        &self,
+        limit: Option<u32>,
+        total_count: Option<u64>,
+        concurrency: usize,
+        page_size_override: Option<usize>,
+    ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
+        let (tx, rx) = mpsc::channel::<anyhow::Result<PhotoAsset>>(500);
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+        let (base_stream, base_token_rx) = self.photo_stream_with_token_inner_no_cross_zone(
+            limit,
+            total_count,
+            concurrency,
+            page_size_override,
+        );
+        let Some(container_id) = self.container_id.clone() else {
+            let _ = token_tx.send(None);
+            return (
+                Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+                token_rx,
+            );
+        };
+        let album_name = Arc::clone(&self.name);
+        let sources = self.cross_zone_sources_for_task();
+        let owner = self.clone_for_task_without_sources();
+
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+
+            let mut base_stream = Box::pin(base_stream);
+            let mut seen_asset_records = FxHashSet::<String>::default();
+            let mut base_seen = 0u64;
+            let mut stream_error = false;
+
+            while let Some(item) = base_stream.next().await {
+                match item {
+                    Ok(asset) => {
+                        seen_asset_records.insert(asset.asset_record_name().to_string());
+                        base_seen += 1;
+                        if tx.send(Ok(asset)).await.is_err() {
+                            let _ = token_tx.send(None);
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        stream_error = true;
+                        let _ = tx.send(Err(e)).await;
+                    }
+                }
+            }
+
+            let base_token = base_token_rx.await.ok().flatten();
+            let should_hydrate =
+                limit.is_none() && total_count.is_some_and(|expected| base_seen < expected);
+            if stream_error {
+                let _ = token_tx.send(None);
+                return;
+            }
+            if !should_hydrate {
+                let _ = token_tx.send(base_token);
+                return;
+            }
+
+            let relation_ids = match owner.album_relation_item_ids(&container_id).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    let _ = token_tx.send(None);
+                    return;
+                }
+            };
+            let mut missing: FxHashSet<String> = relation_ids
+                .into_iter()
+                .filter(|id| !seen_asset_records.contains(id))
+                .collect();
+            if missing.is_empty() {
+                let _ = token_tx.send(None);
+                return;
+            }
+
+            tracing::info!(
+                album = %album_name,
+                base_seen,
+                missing = missing.len(),
+                "Album relation records exceed owner-zone assets; checking bounded cross-zone sources"
+            );
+
+            let mut hydrated = 0usize;
+            for source in sources {
+                if missing.is_empty() {
+                    break;
+                }
+                let missing_before = missing.len();
+                match source
+                    .send_matching_assets_from_changes(&mut missing, &tx)
+                    .await
+                {
+                    Ok(()) => {
+                        hydrated += missing_before.saturating_sub(missing.len());
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        let _ = token_tx.send(None);
+                        return;
+                    }
+                }
+            }
+
+            if hydrated > 0 {
+                tracing::info!(
+                    album = %album_name,
+                    base_seen,
+                    hydrated,
+                    unresolved = missing.len(),
+                    "Album spans multiple CloudKit zones; hydrated bounded cross-zone members"
+                );
+            }
+
+            if !missing.is_empty() {
+                let sample: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
+                tracing::warn!(
+                    album = %album_name,
+                    unresolved = missing.len(),
+                    sample = ?sample,
+                    "Album has unresolved relation records; continuing with visible downloadable assets"
+                );
+            }
+
+            // Cross-zone hydration currently replays full relation/source-zone
+            // scans. Suppress the owner zone token until incremental relation
+            // semantics are implemented.
+            let _ = token_tx.send(None);
+        });
+
+        (
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            token_rx,
+        )
+    }
+
+    fn photo_stream_with_token_inner_no_cross_zone(
+        &self,
+        limit: Option<u32>,
+        total_count: Option<u64>,
+        concurrency: usize,
+        page_size_override: Option<usize>,
+    ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+        let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let (stream, handles) = self.photo_stream_inner(
+            limit,
+            total_count,
+            concurrency,
+            Some(fetcher_sync_tokens.clone()),
+            page_size_override,
+        );
+        let album_name = Arc::clone(&self.name);
+
+        tokio::spawn(async move {
+            let fetcher_panicked = await_fetcher_handles(handles).await;
+            let final_token = if fetcher_panicked {
+                None
+            } else {
+                let tokens = fetcher_sync_tokens.lock().await;
+                unanimous_fetcher_sync_token(&album_name, &tokens)
+            };
+            let _ = token_tx.send(final_token);
+        });
+
+        (stream, token_rx)
+    }
+
+    fn clone_for_task_without_sources(&self) -> PhotoAlbum {
+        PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::clone(&self.params),
+                service_endpoint: Arc::clone(&self.service_endpoint),
+                name: Arc::clone(&self.name),
+                list_type: Arc::clone(&self.list_type),
+                obj_type: Arc::clone(&self.obj_type),
+                query_filter: self.query_filter.as_ref().map(Arc::clone),
+                page_size: self.page_size,
+                zone_id: Arc::clone(&self.zone_id),
+                retry_config: self.retry_config,
+                container_id: self.container_id.as_ref().map(Arc::clone),
+                cross_zone_sources: Vec::new(),
+            },
+            self.session.clone_box(),
+        )
+    }
+
+    fn cross_zone_sources_for_task(&self) -> Vec<PhotoAlbum> {
+        self.cross_zone_sources
+            .iter()
+            .map(Self::clone_for_task_without_sources)
+            .collect()
+    }
+
+    async fn album_relation_item_ids(
+        &self,
+        container_id: &str,
+    ) -> anyhow::Result<FxHashSet<String>> {
+        let mut ids = FxHashSet::default();
+        self.scan_changes_zone(|record| {
+            if record.record_type != "CPLContainerRelation" {
+                return;
+            }
+            if record.deleted == Some(true) {
+                return;
+            }
+            let container = record
+                .fields
+                .get("containerId")
+                .and_then(|f| f.get("value"))
+                .and_then(Value::as_str);
+            if container != Some(container_id) {
+                return;
+            }
+            if let Some(item_id) = record
+                .fields
+                .get("itemId")
+                .and_then(|f| f.get("value"))
+                .and_then(Value::as_str)
+            {
+                ids.insert(item_id.to_string());
+            }
+        })
+        .await?;
+        Ok(ids)
+    }
+
+    async fn send_matching_assets_from_changes(
+        &self,
+        missing_asset_record_names: &mut FxHashSet<String>,
+        tx: &mpsc::Sender<anyhow::Result<PhotoAsset>>,
+    ) -> anyhow::Result<()> {
+        let source_zone: Arc<str> = Arc::from(self.zone_name());
+        let mut buffer = DeltaRecordBuffer::new();
+        let mut matched = Vec::new();
+        self.scan_changes_zone(|record| {
+            let events = buffer.process_records(vec![record]);
+            for event in events {
+                let Some(asset) = event.asset else {
+                    continue;
+                };
+                if missing_asset_record_names.remove(asset.asset_record_name()) {
+                    let asset = asset.with_source_zone(Arc::clone(&source_zone));
+                    matched.push(asset);
+                }
+            }
+        })
+        .await?;
+
+        for event in buffer.flush() {
+            let Some(asset) = event.asset else {
+                continue;
+            };
+            if missing_asset_record_names.remove(asset.asset_record_name()) {
+                let asset = asset.with_source_zone(Arc::clone(&source_zone));
+                matched.push(asset);
+            }
+        }
+        for asset in matched {
+            tx.send(Ok(asset)).await?;
+        }
+        Ok(())
+    }
+
+    async fn scan_changes_zone<F>(&self, mut on_record: F) -> anyhow::Result<()>
+    where
+        F: FnMut(super::cloudkit::Record),
+    {
+        let url = format!(
+            "{}/changes/zone?{}",
+            self.service_endpoint,
+            encode_params(&self.params)
+        );
+        let mut current_token: Option<String> = None;
+
+        loop {
+            let body = build_changes_zone_request(&self.zone_id, current_token.as_deref(), 200);
+            let response = super::session::retry_post(
+                self.session.as_ref(),
+                &url,
+                &body.to_string(),
+                &[("Content-type", "text/plain")],
+                &self.retry_config,
+            )
+            .await?;
+
+            let changes_resp: ChangesZoneResponse = serde_json::from_value(response)?;
+            let Some(zone_result) = changes_resp.zones.into_iter().next() else {
+                anyhow::bail!("changes/zone returned empty zones array");
+            };
+            let zone_name = zone_result.zone_id.zone_name.clone();
+            check_changes_zone_error(
+                zone_result.server_error_code.as_deref(),
+                zone_result.reason.as_deref(),
+                &zone_name,
+            )?;
+
+            current_token = Some(zone_result.sync_token);
+            let more_coming = zone_result.more_coming;
+            for record in zone_result.records {
+                on_record(record);
+            }
+            if !more_coming {
+                return Ok(());
+            }
+        }
     }
 
     /// Stream record changes since the given syncToken via `changes/zone`.
@@ -1082,6 +1424,8 @@ impl PhotoAlbum {
                 page_size: 100,
                 zone_id: Arc::new(serde_json::json!({"zoneName": "PrimarySync"})),
                 retry_config: RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
             },
             Box::new(StubSession),
         )
@@ -1153,6 +1497,8 @@ mod tests {
                 page_size,
                 zone_id: Arc::new(zone_id),
                 retry_config: RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
             },
             Box::new(StubSession),
         )
@@ -1184,6 +1530,8 @@ mod tests {
                     page_size: 100,
                     zone_id: Arc::new(default_zone()),
                     retry_config: RetryConfig::default(),
+                    container_id: None,
+                    cross_zone_sources: Vec::new(),
                 },
                 Box::new(session.clone()),
             )
@@ -1364,6 +1712,8 @@ mod tests {
                 page_size,
                 zone_id: Arc::new(default_zone()),
                 retry_config: RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
             },
             session,
         )
@@ -1774,6 +2124,312 @@ mod tests {
                 "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
             }
         })
+    }
+
+    fn container_relation_record(container_id: &str, item_id: &str) -> Value {
+        json!({
+            "recordName": format!("relation-{item_id}"),
+            "recordType": "CPLContainerRelation",
+            "fields": {
+                "containerId": {"value": container_id, "type": "STRING"},
+                "itemId": {"value": item_id, "type": "STRING"}
+            },
+            "recordChangeTag": "ct-relation"
+        })
+    }
+
+    fn changes_page_for_zone(records: Vec<Value>, zone_name: &str, sync_token: &str) -> Value {
+        json!({
+            "zones": [{
+                "zoneID": {"zoneName": zone_name, "ownerRecordName": "_defaultOwner"},
+                "syncToken": sync_token,
+                "moreComing": false,
+                "records": records
+            }]
+        })
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CrossZoneSessionKind {
+        Owner,
+        Source,
+        EmptySource,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CrossZoneSession {
+        kind: CrossZoneSessionKind,
+        owner_query_calls: Arc<std::sync::atomic::AtomicUsize>,
+        owner_changes_calls: Arc<std::sync::atomic::AtomicUsize>,
+        source_changes_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CrossZoneSession {
+        fn new(
+            kind: CrossZoneSessionKind,
+            owner_query_calls: Arc<std::sync::atomic::AtomicUsize>,
+            owner_changes_calls: Arc<std::sync::atomic::AtomicUsize>,
+            source_changes_calls: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            Self {
+                kind,
+                owner_query_calls,
+                owner_changes_calls,
+                source_changes_calls,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for CrossZoneSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/records/query") {
+                assert!(
+                    matches!(self.kind, CrossZoneSessionKind::Owner),
+                    "only the owner album should use records/query"
+                );
+                let call = self
+                    .owner_query_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    return Ok(mock_photo_query_page("master-owner", Some("owner-token")));
+                }
+                return Ok(json!({"records": [], "syncToken": "owner-token"}));
+            }
+
+            if url.contains("/changes/zone") {
+                return match self.kind {
+                    CrossZoneSessionKind::Owner => {
+                        self.owner_changes_calls
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(changes_page_for_zone(
+                            vec![
+                                container_relation_record("album-container", "asset-master-owner"),
+                                container_relation_record("album-container", "asset-master-shared"),
+                            ],
+                            "PrimarySync",
+                            "owner-changes-token",
+                        ))
+                    }
+                    CrossZoneSessionKind::Source => {
+                        self.source_changes_calls
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(changes_page_for_zone(
+                            test_records("master-shared"),
+                            "SharedSync-abc",
+                            "source-changes-token",
+                        ))
+                    }
+                    CrossZoneSessionKind::EmptySource => {
+                        self.source_changes_calls
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(changes_page_for_zone(
+                            Vec::new(),
+                            "SharedSync-abc",
+                            "source-changes-token",
+                        ))
+                    }
+                };
+            }
+
+            anyhow::bail!("unexpected URL: {url}")
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn make_cross_zone_album(
+        zone_name: &str,
+        session: CrossZoneSession,
+        container_id: Option<Arc<str>>,
+        cross_zone_sources: Vec<PhotoAlbum>,
+    ) -> PhotoAlbum {
+        PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("TestAlbum"),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(json!({"zoneName": zone_name})),
+                retry_config: RetryConfig::default(),
+                container_id,
+                cross_zone_sources,
+            },
+            Box::new(session),
+        )
+    }
+
+    type CrossZoneTestSetup = (
+        PhotoAlbum,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
+
+    fn make_cross_zone_owner_album() -> CrossZoneTestSetup {
+        make_cross_zone_owner_album_with_source_kind(CrossZoneSessionKind::Source)
+    }
+
+    fn make_cross_zone_owner_album_with_source_kind(
+        source_kind: CrossZoneSessionKind,
+    ) -> CrossZoneTestSetup {
+        let owner_query_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner_changes_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source_changes_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner_session = CrossZoneSession::new(
+            CrossZoneSessionKind::Owner,
+            Arc::clone(&owner_query_calls),
+            Arc::clone(&owner_changes_calls),
+            Arc::clone(&source_changes_calls),
+        );
+        let source_session = CrossZoneSession::new(
+            source_kind,
+            Arc::clone(&owner_query_calls),
+            Arc::clone(&owner_changes_calls),
+            Arc::clone(&source_changes_calls),
+        );
+        let source = make_cross_zone_album("SharedSync-abc", source_session, None, Vec::new());
+        let owner = make_cross_zone_album(
+            "PrimarySync",
+            owner_session,
+            Some(Arc::from("album-container")),
+            vec![source],
+        );
+        (
+            owner,
+            owner_query_calls,
+            owner_changes_calls,
+            source_changes_calls,
+        )
+    }
+
+    #[tokio::test]
+    async fn photo_stream_hydrates_named_album_members_from_other_zones() {
+        use tokio_stream::StreamExt;
+
+        let (owner, owner_query_calls, owner_changes_calls, source_changes_calls) =
+            make_cross_zone_owner_album();
+
+        let (stream, token_rx) = owner.photo_stream_with_token(None, Some(2), 1);
+        tokio::pin!(stream);
+
+        let mut assets = Vec::new();
+        while let Some(result) = stream.next().await {
+            assets.push(result.expect("photo asset should be Ok"));
+        }
+
+        assert_eq!(assets.len(), 2);
+        assert!(assets.iter().any(|asset| asset.id() == "master-owner"
+            && asset.asset_record_name() == "asset-master-owner"
+            && asset.source_zone().is_none()));
+        assert!(assets.iter().any(|asset| asset.id() == "master-shared"
+            && asset.asset_record_name() == "asset-master-shared"
+            && asset.source_zone() == Some("SharedSync-abc")));
+        assert_eq!(
+            token_rx.await.expect("sync token sender"),
+            None,
+            "cross-zone hydration suppresses owner-zone token advancement"
+        );
+        assert_eq!(
+            owner_query_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "base enumeration should stop after the owner page plus empty tail"
+        );
+        assert_eq!(
+            owner_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "owner zone relation scan should run only when base enumeration is short"
+        );
+        assert_eq!(
+            source_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "source zone scan should be bounded to missing relation members"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn photo_stream_warns_but_continues_for_unresolved_relation_members() {
+        use tokio_stream::StreamExt;
+
+        let (owner, _owner_query_calls, owner_changes_calls, source_changes_calls) =
+            make_cross_zone_owner_album_with_source_kind(CrossZoneSessionKind::EmptySource);
+
+        let (stream, token_rx) = owner.photo_stream_with_token(None, Some(2), 1);
+        tokio::pin!(stream);
+
+        let mut assets = Vec::new();
+        while let Some(result) = stream.next().await {
+            assets.push(result.expect("unresolved relation records should warn, not error"));
+        }
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].id(), "master-owner");
+        assert_eq!(
+            token_rx.await.expect("sync token sender"),
+            None,
+            "unresolved relation records suppress owner-zone token advancement"
+        );
+        assert_eq!(
+            owner_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "owner relation scan should still run"
+        );
+        assert_eq!(
+            source_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "source zone scan should try to resolve relation members"
+        );
+        assert!(logs_contain("unresolved=1"));
+        assert!(logs_contain("Album has unresolved relation records"));
+    }
+
+    #[tokio::test]
+    async fn photo_stream_recent_limit_does_not_cross_zone_over_hydrate() {
+        use tokio_stream::StreamExt;
+
+        let (owner, owner_query_calls, owner_changes_calls, source_changes_calls) =
+            make_cross_zone_owner_album();
+
+        let (stream, token_rx) = owner.photo_stream_with_token(Some(1), Some(2), 1);
+        tokio::pin!(stream);
+
+        let mut assets = Vec::new();
+        while let Some(result) = stream.next().await {
+            assets.push(result.expect("photo asset should be Ok"));
+        }
+
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].id(), "master-owner");
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("owner-token")
+        );
+        assert_eq!(
+            owner_query_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "recent limit should stop at the requested owner-zone item"
+        );
+        assert_eq!(
+            owner_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "recent-limited streams should not widen into full relation scans"
+        );
+        assert_eq!(
+            source_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "recent-limited streams should not scan source zones"
+        );
     }
 
     #[tokio::test]

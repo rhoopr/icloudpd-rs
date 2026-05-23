@@ -254,6 +254,10 @@ pub(super) struct DownloadTask {
     /// iCloud asset ID for state tracking. Shared with the producer's
     /// dedup set and any deferred state writes via refcount bump.
     pub(super) asset_id: Arc<str>,
+    /// CloudKit zone that owns this asset. Usually matches the pass config's
+    /// library, but cross-zone album hydration can produce bounded assets
+    /// from another zone while preserving the album pass context.
+    pub(super) library: Arc<str>,
     /// Metadata fields surfaced from `AssetMetadata` for writer consumption.
     /// Behind `Arc` so `task.metadata.clone()` in the download hot path is a
     /// refcount bump instead of a deep clone of every `Vec<String>` inside.
@@ -1234,6 +1238,10 @@ pub(super) fn filter_asset_to_tasks(
     let mut tasks = SmallVec::new();
     let mut effective_primary_filename: Option<String> = None;
     let mut seen_urls = SmallVec::<[Box<str>; 4]>::new();
+    let task_library: Arc<str> = asset
+        .source_zone()
+        .map(Arc::from)
+        .unwrap_or_else(|| Arc::clone(&config.library));
 
     if let Some(d) = derive_primary(asset, config, &ctx) {
         let strategy = match config.file_match_policy {
@@ -1284,6 +1292,7 @@ pub(super) fn filter_asset_to_tasks(
                 download_path: p,
                 checksum,
                 asset_id: asset.id_arc(),
+                library: Arc::clone(&task_library),
                 metadata: Arc::clone(&payload),
                 size,
                 created_local: ctx.created_local,
@@ -1335,6 +1344,7 @@ pub(super) fn filter_asset_to_tasks(
                 download_path: p,
                 checksum,
                 asset_id: asset.id_arc(),
+                library: Arc::clone(&task_library),
                 metadata: Arc::clone(&payload),
                 size,
                 created_local: ctx.created_local,
@@ -1389,6 +1399,7 @@ pub(super) fn filter_asset_to_tasks(
                 download_path: p,
                 checksum,
                 asset_id: asset.id_arc(),
+                library: task_library,
                 metadata: Arc::clone(&payload),
                 size,
                 created_local: ctx.created_local,
