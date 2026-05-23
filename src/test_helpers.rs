@@ -4,7 +4,7 @@
 //! and reusable mock implementations of core traits.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -451,15 +451,23 @@ pub(crate) fn mock_photo_query_page(record_name: &str, sync_token: Option<&str>)
 }
 
 fn mock_photo_records(record_name: &str) -> Vec<Value> {
+    mock_photo_records_for_zone_with_filename(record_name, "PrimarySync", "test.jpg")
+}
+
+pub(crate) fn mock_photo_records_for_zone_with_filename(
+    record_name: &str,
+    zone: &str,
+    filename: &str,
+) -> Vec<Value> {
     vec![
         json!({
             "recordName": record_name,
             "recordType": "CPLMaster",
             "fields": {
-                "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
+                "filenameEnc": {"value": filename, "type": "STRING"},
                 "resOriginalRes": {
                     "value": {
-                        "downloadURL": "https://p01.icloud-content.com/photo.jpg",
+                        "downloadURL": format!("https://p01.icloud-content.com/{record_name}.jpg"),
                         "size": 1024,
                         "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
                     }
@@ -477,18 +485,161 @@ fn mock_photo_records(record_name: &str) -> Vec<Value> {
             "recordType": "CPLAsset",
             "fields": {
                 "masterRef": {
-                    "value": {
-                        "recordName": record_name,
-                        "zoneID": {"zoneName": "PrimarySync"}
+                        "value": {
+                            "recordName": record_name,
+                            "zoneID": {"zoneName": zone}
+                        },
+                        "type": "REFERENCE"
                     },
-                    "type": "REFERENCE"
-                },
                 "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
                 "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
             },
             "recordChangeTag": "ct2"
         }),
     ]
+}
+
+#[derive(Clone, Debug)]
+pub struct DynamicRecentPhotosSession {
+    ids: Arc<Vec<String>>,
+    zone: Arc<str>,
+    token: Arc<str>,
+    filename_prefix: Arc<str>,
+    error_at_offset: Option<u64>,
+    offsets: Arc<Mutex<Vec<u64>>>,
+    results_limits: Arc<Mutex<Vec<u64>>>,
+    emitted_ids: Arc<Mutex<Vec<String>>>,
+}
+
+impl DynamicRecentPhotosSession {
+    pub fn new(total_assets: u64) -> Self {
+        Self::from_ids(
+            (0..total_assets)
+                .map(|i| format!("master-{i:04}"))
+                .collect(),
+        )
+    }
+
+    pub fn from_ids(ids: Vec<String>) -> Self {
+        Self {
+            ids: Arc::new(ids),
+            zone: Arc::from("PrimarySync"),
+            token: Arc::from("zone-token"),
+            filename_prefix: Arc::from("photo"),
+            error_at_offset: None,
+            offsets: Arc::new(Mutex::new(Vec::new())),
+            results_limits: Arc::new(Mutex::new(Vec::new())),
+            emitted_ids: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn with_zone(mut self, zone: &str) -> Self {
+        self.zone = Arc::from(zone);
+        self
+    }
+
+    pub fn with_token(mut self, token: &str) -> Self {
+        self.token = Arc::from(token);
+        self
+    }
+
+    pub fn with_filename_prefix(mut self, prefix: &str) -> Self {
+        self.filename_prefix = Arc::from(prefix);
+        self
+    }
+
+    pub fn with_error_at_offset(mut self, offset: u64) -> Self {
+        self.error_at_offset = Some(offset);
+        self
+    }
+
+    pub fn offsets(&self) -> Vec<u64> {
+        self.offsets.lock().expect("offsets lock").clone()
+    }
+
+    pub fn results_limits(&self) -> Vec<u64> {
+        self.results_limits
+            .lock()
+            .expect("results limits lock")
+            .clone()
+    }
+
+    pub fn emitted_ids(&self) -> Vec<String> {
+        self.emitted_ids.lock().expect("emitted ids lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for DynamicRecentPhotosSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/internal/records/query/batch") {
+            return Ok(json!({
+                "batch": [{"records": [{"fields": {"itemCount": {"value": self.ids.len() as u64}}}]}]
+            }));
+        }
+
+        if !url.contains("/records/query?") {
+            return Ok(json!({"records": []}));
+        }
+
+        let request: Value = serde_json::from_str(&body)?;
+        let offset = request["query"]["filterBy"]
+            .as_array()
+            .and_then(|filters| {
+                filters.iter().find_map(|filter| {
+                    (filter["fieldName"] == "startRank")
+                        .then(|| filter["fieldValue"]["value"].as_u64())
+                        .flatten()
+                })
+            })
+            .unwrap_or(0);
+        let results_limit = request["resultsLimit"].as_u64().unwrap_or(0);
+        self.offsets.lock().expect("offsets lock").push(offset);
+        self.results_limits
+            .lock()
+            .expect("results limits lock")
+            .push(results_limit);
+
+        if self
+            .error_at_offset
+            .is_some_and(|error_offset| offset >= error_offset)
+        {
+            return Err(anyhow::anyhow!(
+                "simulated records/query failure at offset {offset}"
+            ));
+        }
+
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        let page_assets = usize::try_from(results_limit / 2).unwrap_or(usize::MAX);
+        let end = start.saturating_add(page_assets).min(self.ids.len());
+        if start >= end {
+            return Ok(json!({"records": [], "syncToken": self.token.as_ref()}));
+        }
+
+        let mut emitted = self.emitted_ids.lock().expect("emitted ids lock");
+        let mut records = Vec::with_capacity((end - start) * 2);
+        for index in start..end {
+            let id = &self.ids[index];
+            emitted.push(id.clone());
+            records.extend(mock_photo_records_for_zone_with_filename(
+                id,
+                &self.zone,
+                &format!("{}-{index:04}.jpg", self.filename_prefix),
+            ));
+        }
+        drop(emitted);
+
+        Ok(json!({"records": records, "syncToken": self.token.as_ref()}))
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
 }
 
 impl Default for MockPhotosFlow {

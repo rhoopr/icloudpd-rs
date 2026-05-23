@@ -75,6 +75,175 @@ fn determine_fetcher_count(total_items: u64, page_size: usize, concurrency: usiz
     pages_as_usize.min(concurrency).max(1)
 }
 
+/// Profile for CloudKit record enumeration.
+///
+/// This intentionally separates *which ranks are enumerated* from *how much
+/// URL-bearing data is allowed to sit ahead of the downloader*. Download mode
+/// can use smaller pages and less concurrency to keep signed CDN URLs fresh,
+/// but it must not change the covered rank range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhotoStreamProfile {
+    FastEnumeration { concurrency: usize },
+    BackpressuredDownload { download_concurrency: usize },
+}
+
+impl PhotoStreamProfile {
+    fn request_page_size(self, default_page_size: usize) -> usize {
+        match self {
+            Self::FastEnumeration { .. } => default_page_size.max(1),
+            Self::BackpressuredDownload {
+                download_concurrency,
+            } => download_stream_page_size(default_page_size, download_concurrency),
+        }
+    }
+
+    fn fetcher_concurrency(self) -> usize {
+        match self {
+            Self::FastEnumeration { concurrency } => concurrency.max(1),
+            Self::BackpressuredDownload { .. } => 1,
+        }
+    }
+
+    fn allow_initial_boundary_probe(self) -> bool {
+        matches!(self, Self::FastEnumeration { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FetcherRange {
+    start: u64,
+    end: u64,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnumerationPlan {
+    page_size: usize,
+    ranges: Vec<FetcherRange>,
+}
+
+impl EnumerationPlan {
+    fn channel_fetchers(&self) -> usize {
+        self.ranges.len().max(1)
+    }
+
+    #[cfg(test)]
+    fn covers_prefix(&self, end: u64) -> bool {
+        if end == 0 {
+            return true;
+        }
+
+        let mut ranges = self.ranges.clone();
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut cursor = 0;
+        for range in ranges {
+            if range.end <= cursor {
+                continue;
+            }
+            if range.start > cursor {
+                return false;
+            }
+            cursor = range.end;
+            if cursor >= end {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn effective_total(limit: Option<u32>, total_count: Option<u64>) -> Option<u64> {
+    total_count
+        .map(|tc| limit.map_or(tc, |lim| tc.min(u64::from(lim))))
+        .or_else(|| limit.map(u64::from))
+}
+
+fn range_limit(limit: Option<u32>, start: u64, end: u64) -> Option<u32> {
+    limit.map(|lim| {
+        let remaining = u64::from(lim).saturating_sub(start);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "bounded by min(end-start, limit) where both operands originated from u32 fetcher limits"
+        )]
+        {
+            remaining.min(end.saturating_sub(start)) as u32
+        }
+    })
+}
+
+fn push_fetcher_range(ranges: &mut Vec<FetcherRange>, limit: Option<u32>, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    ranges.push(FetcherRange {
+        start,
+        end,
+        limit: range_limit(limit, start, end),
+    });
+}
+
+fn build_enumeration_plan(
+    limit: Option<u32>,
+    total_count: Option<u64>,
+    default_page_size: usize,
+    profile: PhotoStreamProfile,
+) -> EnumerationPlan {
+    let page_size = profile.request_page_size(default_page_size);
+    let Some(total) = effective_total(limit, total_count).map(|total| total.max(1)) else {
+        return EnumerationPlan {
+            page_size,
+            ranges: vec![FetcherRange {
+                start: 0,
+                end: u64::MAX,
+                limit,
+            }],
+        };
+    };
+
+    let concurrency = profile.fetcher_concurrency();
+    let num_fetchers = if concurrency > 1 {
+        determine_fetcher_count(total, page_size, concurrency * 2)
+    } else {
+        1
+    };
+    let initial_boundary_probe = profile.allow_initial_boundary_probe()
+        && concurrency > 1
+        && total >= page_size as u64
+        && page_size > 1
+        && limit.is_some();
+    let chunk_size_items = {
+        let raw = total.div_ceil(num_fetchers as u64);
+        let ps = page_size as u64;
+        raw.div_ceil(ps) * ps
+    };
+
+    let mut ranges = Vec::with_capacity(num_fetchers + usize::from(initial_boundary_probe) * 2);
+    for i in 0..num_fetchers {
+        let mut start = i as u64 * chunk_size_items;
+        let end = ((i as u64 + 1) * chunk_size_items).min(total);
+        if start >= total {
+            break;
+        }
+        if initial_boundary_probe && i == 0 {
+            let boundary_start = page_size as u64 - 1;
+            let boundary_end = (page_size as u64).min(total);
+            ranges.push(FetcherRange {
+                start: boundary_start,
+                end: boundary_end,
+                limit: Some(1),
+            });
+            push_fetcher_range(&mut ranges, limit, start, end.min(boundary_start));
+            push_fetcher_range(&mut ranges, limit, boundary_end, end);
+            continue;
+        } else if initial_boundary_probe && i > 0 {
+            start = start.max(page_size as u64);
+        }
+        push_fetcher_range(&mut ranges, limit, start, end);
+    }
+
+    EnumerationPlan { page_size, ranges }
+}
+
 /// Metadata at DEBUG; raw body only at TRACE. Including the body in
 /// the DEBUG event allocates ~MB per page on busy libraries (every
 /// fetched page formats the full response value).
@@ -375,8 +544,12 @@ impl PhotoAlbum {
         concurrency: usize,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<bool>) {
         let (panic_tx, panic_rx) = tokio::sync::oneshot::channel();
-        let (stream, handles) =
-            self.photo_stream_inner_with_page_size(limit, total_count, concurrency, None, None);
+        let (stream, handles) = self.photo_stream_inner(
+            limit,
+            total_count,
+            PhotoStreamProfile::FastEnumeration { concurrency },
+            None,
+        );
         tokio::spawn(async move {
             let panicked = await_fetcher_handles(handles).await;
             let _ = panic_tx.send(panicked);
@@ -403,7 +576,11 @@ impl PhotoAlbum {
         total_count: Option<u64>,
         concurrency: usize,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
-        self.photo_stream_with_token_inner(limit, total_count, concurrency, None)
+        self.photo_stream_with_token_inner(
+            limit,
+            total_count,
+            PhotoStreamProfile::FastEnumeration { concurrency },
+        )
     }
 
     /// Like `photo_stream_with_token`, but tuned for live downloads.
@@ -420,11 +597,9 @@ impl PhotoAlbum {
         self.photo_stream_with_token_inner(
             limit,
             total_count,
-            1,
-            Some(download_stream_page_size(
-                self.page_size,
+            PhotoStreamProfile::BackpressuredDownload {
                 download_concurrency,
-            )),
+            },
         )
     }
 
@@ -432,16 +607,10 @@ impl PhotoAlbum {
         &self,
         limit: Option<u32>,
         total_count: Option<u64>,
-        concurrency: usize,
-        page_size_override: Option<usize>,
+        profile: PhotoStreamProfile,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         if self.has_cross_zone_hydration() {
-            return self.photo_stream_with_cross_zone_hydration(
-                limit,
-                total_count,
-                concurrency,
-                page_size_override,
-            );
+            return self.photo_stream_with_cross_zone_hydration(limit, total_count, profile);
         }
 
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
@@ -451,9 +620,8 @@ impl PhotoAlbum {
         let (stream, handles) = self.photo_stream_inner(
             limit,
             total_count,
-            concurrency,
+            profile,
             Some(fetcher_sync_tokens.clone()),
-            page_size_override,
         );
         let album_name = Arc::clone(&self.name);
 
@@ -482,17 +650,12 @@ impl PhotoAlbum {
         &self,
         limit: Option<u32>,
         total_count: Option<u64>,
-        concurrency: usize,
-        page_size_override: Option<usize>,
+        profile: PhotoStreamProfile,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         let (tx, rx) = mpsc::channel::<anyhow::Result<PhotoAsset>>(500);
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
-        let (base_stream, base_token_rx) = self.photo_stream_with_token_inner_no_cross_zone(
-            limit,
-            total_count,
-            concurrency,
-            page_size_override,
-        );
+        let (base_stream, base_token_rx) =
+            self.photo_stream_with_token_inner_no_cross_zone(limit, total_count, profile);
         let Some(container_id) = self.container_id.clone() else {
             let _ = token_tx.send(None);
             return (
@@ -622,8 +785,7 @@ impl PhotoAlbum {
         &self,
         limit: Option<u32>,
         total_count: Option<u64>,
-        concurrency: usize,
-        page_size_override: Option<usize>,
+        profile: PhotoStreamProfile,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
         let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
@@ -632,9 +794,8 @@ impl PhotoAlbum {
         let (stream, handles) = self.photo_stream_inner(
             limit,
             total_count,
-            concurrency,
+            profile,
             Some(fetcher_sync_tokens.clone()),
-            page_size_override,
         );
         let album_name = Arc::clone(&self.name);
 
@@ -932,136 +1093,31 @@ impl PhotoAlbum {
         &self,
         limit: Option<u32>,
         total_count: Option<u64>,
-        concurrency: usize,
+        profile: PhotoStreamProfile,
         fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
-        page_size_override: Option<usize>,
     ) -> (PhotoStream, Vec<JoinHandle<()>>) {
-        self.photo_stream_inner_with_page_size(
-            limit,
-            total_count,
-            concurrency,
-            fetcher_sync_tokens,
-            page_size_override,
-        )
-    }
+        let plan = build_enumeration_plan(limit, total_count, self.page_size, profile);
+        let (tx, rx) = mpsc::channel::<anyhow::Result<PhotoAsset>>(
+            (plan.page_size * plan.channel_fetchers()).min(500),
+        );
+        let mut handles = Vec::with_capacity(plan.ranges.len());
 
-    fn photo_stream_inner_with_page_size(
-        &self,
-        limit: Option<u32>,
-        total_count: Option<u64>,
-        concurrency: usize,
-        fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
-        page_size_override: Option<usize>,
-    ) -> (PhotoStream, Vec<JoinHandle<()>>) {
-        let page_size = page_size_override.unwrap_or(self.page_size).max(1);
-        let mut handles = Vec::new();
-
-        // Compute effective total, capped by --recent if set.
-        let effective_total = total_count
-            .map(|tc| limit.map_or(tc, |lim| tc.min(u64::from(lim))))
-            .or_else(|| limit.map(u64::from));
-
-        // Use 2x concurrency for enumeration fetchers — Apple's CloudKit
-        // doesn't throttle at these levels and it halves enumeration time.
-        //
-        // Even when the count fits in one fetcher, keep the known bound. The
-        // empty-page gap probe is valuable when no count is available, but
-        // after a successful `len()` call it used to spend five extra HTTP
-        // round trips walking the empty tail of every small album.
-        let (num_fetchers, bounded_total) = match effective_total {
-            Some(total) => {
-                let fetchers = if concurrency > 1 {
-                    determine_fetcher_count(total, page_size, concurrency * 2)
-                } else {
-                    1
-                };
-                // Fetch one page for empty albums so a page syncToken can
-                // still be observed before the stream completes.
-                (fetchers, Some(total.max(1)))
-            }
-            None => (1, None),
-        };
-
-        // Apple's first bounded records/query page can return 199 records:
-        // 99 complete CPLMaster/CPLAsset pairs plus one dangling CPLAsset
-        // whose CPLMaster lives at rank 99. Without this speculative one-rank
-        // probe, the first fetcher has to spend a second full round trip for
-        // that single missing asset after every other fetcher is done. Run the
-        // probe in parallel and shorten the first chunk to keep the asset
-        // range non-overlapping.
-        let initial_boundary_probe = bounded_total
-            .is_some_and(|total| total >= page_size as u64 && page_size > 1 && limit.is_some());
-        let channel_fetchers = num_fetchers + usize::from(initial_boundary_probe);
-        let (tx, rx) =
-            mpsc::channel::<anyhow::Result<PhotoAsset>>((page_size * channel_fetchers).min(500));
-
-        if let Some(total) = bounded_total {
-            // Partition offset range into non-overlapping chunks aligned to
-            // page_size boundaries so each fetcher starts on a clean page.
-            let chunk_size_items = {
-                let raw = total.div_ceil(num_fetchers as u64);
-                // Round up to next page_size boundary
-                let ps = page_size as u64;
-                raw.div_ceil(ps) * ps
-            };
-
-            tracing::debug!(
-                fetchers = num_fetchers,
-                chunk_size = chunk_size_items,
-                total = total,
-                "Parallel photo enumeration"
-            );
-
-            for i in 0..num_fetchers {
-                let mut start = i as u64 * chunk_size_items;
-                let mut end = ((i as u64 + 1) * chunk_size_items).min(total);
-                if start >= total {
-                    break;
-                }
-                if initial_boundary_probe && i == 0 {
-                    end = end.min(page_size as u64 - 1);
-                    handles.push(self.spawn_fetcher(
-                        tx.clone(),
-                        page_size as u64 - 1,
-                        (page_size as u64).min(total),
-                        Some(1),
-                        fetcher_sync_tokens.clone(),
-                    ));
-                } else if initial_boundary_probe && i > 0 {
-                    start = start.max(page_size as u64);
-                }
-                if start >= end {
-                    continue;
-                }
-                // Per-fetcher limit: don't exceed the chunk size, and for the
-                // last fetcher also respect the global --recent cap.
-                let fetcher_limit = match limit {
-                    Some(lim) => {
-                        let remaining = u64::from(lim).saturating_sub(start);
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            reason = "bounded by min(end-start, limit) where both operands originated from u32 fetcher limits"
-                        )]
-                        let capped = remaining.min(end - start) as u32;
-                        Some(capped)
-                    }
-                    None => None,
-                };
-                handles.push(self.spawn_fetcher(
-                    tx.clone(),
-                    start,
-                    end,
-                    fetcher_limit,
-                    fetcher_sync_tokens.clone(),
-                ));
-            }
-            // Drop our sender so channel closes when all fetchers finish.
-            drop(tx);
-        } else {
+        if effective_total(limit, total_count).is_none() {
             tracing::info!("Fetching photos from iCloud...");
-            // Move tx directly — no clone needed for a single fetcher.
-            handles.push(self.spawn_fetcher(tx, 0, u64::MAX, limit, fetcher_sync_tokens));
         }
+
+        for range in plan.ranges {
+            handles.push(self.spawn_fetcher(
+                tx.clone(),
+                range.start,
+                range.end,
+                range.limit,
+                fetcher_sync_tokens.clone(),
+                plan.page_size,
+            ));
+        }
+        // Drop our sender so channel closes when all fetchers finish.
+        drop(tx);
 
         (
             Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
@@ -1087,6 +1143,7 @@ impl PhotoAlbum {
         end_offset: u64,
         limit: Option<u32>,
         fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+        page_size: usize,
     ) -> JoinHandle<()> {
         let session = self.session.clone_box();
         let service_endpoint = Arc::clone(&self.service_endpoint);
@@ -1095,7 +1152,6 @@ impl PhotoAlbum {
         let list_type = Arc::clone(&self.list_type);
         let query_filter = self.query_filter.as_ref().map(Arc::clone);
         let retry_config = self.retry_config;
-        let page_size = self.page_size;
         let zone_id = Arc::clone(&self.zone_id);
 
         tokio::spawn(async move {
@@ -1435,7 +1491,9 @@ impl PhotoAlbum {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{mock_photo_query_page, MockPhotosFlow, MockPhotosSession};
+    use crate::test_helpers::{
+        mock_photo_query_page, DynamicRecentPhotosSession, MockPhotosFlow, MockPhotosSession,
+    };
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -1643,6 +1701,104 @@ mod tests {
     }
 
     #[test]
+    fn download_profile_plan_covers_entire_recent_window_with_reduced_pages() {
+        let plan = build_enumeration_plan(
+            Some(1000),
+            Some(5000),
+            100,
+            PhotoStreamProfile::BackpressuredDownload {
+                download_concurrency: 10,
+            },
+        );
+
+        assert_eq!(plan.page_size, 20);
+        assert_eq!(
+            plan.ranges,
+            vec![FetcherRange {
+                start: 0,
+                end: 1000,
+                limit: Some(1000),
+            }]
+        );
+        assert!(
+            plan.covers_prefix(1000),
+            "download profile must keep complete recent-window coverage"
+        );
+    }
+
+    #[test]
+    fn fast_profile_parallel_plan_covers_recent_window_with_partitioned_ranges() {
+        let plan = build_enumeration_plan(
+            Some(1000),
+            Some(5000),
+            100,
+            PhotoStreamProfile::FastEnumeration { concurrency: 10 },
+        );
+
+        assert_eq!(plan.page_size, 100);
+        assert!(
+            plan.ranges.len() > 1,
+            "fast profile should keep parallel fetcher ranges"
+        );
+        assert!(
+            plan.covers_prefix(1000),
+            "parallel fast profile must cover the same recent window"
+        );
+    }
+
+    #[test]
+    fn boundary_probe_is_disabled_for_single_fetcher_plans() {
+        let plan = build_enumeration_plan(
+            Some(100),
+            Some(100),
+            100,
+            PhotoStreamProfile::FastEnumeration { concurrency: 1 },
+        );
+
+        assert_eq!(
+            plan.ranges,
+            vec![FetcherRange {
+                start: 0,
+                end: 100,
+                limit: Some(100),
+            }]
+        );
+    }
+
+    #[test]
+    fn boundary_probe_is_explicit_in_parallel_plans_without_losing_coverage() {
+        let plan = build_enumeration_plan(
+            Some(100),
+            Some(100),
+            100,
+            PhotoStreamProfile::FastEnumeration { concurrency: 10 },
+        );
+
+        let mut offsets: Vec<u64> = plan.ranges.iter().map(|range| range.start).collect();
+        offsets.sort_unstable();
+        assert_eq!(offsets, vec![0, 99]);
+        assert!(plan.covers_prefix(100));
+    }
+
+    #[test]
+    fn boundary_probe_keeps_rest_of_first_parallel_chunk() {
+        let plan = build_enumeration_plan(
+            Some(5000),
+            Some(5000),
+            100,
+            PhotoStreamProfile::FastEnumeration { concurrency: 10 },
+        );
+
+        assert!(
+            plan.ranges
+                .iter()
+                .any(|range| range.start == 100 && range.end == 300),
+            "the boundary probe must not drop ranks between the first page and second fetcher"
+        );
+        assert!(plan.covers_prefix(5000));
+    }
+
+    #[test]
     fn test_fetcher_count_partial_page() {
         // 150 items, page_size 100 → 2 pages, concurrency 10 → 2 fetchers
         assert_eq!(determine_fetcher_count(150, 100, 10), 2);
@@ -1806,6 +1962,17 @@ mod tests {
         count
     }
 
+    async fn drain_photo_stream_ids(stream: PhotoStream) -> Vec<String> {
+        use tokio_stream::StreamExt;
+
+        tokio::pin!(stream);
+        let mut ids = Vec::new();
+        while let Some(result) = stream.next().await {
+            ids.push(result.expect("photo asset should be Ok").id().to_string());
+        }
+        ids
+    }
+
     #[tokio::test]
     async fn offline_replay_full_pass_fixture() {
         let mock = MockPhotosFlow::new()
@@ -1850,7 +2017,12 @@ mod tests {
             .build();
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None, None);
+        let (stream, _handles) = album.photo_stream_inner(
+            None,
+            None,
+            PhotoStreamProfile::FastEnumeration { concurrency: 1 },
+            None,
+        );
 
         assert_eq!(
             drain_photo_stream_count(stream).await,
@@ -2461,6 +2633,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_stream_recent_limit_drains_beyond_first_small_page() {
+        let session = DynamicRecentPhotosSession::new(100).with_token("st-dynamic");
+        let album = make_album_with_session(100, Box::new(session.clone()));
+
+        let (stream, token_rx) =
+            album.photo_stream_with_token_for_download(Some(100), Some(100), 10);
+
+        assert_eq!(
+            drain_photo_stream_count(stream).await,
+            100,
+            "download-mode --recent must not stop after the first reduced page"
+        );
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("st-dynamic")
+        );
+        assert_eq!(
+            session.offsets().as_slice(),
+            &[0, 20, 40, 60, 80],
+            "download-mode pagination should advance through every reduced page"
+        );
+        assert!(
+            session.results_limits().iter().all(|limit| *limit == 40),
+            "download-mode fetchers must use the reduced 20-asset page size"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_stream_recent_limit_without_total_count_drains_until_limit() {
+        let session = DynamicRecentPhotosSession::new(100);
+        let album = make_album_with_session(100, Box::new(session.clone()));
+
+        let (stream, token_rx) = album.photo_stream_with_token_for_download(Some(100), None, 10);
+
+        let ids = drain_photo_stream_ids(stream).await;
+        assert_eq!(ids.len(), 100);
+        assert_eq!(ids.first().map(String::as_str), Some("master-0000"));
+        assert_eq!(ids.last().map(String::as_str), Some("master-0099"));
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("zone-token")
+        );
+        assert_eq!(
+            session.offsets().as_slice(),
+            &[0, 20, 40, 60, 80],
+            "unknown-total download-mode --recent should keep paging until the limit"
+        );
+        assert!(
+            session.results_limits().iter().all(|limit| *limit == 40),
+            "download-mode unknown-total requests must use the reduced 20-asset page size"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_stream_recent_limit_boundary_table() {
+        for recent in [19_u32, 20, 21, 99, 100, 101] {
+            let session = DynamicRecentPhotosSession::new(u64::from(recent));
+            let album = make_album_with_session(100, Box::new(session.clone()));
+
+            let (stream, token_rx) = album.photo_stream_with_token_for_download(
+                Some(recent),
+                Some(u64::from(recent)),
+                10,
+            );
+            let ids = drain_photo_stream_ids(stream).await;
+
+            assert_eq!(ids.len(), recent as usize, "recent={recent}");
+            for (expected, id) in ids.iter().enumerate() {
+                assert_eq!(id, &format!("master-{expected:04}"), "recent={recent}");
+            }
+            assert_eq!(
+                token_rx.await.expect("sync token sender").as_deref(),
+                Some("zone-token"),
+                "recent={recent}"
+            );
+            assert_eq!(
+                session.offsets().first().copied(),
+                Some(0),
+                "recent={recent}"
+            );
+            assert!(
+                session.offsets().windows(2).all(|pair| pair[0] < pair[1]),
+                "recent={recent}: offsets must advance monotonically, got {:?}",
+                session.offsets()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_photo_stream_with_token_parallel_fetchers_agree() {
         let album = make_album_with_session(
             1,
@@ -2533,7 +2794,12 @@ mod tests {
             .ok(json!({"records": []}));
         let album = make_album_with_session(100, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(Some(0), Some(10), 1, None, None);
+        let (stream, _handles) = album.photo_stream_inner(
+            Some(0),
+            Some(10),
+            PhotoStreamProfile::FastEnumeration { concurrency: 1 },
+            None,
+        );
         tokio::pin!(stream);
 
         let items: Vec<_> = stream.collect().await;
@@ -2550,7 +2816,12 @@ mod tests {
             .ok(json!({"records": []}));
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(Some(1), Some(10), 1, None, None);
+        let (stream, _handles) = album.photo_stream_inner(
+            Some(1),
+            Some(10),
+            PhotoStreamProfile::FastEnumeration { concurrency: 1 },
+            None,
+        );
         tokio::pin!(stream);
 
         let items: Vec<_> = stream.collect().await;
@@ -2596,7 +2867,12 @@ mod tests {
             .ok(json!({"records": []}));
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None, None);
+        let (stream, _handles) = album.photo_stream_inner(
+            None,
+            None,
+            PhotoStreamProfile::FastEnumeration { concurrency: 1 },
+            None,
+        );
         tokio::pin!(stream);
 
         let mut count = 0u32;
@@ -2629,7 +2905,12 @@ mod tests {
         // consecutive empties to commit to EOF.
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None, None);
+        let (stream, _handles) = album.photo_stream_inner(
+            None,
+            None,
+            PhotoStreamProfile::FastEnumeration { concurrency: 1 },
+            None,
+        );
         tokio::pin!(stream);
 
         let mut count = 0u32;
@@ -2664,7 +2945,12 @@ mod tests {
             .ok(mock_photo_query_page("master-2", None));
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None, None);
+        let (stream, _handles) = album.photo_stream_inner(
+            None,
+            None,
+            PhotoStreamProfile::FastEnumeration { concurrency: 1 },
+            None,
+        );
         tokio::pin!(stream);
 
         let mut count = 0u32;
@@ -2702,7 +2988,12 @@ mod tests {
             .ok(mock_photo_query_page("master-unreachable", None));
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None, None);
+        let (stream, _handles) = album.photo_stream_inner(
+            None,
+            None,
+            PhotoStreamProfile::FastEnumeration { concurrency: 1 },
+            None,
+        );
         tokio::pin!(stream);
 
         let mut count = 0u32;

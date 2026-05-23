@@ -2520,6 +2520,13 @@ mod tests {
         zone: &str,
         session: crate::test_helpers::MockPhotosSession,
     ) -> crate::icloud::photos::PhotoAlbum {
+        make_full_album_with_boxed_session(zone, Box::new(session))
+    }
+
+    fn make_full_album_with_boxed_session(
+        zone: &str,
+        session: Box<dyn crate::icloud::photos::PhotosSession>,
+    ) -> crate::icloud::photos::PhotoAlbum {
         use serde_json::json;
         crate::icloud::photos::PhotoAlbum::new(
             crate::icloud::photos::PhotoAlbumConfig {
@@ -2535,7 +2542,7 @@ mod tests {
                 container_id: None,
                 cross_zone_sources: Vec::new(),
             },
-            Box::new(session),
+            session,
         )
     }
 
@@ -2625,6 +2632,15 @@ mod tests {
     struct RunCycleDownloadConfigOptions {
         media: config::MediaSelection,
         per_pass_paths: bool,
+        recent: Option<u32>,
+    }
+
+    fn media_without_photo_downloads() -> config::MediaSelection {
+        config::MediaSelection {
+            photos: false,
+            videos: true,
+            live_photos: true,
+        }
     }
 
     fn make_run_cycle_download_config_builder(
@@ -2665,6 +2681,7 @@ mod tests {
                 config.folder_structure_albums = Arc::from("{album}");
             }
             config.media = options.media;
+            config.recent = options.recent;
             config.state_db = Some(Arc::clone(&db));
             config.sync_mode = sync_mode;
             config.exclude_asset_ids = exclude_asset_ids;
@@ -2770,6 +2787,178 @@ mod tests {
             controls,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn run_cycle_recent_full_download_does_not_store_zone_token() {
+        let mut config = make_run_cycle_config();
+        config.filters.recent = Some(40);
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let session = crate::test_helpers::DynamicRecentPhotosSession::new(40)
+            .with_filename_prefix("cycle-recent")
+            .with_token("zone-tok-recent");
+        let album = make_full_album_with_boxed_session("PrimarySync", Box::new(session));
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                recent: Some(40),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run recent cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.assets_seen, 40);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token"),
+            None,
+            "recent-limited full cycle must not persist a zone token"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_recent_first_cycle_does_not_seed_incremental_token() {
+        let mut config = make_run_cycle_config();
+        config.filters.recent = Some(20);
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let session = crate::test_helpers::DynamicRecentPhotosSession::new(20)
+            .with_filename_prefix("watch-recent")
+            .with_token("zone-tok-watch");
+        let album = make_full_album_with_boxed_session("PrimarySync", Box::new(session));
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                recent: Some(20),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run first watch-like recent cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token"),
+            None
+        );
+        let next_mode = determine_sync_mode(
+            false,
+            1,
+            Some(db.as_ref()),
+            "sync_token:PrimarySync",
+            "PrimarySync",
+        )
+        .await;
+        assert!(
+            matches!(next_mode, download::SyncMode::Full),
+            "a later watch cycle must not switch to incremental from a recent-limited token"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_recent_multiple_libraries_downloads_each_zone_without_token_advance() {
+        let mut config = make_run_cycle_config();
+        config.filters.recent = Some(20);
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let primary_session = crate::test_helpers::DynamicRecentPhotosSession::new(20)
+            .with_filename_prefix("primary-recent")
+            .with_zone("PrimarySync")
+            .with_token("zone-tok-primary");
+        let shared_session_photos = crate::test_helpers::DynamicRecentPhotosSession::new(20)
+            .with_filename_prefix("shared-recent")
+            .with_zone("SharedSync-TEST")
+            .with_token("zone-tok-shared");
+        let primary_state = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_full_album_with_boxed_session("PrimarySync", Box::new(primary_session)),
+        );
+        let shared_state = make_run_cycle_library_state_with_album(
+            "SharedSync-TEST",
+            "sync_token:SharedSync-TEST",
+            make_full_album_with_boxed_session("SharedSync-TEST", Box::new(shared_session_photos)),
+        );
+        let states = vec![&primary_state, &shared_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                recent: Some(20),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run recent multi-library cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.assets_seen, 40);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read primary token"),
+            None
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:SharedSync-TEST")
+                .await
+                .expect("read shared token"),
+            None
+        );
     }
 
     const ZERO_ASSET_WARNING_PREFIX: &str = "Sync completed after enumerating zero assets";

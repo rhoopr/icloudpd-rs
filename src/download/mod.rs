@@ -2903,7 +2903,10 @@ mod tests {
     use crate::commands::{AlbumPass, PassKind};
     use crate::icloud::photos::asset::ChangeEvent;
     use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
-    use crate::test_helpers::{MockPhotosFlow, TestPhotoAsset};
+    use crate::test_helpers::{
+        mock_photo_records_for_zone_with_filename, DynamicRecentPhotosSession, MockPhotosFlow,
+        TestPhotoAsset,
+    };
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3146,6 +3149,10 @@ mod tests {
     }
 
     fn mock_album(name: &str, session: crate::test_helpers::MockPhotosSession) -> PhotoAlbum {
+        album_with_session("PrimarySync", name, Box::new(session))
+    }
+
+    fn album_with_session(zone: &str, name: &str, session: Box<dyn PhotosSession>) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),
@@ -3155,13 +3162,45 @@ mod tests {
                 obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
                 query_filter: None,
                 page_size: 100,
-                zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
+                zone_id: Arc::new(json!({"zoneName": zone})),
                 retry_config: RetryConfig::default(),
                 container_id: None,
                 cross_zone_sources: Vec::new(),
             },
-            Box::new(session),
+            session,
         )
+    }
+
+    async fn seed_existing_recent_files(
+        base_config: &DownloadConfig,
+        pass: &AlbumPass,
+        zone: &str,
+        ids: &[String],
+        filename_prefix: &str,
+    ) {
+        let pass_config = base_config.with_pass(pass);
+        for (index, id) in ids.iter().enumerate() {
+            let records = mock_photo_records_for_zone_with_filename(
+                id,
+                zone,
+                &format!("{filename_prefix}-{index:04}.jpg"),
+            );
+            let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+            let expected_path = filter::expected_paths_for(&asset, &pass_config)
+                .into_iter()
+                .next()
+                .expect("mock asset should have an expected path");
+            tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
+                .await
+                .expect("create parent dir");
+            tokio::fs::write(&expected_path.path, vec![0u8; 1024])
+                .await
+                .expect("seed existing file");
+        }
+    }
+
+    fn recent_ids(prefix: &str, count: u64) -> Vec<String> {
+        (0..count).map(|i| format!("{prefix}-{i:04}")).collect()
     }
 
     fn mock_photo_records_with_filename(record_name: &str, filename: &str) -> Vec<Value> {
@@ -5430,6 +5469,289 @@ mod tests {
         assert_eq!(
             result.sync_token, None,
             "recent-limited full sync must not advance a zone token"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_recent_download_drains_multiple_reduced_pages() {
+        let ids = recent_ids("recent-prod", 100);
+        let session = DynamicRecentPhotosSession::from_ids(ids.clone())
+            .with_filename_prefix("recent-prod")
+            .with_token("zone-token");
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: album_with_session("PrimarySync", "Vacation", Box::new(session.clone())),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 10;
+        config.recent = Some(100);
+        seed_existing_recent_files(&config, &passes[0], "PrimarySync", &ids, "recent-prod").await;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("recent full sync should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.assets_seen, 100);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert_eq!(
+            result.sync_token, None,
+            "recent-limited full sync must not advance a zone token"
+        );
+        assert_eq!(
+            session.offsets().as_slice(),
+            &[0, 20, 40, 60, 80],
+            "write-mode full sync should drain every reduced download page"
+        );
+    }
+
+    async fn run_recent_mode_for_ids(
+        mode: DownloadRunMode,
+        ids: &[String],
+        filename_prefix: &str,
+    ) -> (SyncResult, Vec<String>) {
+        let session = DynamicRecentPhotosSession::from_ids(ids.to_vec())
+            .with_filename_prefix(filename_prefix)
+            .with_token("zone-token");
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: album_with_session("PrimarySync", "Vacation", Box::new(session.clone())),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.recent = Some(ids.len().try_into().expect("test id count fits u32"));
+        if matches!(mode, DownloadRunMode::Download) {
+            seed_existing_recent_files(&config, &passes[0], "PrimarySync", ids, filename_prefix)
+                .await;
+        }
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::new(mode, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("recent mode sync should complete");
+
+        (result, session.emitted_ids())
+    }
+
+    #[tokio::test]
+    async fn full_sync_recent_run_modes_enumerate_same_asset_ids() {
+        let ids = recent_ids("mode-parity", 6);
+
+        let (print_result, print_ids) =
+            run_recent_mode_for_ids(DownloadRunMode::PrintFilenames, &ids, "mode-parity").await;
+        let (dry_result, dry_ids) =
+            run_recent_mode_for_ids(DownloadRunMode::DryRun, &ids, "mode-parity").await;
+        let (download_result, download_ids) =
+            run_recent_mode_for_ids(DownloadRunMode::Download, &ids, "mode-parity").await;
+
+        assert!(matches!(print_result.outcome, DownloadOutcome::Success));
+        assert!(matches!(dry_result.outcome, DownloadOutcome::Success));
+        assert!(matches!(download_result.outcome, DownloadOutcome::Success));
+        assert_eq!(print_ids, ids);
+        assert_eq!(dry_ids, ids);
+        assert_eq!(download_ids, ids);
+        assert_eq!(print_ids, dry_ids);
+        assert_eq!(dry_ids, download_ids);
+        assert_eq!(download_result.stats.assets_seen, ids.len() as u64);
+        assert_eq!(print_result.sync_token, None);
+        assert_eq!(dry_result.sync_token, None);
+        assert_eq!(download_result.sync_token, None);
+    }
+
+    #[tokio::test]
+    async fn full_sync_recent_deferred_unfiled_filters_album_members_after_multi_page_stream() {
+        let album_ids = recent_ids("album-member", 40);
+        let unfiled_only_ids = recent_ids("unfiled-only", 20);
+        let mut unfiled_ids = album_ids.clone();
+        unfiled_ids.extend(unfiled_only_ids.clone());
+
+        let album_session = DynamicRecentPhotosSession::from_ids(album_ids.clone())
+            .with_filename_prefix("album-member")
+            .with_token("zone-token");
+        let unfiled_session = DynamicRecentPhotosSession::from_ids(unfiled_ids.clone())
+            .with_filename_prefix("unfiled-mixed")
+            .with_token("zone-token");
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: album_with_session("PrimarySync", "Vacation", Box::new(album_session)),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session("PrimarySync", "", Box::new(unfiled_session.clone())),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 10;
+        config.recent = Some(60);
+        seed_existing_recent_files(
+            &config,
+            &passes[0],
+            "PrimarySync",
+            &album_ids,
+            "album-member",
+        )
+        .await;
+        seed_existing_recent_files(
+            &config,
+            &passes[1],
+            "PrimarySync",
+            &unfiled_ids,
+            "unfiled-mixed",
+        )
+        .await;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("recent album plus unfiled sync should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            result.stats.assets_seen, 60,
+            "40 album assets plus 20 non-album unfiled assets should be counted"
+        );
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert_eq!(result.sync_token, None);
+        assert_eq!(
+            unfiled_session.emitted_ids().len(),
+            60,
+            "deferred unfiled collection should still drain its recent stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_recent_smart_folder_drains_multiple_reduced_pages() {
+        let ids = recent_ids("smart-recent", 60);
+        let session = DynamicRecentPhotosSession::from_ids(ids.clone())
+            .with_filename_prefix("smart-recent")
+            .with_token("zone-token");
+        let passes = vec![AlbumPass {
+            kind: PassKind::SmartFolder,
+            album: album_with_session("PrimarySync", "Favorites", Box::new(session.clone())),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 10;
+        config.recent = Some(60);
+        seed_existing_recent_files(&config, &passes[0], "PrimarySync", &ids, "smart-recent").await;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("recent smart-folder sync should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.assets_seen, 60);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert_eq!(result.sync_token, None);
+        assert_eq!(session.offsets().as_slice(), &[0, 20, 40]);
+    }
+
+    #[tokio::test]
+    async fn full_sync_deferred_unfiled_waits_when_album_enumeration_errors() {
+        let album_ids = recent_ids("album-error", 40);
+        let unfiled_ids = recent_ids("unfiled-after-error", 20);
+        let album_session = DynamicRecentPhotosSession::from_ids(album_ids.clone())
+            .with_filename_prefix("album-error")
+            .with_error_at_offset(20);
+        let unfiled_session = DynamicRecentPhotosSession::from_ids(unfiled_ids.clone())
+            .with_filename_prefix("unfiled-after-error");
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: album_with_session("PrimarySync", "Vacation", Box::new(album_session)),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session("PrimarySync", "", Box::new(unfiled_session.clone())),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 10;
+        config.recent = Some(40);
+        seed_existing_recent_files(
+            &config,
+            &passes[0],
+            "PrimarySync",
+            &album_ids,
+            "album-error",
+        )
+        .await;
+        seed_existing_recent_files(
+            &config,
+            &passes[1],
+            "PrimarySync",
+            &unfiled_ids,
+            "unfiled-after-error",
+        )
+        .await;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("album enumeration error should be reported as partial result");
+
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { .. }
+        ));
+        assert_eq!(result.stats.enumeration_errors, 1);
+        assert_eq!(
+            result.stats.assets_seen, 20,
+            "unfiled assets must not be processed when album exclusions are incomplete"
+        );
+        assert_eq!(result.sync_token, None);
+        assert!(
+            !unfiled_session.emitted_ids().is_empty(),
+            "the deferred unfiled stream may be collected concurrently"
         );
     }
 
