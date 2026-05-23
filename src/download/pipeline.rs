@@ -982,6 +982,16 @@ where
                     }
 
                     let plan = task_planner.plan_asset(&asset, config).await;
+                    if let Some(resource) = &plan.malformed_resource {
+                        enum_errors += 1;
+                        tracing::error!(
+                            asset_id = %asset.id(),
+                            field = %resource.field,
+                            reason = %resource.reason,
+                            "Malformed CloudKit resource prevented filename planning"
+                        );
+                        continue;
+                    }
                     #[allow(
                         clippy::print_stdout,
                         reason = "--only-print-filenames writes target paths to stdout so callers can pipe to xargs/etc"
@@ -1021,6 +1031,16 @@ where
                 Ok(asset) => {
                     let plan = task_planner.plan_asset(&asset, config).await;
                     if plan.filter_reason.is_some() {
+                        continue;
+                    }
+                    if let Some(resource) = &plan.malformed_resource {
+                        enum_errors += 1;
+                        tracing::error!(
+                            asset_id = %asset.id(),
+                            field = %resource.field,
+                            reason = %resource.reason,
+                            "Malformed CloudKit resource prevented dry-run planning"
+                        );
                         continue;
                     }
                     for task in &plan.tasks {
@@ -1289,6 +1309,17 @@ where
                     let plan = task_planner.plan_asset(&asset, config).await;
                     if let Some(reason) = plan.filter_reason {
                         skips.record_filter_reason(reason);
+                        producer_pb.inc(1);
+                        continue;
+                    }
+                    if let Some(resource) = &plan.malformed_resource {
+                        enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(
+                            asset_id = %asset.id(),
+                            field = %resource.field,
+                            reason = %resource.reason,
+                            "Malformed CloudKit resource prevented download planning"
+                        );
                         producer_pb.inc(1);
                         continue;
                     }

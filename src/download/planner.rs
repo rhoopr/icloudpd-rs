@@ -45,15 +45,22 @@ impl TaskPlanner {
             return AssetTaskPlan {
                 tasks: SmallVec::new(),
                 filter_reason: Some(filter_reason),
+                malformed_resource: None,
             };
         }
 
         pre_ensure_asset_dir(&mut self.dir_cache, asset, config).await;
         let tasks =
             filter_asset_to_tasks(asset, config, &mut self.claimed_paths, &mut self.dir_cache);
+        let malformed_resource = if tasks.is_empty() {
+            super::filter::malformed_no_task_resource(asset, config)
+        } else {
+            None
+        };
         AssetTaskPlan {
             tasks,
             filter_reason: None,
+            malformed_resource,
         }
     }
 
@@ -73,6 +80,13 @@ impl TaskPlanner {
 pub(super) struct AssetTaskPlan {
     pub(super) tasks: SmallVec<[DownloadTask; 5]>,
     pub(super) filter_reason: Option<FilterReason>,
+    pub(super) malformed_resource: Option<MalformedTaskResource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MalformedTaskResource {
+    pub(super) field: Box<str>,
+    pub(super) reason: Box<str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,9 +215,10 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::commands::{AlbumPass, PassKind};
-    use crate::icloud::photos::PhotoAlbum;
+    use crate::icloud::photos::{PhotoAlbum, PhotoAsset};
     use crate::state::SqliteStateDb;
     use crate::test_helpers::TestPhotoAsset;
+    use serde_json::json;
 
     use super::*;
 
@@ -296,6 +311,63 @@ mod tests {
         let plan = second.plan_asset(&asset, &config).await;
         assert_eq!(plan.filter_reason, None);
         assert!(plan.tasks.is_empty(), "existing same-size file should skip");
+    }
+
+    #[tokio::test]
+    async fn planner_reports_null_selected_primary_resource_as_malformed() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let asset = PhotoAsset::new(
+            json!({
+                "recordName": "MALFORMED_PRIMARY",
+                "fields": {
+                    "filenameEnc": {"value": "bad.jpg", "type": "STRING"},
+                    "itemType": {"value": "public.jpeg"},
+                    "resOriginalRes": {"value": null},
+                    "resOriginalFileType": {"value": "public.jpeg"}
+                }
+            }),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+
+        let mut planner = TaskPlanner::new();
+        let plan = planner.plan_asset(&asset, &config).await;
+
+        assert!(plan.tasks.is_empty());
+        let malformed = plan.malformed_resource.unwrap();
+        assert_eq!(malformed.field.as_ref(), "resOriginalRes");
+        assert_eq!(malformed.reason.as_ref(), "resource value is null");
+    }
+
+    #[tokio::test]
+    async fn planner_ignores_malformed_optional_alternative_when_primary_is_valid() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.alternative = true;
+        let asset = PhotoAsset::new(
+            json!({
+                "recordName": "VALID_PRIMARY_BAD_ALT",
+                "fields": {
+                    "filenameEnc": {"value": "good.jpg", "type": "STRING"},
+                    "itemType": {"value": "public.jpeg"},
+                    "resOriginalRes": {"value": {
+                        "size": 1000,
+                        "downloadURL": "https://p01.icloud-content.com/orig",
+                        "fileChecksum": "ck_orig"
+                    }},
+                    "resOriginalFileType": {"value": "public.jpeg"},
+                    "resOriginalAltRes": {"value": null},
+                    "resOriginalAltFileType": {"value": "public.camera-raw-image"}
+                }
+            }),
+            json!({"fields": {"assetDate": {"value": 1736899200000.0}}}),
+        );
+
+        let mut planner = TaskPlanner::new();
+        let plan = planner.plan_asset(&asset, &config).await;
+
+        assert_eq!(plan.tasks.len(), 1);
+        assert!(plan.malformed_resource.is_none());
     }
 
     #[tokio::test]

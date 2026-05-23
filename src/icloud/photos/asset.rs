@@ -19,6 +19,17 @@ use crate::state::AssetMetadata;
 /// (original + optional medium/thumb + optional live photo).
 pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
 
+/// Malformed resource fields seen while extracting downloadable versions.
+///
+/// Absence of an optional resource is normal; this records only resources
+/// CloudKit advertised with an unusable value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MalformedResource {
+    pub(crate) version_size: AssetVersionSize,
+    pub(crate) field: Box<str>,
+    pub(crate) reason: Box<str>,
+}
+
 /// A change event from the `changes/zone` delta API.
 #[derive(Debug)]
 pub struct ChangeEvent {
@@ -58,6 +69,7 @@ pub struct PhotoAsset {
     asset_metadata: Arc<AssetMetadata>,
     // SmallVec with inline storage
     versions: VersionsMap,
+    malformed_resources: Arc<[MalformedResource]>,
     // f64 primitives
     asset_date_ms: Option<f64>,
     added_date_ms: Option<f64>,
@@ -98,11 +110,6 @@ pub(crate) fn f64_to_millis_datetime(ms: f64) -> Option<DateTime<Utc>> {
     }
 }
 
-/// True when `fields.key` is a non-null `Value`.
-fn field_present(fields: &Value, key: &str) -> bool {
-    fields.get(key).is_some_and(|v| !v.is_null())
-}
-
 /// Determine asset type from the `itemType` `CloudKit` field, falling back to
 /// file extension heuristics. Defaults to Movie for unknown types because
 /// videos are more likely to have non-standard UTI strings.
@@ -138,7 +145,7 @@ fn extract_versions(
     master_fields: &Value,
     asset_fields: &Value,
     record_name: &str,
-) -> VersionsMap {
+) -> (VersionsMap, Vec<MalformedResource>) {
     let lookup = if item_type == Some(AssetItemType::Movie) {
         VIDEO_VERSION_LOOKUP
     } else {
@@ -146,12 +153,13 @@ fn extract_versions(
     };
 
     let mut versions = VersionsMap::new();
+    let mut malformed_resources = Vec::new();
     for (key, res_field, type_field) in lookup {
         // Asset record has adjusted versions; master has originals.
         // Prefer asset record so adjusted/edited versions take priority.
-        let fields = if field_present(asset_fields, res_field) {
+        let fields = if asset_fields.get(res_field).is_some() {
             asset_fields
-        } else if field_present(master_fields, res_field) {
+        } else if master_fields.get(res_field).is_some() {
             master_fields
         } else {
             continue;
@@ -162,6 +170,11 @@ fn extract_versions(
             .and_then(|f| f.get("value"))
             .unwrap_or(&Value::Null);
         if res_entry.is_null() {
+            malformed_resources.push(MalformedResource {
+                version_size: *key,
+                field: (*res_field).into(),
+                reason: "resource value is null".into(),
+            });
             continue;
         }
 
@@ -173,6 +186,11 @@ fn extract_versions(
                 field = format_args!("{res_field}.size"),
                 "Missing size, skipping version"
             );
+            malformed_resources.push(MalformedResource {
+                version_size: *key,
+                field: format!("{res_field}.size").into_boxed_str(),
+                reason: "missing size".into(),
+            });
             continue;
         };
 
@@ -187,6 +205,11 @@ fn extract_versions(
                         reason,
                         "Rejected downloadURL, skipping version"
                     );
+                    malformed_resources.push(MalformedResource {
+                        version_size: *key,
+                        field: format!("{res_field}.downloadURL").into_boxed_str(),
+                        reason: reason.into(),
+                    });
                     continue;
                 }
             },
@@ -196,6 +219,11 @@ fn extract_versions(
                     field = format_args!("{res_field}.downloadURL"),
                     "Missing downloadURL, skipping version"
                 );
+                malformed_resources.push(MalformedResource {
+                    version_size: *key,
+                    field: format!("{res_field}.downloadURL").into_boxed_str(),
+                    reason: "missing downloadURL".into(),
+                });
                 continue;
             }
         };
@@ -208,6 +236,11 @@ fn extract_versions(
                     field = format_args!("{res_field}.fileChecksum"),
                     "Empty fileChecksum, skipping version"
                 );
+                malformed_resources.push(MalformedResource {
+                    version_size: *key,
+                    field: format!("{res_field}.fileChecksum").into_boxed_str(),
+                    reason: "empty fileChecksum".into(),
+                });
                 continue;
             }
             None => {
@@ -216,6 +249,11 @@ fn extract_versions(
                     field = format_args!("{res_field}.fileChecksum"),
                     "Missing fileChecksum, skipping version"
                 );
+                malformed_resources.push(MalformedResource {
+                    version_size: *key,
+                    field: format!("{res_field}.fileChecksum").into_boxed_str(),
+                    reason: "missing fileChecksum".into(),
+                });
                 continue;
             }
         };
@@ -232,6 +270,11 @@ fn extract_versions(
                     field = %type_field,
                     "Missing or empty asset type, skipping version"
                 );
+                malformed_resources.push(MalformedResource {
+                    version_size: *key,
+                    field: (*type_field).into(),
+                    reason: "missing or empty asset type".into(),
+                });
                 continue;
             }
         };
@@ -246,7 +289,7 @@ fn extract_versions(
             },
         ));
     }
-    versions
+    (versions, malformed_resources)
 }
 
 /// Host suffixes kei will download from. Narrow to content-delivery hosts
@@ -293,7 +336,8 @@ impl PhotoAsset {
         let item_type_val = Some(resolve_item_type(&master_fields, filename.as_deref()));
         let asset_date_ms = asset_fields["assetDate"]["value"].as_f64();
         let added_date_ms = asset_fields["addedDate"]["value"].as_f64();
-        let versions = extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
+        let (versions, malformed_resources) =
+            extract_versions(item_type_val, &master_fields, &asset_fields, &record_name);
         let asset_metadata = Arc::new(metadata::extract(&master_fields, &asset_fields));
         let asset_record_name: Arc<str> = asset_record["recordName"]
             .as_str()
@@ -309,6 +353,7 @@ impl PhotoAsset {
             asset_date_ms,
             added_date_ms,
             versions,
+            malformed_resources: Arc::from(malformed_resources.into_boxed_slice()),
         }
     }
 
@@ -335,7 +380,7 @@ impl PhotoAsset {
             .get("addedDate")
             .and_then(|f| f.get("value"))
             .and_then(Value::as_f64);
-        let versions = extract_versions(
+        let (versions, malformed_resources) = extract_versions(
             item_type_val,
             &master.fields,
             &asset.fields,
@@ -352,6 +397,7 @@ impl PhotoAsset {
             asset_date_ms,
             added_date_ms,
             versions,
+            malformed_resources: Arc::from(malformed_resources.into_boxed_slice()),
         }
     }
 
@@ -439,6 +485,10 @@ impl PhotoAsset {
     /// Pre-parsed at construction so no JSON traversal happens at download time.
     pub fn versions(&self) -> &VersionsMap {
         &self.versions
+    }
+
+    pub(crate) fn malformed_resources(&self) -> &[MalformedResource] {
+        &self.malformed_resources
     }
 
     /// Get a specific version by size key. Test-only convenience.
@@ -2045,6 +2095,11 @@ mod tests {
             asset.versions().is_empty(),
             "null resOriginalRes value should produce empty versions"
         );
+        assert_eq!(asset.malformed_resources().len(), 1);
+        assert_eq!(
+            asset.malformed_resources()[0].field.as_ref(),
+            "resOriginalRes"
+        );
     }
 
     // ── Gap: asset with missing size skips the version ───────────────
@@ -2067,6 +2122,10 @@ mod tests {
         assert!(
             asset.versions().is_empty(),
             "version with missing size should be skipped"
+        );
+        assert_eq!(
+            asset.malformed_resources()[0].field.as_ref(),
+            "resOriginalRes.size"
         );
     }
 

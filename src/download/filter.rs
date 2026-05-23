@@ -19,6 +19,7 @@ use crate::types::{
 };
 
 use super::paths;
+use super::planner::MalformedTaskResource;
 use super::DownloadConfig;
 
 /// Reason an asset was filtered out during content/metadata filtering.
@@ -733,6 +734,77 @@ fn select_mov_companion<'a>(
         config.force_resolution,
     )?;
     (!url_seen(selected.0, seen_urls)).then_some(selected)
+}
+
+fn malformed_for_keys(
+    asset: &crate::icloud::photos::PhotoAsset,
+    keys: impl IntoIterator<Item = AssetVersionSize>,
+) -> Option<MalformedTaskResource> {
+    let malformed = asset.malformed_resources();
+    keys.into_iter().find_map(|key| {
+        malformed
+            .iter()
+            .find(|resource| resource.version_size == key)
+            .map(|resource| MalformedTaskResource {
+                field: resource.field.clone(),
+                reason: resource.reason.clone(),
+            })
+    })
+}
+
+fn primary_candidate_keys(config: &DownloadConfig) -> SmallVec<[AssetVersionSize; 2]> {
+    let mut keys = SmallVec::new();
+    let Some(requested) = config.resolution.to_asset_version_size() else {
+        return keys;
+    };
+    keys.push(requested);
+    if !config.force_resolution && requested != AssetVersionSize::Original {
+        keys.push(AssetVersionSize::Original);
+    }
+    keys
+}
+
+fn live_candidate_keys(config: &DownloadConfig) -> SmallVec<[AssetVersionSize; 2]> {
+    let mut keys = SmallVec::new();
+    keys.push(config.live_resolution);
+    if !config.force_resolution && config.live_resolution != AssetVersionSize::LiveOriginal {
+        keys.push(AssetVersionSize::LiveOriginal);
+    }
+    keys
+}
+
+/// Return the malformed resource that explains a post-filter asset producing
+/// no downloadable tasks, if CloudKit advertised a selected resource but made
+/// it unusable.
+pub(super) fn malformed_no_task_resource(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &DownloadConfig,
+) -> Option<MalformedTaskResource> {
+    if !derive_expected_paths(asset, config).is_empty() {
+        return None;
+    }
+
+    if !matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Skip | LivePhotoMode::VideoOnly
+    ) || !asset.is_live_photo()
+    {
+        if let Some(resource) = malformed_for_keys(asset, primary_candidate_keys(config)) {
+            return Some(resource);
+        }
+    }
+
+    if matches!(
+        config.live_photo_mode,
+        LivePhotoMode::Both | LivePhotoMode::VideoOnly
+    ) && asset.item_type() == Some(AssetItemType::Image)
+    {
+        if let Some(resource) = malformed_for_keys(asset, live_candidate_keys(config)) {
+            return Some(resource);
+        }
+    }
+
+    None
 }
 
 /// Build the primary `DerivedPath` (or `None` if no primary should be

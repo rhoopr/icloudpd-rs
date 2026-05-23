@@ -2660,6 +2660,7 @@ async fn download_photos_incremental(
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut task_planner = planner::TaskPlanner::new();
     let mut skip_breakdown = SkipBreakdown::default();
+    let mut enumeration_errors = 0usize;
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
 
     for (asset, pass_index) in &downloadable_assets {
@@ -2673,6 +2674,16 @@ async fn download_photos_incremental(
         let plan = task_planner.plan_asset(asset, effective_config).await;
         if let Some(reason) = plan.filter_reason {
             skip_breakdown.record_filter_reason(reason);
+            continue;
+        }
+        if let Some(resource) = &plan.malformed_resource {
+            enumeration_errors += 1;
+            tracing::error!(
+                asset_id = %asset.id(),
+                field = %resource.field,
+                reason = %resource.reason,
+                "Malformed CloudKit resource prevented incremental download planning"
+            );
             continue;
         }
 
@@ -2726,15 +2737,23 @@ async fn download_photos_incremental(
     if tasks.is_empty() {
         let stats = SyncStats {
             skipped: skip_breakdown,
+            enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
         tracing::info!("All incremental assets already downloaded or filtered");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
+        let outcome = if enumeration_errors > 0 {
+            DownloadOutcome::PartialFailure {
+                failed_count: enumeration_errors,
+            }
+        } else {
+            DownloadOutcome::Success
+        };
         return Ok(SyncResult {
-            outcome: DownloadOutcome::Success,
-            sync_token,
+            outcome,
+            sync_token: (enumeration_errors == 0).then_some(sync_token).flatten(),
             stats,
             full_enumeration_ran: false,
         });
@@ -2750,12 +2769,19 @@ async fn download_photos_incremental(
         }
         let stats = SyncStats {
             skipped: skip_breakdown,
+            enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             ..SyncStats::default()
         };
         // Don't advance the sync token — this is a read-only operation.
         return Ok(SyncResult {
-            outcome: DownloadOutcome::Success,
+            outcome: if enumeration_errors > 0 {
+                DownloadOutcome::PartialFailure {
+                    failed_count: enumeration_errors,
+                }
+            } else {
+                DownloadOutcome::Success
+            },
             sync_token: None,
             stats,
             full_enumeration_ran: false,
@@ -2803,7 +2829,7 @@ async fn download_photos_incremental(
         disk_bytes_written: pass_result.disk_bytes_written,
         exif_failures: pass_result.exif_failures,
         state_write_failures: pass_result.state_write_failures,
-        enumeration_errors: 0,
+        enumeration_errors,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: shutdown_token.is_cancelled()
             || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD
@@ -2829,18 +2855,24 @@ async fn download_photos_incremental(
         });
     }
 
-    let outcome =
-        if failed > 0 || pass_result.exif_failures > 0 || pass_result.state_write_failures > 0 {
-            DownloadOutcome::PartialFailure {
-                failed_count: failed + pass_result.exif_failures + pass_result.state_write_failures,
-            }
-        } else {
-            DownloadOutcome::Success
-        };
+    let outcome = if failed > 0
+        || pass_result.exif_failures > 0
+        || pass_result.state_write_failures > 0
+        || enumeration_errors > 0
+    {
+        DownloadOutcome::PartialFailure {
+            failed_count: failed
+                + pass_result.exif_failures
+                + pass_result.state_write_failures
+                + enumeration_errors,
+        }
+    } else {
+        DownloadOutcome::Success
+    };
 
     Ok(SyncResult {
         outcome,
-        sync_token,
+        sync_token: (enumeration_errors == 0).then_some(sync_token).flatten(),
         stats,
         full_enumeration_ran: false,
     })
