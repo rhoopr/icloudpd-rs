@@ -4976,7 +4976,7 @@ mod tests {
                 .item_type("public.jpeg")
                 .orig_file_type("public.jpeg")
                 .orig_size(1234)
-                .orig_url("http://127.0.0.1:1/stuck.jpg")
+                .orig_url("https://p01.icloud-content.com/stuck.jpg")
                 .orig_checksum("ck_stuck")
                 .build()
                 .with_source_zone(Arc::from("SharedSync-abc"))
@@ -5000,17 +5000,14 @@ mod tests {
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
 
-        // Pre-create the on-disk file at the path the producer will
-        // compute so `filter_asset_to_tasks` returns no tasks. Reuses
-        // `local_download_path` to stay tz-independent.
+        // Pre-create the on-disk file at the path the producer will compute
+        // so `filter_asset_to_tasks` returns no tasks.
         let asset = carryover_asset();
-        let target_path = crate::download::paths::local_download_path(
-            &config.directory,
-            &config.folder_structure,
-            &asset.created().with_timezone(&chrono::Local),
-            "stuck.jpg",
-            None,
-        );
+        let target_path = crate::download::filter::expected_paths_for(&asset, &config)
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
