@@ -167,10 +167,7 @@ impl CredentialStore {
         };
         match entry.delete_credential() {
             Ok(()) => DeleteOutcome::Deleted,
-            Err(keyring::Error::NoEntry) => DeleteOutcome::NotFound,
-            Err(e) => DeleteOutcome::Failed(
-                anyhow::anyhow!(e).context("Failed to delete keyring credential"),
-            ),
+            Err(e) => keyring_delete_error_outcome(e),
         }
     }
 
@@ -302,6 +299,31 @@ impl CredentialStore {
             ))),
         }
     }
+}
+
+fn keyring_delete_error_outcome(error: keyring::Error) -> DeleteOutcome {
+    match error {
+        keyring::Error::NoEntry => DeleteOutcome::NotFound,
+        keyring::Error::PlatformFailure(e) if is_keyring_platform_unavailable(e.as_ref()) => {
+            tracing::debug!(
+                error = %e,
+                "Keyring unavailable during credential deletion; treating it as absent"
+            );
+            DeleteOutcome::NotFound
+        }
+        e => {
+            DeleteOutcome::Failed(anyhow::anyhow!(e).context("Failed to delete keyring credential"))
+        }
+    }
+}
+
+fn is_keyring_platform_unavailable(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let message = error.to_string();
+    message.contains("org.freedesktop.secrets")
+        || message.contains("The name is not activatable")
+        || (message.contains("Failed to connect")
+            && message.contains("/run/user/")
+            && message.contains("/bus"))
 }
 
 fn finish_delete(
@@ -487,6 +509,33 @@ mod tests {
         assert!(
             msg.contains("keyring") && msg.contains("keyring locked"),
             "failed deletion must name backend and source error: {msg}"
+        );
+    }
+
+    #[test]
+    fn unavailable_secret_service_delete_is_not_found() {
+        for message in [
+            "DBus error: The name org.freedesktop.secrets was not provided by any .service files",
+            "DBus error: The name is not activatable",
+        ] {
+            let outcome = keyring_delete_error_outcome(keyring::Error::PlatformFailure(Box::new(
+                std::io::Error::other(message),
+            )));
+            assert!(
+                matches!(outcome, DeleteOutcome::NotFound),
+                "headless Secret Service delete should behave like an absent keyring"
+            );
+        }
+    }
+
+    #[test]
+    fn inaccessible_keyring_delete_still_fails() {
+        let outcome = keyring_delete_error_outcome(keyring::Error::NoStorageAccess(Box::new(
+            std::io::Error::other("keyring locked"),
+        )));
+        assert!(
+            matches!(outcome, DeleteOutcome::Failed(_)),
+            "locked keyrings should not be treated as absent"
         );
     }
 
