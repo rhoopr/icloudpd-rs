@@ -21,7 +21,10 @@ use crate::state;
 use crate::state::ImportStateStore;
 use crate::types::FileMatchPolicy;
 
-use super::service::{init_photos_service, resolve_libraries, resolve_passes};
+use super::service::{
+    init_photos_service, resolve_cross_zone_libraries_for_album_hydration, resolve_libraries,
+    resolve_passes,
+};
 
 /// Value of the `stage` field on the one-shot tracing event emitted by
 /// [`import_assets`] when the first asset is dequeued. Operators (and the
@@ -777,6 +780,11 @@ pub(crate) async fn run_import_existing(
     // the same passes sync would, and each pass uses its own
     // `folder_structure_*` template when deriving expected paths.
     let selection = build_import_selection(toml_filters, &selector)?;
+    let cross_zone_libraries = resolve_cross_zone_libraries_for_album_hydration(
+        &selection,
+        photos_service.all_libraries(),
+    )
+    .await?;
 
     let prior_db_total = db.get_summary().await?.total_assets;
     if prior_db_total > 0 && !args.force_empty {
@@ -814,7 +822,7 @@ pub(crate) async fn run_import_existing(
         tracing::debug!(zone = %zone, "Scanning library");
         let library_config = download_config.with_library(zone);
 
-        let plan = resolve_passes(library, &selection, &[]).await?;
+        let plan = resolve_passes(library, &selection, &cross_zone_libraries).await?;
         if plan.passes.is_empty() {
             tracing::debug!(zone = %zone, "No passes resolved; nothing to import");
             continue;
@@ -985,7 +993,9 @@ mod build_selection_tests {
     //! Sync vs. import-existing parity for the current selector resolution.
     //! Both commands must produce the same `Selection` from the same TOML.
     use super::build_import_selection;
+    use crate::commands::resolve_cross_zone_libraries_for_album_hydration;
     use crate::config::TomlFilters;
+    use crate::icloud::photos::PhotoLibrary;
     use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
     use std::collections::BTreeSet;
 
@@ -1029,6 +1039,27 @@ mod build_selection_tests {
                 libraries: primary(),
                 unfiled: true,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn default_import_album_selection_requires_cross_zone_resolution() {
+        let selection = build_import_selection(None, &primary()).expect("ok");
+
+        let err = resolve_cross_zone_libraries_for_album_hydration(&selection, async {
+            Err::<Vec<PhotoLibrary>, anyhow::Error>(anyhow::anyhow!("all-libraries unavailable"))
+        })
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("failed to resolve cross-zone album hydration libraries"),
+            "missing hydration context: {msg}"
+        );
+        assert!(
+            msg.contains("all-libraries unavailable"),
+            "missing cause: {msg}"
         );
     }
 }
