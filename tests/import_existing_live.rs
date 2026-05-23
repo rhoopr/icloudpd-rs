@@ -49,6 +49,7 @@ use tempfile::tempdir;
 const FIXTURE_TIMEOUT_SECS: u64 = 1800; // 30m: full sync of ~100 assets
 const IMPORT_TIMEOUT_SECS: u64 = 300; // 5m: import-existing scans, no downloads
 const FIXTURE_RECENT: u32 = 100;
+const FIXTURE_FILTERS_TOML: &str = "[filters]\nalbums = [\"none\"]\nunfiled = true\n";
 
 /// Copy auth artifacts (cookie file + .session + .cache) from `src`
 /// into `dst`, deliberately skipping `.db` and `.lock` files. A state
@@ -118,7 +119,11 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
             "Building import-existing fixture: --recent {FIXTURE_RECENT} into {}",
             download_dir.display()
         );
-        let config_path = write_kei_toml(&data_dir, &download_dir, "");
+        // Keep the reusable fixture to one library-wide pass. The default
+        // selection also walks every user album, which makes live accounts
+        // with overlapping album memberships produce account-dependent
+        // unmatched duplicate paths in import-existing smoke tests.
+        let config_path = write_kei_toml(&data_dir, &download_dir, FIXTURE_FILTERS_TOML);
         let output = common::cmd()
             .env("ICLOUD_USERNAME", &username)
             .env("KEI_DATA_DIR", &data_dir)
@@ -257,13 +262,14 @@ fn import_matches_default_layout_after_sync() {
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
         let recent = FIXTURE_RECENT.to_string();
+        let toml_path = write_kei_toml(test_data.path(), download_dir, FIXTURE_FILTERS_TOML);
         let output = import_cmd(
             &username,
             &password,
             &cookie_dir,
             download_dir,
             test_data.path(),
-            &["--recent", &recent],
+            &["--recent", &recent, "--config", toml_path.to_str().unwrap()],
         )
         .timeout(Duration::from_secs(IMPORT_TIMEOUT_SECS))
         .assert()
