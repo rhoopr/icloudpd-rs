@@ -867,10 +867,9 @@ fn is_mov_top_atom(atom: &[u8]) -> bool {
 /// Validate that downloaded content matches expected format for the file extension.
 ///
 /// For known media types (JPEG, PNG, HEIC, MOV, etc.), checks magic bytes in the
-/// file header. Magic byte mismatches are logged as warnings but allowed through,
-/// since format variants exist (e.g. classic QuickTime MOV without `ftyp` box).
-/// HTML and JSON error-page sentinels are always rejected as hard errors —
-/// Apple's CDN occasionally returns them with HTTP 200.
+/// file header. HTML and JSON error-page sentinels are always rejected before
+/// extension-specific checks because Apple's CDN occasionally returns them with
+/// HTTP 200.
 fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,
@@ -918,11 +917,11 @@ fn validate_downloaded_content(
             reason = "`n.min(8)` caps the slice at `header.len()`"
         )]
         let preview = &header[..n.min(8)];
-        tracing::warn!(
-            path = %download_path.display(),
-            header = %format_args!("{preview:02x?}"),
-            "File header does not match expected format for .{ext}, saving anyway",
-        );
+        return Err(DownloadError::InvalidContent {
+            path: download_path.display().to_string().into(),
+            reason: format!("file header {preview:02x?} does not match expected format for .{ext}")
+                .into(),
+        });
     }
 
     Ok(())
@@ -1471,20 +1470,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_warns_but_accepts_mismatched_heic_magic() {
-        // Non-ftyp header with .heic extension — warn but accept
+    fn validate_rejects_mismatched_heic_magic() {
+        // Non-ftyp header with .heic extension is not valid HEIC.
         let mut buf = [0u8; 12];
         buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x08]);
         buf[4..8].copy_from_slice(b"wide");
         let (part, dest, _dir) = write_temp_file("photo.heic", &buf);
-        assert!(validate_downloaded_content(&part, &dest).is_ok());
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
 
     #[test]
-    fn validate_warns_but_accepts_mismatched_png_magic() {
-        // JPEG magic with .png extension — warn but accept
+    fn validate_rejects_mismatched_png_magic() {
+        // JPEG magic with .png extension should not be promoted.
         let (part, dest, _dir) = write_temp_file("photo.png", &[0xFF, 0xD8, 0xFF, 0xE0]);
-        assert!(validate_downloaded_content(&part, &dest).is_ok());
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_mismatched_jpeg_magic() {
+        let (part, dest, _dir) = write_temp_file(
+            "photo.jpg",
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        );
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
     }
 
     #[test]
