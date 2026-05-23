@@ -24,6 +24,13 @@ use secrecy::SecretString;
 /// Service name used for keyring entries.
 const KEYRING_SERVICE: &str = "kei";
 
+#[derive(Debug)]
+enum DeleteOutcome {
+    Deleted,
+    NotFound,
+    Failed(anyhow::Error),
+}
+
 /// Backend that accepted a stored credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CredentialBackend {
@@ -99,22 +106,11 @@ impl CredentialStore {
 
     /// Delete stored credentials from all backends.
     pub(crate) fn delete(&self) -> Result<()> {
-        let mut deleted = false;
-        if let Err(e) = self.keyring_delete() {
-            tracing::debug!(error = %e, "Keyring delete failed or not found");
-        } else {
-            deleted = true;
-        }
-        if let Err(e) = self.file_delete() {
-            tracing::debug!(error = %e, "Encrypted file delete failed or not found");
-        } else {
-            deleted = true;
-        }
-        if deleted {
-            Ok(())
-        } else {
-            anyhow::bail!("No stored credential found for {}", self.username)
-        }
+        finish_delete(
+            &self.username,
+            self.keyring_delete_outcome(),
+            self.file_delete_outcome(),
+        )
     }
 
     /// Check whether a credential exists in any backend (keyring or file).
@@ -164,11 +160,18 @@ impl CredentialStore {
         }
     }
 
-    fn keyring_delete(&self) -> Result<()> {
-        let entry = self.keyring_entry()?;
-        entry
-            .delete_credential()
-            .context("Failed to delete keyring credential")
+    fn keyring_delete_outcome(&self) -> DeleteOutcome {
+        let entry = match self.keyring_entry() {
+            Ok(entry) => entry,
+            Err(e) => return DeleteOutcome::Failed(e),
+        };
+        match entry.delete_credential() {
+            Ok(()) => DeleteOutcome::Deleted,
+            Err(keyring::Error::NoEntry) => DeleteOutcome::NotFound,
+            Err(e) => DeleteOutcome::Failed(
+                anyhow::anyhow!(e).context("Failed to delete keyring credential"),
+            ),
+        }
     }
 
     // ── Encrypted file backend ─────────────────────────────────────
@@ -271,17 +274,79 @@ impl CredentialStore {
         Ok(Some(SecretString::from(password)))
     }
 
+    #[cfg(test)]
     fn file_delete(&self) -> Result<()> {
+        match self.file_delete_outcome() {
+            DeleteOutcome::Deleted => Ok(()),
+            DeleteOutcome::NotFound => {
+                anyhow::bail!(
+                    "No credential file found: {}",
+                    self.credential_file_path().display()
+                )
+            }
+            DeleteOutcome::Failed(e) => Err(e),
+        }
+    }
+
+    fn file_delete_outcome(&self) -> DeleteOutcome {
         let cred_path = self.credential_file_path();
         if !cred_path.exists() {
-            anyhow::bail!("No credential file found: {}", cred_path.display());
+            return DeleteOutcome::NotFound;
         }
-        std::fs::remove_file(&cred_path).with_context(|| {
-            format!("Failed to delete credential file: {}", cred_path.display())
-        })?;
-        // Leave the key file — it may be shared if the user re-stores later
-        Ok(())
+        match std::fs::remove_file(&cred_path) {
+            Ok(()) => DeleteOutcome::Deleted,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DeleteOutcome::NotFound,
+            Err(e) => DeleteOutcome::Failed(anyhow::anyhow!(e).context(format!(
+                "Failed to delete credential file: {}",
+                cred_path.display()
+            ))),
+        }
     }
+}
+
+fn finish_delete(
+    username: &str,
+    keyring: DeleteOutcome,
+    encrypted_file: DeleteOutcome,
+) -> Result<()> {
+    let mut deleted = Vec::new();
+    let mut failed = Vec::new();
+
+    match keyring {
+        DeleteOutcome::Deleted => deleted.push("keyring"),
+        DeleteOutcome::NotFound => {}
+        DeleteOutcome::Failed(e) => failed.push(("keyring", e)),
+    }
+    match encrypted_file {
+        DeleteOutcome::Deleted => deleted.push("encrypted-file"),
+        DeleteOutcome::NotFound => {}
+        DeleteOutcome::Failed(e) => failed.push(("encrypted-file", e)),
+    }
+
+    if failed.is_empty() {
+        if deleted.is_empty() {
+            anyhow::bail!("No stored credential found for {username}");
+        }
+        return Ok(());
+    }
+
+    let failed_names = failed
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let details = failed
+        .into_iter()
+        .map(|(name, err)| format!("{name}: {err:#}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if deleted.is_empty() {
+        anyhow::bail!("Failed to delete credential backend(s) {failed_names}: {details}");
+    }
+    anyhow::bail!(
+        "Credential deletion partially failed; deleted from {}, but failed backend(s) {failed_names}: {details}",
+        deleted.join(", ")
+    );
 }
 
 /// Atomically write data to a file with 0o600 permissions (synchronous).
@@ -372,6 +437,60 @@ mod tests {
     }
 
     #[test]
+    fn delete_outcome_file_only_success_when_keyring_missing() {
+        let result = finish_delete(
+            "user@example.com",
+            DeleteOutcome::NotFound,
+            DeleteOutcome::Deleted,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn delete_outcome_both_missing_reports_no_stored_credential() {
+        let err = finish_delete(
+            "user@example.com",
+            DeleteOutcome::NotFound,
+            DeleteOutcome::NotFound,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("No stored credential found"),
+            "expected no-credential error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_outcome_deleted_plus_failure_reports_partial_backend() {
+        let err = finish_delete(
+            "user@example.com",
+            DeleteOutcome::Deleted,
+            DeleteOutcome::Failed(anyhow::anyhow!("permission denied")),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("partially failed") && msg.contains("encrypted-file"),
+            "partial failure must name the failed backend: {msg}"
+        );
+    }
+
+    #[test]
+    fn delete_outcome_failure_without_delete_names_backend() {
+        let err = finish_delete(
+            "user@example.com",
+            DeleteOutcome::Failed(anyhow::anyhow!("keyring locked")),
+            DeleteOutcome::NotFound,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("keyring") && msg.contains("keyring locked"),
+            "failed deletion must name backend and source error: {msg}"
+        );
+    }
+
+    #[test]
     fn encrypted_file_corrupt_data() {
         let (_td, dir) = test_dir("corrupt");
         let store = CredentialStore::new("user@example.com", &dir);
@@ -437,7 +556,17 @@ mod tests {
         store.store("to_delete").unwrap();
         assert!(store.retrieve().unwrap().is_some());
 
-        store.delete().unwrap();
+        let delete_result = store.delete();
+        if let Err(err) = delete_result {
+            assert!(
+                err.to_string().contains("partially failed") && err.to_string().contains("keyring"),
+                "headless keyring failures should surface as partial deletion, got: {err}"
+            );
+            assert!(
+                !store.credential_file_path().exists(),
+                "partial delete should still remove the encrypted-file credential"
+            );
+        }
         assert!(store.retrieve().unwrap().is_none());
     }
 
