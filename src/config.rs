@@ -611,26 +611,6 @@ pub(crate) const fn unfiled_default() -> bool {
     true
 }
 
-/// Stderr deprecation warning, scheduled for removal in v0.20.0. `old` is the
-/// `--album none` callers explicitly opted out of album passes and aren't
-/// surprised when the unfiled pass runs alongside; carve them out of the
-/// warning even though `unfiled_override.is_none()`.
-pub(crate) fn should_warn_implicit_unfiled(
-    unfiled_override: Option<bool>,
-    albums: &crate::selection::AlbumSelector,
-) -> bool {
-    unfiled_override.is_none() && !matches!(albums, crate::selection::AlbumSelector::None)
-}
-
-fn warn_implicit_unfiled_pass() {
-    tracing::warn!(
-        "[filters] unfiled defaults to true in v0.13, so kei is also running an unfiled pass \
-         (every photo not in any user album) alongside the album pass(es). Pass \
-         `[filters] unfiled = false` to restrict to just the album pass(es); pass \
-         `[filters] unfiled = true` to silence this warning."
-    );
-}
-
 /// Application configuration.
 ///
 /// Fields are ordered for optimal memory layout:
@@ -1057,7 +1037,7 @@ impl Config {
         // (`kei password set`), password files, and shell-command sources.
         if toml_auth.and_then(|a| a.password.as_ref()).is_some() {
             anyhow::bail!(
-                "config file sets `[auth] password`, which is no longer supported. \
+                "config file sets `[auth] password`, which is not accepted. \
                  Plaintext passwords in config files are a security risk. \
                  Use one of: `kei password set` (OS keyring or encrypted file), \
                  `[auth] password_file`, or `[auth] password_command` instead."
@@ -1272,9 +1252,6 @@ impl Config {
             libraries: library_selector.clone(),
             unfiled: unfiled_override.unwrap_or_else(unfiled_default),
         };
-        if should_warn_implicit_unfiled(unfiled_override, &selection.albums) {
-            warn_implicit_unfiled_pass();
-        }
         let filename_exclude_strs = resolve_vec(
             overrides.filename_exclude,
             toml_filters.and_then(|f| f.filename_exclude.clone()),
@@ -3148,12 +3125,8 @@ mod tests {
             "Error should name the rejected field; got: {err}"
         );
         assert!(
-            err.contains("no longer supported"),
-            "Error should explain removal; got: {err}"
-        );
-        assert!(
             err.contains("kei password set"),
-            "Error should point at the credential-store migration; got: {err}"
+            "Error should point at the credential store; got: {err}"
         );
     }
 
@@ -3183,7 +3156,7 @@ mod tests {
     #[test]
     fn test_build_toml_password_rejected_even_with_cli_password() {
         // A CLI password does NOT rescue a TOML password; the TOML field is
-        // rejected on its own, so users can't silently ignore the deprecation.
+        // rejected on its own.
         let toml_str = r#"
             [auth]
             password = "toml-pw"
@@ -6178,80 +6151,6 @@ mod tests {
         assert!(cfg.filters.selection.unfiled);
     }
 
-    // ── should_warn_implicit_unfiled ────────────────────────────────────
-    //
-    // Pin the predicate that drives the v0.13 implicit-unfiled-pass warning.
-    // Fires whenever the user did not pin `--unfiled` (CLI or TOML) and at
-    // least one album pass is still in scope, so the silent v0.12->v0.13
-    // behavior shift surfaces in the user's terminal.
-
-    fn empty_excludes() -> std::collections::BTreeSet<String> {
-        std::collections::BTreeSet::new()
-    }
-
-    #[test]
-    fn test_should_warn_implicit_unfiled_fires_on_default_all() {
-        // No --unfiled, --album defaults to All. The default no-flag sync
-        // path is the one most users hit, and it now runs an unfiled pass
-        // alongside every album pass: the warning must fire.
-        assert!(should_warn_implicit_unfiled(
-            None,
-            &crate::selection::AlbumSelector::All {
-                excluded: empty_excludes()
-            }
-        ));
-    }
-
-    #[test]
-    fn test_should_warn_implicit_unfiled_fires_on_named_set() {
-        // --album Vacation without --unfiled: the v0.12 user expected
-        // "Vacation only", v0.13 also runs unfiled. Warn.
-        let mut included = std::collections::BTreeSet::new();
-        included.insert("Vacation".to_string());
-        assert!(should_warn_implicit_unfiled(
-            None,
-            &crate::selection::AlbumSelector::Named {
-                included,
-                excluded: empty_excludes()
-            }
-        ));
-    }
-
-    #[test]
-    fn test_should_warn_implicit_unfiled_silent_when_album_none() {
-        // --album none explicitly opts out of album passes; the unfiled
-        // pass running is the user's clear intent, not a surprise.
-        assert!(!should_warn_implicit_unfiled(
-            None,
-            &crate::selection::AlbumSelector::None
-        ));
-    }
-
-    #[test]
-    fn test_should_warn_implicit_unfiled_silent_when_unfiled_explicit_true() {
-        // User explicitly opted in. No surprise to surface.
-        assert!(!should_warn_implicit_unfiled(
-            Some(true),
-            &crate::selection::AlbumSelector::All {
-                excluded: empty_excludes()
-            }
-        ));
-    }
-
-    #[test]
-    fn test_should_warn_implicit_unfiled_silent_when_unfiled_explicit_false() {
-        // User explicitly opted out. No surprise to surface.
-        let mut included = std::collections::BTreeSet::new();
-        included.insert("Vacation".to_string());
-        assert!(!should_warn_implicit_unfiled(
-            Some(false),
-            &crate::selection::AlbumSelector::Named {
-                included,
-                excluded: empty_excludes()
-            }
-        ));
-    }
-
     #[test]
     fn test_folder_structure_albums_default_is_album_token() {
         let cfg = Config::build(
@@ -6625,7 +6524,7 @@ mod tests {
     #[test]
     fn test_to_toml_omits_delay_when_matches_smart_default() {
         // Smart default for per_transfer=3 is 5. to_toml should NOT write
-        // `delay = 5` back out because it's redundant (and deprecated).
+        // `delay = 5` back out because it's redundant.
         let mut sync = default_sync();
         sync.config_overrides.max_retries = Some(3);
         let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();

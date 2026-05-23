@@ -528,9 +528,10 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         anyhow::bail!("{msg}");
     }
 
-    // Migrate legacy icloudpd-rs paths before loading config, so the
-    // copied config.toml is found at the new location.
-    let migration_report = migration::migrate_legacy_paths();
+    // Copy legacy icloudpd-rs paths before loading config, so the
+    // copied config.toml is found at the new location. Copy failures are
+    // startup errors; kei doesn't continue against the old paths.
+    migration::migrate_legacy_paths()?;
 
     // Load TOML config early so it can influence log level.
     // If the user explicitly set --config, the file must exist.
@@ -661,13 +662,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             .with_env_filter(env_filter)
             .with_writer(make_writer)
             .init();
-    }
-
-    // Log migration warnings now that tracing is initialized.
-    if let Some(report) = &migration_report {
-        for msg in &report.warnings {
-            tracing::warn!(message = %msg, "Config migration warning");
-        }
     }
 
     if used_docker_fallback {

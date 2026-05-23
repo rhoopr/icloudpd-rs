@@ -16,19 +16,11 @@ const NEW_COOKIE_DIR: &str = "~/.config/kei/cookies";
 const OLD_CONFIG_PATH: &str = "~/.config/icloudpd-rs/config.toml";
 const OLD_COOKIE_DIR: &str = "~/.icloudpd-rs";
 
-/// Summary of what was migrated.
-#[derive(Debug, Default)]
-pub(crate) struct MigrationReport {
-    pub warnings: Vec<String>,
-    pub config_migrated: bool,
-    pub cookies_migrated: bool,
-}
-
 /// Check for legacy icloudpd-rs paths and copy data to the new kei locations.
 ///
-/// Called early in `main()`, before config loading. Returns `None` if no
+/// Called early in `main()`, before config loading. Returns `Ok(false)` if no
 /// migration was needed (new paths already exist or no old paths found).
-pub fn migrate_legacy_paths() -> Option<MigrationReport> {
+pub fn migrate_legacy_paths() -> anyhow::Result<bool> {
     let new_config = expand_tilde(NEW_CONFIG_PATH);
     let new_cookie_dir = expand_tilde(NEW_COOKIE_DIR);
     let old_config = expand_tilde(OLD_CONFIG_PATH);
@@ -42,74 +34,32 @@ fn migrate_legacy_paths_from_paths(
     new_cookie_dir: &Path,
     old_config: &Path,
     old_cookie_dir: &Path,
-) -> Option<MigrationReport> {
+) -> anyhow::Result<bool> {
     // If new config already exists, no migration needed.
     if new_config.exists() {
-        return None;
+        return Ok(false);
     }
 
     let has_old_config = old_config.is_file();
     let has_old_cookies = old_cookie_dir.is_dir();
 
     if !has_old_config && !has_old_cookies {
-        return None;
+        return Ok(false);
     }
 
-    let mut report = MigrationReport::default();
+    let mut migrated = false;
 
     // Migrate config file
-    if has_old_config {
-        match migrate_file(old_config, new_config) {
-            Ok(true) => {
-                report.config_migrated = true;
-                report.warnings.push(format!(
-                    "Migrated config from {} to {}",
-                    old_config.display(),
-                    new_config.display()
-                ));
-            }
-            Ok(false) => {} // destination already exists
-            Err(e) => {
-                report.warnings.push(format!(
-                    "Failed to migrate config from {}: {e}. Using old path as fallback.",
-                    old_config.display()
-                ));
-            }
-        }
+    if has_old_config && migrate_file(old_config, new_config)? {
+        migrated = true;
     }
 
     // Migrate cookie/session/state files
     if has_old_cookies {
-        match migrate_directory_contents(old_cookie_dir, new_cookie_dir) {
-            Ok(count) if count > 0 => {
-                report.cookies_migrated = true;
-                report.warnings.push(format!(
-                    "Migrated {count} files from {} to {}",
-                    old_cookie_dir.display(),
-                    new_cookie_dir.display()
-                ));
-            }
-            Ok(_) => {} // nothing to copy or all already existed
-            Err(e) => {
-                report.warnings.push(format!(
-                    "Failed to migrate data from {}: {e}. Using old path as fallback.",
-                    old_cookie_dir.display()
-                ));
-            }
-        }
+        migrated |= migrate_directory_contents(old_cookie_dir, new_cookie_dir)? > 0;
     }
 
-    if !report.config_migrated && !report.cookies_migrated {
-        return None;
-    }
-
-    report.warnings.push(
-        "The old paths will continue to work but are deprecated. \
-         Please update your scripts and config to use ~/.config/kei/."
-            .to_string(),
-    );
-
-    Some(report)
+    Ok(migrated)
 }
 
 /// Copy a single file to a new location, creating parent directories.
@@ -165,7 +115,7 @@ fn migrate_directory_contents(src_dir: &Path, dst_dir: &Path) -> anyhow::Result<
 mod tests {
     use super::*;
 
-    fn migrate_legacy_paths_for_test(home: &Path) -> Option<MigrationReport> {
+    fn migrate_legacy_paths_for_test(home: &Path) -> anyhow::Result<bool> {
         migrate_legacy_paths_from_paths(
             &home.join(".config/kei/config.toml"),
             &home.join(".config/kei/cookies"),
@@ -185,11 +135,7 @@ mod tests {
         std::fs::write(old_cookie_dir.join("old.session"), "session").unwrap();
         std::fs::write(old_cookie_dir.join("old.db"), "db").unwrap();
 
-        let report =
-            migrate_legacy_paths_for_test(tmp.path()).expect("legacy paths should migrate");
-
-        assert!(report.config_migrated);
-        assert!(report.cookies_migrated);
+        assert!(migrate_legacy_paths_for_test(tmp.path()).unwrap());
         assert_eq!(
             std::fs::read_to_string(tmp.path().join(".config/kei/config.toml")).unwrap(),
             "username = \"old@example.com\""
@@ -207,13 +153,6 @@ mod tests {
             old_cookie_dir.exists(),
             "legacy cookie dir must be left in place"
         );
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|line| line.contains("deprecated")),
-            "migration report should tell users to move off old paths: {report:?}"
-        );
     }
 
     #[test]
@@ -226,7 +165,7 @@ mod tests {
         std::fs::write(&new_config, "username = \"new@example.com\"").unwrap();
         std::fs::write(&old_config, "username = \"old@example.com\"").unwrap();
 
-        assert!(migrate_legacy_paths_for_test(tmp.path()).is_none());
+        assert!(!migrate_legacy_paths_for_test(tmp.path()).unwrap());
         assert_eq!(
             std::fs::read_to_string(&new_config).unwrap(),
             "username = \"new@example.com\""
@@ -234,14 +173,34 @@ mod tests {
     }
 
     #[test]
-    fn migrate_legacy_paths_returns_none_without_legacy_inputs() {
+    fn migrate_legacy_paths_returns_false_without_legacy_inputs() {
         let tmp = tempfile::tempdir().unwrap();
 
-        assert!(migrate_legacy_paths_for_test(tmp.path()).is_none());
+        assert!(!migrate_legacy_paths_for_test(tmp.path()).unwrap());
         assert!(
             !tmp.path().join(".config/kei").exists(),
             "no legacy inputs should not create new directories"
         );
+    }
+
+    #[test]
+    fn migrate_legacy_paths_errors_when_copy_cannot_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_config = tmp.path().join(".config/icloudpd-rs/config.toml");
+        let new_config_parent = tmp.path().join(".config/kei");
+        let new_cookie_dir = tmp.path().join(".config/kei/cookies");
+        let old_cookie_dir = tmp.path().join(".icloudpd-rs");
+        std::fs::create_dir_all(old_config.parent().unwrap()).unwrap();
+        std::fs::write(&old_config, "username = \"old@example.com\"").unwrap();
+        std::fs::write(&new_config_parent, "not a directory").unwrap();
+
+        assert!(migrate_legacy_paths_from_paths(
+            &new_config_parent.join("config.toml"),
+            &new_cookie_dir,
+            &old_config,
+            &old_cookie_dir,
+        )
+        .is_err());
     }
 
     #[test]

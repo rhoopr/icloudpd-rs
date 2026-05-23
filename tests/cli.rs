@@ -99,7 +99,7 @@ fn sync_help_omits_removed_directory_flag() {
 }
 
 #[test]
-fn sync_help_hides_deprecated_exclude_album_flag() {
+fn sync_help_omits_removed_exclude_album_flag() {
     common::cmd()
         .args(["sync", "--help"])
         .assert()

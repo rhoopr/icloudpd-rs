@@ -144,8 +144,7 @@ happens:
   just `Cli::try_parse_from(...)`.
 - **`behavioral.rs`** - `assert_cmd`-driven end-to-end against the real
   binary with a pre-seeded state DB. Covers everything that doesn't need
-  the network (status flags, reconcile routing, deprecation warnings,
-  config resolution).
+  the network (status flags, reconcile routing, config resolution).
 - **`sync.rs`** - live iCloud, `#[ignore]` gated. Covers the happy-path
   download flow, filters, EXIF/XMP write-through, HEIC embed, sidecars.
 - **`state_auth.rs`** - live iCloud, `#[ignore]` gated. Covers status /

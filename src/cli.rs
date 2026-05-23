@@ -259,7 +259,7 @@ pub struct FriendlyArgs {
     #[arg(
         long,
         overrides_with = "friendly",
-        long_help = "Force friendly progress messages off (preserves v0.13 scrollback byte-for-byte). \
+        long_help = "Force friendly progress messages off and use the plain tracing output. \
                      Overrides `--friendly`, the TOML `[ui] friendly` setting, and the auto-detected default. \
                      Use this when piping kei output to a log aggregator on an interactive TTY where \
                      auto-detection would otherwise enable friendly mode."

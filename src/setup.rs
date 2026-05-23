@@ -760,8 +760,8 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         }
 
         // Default sourced from runtime so the wizard stays truthful if
-        // `unfiled_default()` ever changes. Always emit explicitly to
-        // silence the runtime's implicit-unfiled warning.
+        // `unfiled_default()` ever changes. Emit explicitly so the generated
+        // config records the user's intended album/unfiled scope.
         if !answers.albums.is_empty() {
             println!();
             let also_unfiled = Confirm::new()
@@ -772,8 +772,8 @@ fn ask_what_to_download(answers: &mut SetupAnswers) -> anyhow::Result<()> {
         }
     } else {
         // scope == 0 ("entire library") -- albums default to `all`. Set
-        // unfiled explicitly so the wizard output silences the implicit-
-        // unfiled warning that would otherwise fire on every sync.
+        // unfiled explicitly so the generated config records the full
+        // library scope.
         answers.unfiled = Some(true);
     }
 
@@ -1534,8 +1534,8 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             None => writeln!(out, "# script = \"/path/to/script.sh\"")?,
         }
 
-        // [server] - HTTP/Prometheus metrics endpoint. Replaces the
-        // deprecated [metrics] section. Hint-only; no wizard prompt.
+        // [server] - HTTP/Prometheus metrics endpoint. Replaces the removed
+        // [metrics] section. Hint-only; no wizard prompt.
         writeln!(out)?;
         writeln!(out, "[server]")?;
         writeln!(out, "# port = 9090")?;
@@ -1662,7 +1662,7 @@ mod tests {
         // Must contain directory uncommented
         assert!(toml.contains("directory = \"~/Photos/iCloud\""));
         // Libraries should be set to ["all"] (v0.13 array form, not the
-        // deprecated singular `library` key).
+        // removed singular `library` key).
         assert!(toml.contains("libraries = [\"all\"]"));
         assert!(!toml.contains("library = \"all\""));
         // Password should NOT be in the TOML
@@ -2182,12 +2182,11 @@ mod tests {
         assert_eq!(albums, vec!["My Album", "Vacation \"2024\""]);
     }
 
-    /// Single source of truth: the wizard must never emit any TOML key that
-    /// `Config::build` would warn about as deprecated. If a future v0.X
-    /// adds another deprecation, add a substring to `DEPRECATED_KEYS` and the
-    /// wizard authors get a CI failure pointing them at the right field.
+    /// Single source of truth: the wizard must never emit any removed TOML key.
+    /// Add future removed keys to `REMOVED_KEYS` so wizard authors get a CI
+    /// failure pointing them at the right field.
     #[test]
-    fn test_wizard_never_emits_deprecated_keys() {
+    fn test_wizard_never_emits_removed_keys() {
         // Cover both "default" answers (most users) and "every option set"
         // answers (everything the wizard can possibly emit).
         let cases: Vec<SetupAnswers> = vec![
@@ -2226,10 +2225,10 @@ mod tests {
             },
         ];
 
-        // Removed/deprecated keys must not appear in wizard output. Match
+        // Removed keys must not appear in wizard output. Match
         // `key = ` (with the equals sign) so we don't false-positive on
         // comment hints or substring matches inside another key.
-        const DEPRECATED_KEYS: &[(&str, &str)] = &[
+        const REMOVED_KEYS: &[(&str, &str)] = &[
             (
                 "cookie_directory =",
                 "[auth].cookie_directory -> top-level data_dir",
@@ -2267,10 +2266,10 @@ mod tests {
                 .filter(|l| !l.trim_start().starts_with('#'))
                 .collect::<Vec<_>>()
                 .join("\n");
-            for (needle, msg) in DEPRECATED_KEYS {
+            for (needle, msg) in REMOVED_KEYS {
                 assert!(
                     !active.contains(needle),
-                    "wizard emitted deprecated key `{needle}` ({msg}); full output:\n{toml_str}"
+                    "wizard emitted removed key `{needle}` ({msg}); full output:\n{toml_str}"
                 );
             }
         }
@@ -2301,9 +2300,7 @@ mod tests {
 
     /// "Specific albums" + the user wants those AND every other photo
     /// (accepted the unfiled prompt) -> wizard emits `unfiled = true`
-    /// explicitly so the runtime's implicit-unfiled warning never fires.
-    /// (That warning's text says "pass `--unfiled true` to silence", so
-    /// always-explicit emission is load-bearing for a clean first sync.)
+    /// explicitly so the generated config records that selection.
     #[test]
     fn test_specific_albums_with_unfiled_enabled_emits_unfiled_true() {
         let answers = SetupAnswers {

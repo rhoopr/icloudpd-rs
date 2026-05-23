@@ -7,7 +7,7 @@
 //! # Schema v2
 //!
 //! v2 renames run-option fields to match the v0.20 public CLI and removes
-//! deprecated incremental controls.
+//! old incremental controls.
 
 use std::path::{Path, PathBuf};
 

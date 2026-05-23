@@ -1,7 +1,7 @@
 //! Behavioral tests -- exercise real execution paths without credentials.
 //!
 //! These tests run the actual binary and verify outputs, exit codes,
-//! deprecation warnings, config resolution, and error messages.
+//! config resolution, command routing, and error messages.
 //! No network, no iCloud credentials required.
 
 #![allow(
@@ -334,91 +334,6 @@ friendly = false
     assert!(
         json.get("failed_assets").is_none(),
         "clean success report should omit failed_assets: {json}"
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Current commands: no deprecation warnings
-// ═══════════════════════════════════════════════════════════════════════
-#[test]
-fn no_deprecation_login() {
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", "x@x.com")
-        .env("KEI_DATA_DIR", "/tmp")
-        .args(["login"])
-        .assert()
-        .failure() // fails at auth, not at parsing
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("deprecated"),
-        "new command should not print deprecation, stderr: {stderr}"
-    );
-}
-#[test]
-fn no_deprecation_list_albums() {
-    let out = clean_cmd()
-        .args(["list", "albums"])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("deprecated"),
-        "new command should not print deprecation, stderr: {stderr}"
-    );
-}
-#[test]
-fn no_deprecation_password_backend() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", "test@example.com")
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["password", "backend"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("deprecated"),
-        "new command should not print deprecation, stderr: {stderr}"
-    );
-}
-#[test]
-fn no_deprecation_reset_state() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", "test@example.com")
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["reset", "state", "--yes"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("deprecated"),
-        "new command should not print deprecation, stderr: {stderr}"
-    );
-}
-#[test]
-fn no_deprecation_reset_sync_token() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", "test@example.com")
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["reset", "sync-token"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("deprecated"),
-        "new command should not print deprecation, stderr: {stderr}"
     );
 }
 
@@ -968,23 +883,6 @@ fn icloud_username_env_resolves_without_cli_flag() {
         .success()
         .stdout(predicate::str::contains("env@icloud.com"));
 }
-#[test]
-fn data_dir_no_deprecation() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", "test@example.com")
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["status"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("deprecated"),
-        "KEI_DATA_DIR should not warn, stderr: {stderr}"
-    );
-}
 
 // ═══════════════════════════════════════════════════════════════════════
 // First-run auto-config
@@ -1079,8 +977,7 @@ fn config_empty_username_in_toml() {
 }
 #[test]
 fn config_toml_password_field_rejected() {
-    // `[auth] password` is no longer accepted, empty or otherwise; kei must
-    // exit with a migration message pointing at the supported alternatives.
+    // `[auth] password` is not accepted, empty or otherwise.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
@@ -1094,7 +991,6 @@ fn config_toml_password_field_rejected() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("`[auth] password`"))
-        .stderr(predicate::str::contains("no longer supported"))
         .stderr(predicate::str::contains("kei password set"));
 }
 
@@ -1105,8 +1001,7 @@ fn config_toml_password_field_rejected() {
 #[test]
 fn config_multiple_password_sources_in_toml() {
     // Both `password_file` and `password_command` set in the same TOML is
-    // still rejected with "pick one" (the `password` variant is rejected
-    // upstream by the stronger deprecation check).
+    // still rejected with "pick one".
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
@@ -1334,8 +1229,7 @@ fn config_resolution_default_values() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Default threads = 10 (new canonical spelling; the `threads_num` TOML
-    // key is deprecated but the serialized default uses the new name).
+    // Default threads = 10 using the canonical TOML spelling.
     assert!(
         stdout.contains("threads = 10"),
         "default threads should be 10, stdout: {stdout}"
@@ -3326,39 +3220,6 @@ fn removed_legacy_album_errors_even_with_user_set_albums_template() {
         "stderr: {stderr}"
     );
 }
-#[test]
-fn migration_no_warning_when_no_album_token() {
-    sync_cmd_for_config_body("folder_structure = \"%Y/%m/%d\"\n")
-        .arg("--only-print-filenames")
-        .assert()
-        .stderr(predicate::str::contains("`{album}` in `--folder-structure`").not());
-}
-
-/// `--smart-folder Favorites` no longer prints the pre-PR6 "not yet wired
-/// into the sync pipeline" disclaimer. The flag executes end-to-end via
-/// `Selection -> resolve_passes -> AlbumPlan`; a stale warning at startup
-/// would mislead users into thinking their config is a no-op.
-#[test]
-fn smart_folder_flag_does_not_print_unwired_warning() {
-    sync_cmd_for_config_body("\n[filters]\nsmart_folders = [\"Favorites\"]\n")
-        .arg("--only-print-filenames")
-        .assert()
-        .stderr(predicate::str::contains("not yet wired").not())
-        .stderr(predicate::str::contains("not download smart folders").not());
-}
-
-/// `--unfiled false` no longer prints the pre-PR6 "not yet wired" disclaimer.
-/// The flag flows into `Selection.unfiled` and gates both the unfiled pass
-/// and the cross-album exclusion-set pre-fetch in `resolve_passes`.
-#[test]
-fn unfiled_flag_does_not_print_unwired_warning() {
-    sync_cmd_for_config_body("\n[filters]\nunfiled = false\n")
-        .arg("--only-print-filenames")
-        .assert()
-        .stderr(predicate::str::contains("not yet wired").not())
-        .stderr(predicate::str::contains("legacy unfiled-pass rules").not());
-}
-
 /// Every per-category selection flag composed in a single
 /// invocation must validate end-to-end through the
 /// `Cli -> Config -> Selection` pipeline. Per-category unit tests in
@@ -3366,7 +3227,7 @@ fn unfiled_flag_does_not_print_unwired_warning() {
 /// wiring (clap field name, config-resolver field name, the
 /// `effective_command()` mapping) can drift independently of the
 /// parsers; a regression there lands green for every per-category
-/// test even when the combined flag set bails or warns at startup.
+/// test even when the combined flag set bails at startup.
 ///
 /// Flags exercised here:
 ///   --album none              → AlbumSelector::None
@@ -3378,7 +3239,7 @@ fn unfiled_flag_does_not_print_unwired_warning() {
 /// available, network unreachable, auth bail) — those are
 /// out-of-scope. What matters is that none of the parser-level bail
 /// strings ("must not be empty", "not supported", "cannot be combined")
-/// or stale "not yet wired" disclaimers reach stderr.
+/// reach stderr.
 #[test]
 fn sync_validation_accepts_full_selection_combo() {
     let out = sync_cmd_for_config_body(
@@ -3389,11 +3250,6 @@ fn sync_validation_accepts_full_selection_combo() {
         .get_output()
         .clone();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // No stale "not yet wired" disclaimers from the pre-PR6 era.
-    assert!(
-        !stderr.contains("not yet wired"),
-        "selection combo must not surface a 'not yet wired' warning; stderr: {stderr}"
-    );
     // No parser-level bail strings — those would mean the combo got
     // rejected at parse time, which the per-category tests already
     // disprove for each flag in isolation.
