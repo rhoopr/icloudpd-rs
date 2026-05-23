@@ -73,7 +73,7 @@ impl std::fmt::Debug for PhotoLibrary {
 }
 
 impl PhotoLibrary {
-    /// Create a new `PhotoLibrary`, warning if indexing has not finished.
+    /// Create a new `PhotoLibrary`, failing if indexing has not finished.
     pub async fn new(
         service_endpoint: String,
         params: Arc<HashMap<String, Value>>,
@@ -157,22 +157,21 @@ impl PhotoLibrary {
 
         let query: super::cloudkit::QueryResponse =
             serde_json::from_value(response).map_err(|e| ICloudError::Connection(e.to_string()))?;
-        let indexing_state = query
-            .records
-            .first()
-            .and_then(|r| {
-                r.fields
-                    .get("state")
-                    .and_then(|f| f.get("value"))
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("");
+        let indexing_state = query.records.first().and_then(|r| {
+            r.fields
+                .get("state")
+                .and_then(|f| f.get("value"))
+                .and_then(Value::as_str)
+        });
+        let Some(indexing_state) = indexing_state else {
+            return Err(ICloudError::Connection(
+                "Photo library indexing state is missing; results may be incomplete".into(),
+            ));
+        };
         if indexing_state != "FINISHED" {
-            tracing::warn!(
-                state = indexing_state,
-                "Photo library indexing state is not FINISHED — proceeding anyway, \
-                 results may be incomplete"
-            );
+            return Err(ICloudError::Connection(format!(
+                "Photo library indexing state is {indexing_state}; expected FINISHED"
+            )));
         }
 
         Ok(Self {
@@ -450,6 +449,28 @@ mod tests {
         }
     }
 
+    struct IndexingStateSession {
+        response: Value,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for IndexingStateSession {
+        async fn post(
+            &self,
+            _url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            Ok(self.response.clone())
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(IndexingStateSession {
+                response: self.response.clone(),
+            })
+        }
+    }
+
     /// Build a `PhotoLibrary` directly (bypassing `new()` which requires a live session).
     fn make_library(zone_id: Value) -> PhotoLibrary {
         PhotoLibrary {
@@ -460,6 +481,60 @@ mod tests {
             library_type: Arc::from("personal"),
             retry_config: RetryConfig::default(),
         }
+    }
+
+    async fn new_library_with_indexing_response(
+        response: Value,
+    ) -> Result<PhotoLibrary, ICloudError> {
+        PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::new(HashMap::new()),
+            Box::new(IndexingStateSession { response }),
+            Arc::new(json!({"zoneName": "PrimarySync"})),
+            "private".into(),
+            RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn indexing_state_finished_initializes_library() {
+        let lib = new_library_with_indexing_response(json!({
+            "records": [{"fields": {"state": {"value": "FINISHED"}}}]
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(lib.zone_name(), "PrimarySync");
+    }
+
+    #[tokio::test]
+    async fn indexing_state_running_fails_library_initialization() {
+        let err = new_library_with_indexing_response(json!({
+            "records": [{"fields": {"state": {"value": "RUNNING"}}}]
+        }))
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("RUNNING") && err.to_string().contains("FINISHED"),
+            "error should name observed and expected indexing states: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexing_state_missing_fails_library_initialization() {
+        let err = new_library_with_indexing_response(json!({"records": []}))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("indexing state is missing"),
+            "missing indexing state must fail closed: {err}"
+        );
     }
 
     #[test]

@@ -226,6 +226,7 @@ impl PhotosService {
                 }
                 Err(e) => {
                     tracing::error!(zone = %zone_name, error = %e, "Failed to load library zone");
+                    anyhow::bail!("Failed to load library zone {zone_name}: {e}");
                 }
             }
         }
@@ -554,15 +555,51 @@ mod tests {
         async fn post(
             &self,
             _url: &str,
-            _body: String,
+            body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
+            if body.contains("CheckIndexingState") {
+                return Ok(json!({
+                    "records": [{
+                        "fields": {"state": {"value": "FINISHED"}}
+                    }]
+                }));
+            }
             Ok(self.response.clone())
         }
 
         fn clone_box(&self) -> Box<dyn session::PhotosSession> {
             Box::new(CloneableSession {
                 response: self.response.clone(),
+            })
+        }
+    }
+
+    struct RunningIndexSession {
+        zone_response: Value,
+    }
+
+    #[async_trait::async_trait]
+    impl session::PhotosSession for RunningIndexSession {
+        async fn post(
+            &self,
+            _url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if body.contains("CheckIndexingState") {
+                return Ok(json!({
+                    "records": [{
+                        "fields": {"state": {"value": "RUNNING"}}
+                    }]
+                }));
+            }
+            Ok(self.zone_response.clone())
+        }
+
+        fn clone_box(&self) -> Box<dyn session::PhotosSession> {
+            Box::new(RunningIndexSession {
+                zone_response: self.zone_response.clone(),
             })
         }
     }
@@ -643,6 +680,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_fetch_libraries_fails_on_non_deleted_zone_initialization_failure() {
+        let session = RunningIndexSession {
+            zone_response: json!({
+                "zones": [
+                    {"zoneID": {"zoneName": "LiveZone"}, "syncToken": "tok"},
+                    {
+                        "zoneID": {"zoneName": "CMM-657AE284-D1E0-4C7F-9B4D-987888651AC6"},
+                        "syncToken": "tok2",
+                    },
+                    {
+                        "zoneID": {"zoneName": "GoneZone"},
+                        "syncToken": "tok3",
+                        "deleted": true,
+                    }
+                ]
+            }),
+        };
+        let mut svc = make_service(Box::new(session), HashMap::new());
+        let err = svc.fetch_private_libraries().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("LiveZone") && msg.contains("RUNNING"),
+            "regular non-deleted zone failure must fail discovery: {msg}"
+        );
+        assert!(
+            svc.private_libraries.is_none(),
+            "failed discovery must not cache a partial private library map"
+        );
+    }
+
     /// Second call to fetch_private_libraries reuses the cached map
     /// rather than re-issuing the HTTP request. A session that only
     /// responds correctly once would fail on the second call if caching
@@ -690,9 +758,16 @@ mod tests {
         async fn post(
             &self,
             url: &str,
-            _body: String,
+            body: String,
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
+            if body.contains("CheckIndexingState") {
+                return Ok(json!({
+                    "records": [{
+                        "fields": {"state": {"value": "FINISHED"}}
+                    }]
+                }));
+            }
             if url.contains("/private/") {
                 Ok(self.private_response.clone())
             } else if url.contains("/shared/") {

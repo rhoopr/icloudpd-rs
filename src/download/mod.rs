@@ -2029,21 +2029,14 @@ async fn build_pass_count_plan(
 }
 
 /// Classification of how the producer-observed asset count compared with the
-/// pre-enumeration API total. Drives the two-tier pagination-undercount gate.
+/// pre-enumeration API total.
 ///
-/// - `Match`: producer saw at least as many assets as `total` reported. Token
-///   advances silently.
-/// - `WithinTolerance`: producer saw fewer than `total` but the gap is below
-///   the 5% suppression threshold. Token advances; a `warn!` fires so a slow
-///   drift is visible before it grows past 5%.
-/// - `Suppress`: gap is at or above 5% of `total`. Token is suppressed so the
-///   next cycle re-enumerates. Without this gate, missed change events would
-///   sit behind an advanced token forever (silent data loss).
+/// Any shortfall is token-unsafe. The severity split is kept only so logs can
+/// distinguish a small mismatch from a larger truncation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaginationShortfall {
     Match,
-    WithinTolerance { shortfall: u64 },
-    Suppress,
+    Shortfall { shortfall: u64 },
 }
 
 /// Pure classifier for the pagination-undercount gate. `total` is the
@@ -2054,13 +2047,8 @@ fn classify_pagination_shortfall(total: u64, seen: u64) -> PaginationShortfall {
     if seen >= total {
         return PaginationShortfall::Match;
     }
-    let suppress_threshold = total * 95 / 100; // 5% tolerance
-    if seen < suppress_threshold {
-        PaginationShortfall::Suppress
-    } else {
-        PaginationShortfall::WithinTolerance {
-            shortfall: total - seen,
-        }
+    PaginationShortfall::Shortfall {
+        shortfall: total - seen,
     }
 }
 
@@ -2428,20 +2416,11 @@ async fn download_photos_full_with_token(
             let decision = classify_pagination_shortfall(total, streaming_result.assets_seen);
             match decision {
                 PaginationShortfall::Match => false,
-                PaginationShortfall::WithinTolerance { shortfall } => {
+                PaginationShortfall::Shortfall { shortfall } => {
                     tracing::warn!(
                         expected = total,
                         seen = streaming_result.assets_seen,
                         shortfall,
-                        "Enumeration saw slightly fewer assets than expected; within \
-                         5% tolerance so sync token will still advance"
-                    );
-                    false
-                }
-                PaginationShortfall::Suppress => {
-                    tracing::warn!(
-                        expected = total,
-                        seen = streaming_result.assets_seen,
                         "Enumeration saw fewer assets than expected — blocking sync token \
                          advancement to force full re-enumeration on next run"
                     );
@@ -2454,6 +2433,9 @@ async fn download_photos_full_with_token(
     } else {
         false
     };
+    if pagination_undercount {
+        streaming_result.enumeration_errors += 1;
+    }
 
     // Collect the sync token from every album's token receiver and require
     // agreement before advancing. In practice, all passes for a zone should
@@ -2461,7 +2443,10 @@ async fn download_photos_full_with_token(
     // observe one coherent snapshot.
     // Don't advance the token for read-only operations, or when pagination
     // was incomplete (would permanently skip missed assets).
-    let sync_token = if !controls.run_mode.only_print_filenames() && !pagination_undercount {
+    let sync_token = if !controls.run_mode.only_print_filenames()
+        && !pagination_undercount
+        && streaming_result.enumeration_errors == 0
+    {
         let mut tokens = Vec::new();
         for rx in token_receivers {
             if let Ok(Some(token)) = rx.await {
@@ -5307,57 +5292,44 @@ mod tests {
         assert_eq!(decision, PaginationShortfall::Match);
     }
 
-    /// A 1% undercount (within 5% tolerance) classifies as
-    /// `WithinTolerance` so the caller emits a `warn!` but still advances the
-    /// sync token. This is the visible-but-non-blocking layer that closes the
-    /// pre-existing 4%-silent-drop gap (the prior gate fired only at >=5%).
+    /// A 1% undercount is token-unsafe. Small mismatches still keep the
+    /// shortfall count for log/report context, but the token must not advance.
     #[test]
-    fn classify_pagination_shortfall_one_percent_below_warns_but_advances() {
+    fn classify_pagination_shortfall_one_percent_below_blocks_token() {
         // 1000 expected, 990 seen → 1% shortfall, within 5% tolerance.
         let decision = classify_pagination_shortfall(1000, 990);
         assert_eq!(
             decision,
-            PaginationShortfall::WithinTolerance { shortfall: 10 },
-            "1% undercount must classify as WithinTolerance so the caller emits \
-             a warn but does NOT suppress the sync token"
+            PaginationShortfall::Shortfall { shortfall: 10 },
+            "1% undercount must block sync-token advancement"
         );
     }
 
-    /// A 4% undercount (still within 5% tolerance) classifies as
-    /// `WithinTolerance`. Pre-fix this slipped through silently with no log;
-    /// post-fix the `warn!` makes the drift visible before it grows past 5%.
+    /// A 4% undercount is also token-unsafe. There is no tolerance for
+    /// write-capable syncs because a short page can hide never-downloaded
+    /// records behind an advanced token.
     #[test]
-    fn classify_pagination_shortfall_four_percent_below_still_advances() {
+    fn classify_pagination_shortfall_four_percent_below_blocks_token() {
         // 1000 expected, 960 seen → 4% shortfall.
         let decision = classify_pagination_shortfall(1000, 960);
-        assert_eq!(
-            decision,
-            PaginationShortfall::WithinTolerance { shortfall: 40 }
-        );
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 40 });
     }
 
-    /// A 6% undercount crosses the 5% threshold and must `Suppress` so
-    /// the sync token is held back, forcing full re-enumeration on the next
-    /// run rather than skipping the missing change events forever.
+    /// A 6% undercount is token-unsafe for the same reason as a small
+    /// undercount.
     #[test]
-    fn classify_pagination_shortfall_six_percent_below_suppresses_token() {
-        // 1000 expected, 940 seen → 6% shortfall, above the 5% suppression
-        // threshold. `total * 95 / 100 = 950`, and 940 < 950 → Suppress.
+    fn classify_pagination_shortfall_six_percent_below_blocks_token() {
+        // 1000 expected, 940 seen → 6% shortfall.
         let decision = classify_pagination_shortfall(1000, 940);
-        assert_eq!(decision, PaginationShortfall::Suppress);
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 60 });
     }
 
-    /// Boundary case at exactly 5% shortfall. `total * 95 / 100 = 950`,
-    /// and seen == 950 is NOT below the threshold, so it stays in
-    /// `WithinTolerance` (the gate is strict less-than). Pinning this so a
-    /// future tweak to the threshold math doesn't flip the boundary silently.
+    /// Boundary case at exactly 5% shortfall. The old tolerance boundary is
+    /// still token-unsafe under fail-closed enumeration.
     #[test]
-    fn classify_pagination_shortfall_at_threshold_is_within_tolerance() {
+    fn classify_pagination_shortfall_at_old_threshold_blocks_token() {
         let decision = classify_pagination_shortfall(1000, 950);
-        assert_eq!(
-            decision,
-            PaginationShortfall::WithinTolerance { shortfall: 50 }
-        );
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 50 });
     }
 
     /// The orphan-part walk must remove .part files older

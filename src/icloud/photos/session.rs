@@ -251,19 +251,17 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
         .into());
     }
 
-    // Per-record errors: filter out errored records and keep valid ones.
-    // Only return Err if ALL records are errored.
+    // Per-record errors make the whole page unusable. Filtering errored
+    // records out of a mixed page can make enumeration look complete while
+    // silently dropping assets from the snapshot.
     if let Some(records) = response.get("records").and_then(Value::as_array) {
-        // Check if any records have errors before taking the mutable path
         let has_errors = records
             .iter()
             .any(|r| r.get("serverErrorCode").and_then(Value::as_str).is_some());
 
         if has_errors {
-            // Log each errored record and capture the last error
-            let mut last_ck_err = None;
-            let mut permanent_errors = 0usize;
-            let mut retryable_errors = 0usize;
+            let mut first_retryable = None;
+            let mut first_permanent = None;
             for record in records {
                 if let Some(code) = record.get("serverErrorCode").and_then(Value::as_str) {
                     let reason = record
@@ -278,13 +276,7 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                         .iter()
                         .any(|&s| s.eq_ignore_ascii_case(code));
                     let service_not_activated = is_service_not_activated(code, reason);
-                    // Permanent errors (e.g. ACCESS_DENIED on a revoked
-                    // shared asset) silently drop records from the
-                    // enumeration; log at error! so operators can audit
-                    // which assets were skipped and why. Retryable errors
-                    // are a matter of the retry loop and stay at warn!.
                     if retryable {
-                        retryable_errors += 1;
                         tracing::warn!(
                             record_name,
                             error_code = code,
@@ -292,53 +284,37 @@ fn check_cloudkit_errors(response: Value) -> anyhow::Result<Value> {
                             service_not_activated,
                             "CloudKit per-record error (retryable): {reason}"
                         );
+                        first_retryable.get_or_insert_with(|| CloudKitServerError {
+                            code: code.into(),
+                            reason: reason.into(),
+                            retryable,
+                            service_not_activated,
+                        });
                     } else {
-                        permanent_errors += 1;
                         tracing::error!(
                             record_name,
                             error_code = code,
                             retryable,
                             service_not_activated,
-                            "CloudKit per-record error (permanent, record skipped): {reason}"
+                            "CloudKit per-record error (permanent): {reason}"
                         );
+                        first_permanent.get_or_insert_with(|| CloudKitServerError {
+                            code: code.into(),
+                            reason: reason.into(),
+                            retryable,
+                            service_not_activated,
+                        });
                     }
-                    last_ck_err = Some(CloudKitServerError {
-                        code: code.into(),
-                        reason: reason.into(),
-                        retryable,
-                        service_not_activated,
-                    });
                 }
             }
 
-            // Now mutate in-place: retain only valid records
-            let mut response = response;
-            let total = response
-                .get("records")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            if let Some(records) = response.get_mut("records").and_then(Value::as_array_mut) {
-                records.retain(|r| r.get("serverErrorCode").and_then(Value::as_str).is_none());
-                let valid_count = records.len();
-                if valid_count == 0 {
-                    let Some(last_ck_err) = last_ck_err else {
-                        anyhow::bail!(
-                            "CloudKit response contained no valid records, \
-                             but no per-record server error was available"
-                        );
-                    };
-                    return Err(last_ck_err.into());
-                }
-                tracing::warn!(
-                    errored = total - valid_count,
-                    permanent = permanent_errors,
-                    retryable = retryable_errors,
-                    valid = valid_count,
-                    total,
-                    "Filtered errored records from CloudKit response"
-                );
+            if let Some(err) = first_retryable.or(first_permanent) {
+                return Err(err.into());
             }
-            return Ok(response);
+            anyhow::bail!(
+                "CloudKit response contained per-record errors, \
+                 but no per-record server error was available"
+            );
         }
     }
 
@@ -526,17 +502,17 @@ mod tests {
 
     #[test]
     fn test_check_cloudkit_errors_per_record_mixed() {
-        // When some records are valid and some errored, valid ones are kept
         let response = serde_json::json!({
             "records": [
                 {"recordName": "A"},
                 {"serverErrorCode": "RETRY_LATER", "reason": "busy"}
             ]
         });
-        let result = check_cloudkit_errors(response).unwrap();
-        let records = result["records"].as_array().unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0]["recordName"], "A");
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert_eq!(&*ck_err.code, "RETRY_LATER");
+        assert!(ck_err.retryable);
+        assert_eq!(classify_api_error(&err), RetryAction::Retry);
     }
 
     #[test]
@@ -926,8 +902,6 @@ mod tests {
 
     #[test]
     fn test_check_cloudkit_errors_per_record_non_retryable_still_filters() {
-        // When a per-record error is non-retryable (e.g., ZONE_NOT_FOUND),
-        // but there are still valid records, the valid ones should be kept.
         let response = serde_json::json!({
             "records": [
                 {"recordName": "VALID_1"},
@@ -935,11 +909,11 @@ mod tests {
                 {"recordName": "VALID_2"}
             ]
         });
-        let result = check_cloudkit_errors(response).unwrap();
-        let records = result["records"].as_array().unwrap();
-        assert_eq!(records.len(), 2, "two valid records should be preserved");
-        assert_eq!(records[0]["recordName"], "VALID_1");
-        assert_eq!(records[1]["recordName"], "VALID_2");
+        let err = check_cloudkit_errors(response).unwrap_err();
+        let ck_err = err.downcast_ref::<CloudKitServerError>().unwrap();
+        assert_eq!(&*ck_err.code, "ZONE_NOT_FOUND");
+        assert!(!ck_err.retryable);
+        assert_eq!(classify_api_error(&err), RetryAction::Abort);
     }
 
     // ── Gap: SyncTokenError::should_fallback_to_full classification ──
