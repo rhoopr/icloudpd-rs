@@ -19,6 +19,7 @@ use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
 use crate::state::ImportStateStore;
+use crate::systemd::SystemdNotifier;
 use crate::types::FileMatchPolicy;
 
 use super::service::{
@@ -97,11 +98,12 @@ pub(crate) trait StrictImportVerifier {
     ) -> BoxFuture<'a, anyhow::Result<StrictImportDecision>>;
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct ImportRunOptions<'a> {
     pub(crate) dry_run: bool,
     pub(crate) show_progress: bool,
     pub(crate) strict_verifier: Option<&'a dyn StrictImportVerifier>,
+    pub(crate) shutdown_token: Option<&'a tokio_util::sync::CancellationToken>,
 }
 
 impl std::fmt::Debug for ImportRunOptions<'_> {
@@ -110,6 +112,7 @@ impl std::fmt::Debug for ImportRunOptions<'_> {
             .field("dry_run", &self.dry_run)
             .field("show_progress", &self.show_progress)
             .field("strict", &self.strict_verifier.is_some())
+            .field("shutdown", &self.shutdown_token.is_some())
             .finish()
     }
 }
@@ -450,7 +453,24 @@ where
         }
     };
 
-    while let Some(result) = stream.next().await {
+    loop {
+        let result = if let Some(shutdown_token) = options.shutdown_token {
+            tokio::select! {
+                () = shutdown_token.cancelled() => {
+                    anyhow::bail!(
+                        "import-existing interrupted by shutdown signal for library '{library_label}'"
+                    );
+                }
+                result = stream.next() => result,
+            }
+        } else {
+            stream.next().await
+        };
+
+        let Some(result) = result else {
+            break;
+        };
+
         // Emit a one-shot marker as soon as the first asset is dequeued so
         // tests (and operators tailing logs) can synchronise on real work
         // having started, rather than racing on a wall-clock sleep against
@@ -706,6 +726,10 @@ pub(crate) async fn run_import_existing(
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
 ) -> anyhow::Result<()> {
+    let shutdown_token = crate::shutdown::install_signal_handler(
+        SystemdNotifier::new(false),
+        crate::personality::Mode::Off,
+    )?;
     let db_path = super::super::get_db_path(globals, toml)?;
     let download_config = build_import_download_config(toml)?;
     let directory = Arc::clone(&download_config.directory);
@@ -850,6 +874,7 @@ pub(crate) async fn run_import_existing(
                     strict_verifier: strict_verifier
                         .as_ref()
                         .map(|v| v as &dyn StrictImportVerifier),
+                    shutdown_token: Some(&shutdown_token),
                 },
             )
             .await?;
@@ -1439,8 +1464,8 @@ mod wiremock_tests {
             &mut dir_cache,
             ImportRunOptions {
                 dry_run,
-                show_progress: false,
                 strict_verifier,
+                ..Default::default()
             },
         )
         .await
@@ -2733,17 +2758,58 @@ mod wiremock_tests {
             &config,
             "test-all",
             &mut dir_cache,
-            ImportRunOptions {
-                dry_run: false,
-                show_progress: false,
-                strict_verifier: None,
-            },
+            ImportRunOptions::default(),
         )
         .await
         .expect("clean exit must be Ok");
         assert_eq!(stats.total, 0);
         assert_eq!(stats.matched, 0);
         assert_eq!(stats.unmatched, 0);
+    }
+
+    /// Cancellation must make `import-existing` leave the scan loop instead
+    /// of relying on default SIGINT process termination. That protects the
+    /// SQLite state DB from being killed mid-write and lets a rerun recover
+    /// from the last committed import rows.
+    #[tokio::test]
+    async fn import_assets_bails_promptly_when_shutdown_token_cancels() {
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+        let db = open_db(&tmp).await;
+
+        let stream = futures_util::stream::pending::<anyhow::Result<PhotoAsset>>();
+        let (_tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        shutdown_token.cancel();
+
+        let mut dir_cache = DirCache::new();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            import_assets(
+                stream,
+                rx,
+                db.as_ref(),
+                &config,
+                "test-all",
+                &mut dir_cache,
+                ImportRunOptions {
+                    shutdown_token: Some(&shutdown_token),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("shutdown cancellation must not hang")
+        .expect_err("shutdown cancellation must abort the scan");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("import-existing interrupted by shutdown signal")
+                && msg.contains("test-all"),
+            "error message must name the shutdown and library label, got: {msg}",
+        );
     }
 
     /// Fetcher panic: the panic_rx delivers `true`. import_assets must
@@ -2769,11 +2835,7 @@ mod wiremock_tests {
             &config,
             "test-all",
             &mut dir_cache,
-            ImportRunOptions {
-                dry_run: false,
-                show_progress: false,
-                strict_verifier: None,
-            },
+            ImportRunOptions::default(),
         )
         .await
         .expect_err("must bail on fetcher panic");
@@ -2852,8 +2914,7 @@ mod wiremock_tests {
             &mut dir_cache,
             ImportRunOptions {
                 dry_run: true,
-                show_progress: false,
-                strict_verifier: None,
+                ..Default::default()
             },
         )
         .await
@@ -2984,8 +3045,7 @@ mod wiremock_tests {
             &mut dir_cache,
             ImportRunOptions {
                 dry_run: true,
-                show_progress: false,
-                strict_verifier: None,
+                ..Default::default()
             },
         )
         .await
@@ -3025,8 +3085,7 @@ mod wiremock_tests {
             &mut dir_cache,
             ImportRunOptions {
                 dry_run: true,
-                show_progress: false,
-                strict_verifier: None,
+                ..Default::default()
             },
         )
         .await

@@ -775,11 +775,7 @@ async fn kei_uses_fingerprint_filename_when_filename_missing() {
         &config,
         "test-all",
         &mut dir_cache,
-        ImportRunOptions {
-            dry_run: false,
-            show_progress: false,
-            strict_verifier: None,
-        },
+        ImportRunOptions::default(),
     )
     .await
     .expect("import_assets ok");
