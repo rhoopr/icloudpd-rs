@@ -4530,6 +4530,14 @@ mod tests {
             db.call_count() > STATE_DB_UNWRITABLE_THRESHOLD,
             "deferred writes must be retried before opening the circuit"
         );
+        for i in 0..STATE_DB_UNWRITABLE_THRESHOLD {
+            let landed = dir.path().join(format!("photo_{i}.jpg"));
+            assert!(
+                landed.exists(),
+                "state write failures must not remove an already-published file: {}",
+                landed.display()
+            );
+        }
     }
 
     /// T-11: When the API returns the same asset ID on two different pages,
@@ -4566,9 +4574,8 @@ mod tests {
         assert_eq!(seen_ids.len(), 2, "only 2 unique IDs should be tracked");
     }
 
-    /// When a CancellationToken fires during a download pass with
-    /// concurrent tasks, the function must return promptly (well within the
-    /// Docker stop_grace_period) rather than blocking on the remaining stream.
+    /// When a CancellationToken is already cancelled as the next asset is
+    /// yielded, the pass must stop before planning or downloading that asset.
     #[tokio::test]
     async fn shutdown_cancellation_exits_download_pass_promptly() {
         use crate::download::{DownloadConfig, SyncMode};
@@ -4576,20 +4583,16 @@ mod tests {
         use crate::types::{
             AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
         };
-        use futures_util::stream;
         use rustc_hash::FxHashSet;
-        use std::time::Instant;
 
-        // Build a slow infinite stream of photo assets — yields one every 50ms.
-        // Without cancellation this would run forever.
-        let asset_stream = stream::unfold(0u32, |i| async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let asset = TestPhotoAsset::new(&format!("SHUTDOWN_{i}"))
-                .orig_size(100)
-                .orig_url("http://127.0.0.1:1/photo.jpg")
-                .orig_checksum(&format!("ck_{i}"))
-                .build();
-            Some((Ok(asset) as anyhow::Result<PhotoAsset>, i + 1))
+        let asset_stream = futures_util::stream::repeat_with(|| {
+            Ok::<PhotoAsset, anyhow::Error>(
+                TestPhotoAsset::new("SHUTDOWN_ALREADY_CANCELLED")
+                    .orig_size(100)
+                    .orig_url("http://127.0.0.1:1/photo.jpg")
+                    .orig_checksum("ck_shutdown")
+                    .build(),
+            )
         });
 
         let dir = TempDir::new().unwrap();
@@ -4648,13 +4651,8 @@ mod tests {
             .expect("client");
 
         let shutdown_token = CancellationToken::new();
-        let token_clone = shutdown_token.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            token_clone.cancel();
-        });
+        shutdown_token.cancel();
 
-        let start = Instant::now();
         let result = stream_and_download_from_stream(
             &client,
             asset_stream,
@@ -4664,16 +4662,13 @@ mod tests {
             shutdown_token,
             StreamRuntime::new(None, None),
         )
-        .await;
-        let elapsed = start.elapsed();
+        .await
+        .expect("cancelled pass should return a streaming result");
 
+        assert_eq!(result.downloaded, 0, "cancelled pass must not download");
         assert!(
-            result.is_ok(),
-            "should return Ok after cancellation, got: {result:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "should exit promptly after cancellation, took {elapsed:?}"
+            !result.enumeration_complete,
+            "cancelled enumeration must not be considered complete"
         );
     }
 

@@ -2901,11 +2901,10 @@ async fn download_photos_incremental(
 mod tests {
     use super::*;
     use crate::commands::{AlbumPass, PassKind};
-    use crate::icloud::photos::asset::ChangeEvent;
     use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
     use crate::test_helpers::{
         mock_photo_records_for_zone_with_filename, DynamicRecentPhotosSession, MockPhotosFlow,
-        TestPhotoAsset,
+        TestAssetRecord,
     };
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -3614,88 +3613,89 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_change_event_asset_extraction() {
-        // Verify that events with None assets are filtered out
-        let event_with_asset = ChangeEvent {
-            record_name: "REC_1".into(),
-            record_type: Some("CPLAsset".into()),
-            reason: ChangeReason::Created,
-            asset: Some(TestPhotoAsset::new("TEST_1").build()),
-        };
-        let event_without_asset = ChangeEvent {
-            record_name: "REC_2".into(),
-            record_type: Some("CPLAsset".into()),
-            reason: ChangeReason::Created,
-            asset: None,
-        };
-
-        let events = vec![event_with_asset, event_without_asset];
-        let downloadable: Vec<_> = events
-            .into_iter()
-            .filter(|e| matches!(e.reason, ChangeReason::Created))
-            .filter_map(|e| e.asset)
-            .collect();
-
-        assert_eq!(downloadable.len(), 1);
-        assert_eq!(downloadable[0].id(), "TEST_1");
+    fn hard_deleted_change_record(record_name: &str) -> Value {
+        json!({
+            "recordName": record_name,
+            "recordType": null,
+            "fields": {},
+            "deleted": true,
+        })
     }
 
-    #[test]
-    fn test_incremental_filters_skip_deletions() {
-        let events = vec![
-            ChangeEvent {
-                record_name: "REC_1".into(),
-                record_type: Some("CPLAsset".into()),
-                reason: ChangeReason::Created,
-                asset: Some(TestPhotoAsset::new("TEST_1").build()),
-            },
-            ChangeEvent {
-                record_name: "REC_2".into(),
-                record_type: None,
-                reason: ChangeReason::HardDeleted,
-                asset: None,
-            },
-            ChangeEvent {
-                record_name: "REC_3".into(),
-                record_type: Some("CPLAsset".into()),
-                reason: ChangeReason::SoftDeleted,
-                asset: None,
-            },
-            ChangeEvent {
-                record_name: "REC_4".into(),
-                record_type: Some("CPLAsset".into()),
-                reason: ChangeReason::Hidden,
-                asset: None,
-            },
-        ];
-
-        let downloadable: Vec<_> = events
-            .into_iter()
-            .filter(|e| matches!(e.reason, ChangeReason::Created))
-            .filter_map(|e| e.asset)
-            .collect();
-
-        assert_eq!(downloadable.len(), 1);
-        assert_eq!(downloadable[0].id(), "TEST_1");
+    fn flagged_incremental_records(record_name: &str, flag: (&str, i64)) -> Vec<Value> {
+        let mut records = incremental_photo_records(record_name);
+        records[0]["fields"][flag.0] = json!({"value": flag.1, "type": "INT64"});
+        records
     }
 
-    #[test]
-    fn test_incremental_modified_events_are_downloadable() {
-        let events = vec![ChangeEvent {
-            record_name: "MOD_1".into(),
-            record_type: Some("CPLAsset".into()),
-            reason: ChangeReason::Created,
-            asset: Some(TestPhotoAsset::new("TEST_1").build()),
+    fn assert_source_flags(
+        records: &[crate::state::AssetRecord],
+        asset_id: &str,
+        expected_deleted: bool,
+        expected_hidden: bool,
+    ) {
+        let record = records
+            .iter()
+            .find(|record| record.id.as_ref() == asset_id)
+            .unwrap_or_else(|| panic!("missing state row for {asset_id}"));
+        assert_eq!(
+            record.metadata.is_deleted, expected_deleted,
+            "is_deleted mismatch for {asset_id}"
+        );
+        assert_eq!(
+            record.metadata.is_hidden, expected_hidden,
+            "is_hidden mismatch for {asset_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_incremental_delete_and_hidden_events_mark_state_without_downloads() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        for id in ["SOFT_DELETE", "HARD_DELETE", "HIDDEN_ASSET"] {
+            db.upsert_seen(&TestAssetRecord::new(id).build())
+                .await
+                .unwrap();
+        }
+
+        let mut records = Vec::new();
+        records.extend(flagged_incremental_records("SOFT_DELETE", ("isDeleted", 1)));
+        records.push(hard_deleted_change_record("HARD_DELETE"));
+        records.extend(flagged_incremental_records("HIDDEN_ASSET", ("isHidden", 1)));
+        records.extend(incremental_photo_records("CREATED_ASSET"));
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(records, "zone-token-after", false)
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Library", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
         }];
 
-        let downloadable: Vec<_> = events
-            .into_iter()
-            .filter(|e| matches!(e.reason, ChangeReason::Created))
-            .filter_map(|e| e.asset)
-            .collect();
+        let mut config = test_config();
+        let dir = TempDir::new().unwrap();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
 
-        assert_eq!(downloadable.len(), 1);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-before",
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            result.sync_token, None,
+            "print-only incremental runs must not advance the sync token"
+        );
+        let pending = db.get_pending().await.unwrap();
+        assert_source_flags(&pending, "SOFT_DELETE", true, false);
+        assert_source_flags(&pending, "HARD_DELETE", true, false);
+        assert_source_flags(&pending, "HIDDEN_ASSET", false, true);
     }
 
     // ── NormalizedPath additional tests ──────────────────────────────────
@@ -4192,72 +4192,6 @@ mod tests {
             !ctx.has_downloaded_without_metadata_hash(),
             "matching downloaded and metadata-hash sets should avoid the extra SQLite scan"
         );
-    }
-
-    // ── Change event classification tests ───────────────────────────────
-
-    #[test]
-    fn test_change_event_filtering_counts_and_extraction() {
-        // Simulate the inline filtering loop from download_photos_incremental
-        let events = vec![
-            ChangeEvent {
-                record_name: "A".into(),
-                record_type: Some("CPLAsset".into()),
-                reason: ChangeReason::Created,
-                asset: Some(TestPhotoAsset::new("TEST_1").build()),
-            },
-            ChangeEvent {
-                record_name: "B".into(),
-                record_type: Some("CPLAsset".into()),
-                reason: ChangeReason::Created,
-                asset: None, // Unpaired record
-            },
-            ChangeEvent {
-                record_name: "C".into(),
-                record_type: None,
-                reason: ChangeReason::HardDeleted,
-                asset: None,
-            },
-            ChangeEvent {
-                record_name: "D".into(),
-                record_type: Some("CPLAsset".into()),
-                reason: ChangeReason::SoftDeleted,
-                asset: None,
-            },
-            ChangeEvent {
-                record_name: "E".into(),
-                record_type: Some("CPLAsset".into()),
-                reason: ChangeReason::Hidden,
-                asset: None,
-            },
-        ];
-
-        let mut created_count = 0u32;
-        let mut soft_deleted_count = 0u32;
-        let mut hard_deleted_count = 0u32;
-        let mut hidden_count = 0u32;
-        let mut downloadable_assets = Vec::new();
-
-        for event in events {
-            match event.reason {
-                ChangeReason::Created => {
-                    created_count += 1;
-                    if let Some(asset) = event.asset {
-                        downloadable_assets.push(asset);
-                    }
-                }
-                ChangeReason::SoftDeleted => soft_deleted_count += 1,
-                ChangeReason::HardDeleted => hard_deleted_count += 1,
-                ChangeReason::Hidden => hidden_count += 1,
-            }
-        }
-
-        assert_eq!(created_count, 2);
-        assert_eq!(soft_deleted_count, 1);
-        assert_eq!(hard_deleted_count, 1);
-        assert_eq!(hidden_count, 1);
-        assert_eq!(downloadable_assets.len(), 1);
-        assert_eq!(downloadable_assets[0].id(), "TEST_1");
     }
 
     // ── Gap coverage: empty versions, path traversal, empty filename ───

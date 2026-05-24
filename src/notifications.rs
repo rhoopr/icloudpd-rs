@@ -380,26 +380,16 @@ mod tests {
         );
         let script_path = write_test_script(dir.path(), "test_notify.sh", body.as_bytes());
 
-        let notifier = Notifier::new(Some(script_path.clone()));
-        notifier.notify(
-            Event::TwoFaRequired,
+        let status = run_script(
+            &script_path,
+            Event::TwoFaRequired.as_str(),
             "Need 2FA code",
             "test@example.com",
             None,
-        );
-
-        // Wait for the spawned background task to complete (poll instead of fixed sleep)
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if output_path.exists() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "notification script did not produce output within timeout"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        )
+        .await
+        .expect("run notification script");
+        assert!(status.success());
 
         let output = read_script_output(&output_path);
         assert_eq!(output.trim(), "2fa_required|Need 2FA code|test@example.com");
@@ -425,20 +415,16 @@ mod tests {
             ..SyncNotificationData::default()
         };
 
-        let notifier = Notifier::new(Some(script_path));
-        notifier.notify(Event::SyncComplete, "test", "user@example.com", Some(&data));
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if output_path.exists() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "notification script did not produce output"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let status = run_script(
+            &script_path,
+            Event::SyncComplete.as_str(),
+            "test",
+            "user@example.com",
+            Some(&data),
+        )
+        .await
+        .expect("run notification script with sync data");
+        assert!(status.success());
 
         let output = read_script_output(&output_path);
         assert_eq!(output.trim(), "42|3|100|1500000|80");
@@ -649,20 +635,16 @@ mod tests {
         );
         let script_path = write_test_script(dir.path(), "test_no_data.sh", body.as_bytes());
 
-        let notifier = Notifier::new(Some(script_path));
-        notifier.notify(Event::SyncComplete, "test", "user@example.com", None);
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if output_path.exists() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "notification script did not produce output"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let status = run_script(
+            &script_path,
+            Event::SyncComplete.as_str(),
+            "test",
+            "user@example.com",
+            None,
+        )
+        .await
+        .expect("run notification script without sync data");
+        assert!(status.success());
 
         let output = read_script_output(&output_path);
         assert_eq!(output.trim(), "unset|unset");

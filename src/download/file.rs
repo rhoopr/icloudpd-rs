@@ -3395,23 +3395,4 @@ mod tests {
         );
         assert!(!err.is_retryable(), "404 should not be retryable");
     }
-
-    /// When the downloaded SHA-256 does not match the API-provided checksum,
-    /// the caller must detect the mismatch. This verifies that two different
-    /// byte sequences produce different SHA-256 hashes, which is the
-    /// foundation of the checksum-verification safety net.
-    #[test]
-    fn checksum_mismatch_detectable_different_bytes_produce_different_hashes() {
-        let a = compute_sha256_of_bytes(b"correct photo bytes");
-        let b = compute_sha256_of_bytes(b"corrupted photo bytes");
-        assert_ne!(a, b, "different content must produce different SHA-256");
-        assert_eq!(a.len(), 44, "base64-encoded SHA-256 is 44 chars");
-    }
-
-    fn compute_sha256_of_bytes(data: &[u8]) -> String {
-        use base64::Engine;
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(data);
-        base64::engine::general_purpose::STANDARD.encode(hash)
-    }
 }

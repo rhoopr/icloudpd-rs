@@ -3194,6 +3194,103 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn concurrent_asset_writers_preserve_library_id_version_pk() {
+        let dir = test_dir();
+        let db_path = dir.path().join("concurrent-writers.db");
+        let db = std::sync::Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let media_dir = dir.path().join("photos");
+        std::fs::create_dir_all(&media_dir).unwrap();
+
+        let cases = [
+            (
+                "PrimarySync",
+                "ASSET_PK",
+                VersionSizeKey::Original,
+                "ck_orig",
+            ),
+            ("PrimarySync", "ASSET_PK", VersionSizeKey::Medium, "ck_med"),
+            (
+                "SharedSync-A1B2C3D4",
+                "ASSET_PK",
+                VersionSizeKey::Original,
+                "ck_shared",
+            ),
+        ];
+        let mut handles = Vec::new();
+        for (library, id, version_size, checksum) in cases {
+            let db = std::sync::Arc::clone(&db);
+            let path = media_dir.join(format!("{}_{}_{}.jpg", library, id, version_size.as_str()));
+            handles.push(tokio::spawn(async move {
+                std::fs::write(&path, b"image-bytes").unwrap();
+                let record = TestAssetRecord::new(id)
+                    .library(library)
+                    .version_size(version_size)
+                    .checksum(checksum)
+                    .build();
+                db.upsert_seen(&record).await.unwrap();
+                db.mark_downloaded(
+                    library,
+                    id,
+                    version_size.as_str(),
+                    &path,
+                    checksum,
+                    Some(checksum),
+                )
+                .await
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let conn = db.acquire_lock("verify concurrent writer rows").unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT library, id, version_size, status FROM assets \
+                 WHERE id = 'ASSET_PK' ORDER BY library, version_size",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "PrimarySync".to_string(),
+                    "ASSET_PK".to_string(),
+                    "medium".to_string(),
+                    "downloaded".to_string()
+                ),
+                (
+                    "PrimarySync".to_string(),
+                    "ASSET_PK".to_string(),
+                    "original".to_string(),
+                    "downloaded".to_string()
+                ),
+                (
+                    "SharedSync-A1B2C3D4".to_string(),
+                    "ASSET_PK".to_string(),
+                    "original".to_string(),
+                    "downloaded".to_string()
+                ),
+            ],
+            "concurrent writers must preserve every library/id/version row"
+        );
+    }
+
     /// `mark_failed` must scope to one zone; the other zone's row for
     /// the same (id, version_size) keeps its prior status.
     #[tokio::test]

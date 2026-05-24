@@ -1418,6 +1418,40 @@ mod wiremock_tests {
         std::fs::write(path, bytes).expect("write file");
     }
 
+    #[cfg(unix)]
+    fn set_mtime_for_test(path: &StdPath, secs: i64) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+        ];
+        // SAFETY: `c_path` is a valid, NUL-terminated copy of `path`, and
+        // `times` points to two initialized timespec values for the duration
+        // of the call.
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "set mtime for {}", path.display());
+    }
+
+    #[cfg(not(unix))]
+    fn set_mtime_for_test(path: &StdPath, _secs: i64) {
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for mtime bump");
+        f.set_len(f.metadata().expect("metadata").len())
+            .expect("set_len same size");
+    }
+
     /// Stage every file `expected_paths_for` would emit for `asset` so
     /// they all match. Returns the list of staged paths.
     fn stage_expected(asset: &PhotoAsset, config: &DownloadConfig) -> Vec<std::path::PathBuf> {
@@ -3175,17 +3209,11 @@ mod wiremock_tests {
         )
         .await;
 
-        // Bump mtime on every staged file. Keep size identical (to stay
-        // matched) and touch the file to force a fresh mtime. The 1.1s
-        // sleep covers filesystems with second-granularity mtime.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Bump mtime on every staged file without relying on wall-clock
+        // sleeps. Keep size identical so the path still matches and only
+        // the rehash guard changes.
         for path in &staged {
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .expect("open for mtime bump");
-            f.set_len(2048).expect("set_len same size");
-            drop(f);
+            set_mtime_for_test(path, 1_800_000_000);
         }
 
         // See sibling test for why reset() is necessary between passes.

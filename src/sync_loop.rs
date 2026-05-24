@@ -5102,15 +5102,21 @@ mod tests {
         );
     }
 
-    /// An empty remote library (zero assets) must exit cleanly with
-    /// exit code 0 and a summary showing zero synced — not treated as
-    /// an error or incomplete response.
+    /// An empty local state must keep all summary and pending views
+    /// internally consistent. This pins the read side that user-facing
+    /// status/verify commands rely on before any remote assets have been
+    /// observed.
     #[tokio::test]
-    async fn empty_remote_library_summary_shows_zero_synced() {
+    async fn empty_state_summary_has_no_pending_or_downloaded_rows() {
         let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
         let summary = db.get_summary().await.unwrap();
-        // Fresh in-memory DB starts empty
         assert_eq!(summary.total_assets, 0, "empty DB must have zero assets");
         assert_eq!(summary.downloaded, 0, "empty DB must have zero downloaded");
+        assert_eq!(summary.pending, 0, "empty DB must have zero pending");
+        assert_eq!(summary.failed, 0, "empty DB must have zero failed");
+        assert!(
+            db.get_pending().await.unwrap().is_empty(),
+            "fresh state must not surface phantom pending work"
+        );
     }
 }

@@ -440,14 +440,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_shared_session_implements_photos_session() {
-        // Verify that SharedSession can be used as a PhotosSession trait object
-        let dir = std::env::temp_dir()
-            .join("claude")
-            .join("shared_session_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let session = crate::auth::session::Session::new(
-            &dir,
+            dir.path(),
             "test@shared.com",
             "https://example.com",
             None,
@@ -459,10 +454,25 @@ mod tests {
 
         // Verify it can be boxed as a PhotosSession
         let boxed: Box<dyn PhotosSession> = Box::new(shared.clone());
+        assert_eq!(
+            std::sync::Arc::strong_count(&shared),
+            2,
+            "boxing SharedSession as PhotosSession must retain the same shared session"
+        );
         let _cloned = boxed.clone_box();
+        assert_eq!(
+            std::sync::Arc::strong_count(&shared),
+            3,
+            "clone_box must clone the underlying SharedSession"
+        );
 
         // Verify clone_box produces a valid trait object
         let _cloned2 = _cloned.clone_box();
+        assert_eq!(
+            std::sync::Arc::strong_count(&shared),
+            4,
+            "cloned trait object must remain cloneable"
+        );
     }
 
     #[test]

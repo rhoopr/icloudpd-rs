@@ -460,12 +460,19 @@ mod tests {
 
     #[test]
     fn delete_outcome_file_only_success_when_keyring_missing() {
-        let result = finish_delete(
+        finish_delete(
             "user@example.com",
             DeleteOutcome::NotFound,
             DeleteOutcome::Deleted,
-        );
-        assert!(result.is_ok());
+        )
+        .expect("encrypted-file deletion must succeed when keyring entry is absent");
+
+        finish_delete(
+            "user@example.com",
+            DeleteOutcome::Deleted,
+            DeleteOutcome::NotFound,
+        )
+        .expect("keyring deletion must succeed when encrypted-file entry is absent");
     }
 
     #[test]
@@ -562,6 +569,28 @@ mod tests {
         assert!(
             err.to_string().contains("decrypt"),
             "Expected decryption error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn encrypted_file_rejects_valid_decrypt_invalid_utf8() {
+        let (_td, dir) = test_dir("invalid_utf8");
+        let store = CredentialStore::new("user@example.com", &dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let key_bytes = store.load_or_create_key().unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes).unwrap();
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = cipher.encrypt(&nonce, [0xff, 0xfe].as_slice()).unwrap();
+        let mut data = Vec::with_capacity(12 + ciphertext.len());
+        data.extend_from_slice(&nonce);
+        data.extend_from_slice(&ciphertext);
+        atomic_write_sync(&store.credential_file_path(), &data).unwrap();
+
+        let err = store.file_retrieve().unwrap_err();
+        assert!(
+            err.to_string().contains("valid UTF-8"),
+            "invalid UTF-8 plaintext must be rejected loudly, got: {err}"
         );
     }
 
