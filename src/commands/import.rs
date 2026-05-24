@@ -23,9 +23,9 @@ use crate::systemd::SystemdNotifier;
 use crate::types::FileMatchPolicy;
 
 use super::service::{
-    build_collection_context, init_photos_service,
+    build_collection_context, collection_libraries, init_photos_service, pass_scope_for_zone,
     resolve_cross_zone_libraries_for_album_hydration, resolve_libraries, resolve_passes_for_scope,
-    PassScope,
+    zone_name_set,
 };
 
 /// Value of the `stage` field on the one-shot tracing event emitted by
@@ -811,22 +811,10 @@ pub(crate) async fn run_import_existing(
             Ok::<_, anyhow::Error>(all_libraries.clone())
         })
         .await?;
-    use crate::selection::{AlbumSelector, SmartFolderSelector};
-    let smart_selector_active = !matches!(selection.smart_folders, SmartFolderSelector::None);
-    let collection_libraries = if selection.albums_explicit || smart_selector_active {
-        all_libraries.clone()
-    } else {
-        libraries.clone()
-    };
-    let collection_context = build_collection_context(&selection, &collection_libraries).await?;
-    let selected_zones: rustc_hash::FxHashSet<String> = libraries
-        .iter()
-        .map(|library| library.zone_name().to_string())
-        .collect();
-    let collection_zones: rustc_hash::FxHashSet<String> = collection_libraries
-        .iter()
-        .map(|library| library.zone_name().to_string())
-        .collect();
+    let collection_libraries = collection_libraries(&selection, &libraries, &all_libraries);
+    let collection_context = build_collection_context(&selection, collection_libraries).await?;
+    let selected_zones = zone_name_set(&libraries);
+    let collection_zones = zone_name_set(collection_libraries);
 
     let prior_db_total = db.get_summary().await?.total_assets;
     if prior_db_total > 0 && !args.force_empty {
@@ -861,22 +849,8 @@ pub(crate) async fn run_import_existing(
 
     for library in &all_libraries {
         let zone = library.zone_name();
-        let include_unfiled = selection.unfiled && selected_zones.contains(zone);
-        let include_albums = match selection.albums {
-            AlbumSelector::None => false,
-            _ if selection.albums_explicit => collection_zones.contains(zone),
-            _ => selected_zones.contains(zone),
-        };
-        let include_smart_folders = smart_selector_active && collection_zones.contains(zone);
-        let pass_scope = PassScope {
-            include_albums,
-            include_smart_folders,
-            include_unfiled,
-        };
-        if !pass_scope.include_albums
-            && !pass_scope.include_smart_folders
-            && !pass_scope.include_unfiled
-        {
+        let pass_scope = pass_scope_for_zone(&selection, zone, &selected_zones, &collection_zones);
+        if pass_scope.is_empty() {
             continue;
         }
         tracing::debug!(zone = %zone, "Scanning library");

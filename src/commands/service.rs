@@ -512,10 +512,67 @@ pub(crate) struct PassScope {
     pub include_unfiled: bool,
 }
 
+impl PassScope {
+    pub(crate) fn is_empty(self) -> bool {
+        !self.include_albums && !self.include_smart_folders && !self.include_unfiled
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CollectionContext {
     pub(crate) collection_album_names: std::collections::BTreeSet<String>,
     pub(crate) selected_smart_folder_names: Vec<String>,
+}
+
+pub(crate) fn smart_selector_active(selection: &crate::selection::Selection) -> bool {
+    !matches!(
+        selection.smart_folders,
+        crate::selection::SmartFolderSelector::None
+    )
+}
+
+pub(crate) fn collection_libraries<'a>(
+    selection: &crate::selection::Selection,
+    selected_libraries: &'a [icloud::photos::PhotoLibrary],
+    all_libraries: &'a [icloud::photos::PhotoLibrary],
+) -> &'a [icloud::photos::PhotoLibrary] {
+    if selection.albums_explicit || smart_selector_active(selection) {
+        all_libraries
+    } else {
+        selected_libraries
+    }
+}
+
+pub(crate) fn zone_name_set(
+    libraries: &[icloud::photos::PhotoLibrary],
+) -> rustc_hash::FxHashSet<String> {
+    libraries
+        .iter()
+        .map(|library| library.zone_name().to_string())
+        .collect()
+}
+
+pub(crate) fn pass_scope_for_zone(
+    selection: &crate::selection::Selection,
+    zone_name: &str,
+    selected_zones: &rustc_hash::FxHashSet<String>,
+    collection_zones: &rustc_hash::FxHashSet<String>,
+) -> PassScope {
+    use crate::selection::AlbumSelector;
+
+    let include_unfiled = selection.unfiled && selected_zones.contains(zone_name);
+    let include_albums = match selection.albums {
+        AlbumSelector::None => false,
+        _ if selection.albums_explicit => collection_zones.contains(zone_name),
+        _ => selected_zones.contains(zone_name),
+    };
+    let include_smart_folders =
+        smart_selector_active(selection) && collection_zones.contains(zone_name);
+    PassScope {
+        include_albums,
+        include_smart_folders,
+        include_unfiled,
+    }
 }
 
 pub(crate) async fn build_collection_context(

@@ -10,10 +10,13 @@ use anyhow::Context;
 
 use crate::auth;
 use crate::cli;
+#[cfg(test)]
+use crate::commands::PassScope;
 use crate::commands::{
-    attempt_reauth, build_collection_context, init_photos_service,
-    resolve_cross_zone_libraries_for_album_hydration, resolve_libraries, resolve_passes_for_scope,
-    wait_and_retry_2fa, CollectionContext, PassScope, MAX_REAUTH_ATTEMPTS,
+    attempt_reauth, build_collection_context, collection_libraries, init_photos_service,
+    pass_scope_for_zone, resolve_cross_zone_libraries_for_album_hydration, resolve_libraries,
+    resolve_passes_for_scope, wait_and_retry_2fa, zone_name_set, CollectionContext,
+    MAX_REAUTH_ATTEMPTS,
 };
 use crate::config;
 use crate::credential;
@@ -817,51 +820,23 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         })
         .await?;
 
-    use crate::selection::{AlbumSelector, SmartFolderSelector};
-    let smart_selector_active = !matches!(
-        config.filters.selection.smart_folders,
-        SmartFolderSelector::None
-    );
-    let collection_libraries = if config.filters.selection.albums_explicit || smart_selector_active
-    {
-        all_libraries.clone()
-    } else {
-        libraries.clone()
-    };
+    let collection_libraries =
+        collection_libraries(&config.filters.selection, &libraries, &all_libraries);
     let collection_context =
-        build_collection_context(&config.filters.selection, &collection_libraries).await?;
-    let selected_zones: rustc_hash::FxHashSet<String> = libraries
-        .iter()
-        .map(|library| library.zone_name().to_string())
-        .collect();
-    let collection_zones: rustc_hash::FxHashSet<String> = collection_libraries
-        .iter()
-        .map(|library| library.zone_name().to_string())
-        .collect();
+        build_collection_context(&config.filters.selection, collection_libraries).await?;
+    let selected_zones = zone_name_set(&libraries);
+    let collection_zones = zone_name_set(collection_libraries);
 
     let mut library_states: Vec<LibraryState> = Vec::with_capacity(all_libraries.len());
     for library in &all_libraries {
         let zone_name = library.zone_name().to_string();
-        let include_unfiled =
-            config.filters.selection.unfiled && selected_zones.contains(zone_name.as_str());
-        let include_albums = match config.filters.selection.albums {
-            AlbumSelector::None => false,
-            _ if config.filters.selection.albums_explicit => {
-                collection_zones.contains(zone_name.as_str())
-            }
-            _ => selected_zones.contains(zone_name.as_str()),
-        };
-        let include_smart_folders =
-            smart_selector_active && collection_zones.contains(zone_name.as_str());
-        let pass_scope = PassScope {
-            include_albums,
-            include_smart_folders,
-            include_unfiled,
-        };
-        if !pass_scope.include_albums
-            && !pass_scope.include_smart_folders
-            && !pass_scope.include_unfiled
-        {
+        let pass_scope = pass_scope_for_zone(
+            &config.filters.selection,
+            zone_name.as_str(),
+            &selected_zones,
+            &collection_zones,
+        );
+        if pass_scope.is_empty() {
             continue;
         }
 
