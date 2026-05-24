@@ -1037,9 +1037,13 @@ mod build_selection_tests {
     //! Sync vs. import-existing parity for the current selector resolution.
     //! Both commands must produce the same `Selection` from the same TOML.
     use super::build_import_selection;
-    use crate::commands::resolve_cross_zone_libraries_for_album_hydration;
+    use crate::commands::{
+        collection_libraries, pass_scope_for_zone,
+        resolve_cross_zone_libraries_for_album_hydration, zone_name_set,
+    };
     use crate::config::TomlFilters;
     use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+    use crate::test_helpers::MockPhotosSession;
     use std::collections::BTreeSet;
 
     fn primary() -> LibrarySelector {
@@ -1097,6 +1101,95 @@ mod build_selection_tests {
         .await
         .unwrap();
         assert!(libraries.is_empty());
+    }
+
+    fn test_library(zone_name: &str) -> crate::icloud::photos::PhotoLibrary {
+        crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+            Box::new(MockPhotosSession::new()),
+            zone_name,
+        )
+    }
+
+    fn smart_folder_filters() -> TomlFilters {
+        TomlFilters {
+            smart_folders: Some(vec!["Hidden".to_string()]),
+            unfiled: Some(false),
+            ..TomlFilters::default()
+        }
+    }
+
+    #[test]
+    fn import_scope_planning_shared_only_smart_folder_excludes_primary_zone() {
+        let selector = crate::selection::parse_library_selector(&["shared".to_string()]).unwrap();
+        let selection =
+            build_import_selection(Some(&smart_folder_filters()), &selector).expect("ok");
+        let primary = test_library("PrimarySync");
+        let shared = test_library("SharedSync-ABCD1234");
+        let selected_libraries = vec![shared.clone()];
+        let all_libraries = vec![primary.clone(), shared.clone()];
+
+        let collection = collection_libraries(&selection, &selected_libraries, &all_libraries);
+        let selected_zones = zone_name_set(&selected_libraries);
+        let collection_zones = zone_name_set(collection);
+
+        let primary_scope = pass_scope_for_zone(
+            &selection,
+            primary.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+        let shared_scope = pass_scope_for_zone(
+            &selection,
+            shared.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+
+        assert!(
+            primary_scope.is_empty(),
+            "import-existing planning must not schedule PrimarySync when library selector is shared-only"
+        );
+        assert!(
+            shared_scope.include_smart_folders,
+            "import-existing planning should schedule smart-folder passes for selected shared zone"
+        );
+    }
+
+    #[test]
+    fn import_scope_planning_primary_only_smart_folder_excludes_shared_zone() {
+        let selector = crate::selection::parse_library_selector(&["primary".to_string()]).unwrap();
+        let selection =
+            build_import_selection(Some(&smart_folder_filters()), &selector).expect("ok");
+        let primary = test_library("PrimarySync");
+        let shared = test_library("SharedSync-ABCD1234");
+        let selected_libraries = vec![primary.clone()];
+        let all_libraries = vec![primary.clone(), shared.clone()];
+
+        let collection = collection_libraries(&selection, &selected_libraries, &all_libraries);
+        let selected_zones = zone_name_set(&selected_libraries);
+        let collection_zones = zone_name_set(collection);
+
+        let primary_scope = pass_scope_for_zone(
+            &selection,
+            primary.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+        let shared_scope = pass_scope_for_zone(
+            &selection,
+            shared.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+
+        assert!(
+            primary_scope.include_smart_folders,
+            "import-existing planning should keep smart-folder passes in the selected primary zone"
+        );
+        assert!(
+            shared_scope.is_empty(),
+            "import-existing planning must not schedule shared-zone passes when selector is primary-only"
+        );
     }
 }
 

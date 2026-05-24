@@ -1822,6 +1822,104 @@ mod tests {
         crate::selection::parse_library_selector(&["SharedSync-ABCD1234".to_string()]).unwrap()
     }
 
+    fn selection_with_smart_folder(
+        libraries: crate::selection::LibrarySelector,
+    ) -> crate::selection::Selection {
+        use crate::selection::{AlbumSelector, Selection, SmartFolderSelector};
+        Selection {
+            albums: AlbumSelector::None,
+            albums_explicit: false,
+            smart_folders: SmartFolderSelector::Named {
+                included: std::collections::BTreeSet::from(["Hidden".to_string()]),
+                excluded: std::collections::BTreeSet::new(),
+            },
+            smart_folders_explicit: true,
+            libraries,
+            unfiled: false,
+        }
+    }
+
+    fn test_library(zone_name: &str) -> crate::icloud::photos::PhotoLibrary {
+        crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+            Box::new(crate::test_helpers::MockPhotosSession::new()),
+            zone_name,
+        )
+    }
+
+    #[test]
+    fn run_sync_scope_planning_shared_only_smart_folder_excludes_primary_zone() {
+        let selection = selection_with_smart_folder(
+            crate::selection::parse_library_selector(&["shared".to_string()]).unwrap(),
+        );
+        let primary = test_library("PrimarySync");
+        let shared = test_library("SharedSync-ABCD1234");
+        let selected_libraries = vec![shared.clone()];
+        let all_libraries = vec![primary.clone(), shared.clone()];
+
+        let collection = collection_libraries(&selection, &selected_libraries, &all_libraries);
+        let selected_zones = zone_name_set(&selected_libraries);
+        let collection_zones = zone_name_set(collection);
+
+        let primary_scope = pass_scope_for_zone(
+            &selection,
+            primary.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+        let shared_scope = pass_scope_for_zone(
+            &selection,
+            shared.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+
+        assert!(
+            primary_scope.is_empty(),
+            "run_sync planning must not schedule PrimarySync when library selector is shared-only"
+        );
+        assert!(
+            shared_scope.include_smart_folders,
+            "run_sync planning should schedule smart-folder passes for selected shared zone"
+        );
+    }
+
+    #[test]
+    fn run_sync_scope_planning_primary_only_smart_folder_excludes_shared_zone() {
+        let selection = selection_with_smart_folder(
+            crate::selection::parse_library_selector(&["primary".to_string()]).unwrap(),
+        );
+        let primary = test_library("PrimarySync");
+        let shared = test_library("SharedSync-ABCD1234");
+        let selected_libraries = vec![primary.clone()];
+        let all_libraries = vec![primary.clone(), shared.clone()];
+
+        let collection = collection_libraries(&selection, &selected_libraries, &all_libraries);
+        let selected_zones = zone_name_set(&selected_libraries);
+        let collection_zones = zone_name_set(collection);
+
+        let primary_scope = pass_scope_for_zone(
+            &selection,
+            primary.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+        let shared_scope = pass_scope_for_zone(
+            &selection,
+            shared.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+
+        assert!(
+            primary_scope.include_smart_folders,
+            "run_sync planning should keep smart-folder passes in the selected primary zone"
+        );
+        assert!(
+            shared_scope.is_empty(),
+            "run_sync planning must not schedule shared-zone passes when selector is primary-only"
+        );
+    }
+
     #[test]
     fn notice_suppressed_when_already_shown() {
         // The marker overrides everything: even a user with 5 shared libraries

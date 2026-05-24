@@ -532,15 +532,11 @@ pub(crate) fn smart_selector_active(selection: &crate::selection::Selection) -> 
 }
 
 pub(crate) fn collection_libraries<'a>(
-    selection: &crate::selection::Selection,
+    _selection: &crate::selection::Selection,
     selected_libraries: &'a [icloud::photos::PhotoLibrary],
-    all_libraries: &'a [icloud::photos::PhotoLibrary],
+    _all_libraries: &'a [icloud::photos::PhotoLibrary],
 ) -> &'a [icloud::photos::PhotoLibrary] {
-    if selection.albums_explicit || smart_selector_active(selection) {
-        all_libraries
-    } else {
-        selected_libraries
-    }
+    selected_libraries
 }
 
 pub(crate) fn zone_name_set(
