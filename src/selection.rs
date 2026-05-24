@@ -112,7 +112,9 @@ impl LibrarySelector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
     pub albums: AlbumSelector,
+    pub albums_explicit: bool,
     pub smart_folders: SmartFolderSelector,
+    pub smart_folders_explicit: bool,
     pub libraries: LibrarySelector,
     /// Run the unfiled (no-album) pass. Default `true` — orthogonal to
     /// `albums`, so `--album Vacation` still produces an unfiled pass unless
@@ -124,7 +126,9 @@ impl Default for Selection {
     fn default() -> Self {
         Self {
             albums: AlbumSelector::default(),
+            albums_explicit: false,
             smart_folders: SmartFolderSelector::default(),
+            smart_folders_explicit: false,
             libraries: LibrarySelector::default(),
             unfiled: true,
         }
@@ -469,7 +473,9 @@ pub(crate) fn build_selection(
 ) -> anyhow::Result<Selection> {
     Ok(Selection {
         albums: parse_album_selector(raw_albums, true)?,
+        albums_explicit: !raw_albums.is_empty(),
         smart_folders: parse_smart_folder_selector(raw_smart_folders)?,
+        smart_folders_explicit: !raw_smart_folders.is_empty(),
         libraries: parse_library_selector(raw_libraries)?,
         unfiled: unfiled_explicit.unwrap_or(true),
     })
@@ -984,7 +990,9 @@ mod tests {
     fn selection_defaults() {
         let s = Selection::default();
         assert_eq!(s.albums, AlbumSelector::default());
+        assert!(!s.albums_explicit);
         assert_eq!(s.smart_folders, SmartFolderSelector::None);
+        assert!(!s.smart_folders_explicit);
         assert!(s.libraries.primary);
         assert!(!s.libraries.shared_all);
         assert!(s.unfiled);
@@ -1024,6 +1032,8 @@ mod tests {
                 excluded: BTreeSet::new(),
             }
         );
+        assert!(s.albums_explicit);
+        assert!(s.smart_folders_explicit);
         assert!(s.libraries.primary);
         assert!(s.libraries.shared_all);
         assert!(s.unfiled);
@@ -1199,10 +1209,12 @@ mod tests {
             albums: AlbumSelector::All {
                 excluded: set(&["Family"]),
             },
+            albums_explicit: true,
             smart_folders: SmartFolderSelector::Named {
                 included: set(&["Favorites"]),
                 excluded: BTreeSet::new(),
             },
+            smart_folders_explicit: true,
             libraries: LibrarySelector {
                 primary: true,
                 shared_all: true,

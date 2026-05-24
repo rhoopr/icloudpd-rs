@@ -1248,7 +1248,9 @@ impl Config {
 
         let selection = crate::selection::Selection {
             albums: crate::selection::parse_album_selector(&raw_albums, true)?,
+            albums_explicit: !raw_albums.is_empty(),
             smart_folders: crate::selection::parse_smart_folder_selector(&raw_smart_folders)?,
+            smart_folders_explicit: !raw_smart_folders.is_empty(),
             libraries: library_selector.clone(),
             unfiled: unfiled_override.unwrap_or_else(unfiled_default),
         };

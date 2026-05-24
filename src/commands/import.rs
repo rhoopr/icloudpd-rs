@@ -23,8 +23,9 @@ use crate::systemd::SystemdNotifier;
 use crate::types::FileMatchPolicy;
 
 use super::service::{
-    init_photos_service, resolve_cross_zone_libraries_for_album_hydration, resolve_libraries,
-    resolve_passes,
+    build_collection_context, init_photos_service,
+    resolve_cross_zone_libraries_for_album_hydration, resolve_libraries, resolve_passes_for_scope,
+    PassScope,
 };
 
 /// Value of the `stage` field on the one-shot tracing event emitted by
@@ -804,11 +805,28 @@ pub(crate) async fn run_import_existing(
     // the same passes sync would, and each pass uses its own
     // `folder_structure_*` template when deriving expected paths.
     let selection = build_import_selection(toml_filters, &selector)?;
-    let cross_zone_libraries = resolve_cross_zone_libraries_for_album_hydration(
-        &selection,
-        photos_service.all_libraries(),
-    )
-    .await?;
+    let all_libraries = photos_service.all_libraries().await?;
+    let cross_zone_libraries =
+        resolve_cross_zone_libraries_for_album_hydration(&selection, async {
+            Ok::<_, anyhow::Error>(all_libraries.clone())
+        })
+        .await?;
+    use crate::selection::{AlbumSelector, SmartFolderSelector};
+    let smart_selector_active = !matches!(selection.smart_folders, SmartFolderSelector::None);
+    let collection_libraries = if selection.albums_explicit || smart_selector_active {
+        all_libraries.clone()
+    } else {
+        libraries.clone()
+    };
+    let collection_context = build_collection_context(&selection, &collection_libraries).await?;
+    let selected_zones: rustc_hash::FxHashSet<String> = libraries
+        .iter()
+        .map(|library| library.zone_name().to_string())
+        .collect();
+    let collection_zones: rustc_hash::FxHashSet<String> = collection_libraries
+        .iter()
+        .map(|library| library.zone_name().to_string())
+        .collect();
 
     let prior_db_total = db.get_summary().await?.total_assets;
     if prior_db_total > 0 && !args.force_empty {
@@ -841,12 +859,37 @@ pub(crate) async fn run_import_existing(
     // once per library scan, not once per pass.
     let mut dir_cache = DirCache::new();
 
-    for library in &libraries {
+    for library in &all_libraries {
         let zone = library.zone_name();
+        let include_unfiled = selection.unfiled && selected_zones.contains(zone);
+        let include_albums = match selection.albums {
+            AlbumSelector::None => false,
+            _ if selection.albums_explicit => collection_zones.contains(zone),
+            _ => selected_zones.contains(zone),
+        };
+        let include_smart_folders = smart_selector_active && collection_zones.contains(zone);
+        let pass_scope = PassScope {
+            include_albums,
+            include_smart_folders,
+            include_unfiled,
+        };
+        if !pass_scope.include_albums
+            && !pass_scope.include_smart_folders
+            && !pass_scope.include_unfiled
+        {
+            continue;
+        }
         tracing::debug!(zone = %zone, "Scanning library");
         let library_config = download_config.with_library(zone);
 
-        let plan = resolve_passes(library, &selection, &cross_zone_libraries).await?;
+        let plan = resolve_passes_for_scope(
+            library,
+            &selection,
+            pass_scope,
+            &collection_context,
+            &cross_zone_libraries,
+        )
+        .await?;
         if plan.passes.is_empty() {
             tracing::debug!(zone = %zone, "No passes resolved; nothing to import");
             continue;
@@ -927,7 +970,9 @@ fn build_import_selection(
 
     Ok(Selection {
         albums: parse_album_selector(&raw_albums, true)?,
+        albums_explicit: !raw_albums.is_empty(),
         smart_folders: parse_smart_folder_selector(&raw_smart_folders)?,
+        smart_folders_explicit: !raw_smart_folders.is_empty(),
         libraries: libraries.clone(),
         unfiled,
     })
@@ -1020,7 +1065,6 @@ mod build_selection_tests {
     use super::build_import_selection;
     use crate::commands::resolve_cross_zone_libraries_for_album_hydration;
     use crate::config::TomlFilters;
-    use crate::icloud::photos::PhotoLibrary;
     use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
     use std::collections::BTreeSet;
 
@@ -1060,7 +1104,9 @@ mod build_selection_tests {
             selection,
             Selection {
                 albums: AlbumSelector::default(),
+                albums_explicit: false,
                 smart_folders: SmartFolderSelector::None,
+                smart_folders_explicit: false,
                 libraries: primary(),
                 unfiled: true,
             }
@@ -1068,24 +1114,15 @@ mod build_selection_tests {
     }
 
     #[tokio::test]
-    async fn default_import_album_selection_requires_cross_zone_resolution() {
+    async fn default_import_album_selection_skips_cross_zone_resolution() {
         let selection = build_import_selection(None, &primary()).expect("ok");
 
-        let err = resolve_cross_zone_libraries_for_album_hydration(&selection, async {
-            Err::<Vec<PhotoLibrary>, anyhow::Error>(anyhow::anyhow!("all-libraries unavailable"))
+        let libraries = resolve_cross_zone_libraries_for_album_hydration(&selection, async {
+            panic!("implicit default album scope must not request all libraries")
         })
         .await
-        .unwrap_err();
-        let msg = format!("{err:#}");
-
-        assert!(
-            msg.contains("failed to resolve cross-zone album hydration libraries"),
-            "missing hydration context: {msg}"
-        );
-        assert!(
-            msg.contains("all-libraries unavailable"),
-            "missing cause: {msg}"
-        );
+        .unwrap();
+        assert!(libraries.is_empty());
     }
 }
 

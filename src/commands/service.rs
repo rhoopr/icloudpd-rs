@@ -488,7 +488,7 @@ where
     use crate::selection::AlbumSelector;
     use anyhow::Context;
 
-    if matches!(selection.albums, AlbumSelector::None) {
+    if matches!(selection.albums, AlbumSelector::None) || !selection.albums_explicit {
         return Ok(Vec::new());
     }
 
@@ -505,43 +505,143 @@ fn library_entry_matches_zone(entry: &str, zone: &str, truncated: &str) -> bool 
     entry.eq_ignore_ascii_case(zone) || entry.eq_ignore_ascii_case(truncated)
 }
 
-/// Pre-flight: bail when the resolved library set cannot fulfill the
-/// requested smart-folder selection. Apple's CloudKit shared zones don't
-/// expose smart folders (`library.albums()` skips smart-folder injection
-/// for `SharedSync-*` zones), so a `--library shared --smart-folder X`
-/// configuration produces zero smart-folder passes and exit 0 — silent
-/// failure. Detect that at startup, before per-library `resolve_passes`
-/// runs, so the user gets an actionable message instead of a
-/// successful-looking sync that quietly skipped what they asked for.
-///
-/// Mixed library sets (primary + shared) pass: smart folders apply to the
-/// primary library, and the shared zones' lack of smart-folder passes is
-/// expected behavior.
-pub(crate) fn validate_smart_folder_fulfillability(
-    libraries: &[icloud::photos::PhotoLibrary],
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PassScope {
+    pub include_albums: bool,
+    pub include_smart_folders: bool,
+    pub include_unfiled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CollectionContext {
+    pub(crate) collection_album_names: std::collections::BTreeSet<String>,
+    pub(crate) selected_smart_folder_names: Vec<String>,
+}
+
+pub(crate) async fn build_collection_context(
     selection: &crate::selection::Selection,
+    collection_libraries: &[icloud::photos::PhotoLibrary],
+) -> anyhow::Result<CollectionContext> {
+    use crate::selection::AlbumSelector;
+
+    let smart_names = smart_folder_name_set();
+    let selected_smart_folder_names =
+        pick_selected_smart_folder_names(&selection.smart_folders, &smart_names)?;
+
+    let mut collection_album_names = std::collections::BTreeSet::new();
+    if selection.albums_explicit && !matches!(selection.albums, AlbumSelector::None) {
+        for library in collection_libraries {
+            let album_map = library.albums().await?;
+            for name in album_map.keys() {
+                if !smart_names.contains(name.as_str()) {
+                    collection_album_names.insert(name.clone());
+                }
+            }
+        }
+        validate_collection_album_selector(
+            &selection.albums,
+            &collection_album_names,
+            &smart_names,
+        )?;
+    }
+
+    Ok(CollectionContext {
+        collection_album_names,
+        selected_smart_folder_names,
+    })
+}
+
+fn validate_collection_album_selector(
+    selector: &crate::selection::AlbumSelector,
+    collection_album_names: &std::collections::BTreeSet<String>,
+    smart_names: &rustc_hash::FxHashSet<&'static str>,
 ) -> anyhow::Result<()> {
+    use crate::selection::AlbumSelector;
+    match selector {
+        AlbumSelector::None => Ok(()),
+        AlbumSelector::All { excluded } => {
+            bail_unknown_excluded_collection_albums(excluded, collection_album_names)
+        }
+        AlbumSelector::Named { included, excluded } => {
+            for name in included {
+                if smart_names.contains(name.as_str()) {
+                    anyhow::bail!(
+                        "'{name}' is a smart folder; pass `--smart-folder {name}` instead of `--album`"
+                    );
+                }
+                if excluded.contains(name) {
+                    continue;
+                }
+                if !collection_album_names.contains(name) {
+                    let available: Vec<&str> =
+                        collection_album_names.iter().map(String::as_str).collect();
+                    anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
+                }
+            }
+            bail_unknown_excluded_collection_albums(excluded, collection_album_names)
+        }
+    }
+}
+
+fn bail_unknown_excluded_collection_albums(
+    excluded: &std::collections::BTreeSet<String>,
+    collection_album_names: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<()> {
+    for name in excluded {
+        if !collection_album_names.contains(name) {
+            let available: Vec<&str> = collection_album_names.iter().map(String::as_str).collect();
+            anyhow::bail!("Excluded album '{name}' not found. Available albums: {available:?}");
+        }
+    }
+    Ok(())
+}
+
+fn pick_selected_smart_folder_names(
+    selector: &crate::selection::SmartFolderSelector,
+    smart_names: &rustc_hash::FxHashSet<&'static str>,
+) -> anyhow::Result<Vec<String>> {
     use crate::selection::SmartFolderSelector;
-    if matches!(selection.smart_folders, SmartFolderSelector::None) {
-        return Ok(());
+    let sensitive: rustc_hash::FxHashSet<&'static str> =
+        icloud::photos::smart_folders::sensitive_smart_folder_names().collect();
+
+    match selector {
+        SmartFolderSelector::None => Ok(Vec::new()),
+        SmartFolderSelector::All {
+            include_sensitive,
+            excluded,
+        } => {
+            for name in excluded {
+                bail_excluded_not_a_smart_folder(name, smart_names)?;
+            }
+            let mut names: Vec<String> = smart_names
+                .iter()
+                .filter(|name| *include_sensitive || !sensitive.contains(**name))
+                .filter(|name| !excluded.contains(**name))
+                .map(|name| (*name).to_string())
+                .collect();
+            names.sort();
+            Ok(names)
+        }
+        SmartFolderSelector::Named { included, excluded } => {
+            for name in included {
+                if !smart_names.contains(name.as_str()) {
+                    let mut available: Vec<&str> = smart_names.iter().copied().collect();
+                    available.sort();
+                    anyhow::bail!(
+                        "'{name}' is not an Apple smart folder. Available: {available:?}"
+                    );
+                }
+            }
+            for name in excluded {
+                bail_excluded_not_a_smart_folder(name, smart_names)?;
+            }
+            Ok(included
+                .iter()
+                .filter(|name| !excluded.contains(*name))
+                .cloned()
+                .collect())
+        }
     }
-    let any_supports = libraries
-        .iter()
-        .any(|l| !icloud::photos::is_shared_zone(l.zone_name()));
-    if any_supports {
-        return Ok(());
-    }
-    let zones: Vec<&str> = libraries
-        .iter()
-        .map(icloud::photos::PhotoLibrary::zone_name)
-        .collect();
-    anyhow::bail!(
-        "--smart-folder requires a library that supports smart folders, but \
-         --library resolved to only shared zones: {zones:?}. Apple does not \
-         expose smart folders on shared libraries. Either include the primary \
-         library (e.g. `--library all` or `--library primary`) or drop \
-         `--smart-folder` (`--smart-folder none`)."
-    )
 }
 
 /// Category of a download pass: a named user album, an Apple-defined smart
@@ -664,26 +764,78 @@ fn smart_folder_name_set() -> rustc_hash::FxHashSet<&'static str> {
 ///
 /// Album member IDs are fetched in parallel before the album map is
 /// consumed into passes; each `PhotoAlbum` is moved into exactly one pass.
+#[cfg(test)]
 pub(crate) async fn resolve_passes(
     library: &icloud::photos::PhotoLibrary,
     selection: &crate::selection::Selection,
     cross_zone_libraries: &[icloud::photos::PhotoLibrary],
 ) -> anyhow::Result<AlbumPlan> {
+    let mut selection_for_test = selection.clone();
+    selection_for_test.albums_explicit = false;
+    let scope = PassScope {
+        include_albums: true,
+        include_smart_folders: true,
+        include_unfiled: selection_for_test.unfiled,
+    };
+    let collection_context = build_collection_context(&selection_for_test, &[]).await?;
+    resolve_passes_for_scope(
+        library,
+        &selection_for_test,
+        scope,
+        &collection_context,
+        cross_zone_libraries,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_passes_for_scope(
+    library: &icloud::photos::PhotoLibrary,
+    selection: &crate::selection::Selection,
+    scope: PassScope,
+    collection_context: &CollectionContext,
+    cross_zone_libraries: &[icloud::photos::PhotoLibrary],
+) -> anyhow::Result<AlbumPlan> {
     use crate::selection::{AlbumSelector, SmartFolderSelector};
 
-    let album_active = !matches!(selection.albums, AlbumSelector::None);
-    let smart_active = !matches!(selection.smart_folders, SmartFolderSelector::None);
+    let album_active = scope.include_albums && !matches!(selection.albums, AlbumSelector::None);
+    let smart_active = scope.include_smart_folders
+        && !matches!(selection.smart_folders, SmartFolderSelector::None);
+    let unfiled_active = scope.include_unfiled;
 
-    if !album_active && !smart_active && !selection.unfiled {
+    if !album_active && !smart_active && !unfiled_active {
         return Ok(AlbumPlan { passes: Vec::new() });
     }
 
-    let mut album_map = library.albums().await?;
+    let mut album_map = if album_active || smart_active {
+        library.albums().await?
+    } else {
+        std::collections::HashMap::new()
+    };
     let smart_names = smart_folder_name_set();
 
-    let selected_album_names = pick_album_names(&selection.albums, &album_map, &smart_names)?;
-    let selected_smart_names =
-        pick_smart_folder_names(&selection.smart_folders, &album_map, &smart_names)?;
+    let selected_album_names = if album_active {
+        if selection.albums_explicit {
+            pick_collection_scoped_album_names_for_library(
+                &selection.albums,
+                &album_map,
+                &smart_names,
+                &collection_context.collection_album_names,
+            )?
+        } else {
+            pick_album_names(&selection.albums, &album_map, &smart_names)?
+        }
+    } else {
+        Vec::new()
+    };
+    let selected_smart_names = if smart_active {
+        pick_collection_scoped_smart_folder_names_for_library(
+            library,
+            &album_map,
+            &collection_context.selected_smart_folder_names,
+        )
+    } else {
+        Vec::new()
+    };
 
     let empty = empty_exclude_ids();
     let mut passes: Vec<AlbumPass> = Vec::new();
@@ -712,7 +864,7 @@ pub(crate) async fn resolve_passes(
         &mut passes,
     );
 
-    if selection.unfiled {
+    if unfiled_active {
         passes.push(AlbumPass {
             kind: PassKind::Unfiled,
             album: library.all(),
@@ -721,6 +873,60 @@ pub(crate) async fn resolve_passes(
     }
 
     Ok(AlbumPlan { passes })
+}
+
+fn pick_collection_scoped_album_names_for_library(
+    selector: &crate::selection::AlbumSelector,
+    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    smart_names: &rustc_hash::FxHashSet<&'static str>,
+    collection_album_names: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    use crate::selection::AlbumSelector;
+
+    match selector {
+        AlbumSelector::None => Ok(Vec::new()),
+        AlbumSelector::All { excluded } => {
+            bail_unknown_excluded_collection_albums(excluded, collection_album_names)?;
+            Ok(album_map
+                .keys()
+                .filter(|name| {
+                    !smart_names.contains(name.as_str()) && !excluded.contains(name.as_str())
+                })
+                .cloned()
+                .collect())
+        }
+        AlbumSelector::Named { included, excluded } => {
+            validate_collection_album_selector(selector, collection_album_names, smart_names)?;
+            Ok(included
+                .iter()
+                .filter(|name| !excluded.contains(*name))
+                .filter(|name| album_map.contains_key(name.as_str()))
+                .cloned()
+                .collect())
+        }
+    }
+}
+
+fn pick_collection_scoped_smart_folder_names_for_library(
+    library: &icloud::photos::PhotoLibrary,
+    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
+    selected_smart_folder_names: &[String],
+) -> Vec<String> {
+    selected_smart_folder_names
+        .iter()
+        .filter_map(|name| {
+            if album_map.contains_key(name.as_str()) {
+                Some(name.clone())
+            } else {
+                tracing::warn!(
+                    zone = %library.zone_name(),
+                    smart_folder = %name,
+                    "Smart folder not present in this library, skipping"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Pick the user-album names selected by `albums`. Bails on missing
@@ -792,66 +998,6 @@ fn bail_unknown_excluded_albums(
         }
     }
     Ok(())
-}
-
-/// Pick the smart-folder names selected by `smart_folders`. Bails on
-/// `Named` entries that aren't smart folders and on excluded entries
-/// that aren't smart folders (a typo'd exclusion would silently match
-/// nothing).
-fn pick_smart_folder_names(
-    selector: &crate::selection::SmartFolderSelector,
-    album_map: &std::collections::HashMap<String, icloud::photos::PhotoAlbum>,
-    smart_names: &rustc_hash::FxHashSet<&'static str>,
-) -> anyhow::Result<Vec<String>> {
-    use crate::selection::SmartFolderSelector;
-    let sensitive: rustc_hash::FxHashSet<&'static str> =
-        icloud::photos::smart_folders::sensitive_smart_folder_names().collect();
-
-    match selector {
-        SmartFolderSelector::None => Ok(Vec::new()),
-        SmartFolderSelector::All {
-            include_sensitive,
-            excluded,
-        } => {
-            for name in excluded {
-                bail_excluded_not_a_smart_folder(name, smart_names)?;
-            }
-            Ok(album_map
-                .keys()
-                .filter(|name| smart_names.contains(name.as_str()))
-                .filter(|name| *include_sensitive || !sensitive.contains(name.as_str()))
-                .filter(|name| !excluded.contains(name.as_str()))
-                .cloned()
-                .collect())
-        }
-        SmartFolderSelector::Named { included, excluded } => {
-            let mut chosen = Vec::with_capacity(included.len());
-            for name in included {
-                if !smart_names.contains(name.as_str()) {
-                    let mut available: Vec<&str> = smart_names.iter().copied().collect();
-                    available.sort();
-                    anyhow::bail!(
-                        "'{name}' is not an Apple smart folder. Available: {available:?}"
-                    );
-                }
-                if excluded.contains(name) {
-                    continue;
-                }
-                if album_map.contains_key(name.as_str()) {
-                    chosen.push(name.clone());
-                } else {
-                    tracing::warn!(
-                        smart_folder = %name,
-                        "Smart folder not present in this library, skipping"
-                    );
-                }
-            }
-            for name in excluded {
-                bail_excluded_not_a_smart_folder(name, smart_names)?;
-            }
-            Ok(chosen)
-        }
-    }
 }
 
 fn bail_excluded_not_a_smart_folder(
@@ -1045,9 +1191,12 @@ mod tests {
     }
 
     fn selection_with_albums(albums: AlbumSelector, unfiled: bool) -> Selection {
+        let albums_explicit = !matches!(albums, AlbumSelector::None);
         Selection {
             albums,
+            albums_explicit,
             smart_folders: SmartFolderSelector::None,
+            smart_folders_explicit: false,
             libraries: crate::selection::LibrarySelector::default(),
             unfiled,
         }
@@ -1197,10 +1346,12 @@ mod tests {
         let library = stub_library(mock);
         let sel = Selection {
             albums: AlbumSelector::None,
+            albums_explicit: false,
             smart_folders: SmartFolderSelector::Named {
                 included: names(&["Favorites"]),
                 excluded: BTreeSet::new(),
             },
+            smart_folders_explicit: true,
             libraries: crate::selection::LibrarySelector::default(),
             unfiled: false,
         };
@@ -1216,10 +1367,12 @@ mod tests {
         let library = stub_library(mock);
         let sel = Selection {
             albums: AlbumSelector::None,
+            albums_explicit: false,
             smart_folders: SmartFolderSelector::Named {
                 included: names(&["NotASmartFolder"]),
                 excluded: BTreeSet::new(),
             },
+            smart_folders_explicit: true,
             libraries: crate::selection::LibrarySelector::default(),
             unfiled: false,
         };
@@ -1231,93 +1384,40 @@ mod tests {
         );
     }
 
-    // ── validate_smart_folder_fulfillability (CF-2, 2026-05-03) ─────────
-    //
-    // Apple's CloudKit shared zones don't have smart folders. Before the
-    // fix, `--library shared --smart-folder Favorites` (or any shared-only
-    // library set with a smart-folder selection) silently warn-and-skipped
-    // every smart-folder pass and exited 0. The user looked at their
-    // primary-library Favorites and assumed shared-Favorites came along.
-    //
-    // The fix is a pre-flight check that bails at startup when the
-    // selected library set cannot fulfill the smart-folder selection.
-
     fn shared_lib_stub(zone: &str) -> PhotoLibrary {
         PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), zone)
     }
 
-    #[test]
-    fn validate_smart_folder_named_against_shared_only_libraries_bails() {
+    #[tokio::test]
+    async fn resolve_passes_shared_library_smart_folder_now_builds_pass() {
         let libs = vec![shared_lib_stub("SharedSync-AAAA1111")];
         let sel = Selection {
             albums: AlbumSelector::None,
+            albums_explicit: false,
             smart_folders: SmartFolderSelector::Named {
                 included: names(&["Favorites"]),
                 excluded: BTreeSet::new(),
             },
+            smart_folders_explicit: true,
             libraries: crate::selection::LibrarySelector::default(),
             unfiled: false,
         };
-        let err = validate_smart_folder_fulfillability(&libs, &sel).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("--smart-folder"),
-            "error must name the offending flag, got: {msg}"
-        );
-        assert!(
-            msg.contains("primary"),
-            "error must guide the user toward the primary library, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_smart_folder_all_against_shared_only_libraries_bails() {
-        let libs = vec![shared_lib_stub("SharedSync-BBBB2222")];
-        let sel = Selection {
-            albums: AlbumSelector::None,
-            smart_folders: SmartFolderSelector::All {
-                include_sensitive: false,
-                excluded: BTreeSet::new(),
+        let ctx = build_collection_context(&sel, &libs).await.unwrap();
+        let plan = resolve_passes_for_scope(
+            &libs[0],
+            &sel,
+            PassScope {
+                include_albums: false,
+                include_smart_folders: true,
+                include_unfiled: false,
             },
-            libraries: crate::selection::LibrarySelector::default(),
-            unfiled: false,
-        };
-        let err = validate_smart_folder_fulfillability(&libs, &sel).unwrap_err();
-        assert!(err.to_string().contains("--smart-folder"));
-    }
-
-    #[test]
-    fn validate_smart_folder_named_against_mixed_libraries_passes() {
-        // Primary in the set fulfills smart folders; shared zones simply
-        // get no smart-folder passes (expected and documented).
-        let primary =
-            PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), "PrimarySync");
-        let shared = shared_lib_stub("SharedSync-CCCC3333");
-        let sel = Selection {
-            albums: AlbumSelector::None,
-            smart_folders: SmartFolderSelector::Named {
-                included: names(&["Favorites"]),
-                excluded: BTreeSet::new(),
-            },
-            libraries: crate::selection::LibrarySelector::default(),
-            unfiled: false,
-        };
-        validate_smart_folder_fulfillability(&[primary, shared], &sel)
-            .expect("primary in mix fulfills smart folders");
-    }
-
-    #[test]
-    fn validate_smart_folder_none_passes_even_on_shared_only() {
-        // No smart-folder pass requested -> nothing to validate.
-        let libs = vec![shared_lib_stub("SharedSync-DDDD4444")];
-        let sel = Selection {
-            albums: AlbumSelector::None,
-            smart_folders: SmartFolderSelector::None,
-            libraries: crate::selection::LibrarySelector::default(),
-            unfiled: false,
-        };
-        validate_smart_folder_fulfillability(&libs, &sel)
-            .expect("smart-folder None imposes no constraint on the library set");
+            &ctx,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.passes.len(), 1);
+        assert_eq!(plan.passes[0].album.name.as_ref(), "Favorites");
     }
 
     #[tokio::test]
@@ -1327,10 +1427,12 @@ mod tests {
             let library = stub_library(mock);
             let sel = Selection {
                 albums: AlbumSelector::None,
+                albums_explicit: false,
                 smart_folders: SmartFolderSelector::All {
                     include_sensitive,
                     excluded: BTreeSet::new(),
                 },
+                smart_folders_explicit: true,
                 libraries: crate::selection::LibrarySelector::default(),
                 unfiled: false,
             };
@@ -1634,10 +1736,12 @@ mod tests {
     async fn cross_zone_hydration_libraries_skip_fetch_without_album_selection() {
         let sel = Selection {
             albums: AlbumSelector::None,
+            albums_explicit: false,
             smart_folders: SmartFolderSelector::Named {
                 included: names(&["Favorites"]),
                 excluded: BTreeSet::new(),
             },
+            smart_folders_explicit: true,
             libraries: crate::selection::LibrarySelector::default(),
             unfiled: false,
         };
@@ -1692,10 +1796,12 @@ mod tests {
                 included: names(&["Vacation"]),
                 excluded: BTreeSet::new(),
             },
+            albums_explicit: true,
             smart_folders: SmartFolderSelector::Named {
                 included: names(&["Favorites"]),
                 excluded: BTreeSet::new(),
             },
+            smart_folders_explicit: true,
             libraries: crate::selection::LibrarySelector::default(),
             unfiled: true,
         };

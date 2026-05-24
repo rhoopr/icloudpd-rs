@@ -17,9 +17,10 @@ pub(crate) use password::run_password;
 pub(crate) use reconcile::run_reconcile;
 pub(crate) use reset::{run_reset_state, run_reset_sync_token};
 pub(crate) use service::{
-    attempt_reauth, init_photos_service, resolve_cross_zone_libraries_for_album_hydration,
-    resolve_libraries, resolve_passes, validate_smart_folder_fulfillability, wait_and_retry_2fa,
-    AlbumPass, AlbumPlan, PassKind, MAX_REAUTH_ATTEMPTS,
+    attempt_reauth, build_collection_context, init_photos_service,
+    resolve_cross_zone_libraries_for_album_hydration, resolve_libraries, resolve_passes_for_scope,
+    wait_and_retry_2fa, AlbumPass, AlbumPlan, CollectionContext, PassKind, PassScope,
+    MAX_REAUTH_ATTEMPTS,
 };
 pub(crate) use status::run_status;
 pub(crate) use verify::run_verify;

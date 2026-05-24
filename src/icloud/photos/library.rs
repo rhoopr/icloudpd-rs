@@ -188,32 +188,32 @@ impl PhotoLibrary {
     pub async fn albums(&self) -> anyhow::Result<HashMap<String, PhotoAlbum>> {
         let mut albums = HashMap::new();
 
-        // Shared libraries don't support smart folder or user album queries —
-        // their CloudKit zones lack the required indexes. Check the zone name
-        // because Apple's private endpoint also returns SharedSync zones
-        // (library_type reflects the API endpoint, not the zone type).
-        if !self.zone_name().starts_with("SharedSync") {
-            for (name, def) in smart_folders() {
-                albums.insert(
-                    name.to_string(),
-                    PhotoAlbum::new(
-                        PhotoAlbumConfig {
-                            params: Arc::clone(&self.params),
-                            service_endpoint: Arc::clone(&self.service_endpoint),
-                            name: Arc::from(name),
-                            list_type: Arc::from(def.list_type),
-                            obj_type: Arc::from(def.obj_type),
-                            query_filter: def.query_filter,
-                            page_size: DEFAULT_PAGE_SIZE,
-                            zone_id: Arc::clone(&self.zone_id),
-                            retry_config: self.retry_config,
-                            container_id: None,
-                            cross_zone_sources: Vec::new(),
-                        },
-                        self.clone_session(),
-                    ),
-                );
-            }
+        // Smart folders are user-scoped and can include assets from shared
+        // zones, so always inject their query definitions for every zone.
+        for (name, def) in smart_folders() {
+            albums.insert(
+                name.to_string(),
+                PhotoAlbum::new(
+                    PhotoAlbumConfig {
+                        params: Arc::clone(&self.params),
+                        service_endpoint: Arc::clone(&self.service_endpoint),
+                        name: Arc::from(name),
+                        list_type: Arc::from(def.list_type),
+                        obj_type: Arc::from(def.obj_type),
+                        query_filter: def.query_filter,
+                        page_size: DEFAULT_PAGE_SIZE,
+                        zone_id: Arc::clone(&self.zone_id),
+                        retry_config: self.retry_config,
+                        container_id: None,
+                        cross_zone_sources: Vec::new(),
+                    },
+                    self.clone_session(),
+                ),
+            );
+        }
+
+        // Shared zones currently skip user-created album folder queries.
+        if !is_shared_zone(self.zone_name()) {
             let folders = self.fetch_folders().await?;
             for folder in &folders {
                 let record_name = &folder.record_name;

@@ -11,9 +11,9 @@ use anyhow::Context;
 use crate::auth;
 use crate::cli;
 use crate::commands::{
-    attempt_reauth, init_photos_service, resolve_cross_zone_libraries_for_album_hydration,
-    resolve_libraries, resolve_passes, validate_smart_folder_fulfillability, wait_and_retry_2fa,
-    MAX_REAUTH_ATTEMPTS,
+    attempt_reauth, build_collection_context, init_photos_service,
+    resolve_cross_zone_libraries_for_album_hydration, resolve_libraries, resolve_passes_for_scope,
+    wait_and_retry_2fa, CollectionContext, PassScope, MAX_REAUTH_ATTEMPTS,
 };
 use crate::config;
 use crate::credential;
@@ -602,12 +602,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         libraries.len(),
     );
 
-    // CloudKit shared zones don't expose smart folders. Catch the
-    // impossible-config case (e.g. shared libraries plus a smart-folder selector)
-    // here, before any per-library work, so the user gets a clear error
-    // instead of a silent zero-pass run with exit code 0.
-    validate_smart_folder_fulfillability(&libraries, &config.filters.selection)?;
-
     // Initialize state database.
     // Skip for --dry-run so a preview doesn't create the DB or poison
     // sync tokens, which would cause a subsequent real sync to believe
@@ -816,18 +810,70 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // failures behind a clean final cycle.
     let mut cumulative_failed_count = 0usize;
 
-    let cross_zone_libraries = resolve_cross_zone_libraries_for_album_hydration(
-        &config.filters.selection,
-        photos_service.all_libraries(),
-    )
-    .await?;
+    let all_libraries = photos_service.all_libraries().await?;
+    let cross_zone_libraries =
+        resolve_cross_zone_libraries_for_album_hydration(&config.filters.selection, async {
+            Ok::<_, anyhow::Error>(all_libraries.clone())
+        })
+        .await?;
 
-    let mut library_states: Vec<LibraryState> = Vec::with_capacity(libraries.len());
-    for library in &libraries {
+    use crate::selection::{AlbumSelector, SmartFolderSelector};
+    let smart_selector_active = !matches!(
+        config.filters.selection.smart_folders,
+        SmartFolderSelector::None
+    );
+    let collection_libraries = if config.filters.selection.albums_explicit || smart_selector_active
+    {
+        all_libraries.clone()
+    } else {
+        libraries.clone()
+    };
+    let collection_context =
+        build_collection_context(&config.filters.selection, &collection_libraries).await?;
+    let selected_zones: rustc_hash::FxHashSet<String> = libraries
+        .iter()
+        .map(|library| library.zone_name().to_string())
+        .collect();
+    let collection_zones: rustc_hash::FxHashSet<String> = collection_libraries
+        .iter()
+        .map(|library| library.zone_name().to_string())
+        .collect();
+
+    let mut library_states: Vec<LibraryState> = Vec::with_capacity(all_libraries.len());
+    for library in &all_libraries {
         let zone_name = library.zone_name().to_string();
+        let include_unfiled =
+            config.filters.selection.unfiled && selected_zones.contains(zone_name.as_str());
+        let include_albums = match config.filters.selection.albums {
+            AlbumSelector::None => false,
+            _ if config.filters.selection.albums_explicit => {
+                collection_zones.contains(zone_name.as_str())
+            }
+            _ => selected_zones.contains(zone_name.as_str()),
+        };
+        let include_smart_folders =
+            smart_selector_active && collection_zones.contains(zone_name.as_str());
+        let pass_scope = PassScope {
+            include_albums,
+            include_smart_folders,
+            include_unfiled,
+        };
+        if !pass_scope.include_albums
+            && !pass_scope.include_smart_folders
+            && !pass_scope.include_unfiled
+        {
+            continue;
+        }
+
         let sync_token_key = make_sync_token_key(&zone_name);
-        let plan =
-            resolve_passes(library, &config.filters.selection, &cross_zone_libraries).await?;
+        let plan = resolve_passes_for_scope(
+            library,
+            &config.filters.selection,
+            pass_scope,
+            &collection_context,
+            &cross_zone_libraries,
+        )
+        .await?;
         let (album_passes, smart_folder_passes, unfiled) = count_passes(&plan);
         tracing::info!(
             zone = %zone_name,
@@ -839,6 +885,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         library_states.push(LibraryState {
             library: library.clone(),
             cross_zone_libraries: cross_zone_libraries.clone(),
+            pass_scope,
             zone_name,
             sync_token_key,
             plan,
@@ -847,11 +894,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         });
     }
     warn_if_multi_library_paths_commingle(
-        library_states.len(),
+        &library_states,
         &config.download.folder_structure,
         &config.download.folder_structure_albums,
         &config.download.folder_structure_smart_folders,
-        &config.filters.selection,
     );
     sd_notifier.notify_ready();
     // Friendly-mode greeting. Lands above any future bar via
@@ -935,6 +981,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             refresh_needed_library_plans(
                 &mut library_states,
                 &config.filters.selection,
+                &collection_context,
                 watch_precheck.changed_zones(),
                 &mut consecutive_album_refresh_failures,
             )
@@ -1422,6 +1469,7 @@ pub(crate) fn should_wait_for_2fa(is_watch_mode: bool, err: &anyhow::Error) -> b
 async fn refresh_needed_library_plans(
     library_states: &mut [LibraryState],
     selection: &crate::selection::Selection,
+    collection_context: &CollectionContext,
     changed_zones: Option<&rustc_hash::FxHashSet<String>>,
     consecutive_album_refresh_failures: &mut u32,
 ) {
@@ -1438,9 +1486,11 @@ async fn refresh_needed_library_plans(
         // phase; incremental/cleanup paths resolve them before planning tasks.
         // This refresh is intentionally delayed until a selected zone has
         // changes so quiet watch cycles avoid the album-listing traffic.
-        match resolve_passes(
+        match resolve_passes_for_scope(
             &lib_state.library,
             selection,
+            lib_state.pass_scope,
+            collection_context,
             &lib_state.cross_zone_libraries,
         )
         .await
@@ -1602,21 +1652,20 @@ pub(crate) fn count_passes(plan: &crate::commands::AlbumPlan) -> (usize, usize, 
 /// when `--smart-folder none`) don't render any path so they don't need
 /// `{library}` to keep the sync safe.
 fn find_multi_library_commingle_flags(
-    library_count: usize,
+    library_states: &[LibraryState],
     folder_structure: &str,
     folder_structure_albums: &str,
     folder_structure_smart_folders: &str,
-    selection: &crate::selection::Selection,
 ) -> Vec<&'static str> {
-    use crate::selection::{AlbumSelector, SmartFolderSelector};
-
-    if library_count < 2 {
+    if library_states.len() < 2 {
         return Vec::new();
     }
 
-    let unfiled_active = selection.unfiled;
-    let album_active = !matches!(selection.albums, AlbumSelector::None);
-    let smart_folder_active = !matches!(selection.smart_folders, SmartFolderSelector::None);
+    let unfiled_active = library_states.iter().any(|s| s.pass_scope.include_unfiled);
+    let album_active = library_states.iter().any(|s| s.pass_scope.include_albums);
+    let smart_folder_active = library_states
+        .iter()
+        .any(|s| s.pass_scope.include_smart_folders);
 
     // All passes disabled — resolve_passes returns an empty plan, no path
     // ever renders, multi-library can't commingle.
@@ -1645,22 +1694,21 @@ fn find_multi_library_commingle_flags(
 /// user can add `{library}` to their templates if they want zone-disjoint
 /// trees.
 fn warn_if_multi_library_paths_commingle(
-    library_count: usize,
+    library_states: &[LibraryState],
     folder_structure: &str,
     folder_structure_albums: &str,
     folder_structure_smart_folders: &str,
-    selection: &crate::selection::Selection,
 ) {
     let missing = find_multi_library_commingle_flags(
-        library_count,
+        library_states,
         folder_structure,
         folder_structure_albums,
         folder_structure_smart_folders,
-        selection,
     );
     if missing.is_empty() {
         return;
     }
+    let library_count = library_states.len();
     tracing::warn!(
         library_count,
         missing = ?missing,
@@ -2144,10 +2192,12 @@ mod tests {
             albums: AlbumSelector::All {
                 excluded: std::collections::BTreeSet::new(),
             },
+            albums_explicit: true,
             smart_folders: SmartFolderSelector::All {
                 include_sensitive: false,
                 excluded: std::collections::BTreeSet::new(),
             },
+            smart_folders_explicit: true,
             libraries: LibrarySelector::default(),
             unfiled: true,
         }
@@ -2158,10 +2208,48 @@ mod tests {
         use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
         Selection {
             albums: AlbumSelector::None,
+            albums_explicit: false,
             smart_folders: SmartFolderSelector::None,
+            smart_folders_explicit: false,
             libraries: LibrarySelector::default(),
             unfiled: true,
         }
+    }
+
+    fn commingle_test_states(
+        count: usize,
+        selection: &crate::selection::Selection,
+    ) -> Vec<LibraryState> {
+        use crate::selection::{AlbumSelector, SmartFolderSelector};
+
+        let pass_scope = PassScope {
+            include_albums: !matches!(selection.albums, AlbumSelector::None),
+            include_smart_folders: !matches!(selection.smart_folders, SmartFolderSelector::None),
+            include_unfiled: selection.unfiled,
+        };
+        (0..count)
+            .map(|idx| {
+                let zone_name = if idx == 0 {
+                    "PrimarySync".to_string()
+                } else {
+                    format!("SharedSync-{:08X}", idx)
+                };
+                let library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+                    Box::new(crate::test_helpers::MockPhotosSession::new()),
+                    &zone_name,
+                );
+                LibraryState {
+                    library,
+                    cross_zone_libraries: Vec::new(),
+                    pass_scope,
+                    zone_name: zone_name.clone(),
+                    sync_token_key: format!("sync_token:{zone_name}"),
+                    plan: crate::commands::AlbumPlan { passes: Vec::new() },
+                    plan_is_stale: false,
+                    plan_needs_refresh: false,
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -2169,20 +2257,20 @@ mod tests {
         // Zero or one library never flags any template, regardless of
         // template content or active-pass selection.
         let sel = selection_all_passes_active();
+        let states0 = commingle_test_states(0, &sel);
         assert!(find_multi_library_commingle_flags(
-            0,
+            &states0,
             "%Y/%m/%d",
             "{album}",
-            "{smart-folder}",
-            &sel
+            "{smart-folder}"
         )
         .is_empty());
+        let states1 = commingle_test_states(1, &sel);
         assert!(find_multi_library_commingle_flags(
-            1,
+            &states1,
             "%Y/%m/%d",
             "{album}",
-            "{smart-folder}",
-            &sel
+            "{smart-folder}"
         )
         .is_empty());
     }
@@ -2193,13 +2281,13 @@ mod tests {
         // multi-library is safe. Inactive templates are irrelevant -
         // their pass kind doesn't run.
         let all = selection_all_passes_active();
+        let all_states = commingle_test_states(2, &all);
         assert!(
             find_multi_library_commingle_flags(
-                2,
+                &all_states,
                 "{library}/%Y/%m/%d",
                 "{library}/{album}",
                 "{library}/{smart-folder}",
-                &all,
             )
             .is_empty(),
             "every active template carries `{{library}}` - no commingle"
@@ -2209,13 +2297,13 @@ mod tests {
         // the only one that needs `{library}`. The album / smart-folder
         // templates can be anything because no pass reads them.
         let unfiled = selection_unfiled_only();
+        let unfiled_states = commingle_test_states(2, &unfiled);
         assert!(
             find_multi_library_commingle_flags(
-                2,
+                &unfiled_states,
                 "{library}/%Y/%m/%d",
                 "{album}",
                 "{smart-folder}",
-                &unfiled,
             )
             .is_empty(),
             "only unfiled active and its template has `{{library}}`"
@@ -2236,19 +2324,21 @@ mod tests {
             albums: AlbumSelector::All {
                 excluded: std::collections::BTreeSet::new(),
             },
+            albums_explicit: true,
             smart_folders: SmartFolderSelector::All {
                 include_sensitive: false,
                 excluded: std::collections::BTreeSet::new(),
             },
+            smart_folders_explicit: true,
             libraries: LibrarySelector::default(),
             unfiled: false,
         };
+        let states = commingle_test_states(2, &sel);
         let missing = find_multi_library_commingle_flags(
-            2,
+            &states,
             "%Y/%m/%d",
             "{library}/{album}",
             "{smart-folder}",
-            &sel,
         );
         assert_eq!(
             missing,
@@ -2262,17 +2352,19 @@ mod tests {
             albums: AlbumSelector::All {
                 excluded: std::collections::BTreeSet::new(),
             },
+            albums_explicit: true,
             smart_folders: SmartFolderSelector::None,
+            smart_folders_explicit: false,
             libraries: LibrarySelector::default(),
             unfiled: false,
         };
+        let states_no_smart = commingle_test_states(2, &sel_no_smart);
         assert!(
             find_multi_library_commingle_flags(
-                2,
+                &states_no_smart,
                 "%Y/%m/%d",
                 "{library}/{album}",
                 "{smart-folder}",
-                &sel_no_smart,
             )
             .is_empty(),
             "smart-folder inactive - its `{{library}}`-less template is irrelevant"
@@ -2283,8 +2375,9 @@ mod tests {
     fn find_multi_library_commingle_flags_reports_all_missing_when_every_active_template_lacks_token(
     ) {
         let sel = selection_all_passes_active();
+        let states = commingle_test_states(2, &sel);
         let missing =
-            find_multi_library_commingle_flags(2, "%Y/%m/%d", "{album}", "{smart-folder}", &sel);
+            find_multi_library_commingle_flags(&states, "%Y/%m/%d", "{album}", "{smart-folder}");
         assert_eq!(
             missing,
             vec![
@@ -2302,8 +2395,9 @@ mod tests {
         // every asset lands directly in the download dir. Still surfaces
         // the unfiled flag so the user knows the namespace is shared.
         let sel = selection_all_passes_active();
+        let states = commingle_test_states(5, &sel);
         let missing =
-            find_multi_library_commingle_flags(5, "none", "{album}", "{smart-folder}", &sel);
+            find_multi_library_commingle_flags(&states, "none", "{album}", "{smart-folder}");
         assert!(missing.contains(&"--folder-structure"));
     }
 
@@ -2316,12 +2410,15 @@ mod tests {
         use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
         let sel = Selection {
             albums: AlbumSelector::None,
+            albums_explicit: true,
             smart_folders: SmartFolderSelector::None,
+            smart_folders_explicit: false,
             libraries: LibrarySelector::default(),
             unfiled: false,
         };
+        let states = commingle_test_states(3, &sel);
         assert!(
-            find_multi_library_commingle_flags(3, "%Y/%m/%d", "{album}", "{smart-folder}", &sel)
+            find_multi_library_commingle_flags(&states, "%Y/%m/%d", "{album}", "{smart-folder}")
                 .is_empty(),
             "no active passes - find_* must report empty"
         );
@@ -2339,7 +2436,8 @@ mod tests {
     #[test]
     fn warn_if_multi_library_paths_commingle_emits_structured_fields() {
         let sel = selection_all_passes_active();
-        warn_if_multi_library_paths_commingle(3, "%Y/%m/%d", "{album}", "{smart-folder}", &sel);
+        let states = commingle_test_states(3, &sel);
+        warn_if_multi_library_paths_commingle(&states, "%Y/%m/%d", "{album}", "{smart-folder}");
         assert!(
             logs_contain("library_count=3"),
             "structured library_count field expected on warn line"
@@ -2372,12 +2470,12 @@ mod tests {
     #[test]
     fn warn_if_multi_library_paths_commingle_silent_when_no_commingle() {
         let sel = selection_all_passes_active();
+        let states = commingle_test_states(3, &sel);
         warn_if_multi_library_paths_commingle(
-            3,
+            &states,
             "{library}/%Y/%m/%d",
             "{library}/{album}",
             "{library}/{smart-folder}",
-            &sel,
         );
         assert!(
             !logs_contain("library_count="),
@@ -2600,6 +2698,11 @@ mod tests {
                 Box::new(crate::test_helpers::MockPhotosSession::new()),
                 zone,
             ),
+            pass_scope: PassScope {
+                include_albums: false,
+                include_smart_folders: false,
+                include_unfiled: true,
+            },
             zone_name: zone.to_string(),
             sync_token_key: sync_token_key.to_string(),
             plan: crate::commands::AlbumPlan {
@@ -3634,6 +3737,11 @@ mod tests {
         );
         LibraryState {
             library: crate::icloud::photos::PhotoLibrary::new_stub(stub_session),
+            pass_scope: PassScope {
+                include_albums: false,
+                include_smart_folders: false,
+                include_unfiled: false,
+            },
             zone_name: zone.to_string(),
             sync_token_key: sync_token_key.to_string(),
             plan: crate::commands::AlbumPlan { passes: Vec::new() },
@@ -3971,14 +4079,26 @@ mod tests {
         changed_zones.insert("PrimarySync".to_string());
         let selection = crate::selection::Selection {
             albums: crate::selection::AlbumSelector::None,
+            albums_explicit: false,
             smart_folders: crate::selection::SmartFolderSelector::None,
+            smart_folders_explicit: false,
             libraries: crate::selection::LibrarySelector::default(),
             unfiled: false,
         };
+        let collection_context = CollectionContext {
+            collection_album_names: std::collections::BTreeSet::new(),
+            selected_smart_folder_names: Vec::new(),
+        };
         let mut failures = 0;
 
-        refresh_needed_library_plans(&mut states, &selection, Some(&changed_zones), &mut failures)
-            .await;
+        refresh_needed_library_plans(
+            &mut states,
+            &selection,
+            &collection_context,
+            Some(&changed_zones),
+            &mut failures,
+        )
+        .await;
 
         assert!(
             !states[0].plan_needs_refresh,
@@ -4003,13 +4123,26 @@ mod tests {
         }
         let selection = crate::selection::Selection {
             albums: crate::selection::AlbumSelector::None,
+            albums_explicit: false,
             smart_folders: crate::selection::SmartFolderSelector::None,
+            smart_folders_explicit: false,
             libraries: all_libraries(),
             unfiled: false,
         };
+        let collection_context = CollectionContext {
+            collection_album_names: std::collections::BTreeSet::new(),
+            selected_smart_folder_names: Vec::new(),
+        };
         let mut failures = 2;
 
-        refresh_needed_library_plans(&mut states, &selection, None, &mut failures).await;
+        refresh_needed_library_plans(
+            &mut states,
+            &selection,
+            &collection_context,
+            None,
+            &mut failures,
+        )
+        .await;
 
         assert!(
             states.iter().all(|state| !state.plan_needs_refresh),
