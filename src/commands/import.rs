@@ -1110,19 +1110,20 @@ mod build_selection_tests {
         )
     }
 
-    fn smart_folder_filters() -> TomlFilters {
+    fn smart_folder_filters_with_unfiled(unfiled: bool) -> TomlFilters {
         TomlFilters {
             smart_folders: Some(vec!["Hidden".to_string()]),
-            unfiled: Some(false),
+            unfiled: Some(unfiled),
             ..TomlFilters::default()
         }
     }
 
     #[test]
-    fn import_scope_planning_shared_only_smart_folder_excludes_primary_zone() {
+    fn import_scope_planning_shared_only_smart_folder_widens_zone_scope() {
         let selector = crate::selection::parse_library_selector(&["shared".to_string()]).unwrap();
         let selection =
-            build_import_selection(Some(&smart_folder_filters()), &selector).expect("ok");
+            build_import_selection(Some(&smart_folder_filters_with_unfiled(false)), &selector)
+                .expect("ok");
         let primary = test_library("PrimarySync");
         let shared = test_library("SharedSync-ABCD1234");
         let selected_libraries = vec![shared.clone()];
@@ -1146,8 +1147,8 @@ mod build_selection_tests {
         );
 
         assert!(
-            primary_scope.is_empty(),
-            "import-existing planning must not schedule PrimarySync when library selector is shared-only"
+            primary_scope.include_smart_folders,
+            "explicit smart-folder selection should widen import pass planning beyond the library selector"
         );
         assert!(
             shared_scope.include_smart_folders,
@@ -1156,10 +1157,11 @@ mod build_selection_tests {
     }
 
     #[test]
-    fn import_scope_planning_primary_only_smart_folder_excludes_shared_zone() {
+    fn import_scope_planning_primary_only_still_filters_unfiled() {
         let selector = crate::selection::parse_library_selector(&["primary".to_string()]).unwrap();
         let selection =
-            build_import_selection(Some(&smart_folder_filters()), &selector).expect("ok");
+            build_import_selection(Some(&smart_folder_filters_with_unfiled(true)), &selector)
+                .expect("ok");
         let primary = test_library("PrimarySync");
         let shared = test_library("SharedSync-ABCD1234");
         let selected_libraries = vec![primary.clone()];
@@ -1187,8 +1189,16 @@ mod build_selection_tests {
             "import-existing planning should keep smart-folder passes in the selected primary zone"
         );
         assert!(
-            shared_scope.is_empty(),
-            "import-existing planning must not schedule shared-zone passes when selector is primary-only"
+            shared_scope.include_smart_folders,
+            "explicit smart-folder selection should widen import scope to shared zones too"
+        );
+        assert!(
+            primary_scope.include_unfiled,
+            "selected primary zone should keep unfiled pass when unfiled=true"
+        );
+        assert!(
+            !shared_scope.include_unfiled,
+            "library selector should still filter unfiled passes to selected zones"
         );
     }
 }

@@ -1824,6 +1824,7 @@ mod tests {
 
     fn selection_with_smart_folder(
         libraries: crate::selection::LibrarySelector,
+        unfiled: bool,
     ) -> crate::selection::Selection {
         use crate::selection::{AlbumSelector, Selection, SmartFolderSelector};
         Selection {
@@ -1835,7 +1836,7 @@ mod tests {
             },
             smart_folders_explicit: true,
             libraries,
-            unfiled: false,
+            unfiled,
         }
     }
 
@@ -1847,9 +1848,10 @@ mod tests {
     }
 
     #[test]
-    fn run_sync_scope_planning_shared_only_smart_folder_excludes_primary_zone() {
+    fn run_sync_scope_planning_shared_only_smart_folder_widens_zone_scope() {
         let selection = selection_with_smart_folder(
             crate::selection::parse_library_selector(&["shared".to_string()]).unwrap(),
+            false,
         );
         let primary = test_library("PrimarySync");
         let shared = test_library("SharedSync-ABCD1234");
@@ -1874,8 +1876,8 @@ mod tests {
         );
 
         assert!(
-            primary_scope.is_empty(),
-            "run_sync planning must not schedule PrimarySync when library selector is shared-only"
+            primary_scope.include_smart_folders,
+            "explicit smart-folder selection should widen pass planning beyond the library selector"
         );
         assert!(
             shared_scope.include_smart_folders,
@@ -1884,9 +1886,10 @@ mod tests {
     }
 
     #[test]
-    fn run_sync_scope_planning_primary_only_smart_folder_excludes_shared_zone() {
+    fn run_sync_scope_planning_primary_only_still_filters_unfiled() {
         let selection = selection_with_smart_folder(
             crate::selection::parse_library_selector(&["primary".to_string()]).unwrap(),
+            true,
         );
         let primary = test_library("PrimarySync");
         let shared = test_library("SharedSync-ABCD1234");
@@ -1915,8 +1918,16 @@ mod tests {
             "run_sync planning should keep smart-folder passes in the selected primary zone"
         );
         assert!(
-            shared_scope.is_empty(),
-            "run_sync planning must not schedule shared-zone passes when selector is primary-only"
+            shared_scope.include_smart_folders,
+            "explicit smart-folder selection should widen scope to shared zones too"
+        );
+        assert!(
+            primary_scope.include_unfiled,
+            "selected primary zone should keep unfiled pass when unfiled=true"
+        );
+        assert!(
+            !shared_scope.include_unfiled,
+            "library selector should still filter unfiled passes to selected zones"
         );
     }
 
