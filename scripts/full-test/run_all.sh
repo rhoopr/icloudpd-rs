@@ -12,6 +12,7 @@
 #   0.75 fuzz_build    cargo +nightly fuzz build (skip if missing)
 #   0.8  udeps         cargo +nightly udeps --all-targets
 #   0.9  offline_all   cargo test --all-features
+#   0.95 scope_matrix  matrix test for library/album/smart-folder/unfiled scope
 #   1    build_release cargo build --release
 #   1.5  release_archive_smoke
 #   2    docker_build      just docker build
@@ -136,6 +137,9 @@ run_phase udeps -- cargo +nightly udeps --all-targets
 
 # --- Phase 0.9: full offline ----------------------------------------------
 run_phase offline_all -- cargo test --all-features
+
+# --- Phase 0.95: scope matrix ----------------------------------------------
+run_phase scope_matrix -- cargo test scope_contract_matrix --lib
 
 # --- Phase 1 + 2: release build + docker builds ---------------------------
 run_phase build_release -- cargo build --release

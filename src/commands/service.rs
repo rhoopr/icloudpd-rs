@@ -2001,6 +2001,149 @@ libraries = ["shared"]
             .collect()
     }
 
+    #[test]
+    fn scope_contract_matrix_zone_widening_and_unfiled_scoping() {
+        use crate::selection::{AlbumSelector, Selection, SmartFolderSelector};
+        use std::collections::BTreeSet;
+
+        let primary_zone = "PrimarySync";
+        let shared_zone = "SharedSync-AAAA1111";
+        let primary =
+            PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), primary_zone);
+        let shared =
+            PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), shared_zone);
+        let all_libraries = vec![primary.clone(), shared.clone()];
+
+        let all_zones = zone_name_set(&all_libraries);
+        let library_cases: [(
+            &str,
+            crate::selection::LibrarySelector,
+            Vec<icloud::photos::PhotoLibrary>,
+        ); 3] = [
+            (
+                "primary",
+                selector_from(&["primary"]),
+                vec![primary.clone()],
+            ),
+            ("shared", selector_from(&["shared"]), vec![shared.clone()]),
+            (
+                "all",
+                selector_from(&["all"]),
+                vec![primary.clone(), shared.clone()],
+            ),
+        ];
+        let album_cases: [(&str, AlbumSelector, bool, bool); 3] = [
+            (
+                "default",
+                AlbumSelector::All {
+                    excluded: BTreeSet::new(),
+                },
+                false,
+                true,
+            ),
+            ("none", AlbumSelector::None, true, false),
+            (
+                "named",
+                AlbumSelector::Named {
+                    included: names(&["Vacation"]),
+                    excluded: BTreeSet::new(),
+                },
+                true,
+                true,
+            ),
+        ];
+        let smart_cases: [(&str, SmartFolderSelector, bool, bool); 3] = [
+            ("default", SmartFolderSelector::None, false, false),
+            ("none", SmartFolderSelector::None, true, false),
+            (
+                "named",
+                SmartFolderSelector::Named {
+                    included: names(&["Hidden"]),
+                    excluded: BTreeSet::new(),
+                },
+                true,
+                true,
+            ),
+        ];
+
+        let mut matrix_cases = 0usize;
+        for (library_label, library_selector, selected_libraries) in &library_cases {
+            let selected_zones = zone_name_set(selected_libraries);
+            for (album_label, album_selector, albums_explicit, albums_active) in &album_cases {
+                for (smart_label, smart_selector, smart_explicit, smart_active) in &smart_cases {
+                    for unfiled in [false, true] {
+                        matrix_cases += 1;
+                        let selection = Selection {
+                            albums: album_selector.clone(),
+                            albums_explicit: *albums_explicit,
+                            smart_folders: smart_selector.clone(),
+                            smart_folders_explicit: *smart_explicit,
+                            libraries: library_selector.clone(),
+                            unfiled,
+                        };
+
+                        let collection_libraries =
+                            collection_libraries(&selection, selected_libraries, &all_libraries);
+                        let collection_zones = zone_name_set(collection_libraries);
+
+                        let expected_collection_zones = if *albums_explicit || *smart_active {
+                            all_zones.clone()
+                        } else {
+                            selected_zones.clone()
+                        };
+                        assert_eq!(
+                            collection_zones, expected_collection_zones,
+                            "collection scope mismatch for --library={library_label} --album={album_label} --smart-folder={smart_label} --unfiled={unfiled}"
+                        );
+
+                        let primary_scope = pass_scope_for_zone(
+                            &selection,
+                            primary_zone,
+                            &selected_zones,
+                            &collection_zones,
+                        );
+                        let shared_scope = pass_scope_for_zone(
+                            &selection,
+                            shared_zone,
+                            &selected_zones,
+                            &collection_zones,
+                        );
+
+                        for (zone_name, scope) in
+                            [(primary_zone, primary_scope), (shared_zone, shared_scope)]
+                        {
+                            let expected_unfiled = unfiled && selected_zones.contains(zone_name);
+                            let expected_albums = if !albums_active {
+                                false
+                            } else if *albums_explicit {
+                                expected_collection_zones.contains(zone_name)
+                            } else {
+                                selected_zones.contains(zone_name)
+                            };
+                            let expected_smart =
+                                *smart_active && expected_collection_zones.contains(zone_name);
+
+                            assert_eq!(
+                                scope.include_unfiled, expected_unfiled,
+                                "unfiled scope mismatch for zone={zone_name}, --library={library_label} --album={album_label} --smart-folder={smart_label} --unfiled={unfiled}"
+                            );
+                            assert_eq!(
+                                scope.include_albums, expected_albums,
+                                "album scope mismatch for zone={zone_name}, --library={library_label} --album={album_label} --smart-folder={smart_label} --unfiled={unfiled}"
+                            );
+                            assert_eq!(
+                                scope.include_smart_folders, expected_smart,
+                                "smart-folder scope mismatch for zone={zone_name}, --library={library_label} --album={album_label} --smart-folder={smart_label} --unfiled={unfiled}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(matrix_cases, 54, "expected full 3x3x3x2 matrix coverage");
+    }
+
     #[tokio::test]
     async fn resolve_libraries_default_returns_primary_only() {
         let mut ps = photos_service_with_zones(&["SharedSync-AAAA1111", "SharedSync-BBBB2222"]);

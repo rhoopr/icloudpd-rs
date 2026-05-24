@@ -14,6 +14,7 @@ PHASE_ORDER = {
     "fuzz_build": 17,
     "udeps": 18,
     "offline_all": 19,
+    "scope_matrix": 19,
     "build_release": 20,
     "docker_build": 30,
     "docker_multiarch": 31,

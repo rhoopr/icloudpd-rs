@@ -61,6 +61,7 @@ PHASE_META = {
     "fuzz_build":               (17, "0.75", None),
     "udeps":                    (18, "0.8", None),
     "offline_all":              (19, "0.9", None),
+    "scope_matrix":             (19, "0.95", 1),
     "build_release":            (20, "1", None),
     "docker_build":             (30, "2", None),
     "docker_multiarch":         (31, "2", None),
