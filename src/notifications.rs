@@ -521,30 +521,27 @@ mod tests {
             notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
         }
 
-        let mut max_concurrent = 0usize;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            max_concurrent = max_concurrent.max(fixture.count_markers());
-            if max_concurrent >= NOTIFIER_MAX_INFLIGHT {
-                for _ in 0..10 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    max_concurrent = max_concurrent.max(fixture.count_markers());
-                }
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        fixture
+            .wait_until(Duration::from_secs(5), || {
+                fixture.count_markers() == NOTIFIER_MAX_INFLIGHT
+            })
+            .await;
+        assert_eq!(
+            fixture.count_markers(),
+            NOTIFIER_MAX_INFLIGHT,
+            "semaphore must cap in-flight scripts at the hard limit"
+        );
+        assert_eq!(
+            fixture.count_invocations(),
+            NOTIFIER_MAX_INFLIGHT,
+            "while barrier is closed, only permit-sized scripts should start"
+        );
 
         fixture.release_barrier();
         fixture
             .wait_until(Duration::from_secs(5), || fixture.count_markers() == 0)
             .await;
-
-        assert!(max_concurrent >= 1, "no scripts ever ran -- test setup bug");
-        assert!(
-            max_concurrent <= NOTIFIER_MAX_INFLIGHT,
-            "semaphore did not cap concurrent scripts: max observed {max_concurrent}, cap is {NOTIFIER_MAX_INFLIGHT}",
-        );
+        assert_eq!(fixture.count_markers(), 0, "scripts did not drain");
     }
 
     /// When more than `NOTIFIER_MAX_INFLIGHT` events are fired while every

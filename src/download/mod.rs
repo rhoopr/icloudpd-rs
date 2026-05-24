@@ -3586,33 +3586,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_change_event_filtering_downloadable_reasons() {
-        // Verify that the filtering logic in download_photos_incremental
-        // correctly identifies which ChangeReasons are downloadable
-        let downloadable = [ChangeReason::Created];
-        let skippable = [
-            ChangeReason::SoftDeleted,
-            ChangeReason::HardDeleted,
-            ChangeReason::Hidden,
-        ];
-
-        for reason in &downloadable {
-            assert!(
-                matches!(reason, ChangeReason::Created),
-                "{:?} should be downloadable",
-                reason
-            );
-        }
-        for reason in &skippable {
-            assert!(
-                !matches!(reason, ChangeReason::Created),
-                "{:?} should be skippable",
-                reason
-            );
-        }
-    }
-
     fn hard_deleted_change_record(record_name: &str) -> Value {
         json!({
             "recordName": record_name,

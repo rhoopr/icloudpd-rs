@@ -460,19 +460,23 @@ mod tests {
 
     #[test]
     fn delete_outcome_file_only_success_when_keyring_missing() {
-        finish_delete(
-            "user@example.com",
-            DeleteOutcome::NotFound,
-            DeleteOutcome::Deleted,
-        )
-        .expect("encrypted-file deletion must succeed when keyring entry is absent");
+        let cases = [
+            (
+                "only encrypted-file deleted",
+                DeleteOutcome::NotFound,
+                DeleteOutcome::Deleted,
+            ),
+            (
+                "only keyring deleted",
+                DeleteOutcome::Deleted,
+                DeleteOutcome::NotFound,
+            ),
+        ];
 
-        finish_delete(
-            "user@example.com",
-            DeleteOutcome::Deleted,
-            DeleteOutcome::NotFound,
-        )
-        .expect("keyring deletion must succeed when encrypted-file entry is absent");
+        for (label, keyring, file) in cases {
+            finish_delete("user@example.com", keyring, file)
+                .unwrap_or_else(|err| panic!("{label} must be treated as success: {err}"));
+        }
     }
 
     #[test]
