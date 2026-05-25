@@ -33,7 +33,18 @@ echo ""
 # ── Setup: copy the pre-authenticated session into a fresh config dir ───
 DOCKER_CONFIG=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-config-XXXXX")
 DOCKER_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-photos-XXXXX")
-trap "rm -rf '$DOCKER_CONFIG' '$DOCKER_PHOTOS'" EXIT
+docker_cleanup() {
+    local exit_code=$?
+    # Root-owned files can be left behind on bind mounts; hand ownership
+    # back before removing scratch dirs so EXIT cleanup never flips the
+    # suite result with Permission denied.
+    docker run --rm -v "$DOCKER_CONFIG:/c" -v "$DOCKER_PHOTOS:/p" "$IMAGE" \
+        chown -R "$(id -u):$(id -g)" /c /p >/dev/null 2>&1 || true
+    chmod -R u+rwX "$DOCKER_CONFIG" "$DOCKER_PHOTOS" >/dev/null 2>&1 || true
+    rm -rf "$DOCKER_CONFIG" "$DOCKER_PHOTOS" >/dev/null 2>&1 || true
+    return "$exit_code"
+}
+trap docker_cleanup EXIT
 
 cp "$COOKIES/"* "$DOCKER_CONFIG/" 2>/dev/null
 cp "$COOKIES/".* "$DOCKER_CONFIG/" 2>/dev/null
@@ -105,7 +116,7 @@ fi
 
 echo ""
 echo "--- 6. Idempotent re-sync (no new downloads) ---"
-docker run --rm \
+RESYNC_OUT=$(docker run --rm \
     -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
     -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
@@ -115,7 +126,13 @@ docker run --rm \
         --password "$ICLOUD_PASSWORD" \
         --no-progress-bar \
         --log-level info \
-    2>&1 | tee /dev/stderr | grep -qE "downloaded=0|No new photos"
+    2>&1)
+RESYNC_EC=$?
+echo "$RESYNC_OUT"
+[ "$RESYNC_EC" -eq 0 ] && case "$RESYNC_OUT" in
+    *downloaded=0*|*"No new photos"*) true ;;
+    *) false ;;
+esac
 kei_check "re-sync downloads 0 files"
 
 echo ""
@@ -184,7 +201,9 @@ echo "  Container exit code:   $EXIT_CODE"
 # 0 = normal, 130 = SIGINT, 143 = SIGTERM after handler.
 case "$EXIT_CODE" in 0|130|143) true;; *) false;; esac
 kei_check "container exited cleanly on SIGTERM (exit $EXIT_CODE)"
-rm -rf "$WATCH_PHOTOS"
+docker run --rm -v "$WATCH_PHOTOS:/p" "$IMAGE" \
+    chown -R "$(id -u):$(id -g)" /p >/dev/null 2>&1 || true
+rm -rf "$WATCH_PHOTOS" >/dev/null 2>&1 || true
 
 echo ""
 echo "--- 11. HEALTHCHECK probe ---"
@@ -192,14 +211,20 @@ echo "--- 11. HEALTHCHECK probe ---"
 # depend on jq being installed in the production image (slim debian, no
 # jq). The field is a top-level integer; the regex scopes the match to
 # its key so adjacent fields can't bleed in.
-docker run --rm --entrypoint sh \
+HEALTHCHECK_OUT=$(docker run --rm --entrypoint sh \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" -c '
       test -f /config/health.json || exit 1
       cf=$(grep -oE "\"consecutive_failures\"[[:space:]]*:[[:space:]]*[0-9]+" /config/health.json \
            | grep -oE "[0-9]+$")
       test -n "$cf" && test "$cf" -lt 5 && echo HEALTHY
-    ' 2>&1 | tee /dev/stderr | grep -q HEALTHY
+    ' 2>&1)
+HEALTHCHECK_EC=$?
+echo "$HEALTHCHECK_OUT"
+[ "$HEALTHCHECK_EC" -eq 0 ] && case "$HEALTHCHECK_OUT" in
+    *HEALTHY*) true ;;
+    *) false ;;
+esac
 kei_check "healthcheck probe reports HEALTHY"
 
 echo ""
