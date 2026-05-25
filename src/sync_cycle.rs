@@ -101,6 +101,25 @@ pub(crate) fn should_store_sync_token_for_cycle(
     should_store_sync_token(outcome, dry_run) && !cycle_has_stale_plan
 }
 
+fn has_active_passes(lib_state: &LibraryState) -> bool {
+    !lib_state.plan.passes.is_empty()
+}
+
+fn should_warn_zero_assets(
+    sync_result: &download::SyncResult,
+    library_completed_without_errors: bool,
+    run_mode: download::DownloadRunMode,
+    is_retry_failed: bool,
+    lib_state: &LibraryState,
+) -> bool {
+    sync_result.full_enumeration_ran
+        && library_completed_without_errors
+        && run_mode.downloads_files()
+        && !is_retry_failed
+        && sync_result.stats.assets_seen == 0
+        && has_active_passes(lib_state)
+}
+
 /// Closure shape used to derive a per-library `DownloadConfig` from the
 /// shared base config. Boxed dyn so `run_cycle` can accept a single
 /// reference instead of a generic parameter (avoids reuse-by-monomorphization
@@ -312,12 +331,13 @@ pub(crate) async fn run_cycle(
                 && !sync_result.stats.interrupted
                 && sync_result.stats.enumeration_errors == 0
                 && !shutdown_token.is_cancelled();
-        if sync_result.full_enumeration_ran
-            && library_completed_without_errors
-            && download_controls.run_mode.downloads_files()
-            && !is_retry_failed
-            && sync_result.stats.assets_seen == 0
-        {
+        if should_warn_zero_assets(
+            &sync_result,
+            library_completed_without_errors,
+            download_controls.run_mode,
+            is_retry_failed,
+            lib_state,
+        ) {
             tracing::warn!(
                 library = %lib_state.zone_name,
                 library_count = library_states.len(),
@@ -475,5 +495,83 @@ where
         }
     } else {
         download::SyncMode::Full
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::PassKind;
+
+    fn make_library_state(has_passes: bool) -> LibraryState {
+        LibraryState {
+            library: crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+                Box::new(crate::test_helpers::MockPhotosSession::new()),
+                "PrimarySync",
+            ),
+            cross_zone_libraries: Vec::new(),
+            pass_scope: crate::commands::PassScope {
+                include_albums: false,
+                include_smart_folders: false,
+                include_unfiled: has_passes,
+            },
+            zone_name: "PrimarySync".to_string(),
+            sync_token_key: "sync_token:PrimarySync".to_string(),
+            plan: crate::commands::AlbumPlan {
+                passes: if has_passes {
+                    vec![crate::commands::AlbumPass {
+                        kind: PassKind::Unfiled,
+                        album: crate::icloud::photos::PhotoAlbum::stub_for_test(Arc::from(
+                            "PrimarySync",
+                        )),
+                        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            },
+            plan_is_stale: false,
+            plan_needs_refresh: false,
+        }
+    }
+
+    #[test]
+    fn should_warn_zero_assets_requires_active_passes() {
+        let sync_result = download::SyncResult {
+            outcome: download::DownloadOutcome::Success,
+            sync_token: Some("zone-token".to_string()),
+            stats: download::SyncStats {
+                assets_seen: 0,
+                ..download::SyncStats::default()
+            },
+            full_enumeration_ran: true,
+        };
+        assert!(!should_warn_zero_assets(
+            &sync_result,
+            true,
+            download::DownloadRunMode::Download,
+            false,
+            &make_library_state(false),
+        ));
+    }
+
+    #[test]
+    fn should_warn_zero_assets_when_all_gates_are_true() {
+        let sync_result = download::SyncResult {
+            outcome: download::DownloadOutcome::Success,
+            sync_token: Some("zone-token".to_string()),
+            stats: download::SyncStats {
+                assets_seen: 0,
+                ..download::SyncStats::default()
+            },
+            full_enumeration_ran: true,
+        };
+        assert!(should_warn_zero_assets(
+            &sync_result,
+            true,
+            download::DownloadRunMode::Download,
+            false,
+            &make_library_state(true),
+        ));
     }
 }

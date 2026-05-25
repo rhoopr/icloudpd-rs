@@ -7,6 +7,7 @@ use crate::auth;
 use crate::cli;
 use crate::config;
 use crate::retry;
+use std::collections::BTreeSet;
 
 use super::service::{init_photos_service, resolve_libraries, retry_on_lock_contention};
 
@@ -49,16 +50,15 @@ pub(crate) async fn run_list(
 
     match what {
         cli::ListCommand::Libraries => {
-            println!("Private libraries:");
-            let private = photos_service.fetch_private_libraries().await?;
-            for name in private.keys() {
-                println!("  {name}");
-            }
-            println!("Shared libraries:");
-            let shared = photos_service.fetch_shared_libraries().await?;
-            for name in shared.keys() {
-                println!("  {name}");
-            }
+            let private: Vec<String> = {
+                let private = photos_service.fetch_private_libraries().await?;
+                private.keys().cloned().collect()
+            };
+            let shared: Vec<String> = {
+                let shared = photos_service.fetch_shared_libraries().await?;
+                shared.keys().cloned().collect()
+            };
+            print!("{}", format_libraries(private, shared));
         }
         cli::ListCommand::Albums => {
             let selector = config::resolve_library_selector(
@@ -76,4 +76,81 @@ pub(crate) async fn run_list(
         }
     }
     Ok(())
+}
+
+fn classify_library(zone_name: &str) -> Option<&'static str> {
+    if zone_name == "PrimarySync" {
+        Some("primary")
+    } else if zone_name.starts_with("SharedSync-") {
+        Some("shared")
+    } else {
+        None
+    }
+}
+
+fn format_libraries(
+    private: impl IntoIterator<Item = String>,
+    shared: impl IntoIterator<Item = String>,
+) -> String {
+    let mut all: BTreeSet<String> = BTreeSet::new();
+    all.extend(private);
+    all.extend(shared);
+
+    let mut ordered: Vec<String> = Vec::with_capacity(all.len());
+    if all.contains("PrimarySync") {
+        ordered.push("PrimarySync".to_string());
+    }
+    ordered.extend(all.into_iter().filter(|name| name != "PrimarySync"));
+
+    let mut out = String::from("Libraries:\n");
+    for zone_name in ordered {
+        match classify_library(&zone_name) {
+            Some(kind) => {
+                out.push_str(&format!("  {zone_name} ({kind})\n"));
+            }
+            None => {
+                out.push_str(&format!("  {zone_name}\n"));
+            }
+        }
+    }
+    out.push_str("\nUse these names in [filters].libraries, or use: primary, shared, all, none.\n");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_libraries;
+
+    #[test]
+    fn format_libraries_primary_then_shared_with_labels() {
+        let rendered = format_libraries(
+            ["SharedSync-AAAA", "PrimarySync"].map(str::to_string),
+            ["SharedSync-BBBB"].map(str::to_string),
+        );
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "Libraries:");
+        assert_eq!(lines[1], "  PrimarySync (primary)");
+        assert_eq!(lines[2], "  SharedSync-AAAA (shared)");
+        assert_eq!(lines[3], "  SharedSync-BBBB (shared)");
+        assert_eq!(
+            lines[5],
+            "Use these names in [filters].libraries, or use: primary, shared, all, none."
+        );
+    }
+
+    #[test]
+    fn format_libraries_dedupes_names_from_private_and_shared_sources() {
+        let rendered = format_libraries(
+            ["PrimarySync", "SharedSync-AAAA"].map(str::to_string),
+            ["SharedSync-AAAA"].map(str::to_string),
+        );
+        assert_eq!(rendered.matches("SharedSync-AAAA").count(), 1);
+    }
+
+    #[test]
+    fn format_libraries_unknown_zone_stays_copy_pasteable() {
+        let rendered = format_libraries(["CustomZone".to_string()], Vec::new());
+        assert!(rendered.contains("  CustomZone"));
+        assert!(!rendered.contains("CustomZone ("));
+    }
 }

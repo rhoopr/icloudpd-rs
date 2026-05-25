@@ -195,8 +195,10 @@ pub struct PasswordArgs {
 /// Arguments for the sync command (also used as default when no subcommand).
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
-    /// Number of recent photos to download (e.g. `--recent 100`) or a recency
-    /// window in days (e.g. `--recent 30d`). Days form maps to
+    /// Limit recent assets per selected library/album/smart-folder pass
+    /// (e.g. `--recent 100`) or use a days window (e.g. `--recent 30d`).
+    /// This is not a global exact file count - filters and live-photo parts
+    /// can change the final number of downloaded files. Days form maps to
     /// `--skip-created-before` internally.
     #[arg(long, value_parser = parse_recent_limit)]
     pub recent: Option<RecentLimit>,

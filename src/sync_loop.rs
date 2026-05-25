@@ -1636,26 +1636,39 @@ fn find_multi_library_commingle_flags(
         return Vec::new();
     }
 
-    let unfiled_active = library_states.iter().any(|s| s.pass_scope.include_unfiled);
-    let album_active = library_states.iter().any(|s| s.pass_scope.include_albums);
-    let smart_folder_active = library_states
-        .iter()
-        .any(|s| s.pass_scope.include_smart_folders);
+    let mut active_unfiled_libraries = 0usize;
+    let mut active_album_libraries = 0usize;
+    let mut active_smart_folder_libraries = 0usize;
+    for state in library_states {
+        let (album_passes, smart_folder_passes, has_unfiled_pass) = count_passes(&state.plan);
+        if has_unfiled_pass {
+            active_unfiled_libraries += 1;
+        }
+        if album_passes > 0 {
+            active_album_libraries += 1;
+        }
+        if smart_folder_passes > 0 {
+            active_smart_folder_libraries += 1;
+        }
+    }
 
-    // All passes disabled — resolve_passes returns an empty plan, no path
+    // All passes disabled - resolve_passes returns an empty plan, no path
     // ever renders, multi-library can't commingle.
-    if !unfiled_active && !album_active && !smart_folder_active {
+    if active_unfiled_libraries == 0
+        && active_album_libraries == 0
+        && active_smart_folder_libraries == 0
+    {
         return Vec::new();
     }
 
     let mut missing: Vec<&'static str> = Vec::new();
-    if unfiled_active && !folder_structure.contains("{library}") {
+    if active_unfiled_libraries > 1 && !folder_structure.contains("{library}") {
         missing.push("--folder-structure");
     }
-    if album_active && !folder_structure_albums.contains("{library}") {
+    if active_album_libraries > 1 && !folder_structure_albums.contains("{library}") {
         missing.push("--folder-structure-albums");
     }
-    if smart_folder_active && !folder_structure_smart_folders.contains("{library}") {
+    if active_smart_folder_libraries > 1 && !folder_structure_smart_folders.contains("{library}") {
         missing.push("--folder-structure-smart-folders");
     }
     missing
@@ -2304,6 +2317,7 @@ mod tests {
         count: usize,
         selection: &crate::selection::Selection,
     ) -> Vec<LibraryState> {
+        use crate::commands::PassKind;
         use crate::selection::{AlbumSelector, SmartFolderSelector};
 
         let pass_scope = PassScope {
@@ -2328,7 +2342,22 @@ mod tests {
                     pass_scope,
                     zone_name: zone_name.clone(),
                     sync_token_key: format!("sync_token:{zone_name}"),
-                    plan: crate::commands::AlbumPlan { passes: Vec::new() },
+                    plan: crate::commands::AlbumPlan {
+                        passes: [
+                            pass_scope
+                                .include_albums
+                                .then(|| make_pass("album", PassKind::Album)),
+                            pass_scope
+                                .include_smart_folders
+                                .then(|| make_pass("smart-folder", PassKind::SmartFolder)),
+                            pass_scope
+                                .include_unfiled
+                                .then(|| make_pass("unfiled", PassKind::Unfiled)),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                    },
                     plan_is_stale: false,
                     plan_needs_refresh: false,
                 }
@@ -2452,6 +2481,32 @@ mod tests {
             )
             .is_empty(),
             "smart-folder inactive - its `{{library}}`-less template is irrelevant"
+        );
+    }
+
+    #[test]
+    fn find_multi_library_commingle_flags_ignores_visibility_only_libraries() {
+        use crate::commands::PassKind;
+        let mut states = commingle_test_states(2, &selection_all_passes_active());
+        states[1].plan = crate::commands::AlbumPlan { passes: Vec::new() };
+        states[1].pass_scope = PassScope {
+            include_albums: true,
+            include_smart_folders: true,
+            include_unfiled: true,
+        };
+        states[0].plan = crate::commands::AlbumPlan {
+            passes: vec![make_pass("Album A", PassKind::Album)],
+        };
+        states[0].pass_scope = PassScope {
+            include_albums: true,
+            include_smart_folders: false,
+            include_unfiled: false,
+        };
+        let missing =
+            find_multi_library_commingle_flags(&states, "%Y/%m/%d", "{album}", "{smart-folder}");
+        assert!(
+            missing.is_empty(),
+            "only one library has active passes - visibility-only zones must not trigger commingle warnings"
         );
     }
 

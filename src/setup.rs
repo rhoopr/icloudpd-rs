@@ -57,6 +57,9 @@ struct SetupAnswers {
     /// v0.13+ smart-folder selector (Favorites, Hidden, etc.). Empty = default
     /// (`none`); non-empty = emit `[filters].smart_folders`.
     smart_folders: Vec<String>,
+    /// Optional smart-folder pass template for `[download].folder_structure_smart_folders`.
+    /// `None` leaves the runtime default (`{smart-folder}`).
+    folder_structure_smart_folders: Option<String>,
     /// `Some(false)` emits `[filters].unfiled = false` (used when the user
     /// picks specific albums and doesn't also want every other photo).
     /// `None` keeps the v0.13 default (`true`).
@@ -124,6 +127,7 @@ impl Default for SetupAnswers {
             albums: Vec::new(),
             libraries: vec!["all".to_string()],
             smart_folders: Vec::new(),
+            folder_structure_smart_folders: None,
             unfiled: None,
             filename_exclude: Vec::new(),
             skip_videos: false,
@@ -294,6 +298,8 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     section_header("Extras");
     ask_extras(&mut answers)?;
 
+    apply_library_scoped_templates_for_all_libraries(&mut answers);
+
     // Generate TOML with a brief spinner so the user sees something happening.
     let toml_content: String = spinner_for("Building your config...", || generate_toml(&answers));
     check("All done.");
@@ -367,10 +373,44 @@ pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
         if let Some(env_path) = &write_result.env_path {
             print_load_env_snippet(env_path);
         }
-        println!("  kei sync");
+        println!("  {}", sync_command_for_config(config_path));
         println!();
         Ok(SetupResult::Done)
     }
+}
+
+fn apply_library_scoped_templates_for_all_libraries(answers: &mut SetupAnswers) {
+    if answers.libraries.as_slice() != ["all"] {
+        return;
+    }
+
+    answers.folder_structure = Some(library_template_or_default(
+        answers.folder_structure.as_deref(),
+        "%Y/%m/%d",
+    ));
+}
+
+fn ensure_library_token(template: &str) -> String {
+    if template.contains("{library}") {
+        return template.to_string();
+    }
+    if template.is_empty() {
+        return "{library}".to_string();
+    }
+    format!("{{library}}/{template}")
+}
+
+fn library_template_or_default(template: Option<&str>, default: &str) -> String {
+    ensure_library_token(template.unwrap_or(default))
+}
+
+fn single_quoted_shell(value: &str) -> String {
+    format!("'{}'", shell_single_quote_escape(value))
+}
+
+fn sync_command_for_config(config_path: &Path) -> String {
+    let path = config_path.to_string_lossy();
+    format!("kei --config {} sync", single_quoted_shell(&path))
 }
 
 /// Print the right "load .env into this shell" command for the user's shell.
@@ -922,7 +962,9 @@ fn ask_date_range(answers: &mut SetupAnswers) -> anyhow::Result<()> {
     answers.skip_created_after = date_prompt("Only sync photos created before")?;
 
     let recent: String = Input::new()
-        .with_prompt("Only sync the N most-recently-created photos (blank = all)")
+        .with_prompt(
+            "Only consider the N most-recent assets per selected library/album/smart-folder pass (blank = all)",
+        )
         .default(String::new())
         .show_default(false)
         .allow_empty(true)
@@ -1347,10 +1389,17 @@ fn generate_toml(answers: &SetupAnswers) -> String {
             )?,
             None => writeln!(out, "# folder_structure_albums = \"{{album}}\"")?,
         };
-        writeln!(
-            out,
-            "# folder_structure_smart_folders = \"{{smart-folder}}\""
-        )?;
+        match &answers.folder_structure_smart_folders {
+            Some(fs) => writeln!(
+                out,
+                "folder_structure_smart_folders = \"{}\"",
+                escape_toml_string(fs)
+            )?,
+            None => writeln!(
+                out,
+                "# folder_structure_smart_folders = \"{{smart-folder}}\""
+            )?,
+        };
         match answers.threads_num {
             Some(n) => writeln!(out, "threads = {n}")?,
             None => writeln!(out, "# threads = 10")?,
@@ -1453,7 +1502,10 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         // `live_photo_mode` is emitted in the [photos] section below.
         match answers.recent {
             Some(n) => writeln!(out, "recent = {n}")?,
-            None => writeln!(out, "# recent = 0  (0 = all)")?,
+            None => writeln!(
+                out,
+                "# recent = 0  # 0 = all; cap applies per selected library/album/smart-folder pass"
+            )?,
         };
         match &answers.skip_created_before {
             Some(d) => writeln!(out, "skip_created_before = \"{}\"", escape_toml_string(d))?,
@@ -1644,6 +1696,82 @@ mod tests {
         assert!(
             !SetupSecretSource::PasswordCommand("op read item kei".to_string())
                 .needs_password_prompt()
+        );
+    }
+
+    #[test]
+    fn apply_library_scoped_templates_sets_library_safe_defaults_for_all_libraries() {
+        let mut answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("secret"),
+            directory: "~/Photos/iCloud".to_string(),
+            libraries: vec!["all".to_string()],
+            folder_structure_albums: Some("{album}/%Y/%m/%d".to_string()),
+            ..Default::default()
+        };
+
+        apply_library_scoped_templates_for_all_libraries(&mut answers);
+
+        assert_eq!(
+            answers.folder_structure.as_deref(),
+            Some("{library}/%Y/%m/%d")
+        );
+        assert_eq!(
+            answers.folder_structure_albums.as_deref(),
+            Some("{album}/%Y/%m/%d")
+        );
+        assert_eq!(answers.folder_structure_smart_folders.as_deref(), None);
+    }
+
+    #[test]
+    fn apply_library_scoped_templates_does_not_mutate_primary_only_setup() {
+        let mut answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("secret"),
+            directory: "~/Photos/iCloud".to_string(),
+            libraries: Vec::new(),
+            ..Default::default()
+        };
+
+        apply_library_scoped_templates_for_all_libraries(&mut answers);
+
+        assert_eq!(answers.folder_structure, None);
+        assert_eq!(answers.folder_structure_albums, None);
+        assert_eq!(answers.folder_structure_smart_folders, None);
+    }
+
+    #[test]
+    fn apply_library_scoped_templates_avoids_double_prefixing() {
+        let mut answers = SetupAnswers {
+            username: "user@example.com".to_string(),
+            password: secrecy::SecretString::from("secret"),
+            directory: "~/Photos/iCloud".to_string(),
+            libraries: vec!["all".to_string()],
+            folder_structure: Some("{library}/%Y/%m".to_string()),
+            folder_structure_albums: Some("{album}".to_string()),
+            folder_structure_smart_folders: Some("{smart-folder}".to_string()),
+            ..Default::default()
+        };
+
+        apply_library_scoped_templates_for_all_libraries(&mut answers);
+
+        assert_eq!(answers.folder_structure.as_deref(), Some("{library}/%Y/%m"));
+        assert_eq!(answers.folder_structure_albums.as_deref(), Some("{album}"));
+        assert_eq!(
+            answers.folder_structure_smart_folders.as_deref(),
+            Some("{smart-folder}")
+        );
+    }
+
+    #[test]
+    fn sync_command_for_config_shell_quotes_paths() {
+        assert_eq!(
+            sync_command_for_config(Path::new("/tmp/kei config.toml")),
+            "kei --config '/tmp/kei config.toml' sync"
+        );
+        assert_eq!(
+            sync_command_for_config(Path::new("/tmp/rob's-config.toml")),
+            "kei --config '/tmp/rob'\\''s-config.toml' sync"
         );
     }
 
@@ -1971,6 +2099,7 @@ mod tests {
             albums: vec!["Favorites".to_string(), "Vacation".to_string()],
             libraries: vec!["all".to_string()],
             smart_folders: vec!["all".to_string()],
+            folder_structure_smart_folders: None,
             unfiled: Some(false),
             filename_exclude: vec!["IMG_screenshot*.png".to_string()],
             skip_videos: true,
@@ -2056,6 +2185,7 @@ mod tests {
             albums: vec!["A".to_string()],
             libraries: Vec::new(),
             smart_folders: vec!["Favorites".to_string()],
+            folder_structure_smart_folders: None,
             unfiled: Some(false),
             filename_exclude: vec!["*.tmp".to_string()],
             skip_videos: true,
@@ -2203,6 +2333,7 @@ mod tests {
                 albums: vec!["A".to_string()],
                 libraries: Vec::new(),
                 smart_folders: vec!["all".to_string()],
+                folder_structure_smart_folders: None,
                 unfiled: Some(false),
                 filename_exclude: vec!["*.tmp".to_string()],
                 skip_videos: true,
