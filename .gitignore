@@ -1,12 +1,11 @@
 # Local Repo
+.agents/
 .scratch/
-.codex
 .codex/
 AGENTS.md
 CODEBASE.md
-
-# Pi coding agent
-.pi/
+CODEGRAPH.md
+UNSAFE.md
 
 # Rust
 /target
@@ -15,22 +14,12 @@ CODEBASE.md
 __pycache__/
 *.py[cod]
 
-# Claude
-.claude/
-CLAUDE.md
-
 # macOS Junk
 .DS_Store
 
-# Credentials
+# Local Testing Artifacts
 .env
-
-# Test session cookies
 .test-cookies/
-
-# Test logs
 tests/results.log
-
-# Transient test artifacts created by tests/run-*.sh
 .deep-test/
 .gap*/
