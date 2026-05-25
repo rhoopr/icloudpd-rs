@@ -106,6 +106,7 @@ Sync what matters:
 - Sync your full iCloud Photos library, selected albums, smart folders, shared libraries, or only recent media.
 - Keep unfiled photos and shared-library media organized without manual sorting.
 - Filter by media type, filename, date, and library when you only want part of the archive.
+- Explicit smart-folder filters (including `Hidden` and `Recently Deleted`) are collection-scoped across visible libraries; library selection still scopes unfiled passes.
 - Details: [Configuration](https://github.com/rhoopr/kei/wiki/Configuration)
 
 Run it your way:

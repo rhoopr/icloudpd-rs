@@ -536,6 +536,9 @@ pub(crate) fn collection_libraries<'a>(
     selected_libraries: &'a [icloud::photos::PhotoLibrary],
     all_libraries: &'a [icloud::photos::PhotoLibrary],
 ) -> &'a [icloud::photos::PhotoLibrary] {
+    // Explicit collection selectors widen album/smart-folder enumeration to
+    // every visible library. Unfiled remains selected-library scoped via
+    // `pass_scope_for_zone`.
     if selection.albums_explicit || smart_selector_active(selection) {
         all_libraries
     } else {
@@ -2142,6 +2145,97 @@ libraries = ["shared"]
         }
 
         assert_eq!(matrix_cases, 54, "expected full 3x3x3x2 matrix coverage");
+    }
+
+    #[tokio::test]
+    async fn named_sensitive_smart_folders_widen_across_zones_unfiled_stays_selected() {
+        use crate::selection::{AlbumSelector, Selection, SmartFolderSelector};
+
+        for smart_name in ["Hidden", "Recently Deleted"] {
+            let primary_zone = "PrimarySync";
+            let shared_zone = "SharedSync-AAAA1111";
+            let primary =
+                PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), primary_zone);
+            let shared =
+                PhotoLibrary::new_stub_with_zone(Box::new(MockPhotosSession::new()), shared_zone);
+            let all_libraries = vec![primary.clone(), shared.clone()];
+            let selected_libraries = vec![primary.clone()];
+
+            let selection = Selection {
+                albums: AlbumSelector::None,
+                albums_explicit: false,
+                smart_folders: SmartFolderSelector::Named {
+                    included: names(&[smart_name]),
+                    excluded: BTreeSet::new(),
+                },
+                smart_folders_explicit: true,
+                libraries: selector_from(&["primary"]),
+                unfiled: true,
+            };
+
+            let selected_zones = zone_name_set(&selected_libraries);
+            let collection = collection_libraries(&selection, &selected_libraries, &all_libraries);
+            let collection_zones = zone_name_set(collection);
+            let collection_context = build_collection_context(&selection, collection)
+                .await
+                .unwrap();
+
+            let primary_scope =
+                pass_scope_for_zone(&selection, primary_zone, &selected_zones, &collection_zones);
+            let shared_scope =
+                pass_scope_for_zone(&selection, shared_zone, &selected_zones, &collection_zones);
+            assert!(
+                primary_scope.include_smart_folders && shared_scope.include_smart_folders,
+                "named smart folder should widen to both zones for {smart_name}"
+            );
+            assert!(primary_scope.include_unfiled);
+            assert!(
+                !shared_scope.include_unfiled,
+                "unfiled should remain selected-library scoped for {smart_name}"
+            );
+
+            let primary_plan = resolve_passes_for_scope(
+                &primary,
+                &selection,
+                primary_scope,
+                &collection_context,
+                &[],
+            )
+            .await
+            .unwrap();
+            let shared_plan = resolve_passes_for_scope(
+                &shared,
+                &selection,
+                shared_scope,
+                &collection_context,
+                &[],
+            )
+            .await
+            .unwrap();
+
+            let primary_smart_names: Vec<String> = primary_plan
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == PassKind::SmartFolder)
+                .map(|pass| pass.album.name.to_string())
+                .collect();
+            let shared_smart_names: Vec<String> = shared_plan
+                .passes
+                .iter()
+                .filter(|pass| pass.kind == PassKind::SmartFolder)
+                .map(|pass| pass.album.name.to_string())
+                .collect();
+            assert_eq!(primary_smart_names, vec![smart_name.to_string()]);
+            assert_eq!(shared_smart_names, vec![smart_name.to_string()]);
+            assert!(primary_plan
+                .passes
+                .iter()
+                .any(|pass| pass.kind == PassKind::Unfiled));
+            assert!(!shared_plan
+                .passes
+                .iter()
+                .any(|pass| pass.kind == PassKind::Unfiled));
+        }
     }
 
     #[tokio::test]
