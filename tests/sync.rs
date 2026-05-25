@@ -177,7 +177,7 @@ fn list_libraries_prints_output() {
             .timeout(Duration::from_secs(TIMEOUT_META))
             .assert()
             .success()
-            .stdout(predicate::str::contains("libraries:"));
+            .stdout(predicate::str::contains("Libraries:"));
     });
 }
 

@@ -883,6 +883,7 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
 pub struct ParseCliError {
     rendered: String,
     exit_code: i32,
+    use_stderr: bool,
 }
 
 impl ParseCliError {
@@ -894,6 +895,11 @@ impl ParseCliError {
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         self.exit_code
+    }
+
+    #[must_use]
+    pub const fn use_stderr(&self) -> bool {
+        self.use_stderr
     }
 }
 
@@ -970,11 +976,13 @@ where
                 err.to_string()
             },
             exit_code: err.exit_code(),
+            use_stderr: err.use_stderr(),
         })?;
     let explicit_sync_flags = explicit_top_level_sync_flags(&matches);
     let cli = Cli::from_arg_matches(&matches).map_err(|err| ParseCliError {
         rendered: err.to_string(),
         exit_code: err.exit_code(),
+        use_stderr: err.use_stderr(),
     })?;
     Ok((cli, explicit_sync_flags))
 }

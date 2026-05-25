@@ -498,12 +498,12 @@ pub fn main_inner() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             if let Some(parse_err) = e.downcast_ref::<cli::ParseCliError>() {
-                #[allow(
-                    clippy::print_stderr,
-                    reason = "clap parse errors are already rendered for stderr output"
-                )]
-                {
+                #[allow(clippy::print_stdout, reason = "clap routes help/version to stdout")]
+                #[allow(clippy::print_stderr, reason = "clap routes parse failures to stderr")]
+                if parse_err.use_stderr() {
                     eprint!("{}", parse_err.rendered());
+                } else {
+                    print!("{}", parse_err.rendered());
                 }
                 let code = u8::try_from(parse_err.exit_code()).unwrap_or(1);
                 return ExitCode::from(code);
