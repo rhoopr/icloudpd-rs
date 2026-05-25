@@ -3149,6 +3149,17 @@ fn run_config_show_error(body: &str) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+fn assert_removed_env_config_hint(stderr: &str) {
+    assert!(
+        stderr.contains("found removed v0.20 env config"),
+        "stale sync env vars should emit a migration hint; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("KEI_DOWNLOAD_DIR"),
+        "stale sync env vars should name KEI_DOWNLOAD_DIR; stderr: {stderr}"
+    );
+}
+
 /// Build a `kei sync` invocation pre-populated with username, fresh tempdir
 /// config/data directories, and `--only-print-filenames` so the
 /// run exits before auth. Returns the live `Command` so callers can append
@@ -3452,6 +3463,14 @@ fn removed_toml_filter_aliases_error() {
             stderr.contains(&format!("unknown field `{field}`")),
             "expected unknown-field error for {field}; stderr:\n{stderr}"
         );
+        assert!(
+            stderr.contains("pre-v0.20 config"),
+            "expected v0.20 migration hint for {field}; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("docs/v0.20-migration.md"),
+            "expected migration guide URL for {field}; stderr:\n{stderr}"
+        );
     }
 }
 #[test]
@@ -3496,10 +3515,36 @@ fn removed_sync_env_vars_do_not_supply_sync_config() {
         stderr.contains("[download] directory is required"),
         "stale sync env vars must not provide durable config; stderr: {stderr}"
     );
+    assert_removed_env_config_hint(&stderr);
+    assert!(
+        stderr.contains("ignored in v0.20"),
+        "stale sync env vars should explain they are ignored; stderr: {stderr}"
+    );
     assert!(
         !stderr.contains("unexpected argument"),
         "stale sync env vars should be ignored by clap, not parsed as CLI args; stderr: {stderr}"
     );
+}
+
+#[test]
+fn removed_sync_env_vars_do_not_supply_import_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", "test@example.com")
+        .env("KEI_DATA_DIR", dir.path())
+        .env("KEI_DOWNLOAD_DIR", "/legacy/photos")
+        .env("KEI_ALBUM", "Legacy Album")
+        .args(["import-existing", "--dry-run"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[download] directory is required for import-existing"),
+        "stale sync env vars must not provide import config; stderr: {stderr}"
+    );
+    assert_removed_env_config_hint(&stderr);
 }
 
 #[test]

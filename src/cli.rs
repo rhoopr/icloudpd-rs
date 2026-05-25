@@ -1,5 +1,6 @@
 use crate::types::LogLevel;
 use clap::{Args, FromArgMatches, Parser, Subcommand};
+use std::ffi::{OsStr, OsString};
 
 /// Reject empty strings at CLI parse time.
 fn non_empty_string(s: &str) -> Result<String, String> {
@@ -877,26 +878,104 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     out
 }
 
+/// Rendered CLI parse failure with a concrete process exit code.
+#[derive(Debug)]
+pub struct ParseCliError {
+    rendered: String,
+    exit_code: i32,
+}
+
+impl ParseCliError {
+    #[must_use]
+    pub fn rendered(&self) -> &str {
+        &self.rendered
+    }
+
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+}
+
+impl std::fmt::Display for ParseCliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.rendered)
+    }
+}
+
+impl std::error::Error for ParseCliError {}
+
+fn command_context_from_argv(argv: &[OsString]) -> Option<&str> {
+    const KNOWN_COMMANDS: [&str; 11] = [
+        "sync",
+        "login",
+        "list",
+        "password",
+        "reset",
+        "config",
+        "status",
+        "verify",
+        "import-existing",
+        "reconcile",
+        "service",
+    ];
+    argv.iter()
+        .skip(1)
+        .filter_map(|token| token.to_str())
+        .find(|token| KNOWN_COMMANDS.contains(token))
+}
+
+fn should_append_removed_sync_surface_hint(argv: &[OsString], err: &clap::Error) -> bool {
+    if err.kind() != clap::error::ErrorKind::UnknownArgument {
+        return false;
+    }
+
+    match command_context_from_argv(argv) {
+        None | Some("sync") | Some("import-existing") => true,
+        Some("service") => argv
+            .iter()
+            .skip(1)
+            .skip_while(|token| *token != OsStr::new("service"))
+            .skip(1)
+            .any(|token| token == OsStr::new("run")),
+        Some(_) => false,
+    }
+}
+
+fn with_removed_sync_surface_hint(message: String) -> String {
+    format!(
+        "{message}\n\nnote: v0.20 removed durable sync CLI flags. Put persistent sync settings in config.toml instead.\n      See {}",
+        crate::upgrade_hints::V020_MIGRATION_URL
+    )
+}
+
 /// Parse CLI arguments and return both the parsed struct and the list of
 /// sync-only flags that were explicitly provided on the command line.
 ///
 /// This is the production entry point. It replaces `Cli::parse()` so the
 /// validator can distinguish between CLI-provided and env-provided flags.
-pub fn parse_cli_with_sources<I, T>(itr: I) -> Result<(Cli, Vec<&'static str>), clap::Error>
+pub fn parse_cli_with_sources<I, T>(itr: I) -> Result<(Cli, Vec<&'static str>), ParseCliError>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
+    let argv: Vec<OsString> = itr.into_iter().map(Into::into).collect();
     let cmd = <Cli as clap::CommandFactory>::command();
-    let matches = match cmd.try_get_matches_from(itr) {
-        Ok(m) => m,
-        Err(e) => e.exit(),
-    };
+    let matches = cmd
+        .try_get_matches_from(&argv)
+        .map_err(|err| ParseCliError {
+            rendered: if should_append_removed_sync_surface_hint(&argv, &err) {
+                with_removed_sync_surface_hint(err.to_string())
+            } else {
+                err.to_string()
+            },
+            exit_code: err.exit_code(),
+        })?;
     let explicit_sync_flags = explicit_top_level_sync_flags(&matches);
-    let cli = match Cli::from_arg_matches(&matches) {
-        Ok(c) => c,
-        Err(e) => e.exit(),
-    };
+    let cli = Cli::from_arg_matches(&matches).map_err(|err| ParseCliError {
+        rendered: err.to_string(),
+        exit_code: err.exit_code(),
+    })?;
     Ok((cli, explicit_sync_flags))
 }
 

@@ -415,10 +415,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Validate download directory early (before auth) to avoid wasting a 2FA code
     // when the user simply forgot the destination.
     if config.download.directory.as_os_str().is_empty() {
-        anyhow::bail!(
+        let message = crate::upgrade_hints::with_stale_env_hint(String::from(
             "[download] directory is required for downloading \
-             (set it in the config file)"
-        );
+             (set it in the config file)",
+        ));
+        anyhow::bail!(message);
     }
 
     // Validate download directory is writable before spending time on authentication.

@@ -72,6 +72,40 @@ partial_out=$(docker run --rm \
 printf '%s\n' "$partial_out"
 echo "$partial_out" | grep -q "must be set together"
 
+echo "--- v0.20 Docker preflight: removed env config requires /config/config.toml ---"
+prefail_out=$(docker run --rm \
+  -e KEI_DOWNLOAD_DIR=/legacy/photos \
+  -e KEI_ALBUM="Legacy Album" \
+  --entrypoint /usr/local/bin/entrypoint.sh \
+  "$image" sync --dry-run 2>&1 || true)
+printf '%s\n' "$prefail_out"
+echo "$prefail_out" | grep -q "/config/config.toml is required for v0.20 Docker sync settings"
+echo "$prefail_out" | grep -q "KEI_DOWNLOAD_DIR"
+echo "$prefail_out" | grep -q "docs/v0.20-migration.md"
+
+echo "--- v0.20 Docker preflight: --version bypasses removed env config check ---"
+preflight_version_out=$(docker run --rm \
+  -e KEI_DOWNLOAD_DIR=/legacy/photos \
+  --entrypoint /usr/local/bin/entrypoint.sh \
+  "$image" --version 2>&1)
+printf '%s\n' "$preflight_version_out"
+echo "$preflight_version_out" | grep -q "^kei "
+
+echo "--- v0.20 Docker preflight: explicit non-default --config bypasses check ---"
+custom_cfg_dir="$work/custom-config"
+mkdir -p "$custom_cfg_dir"
+cat > "$custom_cfg_dir/custom.toml" <<'TOML'
+[auth]
+username = "docker-preflight@example.invalid"
+TOML
+preflight_custom_out=$(docker run --rm \
+  -e KEI_DOWNLOAD_DIR=/legacy/photos \
+  -v "$custom_cfg_dir:/tmp/cfg" \
+  --entrypoint /usr/local/bin/entrypoint.sh \
+  "$image" config show --config /tmp/cfg/custom.toml 2>&1)
+printf '%s\n' "$preflight_custom_out"
+echo "$preflight_custom_out" | grep -q "docker-preflight@example.invalid"
+
 echo "--- kei subcommand under dropped uid ---"
 sub_out=$(docker run --rm \
   -e ICLOUD_USERNAME=docker-puid@example.invalid \

@@ -1002,7 +1002,9 @@ fn build_import_download_config(
         .and_then(|d| d.directory.clone())
         .unwrap_or_default();
     if directory_str.is_empty() {
-        anyhow::bail!("[download] directory is required for import-existing");
+        anyhow::bail!(crate::upgrade_hints::with_stale_env_hint(String::from(
+            "[download] directory is required for import-existing",
+        )));
     }
     let directory_path = config::expand_tilde(&directory_str);
     config::validate_download_dir(&directory_path)?;

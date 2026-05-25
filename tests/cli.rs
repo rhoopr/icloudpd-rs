@@ -34,6 +34,17 @@ const ALL_SUBCOMMANDS: &[&str] = &[
 /// Subcommands that accept `--password` (have PasswordArgs).
 const PASSWORD_SUBCOMMANDS: &[&str] = &["sync", "login", "import-existing"];
 
+fn assert_removed_sync_flag_hint(args: &[&str]) {
+    common::cmd()
+        .args(args)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "v0.20 removed durable sync CLI flags",
+        ))
+        .stderr(predicate::str::contains("docs/v0.20-migration.md"));
+}
+
 // ── Help output ─────────────────────────────────────────────────────────
 
 #[test]
@@ -411,6 +422,21 @@ fn removed_threads_num_flag_fails() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument"));
+}
+
+#[test]
+fn removed_sync_flag_error_includes_v020_migration_hint() {
+    assert_removed_sync_flag_hint(&["sync", "--download-dir", "/photos"]);
+}
+
+#[test]
+fn removed_import_flag_error_includes_v020_migration_hint() {
+    assert_removed_sync_flag_hint(&["import-existing", "--download-dir", "/photos"]);
+}
+
+#[test]
+fn removed_service_run_flag_error_includes_v020_migration_hint() {
+    assert_removed_sync_flag_hint(&["service", "run", "--download-dir", "/photos"]);
 }
 
 // ── submit-code requires positional CODE ────────────────────────────────

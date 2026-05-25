@@ -53,6 +53,7 @@ mod sync_cycle;
 mod sync_loop;
 mod systemd;
 mod types;
+mod upgrade_hints;
 
 #[cfg(test)]
 mod test_helpers;
@@ -496,6 +497,18 @@ pub fn main_inner() -> ExitCode {
     match rt.block_on(run(env_password)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            if let Some(parse_err) = e.downcast_ref::<cli::ParseCliError>() {
+                #[allow(
+                    clippy::print_stderr,
+                    reason = "clap parse errors are already rendered for stderr output"
+                )]
+                {
+                    eprint!("{}", parse_err.rendered());
+                }
+                let code = u8::try_from(parse_err.exit_code()).unwrap_or(1);
+                return ExitCode::from(code);
+            }
+
             let classification = classify_exit_error(&e);
             if classification.should_log() {
                 // Route the final error through tracing so it carries the same

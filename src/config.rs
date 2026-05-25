@@ -388,8 +388,18 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
 
     match std::fs::read_to_string(path) {
         Ok(contents) => {
-            let config: TomlConfig = toml::from_str(&contents)
-                .context(format!("Failed to parse config file {}", path.display()))?;
+            let config: TomlConfig = toml::from_str(&contents).map_err(|err| {
+                let parse_error = err.to_string();
+                let mut message = format!(
+                    "Failed to parse config file {}: {parse_error}",
+                    path.display()
+                );
+                if parse_error.contains("unknown field") {
+                    message.push_str("\n\n");
+                    message.push_str(&crate::upgrade_hints::toml_unknown_field_hint());
+                }
+                anyhow::anyhow!(message)
+            })?;
             // Warn if config contains a password and file permissions are too open
             #[cfg(unix)]
             if config.auth.as_ref().is_some_and(|a| a.password.is_some()) {
