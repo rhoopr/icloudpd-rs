@@ -1,6 +1,6 @@
 # Migrating from `icloudpd`
 
-> Last updated on 5-17-26 for v0.20.
+> Last updated on 5-25-26 for the v0.20 release candidate.
 
 This guide is for moving an existing
 [`icloud-photos-downloader`](https://github.com/icloud-photos-downloader/icloud_photos_downloader)
@@ -15,6 +15,9 @@ The short version:
 
 kei can't reuse Python's `~/.pyicloud` cookies, so the first run still needs a
 fresh Apple login and 2FA approval. Your local photo files can stay in place.
+
+During the release candidate, use the Docker `:main` image if you test v0.20 in
+containers. Use `:latest` or pin `:0.20.0` after the release tag is published.
 
 ## Step 1: import the existing tree
 
@@ -135,8 +138,12 @@ raw_policy = "as-is"
 
 ### Libraries and albums
 
-kei defaults to the primary iCloud Photos library. If you want shared libraries
-too, import with the same library selector that sync will read from TOML:
+The runtime default is the primary iCloud Photos library. The setup wizard
+defaults to all visible libraries and writes a `{library}` segment for unfiled
+paths when that avoids mixing primary and shared files.
+
+If you want shared libraries too, import with the same library selector that
+sync will read from TOML:
 
 ```sh
 kei import-existing --library all --config ~/.config/kei/config.toml
@@ -167,6 +174,11 @@ folder_structure_albums = "{library}/{album}/%Y/%m/%d"
 flags. It reads those selectors from `config.toml`, using the same defaults as
 sync: all user albums, no smart folders, and an unfiled pass. If you use a
 config file for sync selection, pass that same `--config` during import.
+
+Explicit album and smart-folder selectors are collection-scoped in v0.20. When
+`[filters].albums` or `[filters].smart_folders` is set, sync and
+`import-existing` look for those passes across every visible library. The
+`--library` import flag and `[filters].libraries` still scope unfiled photos.
 
 ## Step 2: sync
 
@@ -251,7 +263,7 @@ the same way.
 | `kei password set` | Store the password in the OS keyring or encrypted file backend. |
 | `--save-password` | Save the password after a successful auth. |
 | `[filters].libraries` | Select primary, shared, all, named, or excluded iCloud libraries. |
-| `[filters].smart_folders` | Sync Favorites, Screenshots, Hidden, Recently Deleted, and other Apple smart folders. |
+| `[filters].smart_folders` | Sync Favorites, Screenshots, Hidden, Recently Deleted, and other Apple smart folders across visible libraries when explicitly set. |
 | `[filters].unfiled = false` | Disable the separate pass for photos not in any user album. |
 | `[filters].filename_exclude` | Skip files by glob, such as `*.AAE` or `Screenshot*`. |
 | `[download].bandwidth_limit` | Cap total download throughput, for example `10M` or `1.5Mi`. |
@@ -282,7 +294,8 @@ v0.20 removed the remaining v0.13 compatibility aliases:
 
 ## Docker migration
 
-The official image is `ghcr.io/rhoopr/kei:latest`. It uses `/config` and
+During the release candidate, use `ghcr.io/rhoopr/kei:main`. After release, use
+`ghcr.io/rhoopr/kei:latest` or pin `ghcr.io/rhoopr/kei:0.20.0`. It uses `/config` and
 `/photos` volumes. The image runs `kei service run --config /config/config.toml`
 by default, with `KEI_DATA_DIR=/config` as container runtime glue. Set
 `[download].directory = "/photos"` in the config file. `service run` uses a
@@ -293,7 +306,7 @@ A minimal compose file:
 ```yaml
 services:
   kei:
-    image: ghcr.io/rhoopr/kei:latest
+    image: ghcr.io/rhoopr/kei:main
     container_name: kei
     restart: unless-stopped
     stop_grace_period: 30s
@@ -320,6 +333,11 @@ virtual malloc arenas even when their resident memory is small. The Docker
 image sets `MALLOC_ARENA_MAX=2`, and `kei install` writes the same setting into
 Linux systemd units. If you run kei from your own service manager and care
 about VSZ, set `MALLOC_ARENA_MAX=2` before `kei service run`.
+
+If the container exits with a v0.20 `/config/config.toml` error, it found old
+sync env vars such as `KEI_DOWNLOAD_DIR` but no mounted config file. Move those
+durable settings into `/config/config.toml` and keep env for secrets or runtime
+glue.
 
 For a one-shot import against an existing mounted tree:
 

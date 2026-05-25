@@ -11,13 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.20.0] - 2026-05-24
+## [0.20.0] - 2026-05-25 release candidate
 
 ### Added
 
 - **v0.20 migration guide and example config.** Added `docs/v0.20-migration.md` and `example.config.toml` to show every supported TOML key, default, and allowed value. README, Docker Compose, and migration docs now describe the v0.20 source model: TOML for persistent settings, CLI flags for one-run actions, and env vars for secrets or runtime glue. ([#411])
 - **Keyring-first setup wizard.** `kei config setup` now stores accepted passwords through the same credential path as `kei password set`, keeps `.env` as an explicit fallback, and shows which credential backend was used. Generated TOML stays password-free. ([#410])
 - **Strict import adoption.** `import-existing --strict` and `[import].strict = true` verify a small iCloud prefix before adopting same-name, same-size local files. Strict refusals are counted in the import summary. ([#408])
+- **Upgrade hints for v0.20 config failures.** Removed sync flags now print a direct v0.20 migration note, unknown TOML fields point at the migration guide, and stale removed env vars are named when `[download].directory` is missing. The Docker entrypoint also fails early when a sync-like command still relies on removed durable env config and `/config/config.toml` is absent. ([#496])
 
 ### Changed
 
@@ -26,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **JPEG/TIFF EXIF writes no longer require the `xmp` feature.** Native EXIF updates now work in default builds. XMP sidecars and HEIC metadata writes still require the `xmp` feature. ([#409])
 - **Watch and full-sync runs make fewer Apple and SQLite calls.** Idle watch cycles can skip album refresh when `/changes/database` reports no selected-library changes. Multi-pass full syncs preload download state once, batch same-library album counts, bound known-count streams, and run independent album streams concurrently. ([#416], [#464], [#465], [#466], [#467], [#468])
 - **Download scheduling now keeps iCloud URLs fresher.** Full download enumeration stays close to the worker pool so signed URLs spend less time waiting before transfer. Cleanup retries target the exact failed asset/version/path entries instead of retrying the whole library. ([#473])
+- **Explicit album and smart-folder selection is collection-scoped.** When users ask for albums or smart folders by config, sync and `import-existing` resolve those passes across every visible library. Unfiled photos still follow `[filters].libraries`, so a primary-only unfiled pass does not unexpectedly widen to shared libraries. Named sensitive smart folders such as `Hidden` and `Recently Deleted` follow the same collection scope. ([#492], [#493])
+- **Setup and listing guide multi-library users more clearly.** `kei config setup` still defaults to all visible libraries, but now writes library-scoped unfiled templates by default when that choice would otherwise mix primary and shared files. `kei list libraries` now labels primary/shared zones and prints the selector values users can paste into `[filters].libraries`. `--recent` help now says the cap is per selected library, album, or smart-folder pass. ([#495])
 - **Service behavior is safer to preview and easier to operate.** `kei install --dry-run` on Linux and macOS prints the service artifact without writing unit/plist files or log directories. Linux system install previews work without root. `kei status` gives clearer background-sync guidance, Docker and generated Linux systemd units set `MALLOC_ARENA_MAX=2`, and Linux uninstall restores the pre-install linger state when kei recorded it. ([#413], [#417], [#451], [#471], [#472])
 - **Sync internals have narrower ownership boundaries.** Selection config, post-cycle reporting, cycle execution, download planning/finalization, and state access were split into smaller owner modules and role traits. These changes keep the v0.20 behavior easier to test without changing the user command shape. ([#418], [#449], [#450], [#452], [#453], [#455], [#456])
 - **Release validation now carries more of the release-candidate checks.** The repo-owned full-test path covers release archive smoke tests, Docker image smoke tests, live import rehearsal, service lifecycle checks, and stricter sync safety assertions. ([#457], [#459], [#460], [#471], [#488], [#489], [#490])
@@ -34,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Old v0.13-v0.19 compatibility names were removed.** v0.20 rejects the deprecated durable flags, env mirrors, TOML keys, and hidden command aliases from the warning window. Removed names include `--directory` / `KEI_DIRECTORY`, `--threads-num`, `--cookie-directory`, `[auth].cookie_directory`, `[download].threads_num`, `[metrics].port`, `--exclude-album` / `KEI_EXCLUDE_ALBUM`, `{album}` in the base folder template, implicit `--album all` from that token, `[filters].album`, `[filters].exclude_albums`, `[filters].library`, and the legacy `kei setup` / `kei retry-failed` / `kei reset-state` aliases. Use the v0.20 TOML keys and current subcommands instead. ([#402], [#403], [#405], [#406], [#409], [#485])
 - **Import-only durable flags and env mirrors were removed.** `import-existing` now reads durable matching settings from TOML, like sync. `--library`, `--recent`, `--dry-run`, `--force-empty`, `--no-progress-bar`, and `--strict` remain one-off import controls. ([#408])
+- **Stale local docs and old logo experiments were removed.** The deleted v0.13 migration note and synctoken diagnostic scratch guide had drifted behind the v0.20 config model. Current migration guidance now lives in `docs/v0.20-migration.md` and the CloudKit synctoken reference remains in `docs/synctoken-reference.md`. ([#494])
 
 ### Fixed
 
@@ -112,6 +116,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#488]: https://github.com/rhoopr/kei/pull/488
 [#489]: https://github.com/rhoopr/kei/pull/489
 [#490]: https://github.com/rhoopr/kei/pull/490
+[#492]: https://github.com/rhoopr/kei/pull/492
+[#493]: https://github.com/rhoopr/kei/pull/493
+[#494]: https://github.com/rhoopr/kei/pull/494
+[#495]: https://github.com/rhoopr/kei/pull/495
+[#496]: https://github.com/rhoopr/kei/pull/496
 
 ---
 
@@ -260,7 +269,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.13.0] - 2026-05-02
 
-Selection and folder-structure flag redesign. `--exclude-album` becomes `--album '!NAME'`. New `--smart-folder` and `--unfiled` per-category flags. `--library` now repeatable. Per-category `--folder-structure-{albums,smart-folders}` templates with their own defaults. Multi-library scope with `{library}` in any template. State DB schema migrates to v9 (per-zone primary key on `assets`, `asset_albums`, and `asset_people`) on first sync. Old shapes worked with deprecation warnings through v0.19 and were removed in v0.20. Full migration guide: [docs/v0.13-migration.md](docs/v0.13-migration.md). ([#215], [#288])
+Selection and folder-structure flag redesign. `--exclude-album` becomes `--album '!NAME'`. New `--smart-folder` and `--unfiled` per-category flags. `--library` now repeatable. Per-category `--folder-structure-{albums,smart-folders}` templates with their own defaults. Multi-library scope with `{library}` in any template. State DB schema migrates to v9 (per-zone primary key on `assets`, `asset_albums`, and `asset_people`) on first sync. Old shapes worked with deprecation warnings through v0.19 and were removed in v0.20. Current migration guide: [docs/v0.20-migration.md](docs/v0.20-migration.md). ([#215], [#288])
 
 ### Added
 
@@ -1304,8 +1313,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.20.0...HEAD
-[0.20.0]: https://github.com/rhoopr/kei/compare/v0.14.2...v0.20.0
+[Unreleased]: https://github.com/rhoopr/kei/compare/main...HEAD
+[0.20.0]: https://github.com/rhoopr/kei/compare/v0.14.2...main
 [0.14.2]: https://github.com/rhoopr/kei/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/rhoopr/kei/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/rhoopr/kei/compare/v0.13.3...v0.14.0

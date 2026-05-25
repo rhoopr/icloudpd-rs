@@ -40,4 +40,4 @@ You don't need to run auth tests for most changes. CI runs the offline suite (un
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the [MIT License](LICENSE.md).
+By contributing, you agree that your contributions are licensed under the [MIT License](LICENSE).

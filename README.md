@@ -31,7 +31,7 @@
 > Check [CHANGELOG.md](CHANGELOG.md) before updating.
 
 > [!IMPORTANT]
-> **v0.20 is a breaking config release.**
+> **v0.20 is the current release candidate and is a breaking config release.**
 >
 > The old "everything can be a CLI flag or `KEI_*` env var" model was replaced by a smaller source model:
 >
@@ -61,8 +61,8 @@
 ```sh
 brew install rhoopr/kei/kei             # Homebrew
 
-docker pull ghcr.io/rhoopr/kei:latest   # Docker tagged release
-docker pull ghcr.io/rhoopr/kei:0.20.0   # Docker pinned release
+docker pull ghcr.io/rhoopr/kei:latest   # last tagged release
+docker pull ghcr.io/rhoopr/kei:main     # v0.20 release candidate
 ```
 
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, FreeBSD, and other install paths, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install).
@@ -82,7 +82,9 @@ kei sync
 
 `kei config setup` writes a TOML config and can save your password in the OS
 keyring, or in an encrypted file when a keyring isn't available. You'll still
-approve 2FA on a trusted device the first time.
+approve 2FA on a trusted device the first time. The wizard defaults to all
+visible iCloud Photos libraries and adds `{library}` to unfiled paths when that
+keeps shared-library files separated.
 
 Minimal config:
 
@@ -106,6 +108,7 @@ Sync what matters:
 - Sync your full iCloud Photos library, selected albums, smart folders, shared libraries, or only recent media.
 - Keep unfiled photos and shared-library media organized without manual sorting.
 - Filter by media type, filename, date, and library when you only want part of the archive.
+- Explicit album and smart-folder filters are collection-scoped across visible libraries. That includes `Hidden` and `Recently Deleted` when you ask for them. Library selection still scopes unfiled passes.
 - Details: [Configuration](https://github.com/rhoopr/kei/wiki/Configuration)
 
 Run it your way:
