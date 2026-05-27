@@ -3749,6 +3749,32 @@ mod tests {
         );
     }
 
+    /// Retry-failed should ignore a stored token for its own run, but it must
+    /// not clear that token. A subsequent normal sync should still use
+    /// incremental mode from the previously stored token.
+    #[tokio::test]
+    async fn determine_sync_mode_retry_failed_does_not_consume_or_clear_stored_token() {
+        let db = make_state_db();
+        let sync_token_key = "sync_token:PrimarySync";
+        db.set_metadata(sync_token_key, "stored-token-abc")
+            .await
+            .expect("set token");
+
+        let retry_mode =
+            determine_sync_mode(true, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
+        assert!(
+            matches!(retry_mode, download::SyncMode::Full),
+            "retry-failed must force Full, got {retry_mode:?}"
+        );
+
+        let normal_mode =
+            determine_sync_mode(false, 1, Some(db.as_ref()), sync_token_key, "PrimarySync").await;
+        assert!(
+            matches!(normal_mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
+            "normal sync should still use the stored token after retry-failed, got {normal_mode:?}"
+        );
+    }
+
     #[tokio::test]
     async fn determine_sync_mode_empty_stored_token_falls_back_to_full() {
         let db = make_state_db();

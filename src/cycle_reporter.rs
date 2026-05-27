@@ -380,6 +380,25 @@ mod tests {
         })
     }
 
+    fn reporter_with_db<'a>(
+        dir: &'a Path,
+        report_path: Option<&'a Path>,
+        notifier: &'a Notifier,
+        db: &'a state::SqliteStateDb,
+    ) -> CycleReporter<'a, state::SqliteStateDb> {
+        CycleReporter::new(CycleReporterConfig {
+            username: "reporter@example.com",
+            watch_mode: false,
+            report_path,
+            run_options: run_options(),
+            health_dir: dir,
+            personality_mode: Mode::Off,
+            state_db: Some(db),
+            metrics_handle: None,
+            notifier,
+        })
+    }
+
     fn parse_json(path: &Path) -> serde_json::Value {
         let contents = std::fs::read_to_string(path).unwrap();
         serde_json::from_str(&contents).unwrap()
@@ -426,6 +445,49 @@ mod tests {
         let report_json = parse_json(&report_path);
         assert_eq!(report_json["status"], "success");
         assert_eq!(report_json["stats"]["downloaded"], 2);
+    }
+
+    #[tokio::test]
+    async fn success_report_can_include_preexisting_failed_assets_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("sync_report.json");
+        let notifier = Notifier::new(None);
+        let db = state::SqliteStateDb::open_in_memory().expect("open db");
+        let failed_record = state::AssetRecord::new_pending(
+            std::sync::Arc::from("PrimarySync"),
+            "FAILED_OLD".to_string(),
+            crate::state::VersionSizeKey::Original,
+            "checksum".to_string(),
+            "failed_old.jpg".to_string(),
+            chrono::Utc::now(),
+            None,
+            1_024,
+            crate::state::MediaType::Photo,
+        );
+        db.upsert_seen(&failed_record)
+            .await
+            .expect("upsert failed row");
+        db.mark_failed("PrimarySync", "FAILED_OLD", "original", "old failure")
+            .await
+            .expect("mark failed");
+        let reporter = reporter_with_db(dir.path(), Some(&report_path), &notifier, &db);
+        let mut health = HealthStatus::new();
+        let stats = SyncStats {
+            downloaded: 1,
+            failed: 0,
+            ..SyncStats::default()
+        };
+
+        report_cycle(&reporter, &mut health, &stats, 0, false).await;
+
+        let report_json = parse_json(&report_path);
+        assert_eq!(report_json["status"], "success");
+        assert_eq!(report_json["stats"]["failed"], 0);
+        assert_eq!(report_json["failed_assets"][0]["id"], "FAILED_OLD");
+        assert_eq!(
+            report_json["failed_assets"][0]["error_message"],
+            "old failure"
+        );
     }
 
     #[tokio::test]

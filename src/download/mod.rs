@@ -3747,17 +3747,17 @@ mod tests {
         assert!(result.stats.sync_token_blocked);
         assert_eq!(
             result.stats.sync_token_blocked_reason,
-            Some("icloud_sync_token_missing")
+            Some("icloud_blank_sync_token")
         );
         assert_eq!(result.stats.sync_token_blocked_source, Some("icloud"));
         assert_eq!(
             result.stats.sync_token_blocked_explanation,
-            Some(sync_token_blocked_explanation("icloud_sync_token_missing"))
+            Some(sync_token_blocked_explanation("icloud_blank_sync_token"))
         );
         assert_eq!(result.stats.sync_token_expected_receivers, Some(1));
         assert_eq!(result.stats.sync_token_receivers_with_token, Some(0));
-        assert_eq!(result.stats.sync_token_receivers_missing, Some(1));
-        assert_eq!(result.stats.sync_token_receivers_blank, Some(0));
+        assert_eq!(result.stats.sync_token_receivers_missing, Some(0));
+        assert_eq!(result.stats.sync_token_receivers_blank, Some(1));
         assert_eq!(result.stats.sync_token_receivers_dropped, Some(0));
         assert_eq!(result.stats.sync_token_unique_values, Some(0));
         assert_eq!(result.sync_token, None, "blank token must not be persisted");
@@ -5598,6 +5598,84 @@ mod tests {
             3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13,
             "skip total must reflect summed breakdown"
         );
+    }
+
+    /// When multiple libraries block token advancement in one cycle, the
+    /// aggregated cycle stats preserve the first blocked diagnostic payload.
+    #[test]
+    fn sync_stats_accumulate_preserves_first_token_blocked_diagnostics() {
+        let first = SyncStats {
+            sync_token_blocked: true,
+            sync_token_blocked_reason: Some("icloud_blank_sync_token"),
+            sync_token_blocked_source: Some("icloud"),
+            sync_token_blocked_explanation: Some(sync_token_blocked_explanation(
+                "icloud_blank_sync_token",
+            )),
+            sync_token_blocked_zone: Some("PrimarySync".to_string()),
+            sync_token_expected_receivers: Some(2),
+            sync_token_receivers_with_token: Some(0),
+            sync_token_receivers_missing: Some(0),
+            sync_token_receivers_blank: Some(2),
+            sync_token_receivers_dropped: Some(0),
+            sync_token_unique_values: Some(0),
+            ..SyncStats::default()
+        };
+        let second = SyncStats {
+            sync_token_blocked: true,
+            sync_token_blocked_reason: Some("icloud_sync_token_mismatch"),
+            sync_token_blocked_source: Some("icloud"),
+            sync_token_blocked_explanation: Some(sync_token_blocked_explanation(
+                "icloud_sync_token_mismatch",
+            )),
+            sync_token_blocked_zone: Some("SharedSync-XYZ".to_string()),
+            sync_token_expected_receivers: Some(3),
+            sync_token_receivers_with_token: Some(3),
+            sync_token_receivers_missing: Some(0),
+            sync_token_receivers_blank: Some(0),
+            sync_token_receivers_dropped: Some(0),
+            sync_token_unique_values: Some(2),
+            ..SyncStats::default()
+        };
+
+        let mut acc = SyncStats::default();
+        acc.accumulate(&first);
+        acc.accumulate(&second);
+
+        assert!(acc.sync_token_blocked);
+        assert_eq!(
+            acc.sync_token_blocked_reason,
+            first.sync_token_blocked_reason
+        );
+        assert_eq!(
+            acc.sync_token_blocked_source,
+            first.sync_token_blocked_source
+        );
+        assert_eq!(
+            acc.sync_token_blocked_explanation,
+            first.sync_token_blocked_explanation
+        );
+        assert_eq!(acc.sync_token_blocked_zone, first.sync_token_blocked_zone);
+        assert_eq!(
+            acc.sync_token_expected_receivers,
+            first.sync_token_expected_receivers
+        );
+        assert_eq!(
+            acc.sync_token_receivers_with_token,
+            first.sync_token_receivers_with_token
+        );
+        assert_eq!(
+            acc.sync_token_receivers_missing,
+            first.sync_token_receivers_missing
+        );
+        assert_eq!(
+            acc.sync_token_receivers_blank,
+            first.sync_token_receivers_blank
+        );
+        assert_eq!(
+            acc.sync_token_receivers_dropped,
+            first.sync_token_receivers_dropped
+        );
+        assert_eq!(acc.sync_token_unique_values, first.sync_token_unique_values);
     }
 
     /// A transient `pass.album.len()` failure must not

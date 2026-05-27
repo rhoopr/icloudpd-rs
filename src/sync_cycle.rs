@@ -513,8 +513,8 @@ where
 {
     if is_retry_failed {
         if library_count == 1 {
-            tracing::debug!(
-                "Retry-failed requires full enumeration to find previously-failed assets"
+            tracing::info!(
+                "Retry-failed always runs full enumeration because incremental sync only returns new iCloud changes and can miss older failed assets"
             );
         }
         download::SyncMode::Full
