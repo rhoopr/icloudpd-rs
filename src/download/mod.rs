@@ -1098,6 +1098,11 @@ struct DownloadContext {
     /// changed.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     metadata_retry_markers: LibraryAssetVersionSet,
+    /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
+    /// are pending at sync start. Used to resolve failed/pending rows when
+    /// the expected file is already on disk instead of promoting them back to
+    /// failed after the producer skips the duplicate path.
+    pending_ids: LibraryAssetVersionSet,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced. Library-blind: a known ID
     /// is "known" regardless of which zone it belongs to.
@@ -1113,7 +1118,7 @@ struct DownloadContext {
 }
 
 impl DownloadContext {
-    /// Load the download context from the state database. All six queries
+    /// Load the download context from the state database. All state queries
     /// are independent and run concurrently so sync start doesn't serialize
     /// on round-trip latency across them.
     async fn load<D>(db: &D, retry_only: bool) -> Self
@@ -1130,7 +1135,7 @@ impl DownloadContext {
                 Default::default()
             }
         };
-        let (ids, checksums, hashes, markers, attempts, known_ids) = tokio::join!(
+        let (ids, checksums, hashes, markers, pending, attempts, known_ids) = tokio::join!(
             async {
                 db.get_downloaded_ids().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
@@ -1154,6 +1159,12 @@ impl DownloadContext {
             async {
                 db.get_metadata_retry_markers().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
+                    Default::default()
+                })
+            },
+            async {
+                db.get_pending().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load pending assets from state DB");
                     Default::default()
                 })
             },
@@ -1228,6 +1239,18 @@ impl DownloadContext {
                 .insert(version_size.into_boxed_str());
         }
 
+        let mut pending_ids: LibraryAssetVersionSet = FxHashMap::default();
+        for record in pending {
+            let lib = intern_id(&mut interner, record.library.to_string());
+            let id = intern_id(&mut interner, record.id.to_string());
+            pending_ids
+                .entry(lib)
+                .or_default()
+                .entry(id)
+                .or_default()
+                .insert(record.version_size.as_str().into());
+        }
+
         let known_ids: FxHashSet<Arc<str>> = known_ids
             .into_iter()
             .map(|id| intern_id(&mut interner, id))
@@ -1245,6 +1268,7 @@ impl DownloadContext {
             downloaded_checksums,
             downloaded_metadata_hashes,
             metadata_retry_markers,
+            pending_ids,
             known_ids,
             attempt_counts,
             downloaded_without_metadata_hash,
@@ -1913,7 +1937,7 @@ pub async fn download_photos_with_sync(
     // Give every non-downloaded asset a fresh start this sync:
     // failed -> pending (with attempts reset), and stale attempt counts on
     // pending assets cleared so the per-sync cap starts from zero.
-    let total_pending = if let Some(db) = &config.state_db {
+    let (retry_failed_count, total_pending) = if let Some(db) = &config.state_db {
         match db.prepare_for_retry().await {
             Ok((failed, stale, total_pending)) => {
                 if failed > 0 {
@@ -1925,15 +1949,15 @@ pub async fn download_photos_with_sync(
                         "Cleared stale attempt counts on pending assets"
                     );
                 }
-                total_pending
+                (failed, total_pending)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to reset assets for retry");
-                0
+                (0, 0)
             }
         }
     } else {
-        0
+        (0, 0)
     };
 
     let result = match &config.sync_mode {
@@ -1972,9 +1996,10 @@ pub async fn download_photos_with_sync(
         // pending assets from previous syncs. Fall back to full so they get
         // retried. Once everything is downloaded, incremental resumes.
         SyncMode::Incremental { .. } if total_pending > 0 => {
-            tracing::debug!(
+            tracing::info!(
                 pending = total_pending,
-                "Pending assets require full enumeration, skipping incremental sync"
+                failed_reset = retry_failed_count,
+                "Retrying failed/pending assets requires full enumeration, skipping incremental sync"
             );
             download_photos_full_with_token(
                 download_client,

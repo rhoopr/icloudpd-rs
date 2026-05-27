@@ -65,12 +65,18 @@ impl TaskPlanner {
     }
 
     pub(super) fn existing_path_match(&mut self, path: &Path) -> ExistingPathMatch {
+        match self.existing_path(path) {
+            Some(found) if found == path => ExistingPathMatch::Exact,
+            Some(_) => ExistingPathMatch::AmpmVariant,
+            None => ExistingPathMatch::Missing,
+        }
+    }
+
+    pub(super) fn existing_path(&mut self, path: &Path) -> Option<std::path::PathBuf> {
         if self.dir_cache.exists(path) {
-            ExistingPathMatch::Exact
-        } else if self.dir_cache.find_ampm_variant(path).is_some() {
-            ExistingPathMatch::AmpmVariant
+            Some(path.to_path_buf())
         } else {
-            ExistingPathMatch::Missing
+            self.dir_cache.find_ampm_variant(path)
         }
     }
 }
