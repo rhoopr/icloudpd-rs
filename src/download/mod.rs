@@ -201,21 +201,33 @@ pub struct SyncStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_blocked_zone: Option<String>,
     /// Number of token receivers expected from full-enumeration passes.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_expected_receivers: Option<usize>,
     /// Number of passes that produced a non-blank sync token.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_receivers_with_token: Option<usize>,
     /// Number of passes that completed but produced no sync token.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_receivers_missing: Option<usize>,
     /// Number of passes that produced a blank sync token.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_receivers_blank: Option<usize>,
     /// Number of sync token channels that dropped before reporting.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_receivers_dropped: Option<usize>,
     /// Number of unique non-blank sync token values observed.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_unique_values: Option<usize>,
     pub elapsed_secs: f64,
@@ -2690,6 +2702,14 @@ async fn download_photos_full_with_token(
     .await?;
     stats.pagination_shortfall_warnings = pagination_shortfall_warnings;
     stats.pagination_shortfall_assets = pagination_shortfall_assets;
+    if token_eligible {
+        stats.sync_token_expected_receivers = token_expected_receivers;
+        stats.sync_token_receivers_with_token = token_receivers_with_token;
+        stats.sync_token_receivers_missing = token_receivers_missing;
+        stats.sync_token_receivers_blank = token_receivers_blank;
+        stats.sync_token_receivers_dropped = token_receivers_dropped;
+        stats.sync_token_unique_values = token_unique_values;
+    }
     if pagination_undercount {
         stats.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some("pagination_shortfall");
@@ -2702,12 +2722,6 @@ async fn download_photos_full_with_token(
         stats.sync_token_blocked_reason = Some(reason);
         stats.sync_token_blocked_source = Some(sync_token_blocked_source(reason));
         stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(reason));
-        stats.sync_token_expected_receivers = token_expected_receivers;
-        stats.sync_token_receivers_with_token = token_receivers_with_token;
-        stats.sync_token_receivers_missing = token_receivers_missing;
-        stats.sync_token_receivers_blank = token_receivers_blank;
-        stats.sync_token_receivers_dropped = token_receivers_dropped;
-        stats.sync_token_unique_values = token_unique_values;
     }
 
     // Clear enumeration-in-progress markers when the producer reached the
@@ -3615,6 +3629,13 @@ mod tests {
             Some("zone-token"),
             "clean write-mode enumeration should still advance the agreed sync token"
         );
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.stats.sync_token_expected_receivers, Some(2));
+        assert_eq!(result.stats.sync_token_receivers_with_token, Some(2));
+        assert_eq!(result.stats.sync_token_receivers_missing, Some(0));
+        assert_eq!(result.stats.sync_token_receivers_blank, Some(0));
+        assert_eq!(result.stats.sync_token_receivers_dropped, Some(0));
+        assert_eq!(result.stats.sync_token_unique_values, Some(1));
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "filtered duplicate should not make the write-mode run partial"
