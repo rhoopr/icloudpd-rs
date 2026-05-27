@@ -1107,6 +1107,9 @@ struct DownloadContext {
     /// Library-blind: an asset shared across libraries shares its attempt
     /// budget (mirrors how `get_attempt_counts` aggregates by id alone).
     attempt_counts: FxHashMap<Arc<str>, u32>,
+    /// True when at least one downloaded asset-version lacks a metadata hash.
+    /// Cached because the producer checks this on hot on-disk skip paths.
+    downloaded_without_metadata_hash: bool,
 }
 
 impl DownloadContext {
@@ -1234,6 +1237,8 @@ impl DownloadContext {
             .into_iter()
             .map(|(id, count)| (intern_id(&mut interner, id), count))
             .collect();
+        let downloaded_without_metadata_hash = count_version_set_entries(&downloaded_ids)
+            > count_value_map_entries(&downloaded_metadata_hashes);
 
         Self {
             downloaded_ids,
@@ -1242,6 +1247,7 @@ impl DownloadContext {
             metadata_retry_markers,
             known_ids,
             attempt_counts,
+            downloaded_without_metadata_hash,
         }
     }
 
@@ -1357,16 +1363,8 @@ impl DownloadContext {
         }
     }
 
-    fn downloaded_version_count(&self) -> usize {
-        count_version_set_entries(&self.downloaded_ids)
-    }
-
-    fn downloaded_metadata_hash_count(&self) -> usize {
-        count_value_map_entries(&self.downloaded_metadata_hashes)
-    }
-
     fn has_downloaded_without_metadata_hash(&self) -> bool {
-        self.downloaded_version_count() > self.downloaded_metadata_hash_count()
+        self.downloaded_without_metadata_hash
     }
 }
 
@@ -1434,6 +1432,12 @@ fn build_pass_configs_with_download_concurrency(
             Arc::new(config)
         })
         .collect()
+}
+
+fn incremental_requires_full_enumeration(passes: &[crate::commands::AlbumPass]) -> bool {
+    passes
+        .iter()
+        .any(|pass| pass.kind != crate::commands::PassKind::Unfiled)
 }
 
 async fn collect_pass_asset_ids(pass: &crate::commands::AlbumPass) -> Result<FxHashSet<String>> {
@@ -1906,15 +1910,14 @@ pub async fn download_photos_with_sync(
     let sync_started_at = chrono::Utc::now().timestamp();
     cleanup_orphan_part_files(&config).await;
 
-    // Give every non-downloaded asset a fresh start this sync:
-    // failed -> pending (with attempts reset), and stale attempt counts on
-    // pending assets cleared so the per-sync cap starts from zero.
+    // Give already-pending assets a fresh per-sync attempt budget. Failed
+    // assets stay failed during normal syncs; `sync --retry-failed` resets
+    // them explicitly before this point. Resetting failed rows here would make
+    // every normal sync act like a failed-assets retry and force full
+    // enumeration forever while a persistent failure exists.
     let total_pending = if let Some(db) = &config.state_db {
         match db.prepare_for_retry().await {
-            Ok((failed, stale, total_pending)) => {
-                if failed > 0 {
-                    tracing::debug!(count = failed, "Reset failed assets for retry");
-                }
+            Ok((_failed, stale, total_pending)) => {
                 if stale > 0 {
                     tracing::debug!(
                         count = stale,
@@ -1943,16 +1946,17 @@ pub async fn download_photos_with_sync(
             )
             .await
         }
-        // In `{album}` mode we have to fall back to full enumeration:
         // `changes_stream` uses the zone-level `/changes/zone` endpoint, so
-        // it returns the same delta for every album in a zone. Without
-        // per-asset album-membership info on the change events, we can't
-        // route assets to the correct album folder — full enumeration uses
-        // the album-scoped `photo_stream_with_token` and stays correct.
-        SyncMode::Incremental { .. } if config.requires_per_pass_paths() => {
+        // it returns the same delta for every selected album or smart folder
+        // in a zone. Without per-asset membership info on the change events,
+        // we can't tell whether a new asset belongs in those scoped passes.
+        // The unfiled/library-wide pass is safe: every zone change belongs to
+        // that pass, and inactive album/smart-folder templates shouldn't
+        // force full enumeration on an unfiled-only sync.
+        SyncMode::Incremental { .. } if incremental_requires_full_enumeration(passes) => {
             tracing::debug!(
-                "`{{album}}` folder template requires full enumeration for correct \
-                 per-album routing, skipping incremental"
+                "Album or smart-folder passes require full enumeration for correct \
+                 membership routing, skipping incremental"
             );
             download_photos_full_with_token(
                 download_client,
@@ -3201,7 +3205,7 @@ mod tests {
         );
     }
 
-    fn changes_album(name: &str, session: CountingChangesZoneSession) -> PhotoAlbum {
+    fn changes_album(name: &str, session: impl PhotosSession + 'static) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),
@@ -3223,6 +3227,17 @@ mod tests {
     #[derive(Clone)]
     struct CountingChangesZoneSession {
         changes_zone_calls: Arc<AtomicUsize>,
+        records: Vec<Value>,
+    }
+
+    fn changes_zone_session(
+        changes_zone_calls: Arc<AtomicUsize>,
+        records: Vec<Value>,
+    ) -> CountingChangesZoneSession {
+        CountingChangesZoneSession {
+            changes_zone_calls,
+            records,
+        }
     }
 
     #[async_trait::async_trait]
@@ -3240,7 +3255,7 @@ mod tests {
                         "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
                         "syncToken": "zone-token-next",
                         "moreComing": false,
-                        "records": incremental_photo_records("MASTER_CHANGED"),
+                        "records": self.records.clone(),
                     }]
                 }));
             }
@@ -4274,11 +4289,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unfiled_only_incremental_ignores_inactive_album_path_templates() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            incremental_photo_records("MASTER_CHANGED"),
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        assert!(
+            config.requires_per_pass_paths(),
+            "default inactive album templates still contain per-pass tokens"
+        );
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("unfiled-only incremental sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(
+            !result.full_enumeration_ran,
+            "inactive album/smart-folder templates must not force full enumeration"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "unfiled-only incremental sync should query changes/zone"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_incremental_sync_does_not_retry_failed_assets() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(Arc::clone(&calls), Vec::new());
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let failed = TestAssetRecord::new("FAILED")
+            .checksum("ck_failed")
+            .filename("failed.jpg")
+            .size(1024)
+            .build();
+        db.upsert_seen(&failed).await.expect("record failed row");
+        db.mark_failed("PrimarySync", "FAILED", "original", "HTTP 500")
+            .await
+            .expect("mark failed");
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("normal incremental sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(
+            !result.full_enumeration_ran,
+            "normal sync must not become retry-failed just because failed rows exist"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "normal sync should still query changes/zone"
+        );
+        let summary = db.get_summary().await.expect("state summary");
+        assert_eq!(summary.failed, 1, "failed row should stay failed");
+        assert_eq!(
+            summary.pending, 0,
+            "failed row should not be reset to pending"
+        );
+    }
+
+    #[tokio::test]
     async fn incremental_sync_queries_zone_changes_once_per_library() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let session = CountingChangesZoneSession {
-            changes_zone_calls: Arc::clone(&calls),
-        };
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            incremental_photo_records("MASTER_CHANGED"),
+        );
         let passes = vec![
             AlbumPass {
                 kind: PassKind::Album,
@@ -4876,6 +4995,36 @@ mod tests {
         c.folder_structure_albums = Arc::from(albums);
         c.folder_structure_smart_folders = Arc::from(smart_folders);
         c
+    }
+
+    #[test]
+    fn incremental_full_enumeration_gate_ignores_unfiled_only_pass() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        assert!(
+            !incremental_requires_full_enumeration(&passes),
+            "unfiled-only sync can use zone-level incremental changes"
+        );
+    }
+
+    #[test]
+    fn incremental_full_enumeration_gate_fires_on_album_pass() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Vacation", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        assert!(
+            incremental_requires_full_enumeration(&passes),
+            "album-scoped sync needs full enumeration to preserve membership"
+        );
     }
 
     #[test]

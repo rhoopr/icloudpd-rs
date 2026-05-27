@@ -19,12 +19,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::PhotoAsset;
 use crate::retry::RetryConfig;
-use crate::state::{MetadataRewriteStore, StateDb, SyncRunStats, VersionSizeKey};
+use crate::state::{AssetRecord, MetadataRewriteStore, StateDb, SyncRunStats, VersionSizeKey};
 
 use super::error::DownloadError;
 #[cfg_attr(not(feature = "xmp"), allow(unused_imports))]
 use super::filter::MetadataPayload;
-use super::filter::{extract_skip_candidates, is_asset_filtered, DownloadTask};
+use super::filter::{
+    derive_expected_paths, determine_media_type, extract_skip_candidates, is_asset_filtered,
+    DownloadTask,
+};
 #[cfg(test)]
 use super::finalize::update_metadata_marker_for_test as update_metadata_marker;
 use super::finalize::{
@@ -293,6 +296,63 @@ fn effective_asset_library_arc(asset: &PhotoAsset, config: &DownloadConfig) -> A
         .source_zone()
         .map(Arc::from)
         .unwrap_or_else(|| Arc::clone(&config.library))
+}
+
+async fn backfill_downloaded_metadata_for_on_disk_skip(
+    state_db: Option<&dyn StateDb>,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    ctx: &DownloadContext,
+) {
+    if !ctx.has_downloaded_without_metadata_hash() {
+        return;
+    }
+    let Some(db) = state_db else {
+        return;
+    };
+    let library = effective_asset_library(asset, config);
+    let downloaded_versions = ctx
+        .downloaded_ids
+        .get(library)
+        .and_then(|assets| assets.get(asset.id()));
+    let Some(downloaded_versions) = downloaded_versions else {
+        return;
+    };
+    let version_hashes = ctx
+        .downloaded_metadata_hashes
+        .get(library)
+        .and_then(|assets| assets.get(asset.id()));
+
+    for derived in derive_expected_paths(asset, config) {
+        let version_size = derived.version_size.as_str();
+        let has_metadata_hash =
+            version_hashes.is_some_and(|hashes| hashes.contains_key(version_size));
+        if !downloaded_versions.contains(version_size) || has_metadata_hash {
+            continue;
+        }
+
+        let record = AssetRecord::new_pending(
+            Arc::from(library),
+            asset.id().to_string(),
+            derived.version_size,
+            derived.checksum.to_string(),
+            derived.filename,
+            asset.created(),
+            Some(asset.added_date()),
+            derived.size,
+            determine_media_type(derived.version_size, asset),
+        )
+        .with_metadata_arc(asset.metadata_arc());
+
+        if let Err(e) = db.upsert_seen(&record).await {
+            tracing::warn!(
+                asset_id = %asset.id(),
+                version_size,
+                error = %e,
+                "Failed to backfill metadata for skipped downloaded asset"
+            );
+        }
+    }
 }
 
 /// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case
@@ -1335,6 +1395,13 @@ where
                             config,
                             &asset,
                             &candidates,
+                            &download_ctx,
+                        )
+                        .await;
+                        backfill_downloaded_metadata_for_on_disk_skip(
+                            producer_state_db.as_deref(),
+                            config,
+                            &asset,
                             &download_ctx,
                         )
                         .await;
@@ -5016,7 +5083,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut config = DownloadConfig::test_default();
-        config.directory = std::sync::Arc::from(dir.path());
+        config.directory = Arc::from(dir.path());
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
 
@@ -5058,6 +5125,91 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].library.as_ref(), "SharedSync-abc");
         assert_eq!(&*failed[0].id, "STUCK");
+    }
+
+    /// v5 metadata backfill regression: a previously downloaded row with a
+    /// NULL metadata_hash can hit the producer's on-disk-skip branch when
+    /// the file already exists. That branch must refresh metadata for the
+    /// existing downloaded row; otherwise the "one-time after upgrade"
+    /// backfill notice repeats forever.
+    #[tokio::test]
+    async fn on_disk_skip_backfills_downloaded_row_metadata_hash() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        fn existing_asset() -> PhotoAsset {
+            TestPhotoAsset::new("BACKFILL")
+                .filename("backfill.jpg")
+                .item_type("public.jpeg")
+                .orig_file_type("public.jpeg")
+                .orig_size(1234)
+                .orig_url("https://p01.icloud-content.com/backfill.jpg")
+                .orig_checksum("ck_backfill")
+                .build()
+        }
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let asset = existing_asset();
+        let target_path = crate::download::filter::expected_paths_for(&asset, &config)
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&target_path, vec![0u8; 1234]).unwrap();
+
+        let record = crate::test_helpers::TestAssetRecord::new("BACKFILL")
+            .checksum("ck_backfill")
+            .filename("backfill.jpg")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "BACKFILL",
+            "original",
+            &target_path,
+            "sha256",
+            None,
+        )
+        .await
+        .unwrap();
+        db.clear_metadata_hash_for_test("PrimarySync", "BACKFILL", "original");
+        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+
+        let client = reqwest::Client::new();
+        let assets = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(existing_asset())]);
+        let result = stream_and_download_from_stream(
+            &client,
+            assets,
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(
+            result.downloaded, 0,
+            "existing file should not be re-downloaded"
+        );
+        assert!(
+            !db.has_downloaded_without_metadata_hash().await.unwrap(),
+            "on-disk skip must backfill metadata_hash for existing downloaded rows"
+        );
     }
 
     /// Data-sacred regression for the trust-state fast-skip removal.
