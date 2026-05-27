@@ -1994,6 +1994,7 @@ pub(super) async fn build_download_outcome(
             photos_downloaded: streaming_result.photos_downloaded,
             videos_downloaded: streaming_result.videos_downloaded,
             recap: streaming_result.recap.clone(),
+            ..super::SyncStats::default()
         };
         return Ok((
             DownloadOutcome::SessionExpired {
@@ -2082,6 +2083,7 @@ pub(super) async fn build_download_outcome(
             photos_downloaded: streaming_result.photos_downloaded,
             videos_downloaded: streaming_result.videos_downloaded,
             recap: streaming_result.recap.clone(),
+            ..super::SyncStats::default()
         };
         log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
         return Ok((
@@ -2119,6 +2121,7 @@ pub(super) async fn build_download_outcome(
             photos_downloaded: streaming_result.photos_downloaded,
             videos_downloaded: streaming_result.videos_downloaded,
             recap: streaming_result.recap.clone(),
+            ..super::SyncStats::default()
         };
         log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
         if state_write_failures > 0
@@ -2204,6 +2207,7 @@ pub(super) async fn build_download_outcome(
             photos_downloaded: streaming_result.photos_downloaded + pass_result.photos_downloaded,
             videos_downloaded: streaming_result.videos_downloaded + pass_result.videos_downloaded,
             recap: merged_recap,
+            ..super::SyncStats::default()
         };
         return Ok((
             DownloadOutcome::SessionExpired {
@@ -2252,6 +2256,7 @@ pub(super) async fn build_download_outcome(
         photos_downloaded: streaming_result.photos_downloaded + pass_result.photos_downloaded,
         videos_downloaded: streaming_result.videos_downloaded + pass_result.videos_downloaded,
         recap: merged_recap,
+        ..super::SyncStats::default()
     };
     maybe_warn_rate_limit_pressure(&stats);
     log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);

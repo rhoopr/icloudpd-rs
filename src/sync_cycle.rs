@@ -317,7 +317,7 @@ pub(crate) async fn run_cycle(
             Arc::from(lib_state.zone_name.as_str()),
         );
         let download_client = shared_session.read().await.download_client().clone();
-        let sync_result = download::download_photos_with_sync(
+        let mut sync_result = download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,
             download_config,
@@ -378,9 +378,45 @@ pub(crate) async fn run_cycle(
                 }
                 (None, _) => {
                     db_sync_token_advance_safe = false;
-                    tracing::debug!(
+                    let reason = sync_result
+                        .stats
+                        .sync_token_blocked_reason
+                        .unwrap_or("sync_token_missing");
+                    let source = sync_result
+                        .stats
+                        .sync_token_blocked_source
+                        .unwrap_or_else(|| download::sync_token_blocked_source(reason));
+                    let explanation = sync_result
+                        .stats
+                        .sync_token_blocked_explanation
+                        .as_ref()
+                        .copied()
+                        .unwrap_or_else(|| download::sync_token_blocked_explanation(reason));
+                    let observation = match (
+                        sync_result.stats.sync_token_expected_receivers,
+                        sync_result.stats.sync_token_receivers_with_token,
+                    ) {
+                        (Some(expected), Some(with_token)) => {
+                            let missing = sync_result.stats.sync_token_receivers_missing.unwrap_or(0);
+                            let blank = sync_result.stats.sync_token_receivers_blank.unwrap_or(0);
+                            let dropped = sync_result.stats.sync_token_receivers_dropped.unwrap_or(0);
+                            let unique = sync_result.stats.sync_token_unique_values.unwrap_or(0);
+                            format!(
+                                "Observed usable sync tokens on {with_token}/{expected} passes (missing: {missing}, blank: {blank}, dropped: {dropped}, unique values: {unique})"
+                            )
+                        }
+                        _ => "No per-pass sync token observation details were collected for this reason"
+                            .to_string(),
+                    };
+                    tracing::warn!(
                         zone = %lib_state.zone_name,
-                        "Sync token unavailable after successful sync"
+                        reason,
+                        source,
+                        explanation,
+                        observation,
+                        "Sync token did not advance after this successful sync. Here's why: {}. {}. Next cycle will run full enumeration",
+                        explanation,
+                        observation
                     );
                 }
             }
@@ -390,6 +426,12 @@ pub(crate) async fn run_cycle(
                 zone = %lib_state.zone_name,
                 "Sync token NOT advanced (incomplete sync -- will replay changes next cycle)"
             );
+        }
+
+        if sync_result.stats.sync_token_blocked
+            && sync_result.stats.sync_token_blocked_zone.is_none()
+        {
+            sync_result.stats.sync_token_blocked_zone = Some(lib_state.zone_name.clone());
         }
 
         // Accumulate stats across libraries.

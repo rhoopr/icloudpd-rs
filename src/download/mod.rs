@@ -190,6 +190,34 @@ pub struct SyncStats {
     /// Structured reason for `sync_token_blocked`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_blocked_reason: Option<&'static str>,
+    /// High-level owner attribution for `sync_token_blocked_reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_token_blocked_source: Option<&'static str>,
+    /// Human-readable explanation for why token advancement was blocked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_token_blocked_explanation: Option<&'static str>,
+    /// Zone name where token advancement was blocked. Set by the cycle owner
+    /// so report.json can identify the affected library directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_token_blocked_zone: Option<String>,
+    /// Number of token receivers expected from full-enumeration passes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_token_expected_receivers: Option<usize>,
+    /// Number of passes that produced a non-blank sync token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_token_receivers_with_token: Option<usize>,
+    /// Number of passes that completed but produced no sync token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_token_receivers_missing: Option<usize>,
+    /// Number of passes that produced a blank sync token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_token_receivers_blank: Option<usize>,
+    /// Number of sync token channels that dropped before reporting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_token_receivers_dropped: Option<usize>,
+    /// Number of unique non-blank sync token values observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_token_unique_values: Option<usize>,
     pub elapsed_secs: f64,
     pub interrupted: bool,
     /// Number of tasks that observed at least one HTTP 429 / 503 response
@@ -242,6 +270,33 @@ impl SyncStats {
         if self.sync_token_blocked_reason.is_none() {
             self.sync_token_blocked_reason = other.sync_token_blocked_reason;
         }
+        if self.sync_token_blocked_source.is_none() {
+            self.sync_token_blocked_source = other.sync_token_blocked_source;
+        }
+        if self.sync_token_blocked_explanation.is_none() {
+            self.sync_token_blocked_explanation = other.sync_token_blocked_explanation;
+        }
+        if self.sync_token_blocked_zone.is_none() {
+            self.sync_token_blocked_zone = other.sync_token_blocked_zone.clone();
+        }
+        if self.sync_token_expected_receivers.is_none() {
+            self.sync_token_expected_receivers = other.sync_token_expected_receivers;
+        }
+        if self.sync_token_receivers_with_token.is_none() {
+            self.sync_token_receivers_with_token = other.sync_token_receivers_with_token;
+        }
+        if self.sync_token_receivers_missing.is_none() {
+            self.sync_token_receivers_missing = other.sync_token_receivers_missing;
+        }
+        if self.sync_token_receivers_blank.is_none() {
+            self.sync_token_receivers_blank = other.sync_token_receivers_blank;
+        }
+        if self.sync_token_receivers_dropped.is_none() {
+            self.sync_token_receivers_dropped = other.sync_token_receivers_dropped;
+        }
+        if self.sync_token_unique_values.is_none() {
+            self.sync_token_unique_values = other.sync_token_unique_values;
+        }
         self.elapsed_secs += other.elapsed_secs;
         self.interrupted = self.interrupted || other.interrupted;
         self.rate_limited += other.rate_limited;
@@ -253,6 +308,39 @@ impl SyncStats {
 
 const PAGINATION_SHORTFALL_TOLERANCE_PERCENT: u64 = 5;
 const PAGINATION_SHORTFALL_TOLERANCE_ABSOLUTE: u64 = 100;
+
+pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
+    match reason {
+        "kei_internal_token_receiver_dropped" => "kei",
+        "pagination_shortfall"
+        | "icloud_blank_sync_token"
+        | "icloud_sync_token_mismatch"
+        | "icloud_sync_token_missing" => "icloud",
+        _ => "unknown",
+    }
+}
+
+pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
+    match reason {
+        "pagination_shortfall" => {
+            "enumeration counts did not line up safely, so kei blocked token advancement"
+        }
+        "icloud_sync_token_missing" => {
+            "iCloud did not return a sync token for this full enumeration"
+        }
+        "icloud_blank_sync_token" => {
+            "iCloud returned a blank sync token, which kei treated as unusable"
+        }
+        "icloud_sync_token_mismatch" => "iCloud returned conflicting sync tokens across passes",
+        "kei_internal_token_receiver_dropped" => {
+            "an internal token collection channel closed before completion"
+        }
+        "sync_token_unavailable" | "sync_token_missing" => {
+            "no usable sync token was available at the end of the cycle"
+        }
+        _ => "the sync token was unavailable for an unspecified reason",
+    }
+}
 
 /// Per-reason breakdown of skipped assets.
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -2470,8 +2558,7 @@ async fn download_photos_full_with_token(
                         shortfall,
                         tolerance_percent = PAGINATION_SHORTFALL_TOLERANCE_PERCENT,
                         tolerance_assets = PAGINATION_SHORTFALL_TOLERANCE_ABSOLUTE,
-                        "Enumeration count shortfall observed, but within tolerance - \
-                         sync token will still advance"
+                        "Enumeration count shortfall observed, but within tolerance"
                     );
                     false
                 }
@@ -2505,18 +2592,81 @@ async fn download_photos_full_with_token(
     // intentionally stops before the full pass is drained, so advancing the
     // token would make older, unenumerated assets invisible to later
     // incremental syncs.
-    let sync_token = if config.recent.is_none()
+    let token_eligible = config.recent.is_none()
         && !controls.run_mode.only_print_filenames()
         && !pagination_undercount
-        && streaming_result.enumeration_errors == 0
-    {
+        && streaming_result.enumeration_errors == 0;
+    let mut token_block_reason: Option<&'static str> = None;
+    let mut token_expected_receivers: Option<usize> = None;
+    let mut token_receivers_with_token: Option<usize> = None;
+    let mut token_receivers_missing: Option<usize> = None;
+    let mut token_receivers_blank: Option<usize> = None;
+    let mut token_receivers_dropped: Option<usize> = None;
+    let mut token_unique_values: Option<usize> = None;
+    let sync_token = if token_eligible {
+        let expected_token_count = token_receivers.len();
+        token_expected_receivers = Some(expected_token_count);
         let mut tokens = Vec::new();
+        let mut missing_tokens = 0usize;
+        let mut blank_tokens = 0usize;
+        let mut dropped_receivers = 0usize;
         for rx in token_receivers {
-            if let Ok(Some(token)) = rx.await {
-                tokens.push(token);
+            match rx.await {
+                Ok(Some(token)) => {
+                    let trimmed = token.trim();
+                    if trimmed.is_empty() {
+                        blank_tokens += 1;
+                        continue;
+                    }
+                    tokens.push(trimmed.to_string());
+                }
+                Ok(None) => {
+                    missing_tokens += 1;
+                }
+                Err(_) => {
+                    dropped_receivers += 1;
+                }
             }
         }
-        unanimous_pass_sync_token(&tokens)
+        token_receivers_with_token = Some(tokens.len());
+        token_receivers_missing = Some(missing_tokens);
+        token_receivers_blank = Some(blank_tokens);
+        token_receivers_dropped = Some(dropped_receivers);
+        if blank_tokens > 0 {
+            tracing::warn!(
+                blank_tokens,
+                expected_token_count,
+                "Full enumeration returned blank syncToken values; blocking token advancement"
+            );
+        }
+        if dropped_receivers > 0 {
+            tracing::warn!(
+                dropped_receivers,
+                expected_token_count,
+                "Full enumeration syncToken receiver dropped before completion; blocking token advancement"
+            );
+        }
+        let unique_token_count = tokens
+            .iter()
+            .map(std::string::String::as_str)
+            .collect::<FxHashSet<_>>()
+            .len();
+        token_unique_values = Some(unique_token_count);
+        let resolved = unanimous_pass_sync_token(&tokens);
+        if resolved.is_none() {
+            token_block_reason = Some(if dropped_receivers > 0 {
+                "kei_internal_token_receiver_dropped"
+            } else if blank_tokens > 0 {
+                "icloud_blank_sync_token"
+            } else if unique_token_count > 1 {
+                "icloud_sync_token_mismatch"
+            } else if missing_tokens > 0 {
+                "icloud_sync_token_missing"
+            } else {
+                "sync_token_unavailable"
+            });
+        }
+        resolved
     } else {
         None
     };
@@ -2543,6 +2693,21 @@ async fn download_photos_full_with_token(
     if pagination_undercount {
         stats.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some("pagination_shortfall");
+        stats.sync_token_blocked_source = Some(sync_token_blocked_source("pagination_shortfall"));
+        stats.sync_token_blocked_explanation =
+            Some(sync_token_blocked_explanation("pagination_shortfall"));
+    } else if token_eligible && sync_token.is_none() {
+        let reason = token_block_reason.unwrap_or("sync_token_unavailable");
+        stats.sync_token_blocked = true;
+        stats.sync_token_blocked_reason = Some(reason);
+        stats.sync_token_blocked_source = Some(sync_token_blocked_source(reason));
+        stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(reason));
+        stats.sync_token_expected_receivers = token_expected_receivers;
+        stats.sync_token_receivers_with_token = token_receivers_with_token;
+        stats.sync_token_receivers_missing = token_receivers_missing;
+        stats.sync_token_receivers_blank = token_receivers_blank;
+        stats.sync_token_receivers_dropped = token_receivers_dropped;
+        stats.sync_token_unique_values = token_unique_values;
     }
 
     // Clear enumeration-in-progress markers when the producer reached the
@@ -2911,6 +3076,7 @@ async fn download_photos_incremental(
         photos_downloaded: pass_result.photos_downloaded,
         videos_downloaded: pass_result.videos_downloaded,
         recap: pass_result.recap.clone(),
+        ..SyncStats::default()
     };
     log_sync_summary(
         "\u{2500}\u{2500} Incremental Sync Summary \u{2500}\u{2500}",
@@ -3512,7 +3678,89 @@ mod tests {
             result.stats.sync_token_blocked_reason,
             Some("pagination_shortfall")
         );
+        assert_eq!(result.stats.sync_token_blocked_source, Some("icloud"));
+        assert_eq!(
+            result.stats.sync_token_blocked_explanation,
+            Some(sync_token_blocked_explanation("pagination_shortfall"))
+        );
+        assert_eq!(result.stats.sync_token_expected_receivers, None);
+        assert_eq!(result.stats.sync_token_receivers_with_token, None);
+        assert_eq!(result.stats.sync_token_receivers_missing, None);
+        assert_eq!(result.stats.sync_token_receivers_blank, None);
+        assert_eq!(result.stats.sync_token_receivers_dropped, None);
+        assert_eq!(result.stats.sync_token_unique_values, None);
         assert_eq!(result.sync_token, None, "token should stay blocked");
+    }
+
+    #[tokio::test]
+    async fn full_sync_blank_query_sync_token_blocks_advancement() {
+        let records = mock_photo_records_with_filename("MASTER_BLANK_TOKEN", "blank-token.jpg");
+        let session = MockPhotosFlow::new()
+            .album_count(1)
+            .query_page(records.clone(), Some(""))
+            .empty_query_page(Some(""))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Hidden", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 2;
+
+        // Seed the destination so the enumerated asset is skipped on-disk
+        // and this test isolates token-capture behavior.
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let pass_config = config.with_pass(&passes[0]);
+        let expected_path = filter::expected_paths_for(&asset, &pass_config)
+            .into_iter()
+            .next()
+            .expect("mock asset should have an expected path");
+        tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
+            .await
+            .expect("create parent dir");
+        tokio::fs::write(&expected_path.path, vec![0u8; 1024])
+            .await
+            .expect("seed existing file");
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("blank sync token should not error");
+
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "blank token should not force partial failure"
+        );
+        assert_eq!(result.stats.failed, 0);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(result.stats.pagination_shortfall_assets, 0);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some("icloud_sync_token_missing")
+        );
+        assert_eq!(result.stats.sync_token_blocked_source, Some("icloud"));
+        assert_eq!(
+            result.stats.sync_token_blocked_explanation,
+            Some(sync_token_blocked_explanation("icloud_sync_token_missing"))
+        );
+        assert_eq!(result.stats.sync_token_expected_receivers, Some(1));
+        assert_eq!(result.stats.sync_token_receivers_with_token, Some(0));
+        assert_eq!(result.stats.sync_token_receivers_missing, Some(1));
+        assert_eq!(result.stats.sync_token_receivers_blank, Some(0));
+        assert_eq!(result.stats.sync_token_receivers_dropped, Some(0));
+        assert_eq!(result.stats.sync_token_unique_values, Some(0));
+        assert_eq!(result.sync_token, None, "blank token must not be persisted");
     }
 
     #[test]
@@ -5224,6 +5472,17 @@ mod tests {
             pagination_shortfall_assets: 9,
             sync_token_blocked: true,
             sync_token_blocked_reason: Some("pagination_shortfall"),
+            sync_token_blocked_source: Some("icloud"),
+            sync_token_blocked_explanation: Some(sync_token_blocked_explanation(
+                "pagination_shortfall",
+            )),
+            sync_token_blocked_zone: Some("PrimarySync".to_string()),
+            sync_token_expected_receivers: Some(3),
+            sync_token_receivers_with_token: Some(2),
+            sync_token_receivers_missing: Some(1),
+            sync_token_receivers_blank: Some(0),
+            sync_token_receivers_dropped: Some(0),
+            sync_token_unique_values: Some(1),
             elapsed_secs: 1.5,
             interrupted: false,
             rate_limited: 7,
@@ -5258,6 +5517,15 @@ mod tests {
             pagination_shortfall_assets: 11,
             sync_token_blocked: false,
             sync_token_blocked_reason: None,
+            sync_token_blocked_source: Some("kei"),
+            sync_token_blocked_explanation: Some("should not overwrite first"),
+            sync_token_blocked_zone: Some("SharedSync-abc".to_string()),
+            sync_token_expected_receivers: Some(9),
+            sync_token_receivers_with_token: Some(9),
+            sync_token_receivers_missing: Some(0),
+            sync_token_receivers_blank: Some(0),
+            sync_token_receivers_dropped: Some(0),
+            sync_token_unique_values: Some(1),
             elapsed_secs: 0.75,
             interrupted: true,
             rate_limited: 3,
@@ -5288,6 +5556,18 @@ mod tests {
         );
         assert!(acc.sync_token_blocked, "sync_token_blocked must OR");
         assert_eq!(acc.sync_token_blocked_reason, Some("pagination_shortfall"));
+        assert_eq!(acc.sync_token_blocked_source, Some("icloud"));
+        assert_eq!(
+            acc.sync_token_blocked_explanation,
+            Some(sync_token_blocked_explanation("pagination_shortfall"))
+        );
+        assert_eq!(acc.sync_token_blocked_zone.as_deref(), Some("PrimarySync"));
+        assert_eq!(acc.sync_token_expected_receivers, Some(3));
+        assert_eq!(acc.sync_token_receivers_with_token, Some(2));
+        assert_eq!(acc.sync_token_receivers_missing, Some(1));
+        assert_eq!(acc.sync_token_receivers_blank, Some(0));
+        assert_eq!(acc.sync_token_receivers_dropped, Some(0));
+        assert_eq!(acc.sync_token_unique_values, Some(1));
         assert!(
             (acc.elapsed_secs - 2.25).abs() < 1e-9,
             "elapsed_secs must sum (got {})",

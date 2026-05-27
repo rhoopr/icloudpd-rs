@@ -553,4 +553,50 @@ mod tests {
             "pagination_shortfall"
         );
     }
+
+    #[tokio::test]
+    async fn sync_token_blocked_diagnostics_serialize_to_report_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("sync_report.json");
+        let notifier = Notifier::new(None);
+        let reporter = reporter(dir.path(), Some(&report_path), &notifier);
+        let mut health = HealthStatus::new();
+        let stats = SyncStats {
+            sync_token_blocked: true,
+            sync_token_blocked_reason: Some("icloud_sync_token_missing"),
+            sync_token_blocked_source: Some("icloud"),
+            sync_token_blocked_explanation: Some(
+                "iCloud did not return a sync token for this full enumeration",
+            ),
+            sync_token_blocked_zone: Some("PrimarySync".to_string()),
+            sync_token_expected_receivers: Some(3),
+            sync_token_receivers_with_token: Some(0),
+            sync_token_receivers_missing: Some(3),
+            sync_token_receivers_blank: Some(0),
+            sync_token_receivers_dropped: Some(0),
+            sync_token_unique_values: Some(0),
+            ..SyncStats::default()
+        };
+
+        report_cycle(&reporter, &mut health, &stats, 0, false).await;
+
+        let report_json = parse_json(&report_path);
+        let stats_json = &report_json["stats"];
+        assert_eq!(
+            stats_json["sync_token_blocked_reason"],
+            "icloud_sync_token_missing"
+        );
+        assert_eq!(stats_json["sync_token_blocked_source"], "icloud");
+        assert_eq!(
+            stats_json["sync_token_blocked_explanation"],
+            "iCloud did not return a sync token for this full enumeration"
+        );
+        assert_eq!(stats_json["sync_token_blocked_zone"], "PrimarySync");
+        assert_eq!(stats_json["sync_token_expected_receivers"], 3);
+        assert_eq!(stats_json["sync_token_receivers_with_token"], 0);
+        assert_eq!(stats_json["sync_token_receivers_missing"], 3);
+        assert_eq!(stats_json["sync_token_receivers_blank"], 0);
+        assert_eq!(stats_json["sync_token_receivers_dropped"], 0);
+        assert_eq!(stats_json["sync_token_unique_values"], 0);
+    }
 }

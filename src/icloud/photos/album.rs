@@ -1218,8 +1218,19 @@ impl PhotoAlbum {
                 };
 
                 // Capture the zone-level syncToken from each page response.
-                if let Some(token) = &query.sync_token {
-                    last_sync_token = Some(token.clone());
+                // Treat blank tokens as missing so we never persist an
+                // unusable marker that forces the next cycle back to full.
+                if let Some(token) = query.sync_token.as_deref() {
+                    let trimmed = token.trim();
+                    if trimmed.is_empty() {
+                        tracing::warn!(
+                            album = %name,
+                            offset,
+                            "Fetcher response contained blank syncToken; treating as unavailable"
+                        );
+                    } else {
+                        last_sync_token = Some(trimmed.to_string());
+                    }
                 }
 
                 let records = query.records;
@@ -1920,6 +1931,30 @@ mod tests {
 
         let token = token_rx.await.expect("oneshot should not be dropped");
         assert_eq!(token, None, "no syncToken in responses means None");
+    }
+
+    #[tokio::test]
+    async fn test_photo_stream_with_token_blank_sync_token_treated_as_none() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-1", Some(""))
+            .empty_query_page(Some(""))
+            .build();
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        tokio::pin!(stream);
+
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+        }
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(
+            token, None,
+            "blank syncToken must be treated as unavailable"
+        );
     }
 
     #[tokio::test]
