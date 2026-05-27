@@ -410,13 +410,11 @@ pub trait StateDb: Send + Sync {
     /// Returns the number of assets reset.
     async fn reset_failed(&self) -> Result<u64, StateError>;
 
-    /// Prepare already-pending assets for a fresh sync attempt.
+    /// Reset all non-downloaded assets for a fresh sync attempt.
     ///
-    /// Failed assets remain failed until an explicit `--retry-failed` run calls
-    /// `reset_failed`; otherwise a persistent failed row would force every
-    /// normal incremental sync back through full enumeration. Returns
-    /// (failed_reset, pending_reset, total_pending), where failed_reset is kept
-    /// for compatibility and is always 0.
+    /// Moves failed -> pending and clears stale attempt counts on pending
+    /// assets, all in one lock acquisition. Returns
+    /// (failed_reset, pending_reset, total_pending).
     async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError>;
 
     /// Promote stuck pending assets to failed.
@@ -2163,22 +2161,20 @@ impl SqliteStateDb {
     }
 
     pub(crate) async fn reset_failed(&self) -> Result<u64, StateError> {
-        self.with_conn("reset_failed", move |conn| {
+        let (failed, _, _) = self.prepare_for_retry().await?;
+        Ok(failed)
+    }
+
+    pub(crate) async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+        self.with_conn("prepare_for_retry", move |conn| {
             let failed = conn
                 .execute(
                     "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
                      WHERE status = 'failed'",
                     [],
                 )
-                .map_err(|e| StateError::query("reset_failed", e))?;
-            #[allow(clippy::cast_possible_truncation, reason = "rusqlite row counts fit in u64")]
-            Ok(failed as u64)
-        })
-        .await
-    }
+                .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
 
-    pub(crate) async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
-        self.with_conn("prepare_for_retry", move |conn| {
             let pending =
                 conn.execute(
                     "UPDATE assets SET download_attempts = 0, last_error = NULL \
@@ -2197,7 +2193,7 @@ impl SqliteStateDb {
             #[allow(clippy::cast_sign_loss, reason = "SQL COUNT(*) is always non-negative")]
             let total_pending = total_pending as u64;
 
-            Ok((0, pending, total_pending))
+            Ok((failed, pending, total_pending))
         })
         .await
     }
@@ -5099,7 +5095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_retry_resets_stuck_pending_but_leaves_failed() {
+    async fn prepare_for_retry_resets_failed_and_stuck_pending() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let dir = test_dir();
 
@@ -5174,26 +5170,18 @@ mod tests {
 
         let (failed_reset, pending_reset, total_pending) = db.prepare_for_retry().await.unwrap();
 
-        assert_eq!(
-            failed_reset, 0,
-            "normal sync preparation must not reset failed rows"
-        );
+        assert_eq!(failed_reset, 2);
         assert_eq!(pending_reset, 1); // only the stuck one
-        assert_eq!(total_pending, 2); // only the original pending rows
+        assert_eq!(total_pending, 4); // 2 original pending + 2 reset from failed
 
         let after = db.get_summary().await.unwrap();
         assert_eq!(after.downloaded, 1);
-        assert_eq!(after.pending, 2);
-        assert_eq!(after.failed, 2);
+        assert_eq!(after.pending, 4);
+        assert_eq!(after.failed, 0);
 
-        // Verify pending attempt counts are zero now; failed rows keep their
-        // attempt counts until an explicit retry-failed reset.
+        // Verify attempt counts are all zero now
         let attempts = db.get_attempt_counts().await.unwrap();
-        assert_eq!(
-            attempts.len(),
-            2,
-            "only failed rows should retain attempt counts"
-        );
+        assert!(attempts.is_empty(), "all attempt counts should be zero");
     }
 
     #[tokio::test]

@@ -1910,14 +1910,15 @@ pub async fn download_photos_with_sync(
     let sync_started_at = chrono::Utc::now().timestamp();
     cleanup_orphan_part_files(&config).await;
 
-    // Give already-pending assets a fresh per-sync attempt budget. Failed
-    // assets stay failed during normal syncs; `sync --retry-failed` resets
-    // them explicitly before this point. Resetting failed rows here would make
-    // every normal sync act like a failed-assets retry and force full
-    // enumeration forever while a persistent failure exists.
+    // Give every non-downloaded asset a fresh start this sync:
+    // failed -> pending (with attempts reset), and stale attempt counts on
+    // pending assets cleared so the per-sync cap starts from zero.
     let total_pending = if let Some(db) = &config.state_db {
         match db.prepare_for_retry().await {
-            Ok((_failed, stale, total_pending)) => {
+            Ok((failed, stale, total_pending)) => {
+                if failed > 0 {
+                    tracing::debug!(count = failed, "Reset failed assets for retry");
+                }
                 if stale > 0 {
                     tracing::debug!(
                         count = stale,
@@ -4331,63 +4332,6 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "unfiled-only incremental sync should query changes/zone"
-        );
-    }
-
-    #[tokio::test]
-    async fn normal_incremental_sync_does_not_retry_failed_assets() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let session = changes_zone_session(Arc::clone(&calls), Vec::new());
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: changes_album("", session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
-
-        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-        let failed = TestAssetRecord::new("FAILED")
-            .checksum("ck_failed")
-            .filename("failed.jpg")
-            .size(1024)
-            .build();
-        db.upsert_seen(&failed).await.expect("record failed row");
-        db.mark_failed("PrimarySync", "FAILED", "original", "HTTP 500")
-            .await
-            .expect("mark failed");
-
-        let mut config = test_config();
-        let dir = TempDir::new().expect("temp dir");
-        config.directory = Arc::from(dir.path());
-        config.state_db = Some(db.clone());
-        config.sync_mode = SyncMode::Incremental {
-            zone_sync_token: "zone-token-prev".to_string(),
-        };
-
-        let result = download_photos_with_sync(
-            &Client::new(),
-            &passes,
-            Arc::new(config),
-            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("normal incremental sync should succeed");
-
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
-        assert!(
-            !result.full_enumeration_ran,
-            "normal sync must not become retry-failed just because failed rows exist"
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "normal sync should still query changes/zone"
-        );
-        let summary = db.get_summary().await.expect("state summary");
-        assert_eq!(summary.failed, 1, "failed row should stay failed");
-        assert_eq!(
-            summary.pending, 0,
-            "failed row should not be reset to pending"
         );
     }
 
