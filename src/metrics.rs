@@ -101,6 +101,9 @@ pub(crate) struct MetricsHandle {
     exif_failures: Counter,
     state_write_failures: Counter,
     enumeration_errors: Counter,
+    pagination_shortfall_warnings: Counter,
+    pagination_shortfall_assets: Counter,
+    sync_token_blocked_cycles: Counter,
     session_expirations: Counter,
     cycle_duration_seconds: Gauge<f64, AtomicU64>,
     consecutive_failures: Gauge,
@@ -179,6 +182,27 @@ impl MetricsHandle {
             "kei_sync_enumeration_errors",
             "Total number of iCloud API enumeration errors",
             enumeration_errors.clone(),
+        );
+
+        let pagination_shortfall_warnings = Counter::default();
+        registry.register(
+            "kei_sync_pagination_shortfall_warnings",
+            "Total number of count-only pagination shortfall warnings",
+            pagination_shortfall_warnings.clone(),
+        );
+
+        let pagination_shortfall_assets = Counter::default();
+        registry.register(
+            "kei_sync_pagination_shortfall_assets",
+            "Total number of missing assets reported by pagination shortfall warnings",
+            pagination_shortfall_assets.clone(),
+        );
+
+        let sync_token_blocked_cycles = Counter::default();
+        registry.register(
+            "kei_sync_token_blocked_cycles",
+            "Total number of sync cycles that blocked sync-token advancement for safety",
+            sync_token_blocked_cycles.clone(),
         );
 
         let session_expirations = Counter::default();
@@ -276,6 +300,9 @@ impl MetricsHandle {
             exif_failures,
             state_write_failures,
             enumeration_errors,
+            pagination_shortfall_warnings,
+            pagination_shortfall_assets,
+            sync_token_blocked_cycles,
             session_expirations,
             cycle_duration_seconds,
             consecutive_failures,
@@ -304,6 +331,13 @@ impl MetricsHandle {
             .inc_by(stats.state_write_failures as u64);
         self.enumeration_errors
             .inc_by(stats.enumeration_errors as u64);
+        self.pagination_shortfall_warnings
+            .inc_by(stats.pagination_shortfall_warnings as u64);
+        self.pagination_shortfall_assets
+            .inc_by(stats.pagination_shortfall_assets);
+        if stats.sync_token_blocked {
+            self.sync_token_blocked_cycles.inc();
+        }
 
         if stats.interrupted {
             self.interrupted_cycles.inc();
@@ -636,6 +670,43 @@ mod tests {
         );
         assert!(
             output.contains("kei_sync_bytes_downloaded_total 800"),
+            "output:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_shortfall_warning_does_not_increment_failed_counter() {
+        let handle = MetricsHandle::new(None);
+        let stats = SyncStats {
+            failed: 0,
+            enumeration_errors: 0,
+            pagination_shortfall_warnings: 1,
+            pagination_shortfall_assets: 41,
+            sync_token_blocked: true,
+            sync_token_blocked_reason: Some("pagination_shortfall"),
+            ..SyncStats::default()
+        };
+        handle.update(&stats, &healthy_status(0)).await;
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains("kei_sync_failed_total 0"),
+            "count-only shortfall must not hit failed counter:\n{output}"
+        );
+        assert!(
+            output.contains("kei_sync_enumeration_errors_total 0"),
+            "count-only shortfall must not hit hard enumeration errors:\n{output}"
+        );
+        assert!(
+            output.contains("kei_sync_pagination_shortfall_warnings_total 1"),
+            "output:\n{output}"
+        );
+        assert!(
+            output.contains("kei_sync_pagination_shortfall_assets_total 41"),
+            "output:\n{output}"
+        );
+        assert!(
+            output.contains("kei_sync_token_blocked_cycles_total 1"),
             "output:\n{output}"
         );
     }

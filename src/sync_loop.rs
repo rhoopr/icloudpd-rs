@@ -1101,7 +1101,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     tracing::warn!(
                         failed_count = cycle_result.failed_count,
                         cumulative = cumulative_failed_count,
-                        "Some downloads failed this cycle, will retry next cycle"
+                        "Some sync failures occurred this cycle, will retry next cycle"
                     );
                 } else {
                     return Err(PartialSyncError(cycle_result.failed_count).into());

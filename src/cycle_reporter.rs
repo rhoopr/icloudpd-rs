@@ -210,7 +210,7 @@ where
         if input.session_expired {
             health.record_failure("session expired");
         } else if input.failed_count > 0 {
-            health.record_failure(&format!("{} downloads failed", input.failed_count));
+            health.record_failure(&format!("{} sync failures", input.failed_count));
         } else {
             health.record_success();
         }
@@ -319,7 +319,7 @@ where
         if input.failed_count > 0 {
             self.notifier.notify(
                 notifications::Event::SyncFailed,
-                &format!("{} downloads failed", input.failed_count),
+                &format!("{} sync failures", input.failed_count),
                 self.username,
                 Some(&data),
             );
@@ -444,7 +444,7 @@ mod tests {
 
         let health_json = parse_json(&dir.path().join("health.json"));
         assert_eq!(health_json["consecutive_failures"], 1);
-        assert_eq!(health_json["last_error"], "3 downloads failed");
+        assert_eq!(health_json["last_error"], "3 sync failures");
         let report_json = parse_json(&report_path);
         assert_eq!(report_json["status"], "partial_failure");
         assert_eq!(report_json["stats"]["failed"], 3);
@@ -516,5 +516,41 @@ mod tests {
 
         let health_json = parse_json(&dir.path().join("health.json"));
         assert_eq!(health_json["consecutive_failures"], 0);
+    }
+
+    #[tokio::test]
+    async fn pagination_shortfall_warning_does_not_mark_cycle_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("sync_report.json");
+        let notifier = Notifier::new(None);
+        let reporter = reporter(dir.path(), Some(&report_path), &notifier);
+        let mut health = HealthStatus::new();
+        let stats = SyncStats {
+            failed: 0,
+            enumeration_errors: 0,
+            pagination_shortfall_warnings: 1,
+            pagination_shortfall_assets: 45,
+            sync_token_blocked: true,
+            sync_token_blocked_reason: Some("pagination_shortfall"),
+            ..SyncStats::default()
+        };
+
+        report_cycle(&reporter, &mut health, &stats, 0, false).await;
+
+        let health_json = parse_json(&dir.path().join("health.json"));
+        assert_eq!(health_json["consecutive_failures"], 0);
+        assert!(health_json["last_error"].is_null());
+
+        let report_json = parse_json(&report_path);
+        assert_eq!(report_json["status"], "success");
+        assert_eq!(report_json["stats"]["failed"], 0);
+        assert_eq!(report_json["stats"]["enumeration_errors"], 0);
+        assert_eq!(report_json["stats"]["pagination_shortfall_warnings"], 1);
+        assert_eq!(report_json["stats"]["pagination_shortfall_assets"], 45);
+        assert_eq!(report_json["stats"]["sync_token_blocked"], true);
+        assert_eq!(
+            report_json["stats"]["sync_token_blocked_reason"],
+            "pagination_shortfall"
+        );
     }
 }

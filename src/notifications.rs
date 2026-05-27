@@ -48,6 +48,10 @@ pub(crate) struct SyncNotificationData {
     pub exif_failures: usize,
     pub state_write_failures: usize,
     pub enumeration_errors: usize,
+    pub pagination_shortfall_warnings: usize,
+    pub pagination_shortfall_assets: u64,
+    pub sync_token_blocked: bool,
+    pub sync_token_blocked_reason: Option<&'static str>,
     // Skip breakdown
     pub skipped_by_state: usize,
     pub skipped_on_disk: usize,
@@ -76,6 +80,10 @@ impl From<&crate::download::SyncStats> for SyncNotificationData {
             exif_failures: s.exif_failures,
             state_write_failures: s.state_write_failures,
             enumeration_errors: s.enumeration_errors,
+            pagination_shortfall_warnings: s.pagination_shortfall_warnings,
+            pagination_shortfall_assets: s.pagination_shortfall_assets,
+            sync_token_blocked: s.sync_token_blocked,
+            sync_token_blocked_reason: s.sync_token_blocked_reason,
             skipped_by_state: s.skipped.by_state,
             skipped_on_disk: s.skipped.on_disk,
             skipped_by_media_type: s.skipped.by_media_type,
@@ -239,6 +247,15 @@ async fn run_script(
                 d.state_write_failures.to_string(),
             )
             .env("KEI_ENUMERATION_ERRORS", d.enumeration_errors.to_string())
+            .env(
+                "KEI_PAGINATION_SHORTFALL_WARNINGS",
+                d.pagination_shortfall_warnings.to_string(),
+            )
+            .env(
+                "KEI_PAGINATION_SHORTFALL_ASSETS",
+                d.pagination_shortfall_assets.to_string(),
+            )
+            .env("KEI_SYNC_TOKEN_BLOCKED", d.sync_token_blocked.to_string())
             .env("KEI_SKIPPED_BY_STATE", d.skipped_by_state.to_string())
             .env("KEI_SKIPPED_ON_DISK", d.skipped_on_disk.to_string())
             .env(
@@ -268,6 +285,9 @@ async fn run_script(
                 d.skipped_retry_exhausted.to_string(),
             )
             .env("KEI_SKIPPED_RETRY_ONLY", d.skipped_retry_only.to_string());
+        if let Some(reason) = &d.sync_token_blocked_reason {
+            cmd.env("KEI_SYNC_TOKEN_BLOCK_REASON", reason);
+        }
     }
 
     let mut child = cmd.spawn()?;

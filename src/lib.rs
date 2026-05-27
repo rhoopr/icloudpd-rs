@@ -206,16 +206,16 @@ fn harden_process() {
     }
 }
 
-/// Exit code for partial sync (some downloads failed, but sync was not a total failure).
+/// Exit code for partial sync (some sync failures occurred, but sync was not a total failure).
 const EXIT_PARTIAL: u8 = 2;
 /// Exit code for authentication failures.
 const EXIT_AUTH: u8 = 3;
 /// Exit code for terminal Apple authentication states that need operator action.
 const EXIT_TERMINAL_AUTH: u8 = 4;
 
-/// Returned when some (but not all) downloads failed during a sync.
+/// Returned when some (but not all) sync failures occurred during a cycle.
 #[derive(Debug, thiserror::Error)]
-#[error("{0} downloads failed")]
+#[error("{0} sync failures")]
 struct PartialSyncError(usize);
 
 /// Maps a fatal `Err` from `run` to an exit code and decides whether to
