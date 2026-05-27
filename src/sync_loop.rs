@@ -1508,7 +1508,9 @@ async fn store_db_sync_token(db: &dyn state::StateDb, token: &str) {
 
 /// Check `changes/database` to determine if this watch cycle can be skipped.
 ///
-/// Returns `SkipAll` when no selected zones report changes and `moreComing` is false.
+/// Returns `SkipAll` when a complete pre-check reports no selected-zone changes.
+/// An empty complete page still skips the cycle but keeps the previous
+/// `db_sync_token`, so the next watch wakeup rechecks from the same point.
 async fn check_changes_database(
     state_db: Option<&dyn state::StateDb>,
     library_states: &[LibraryState],
@@ -1555,6 +1557,7 @@ async fn check_changes_database(
                 .map(|s| s.zone_name.as_str())
                 .collect();
             let mut changed_selected_zones = rustc_hash::FxHashSet::default();
+            let has_any_changed_zone = !db_resp.zones.is_empty();
             if db_resp.more_coming {
                 tracing::debug!("changes/database has more pages (moreComing=true)");
             }
@@ -1576,7 +1579,13 @@ async fn check_changes_database(
                         db_sync_token_after_success: Some(db_resp.sync_token),
                     };
                 }
-                store_db_sync_token(db, &db_resp.sync_token).await;
+                if has_any_changed_zone {
+                    store_db_sync_token(db, &db_resp.sync_token).await;
+                } else {
+                    tracing::debug!(
+                        "changes/database returned an empty complete page; skipping without advancing db_sync_token"
+                    );
+                }
                 tracing::info!(
                     "No selected library changes detected (changes/database), skipping cycle"
                 );
@@ -3990,13 +3999,12 @@ mod tests {
         );
     }
 
-    /// Empty zones + `more_coming=false` must return `skip=true`.
-    /// This is the optimistic short-circuit: Apple confirmed there are no
-    /// pending changes, so we save a full enumeration cycle. A regression
-    /// that flipped this branch would either burn a CloudKit query per
-    /// idle wakeup (cost) or silently skip a real cycle (loss).
+    /// Empty zones + `more_coming=false` still skip this watch cycle, but
+    /// must not advance `db_sync_token`.
+    /// A suspicious empty page should self-heal on the next wakeup by
+    /// rechecking from the last persisted token.
     #[tokio::test]
-    async fn check_changes_database_empty_zones_skips_cycle() {
+    async fn check_changes_database_empty_zones_skip_without_advancing_db_sync_token() {
         use serde_json::json;
         let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
             "syncToken": "db-tok-3",
@@ -4012,6 +4020,9 @@ mod tests {
         db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("set token");
+        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
+            .await
+            .expect("seed previous db token");
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
@@ -4023,15 +4034,12 @@ mod tests {
             WatchPrecheck::SkipAll,
             "empty zones + more_coming=false must skip the cycle"
         );
-        // The new db_sync_token must still be persisted even on skip:
-        // otherwise the next call re-asks from scratch and we'd get an
-        // unbounded list of all zones.
         let stored = db
             .get_metadata(DB_SYNC_TOKEN_KEY)
             .await
             .expect("read db_sync_token")
-            .expect("token persisted on skip");
-        assert_eq!(stored, "db-tok-3");
+            .expect("token should still be present");
+        assert_eq!(stored, "db-tok-prev");
     }
 
     /// A non-empty zones list MUST NOT skip — even
@@ -4321,15 +4329,11 @@ mod tests {
         assert_eq!(failures, 0);
     }
 
-    /// A `set_metadata(DB_SYNC_TOKEN_KEY, ...)` write failure must
-    /// NOT break the cycle. The current implementation logs a warning and
-    /// continues. A regression that propagated the error would crash watch
-    /// mode whenever a sqlite hiccup hit that single write.
+    /// A `set_metadata(DB_SYNC_TOKEN_KEY, ...)` write failure on the
+    /// unselected-zone skip path must not break watch mode.
     #[tokio::test]
-    async fn check_changes_database_token_persist_failure_does_not_skip() {
+    async fn check_changes_database_unselected_zone_token_persist_failure_still_skips() {
         use serde_json::json;
-        // Inner DB has the stored sync token so the changes/database call
-        // is actually attempted.
         let inner = make_state_db();
         inner
             .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
@@ -4345,7 +4349,7 @@ mod tests {
             "syncToken": "db-tok-bad-write",
             "moreComing": false,
             "zones": [
-                {"zoneID": {"zoneName": "PrimarySync"}, "syncToken": "ps-tok-new"}
+                {"zoneID": {"zoneName": "SharedSync-ABCD"}, "syncToken": "ss-tok-new"}
             ]
         }));
         let mut svc = crate::icloud::photos::PhotosService::for_testing(
@@ -4354,13 +4358,9 @@ mod tests {
         );
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
-
-        // Zone changes hold db_sync_token advancement until after the sync
-        // succeeds, so a db token write failure here must not affect the
-        // pre-check decision.
         let precheck =
             check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
-        assert_proceed_changed(&precheck, "PrimarySync", "db-tok-bad-write");
+        assert_eq!(precheck, WatchPrecheck::SkipAll);
     }
 
     // ── preload_asset_groupings ──────────────────────────────────────
