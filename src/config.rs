@@ -695,39 +695,6 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-#[cfg(windows)]
-fn repair_malformed_windows_data_dir(path: PathBuf) -> PathBuf {
-    let Some(home) = dirs::home_dir() else {
-        return path;
-    };
-    let Some(parent) = home.parent() else {
-        return path;
-    };
-    let Some(user_name) = home.file_name() else {
-        return path;
-    };
-
-    let mut bugged_name = user_name.to_os_string();
-    bugged_name.push(".config");
-    let bugged_kei_dir = parent.join(bugged_name).join("kei");
-    let Ok(suffix) = path.strip_prefix(&bugged_kei_dir) else {
-        return path;
-    };
-
-    let corrected = kei_data_dir_with_home(&home).join(suffix);
-    tracing::warn!(
-        configured = %path.display(),
-        corrected = %corrected.display(),
-        "data_dir matches a malformed old Windows path; using corrected ~/.config/kei path"
-    );
-    corrected
-}
-
-#[cfg(not(windows))]
-fn repair_malformed_windows_data_dir(path: PathBuf) -> PathBuf {
-    path
-}
-
 /// Reject system directories that should never be used as a download
 /// target. Shared by sync (`Config::build`) and import-existing
 /// (`build_import_download_config`) so both refuse the same set with the
@@ -1034,10 +1001,10 @@ pub(crate) fn resolve_data_dir(
     config_path: &Path,
 ) -> PathBuf {
     if let Some(d) = data_dir_cli {
-        return repair_malformed_windows_data_dir(expand_tilde(d));
+        return expand_tilde(d);
     }
     if let Some(d) = toml.and_then(|t| t.data_dir.as_deref()) {
-        return repair_malformed_windows_data_dir(expand_tilde(d));
+        return expand_tilde(d);
     }
     config_path
         .parent()
@@ -5856,33 +5823,6 @@ mod tests {
         };
         let result = resolve_data_dir(None, Some(&toml), Path::new("/config/config.toml"));
         assert_eq!(result, PathBuf::from("/toml/data"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn test_resolve_data_dir_repairs_malformed_windows_dot_config_path() {
-        let Some(home) = dirs::home_dir() else {
-            return;
-        };
-        let Some(parent) = home.parent() else {
-            return;
-        };
-        let Some(user_name) = home.file_name() else {
-            return;
-        };
-
-        let mut bugged_name = user_name.to_os_string();
-        bugged_name.push(".config");
-        let bugged = parent.join(bugged_name).join("kei").join("cookies");
-        let corrected = kei_data_dir_with_home(&home).join("cookies");
-        let result = resolve_data_dir(
-            Some(&bugged.to_string_lossy()),
-            None,
-            Path::new(r"C:\unused\config.toml"),
-        );
-
-        assert_eq!(result, corrected);
-        assert_ne!(result, bugged);
     }
 
     #[test]
