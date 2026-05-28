@@ -4361,6 +4361,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_with_failed_rows_falls_back_to_full_enumeration() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = crate::test_helpers::TestAssetRecord::new("FAILED_BEFORE_SYNC")
+            .filename("failed-before-sync.jpg")
+            .checksum("ck_failed_before_sync")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        db.mark_failed(
+            "PrimarySync",
+            "FAILED_BEFORE_SYNC",
+            "original",
+            "prior download failure",
+        )
+        .await
+        .expect("mark failed");
+
+        let session = MockPhotosFlow::new()
+            .album_count(0)
+            .empty_query_page(Some("zone-token-next"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("failed rows should fall back to full enumeration");
+
+        assert!(
+            result.full_enumeration_ran,
+            "normal sync with failed rows must not stay incremental"
+        );
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+    }
+
+    #[tokio::test]
     async fn incremental_sync_queries_zone_changes_once_per_library() {
         let calls = Arc::new(AtomicUsize::new(0));
         let session = changes_zone_session(

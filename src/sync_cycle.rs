@@ -616,4 +616,28 @@ mod tests {
             &make_library_state(true),
         ));
     }
+
+    #[tokio::test]
+    async fn determine_sync_mode_two_normal_syncs_reuse_stored_token() {
+        let db = state::SqliteStateDb::open_in_memory().expect("state db");
+        let sync_token_key = sync_token_key("PrimarySync");
+        db.set_metadata(&sync_token_key, "stored-token-abc")
+            .await
+            .expect("set token");
+
+        for cycle in 1..=2 {
+            let mode =
+                determine_sync_mode(false, 1, Some(&db), &sync_token_key, "PrimarySync").await;
+            assert!(
+                matches!(mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "stored-token-abc"),
+                "normal sync cycle {cycle} should use the stored token, got {mode:?}"
+            );
+        }
+
+        assert_eq!(
+            db.get_metadata(&sync_token_key).await.expect("read token"),
+            Some("stored-token-abc".to_string()),
+            "mode selection must not consume or clear the stored token"
+        );
+    }
 }

@@ -39,6 +39,7 @@ tests/
 | `scripts/full-test/run_live_import_rehearsal.sh` | 1 | yes | `just full-test` |
 | `scripts/full-test/run_docker_puid_smoke.sh` | 1 | no | `just full-test` |
 | `scripts/full-test/run_release_archive_smoke.sh` | 1 | no | `just full-test` |
+| `scripts/full-test/run_release_regression_smoke.sh` | 8 | no | `just release-smoke` |
 | `.github/workflows/service-smoke.yml` | 3 (linux/macos/windows) | no | `just service-smoke` (linux/macOS) |
 
 Counts are approximate and drift as tests are added.
@@ -54,6 +55,7 @@ just test state       # shell: token + config-hash invariants
 just test docker      # shell: docker container scenarios
 just test PATTERN     # passes through to cargo test PATTERN
 just gate             # full pre-push gate (what CI runs)
+just release-smoke    # fast offline v0.20 hotfix regression smoke
 just full-test        # pre-release battery, including Docker and live smokes
 ```
 
@@ -182,6 +184,10 @@ happens:
 - **`scripts/full-test/run_release_archive_smoke.sh`** - packages the host
   release binary into a temp archive, extracts it, and runs basic CLI/config
   probes against the extracted binary.
+- **`scripts/full-test/run_release_regression_smoke.sh`** - fast offline
+  v0.20 hotfix gate. Run `just release-smoke` before any `v0.20.x` hotfix and
+  before release branches that touch sync tokens, retry state, download
+  validation, config paths, or reporting.
 - **`scripts/full-test/run_docker_puid_smoke.sh`** - offline Docker entrypoint
   checks for PUID/PGID drop, volume chown, root-default behavior, and invalid
   env rejection.

@@ -65,6 +65,10 @@ full-test:
 full-test-history N="10":
     scripts/full-test/history.sh "{{N}}"
 
+# Fast offline v0.20 patch-release smoke for the May 27 regression set.
+release-smoke:
+    scripts/full-test/run_release_regression_smoke.sh
+
 # Test dispatcher: offline | fast | live | concurrency | state | docker | PATTERN.
 test MODE="":
     #!/usr/bin/env bash
