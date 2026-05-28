@@ -309,17 +309,16 @@ async fn attempt_download<C: DownloadClient>(
         }
     };
 
-    // Reject HTML content-type before writing to disk. Apple's CDN sometimes
-    // returns HTTP 200 with text/html for rate-limit or error pages.
-    // Delete any stale .part file so the next successful attempt starts fresh
-    // rather than appending to data from a previous (possibly different) response.
+    // Reject content types that prove the body is an error document before
+    // writing to disk. Delete any stale .part file so the next successful
+    // attempt starts fresh rather than appending to data from a previous
+    // (possibly different) response.
     if let Some(ct) = &response.content_type {
-        let ct_lower = ct.to_ascii_lowercase();
-        if ct_lower.starts_with("text/html") {
+        if let Some(reason) = rejecting_content_type_reason(ct) {
             crate::fs_util::log_remove_async(part_path).await;
             return Err(DownloadError::InvalidContent {
                 path: path_str.into(),
-                reason: format!("server returned content-type: {ct}").into(),
+                reason: format!("server returned {reason} content-type: {ct}").into(),
             });
         }
     }
@@ -772,6 +771,22 @@ fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum>
     Ok(DecodedChecksum { hex, is_sha1 })
 }
 
+fn rejecting_content_type_reason(content_type: &str) -> Option<&'static str> {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+
+    match essence.as_str() {
+        "text/html" | "application/xhtml+xml" => Some("HTML"),
+        "application/json" | "text/json" => Some("JSON"),
+        _ if essence.ends_with("+json") => Some("JSON"),
+        _ => None,
+    }
+}
+
 /// Inspect the first bytes of a downloaded file for known-bad sentinels that
 /// unambiguously identify a non-media error body (HTML error page, JSON error,
 /// etc.). Returns a human-readable reason string when a sentinel is present.
@@ -886,14 +901,17 @@ fn is_mov_top_atom(atom: &[u8]) -> bool {
     )
 }
 
-/// Validate that downloaded content matches expected format for the file extension.
+/// Validate downloaded content using kei's permissive valid-media policy.
 ///
-/// For known media types (JPEG, PNG, HEIC, MOV, etc.), checks magic bytes in the
-/// file header. HTML and JSON error-page sentinels are always rejected before
-/// extension-specific checks because Apple's CDN occasionally returns them with
-/// HTTP 200. Extension-specific mismatches are warnings, not hard failures:
-/// iCloud sometimes assigns `.PNG` names to JPEG bytes, and kei's signature
-/// table is intentionally not treated as a complete media catalog.
+/// Hard-fail only when kei has positive evidence the file is unsafe or
+/// incomplete: zero bytes, known HTML/JSON error bodies, known error-document
+/// content types checked before writing, or byte-count mismatches checked by
+/// the caller.
+/// Extension-specific magic mismatches are warnings, not hard failures: iCloud
+/// sometimes assigns `.PNG` names to JPEG bytes, and kei's signature table is
+/// intentionally not treated as a complete media catalog. Unknown-but-not-known
+/// bad headers are saved when size checks have passed. Filenames stay exactly as
+/// planned; validation never rewrites extensions.
 fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,
@@ -1393,6 +1411,28 @@ mod tests {
         assert!(detect_error_sentinel(b"").is_none());
         // A JSON-looking body that isn't an error envelope should pass through
         assert!(detect_error_sentinel(b"{\"width\":1024}").is_none());
+    }
+
+    #[test]
+    fn rejecting_content_type_reason_classifies_error_document_types() {
+        assert_eq!(
+            rejecting_content_type_reason("text/html; charset=utf-8"),
+            Some("HTML")
+        );
+        assert_eq!(
+            rejecting_content_type_reason("Application/JSON"),
+            Some("JSON")
+        );
+        assert_eq!(
+            rejecting_content_type_reason("application/problem+json"),
+            Some("JSON")
+        );
+
+        assert_eq!(rejecting_content_type_reason("image/jpeg"), None);
+        assert_eq!(
+            rejecting_content_type_reason("application/octet-stream"),
+            None
+        );
     }
 
     #[test]
@@ -2485,6 +2525,40 @@ mod tests {
             err.to_string().contains("content-type"),
             "error message should mention content-type"
         );
+    }
+
+    #[tokio::test]
+    async fn attempt_download_rejects_application_json_content_type() {
+        let body = br#"{"error":"Forbidden"}"#;
+        let client = StubDownloadClient::ok(body).with_content_type("application/json");
+        let (download_path, part_path, _dir) = setup_download_dir("ct_json", "jpg");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, DownloadError::InvalidContent { .. }),
+            "expected InvalidContent, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("JSON content-type"),
+            "error message should identify JSON content-type, got: {err}"
+        );
+        assert!(
+            !part_path.exists(),
+            ".part should be deleted after JSON content-type rejection"
+        );
+        assert!(!download_path.exists(), "final path must not exist");
     }
 
     #[tokio::test]
