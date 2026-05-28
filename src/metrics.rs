@@ -513,6 +513,18 @@ async fn handle_healthz(State(handle): State<MetricsHandle>) -> impl IntoRespons
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn render_metrics_for_test(handle: &MetricsHandle) -> String {
+    let response = handle_metrics(State(handle.clone())).await;
+    let body = axum::body::to_bytes(
+        axum::response::IntoResponse::into_response(response).into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
 // ── Server entrypoint ─────────────────────────────────────────────────────────
 
 /// Bind and spawn the metrics HTTP server as a background tokio task.
@@ -587,14 +599,7 @@ mod tests {
     }
 
     async fn render_metrics(handle: &MetricsHandle) -> String {
-        let response = handle_metrics(State(handle.clone())).await;
-        let body = axum::body::to_bytes(
-            axum::response::IntoResponse::into_response(response).into_body(),
-            usize::MAX,
-        )
-        .await
-        .unwrap();
-        String::from_utf8(body.to_vec()).unwrap()
+        super::render_metrics_for_test(handle).await
     }
 
     async fn render_healthz(handle: &MetricsHandle) -> (axum::http::StatusCode, String) {

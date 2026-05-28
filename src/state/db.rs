@@ -2100,6 +2100,29 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) fn sync_run_snapshot_for_test(
+        &self,
+        run_id: i64,
+    ) -> Result<(String, i64, i64, i64, i32), StateError> {
+        let conn = self.acquire_lock("sync_run_snapshot_for_test")?;
+        conn.query_row(
+            "SELECT status, assets_seen, assets_failed, enumeration_errors, interrupted \
+             FROM sync_runs WHERE id = ?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i32>(4)?,
+                ))
+            },
+        )
+        .map_err(|e| StateError::query("sync_run_snapshot_for_test", e))
+    }
+
     pub(crate) async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
         self.with_conn("promote_orphaned_sync_runs", move |conn| {
             let rows = conn
@@ -3712,13 +3735,7 @@ mod tests {
     // ── sync_runs status lifecycle ─────────────────────────────────────────
 
     fn status_of(db: &SqliteStateDb, run_id: i64) -> String {
-        let conn = db.acquire_lock("test_status_of").unwrap();
-        conn.query_row(
-            "SELECT status FROM sync_runs WHERE id = ?1",
-            [run_id],
-            |row| row.get::<_, String>(0),
-        )
-        .unwrap()
+        db.sync_run_snapshot_for_test(run_id).unwrap().0
     }
 
     #[tokio::test]

@@ -362,10 +362,12 @@ mod tests {
         RunOptions::from_config(&config)
     }
 
-    fn reporter<'a>(
+    fn reporter_with_surfaces<'a>(
         dir: &'a Path,
         report_path: Option<&'a Path>,
         notifier: &'a Notifier,
+        state_db: Option<&'a state::SqliteStateDb>,
+        metrics_handle: Option<&'a MetricsHandle>,
     ) -> CycleReporter<'a, state::SqliteStateDb> {
         CycleReporter::new(CycleReporterConfig {
             username: "reporter@example.com",
@@ -374,10 +376,18 @@ mod tests {
             run_options: run_options(),
             health_dir: dir,
             personality_mode: Mode::Off,
-            state_db: None,
-            metrics_handle: None,
+            state_db,
+            metrics_handle,
             notifier,
         })
+    }
+
+    fn reporter<'a>(
+        dir: &'a Path,
+        report_path: Option<&'a Path>,
+        notifier: &'a Notifier,
+    ) -> CycleReporter<'a, state::SqliteStateDb> {
+        reporter_with_surfaces(dir, report_path, notifier, None, None)
     }
 
     fn reporter_with_db<'a>(
@@ -386,22 +396,50 @@ mod tests {
         notifier: &'a Notifier,
         db: &'a state::SqliteStateDb,
     ) -> CycleReporter<'a, state::SqliteStateDb> {
-        CycleReporter::new(CycleReporterConfig {
-            username: "reporter@example.com",
-            watch_mode: false,
-            report_path,
-            run_options: run_options(),
-            health_dir: dir,
-            personality_mode: Mode::Off,
-            state_db: Some(db),
-            metrics_handle: None,
-            notifier,
-        })
+        reporter_with_surfaces(dir, report_path, notifier, Some(db), None)
+    }
+
+    #[cfg(unix)]
+    fn reporter_with_db_and_metrics<'a>(
+        dir: &'a Path,
+        report_path: Option<&'a Path>,
+        notifier: &'a Notifier,
+        db: &'a state::SqliteStateDb,
+        metrics_handle: &'a MetricsHandle,
+    ) -> CycleReporter<'a, state::SqliteStateDb> {
+        reporter_with_surfaces(dir, report_path, notifier, Some(db), Some(metrics_handle))
     }
 
     fn parse_json(path: &Path) -> serde_json::Value {
         let contents = std::fs::read_to_string(path).unwrap();
         serde_json::from_str(&contents).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
+    #[cfg(unix)]
+    fn write_notification_capture_script(dir: &Path, output_path: &Path) -> std::path::PathBuf {
+        let script_path = dir.join("notify.sh");
+        let output_path = shell_quote(output_path);
+        let body = format!(
+            "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s|%s\\n' \"$KEI_EVENT\" \"$KEI_MESSAGE\" \"$KEI_FAILED\" \"$KEI_ENUMERATION_ERRORS\" \"$KEI_PAGINATION_SHORTFALL_WARNINGS\" \"$KEI_SYNC_TOKEN_BLOCKED\" \"${{KEI_SYNC_TOKEN_BLOCK_REASON:-}}\" > {output_path}\n"
+        );
+        std::fs::write(&script_path, body).unwrap();
+        script_path
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_notification_output(path: &Path) -> String {
+        for _ in 0..100 {
+            if let Ok(output) = std::fs::read_to_string(path) {
+                return output;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("notification script did not write {}", path.display());
     }
 
     fn assert_sync_token_observation_fields(
@@ -442,6 +480,313 @@ mod tests {
                 },
             )
             .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_report_outcome_matrix_keeps_db_metrics_and_notifications_consistent() {
+        struct OutcomeCase {
+            name: &'static str,
+            stats: SyncStats,
+            failed_count: usize,
+            session_expired: bool,
+            expected_report_status: &'static str,
+            expected_health_failures: u64,
+            expected_health_error: Option<&'static str>,
+            expected_notification: &'static str,
+            expected_notification_message: &'static str,
+            expected_db_status: &'static str,
+            expected_db_assets_failed: i64,
+            expected_db_enumeration_errors: i64,
+            expected_metrics: &'static [&'static str],
+        }
+
+        let cases = [
+            OutcomeCase {
+                name: "clean success",
+                stats: SyncStats {
+                    assets_seen: 4,
+                    downloaded: 2,
+                    bytes_downloaded: 2048,
+                    ..SyncStats::default()
+                },
+                failed_count: 0,
+                session_expired: false,
+                expected_report_status: "success",
+                expected_health_failures: 0,
+                expected_health_error: None,
+                expected_notification: "sync_complete",
+                expected_notification_message: "Sync completed successfully",
+                expected_db_status: "complete",
+                expected_db_assets_failed: 0,
+                expected_db_enumeration_errors: 0,
+                expected_metrics: &[
+                    "kei_sync_downloaded_total 2",
+                    "kei_sync_failed_total 0",
+                    "kei_sync_enumeration_errors_total 0",
+                ],
+            },
+            OutcomeCase {
+                name: "warning-only token-blocked success",
+                stats: SyncStats {
+                    assets_seen: 1533,
+                    pagination_shortfall_warnings: 1,
+                    pagination_shortfall_assets: 45,
+                    sync_token_blocked: true,
+                    sync_token_blocked_reason: Some("pagination_shortfall"),
+                    sync_token_blocked_source: Some("icloud"),
+                    sync_token_blocked_explanation: Some(
+                        crate::download::sync_token_blocked_explanation("pagination_shortfall"),
+                    ),
+                    sync_token_blocked_zone: Some("PrimarySync".to_string()),
+                    ..SyncStats::default()
+                },
+                failed_count: 0,
+                session_expired: false,
+                expected_report_status: "success",
+                expected_health_failures: 0,
+                expected_health_error: None,
+                expected_notification: "sync_complete",
+                expected_notification_message: "Sync completed successfully",
+                expected_db_status: "complete",
+                expected_db_assets_failed: 0,
+                expected_db_enumeration_errors: 0,
+                expected_metrics: &[
+                    "kei_sync_failed_total 0",
+                    "kei_sync_enumeration_errors_total 0",
+                    "kei_sync_pagination_shortfall_warnings_total 1",
+                    "kei_sync_token_blocked_cycles_total 1",
+                ],
+            },
+            OutcomeCase {
+                name: "sync-token blocked without transfer failure",
+                stats: SyncStats {
+                    assets_seen: 10,
+                    sync_token_blocked: true,
+                    sync_token_blocked_reason: Some("icloud_blank_sync_token"),
+                    sync_token_blocked_source: Some("icloud"),
+                    sync_token_blocked_explanation: Some(
+                        crate::download::sync_token_blocked_explanation("icloud_blank_sync_token"),
+                    ),
+                    sync_token_blocked_zone: Some("PrimarySync".to_string()),
+                    sync_token_expected_receivers: Some(1),
+                    sync_token_receivers_with_token: Some(0),
+                    sync_token_receivers_missing: Some(0),
+                    sync_token_receivers_blank: Some(1),
+                    sync_token_receivers_dropped: Some(0),
+                    sync_token_unique_values: Some(0),
+                    ..SyncStats::default()
+                },
+                failed_count: 0,
+                session_expired: false,
+                expected_report_status: "success",
+                expected_health_failures: 0,
+                expected_health_error: None,
+                expected_notification: "sync_complete",
+                expected_notification_message: "Sync completed successfully",
+                expected_db_status: "complete",
+                expected_db_assets_failed: 0,
+                expected_db_enumeration_errors: 0,
+                expected_metrics: &[
+                    "kei_sync_failed_total 0",
+                    "kei_sync_enumeration_errors_total 0",
+                    "kei_sync_token_blocked_cycles_total 1",
+                ],
+            },
+            OutcomeCase {
+                name: "enumeration partial failure",
+                stats: SyncStats {
+                    assets_seen: 8,
+                    enumeration_errors: 2,
+                    ..SyncStats::default()
+                },
+                failed_count: 2,
+                session_expired: false,
+                expected_report_status: "partial_failure",
+                expected_health_failures: 1,
+                expected_health_error: Some("2 sync failures"),
+                expected_notification: "sync_failed",
+                expected_notification_message: "2 sync failures",
+                expected_db_status: "complete",
+                expected_db_assets_failed: 0,
+                expected_db_enumeration_errors: 2,
+                expected_metrics: &[
+                    "kei_sync_failed_total 0",
+                    "kei_sync_enumeration_errors_total 2",
+                ],
+            },
+            OutcomeCase {
+                name: "real download failure",
+                stats: SyncStats {
+                    assets_seen: 12,
+                    failed: 3,
+                    ..SyncStats::default()
+                },
+                failed_count: 3,
+                session_expired: false,
+                expected_report_status: "partial_failure",
+                expected_health_failures: 1,
+                expected_health_error: Some("3 sync failures"),
+                expected_notification: "sync_failed",
+                expected_notification_message: "3 sync failures",
+                expected_db_status: "complete",
+                expected_db_assets_failed: 3,
+                expected_db_enumeration_errors: 0,
+                expected_metrics: &[
+                    "kei_sync_failed_total 3",
+                    "kei_sync_enumeration_errors_total 0",
+                ],
+            },
+        ];
+
+        for case in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let report_path = dir.path().join("sync_report.json");
+            let notification_output = dir.path().join("notification.txt");
+            let script_path = write_notification_capture_script(dir.path(), &notification_output);
+            let notifier = Notifier::new(Some(script_path));
+            let db = state::SqliteStateDb::open_in_memory().unwrap();
+            let metrics_handle = MetricsHandle::new(None);
+            let reporter = reporter_with_db_and_metrics(
+                dir.path(),
+                Some(&report_path),
+                &notifier,
+                &db,
+                &metrics_handle,
+            );
+            let mut health = HealthStatus::new();
+
+            let run_id = db.start_sync_run().await.unwrap();
+            db.complete_sync_run(
+                run_id,
+                &state::SyncRunStats {
+                    assets_seen: case.stats.assets_seen,
+                    assets_downloaded: u64::try_from(case.stats.downloaded).unwrap(),
+                    assets_failed: u64::try_from(case.stats.failed).unwrap(),
+                    enumeration_errors: u64::try_from(case.stats.enumeration_errors).unwrap(),
+                    interrupted: case.stats.interrupted,
+                },
+            )
+            .await
+            .unwrap();
+
+            report_cycle(
+                &reporter,
+                &mut health,
+                &case.stats,
+                case.failed_count,
+                case.session_expired,
+            )
+            .await;
+
+            let report_json = parse_json(&report_path);
+            assert_eq!(
+                report_json["status"], case.expected_report_status,
+                "{} report status",
+                case.name
+            );
+            assert_eq!(
+                report_json["stats"]["failed"], case.stats.failed,
+                "{} JSON failed counter",
+                case.name
+            );
+            assert_eq!(
+                report_json["stats"]["enumeration_errors"], case.stats.enumeration_errors,
+                "{} JSON enumeration_errors counter",
+                case.name
+            );
+            assert_eq!(
+                report_json["stats"]["pagination_shortfall_warnings"],
+                case.stats.pagination_shortfall_warnings,
+                "{} JSON shortfall warnings",
+                case.name
+            );
+            assert_eq!(
+                report_json["stats"]["sync_token_blocked"], case.stats.sync_token_blocked,
+                "{} JSON token-blocked flag",
+                case.name
+            );
+            if let Some(reason) = case.stats.sync_token_blocked_reason {
+                assert_eq!(
+                    report_json["stats"]["sync_token_blocked_reason"], reason,
+                    "{} JSON token-blocked reason",
+                    case.name
+                );
+            } else {
+                assert!(
+                    report_json["stats"]["sync_token_blocked_reason"].is_null(),
+                    "{} JSON token-blocked reason should be absent",
+                    case.name
+                );
+            }
+
+            let health_json = parse_json(&dir.path().join("health.json"));
+            assert_eq!(
+                health_json["consecutive_failures"], case.expected_health_failures,
+                "{} health failure count",
+                case.name
+            );
+            match case.expected_health_error {
+                Some(expected) => assert_eq!(
+                    health_json["last_error"], expected,
+                    "{} health last_error",
+                    case.name
+                ),
+                None => assert!(
+                    health_json["last_error"].is_null(),
+                    "{} health last_error should be null",
+                    case.name
+                ),
+            }
+
+            let (status, assets_seen, assets_failed, enumeration_errors, interrupted) =
+                db.sync_run_snapshot_for_test(run_id).unwrap();
+            assert_eq!(status, case.expected_db_status, "{} DB status", case.name);
+            assert_eq!(
+                assets_seen,
+                i64::try_from(case.stats.assets_seen).unwrap(),
+                "{} DB assets_seen",
+                case.name
+            );
+            assert_eq!(
+                assets_failed, case.expected_db_assets_failed,
+                "{} DB assets_failed",
+                case.name
+            );
+            assert_eq!(
+                enumeration_errors, case.expected_db_enumeration_errors,
+                "{} DB enumeration_errors",
+                case.name
+            );
+            assert_eq!(interrupted, 0, "{} DB interrupted flag", case.name);
+
+            let metrics = crate::metrics::render_metrics_for_test(&metrics_handle).await;
+            for expected in case.expected_metrics {
+                assert!(
+                    metrics.contains(expected),
+                    "{} metrics missing {expected}; output:\n{metrics}",
+                    case.name
+                );
+            }
+
+            let notification = wait_for_notification_output(&notification_output).await;
+            let expected_notification = format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                case.expected_notification,
+                case.expected_notification_message,
+                case.stats.failed,
+                case.stats.enumeration_errors,
+                case.stats.pagination_shortfall_warnings,
+                case.stats.sync_token_blocked,
+                case.stats.sync_token_blocked_reason.unwrap_or("")
+            );
+            assert_eq!(
+                notification.trim(),
+                expected_notification,
+                "{} notification env",
+                case.name
+            );
+        }
     }
 
     #[tokio::test]
