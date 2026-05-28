@@ -366,6 +366,45 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn wait_until_file_contains(path: &Path, expected: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let last_observed = match std::fs::read_to_string(path) {
+                Ok(contents) if contents.contains(expected) => return,
+                Ok(contents) => contents,
+                Err(err) => format!("<read failed: {err}>"),
+            };
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {} to contain {expected:?}; last observed: {last_observed:?}",
+                path.display()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_until_available_permits(
+        semaphore: &tokio::sync::Semaphore,
+        expected_permits: usize,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let available = semaphore.available_permits();
+            if available == expected_permits {
+                return;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for notifier permits; expected {expected_permits}, observed {available}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_script_success() {
         let dir = notification_test_dir("run_script_success");
@@ -499,7 +538,9 @@ mod tests {
     async fn notifier_drops_events_when_saturated() {
         let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let dir = notification_test_dir("saturated notifier");
-        let script_path = write_test_script(dir.path(), "notify.sh", b"#!/bin/sh\nexit 0\n");
+        let output_path = dir.path().join("fresh-notify.txt");
+        let body = format!("#!/bin/sh\necho fresh > {}\n", output_path.display());
+        let script_path = write_test_script(dir.path(), "notify.sh", body.as_bytes());
         let notifier = Notifier::new(Some(script_path));
         let held: Vec<_> = (0..NOTIFIER_MAX_INFLIGHT)
             .map(|_| {
@@ -535,11 +576,19 @@ mod tests {
             0,
             "dropped notification must not consume or leak a permit"
         );
+        assert!(
+            !output_path.exists(),
+            "saturated notification should be dropped instead of queued"
+        );
+
         drop(held);
+        notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
+        wait_until_file_contains(&output_path, "fresh").await;
+        wait_until_available_permits(&notifier.concurrency, NOTIFIER_MAX_INFLIGHT).await;
         assert_eq!(
-            notifier.concurrency.available_permits(),
-            NOTIFIER_MAX_INFLIGHT,
-            "held permits must return after saturation"
+            read_script_output(&output_path).trim(),
+            "fresh",
+            "fresh notification should run through Notifier::notify after saturation"
         );
     }
 
