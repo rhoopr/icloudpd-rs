@@ -13,6 +13,118 @@ use crate::icloud::photos::session::PhotosSession;
 use crate::icloud::photos::PhotoAsset;
 use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey};
 
+// ── Tracing capture helper ─────────────────────────────────────────
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct CapturedEvent {
+    pub level: tracing::Level,
+    pub fields: std::collections::HashMap<String, String>,
+}
+
+#[cfg(test)]
+impl CapturedEvent {
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.field("message")
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct TracingCapture {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+#[cfg(test)]
+impl TracingCapture {
+    pub fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::prelude::*;
+
+        let capture = Self::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer {
+            events: Arc::clone(&capture.events),
+        });
+        let guard = tracing::subscriber::set_default(subscriber);
+        (capture, guard)
+    }
+
+    pub fn events(&self) -> Vec<CapturedEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn contains_event(&self, predicate: impl Fn(&CapturedEvent) -> bool) -> bool {
+        self.events().iter().any(predicate)
+    }
+}
+
+#[cfg(test)]
+struct CaptureLayer {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+#[cfg(test)]
+impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = FieldVisitor::default();
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(CapturedEvent {
+                level: *event.metadata().level(),
+                fields: visitor.fields,
+            });
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FieldVisitor {
+    fields: std::collections::HashMap<String, String>,
+}
+
+#[cfg(test)]
+impl tracing::field::Visit for FieldVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.fields
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
 // ── AssetRecord builder ─────────────────────────────────────────────
 
 /// Builder for `AssetRecord::new_pending()` with sensible test defaults.

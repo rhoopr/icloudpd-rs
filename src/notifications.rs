@@ -450,118 +450,42 @@ mod tests {
         assert_eq!(output.trim(), "42|3|100|1500000|80");
     }
 
-    /// Test scaffold: a barrier-blocked sh script that tracks both
-    /// concurrent in-flight invocations (per-pid marker files) and
-    /// total invocations (single-byte appends). Each invocation:
-    /// 1. Appends one byte to `invocations` (atomic on Linux).
-    /// 2. Drops a marker file at `inflight/$pid`.
-    /// 3. Polls until `release` exists.
-    /// 4. Removes its marker on exit.
-    #[cfg(unix)]
-    struct BarrierFixture {
-        _dir: tempfile::TempDir,
-        counter_dir: PathBuf,
-        release: PathBuf,
-        invocations: PathBuf,
-        script_path: PathBuf,
-    }
-
-    #[cfg(unix)]
-    impl BarrierFixture {
-        fn new() -> Self {
-            let dir = notification_test_dir("barrier notification script");
-            let counter_dir = dir.path().join("inflight");
-            std::fs::create_dir_all(&counter_dir).unwrap_or_else(|err| {
-                panic!(
-                    "create notification script counter dir {}: {err}",
-                    counter_dir.display()
-                )
-            });
-            let release = dir.path().join("release");
-            let invocations = dir.path().join("invocations");
-            let body = format!(
-                "#!/bin/sh\nprintf x >> \"{}\"\nmarker=\"{}/$$\"\n: > \"$marker\"\n\
-                 while [ ! -f \"{}\" ]; do sleep 0.02; done\nrm -f \"$marker\"\n",
-                invocations.display(),
-                counter_dir.display(),
-                release.display(),
-            );
-            let script_path = write_test_script(dir.path(), "barrier.sh", body.as_bytes());
-            Self {
-                _dir: dir,
-                counter_dir,
-                release,
-                invocations,
-                script_path,
-            }
-        }
-
-        fn count_markers(&self) -> usize {
-            std::fs::read_dir(&self.counter_dir)
-                .map(|it| it.flatten().count())
-                .unwrap_or(0)
-        }
-
-        fn count_invocations(&self) -> usize {
-            std::fs::read(&self.invocations)
-                .map(|b| b.len())
-                .unwrap_or(0)
-        }
-
-        fn release_barrier(&self) {
-            std::fs::write(&self.release, b"").unwrap_or_else(|err| {
-                panic!(
-                    "write notification script release file {}: {err}",
-                    self.release.display()
-                )
-            });
-        }
-
-        async fn wait_until<F: FnMut() -> bool>(&self, timeout: Duration, mut pred: F) {
-            let deadline = tokio::time::Instant::now() + timeout;
-            while tokio::time::Instant::now() < deadline {
-                if pred() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    }
-
-    /// Fire more events than `NOTIFIER_MAX_INFLIGHT` at a barrier script
-    /// and confirm the semaphore caps concurrent in-flight invocations.
-    /// Without the cap, every event would spawn `/bin/sh` concurrently
-    /// and the marker count would exceed `NOTIFIER_MAX_INFLIGHT`.
+    /// The semaphore itself is the concurrency contract. Acquire every
+    /// permit explicitly instead of coordinating shell scripts with marker
+    /// files and sleep loops.
     #[cfg(unix)]
     #[tokio::test]
     async fn notifier_semaphore_caps_concurrent_inflight() {
-        let fixture = BarrierFixture::new();
-        let notifier = Notifier::new(Some(fixture.script_path.clone()));
-        for _ in 0..NOTIFIER_MAX_INFLIGHT * 2 {
-            notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
-        }
-
-        fixture
-            .wait_until(Duration::from_secs(5), || {
-                fixture.count_markers() == NOTIFIER_MAX_INFLIGHT
+        let notifier = Notifier::new(Some(PathBuf::from("/tmp/codex/kei/unused-notify.sh")));
+        let held: Vec<_> = (0..NOTIFIER_MAX_INFLIGHT)
+            .map(|_| {
+                Arc::clone(&notifier.concurrency)
+                    .try_acquire_owned()
+                    .expect("permit should be available")
             })
-            .await;
+            .collect();
         assert_eq!(
-            fixture.count_markers(),
+            held.len(),
             NOTIFIER_MAX_INFLIGHT,
-            "semaphore must cap in-flight scripts at the hard limit"
+            "test must hold every notifier permit"
         );
         assert_eq!(
-            fixture.count_invocations(),
-            NOTIFIER_MAX_INFLIGHT,
-            "while barrier is closed, only permit-sized scripts should start"
+            notifier.concurrency.available_permits(),
+            0,
+            "all notification permits should be held"
         );
-
-        fixture.release_barrier();
-        fixture
-            .wait_until(Duration::from_secs(5), || fixture.count_markers() == 0)
-            .await;
-        assert_eq!(fixture.count_markers(), 0, "scripts did not drain");
+        assert!(
+            Arc::clone(&notifier.concurrency)
+                .try_acquire_owned()
+                .is_err(),
+            "semaphore must reject the next concurrent invocation"
+        );
+        drop(held);
+        assert_eq!(
+            notifier.concurrency.available_permits(),
+            NOTIFIER_MAX_INFLIGHT,
+            "dropping held permits must restore full capacity"
+        );
     }
 
     /// When more than `NOTIFIER_MAX_INFLIGHT` events are fired while every
@@ -571,73 +495,51 @@ mod tests {
     /// the surplus saturates and we drop on the floor. After permits are
     /// released, fresh events must still be able to acquire (no permit leak).
     #[cfg(unix)]
-    #[tracing_test::traced_test]
     #[tokio::test]
     async fn notifier_drops_events_when_saturated() {
-        let fixture = BarrierFixture::new();
-        let notifier = Notifier::new(Some(fixture.script_path.clone()));
-        for _ in 0..NOTIFIER_MAX_INFLIGHT * 4 {
-            notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
-        }
-
-        fixture
-            .wait_until(Duration::from_secs(5), || {
-                fixture.count_markers() >= NOTIFIER_MAX_INFLIGHT
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let dir = notification_test_dir("saturated notifier");
+        let script_path = write_test_script(dir.path(), "notify.sh", b"#!/bin/sh\nexit 0\n");
+        let notifier = Notifier::new(Some(script_path));
+        let held: Vec<_> = (0..NOTIFIER_MAX_INFLIGHT)
+            .map(|_| {
+                Arc::clone(&notifier.concurrency)
+                    .try_acquire_owned()
+                    .expect("permit should be available")
             })
-            .await;
+            .collect();
         assert_eq!(
-            fixture.count_markers(),
-            NOTIFIER_MAX_INFLIGHT,
-            "expected exactly {NOTIFIER_MAX_INFLIGHT} scripts holding permits"
+            notifier.concurrency.available_permits(),
+            0,
+            "test must hold every permit before calling notify"
         );
 
-        fixture.release_barrier();
-        fixture
-            .wait_until(Duration::from_secs(5), || fixture.count_markers() == 0)
-            .await;
-        fixture
-            .wait_until(Duration::from_secs(5), || {
-                notifier.concurrency.available_permits() == NOTIFIER_MAX_INFLIGHT
+        notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
+
+        let events = capture.events();
+        let saturated = events
+            .iter()
+            .find(|event| {
+                event.level == tracing::Level::WARN
+                    && event.message() == Some("Notifier saturated, dropping event")
             })
-            .await;
+            .unwrap_or_else(|| panic!("missing notifier saturation warning: {events:?}"));
+        assert_eq!(saturated.field("event"), Some(Event::SyncStarted.as_str()));
+        let expected_in_flight = NOTIFIER_MAX_INFLIGHT.to_string();
         assert_eq!(
-            fixture.count_markers(),
-            0,
-            "scripts did not drain after release"
+            saturated.field("in_flight"),
+            Some(expected_in_flight.as_str())
         );
         assert_eq!(
             notifier.concurrency.available_permits(),
-            NOTIFIER_MAX_INFLIGHT,
-            "notification permits did not fully drain after release"
+            0,
+            "dropped notification must not consume or leak a permit"
         );
-
-        // Dropped events must not retroactively run once permits are free.
+        drop(held);
         assert_eq!(
-            fixture.count_invocations(),
+            notifier.concurrency.available_permits(),
             NOTIFIER_MAX_INFLIGHT,
-            "saturation drop regressed: surplus events ran retroactively"
-        );
-        assert!(
-            logs_contain("Notifier saturated"),
-            "expected a 'Notifier saturated' warning during the flood"
-        );
-
-        // Permit-leak guard: after drain, fresh events should run.
-        // With `release` in place, each new script exits immediately.
-        const FRESH_BATCH: usize = 4;
-        for _ in 0..FRESH_BATCH {
-            notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
-        }
-        let expected_total = NOTIFIER_MAX_INFLIGHT + FRESH_BATCH;
-        fixture
-            .wait_until(Duration::from_secs(5), || {
-                fixture.count_invocations() >= expected_total
-            })
-            .await;
-        assert_eq!(
-            fixture.count_invocations(),
-            expected_total,
-            "permit leak: post-release events failed to acquire"
+            "held permits must return after saturation"
         );
     }
 

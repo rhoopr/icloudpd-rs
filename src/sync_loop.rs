@@ -2580,35 +2580,34 @@ mod tests {
     /// them with a positional message) would silently lose operator
     /// visibility into commingle scenarios. Pin the field shape so the
     /// regression is loud.
-    #[tracing_test::traced_test]
     #[test]
     fn warn_if_multi_library_paths_commingle_emits_structured_fields() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let sel = selection_all_passes_active();
         let states = commingle_test_states(3, &sel);
         warn_if_multi_library_paths_commingle(&states, "%Y/%m/%d", "{album}", "{smart-folder}");
-        assert!(
-            logs_contain("library_count=3"),
-            "structured library_count field expected on warn line"
-        );
-        // `missing = ?missing` debug-formats the Vec; the rendered output
-        // contains the bare flag names. Pin at least the unfiled-related
-        // root flag and the album-template flag.
-        assert!(
-            logs_contain("missing="),
-            "structured `missing` field expected on warn line"
-        );
-        assert!(
-            logs_contain("--folder-structure"),
-            "missing list should include the root --folder-structure flag"
-        );
-        assert!(
-            logs_contain("--folder-structure-albums"),
-            "missing list should include the album-template flag"
-        );
-        assert!(
-            logs_contain("--folder-structure-smart-folders"),
-            "missing list should include the smart-folder-template flag"
-        );
+        let events = capture.events();
+        let warn = events
+            .iter()
+            .find(|event| {
+                event.level == tracing::Level::WARN
+                    && event
+                        .message()
+                        .is_some_and(|msg| msg.starts_with("Multi-library sync"))
+            })
+            .unwrap_or_else(|| panic!("missing commingle warning event: {events:?}"));
+        assert_eq!(warn.field("library_count"), Some("3"));
+        let missing = warn.field("missing").expect("missing field");
+        for flag in [
+            "--folder-structure",
+            "--folder-structure-albums",
+            "--folder-structure-smart-folders",
+        ] {
+            assert!(
+                missing.contains(flag),
+                "missing field should include {flag}, got {missing}"
+            );
+        }
     }
 
     /// CG-6 negative: when `{library}` is present in every active
@@ -4797,8 +4796,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tracing_test::traced_test]
     async fn run_cycle_destination_replaced_after_enumeration_reports_partial_failure() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let config = make_run_cycle_config();
         let inner = make_state_db();
         let download_dir = tempfile::tempdir().expect("download tempdir");
@@ -4868,14 +4867,20 @@ mod tests {
             "failed asset error should name the failing filesystem operation, got: {last_error}"
         );
         let root = download_root.display().to_string();
+        let events = capture.events();
+        let failure_event = events
+            .iter()
+            .find(|event| {
+                event.level == tracing::Level::ERROR
+                    && event.message() == Some("Download failed")
+                    && event.field("asset_id") == Some(master_record_name)
+            })
+            .unwrap_or_else(|| panic!("missing structured download failure event: {events:?}"));
         assert!(
-            logs_contain("Download failed") && logs_contain(&root),
-            "download failure log should include the target path context under {root}"
-        );
-        assert!(
-            logs_contain("Download failed")
-                && logs_contain(&format!("asset_id={master_record_name}")),
-            "download failure log should include structured asset_id={master_record_name}"
+            failure_event
+                .field("path")
+                .is_some_and(|path| path.contains(&root)),
+            "download failure event should include path under {root}, got {failure_event:?}"
         );
 
         if download_root.is_file() {

@@ -217,12 +217,12 @@ fn extract_xmp_from_meta(
         const MAX_META_SUBBOX_BYTES: usize = 8 * 1024 * 1024;
         if body.len() <= MAX_META_SUBBOX_BYTES {
             if h.kind == FourCC::new(b"iinf") {
-                iinf = Some(Iinf::decode_body(&mut &body[..]).map_err(|source| {
-                    HeifError::MetaSubBoxDecode {
+                iinf = Some(
+                    decode_iinf(body).map_err(|source| HeifError::MetaSubBoxDecode {
                         kind: FourCC::new(b"iinf"),
                         source,
-                    }
-                })?);
+                    })?,
+                );
             } else if h.kind == FourCC::new(b"iloc") {
                 iloc = Some(Iloc::decode_body(&mut &body[..]).map_err(|source| {
                     HeifError::MetaSubBoxDecode {
@@ -270,6 +270,80 @@ fn extract_xmp_from_meta(
         return Ok(None);
     };
     Ok(file_bytes.get(start..end).map(<[u8]>::to_vec))
+}
+
+/// Decode `iinf` while shielding kei from known mp4-atom panic paths.
+///
+/// `mp4-atom` 0.11.0 still has an `unimplemented!` branch for version-1
+/// `infe` entries. `iinf` comes from user-controlled HEIF bytes, so kei
+/// pre-screens that unsupported shape and converts it to a normal decode
+/// error until upstream returns `Err` itself:
+/// <https://github.com/kixelated/mp4-atom/issues/164>.
+fn decode_iinf(body: &[u8]) -> Result<Iinf, mp4_atom::Error> {
+    if contains_unsupported_infe_v1(body) {
+        return Err(mp4_atom::Error::Unsupported("infe version 1 extensions"));
+    }
+    Iinf::decode_body(&mut &body[..])
+}
+
+fn contains_unsupported_infe_v1(mut body: &[u8]) -> bool {
+    let Some(version) = body.first().copied() else {
+        return false;
+    };
+    let Some(mut entries) = iinf_entry_count(body, version) else {
+        return false;
+    };
+
+    let count_len = if version == 0 { 2 } else { 4 };
+    let Some(entries_body) = body.get(4 + count_len..) else {
+        return false;
+    };
+    body = entries_body;
+
+    while entries > 0 {
+        let before = body.len();
+        let Some(header) = Header::decode_maybe(&mut body).ok().flatten() else {
+            return false;
+        };
+        let header_len = before - body.len();
+        let entry_body_len = header.size.unwrap_or(body.len());
+        if entry_body_len > body.len() {
+            return false;
+        }
+
+        // `mp4-atom` decodes every child declared by the `iinf` entry count
+        // as `ItemInfoEntry` without checking the child FourCC first, so a
+        // malformed child kind can still reach the version-1 `infe` panic.
+        if body.first() == Some(&1) {
+            return true;
+        }
+
+        let Some(rest) = body.get(entry_body_len..) else {
+            return false;
+        };
+        body = rest;
+        entries -= 1;
+
+        if header_len == 0 {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn iinf_entry_count(body: &[u8], version: u8) -> Option<u32> {
+    match version {
+        0 => body
+            .get(4..6)
+            .and_then(|count| count.try_into().ok())
+            .map(|count| u16::from_be_bytes(count) as u32),
+        1 => body
+            .get(4..8)
+            .and_then(|count| count.try_into().ok())
+            .map(u32::from_be_bytes),
+        _ => None,
+    }
 }
 
 /// Surgically insert (or replace) the XMP `mime` item inside a HEIC file,
@@ -890,6 +964,38 @@ mod tests {
 
         // Lenient variant: same input, structural failure collapsed to None.
         assert!(extract_xmp_bytes(&meta_box).is_none());
+    }
+
+    #[test]
+    fn extract_xmp_bytes_unsupported_infe_v1_returns_none_not_panic() {
+        // Durable unit regression for fuzz artifact
+        // crash-26040ebf1e311287ba7f285b767ac5a6ca9aef5e. The unsupported
+        // version-1 `infe` shape must not panic in the lenient probe path.
+        const REPRO: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00, b'm', b'e', b't', b'a', 0x00, 0x1d, 0x00, 0x22, 0x00, 0x00,
+            0x00, 0x08, 0x00, 0x00, 0x00, 0x5b, 0x00, 0x00, 0x00, 0x00, b'i', b'i', b'n', b'f',
+            0x00, 0x00, 0x00, 0x00, 0x5b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x80,
+            0x01, 0x00, 0x00, 0x04, 0x00, b'p', b'y', b't', b'f',
+        ];
+
+        let lenient = std::panic::catch_unwind(|| extract_xmp_bytes(REPRO));
+        assert!(
+            lenient.is_ok(),
+            "lenient HEIF XMP probe must not panic on unsupported infe v1"
+        );
+        assert_eq!(lenient.unwrap(), None);
+
+        let strict = std::panic::catch_unwind(|| extract_xmp_strict(REPRO));
+        assert!(
+            strict.is_ok(),
+            "strict HEIF XMP probe must convert unsupported infe v1 to a typed error"
+        );
+        match strict.unwrap() {
+            Err(HeifError::MetaSubBoxDecode { kind, .. }) => {
+                assert_eq!(kind, FourCC::new(b"iinf"));
+            }
+            other => panic!("expected MetaSubBoxDecode for unsupported infe v1, got {other:?}"),
+        }
     }
 
     fn malformed_iinf_meta_box() -> Vec<u8> {

@@ -316,9 +316,9 @@ mod tests {
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
-    #[tracing_test::traced_test]
     #[tokio::test]
     async fn test_retry_logs_structured_fields_on_retryable_error() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let config = RetryConfig {
             max_retries: 2,
             base_delay_secs: 0,
@@ -343,10 +343,18 @@ mod tests {
         )
         .await;
 
-        assert!(logs_contain("Retryable error, retrying"));
-        assert!(logs_contain("attempt=1"));
-        assert!(logs_contain("total_attempts=3"));
-        assert!(logs_contain("transient failure"));
+        let events = capture.events();
+        let retry_event = events
+            .iter()
+            .find(|event| {
+                event.level == tracing::Level::WARN
+                    && event.message() == Some("Retryable error, retrying")
+            })
+            .unwrap_or_else(|| panic!("missing retry warning event: {events:?}"));
+        assert_eq!(retry_event.field("attempt"), Some("1"));
+        assert_eq!(retry_event.field("total_attempts"), Some("3"));
+        assert_eq!(retry_event.field("retry_delay_secs"), Some("0"));
+        assert_eq!(retry_event.field("error"), Some("transient failure"));
     }
 
     #[tracing_test::traced_test]

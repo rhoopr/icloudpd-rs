@@ -73,6 +73,25 @@ fn copy_auth_artifacts(src: &Path, dst: &Path) {
     }
 }
 
+fn prepare_fixture_data_dir(download_dir: &Path, cookie_dir: &Path) -> PathBuf {
+    // Fresh data_dir under the download_dir, recreated each run.
+    // Wipe an existing one (which may carry a higher-schema DB).
+    let data_dir = download_dir.join("_kei_data");
+    if data_dir.exists() {
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Mirror auth artifacts from the cookie dir into data_dir so the
+    // sync command can re-use the existing trust cookie. Deliberately
+    // skips .db / .lock files: a state DB from a different branch can
+    // have a higher schema version than this checkout supports, which
+    // would fail the sync open with a confusing "schema too new"
+    // error. We rebuild state.db fresh on every run.
+    copy_auth_artifacts(cookie_dir, &data_dir);
+    data_dir
+}
+
 /// Dir where the fixture sync writes its files. Reused across tests in a
 /// single `cargo test` invocation, and persisted across invocations
 /// (allowing the second run to re-use the cache as long as the dir exists
@@ -99,21 +118,7 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
         let download_dir = fixture_root();
         std::fs::create_dir_all(&download_dir).unwrap();
 
-        // Fresh data_dir under the download_dir, recreated each run.
-        // Wipe an existing one (which may carry a higher-schema DB).
-        let data_dir = download_dir.join("_kei_data");
-        if data_dir.exists() {
-            let _ = std::fs::remove_dir_all(&data_dir);
-        }
-        std::fs::create_dir_all(&data_dir).unwrap();
-
-        // Mirror auth artifacts from the cookie dir into data_dir so the
-        // sync command can re-use the existing trust cookie. Deliberately
-        // skips .db / .lock files: a state DB from a different branch can
-        // have a higher schema version than this checkout supports, which
-        // would fail the sync open with a confusing "schema too new"
-        // error. We rebuild state.db fresh on every run.
-        copy_auth_artifacts(&cookie_dir, &data_dir);
+        let data_dir = prepare_fixture_data_dir(&download_dir, &cookie_dir);
 
         eprintln!(
             "Building import-existing fixture: --recent {FIXTURE_RECENT} into {}",
@@ -147,6 +152,58 @@ fn fixture() -> &'static (PathBuf, PathBuf) {
         eprintln!("Fixture ready: {}", download_dir.display());
         (download_dir, data_dir)
     })
+}
+
+#[test]
+fn copy_auth_artifacts_skips_state_db_and_lock_files() {
+    let src = tempdir().unwrap();
+    let dst = tempdir().unwrap();
+    std::fs::write(src.path().join("user.session"), b"session").unwrap();
+    std::fs::write(src.path().join("user.cache"), b"cache").unwrap();
+    std::fs::write(src.path().join("user.db"), b"stale db").unwrap();
+    std::fs::write(src.path().join("user.lock"), b"stale lock").unwrap();
+
+    copy_auth_artifacts(src.path(), dst.path());
+
+    assert_eq!(
+        std::fs::read(dst.path().join("user.session")).unwrap(),
+        b"session"
+    );
+    assert_eq!(
+        std::fs::read(dst.path().join("user.cache")).unwrap(),
+        b"cache"
+    );
+    assert!(
+        !dst.path().join("user.db").exists(),
+        "fixture auth copy must not carry stale state DBs between branches"
+    );
+    assert!(
+        !dst.path().join("user.lock").exists(),
+        "fixture auth copy must not carry stale process locks between branches"
+    );
+}
+
+#[test]
+fn fixture_data_dir_is_rebuilt_before_live_sync() {
+    let download_dir = tempdir().unwrap();
+    let cookie_dir = tempdir().unwrap();
+    std::fs::write(cookie_dir.path().join("user.session"), b"session").unwrap();
+    let stale_data = download_dir.path().join("_kei_data");
+    std::fs::create_dir_all(&stale_data).unwrap();
+    std::fs::write(stale_data.join("old.db"), b"stale schema").unwrap();
+    std::fs::write(stale_data.join("old.lock"), b"stale lock").unwrap();
+
+    let data_dir = prepare_fixture_data_dir(download_dir.path(), cookie_dir.path());
+
+    assert_eq!(data_dir, stale_data);
+    assert_eq!(
+        std::fs::read(data_dir.join("user.session")).unwrap(),
+        b"session"
+    );
+    assert!(
+        !data_dir.join("old.db").exists() && !data_dir.join("old.lock").exists(),
+        "fixture data dir must be rebuilt instead of reusing stale DB/lock artifacts"
+    );
 }
 
 /// Build an `import-existing` command targeting the fixture's download

@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_outcome_file_only_success_when_keyring_missing() {
+    fn delete_outcome_file_only_success_reports_backend_state() {
         let cases = [
             (
                 "only encrypted-file deleted",
@@ -477,6 +477,31 @@ mod tests {
             finish_delete("user@example.com", keyring, file)
                 .unwrap_or_else(|err| panic!("{label} must be treated as success: {err}"));
         }
+
+        let partial = finish_delete(
+            "user@example.com",
+            DeleteOutcome::Failed(anyhow::anyhow!("keyring locked")),
+            DeleteOutcome::Deleted,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            partial.contains("deleted from encrypted-file")
+                && partial.contains("failed backend(s) keyring"),
+            "partial delete must preserve which backend succeeded and which failed: {partial}"
+        );
+
+        let missing = finish_delete(
+            "user@example.com",
+            DeleteOutcome::NotFound,
+            DeleteOutcome::NotFound,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing.contains("No stored credential found"),
+            "two missing backends must not be treated as file-only success: {missing}"
+        );
     }
 
     #[test]

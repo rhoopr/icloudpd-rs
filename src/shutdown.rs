@@ -156,9 +156,9 @@ mod tests {
     /// `start_paused = true` lets tokio auto-advance the clock when
     /// nothing else can make progress, so awaiting the helper runs the
     /// sleep to completion without wall-clock delay.
-    #[tracing_test::traced_test]
     #[tokio::test(start_paused = true)]
     async fn shutdown_grace_period_elapses_invokes_exit_callback() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let exited: Arc<std::sync::Mutex<Option<i32>>> = Arc::new(std::sync::Mutex::new(None));
         let exited_clone = Arc::clone(&exited);
 
@@ -169,7 +169,10 @@ mod tests {
 
         assert_eq!(*exited.lock().unwrap(), Some(FORCE_EXIT_CODE));
         assert!(
-            logs_contain("Graceful shutdown timed out"),
+            capture.contains_event(|event| {
+                event.level == tracing::Level::WARN
+                    && event.message() == Some("Graceful shutdown timed out, forcing exit")
+            }),
             "warn line must accompany the timeout fire so operators can grep for it"
         );
     }

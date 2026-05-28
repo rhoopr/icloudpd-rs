@@ -246,6 +246,13 @@ fn warn_if_permissive_mode(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
     static WARNED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let Some(msg) = check_password_file_mode(path, meta.permissions().mode()) else {
+        return;
+    };
+
     let warned = WARNED_PATHS.get_or_init(|| Mutex::new(HashSet::new()));
     let Ok(mut guard) = warned.lock() else { return };
     if !guard.insert(path.to_path_buf()) {
@@ -253,16 +260,11 @@ fn warn_if_permissive_mode(path: &Path) {
     }
     drop(guard);
 
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    if let Some(msg) = check_password_file_mode(path, meta.permissions().mode()) {
-        tracing::warn!(
-            path = %path.display(),
-            message = %msg,
-            "Permissive password file mode"
-        );
-    }
+    tracing::warn!(
+        path = %path.display(),
+        message = %msg,
+        "Permissive password file mode"
+    );
 }
 
 #[cfg(not(unix))]
@@ -747,6 +749,36 @@ mod tests {
         assert_eq!(read_password_file(&path).unwrap().expose_secret(), "leaky");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn password_file_permission_warning_not_cached_before_violation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("later_permissive_pw.txt");
+
+        warn_if_permissive_mode(&path);
+
+        std::fs::write(&path, "secret\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        warn_if_permissive_mode(&path);
+
+        assert!(
+            capture.contains_event(|event| {
+                event.level == tracing::Level::WARN
+                    && event.field("message").is_some_and(|message| {
+                        message.contains("readable by other users")
+                            || message == "Permissive password file mode"
+                    })
+                    && event.field("path") == Some(path.to_string_lossy().as_ref())
+            }),
+            "missing warning for path that became permissive after initial non-violation: {:?}",
+            capture.events()
+        );
+    }
+
     // ── invoke_password_provider ────────────────────────────────────
     //
     // A provider whose resolve() does blocking I/O (subprocess wait,
@@ -762,22 +794,36 @@ mod tests {
 
         let interleaved = StdArc::new(AtomicBool::new(false));
         let seen = StdArc::clone(&interleaved);
+        let release = StdArc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let provider_release = StdArc::clone(&release);
 
-        // Sync provider that blocks for longer than the other future's delay.
-        // If spawn_blocking pins the single async worker, the concurrent
-        // task below will be starved past its intended wake time.
+        // Sync provider that blocks until the async canary releases it. If
+        // invoke_password_provider ran this closure on the single async
+        // worker, the canary would never execute and the timeout would fire.
         let provider: PasswordProvider = StdArc::new(move || {
-            std::thread::sleep(Duration::from_millis(200));
+            let (lock, cvar) = &*provider_release;
+            let mut released = lock.lock().expect("release mutex");
+            while !*released {
+                released = cvar.wait(released).expect("release condvar");
+            }
             Some(SecretString::from("ok".to_string()))
         });
 
         let provider_fut = super::invoke_password_provider(&provider);
         let canary_fut = async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
             seen.store(true, Ordering::SeqCst);
+            let (lock, cvar) = &*release;
+            *lock.lock().expect("release mutex") = true;
+            cvar.notify_one();
         };
 
-        tokio::join!(provider_fut, canary_fut);
+        let (password, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(provider_fut, canary_fut)
+        })
+        .await
+        .expect("spawn_blocking provider must not starve the async worker");
+        assert_eq!(password.unwrap().expose_secret(), "ok");
         assert!(
             interleaved.load(Ordering::SeqCst),
             "the async canary must have run while the sync provider was sleeping"

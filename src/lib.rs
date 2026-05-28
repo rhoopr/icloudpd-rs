@@ -67,44 +67,118 @@ use password::{ExposeSecret, SecretString};
 /// A writer wrapper that redacts a password string from log output.
 ///
 /// Wraps any `io::Write` implementor and replaces occurrences of the
-/// configured password with `********` in each `write()` call.
-struct RedactingWriter<W> {
+/// configured password with `********`, including secrets split across
+/// adjacent `write()` calls.
+struct RedactingWriter<W: std::io::Write> {
     inner: W,
     password: Arc<std::sync::Mutex<Option<SecretString>>>,
+    pending: Vec<u8>,
 }
 
 impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let password = self
-            .password
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let password = self.current_password();
 
         // Fast path: short-circuit before allocating a `String`. Under
         // trace-level logging the redaction path runs on every event,
         // and `String::from_utf8_lossy` per event dominates the heap churn.
-        let Some(pw) = &*password else {
+        let Some(pw) = password.as_deref() else {
+            self.flush_pending_without_redaction()?;
             self.inner.write_all(buf)?;
             return Ok(buf.len());
         };
-        let pw_bytes = pw.expose_secret().as_bytes();
+        let pw_bytes = pw.as_bytes();
         if pw_bytes.is_empty() || buf.len() < pw_bytes.len() {
-            self.inner.write_all(buf)?;
+            self.pending.extend_from_slice(buf);
+            self.flush_redacted_pending(pw_bytes, false)?;
             return Ok(buf.len());
         }
-        if memchr::memmem::find(buf, pw_bytes).is_none() {
-            self.inner.write_all(buf)?;
-            return Ok(buf.len());
-        }
-
-        let s = String::from_utf8_lossy(buf);
-        let redacted = s.replace(pw.expose_secret(), "********");
-        self.inner.write_all(redacted.as_bytes())?;
+        self.pending.extend_from_slice(buf);
+        self.flush_redacted_pending(pw_bytes, false)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        let password = self.current_password();
+        if let Some(pw) = password.as_deref() {
+            self.flush_redacted_pending(pw.as_bytes(), true)?;
+        } else {
+            self.flush_pending_without_redaction()?;
+        }
         self.inner.flush()
+    }
+}
+
+impl<W: std::io::Write> RedactingWriter<W> {
+    fn current_password(&self) -> Option<String> {
+        self.password
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|pw| pw.expose_secret().to_string())
+    }
+
+    fn flush_pending_without_redaction(&mut self) -> std::io::Result<()> {
+        if !self.pending.is_empty() {
+            self.inner.write_all(&self.pending)?;
+            self.pending.clear();
+        }
+        Ok(())
+    }
+
+    fn flush_redacted_pending(&mut self, pw_bytes: &[u8], flush_all: bool) -> std::io::Result<()> {
+        if pw_bytes.is_empty() {
+            return self.flush_pending_without_redaction();
+        }
+
+        let hold_back = if flush_all {
+            0
+        } else {
+            pw_bytes.len().saturating_sub(1)
+        };
+        let mut emit_cutoff = self.pending.len().saturating_sub(hold_back);
+        if emit_cutoff == 0 {
+            return Ok(());
+        }
+
+        let mut output = Vec::with_capacity(emit_cutoff);
+        let mut consumed = 0usize;
+        let mut search_from = 0usize;
+        while let Some(search) = self.pending.get(search_from..) {
+            let Some(pos) = memchr::memmem::find(search, pw_bytes) else {
+                break;
+            };
+            let match_start = search_from + pos;
+            let match_end = match_start + pw_bytes.len();
+            if match_start >= emit_cutoff {
+                break;
+            }
+            if match_end > emit_cutoff {
+                emit_cutoff = match_start;
+                break;
+            }
+            if let Some(prefix) = self.pending.get(consumed..match_start) {
+                output.extend_from_slice(prefix);
+            }
+            output.extend_from_slice(b"********");
+            consumed = match_end;
+            search_from = match_end;
+        }
+
+        if let Some(rest) = self.pending.get(consumed..emit_cutoff) {
+            output.extend_from_slice(rest);
+        }
+        if !output.is_empty() {
+            self.inner.write_all(&output)?;
+        }
+        self.pending.drain(..emit_cutoff);
+        Ok(())
+    }
+}
+
+impl<W: std::io::Write> Drop for RedactingWriter<W> {
+    fn drop(&mut self) {
+        let _ = <Self as std::io::Write>::flush(self);
     }
 }
 
@@ -122,6 +196,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
         RedactingWriter {
             inner: self.inner.clone(),
             password: Arc::clone(&self.password),
+            pending: Vec::new(),
         }
     }
 }
@@ -896,11 +971,35 @@ mod tests {
             let mut writer = RedactingWriter {
                 inner: &mut buf,
                 password: Arc::clone(&password),
+                pending: Vec::new(),
             };
             writer.write_all(b"Login with s3cret ok").unwrap();
         }
         let output = String::from_utf8(buf).unwrap();
         assert!(!output.contains("s3cret"));
+        assert!(output.contains("********"));
+    }
+
+    #[test]
+    fn redacting_writer_redacts_secret_split_across_writes() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from("s3cret"))));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+                pending: Vec::new(),
+            };
+            writer.write_all(b"Login with s3").unwrap();
+            writer.write_all(b"cret ok").unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("s3cret"),
+            "split writes must not leak the configured password: {output}"
+        );
         assert!(output.contains("********"));
     }
 
@@ -915,6 +1014,7 @@ mod tests {
             let mut writer = RedactingWriter {
                 inner: &mut buf,
                 password: Arc::clone(&password),
+                pending: Vec::new(),
             };
             writer.write_all(b"normal log line").unwrap();
         }
@@ -934,6 +1034,7 @@ mod tests {
             let mut writer = RedactingWriter {
                 inner: &mut buf,
                 password: Arc::clone(&password),
+                pending: Vec::new(),
             };
             writer.write_all(b"normal log line").unwrap();
         }
@@ -954,6 +1055,7 @@ mod tests {
             let mut writer = RedactingWriter {
                 inner: &mut buf,
                 password: Arc::clone(&password),
+                pending: Vec::new(),
             };
             writer.write_all(b"short").unwrap();
         }
@@ -971,6 +1073,7 @@ mod tests {
         let mut writer = RedactingWriter {
             inner: &mut buf,
             password,
+            pending: Vec::new(),
         };
         writer.flush().unwrap();
     }
@@ -990,6 +1093,7 @@ mod tests {
             let mut writer = RedactingWriter {
                 inner: &mut buf,
                 password: Arc::clone(&password),
+                pending: Vec::new(),
             };
             writer
                 .write_all(b"long line of trace output without any sensitive value")
@@ -1018,6 +1122,7 @@ mod tests {
             let mut writer = RedactingWriter {
                 inner: &mut buf,
                 password: Arc::clone(&password),
+                pending: Vec::new(),
             };
             writer.write_all(&bytes).unwrap();
         }
@@ -1041,6 +1146,7 @@ mod tests {
             let mut writer = RedactingWriter {
                 inner: &mut buf,
                 password: Arc::clone(&password),
+                pending: Vec::new(),
             };
             writer.write_all(&bytes).unwrap();
         }

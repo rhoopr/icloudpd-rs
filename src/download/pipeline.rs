@@ -4507,8 +4507,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tracing_test::traced_test]
     async fn flush_pending_state_writes_recovers_after_transient_failure() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         // Fail the first attempt, succeed on retry
         let db = FailingStateDb::new(1);
         let pending = vec![PendingStateWrite {
@@ -4522,26 +4522,28 @@ mod tests {
         let failures = flush_pending_state_writes(&db, &pending).await;
         assert_eq!(failures, 0);
         assert_eq!(db.success_count(), 1);
+        let events = capture.events();
+        let retry = events
+            .iter()
+            .find(|event| event.message() == Some("State write retry failed, will retry"))
+            .unwrap_or_else(|| panic!("missing deferred-state retry event: {events:?}"));
+        assert_eq!(retry.field("asset_id"), Some("A1"));
+        assert_eq!(retry.field("pending_count"), Some("1"));
+        assert_eq!(retry.field("attempt"), Some("1"));
         assert!(
-            logs_contain("State write retry failed, will retry"),
-            "retry attempt should be visible at info level"
+            retry
+                .field("error")
+                .is_some_and(|error| error.contains("simulated failure")),
+            "retry event should carry source error, got {retry:?}"
         );
-        assert!(
-            logs_contain("Recovered deferred state write"),
-            "successful retry should log a recovery breadcrumb"
-        );
-        assert!(
-            logs_contain("pending_count=1"),
-            "retry logs must carry pending_count"
-        );
-        assert!(
-            logs_contain("attempt=1"),
-            "retry logs must carry the failed attempt number"
-        );
-        assert!(
-            logs_contain("attempt=2"),
-            "recovery logs must carry the successful attempt number"
-        );
+
+        let recovered = events
+            .iter()
+            .find(|event| event.message() == Some("Recovered deferred state write"))
+            .unwrap_or_else(|| panic!("missing deferred-state recovery event: {events:?}"));
+        assert_eq!(recovered.field("asset_id"), Some("A1"));
+        assert_eq!(recovered.field("pending_count"), Some("1"));
+        assert_eq!(recovered.field("attempt"), Some("2"));
     }
 
     #[tokio::test]

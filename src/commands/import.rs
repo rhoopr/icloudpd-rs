@@ -3171,8 +3171,8 @@ mod wiremock_tests {
     /// break that test by reintroducing a sleep race. Pin its emission
     /// via `tracing_test`.
     #[tokio::test]
-    #[tracing_test::traced_test]
     async fn import_emits_scan_started_marker_with_library_label() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let tmp = TempDir::new().expect("tempdir");
         let server = MockServer::start().await;
         let asset = WiremockAsset::new("S1", "IMG_SCAN.JPG", "public.jpeg").orig(
@@ -3201,13 +3201,20 @@ mod wiremock_tests {
         .await
         .expect("import_assets");
 
-        assert!(
-            logs_contain(&format!("stage=\"{}\"", super::SCAN_STARTED_STAGE)),
-            "import_assets must emit stage=scan_started once first asset is dequeued",
-        );
-        assert!(
-            logs_contain("library=PrimarySync"),
+        let events = capture.events();
+        let started = events
+            .iter()
+            .find(|event| event.field("stage") == Some(super::SCAN_STARTED_STAGE))
+            .unwrap_or_else(|| panic!("missing scan_started event: {events:?}"));
+        assert_eq!(
+            started.field("library"),
+            Some("PrimarySync"),
             "scan_started marker must carry the library_label for multi-library disambiguation",
+        );
+        assert_eq!(
+            started.message(),
+            Some("import scan dequeued first asset"),
+            "scan_started event should keep the operator breadcrumb message",
         );
     }
 
@@ -3690,45 +3697,14 @@ mod heartbeat_tests {
         );
     }
 
-    /// 5 ms-per-write sink is realistic stderr-pipe latency, not
-    /// pathological saturation: pathological loads exhaust the lossy
-    /// buffer before the worker drains on shutdown, conflating the bug
-    /// under test with teardown timing.
-    #[tokio::test]
+    /// Paused time makes the heartbeat progress causal rather than
+    /// wall-clock dependent: a busy scan loop can keep logging, but the
+    /// watchdog must still tick at its configured cadence.
+    #[tokio::test(start_paused = true)]
     async fn heartbeat_fires_under_writer_load() {
-        use std::io::Write;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        struct PipeSink {
-            buf: Arc<std::sync::Mutex<Vec<u8>>>,
-            delay: std::time::Duration,
-        }
-        impl Write for PipeSink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                std::thread::sleep(self.delay);
-                self.buf
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = PipeSink {
-            buf: Arc::clone(&buf),
-            delay: std::time::Duration::from_millis(5),
-        };
-        let (make_writer, writer_guard, _pw) = crate::build_redacting_writer(sink);
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-            .with_writer(make_writer)
-            .with_ansi(false)
-            .finish();
-        let _dispatch_guard = tracing::subscriber::set_default(subscriber);
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
 
         let state = Arc::new(super::HeartbeatState::default());
         let hb = super::HeartbeatGuard::spawn(
@@ -3746,28 +3722,25 @@ mod heartbeat_tests {
             }
         });
 
-        // 300 ms covers 5 heartbeat intervals (first tick skipped; emits
-        // land at t≈50, 100, 150, 200, 250 ms). Asserting >= 3 still
-        // survives one missed tick from CI jitter without giving a real
-        // chokepoint regression a way through.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
+        // 300 ms covers five heartbeat intervals after the immediate tick
+        // is skipped. Because time is paused, no host scheduling jitter is
+        // involved in the count.
+        tokio::time::advance(std::time::Duration::from_millis(300)).await;
+        tokio::task::yield_now().await;
         stop.store(true, Ordering::Relaxed);
         scan.await.unwrap();
 
         drop(hb);
-        drop(_dispatch_guard);
-        drop(writer_guard);
 
-        let captured = buf
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let captured_str = String::from_utf8_lossy(&captured);
-        let heartbeat_count = captured_str.matches("import scan heartbeat").count();
+        let events = capture.events();
+        let heartbeat_count = events
+            .iter()
+            .filter(|event| event.message() == Some("import scan heartbeat"))
+            .count();
         assert!(
-            heartbeat_count >= 3,
-            "heartbeat fired {heartbeat_count} times in 300 ms under concurrent \
-             scan-loop traffic (expected >= 3); the watchdog is sharing the data \
-             plane's chokepoint or otherwise stalled. Captured: {captured_str}",
+            heartbeat_count >= 5,
+            "heartbeat fired {heartbeat_count} times in 300 ms under concurrent scan-loop traffic; events: {events:?}",
         );
     }
 }
