@@ -2266,7 +2266,8 @@ mod tests {
     async fn download_file_interrupted_mid_body_keeps_part_and_resumes() {
         let mut body = vec![0xFF, 0xD8, 0xFF, 0xE0];
         body.extend((4..128u8).map(|n| n.wrapping_mul(3)));
-        let client = InterruptingResumeClient::new(body.clone(), 4);
+        let first_chunk_len = 4;
+        let client = InterruptingResumeClient::new(body.clone(), first_chunk_len);
         let dir = TempDir::new().unwrap();
         let download_path = dir.path().join("interrupted.jpg");
         let checksum = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
@@ -2298,7 +2299,22 @@ mod tests {
             let cancel_after_partial = async {
                 client.release_first_chunk();
                 client.wait_until_first_chunk_delivered().await;
-                tokio::task::yield_now().await;
+                let mut partial_bytes_are_visible = false;
+                for _ in 0..1000 {
+                    let part_len = tokio::fs::metadata(&part_path)
+                        .await
+                        .map(|meta| meta.len())
+                        .unwrap_or(0);
+                    if part_len == first_chunk_len as u64 {
+                        partial_bytes_are_visible = true;
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    partial_bytes_are_visible,
+                    "test setup should wait until the first chunk reaches the .part file"
+                );
                 shutdown_token.cancel();
             };
             let (result, ()) = tokio::join!(download, cancel_after_partial);
