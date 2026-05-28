@@ -404,6 +404,26 @@ mod tests {
         serde_json::from_str(&contents).unwrap()
     }
 
+    fn assert_sync_token_observation_fields(
+        stats_json: &serde_json::Value,
+        expected_receivers: usize,
+        with_token: usize,
+        missing: usize,
+        blank: usize,
+        dropped: usize,
+        unique: usize,
+    ) {
+        assert_eq!(
+            stats_json["sync_token_expected_receivers"],
+            expected_receivers
+        );
+        assert_eq!(stats_json["sync_token_receivers_with_token"], with_token);
+        assert_eq!(stats_json["sync_token_receivers_missing"], missing);
+        assert_eq!(stats_json["sync_token_receivers_blank"], blank);
+        assert_eq!(stats_json["sync_token_receivers_dropped"], dropped);
+        assert_eq!(stats_json["sync_token_unique_values"], unique);
+    }
+
     async fn report_cycle(
         reporter: &CycleReporter<'_, state::SqliteStateDb>,
         health: &mut HealthStatus,
@@ -654,11 +674,36 @@ mod tests {
             "iCloud did not return a sync token for this full enumeration"
         );
         assert_eq!(stats_json["sync_token_blocked_zone"], "PrimarySync");
-        assert_eq!(stats_json["sync_token_expected_receivers"], 3);
-        assert_eq!(stats_json["sync_token_receivers_with_token"], 0);
-        assert_eq!(stats_json["sync_token_receivers_missing"], 3);
-        assert_eq!(stats_json["sync_token_receivers_blank"], 0);
-        assert_eq!(stats_json["sync_token_receivers_dropped"], 0);
-        assert_eq!(stats_json["sync_token_unique_values"], 0);
+        assert_sync_token_observation_fields(stats_json, 3, 0, 3, 0, 0, 0);
+    }
+
+    #[tokio::test]
+    async fn sync_token_observation_fields_serialize_even_when_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("sync_report.json");
+        let notifier = Notifier::new(None);
+        let reporter = reporter(dir.path(), Some(&report_path), &notifier);
+        let mut health = HealthStatus::new();
+        let stats = SyncStats {
+            sync_token_blocked: false,
+            sync_token_expected_receivers: Some(2),
+            sync_token_receivers_with_token: Some(2),
+            sync_token_receivers_missing: Some(0),
+            sync_token_receivers_blank: Some(0),
+            sync_token_receivers_dropped: Some(0),
+            sync_token_unique_values: Some(1),
+            ..SyncStats::default()
+        };
+
+        report_cycle(&reporter, &mut health, &stats, 0, false).await;
+
+        let report_json = parse_json(&report_path);
+        let stats_json = &report_json["stats"];
+        assert_eq!(stats_json["sync_token_blocked"], false);
+        assert_sync_token_observation_fields(stats_json, 2, 2, 0, 0, 0, 1);
+        assert!(
+            stats_json["sync_token_blocked_reason"].is_null(),
+            "reason should stay absent when sync token was not blocked"
+        );
     }
 }

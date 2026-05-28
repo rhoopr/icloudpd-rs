@@ -661,10 +661,35 @@ impl std::fmt::Debug for Config {
     }
 }
 
-pub(crate) fn expand_tilde(path: &str) -> PathBuf {
+pub(crate) fn kei_data_dir_with_home(home: &Path) -> PathBuf {
+    home.join(".config").join("kei")
+}
+
+pub(crate) fn kei_data_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| kei_data_dir_with_home(&home))
+        .unwrap_or_else(|| PathBuf::from("~/.config/kei"))
+}
+
+pub(crate) fn default_config_path() -> PathBuf {
+    kei_data_dir().join("config.toml")
+}
+
+pub(crate) fn default_cookie_dir() -> PathBuf {
+    kei_data_dir().join("cookies")
+}
+
+fn expand_tilde_with_home(path: &str, home: &Path) -> PathBuf {
     if let Some(stripped) = path.strip_prefix("~/") {
+        return home.join(stripped);
+    }
+    PathBuf::from(path)
+}
+
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
+    if path.starts_with("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
+            return expand_tilde_with_home(path, &home);
         }
     }
     PathBuf::from(path)
@@ -955,10 +980,10 @@ pub(crate) fn resolve_auth(
     let has_explicit_data_dir =
         globals.data_dir.is_some() || toml.and_then(|t| t.data_dir.as_ref()).is_some();
     let cookie_directory = if has_explicit_data_dir {
-        let default_config = expand_tilde("~/.config/kei/config.toml");
+        let default_config = default_config_path();
         resolve_data_dir(globals.data_dir.as_deref(), toml, &default_config)
     } else {
-        expand_tilde("~/.config/kei/cookies")
+        default_cookie_dir()
     };
 
     (username, password, domain, cookie_directory)
@@ -984,7 +1009,7 @@ pub(crate) fn resolve_data_dir(
     config_path
         .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| expand_tilde("~/.config/kei"))
+        .unwrap_or_else(kei_data_dir)
 }
 
 /// Resolve `password_file` from CLI + TOML.
@@ -2069,6 +2094,24 @@ mod tests {
         if let Some(home) = dirs::home_dir() {
             assert_eq!(result, home.join("Documents"));
         }
+    }
+
+    #[test]
+    fn test_expand_tilde_with_injected_home_uses_path_join() {
+        let home = Path::new("/home/ajlow");
+        assert_eq!(
+            expand_tilde_with_home("~/.config/kei/cookies", home),
+            kei_data_dir_with_home(home).join("cookies")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_expand_tilde_windows_home_keeps_separator_before_dot_config() {
+        let home = Path::new(r"C:\Users\ajlow");
+        let result = expand_tilde_with_home("~/.config/kei/cookies", home);
+        assert_eq!(result, PathBuf::from(r"C:\Users\ajlow\.config\kei\cookies"));
+        assert_ne!(result, PathBuf::from(r"C:\Users\ajlow.config\kei\cookies"));
     }
 
     #[test]

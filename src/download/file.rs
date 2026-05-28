@@ -778,8 +778,8 @@ fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum>
 ///
 /// Checks run case-insensitively against ASCII-whitespace-trimmed content so
 /// that e.g. a leading `\n<html>` still fails. These sentinels are never valid
-/// image/video starts — unlike the magic-byte checks further down, which are
-/// only warnings because exotic variants exist.
+/// image/video starts, while extension mismatches further down are warnings
+/// unless kei has positive evidence that the body is bad content.
 #[allow(
     clippy::indexing_slicing,
     reason = "`pos` comes from `header.iter().position(...)` so `header[pos..]` is \
@@ -851,6 +851,28 @@ fn classify_magic(ext: &str, header: &[u8]) -> Option<bool> {
     }
 }
 
+/// Classify whether `header` starts with any media signature kei recognizes,
+/// independent of the destination filename extension.
+fn classify_known_media_magic(header: &[u8]) -> Option<&'static str> {
+    if classify_magic("jpg", header) == Some(true) {
+        Some("JPEG")
+    } else if classify_magic("png", header) == Some(true) {
+        Some("PNG")
+    } else if classify_magic("gif", header) == Some(true) {
+        Some("GIF")
+    } else if classify_magic("tiff", header) == Some(true) {
+        Some("TIFF/DNG")
+    } else if classify_magic("webp", header) == Some(true) {
+        Some("WebP")
+    } else if classify_magic("heic", header) == Some(true) {
+        Some("ISO-BMFF media")
+    } else if classify_magic("mov", header) == Some(true) {
+        Some("QuickTime MOV")
+    } else {
+        None
+    }
+}
+
 /// Valid top-level atom types at offset 4 of a QuickTime `.mov` file.
 ///
 /// Modern ISO-BMFF MOVs begin with `ftyp`. Classic QuickTime MOVs (produced
@@ -869,7 +891,9 @@ fn is_mov_top_atom(atom: &[u8]) -> bool {
 /// For known media types (JPEG, PNG, HEIC, MOV, etc.), checks magic bytes in the
 /// file header. HTML and JSON error-page sentinels are always rejected before
 /// extension-specific checks because Apple's CDN occasionally returns them with
-/// HTTP 200.
+/// HTTP 200. Extension-specific mismatches are warnings, not hard failures:
+/// iCloud sometimes assigns `.PNG` names to JPEG bytes, and kei's signature
+/// table is intentionally not treated as a complete media catalog.
 fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,
@@ -917,11 +941,22 @@ fn validate_downloaded_content(
             reason = "`n.min(8)` caps the slice at `header.len()`"
         )]
         let preview = &header[..n.min(8)];
-        return Err(DownloadError::InvalidContent {
-            path: download_path.display().to_string().into(),
-            reason: format!("file header {preview:02x?} does not match expected format for .{ext}")
-                .into(),
-        });
+        if let Some(detected_media) = classify_known_media_magic(header) {
+            tracing::warn!(
+                path = %download_path.display(),
+                expected_extension = %ext,
+                detected_media,
+                header = %format_args!("{preview:02x?}"),
+                "File header is valid media but does not match extension; saving anyway",
+            );
+            return Ok(());
+        }
+        tracing::warn!(
+            path = %download_path.display(),
+            expected_extension = %ext,
+            header = %format_args!("{preview:02x?}"),
+            "File header does not match expected extension and is not recognized by kei; saving anyway",
+        );
     }
 
     Ok(())
@@ -931,6 +966,8 @@ fn validate_downloaded_content(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    const ISSUE_507_JPEG_HEADER: [u8; 8] = [0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x80, 0x45, 0x78];
 
     #[test]
     fn test_base32_encode() {
@@ -1470,32 +1507,43 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_mismatched_heic_magic() {
-        // Non-ftyp header with .heic extension is not valid HEIC.
+    fn validate_accepts_known_media_with_mismatched_heic_extension() {
+        // Non-ftyp header with .heic extension is not HEIC, but it is valid
+        // QuickTime media. Keep Apple's advertised filename and warn.
         let mut buf = [0u8; 12];
         buf[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x08]);
         buf[4..8].copy_from_slice(b"wide");
         let (part, dest, _dir) = write_temp_file("photo.heic", &buf);
-        let err = validate_downloaded_content(&part, &dest).unwrap_err();
-        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
-    fn validate_rejects_mismatched_png_magic() {
-        // JPEG magic with .png extension should not be promoted.
+    fn validate_accepts_known_media_with_mismatched_png_extension_issue_507() {
+        // iCloud can advertise screenshot/edited assets as .PNG while serving
+        // JPEG bytes. The content is valid media, so keep the file and warn.
         let (part, dest, _dir) = write_temp_file("photo.png", &[0xFF, 0xD8, 0xFF, 0xE0]);
-        let err = validate_downloaded_content(&part, &dest).unwrap_err();
-        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
-    fn validate_rejects_mismatched_jpeg_magic() {
+    fn validate_accepts_exif_jpeg_with_mismatched_png_extension_issue_507() {
+        let (part, dest, _dir) = write_temp_file("cachedImage.PNG", &ISSUE_507_JPEG_HEADER);
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_known_media_with_mismatched_jpeg_extension() {
         let (part, dest, _dir) = write_temp_file(
             "photo.jpg",
             &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
         );
-        let err = validate_downloaded_content(&part, &dest).unwrap_err();
-        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_unrecognized_header_for_known_extension() {
+        let (part, dest, _dir) = write_temp_file("photo.jpg", b"not media bytes");
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
@@ -1816,6 +1864,54 @@ mod tests {
             ".part should be removed on bad content"
         );
         assert!(!download_path.exists(), "final path must not exist");
+    }
+
+    #[tokio::test]
+    async fn attempt_download_promotes_valid_jpeg_with_png_extension_issue_507() {
+        let client = StubDownloadClient::ok(&ISSUE_507_JPEG_HEADER);
+        let (download_path, part_path, _dir) = setup_download_dir("cachedImage", "PNG");
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            Some(ISSUE_507_JPEG_HEADER.len() as u64),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!part_path.exists(), ".part should be promoted");
+        assert_eq!(
+            std::fs::read(&download_path).unwrap(),
+            ISSUE_507_JPEG_HEADER
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_download_promotes_unrecognized_header_under_known_extension() {
+        let body = b"not media bytes";
+        let client = StubDownloadClient::ok(body);
+        let (download_path, part_path, _dir) = setup_download_dir("unknown_header", "jpg");
+
+        attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            Some(body.len() as u64),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!part_path.exists(), ".part should be promoted");
+        assert_eq!(std::fs::read(&download_path).unwrap(), body);
     }
 
     #[tokio::test]

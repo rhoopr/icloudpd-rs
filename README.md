@@ -62,7 +62,7 @@
 brew install rhoopr/kei/kei             # Homebrew
 
 docker pull ghcr.io/rhoopr/kei:latest
-docker pull ghcr.io/rhoopr/kei:0.20.0   # pin this release
+docker pull ghcr.io/rhoopr/kei:0.20.4   # pin this release
 ```
 
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, FreeBSD, and other install paths, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install).

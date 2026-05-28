@@ -11,6 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.20.4] - 2026-05-27
+
+### Fixed
+
+- Failed and pending retry rows now resolve cleanly when the expected same-size file is already on disk. kei marks the row downloaded with a fresh local SHA-256 instead of looping it back to failed after the on-disk skip, and backfills missing metadata hashes for downloaded rows that use that path. ([#505])
+- Incremental sync no longer falls back to full enumeration just because inactive album or smart-folder path templates differ during an unfiled-only run. Failed or pending retry state still forces full enumeration, but kei now logs that reason explicitly. ([#505])
+- Old malformed Windows default data directories such as `C:\Users\name.config\kei` are repaired to `C:\Users\name\.config\kei` at runtime. Setup, migration, credential storage, and service purge paths now use the same default `~/.config/kei` construction. ([#505])
+- Media downloads with valid bytes but a mismatched extension now warn and save instead of failing the asset. Positive bad-content signals such as empty files, HTML or JSON error bodies, rejected content types, and size mismatches still fail before promotion. ([#508])
+
+[#505]: https://github.com/rhoopr/kei/pull/505
+[#508]: https://github.com/rhoopr/kei/pull/508
+
+---
+
+## [0.20.3] - 2026-05-27
+
+### Fixed
+
+- **sync_report.json now keeps sync-token receiver observations even when token advancement is not blocked.** Token telemetry fields (`sync_token_expected_receivers`, `sync_token_receivers_with_token`, `sync_token_receivers_missing`, `sync_token_receivers_blank`, `sync_token_receivers_dropped`, `sync_token_unique_values`) are now emitted whenever observation data exists, so operators can inspect iCloud-side token behavior on successful runs instead of seeing an empty diagnostics block unless `sync_token_blocked` is true. ([#504])
+
+[#504]: https://github.com/rhoopr/kei/pull/504
+
+---
+
 ## [0.20.2] - 2026-05-27
 
 ### Fixed
@@ -1333,7 +1357,10 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.20.4...HEAD
+[0.20.4]: https://github.com/rhoopr/kei/compare/v0.20.3...v0.20.4
+[0.20.3]: https://github.com/rhoopr/kei/compare/v0.20.2...v0.20.3
+[0.20.2]: https://github.com/rhoopr/kei/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/rhoopr/kei/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/rhoopr/kei/compare/v0.14.2...v0.20.0
 [0.14.2]: https://github.com/rhoopr/kei/compare/v0.14.1...v0.14.2

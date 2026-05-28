@@ -19,12 +19,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::PhotoAsset;
 use crate::retry::RetryConfig;
-use crate::state::{MetadataRewriteStore, StateDb, SyncRunStats, VersionSizeKey};
+use crate::state::{AssetRecord, MetadataRewriteStore, StateDb, SyncRunStats, VersionSizeKey};
 
 use super::error::DownloadError;
 #[cfg_attr(not(feature = "xmp"), allow(unused_imports))]
 use super::filter::MetadataPayload;
-use super::filter::{extract_skip_candidates, is_asset_filtered, DownloadTask};
+use super::filter::{
+    derive_expected_paths, determine_media_type, extract_skip_candidates, is_asset_filtered,
+    DerivedPath, DownloadTask,
+};
 #[cfg(test)]
 use super::finalize::update_metadata_marker_for_test as update_metadata_marker;
 use super::finalize::{
@@ -293,6 +296,166 @@ fn effective_asset_library_arc(asset: &PhotoAsset, config: &DownloadConfig) -> A
         .source_zone()
         .map(Arc::from)
         .unwrap_or_else(|| Arc::clone(&config.library))
+}
+
+fn asset_record_for_derived_path(
+    library: Arc<str>,
+    asset: &PhotoAsset,
+    derived: &DerivedPath,
+) -> AssetRecord {
+    AssetRecord::new_pending(
+        library,
+        asset.id().to_string(),
+        derived.version_size,
+        derived.checksum.to_string(),
+        derived.filename.clone(),
+        asset.created(),
+        Some(asset.added_date()),
+        derived.size,
+        determine_media_type(derived.version_size, asset),
+    )
+    .with_metadata_arc(asset.metadata_arc())
+}
+
+async fn adopt_pending_on_disk_skip(
+    state_db: Option<&dyn StateDb>,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    ctx: &DownloadContext,
+    task_planner: &mut TaskPlanner,
+) -> usize {
+    let Some(db) = state_db else {
+        return 0;
+    };
+    let library = effective_asset_library(asset, config);
+    let pending_versions = ctx
+        .pending_ids
+        .get(library)
+        .and_then(|assets| assets.get(asset.id()));
+    let Some(pending_versions) = pending_versions else {
+        return 0;
+    };
+
+    let mut adopted = 0usize;
+    for derived in derive_expected_paths(asset, config) {
+        let version_size = derived.version_size.as_str();
+        if !pending_versions.contains(version_size) {
+            continue;
+        }
+        let Some(existing_path) = task_planner.existing_path(&derived.path) else {
+            continue;
+        };
+        let Ok(metadata) = tokio::fs::metadata(&existing_path).await else {
+            continue;
+        };
+        if metadata.len() != derived.size {
+            continue;
+        }
+
+        let record = asset_record_for_derived_path(
+            effective_asset_library_arc(asset, config),
+            asset,
+            &derived,
+        );
+        if let Err(e) = db.upsert_seen(&record).await {
+            tracing::warn!(
+                asset_id = %asset.id(),
+                version_size,
+                error = %e,
+                "Failed to refresh pending asset before adopting on-disk file"
+            );
+            continue;
+        }
+
+        let local_checksum = match super::file::compute_sha256(&existing_path).await {
+            Ok(checksum) => checksum,
+            Err(e) => {
+                tracing::warn!(
+                    asset_id = %asset.id(),
+                    version_size,
+                    path = %existing_path.display(),
+                    error = %e,
+                    "Failed to hash on-disk file for pending asset"
+                );
+                continue;
+            }
+        };
+        if let Err(e) = db
+            .mark_downloaded(
+                library,
+                asset.id(),
+                version_size,
+                &existing_path,
+                &local_checksum,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(
+                asset_id = %asset.id(),
+                version_size,
+                path = %existing_path.display(),
+                error = %e,
+                "Failed to mark pending asset downloaded from on-disk file"
+            );
+            continue;
+        }
+        tracing::info!(
+            asset_id = %asset.id(),
+            version_size,
+            path = %existing_path.display(),
+            "Resolved pending asset from existing on-disk file"
+        );
+        adopted += 1;
+    }
+
+    adopted
+}
+
+async fn backfill_downloaded_metadata_for_on_disk_skip(
+    state_db: Option<&dyn StateDb>,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    ctx: &DownloadContext,
+) {
+    if !ctx.has_downloaded_without_metadata_hash() {
+        return;
+    }
+    let Some(db) = state_db else {
+        return;
+    };
+    let library = effective_asset_library(asset, config);
+    let downloaded_versions = ctx
+        .downloaded_ids
+        .get(library)
+        .and_then(|assets| assets.get(asset.id()));
+    let Some(downloaded_versions) = downloaded_versions else {
+        return;
+    };
+    let version_hashes = ctx
+        .downloaded_metadata_hashes
+        .get(library)
+        .and_then(|assets| assets.get(asset.id()));
+
+    for derived in derive_expected_paths(asset, config) {
+        let version_size = derived.version_size.as_str();
+        let has_metadata_hash =
+            version_hashes.is_some_and(|hashes| hashes.contains_key(version_size));
+        if !downloaded_versions.contains(version_size) || has_metadata_hash {
+            continue;
+        }
+
+        let record = asset_record_for_derived_path(Arc::from(library), asset, &derived);
+
+        if let Err(e) = db.upsert_seen(&record).await {
+            tracing::warn!(
+                asset_id = %asset.id(),
+                version_size,
+                error = %e,
+                "Failed to backfill metadata for skipped downloaded asset"
+            );
+        }
+    }
 }
 
 /// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case
@@ -1326,15 +1489,31 @@ where
 
                     if plan.tasks.is_empty() {
                         // No-op for status='downloaded' rows (the common
-                        // case). A row left status='pending' by a prior
-                        // interrupted sync will be promoted to failed at
-                        // sync end as stuck-pipeline recovery.
+                        // case). A pending row from a prior failed or
+                        // interrupted sync is adopted when the matching file
+                        // is already on disk; if adoption fails, the touched
+                        // flush still lets stuck-pipeline recovery promote it.
                         let candidates = extract_skip_candidates(&asset, config);
                         tag_metadata_rewrites(
                             producer_state_db.as_deref(),
                             config,
                             &asset,
                             &candidates,
+                            &download_ctx,
+                        )
+                        .await;
+                        adopt_pending_on_disk_skip(
+                            producer_state_db.as_deref(),
+                            config,
+                            &asset,
+                            &download_ctx,
+                            &mut task_planner,
+                        )
+                        .await;
+                        backfill_downloaded_metadata_for_on_disk_skip(
+                            producer_state_db.as_deref(),
+                            config,
+                            &asset,
                             &download_ctx,
                         )
                         .await;
@@ -1590,18 +1769,16 @@ where
         // libraries.
         //
         // touched_assets contains assets the consumer will not finalize this
-        // sync: trust-state fast-skips (line 1026, status='downloaded')
-        // and on-disk skips (line 1053, which the comment at the push
-        // site notes can include status='pending' rows carried over from
-        // a prior interrupted sync). Bumping their last_seen_at is a
-        // no-op for terminal rows and is load-bearing for stuck-pipeline
-        // recovery on pending rows: promote_pending_to_failed promotes
-        // any 'pending' row whose last_seen_at >= sync_started_at.
+        // sync: trust-state fast-skips and on-disk skips. Bumping
+        // last_seen_at is a no-op for terminal rows. For pending rows that
+        // could not be adopted from disk, it is load-bearing for
+        // stuck-pipeline recovery: promote_pending_to_failed promotes any
+        // pending row whose last_seen_at >= sync_started_at.
         //
         // If we lose this flush (e.g. process killed between the producer
         // loop exiting and touch_last_seen_many returning), stuck-pipeline
-        // promotion is delayed by exactly one sync — the same row hits
-        // the same path next run and gets promoted then. No data loss.
+        // promotion is delayed by exactly one sync. The same row hits the
+        // same path next run and gets adopted or promoted then. No data loss.
         if let Some(db) = &producer_state_db {
             if !touched_assets.is_empty() {
                 let mut touched_by_library: FxHashMap<Arc<str>, Vec<Arc<str>>> =
@@ -3950,7 +4127,7 @@ mod tests {
 
         #[cfg(test)]
         async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
-            unimplemented!()
+            Ok(Vec::new())
         }
 
         async fn reset_failed(&self) -> Result<u64, StateError> {
@@ -4967,22 +5144,17 @@ mod tests {
         assert_eq!(summary.failed, 0);
     }
 
-    /// Producer-side regression for the deferred `touched_assets` flush.
+    /// Producer-side regression for resolving pending rows on on-disk skip.
     ///
     /// A pending row carried over from a prior interrupted sync, whose
     /// new sync hits the on-disk-skip path (the `tasks.is_empty()`
-    /// branch at the producer's filter step), must end the sync as
-    /// `failed` -- the producer task pushes its source library and id into
-    /// `touched_assets`, the deferred `touch_last_seen_many` flush bumps
-    /// `last_seen_at`, and `promote_pending_to_failed` then promotes it.
-    /// This is load-bearing for stuck-pipeline recovery and for cross-zone
-    /// album members whose owner album pass differs from the asset source zone.
-    ///
-    /// If a future refactor moves the flush behind a not-always-reached
-    /// path, or moves `touched_assets` writes off the producer's terminal
-    /// path, this test fails.
+    /// branch at the producer's filter step), must be adopted as downloaded
+    /// when the expected file already exists with the same name and size.
+    /// Otherwise standard sync resets failed assets to pending, full
+    /// enumeration skips the already-present file, and the same row is
+    /// promoted back to failed every run.
     #[tokio::test]
-    async fn producer_flushes_touched_ids_so_pending_on_disk_skip_promotes() {
+    async fn producer_adopts_pending_on_disk_skip_as_downloaded() {
         use crate::download::DownloadConfig;
         use crate::icloud::photos::PhotoAsset;
         use crate::state::SqliteStateDb;
@@ -5016,7 +5188,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut config = DownloadConfig::test_default();
-        config.directory = std::sync::Arc::from(dir.path());
+        config.directory = Arc::from(dir.path());
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
 
@@ -5050,14 +5222,99 @@ mod tests {
 
         let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
         assert_eq!(
-            promoted, 1,
-            "stuck pending row must be promoted by the deferred touched_ids flush"
+            promoted, 0,
+            "on-disk pending row should be resolved before failed promotion"
         );
 
-        let failed = db.get_failed().await.unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].library.as_ref(), "SharedSync-abc");
-        assert_eq!(&*failed[0].id, "STUCK");
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+    }
+
+    /// v5 metadata backfill regression: a previously downloaded row with a
+    /// NULL metadata_hash can hit the producer's on-disk-skip branch when
+    /// the file already exists. That branch must refresh metadata for the
+    /// existing downloaded row; otherwise the "one-time after upgrade"
+    /// backfill notice repeats forever.
+    #[tokio::test]
+    async fn on_disk_skip_backfills_downloaded_row_metadata_hash() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        fn existing_asset() -> PhotoAsset {
+            TestPhotoAsset::new("BACKFILL")
+                .filename("backfill.jpg")
+                .item_type("public.jpeg")
+                .orig_file_type("public.jpeg")
+                .orig_size(1234)
+                .orig_url("https://p01.icloud-content.com/backfill.jpg")
+                .orig_checksum("ck_backfill")
+                .build()
+        }
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let asset = existing_asset();
+        let target_path = crate::download::filter::expected_paths_for(&asset, &config)
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&target_path, vec![0u8; 1234]).unwrap();
+
+        let record = crate::test_helpers::TestAssetRecord::new("BACKFILL")
+            .checksum("ck_backfill")
+            .filename("backfill.jpg")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "BACKFILL",
+            "original",
+            &target_path,
+            "sha256",
+            None,
+        )
+        .await
+        .unwrap();
+        db.clear_metadata_hash_for_test("PrimarySync", "BACKFILL", "original");
+        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+
+        let client = reqwest::Client::new();
+        let assets = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(existing_asset())]);
+        let result = stream_and_download_from_stream(
+            &client,
+            assets,
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(
+            result.downloaded, 0,
+            "existing file should not be re-downloaded"
+        );
+        assert!(
+            !db.has_downloaded_without_metadata_hash().await.unwrap(),
+            "on-disk skip must backfill metadata_hash for existing downloaded rows"
+        );
     }
 
     /// Data-sacred regression for the trust-state fast-skip removal.

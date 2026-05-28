@@ -201,21 +201,33 @@ pub struct SyncStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_blocked_zone: Option<String>,
     /// Number of token receivers expected from full-enumeration passes.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_expected_receivers: Option<usize>,
     /// Number of passes that produced a non-blank sync token.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_receivers_with_token: Option<usize>,
     /// Number of passes that completed but produced no sync token.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_receivers_missing: Option<usize>,
     /// Number of passes that produced a blank sync token.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_receivers_blank: Option<usize>,
     /// Number of sync token channels that dropped before reporting.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_receivers_dropped: Option<usize>,
     /// Number of unique non-blank sync token values observed.
+    /// Emitted whenever token receiver telemetry was collected, even if
+    /// `sync_token_blocked` is false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_unique_values: Option<usize>,
     pub elapsed_secs: f64,
@@ -1086,6 +1098,11 @@ struct DownloadContext {
     /// changed.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     metadata_retry_markers: LibraryAssetVersionSet,
+    /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
+    /// are pending at sync start. Used to resolve failed/pending rows when
+    /// the expected file is already on disk instead of promoting them back to
+    /// failed after the producer skips the duplicate path.
+    pending_ids: LibraryAssetVersionSet,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced. Library-blind: a known ID
     /// is "known" regardless of which zone it belongs to.
@@ -1095,10 +1112,13 @@ struct DownloadContext {
     /// Library-blind: an asset shared across libraries shares its attempt
     /// budget (mirrors how `get_attempt_counts` aggregates by id alone).
     attempt_counts: FxHashMap<Arc<str>, u32>,
+    /// True when at least one downloaded asset-version lacks a metadata hash.
+    /// Cached because the producer checks this on hot on-disk skip paths.
+    downloaded_without_metadata_hash: bool,
 }
 
 impl DownloadContext {
-    /// Load the download context from the state database. All six queries
+    /// Load the download context from the state database. All state queries
     /// are independent and run concurrently so sync start doesn't serialize
     /// on round-trip latency across them.
     async fn load<D>(db: &D, retry_only: bool) -> Self
@@ -1115,7 +1135,7 @@ impl DownloadContext {
                 Default::default()
             }
         };
-        let (ids, checksums, hashes, markers, attempts, known_ids) = tokio::join!(
+        let (ids, checksums, hashes, markers, pending, attempts, known_ids) = tokio::join!(
             async {
                 db.get_downloaded_ids().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
@@ -1139,6 +1159,12 @@ impl DownloadContext {
             async {
                 db.get_metadata_retry_markers().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
+                    Default::default()
+                })
+            },
+            async {
+                db.get_pending().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load pending assets from state DB");
                     Default::default()
                 })
             },
@@ -1213,6 +1239,18 @@ impl DownloadContext {
                 .insert(version_size.into_boxed_str());
         }
 
+        let mut pending_ids: LibraryAssetVersionSet = FxHashMap::default();
+        for record in pending {
+            let lib = intern_id(&mut interner, record.library.to_string());
+            let id = intern_id(&mut interner, record.id.to_string());
+            pending_ids
+                .entry(lib)
+                .or_default()
+                .entry(id)
+                .or_default()
+                .insert(record.version_size.as_str().into());
+        }
+
         let known_ids: FxHashSet<Arc<str>> = known_ids
             .into_iter()
             .map(|id| intern_id(&mut interner, id))
@@ -1222,14 +1260,18 @@ impl DownloadContext {
             .into_iter()
             .map(|(id, count)| (intern_id(&mut interner, id), count))
             .collect();
+        let downloaded_without_metadata_hash = count_version_set_entries(&downloaded_ids)
+            > count_value_map_entries(&downloaded_metadata_hashes);
 
         Self {
             downloaded_ids,
             downloaded_checksums,
             downloaded_metadata_hashes,
             metadata_retry_markers,
+            pending_ids,
             known_ids,
             attempt_counts,
+            downloaded_without_metadata_hash,
         }
     }
 
@@ -1345,16 +1387,8 @@ impl DownloadContext {
         }
     }
 
-    fn downloaded_version_count(&self) -> usize {
-        count_version_set_entries(&self.downloaded_ids)
-    }
-
-    fn downloaded_metadata_hash_count(&self) -> usize {
-        count_value_map_entries(&self.downloaded_metadata_hashes)
-    }
-
     fn has_downloaded_without_metadata_hash(&self) -> bool {
-        self.downloaded_version_count() > self.downloaded_metadata_hash_count()
+        self.downloaded_without_metadata_hash
     }
 }
 
@@ -1422,6 +1456,12 @@ fn build_pass_configs_with_download_concurrency(
             Arc::new(config)
         })
         .collect()
+}
+
+fn incremental_requires_full_enumeration(passes: &[crate::commands::AlbumPass]) -> bool {
+    passes
+        .iter()
+        .any(|pass| pass.kind != crate::commands::PassKind::Unfiled)
 }
 
 async fn collect_pass_asset_ids(pass: &crate::commands::AlbumPass) -> Result<FxHashSet<String>> {
@@ -1897,7 +1937,7 @@ pub async fn download_photos_with_sync(
     // Give every non-downloaded asset a fresh start this sync:
     // failed -> pending (with attempts reset), and stale attempt counts on
     // pending assets cleared so the per-sync cap starts from zero.
-    let total_pending = if let Some(db) = &config.state_db {
+    let (retry_failed_count, total_pending) = if let Some(db) = &config.state_db {
         match db.prepare_for_retry().await {
             Ok((failed, stale, total_pending)) => {
                 if failed > 0 {
@@ -1909,15 +1949,15 @@ pub async fn download_photos_with_sync(
                         "Cleared stale attempt counts on pending assets"
                     );
                 }
-                total_pending
+                (failed, total_pending)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to reset assets for retry");
-                0
+                (0, 0)
             }
         }
     } else {
-        0
+        (0, 0)
     };
 
     let result = match &config.sync_mode {
@@ -1931,16 +1971,17 @@ pub async fn download_photos_with_sync(
             )
             .await
         }
-        // In `{album}` mode we have to fall back to full enumeration:
         // `changes_stream` uses the zone-level `/changes/zone` endpoint, so
-        // it returns the same delta for every album in a zone. Without
-        // per-asset album-membership info on the change events, we can't
-        // route assets to the correct album folder — full enumeration uses
-        // the album-scoped `photo_stream_with_token` and stays correct.
-        SyncMode::Incremental { .. } if config.requires_per_pass_paths() => {
+        // it returns the same delta for every selected album or smart folder
+        // in a zone. Without per-asset membership info on the change events,
+        // we can't tell whether a new asset belongs in those scoped passes.
+        // The unfiled/library-wide pass is safe: every zone change belongs to
+        // that pass, and inactive album/smart-folder templates shouldn't
+        // force full enumeration on an unfiled-only sync.
+        SyncMode::Incremental { .. } if incremental_requires_full_enumeration(passes) => {
             tracing::debug!(
-                "`{{album}}` folder template requires full enumeration for correct \
-                 per-album routing, skipping incremental"
+                "Album or smart-folder passes require full enumeration for correct \
+                 membership routing, skipping incremental"
             );
             download_photos_full_with_token(
                 download_client,
@@ -1955,9 +1996,10 @@ pub async fn download_photos_with_sync(
         // pending assets from previous syncs. Fall back to full so they get
         // retried. Once everything is downloaded, incremental resumes.
         SyncMode::Incremental { .. } if total_pending > 0 => {
-            tracing::debug!(
+            tracing::info!(
                 pending = total_pending,
-                "Pending assets require full enumeration, skipping incremental sync"
+                failed_reset = retry_failed_count,
+                "Retrying failed/pending assets requires full enumeration, skipping incremental sync"
             );
             download_photos_full_with_token(
                 download_client,
@@ -2690,6 +2732,14 @@ async fn download_photos_full_with_token(
     .await?;
     stats.pagination_shortfall_warnings = pagination_shortfall_warnings;
     stats.pagination_shortfall_assets = pagination_shortfall_assets;
+    if token_eligible {
+        stats.sync_token_expected_receivers = token_expected_receivers;
+        stats.sync_token_receivers_with_token = token_receivers_with_token;
+        stats.sync_token_receivers_missing = token_receivers_missing;
+        stats.sync_token_receivers_blank = token_receivers_blank;
+        stats.sync_token_receivers_dropped = token_receivers_dropped;
+        stats.sync_token_unique_values = token_unique_values;
+    }
     if pagination_undercount {
         stats.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some("pagination_shortfall");
@@ -2702,12 +2752,6 @@ async fn download_photos_full_with_token(
         stats.sync_token_blocked_reason = Some(reason);
         stats.sync_token_blocked_source = Some(sync_token_blocked_source(reason));
         stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(reason));
-        stats.sync_token_expected_receivers = token_expected_receivers;
-        stats.sync_token_receivers_with_token = token_receivers_with_token;
-        stats.sync_token_receivers_missing = token_receivers_missing;
-        stats.sync_token_receivers_blank = token_receivers_blank;
-        stats.sync_token_receivers_dropped = token_receivers_dropped;
-        stats.sync_token_unique_values = token_unique_values;
     }
 
     // Clear enumeration-in-progress markers when the producer reached the
@@ -3187,7 +3231,7 @@ mod tests {
         );
     }
 
-    fn changes_album(name: &str, session: CountingChangesZoneSession) -> PhotoAlbum {
+    fn changes_album(name: &str, session: impl PhotosSession + 'static) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),
@@ -3209,6 +3253,17 @@ mod tests {
     #[derive(Clone)]
     struct CountingChangesZoneSession {
         changes_zone_calls: Arc<AtomicUsize>,
+        records: Vec<Value>,
+    }
+
+    fn changes_zone_session(
+        changes_zone_calls: Arc<AtomicUsize>,
+        records: Vec<Value>,
+    ) -> CountingChangesZoneSession {
+        CountingChangesZoneSession {
+            changes_zone_calls,
+            records,
+        }
     }
 
     #[async_trait::async_trait]
@@ -3226,7 +3281,7 @@ mod tests {
                         "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
                         "syncToken": "zone-token-next",
                         "moreComing": false,
-                        "records": incremental_photo_records("MASTER_CHANGED"),
+                        "records": self.records.clone(),
                     }]
                 }));
             }
@@ -3615,6 +3670,13 @@ mod tests {
             Some("zone-token"),
             "clean write-mode enumeration should still advance the agreed sync token"
         );
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.stats.sync_token_expected_receivers, Some(2));
+        assert_eq!(result.stats.sync_token_receivers_with_token, Some(2));
+        assert_eq!(result.stats.sync_token_receivers_missing, Some(0));
+        assert_eq!(result.stats.sync_token_receivers_blank, Some(0));
+        assert_eq!(result.stats.sync_token_receivers_dropped, Some(0));
+        assert_eq!(result.stats.sync_token_unique_values, Some(1));
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "filtered duplicate should not make the write-mode run partial"
@@ -4253,11 +4315,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unfiled_only_incremental_ignores_inactive_album_path_templates() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            incremental_photo_records("MASTER_CHANGED"),
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        assert!(
+            config.requires_per_pass_paths(),
+            "default inactive album templates still contain per-pass tokens"
+        );
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("unfiled-only incremental sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(
+            !result.full_enumeration_ran,
+            "inactive album/smart-folder templates must not force full enumeration"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "unfiled-only incremental sync should query changes/zone"
+        );
+    }
+
+    #[tokio::test]
     async fn incremental_sync_queries_zone_changes_once_per_library() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let session = CountingChangesZoneSession {
-            changes_zone_calls: Arc::clone(&calls),
-        };
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            incremental_photo_records("MASTER_CHANGED"),
+        );
         let passes = vec![
             AlbumPass {
                 kind: PassKind::Album,
@@ -4511,6 +4620,9 @@ mod tests {
             .or_default()
             .insert("original".into());
 
+        ctx.downloaded_without_metadata_hash = count_version_set_entries(&ctx.downloaded_ids)
+            > count_value_map_entries(&ctx.downloaded_metadata_hashes);
+
         assert!(
             ctx.has_downloaded_without_metadata_hash(),
             "a downloaded row with no matching metadata hash needs the backfill notice"
@@ -4522,6 +4634,9 @@ mod tests {
             .entry("asset_meta".into())
             .or_default()
             .insert("original".into(), "metadata_hash".into());
+
+        ctx.downloaded_without_metadata_hash = count_version_set_entries(&ctx.downloaded_ids)
+            > count_value_map_entries(&ctx.downloaded_metadata_hashes);
 
         assert!(
             !ctx.has_downloaded_without_metadata_hash(),
@@ -4855,6 +4970,36 @@ mod tests {
         c.folder_structure_albums = Arc::from(albums);
         c.folder_structure_smart_folders = Arc::from(smart_folders);
         c
+    }
+
+    #[test]
+    fn incremental_full_enumeration_gate_ignores_unfiled_only_pass() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        assert!(
+            !incremental_requires_full_enumeration(&passes),
+            "unfiled-only sync can use zone-level incremental changes"
+        );
+    }
+
+    #[test]
+    fn incremental_full_enumeration_gate_fires_on_album_pass() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Vacation", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        assert!(
+            incremental_requires_full_enumeration(&passes),
+            "album-scoped sync needs full enumeration to preserve membership"
+        );
     }
 
     #[test]

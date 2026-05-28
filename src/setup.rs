@@ -502,7 +502,7 @@ fn write_config_file(config_path: &Path, toml_content: &str) -> anyhow::Result<(
 fn credential_store_dir(answers: &SetupAnswers) -> PathBuf {
     match &answers.data_dir {
         Some(dir) => crate::config::expand_tilde(dir),
-        None => crate::config::expand_tilde("~/.config/kei/cookies"),
+        None => crate::config::default_cookie_dir(),
     }
 }
 
@@ -2735,7 +2735,7 @@ mod tests {
         let default = SetupAnswers::default();
         assert_eq!(
             credential_store_dir(&default),
-            crate::config::expand_tilde("~/.config/kei/cookies")
+            crate::config::default_cookie_dir()
         );
     }
 

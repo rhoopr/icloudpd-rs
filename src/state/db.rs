@@ -2175,8 +2175,8 @@ impl SqliteStateDb {
                 )
                 .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
 
-            let pending = conn
-                .execute(
+            let pending =
+                conn.execute(
                     "UPDATE assets SET download_attempts = 0, last_error = NULL \
                      WHERE status = 'pending' AND download_attempts > 0",
                     [],
@@ -3003,6 +3003,21 @@ impl SqliteStateDb {
         conn.execute(
             "UPDATE assets SET last_seen_at = ?1 WHERE library = ?2 AND id = ?3",
             rusqlite::params![ts, library, asset_id],
+        )
+        .unwrap();
+    }
+
+    pub(crate) fn clear_metadata_hash_for_test(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: &str,
+    ) {
+        let conn = self.acquire_lock("test_clear_metadata_hash").unwrap();
+        conn.execute(
+            "UPDATE assets SET metadata_hash = NULL \
+             WHERE library = ?1 AND id = ?2 AND version_size = ?3",
+            rusqlite::params![library, asset_id, version_size],
         )
         .unwrap();
     }
