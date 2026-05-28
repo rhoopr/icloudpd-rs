@@ -6,11 +6,7 @@
 
 use std::path::Path;
 
-use crate::config::expand_tilde;
-
-/// New default paths.
-const NEW_CONFIG_PATH: &str = "~/.config/kei/config.toml";
-const NEW_COOKIE_DIR: &str = "~/.config/kei/cookies";
+use crate::config::{default_config_path, default_cookie_dir, expand_tilde};
 
 /// Legacy paths from icloudpd-rs.
 const OLD_CONFIG_PATH: &str = "~/.config/icloudpd-rs/config.toml";
@@ -21,8 +17,8 @@ const OLD_COOKIE_DIR: &str = "~/.icloudpd-rs";
 /// Called early in `main()`, before config loading. Returns `Ok(false)` if no
 /// migration was needed (new paths already exist or no old paths found).
 pub fn migrate_legacy_paths() -> anyhow::Result<bool> {
-    let new_config = expand_tilde(NEW_CONFIG_PATH);
-    let new_cookie_dir = expand_tilde(NEW_COOKIE_DIR);
+    let new_config = default_config_path();
+    let new_cookie_dir = default_cookie_dir();
     let old_config = expand_tilde(OLD_CONFIG_PATH);
     let old_cookie_dir = expand_tilde(OLD_COOKIE_DIR);
 
