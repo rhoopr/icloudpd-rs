@@ -539,6 +539,9 @@ mod tests {
                         crate::download::sync_token_blocked_explanation("pagination_shortfall"),
                     ),
                     sync_token_blocked_zone: Some("PrimarySync".to_string()),
+                    full_enumeration_reason: Some(
+                        crate::download::FullEnumerationReason::RetryFailedRows,
+                    ),
                     ..SyncStats::default()
                 },
                 failed_count: 0,
@@ -556,6 +559,7 @@ mod tests {
                     "kei_sync_enumeration_errors_total 0",
                     "kei_sync_pagination_shortfall_warnings_total 1",
                     "kei_sync_token_blocked_cycles_total 1",
+                    "kei_sync_full_enumeration_reason_total{reason=\"retry_failed_rows\"} 1",
                 ],
             },
             OutcomeCase {
@@ -716,6 +720,20 @@ mod tests {
                 assert!(
                     report_json["stats"]["sync_token_blocked_reason"].is_null(),
                     "{} JSON token-blocked reason should be absent",
+                    case.name
+                );
+            }
+            if let Some(reason) = case.stats.full_enumeration_reason {
+                assert_eq!(
+                    report_json["stats"]["full_enumeration_reason"],
+                    reason.as_str(),
+                    "{} JSON full-enumeration reason",
+                    case.name
+                );
+            } else {
+                assert!(
+                    report_json["stats"]["full_enumeration_reason"].is_null(),
+                    "{} JSON full-enumeration reason should be absent",
                     case.name
                 );
             }

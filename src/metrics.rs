@@ -62,6 +62,12 @@ struct SkipLabels {
     reason: &'static str,
 }
 
+/// Label set for the `kei_sync_full_enumeration_reason_total` counter family.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
+struct FullEnumerationLabels {
+    reason: &'static str,
+}
+
 /// Label set for the `kei_db_assets_total` and `kei_db_assets_size_bytes` gauge families.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, prometheus_client::encoding::EncodeLabelSet)]
 struct StatusLabels {
@@ -104,6 +110,7 @@ pub(crate) struct MetricsHandle {
     pagination_shortfall_warnings: Counter,
     pagination_shortfall_assets: Counter,
     sync_token_blocked_cycles: Counter,
+    full_enumeration_reasons: Family<FullEnumerationLabels, Counter>,
     session_expirations: Counter,
     cycle_duration_seconds: Gauge<f64, AtomicU64>,
     consecutive_failures: Gauge,
@@ -205,6 +212,13 @@ impl MetricsHandle {
             sync_token_blocked_cycles.clone(),
         );
 
+        let full_enumeration_reasons: Family<FullEnumerationLabels, Counter> = Family::default();
+        registry.register(
+            "kei_sync_full_enumeration_reason",
+            "Total number of full-enumeration sync cycles, by bounded reason",
+            full_enumeration_reasons.clone(),
+        );
+
         let session_expirations = Counter::default();
         registry.register(
             "kei_sync_session_expirations",
@@ -303,6 +317,7 @@ impl MetricsHandle {
             pagination_shortfall_warnings,
             pagination_shortfall_assets,
             sync_token_blocked_cycles,
+            full_enumeration_reasons,
             session_expirations,
             cycle_duration_seconds,
             consecutive_failures,
@@ -337,6 +352,13 @@ impl MetricsHandle {
             .inc_by(stats.pagination_shortfall_assets);
         if stats.sync_token_blocked {
             self.sync_token_blocked_cycles.inc();
+        }
+        if let Some(reason) = stats.full_enumeration_reason {
+            self.full_enumeration_reasons
+                .get_or_create(&FullEnumerationLabels {
+                    reason: reason.as_str(),
+                })
+                .inc();
         }
 
         if stats.interrupted {
@@ -712,6 +734,26 @@ mod tests {
         );
         assert!(
             output.contains("kei_sync_token_blocked_cycles_total 1"),
+            "output:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_enumeration_reason_counter_uses_bounded_label() {
+        let handle = MetricsHandle::new(None);
+        let stats = SyncStats {
+            full_enumeration_reason: Some(
+                crate::download::FullEnumerationReason::PathTemplateRequiresFullEnumeration,
+            ),
+            ..SyncStats::default()
+        };
+        handle.update(&stats, &healthy_status(0)).await;
+
+        let output = render_metrics(&handle).await;
+        assert!(
+            output.contains(
+                "kei_sync_full_enumeration_reason_total{reason=\"path_template_requires_full_enumeration\"} 1"
+            ),
             "output:\n{output}"
         );
     }

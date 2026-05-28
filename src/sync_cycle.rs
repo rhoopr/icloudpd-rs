@@ -161,6 +161,12 @@ impl EnumConfigHashOutcome {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SyncModeDecision {
+    pub(crate) mode: download::SyncMode,
+    pub(crate) full_enumeration_reason: Option<download::FullEnumerationReason>,
+}
+
 /// Compare the current download-config hash against the one stored in
 /// the state DB and react to drift. Storage failures are logged at warn
 /// and swallowed, but the new hash is never persisted unless stale sync
@@ -275,14 +281,19 @@ pub(crate) async fn run_cycle(
         // retry-failed must always use full enumeration: incremental
         // sync only returns NEW iCloud changes, missing previously-
         // failed assets that were already enumerated but not downloaded.
-        let sync_mode = if force_full_for_config_hash {
+        let sync_mode_decision = if force_full_for_config_hash {
+            let reason = download::FullEnumerationReason::EnumConfigHashDrift;
             tracing::debug!(
                 zone = %lib_state.zone_name,
+                full_enumeration_reason = reason.as_str(),
                 "Forcing full sync because config-hash validation invalidated stored sync tokens"
             );
-            download::SyncMode::Full
+            SyncModeDecision {
+                mode: download::SyncMode::Full,
+                full_enumeration_reason: Some(reason),
+            }
         } else {
-            determine_sync_mode(
+            determine_sync_mode_decision(
                 is_retry_failed,
                 library_states.len(),
                 state_db,
@@ -291,12 +302,22 @@ pub(crate) async fn run_cycle(
             )
             .await
         };
+        let sync_mode = sync_mode_decision.mode;
 
         let sync_mode_label = match &sync_mode {
             download::SyncMode::Full => "full",
             download::SyncMode::Incremental { .. } => "incremental",
         };
-        tracing::debug!(sync_mode = sync_mode_label, zone = %lib_state.zone_name, "Starting sync cycle");
+        if let Some(reason) = sync_mode_decision.full_enumeration_reason {
+            tracing::info!(
+                sync_mode = sync_mode_label,
+                zone = %lib_state.zone_name,
+                full_enumeration_reason = reason.as_str(),
+                "Starting full-enumeration sync cycle"
+            );
+        } else {
+            tracing::debug!(sync_mode = sync_mode_label, zone = %lib_state.zone_name, "Starting sync cycle");
+        }
 
         // Skip the DB scan entirely when nothing downstream will read it.
         #[cfg(feature = "xmp")]
@@ -325,6 +346,10 @@ pub(crate) async fn run_cycle(
             shutdown_token.clone(),
         )
         .await?;
+
+        if sync_result.full_enumeration_ran && sync_result.stats.full_enumeration_reason.is_none() {
+            sync_result.stats.full_enumeration_reason = sync_mode_decision.full_enumeration_reason;
+        }
 
         let library_completed_without_errors =
             matches!(&sync_result.outcome, download::DownloadOutcome::Success)
@@ -501,6 +526,73 @@ where
 }
 
 /// Determine the sync mode for a library: full enumeration or incremental.
+pub(crate) async fn determine_sync_mode_decision<D>(
+    is_retry_failed: bool,
+    library_count: usize,
+    state_db: Option<&D>,
+    sync_token_key: &str,
+    zone_name: &str,
+) -> SyncModeDecision
+where
+    D: state::SyncTokenStore + ?Sized,
+{
+    if is_retry_failed {
+        let reason = download::FullEnumerationReason::ExplicitRetryFailed;
+        if library_count == 1 {
+            tracing::info!(
+                full_enumeration_reason = reason.as_str(),
+                "Retry-failed always runs full enumeration because incremental sync only returns new iCloud changes and can miss older failed assets"
+            );
+        }
+        SyncModeDecision {
+            mode: download::SyncMode::Full,
+            full_enumeration_reason: Some(reason),
+        }
+    } else if let Some(db) = state_db {
+        match db.get_metadata(sync_token_key).await {
+            Ok(Some(ref token)) if !token.is_empty() => {
+                tracing::debug!(zone = %zone_name, "Stored sync token found, using incremental sync");
+                SyncModeDecision {
+                    mode: download::SyncMode::Incremental {
+                        zone_sync_token: token.clone(),
+                    },
+                    full_enumeration_reason: None,
+                }
+            }
+            Ok(_) => {
+                let reason = download::FullEnumerationReason::NoStoredToken;
+                tracing::debug!(
+                    zone = %zone_name,
+                    full_enumeration_reason = reason.as_str(),
+                    "No sync token found, performing full enumeration"
+                );
+                SyncModeDecision {
+                    mode: download::SyncMode::Full,
+                    full_enumeration_reason: Some(reason),
+                }
+            }
+            Err(e) => {
+                let reason = download::FullEnumerationReason::OtherStaticReason;
+                tracing::warn!(
+                    error = %e,
+                    full_enumeration_reason = reason.as_str(),
+                    "Failed to load sync token, falling back to full enumeration"
+                );
+                SyncModeDecision {
+                    mode: download::SyncMode::Full,
+                    full_enumeration_reason: Some(reason),
+                }
+            }
+        }
+    } else {
+        SyncModeDecision {
+            mode: download::SyncMode::Full,
+            full_enumeration_reason: Some(download::FullEnumerationReason::NoStoredToken),
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) async fn determine_sync_mode<D>(
     is_retry_failed: bool,
     library_count: usize,
@@ -511,33 +603,15 @@ pub(crate) async fn determine_sync_mode<D>(
 where
     D: state::SyncTokenStore + ?Sized,
 {
-    if is_retry_failed {
-        if library_count == 1 {
-            tracing::info!(
-                "Retry-failed always runs full enumeration because incremental sync only returns new iCloud changes and can miss older failed assets"
-            );
-        }
-        download::SyncMode::Full
-    } else if let Some(db) = state_db {
-        match db.get_metadata(sync_token_key).await {
-            Ok(Some(ref token)) if !token.is_empty() => {
-                tracing::debug!(zone = %zone_name, "Stored sync token found, using incremental sync");
-                download::SyncMode::Incremental {
-                    zone_sync_token: token.clone(),
-                }
-            }
-            Ok(_) => {
-                tracing::debug!(zone = %zone_name, "No sync token found, performing full enumeration");
-                download::SyncMode::Full
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to load sync token, falling back to full enumeration");
-                download::SyncMode::Full
-            }
-        }
-    } else {
-        download::SyncMode::Full
-    }
+    determine_sync_mode_decision(
+        is_retry_failed,
+        library_count,
+        state_db,
+        sync_token_key,
+        zone_name,
+    )
+    .await
+    .mode
 }
 
 #[cfg(test)]
@@ -638,6 +712,34 @@ mod tests {
             db.get_metadata(&sync_token_key).await.expect("read token"),
             Some("stored-token-abc".to_string()),
             "mode selection must not consume or clear the stored token"
+        );
+    }
+
+    #[tokio::test]
+    async fn determine_sync_mode_decision_records_explicit_full_reasons() {
+        let db = state::SqliteStateDb::open_in_memory().expect("state db");
+        let sync_token_key = sync_token_key("PrimarySync");
+        db.set_metadata(&sync_token_key, "stored-token-abc")
+            .await
+            .expect("set token");
+
+        let retry =
+            determine_sync_mode_decision(true, 1, Some(&db), &sync_token_key, "PrimarySync").await;
+        assert!(matches!(retry.mode, download::SyncMode::Full));
+        assert_eq!(
+            retry.full_enumeration_reason,
+            Some(download::FullEnumerationReason::ExplicitRetryFailed)
+        );
+
+        db.delete_metadata_by_prefix(SYNC_TOKEN_PREFIX)
+            .await
+            .expect("clear token");
+        let no_token =
+            determine_sync_mode_decision(false, 1, Some(&db), &sync_token_key, "PrimarySync").await;
+        assert!(matches!(no_token.mode, download::SyncMode::Full));
+        assert_eq!(
+            no_token.full_enumeration_reason,
+            Some(download::FullEnumerationReason::NoStoredToken)
         );
     }
 }

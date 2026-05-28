@@ -4700,6 +4700,10 @@ mod tests {
 
         assert_eq!(result.failed_count, 0);
         assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(download::FullEnumerationReason::EnumConfigHashDrift)
+        );
+        assert_eq!(
             observed_modes
                 .lock()
                 .expect("recorded modes lock")
@@ -4887,6 +4891,10 @@ mod tests {
 
         assert_eq!(result.failed_count, 0);
         assert_eq!(result.stats.assets_seen, 0);
+        assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(download::FullEnumerationReason::NoStoredToken)
+        );
         assert!(
             logs_contain(ZERO_ASSET_WARNING_PREFIX),
             "completed full sync with zero assets should be visible in normal logs"
@@ -4908,6 +4916,10 @@ mod tests {
 
         assert_eq!(result.failed_count, 0);
         assert_eq!(result.stats.assets_seen, 0);
+        assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(download::FullEnumerationReason::ExplicitRetryFailed)
+        );
         assert!(
             !logs_contain(ZERO_ASSET_WARNING_PREFIX),
             "retry-failed no-op cycles must stay quiet"

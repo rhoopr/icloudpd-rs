@@ -73,6 +73,41 @@ pub enum SyncMode {
     },
 }
 
+/// Bounded reason vocabulary for full enumeration runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullEnumerationReason {
+    NoStoredToken,
+    RetryFailedRows,
+    PendingRows,
+    MetadataBackfill,
+    PathTemplateRequiresFullEnumeration,
+    EnumConfigHashDrift,
+    ExplicitRetryFailed,
+    #[allow(
+        dead_code,
+        reason = "reserved report vocabulary for a future durable token-blocked marker"
+    )]
+    TokenBlockedPreviously,
+    OtherStaticReason,
+}
+
+impl FullEnumerationReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoStoredToken => "no_stored_token",
+            Self::RetryFailedRows => "retry_failed_rows",
+            Self::PendingRows => "pending_rows",
+            Self::MetadataBackfill => "metadata_backfill",
+            Self::PathTemplateRequiresFullEnumeration => "path_template_requires_full_enumeration",
+            Self::EnumConfigHashDrift => "enum_config_hash_drift",
+            Self::ExplicitRetryFailed => "explicit_retry_failed",
+            Self::TokenBlockedPreviously => "token_blocked_previously",
+            Self::OtherStaticReason => "other_static_reason",
+        }
+    }
+}
+
 /// One-shot runtime behavior for a sync pass.
 ///
 /// Kept outside [`DownloadConfig`] so path/filter/download decisions do not
@@ -196,6 +231,10 @@ pub struct SyncStats {
     /// Human-readable explanation for why token advancement was blocked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_token_blocked_explanation: Option<&'static str>,
+    /// Bounded reason explaining why this run used full enumeration instead
+    /// of incremental sync.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_enumeration_reason: Option<FullEnumerationReason>,
     /// Zone name where token advancement was blocked. Set by the cycle owner
     /// so report.json can identify the affected library directly.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,6 +326,9 @@ impl SyncStats {
         }
         if self.sync_token_blocked_explanation.is_none() {
             self.sync_token_blocked_explanation = other.sync_token_blocked_explanation;
+        }
+        if self.full_enumeration_reason.is_none() {
+            self.full_enumeration_reason = other.full_enumeration_reason;
         }
         if self.sync_token_blocked_zone.is_none() {
             self.sync_token_blocked_zone = other.sync_token_blocked_zone.clone();
@@ -1924,6 +1966,43 @@ async fn cleanup_orphan_part_files(config: &DownloadConfig) {
     }
 }
 
+async fn has_metadata_backfill_work(config: &DownloadConfig) -> bool {
+    let Some(db) = &config.state_db else {
+        return false;
+    };
+    match db.has_downloaded_without_metadata_hash().await {
+        Ok(needs_backfill) => needs_backfill,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to check metadata backfill state before incremental sync"
+            );
+            false
+        }
+    }
+}
+
+fn set_full_enumeration_reason(result: &mut SyncResult, reason: FullEnumerationReason) {
+    if result.full_enumeration_ran && result.stats.full_enumeration_reason.is_none() {
+        result.stats.full_enumeration_reason = Some(reason);
+    }
+}
+
+async fn download_photos_full_with_reason(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+    reason: FullEnumerationReason,
+) -> Result<SyncResult> {
+    let mut result =
+        download_photos_full_with_token(download_client, passes, config, controls, shutdown_token)
+            .await?;
+    set_full_enumeration_reason(&mut result, reason);
+    Ok(result)
+}
+
 pub async fn download_photos_with_sync(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -1979,16 +2058,19 @@ pub async fn download_photos_with_sync(
         // that pass, and inactive album/smart-folder templates shouldn't
         // force full enumeration on an unfiled-only sync.
         SyncMode::Incremental { .. } if incremental_requires_full_enumeration(passes) => {
+            let reason = FullEnumerationReason::PathTemplateRequiresFullEnumeration;
             tracing::debug!(
+                full_enumeration_reason = reason.as_str(),
                 "Album or smart-folder passes require full enumeration for correct \
                  membership routing, skipping incremental"
             );
-            download_photos_full_with_token(
+            download_photos_full_with_reason(
                 download_client,
                 passes,
                 &config,
                 controls,
                 shutdown_token.clone(),
+                reason,
             )
             .await
         }
@@ -1996,17 +2078,40 @@ pub async fn download_photos_with_sync(
         // pending assets from previous syncs. Fall back to full so they get
         // retried. Once everything is downloaded, incremental resumes.
         SyncMode::Incremental { .. } if total_pending > 0 => {
+            let reason = if retry_failed_count > 0 {
+                FullEnumerationReason::RetryFailedRows
+            } else {
+                FullEnumerationReason::PendingRows
+            };
             tracing::info!(
                 pending = total_pending,
                 failed_reset = retry_failed_count,
+                full_enumeration_reason = reason.as_str(),
                 "Retrying failed/pending assets requires full enumeration, skipping incremental sync"
             );
-            download_photos_full_with_token(
+            download_photos_full_with_reason(
                 download_client,
                 passes,
                 &config,
                 controls,
                 shutdown_token.clone(),
+                reason,
+            )
+            .await
+        }
+        SyncMode::Incremental { .. } if has_metadata_backfill_work(&config).await => {
+            let reason = FullEnumerationReason::MetadataBackfill;
+            tracing::info!(
+                full_enumeration_reason = reason.as_str(),
+                "Metadata backfill requires full enumeration, skipping incremental sync"
+            );
+            download_photos_full_with_reason(
+                download_client,
+                passes,
+                &config,
+                controls,
+                shutdown_token.clone(),
+                reason,
             )
             .await
         }
@@ -2042,16 +2147,19 @@ pub async fn download_photos_with_sync(
                         });
 
                     if is_token_error || !is_transient {
+                        let reason = FullEnumerationReason::OtherStaticReason;
                         tracing::warn!(
                             error = %e,
+                            full_enumeration_reason = reason.as_str(),
                             "Incremental sync failed, falling back to full enumeration"
                         );
-                        download_photos_full_with_token(
+                        download_photos_full_with_reason(
                             download_client,
                             passes,
                             &config,
                             controls,
                             shutdown_token.clone(),
+                            reason,
                         )
                         .await
                     } else {
@@ -4361,6 +4469,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn album_incremental_records_path_template_full_enumeration_reason() {
+        let session = MockPhotosFlow::new()
+            .album_count(0)
+            .empty_query_page(Some("zone-token-next"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Vacation", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("album incremental should fall back to full enumeration");
+
+        assert!(result.full_enumeration_ran);
+        assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(FullEnumerationReason::PathTemplateRequiresFullEnumeration)
+        );
+    }
+
+    #[tokio::test]
     async fn incremental_with_failed_rows_falls_back_to_full_enumeration() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = crate::test_helpers::TestAssetRecord::new("FAILED_BEFORE_SYNC")
@@ -4410,7 +4554,117 @@ mod tests {
             result.full_enumeration_ran,
             "normal sync with failed rows must not stay incremental"
         );
+        assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(FullEnumerationReason::RetryFailedRows)
+        );
         assert!(matches!(result.outcome, DownloadOutcome::Success));
+    }
+
+    #[tokio::test]
+    async fn incremental_with_pending_rows_records_pending_full_enumeration_reason() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = crate::test_helpers::TestAssetRecord::new("PENDING_BEFORE_SYNC")
+            .filename("pending-before-sync.jpg")
+            .checksum("ck_pending_before_sync")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+
+        let session = MockPhotosFlow::new()
+            .album_count(0)
+            .empty_query_page(Some("zone-token-next"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("pending rows should fall back to full enumeration");
+
+        assert!(result.full_enumeration_ran);
+        assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(FullEnumerationReason::PendingRows)
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_with_metadata_backfill_records_full_enumeration_reason() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let dir = TempDir::new().expect("temp dir");
+        let record = crate::test_helpers::TestAssetRecord::new("BACKFILL_BEFORE_SYNC")
+            .filename("backfill-before-sync.jpg")
+            .checksum("ck_backfill_before_sync")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        let path = dir.path().join("backfill-before-sync.jpg");
+        tokio::fs::write(&path, vec![0u8; 1024])
+            .await
+            .expect("write local file");
+        db.mark_downloaded(
+            "PrimarySync",
+            "BACKFILL_BEFORE_SYNC",
+            "original",
+            &path,
+            "local_hash",
+            None,
+        )
+        .await
+        .expect("mark downloaded");
+        db.clear_metadata_hash_for_test("PrimarySync", "BACKFILL_BEFORE_SYNC", "original");
+        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+
+        let session = MockPhotosFlow::new()
+            .album_count(0)
+            .empty_query_page(Some("zone-token-next"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("metadata backfill should fall back to full enumeration");
+
+        assert!(result.full_enumeration_ran);
+        assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(FullEnumerationReason::MetadataBackfill)
+        );
     }
 
     #[tokio::test]
@@ -5681,6 +5935,7 @@ mod tests {
             sync_token_receivers_blank: Some(0),
             sync_token_receivers_dropped: Some(0),
             sync_token_unique_values: Some(1),
+            full_enumeration_reason: Some(FullEnumerationReason::RetryFailedRows),
             elapsed_secs: 1.5,
             interrupted: false,
             rate_limited: 7,
@@ -5724,6 +5979,7 @@ mod tests {
             sync_token_receivers_blank: Some(0),
             sync_token_receivers_dropped: Some(0),
             sync_token_unique_values: Some(1),
+            full_enumeration_reason: Some(FullEnumerationReason::PendingRows),
             elapsed_secs: 0.75,
             interrupted: true,
             rate_limited: 3,
@@ -5766,6 +6022,10 @@ mod tests {
         assert_eq!(acc.sync_token_receivers_blank, Some(0));
         assert_eq!(acc.sync_token_receivers_dropped, Some(0));
         assert_eq!(acc.sync_token_unique_values, Some(1));
+        assert_eq!(
+            acc.full_enumeration_reason,
+            Some(FullEnumerationReason::RetryFailedRows)
+        );
         assert!(
             (acc.elapsed_secs - 2.25).abs() < 1e-9,
             "elapsed_secs must sum (got {})",
