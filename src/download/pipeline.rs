@@ -4127,7 +4127,7 @@ mod tests {
 
         #[cfg(test)]
         async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
-            unimplemented!()
+            Ok(Vec::new())
         }
 
         async fn reset_failed(&self) -> Result<u64, StateError> {

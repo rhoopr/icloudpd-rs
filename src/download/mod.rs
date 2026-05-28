@@ -4620,6 +4620,9 @@ mod tests {
             .or_default()
             .insert("original".into());
 
+        ctx.downloaded_without_metadata_hash = count_version_set_entries(&ctx.downloaded_ids)
+            > count_value_map_entries(&ctx.downloaded_metadata_hashes);
+
         assert!(
             ctx.has_downloaded_without_metadata_hash(),
             "a downloaded row with no matching metadata hash needs the backfill notice"
@@ -4631,6 +4634,9 @@ mod tests {
             .entry("asset_meta".into())
             .or_default()
             .insert("original".into(), "metadata_hash".into());
+
+        ctx.downloaded_without_metadata_hash = count_version_set_entries(&ctx.downloaded_ids)
+            > count_value_map_entries(&ctx.downloaded_metadata_hashes);
 
         assert!(
             !ctx.has_downloaded_without_metadata_hash(),
