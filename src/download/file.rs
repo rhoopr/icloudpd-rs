@@ -778,8 +778,8 @@ fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum>
 ///
 /// Checks run case-insensitively against ASCII-whitespace-trimmed content so
 /// that e.g. a leading `\n<html>` still fails. These sentinels are never valid
-/// image/video starts, while extension mismatches further down can still be
-/// accepted when the bytes match another known media signature.
+/// image/video starts, while extension mismatches further down are warnings
+/// unless kei has positive evidence that the body is bad content.
 #[allow(
     clippy::indexing_slicing,
     reason = "`pos` comes from `header.iter().position(...)` so `header[pos..]` is \
