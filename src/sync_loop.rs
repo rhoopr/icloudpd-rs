@@ -340,7 +340,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         globals,
         &pw,
         sync,
-        config::SyncConfigOverrides::default(),
         toml_config.as_ref(),
         personality_mode,
         friendly_request,

@@ -233,8 +233,9 @@ pub struct SyncArgs {
     #[arg(long, conflicts_with = "dry_run")]
     pub retry_failed: bool,
 
-    /// Internal durable config overrides for tests and programmatic call
-    /// sites. Public CLI/env no longer expose these fields in v0.20.
+    /// Test-only durable config overrides used by unit tests that exercise
+    /// resolver internals without rebuilding TOML snippets.
+    #[cfg(test)]
     #[arg(skip)]
     pub(crate) config_overrides: crate::config::SyncConfigOverrides,
 }

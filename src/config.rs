@@ -1033,6 +1033,16 @@ pub(crate) fn resolve_password_command(
         .or_else(|| toml_auth.and_then(|a| a.password_command.clone()))
 }
 
+#[cfg(test)]
+fn take_sync_config_overrides(sync: &mut crate::cli::SyncArgs) -> SyncConfigOverrides {
+    std::mem::take(&mut sync.config_overrides)
+}
+
+#[cfg(not(test))]
+fn take_sync_config_overrides(_sync: &mut crate::cli::SyncArgs) -> SyncConfigOverrides {
+    SyncConfigOverrides::default()
+}
+
 impl Config {
     /// Build a Config by merging CLI args with optional TOML config.
     /// Runtime CLI flags override TOML where they remain public. Durable sync
@@ -1040,12 +1050,13 @@ impl Config {
     pub fn build(
         globals: &GlobalArgs,
         pw: &crate::cli::PasswordArgs,
-        mut sync: crate::cli::SyncArgs,
+        sync: crate::cli::SyncArgs,
         toml: Option<&TomlConfig>,
     ) -> anyhow::Result<Self> {
-        let overrides = std::mem::take(&mut sync.config_overrides);
+        let mut sync = sync;
+        let overrides = take_sync_config_overrides(&mut sync);
         let friendly_request = toml.and_then(|t| t.ui.as_ref()).and_then(|u| u.friendly);
-        Self::build_inner(
+        Self::build_inner_impl(
             globals,
             pw,
             sync,
@@ -1057,6 +1068,25 @@ impl Config {
     }
 
     pub(crate) fn build_inner(
+        globals: &GlobalArgs,
+        pw: &crate::cli::PasswordArgs,
+        sync: crate::cli::SyncArgs,
+        toml: Option<&TomlConfig>,
+        personality_mode: crate::personality::Mode,
+        friendly_request: Option<bool>,
+    ) -> anyhow::Result<Self> {
+        Self::build_inner_impl(
+            globals,
+            pw,
+            sync,
+            SyncConfigOverrides::default(),
+            toml,
+            personality_mode,
+            friendly_request,
+        )
+    }
+
+    fn build_inner_impl(
         globals: &GlobalArgs,
         pw: &crate::cli::PasswordArgs,
         sync: crate::cli::SyncArgs,
