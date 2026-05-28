@@ -189,8 +189,8 @@ happens:
   before release branches that touch sync tokens, retry state, download
   validation, config paths, or reporting.
 - **`scripts/full-test/run_docker_puid_smoke.sh`** - offline Docker entrypoint
-  checks for PUID/PGID drop, volume chown, root-default behavior, and invalid
-  env rejection.
+  checks for PUID/PGID drop, volume chown, `MALLOC_ARENA_MAX=2`, root-default
+  behavior, and invalid env rejection.
 - **`scripts/full-test/run_live_import_rehearsal.sh`** - live mini rehearsal
   for v0.20's TOML-first import path: seed a tiny real tree, import it into a
   fresh DB, and verify a repeat dry-run stays matched.

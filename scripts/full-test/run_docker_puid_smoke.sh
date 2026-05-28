@@ -46,6 +46,14 @@ if [[ "$puid_out" != "$expected" ]]; then
   exit 1
 fi
 
+echo "--- allocator env default ---"
+arena_out=$(docker run --rm \
+  "$image" sh -c 'printf "%s" "${MALLOC_ARENA_MAX:-}"' 2>&1)
+if [[ "$arena_out" != "2" ]]; then
+  echo "run_docker_puid_smoke: expected MALLOC_ARENA_MAX=2, got '$arena_out'" >&2
+  exit 1
+fi
+
 echo "--- default root mode ---"
 root_out=$(docker run --rm \
   --entrypoint /usr/local/bin/entrypoint.sh \
