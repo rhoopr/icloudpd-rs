@@ -1603,6 +1603,24 @@ struct PerPassStreamingResult {
 
 type DownloadPhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
 
+fn open_photo_stream_for_controls(
+    album: &crate::icloud::photos::PhotoAlbum,
+    limit: Option<u32>,
+    total_count: Option<u64>,
+    fast_concurrency: usize,
+    download_concurrency: usize,
+    controls: DownloadControls,
+) -> (
+    DownloadPhotoStream,
+    tokio::sync::oneshot::Receiver<Option<String>>,
+) {
+    if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
+        album.photo_stream_with_token(limit, total_count, fast_concurrency)
+    } else {
+        album.photo_stream_with_token_for_download(limit, total_count, download_concurrency)
+    }
+}
+
 struct RecentFrontier {
     asset_ids: Arc<FxHashSet<String>>,
     oldest_created: Option<DateTime<Utc>>,
@@ -1676,16 +1694,14 @@ async fn build_recent_frontier(
         return Ok(None);
     };
 
-    let (stream, _token_rx) =
-        if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
-            frontier_source.photo_stream_with_token(Some(recent), None, config.concurrent_downloads)
-        } else {
-            frontier_source.photo_stream_with_token_for_download(
-                Some(recent),
-                None,
-                config.concurrent_downloads,
-            )
-        };
+    let (stream, _token_rx) = open_photo_stream_for_controls(
+        &frontier_source,
+        Some(recent),
+        None,
+        config.concurrent_downloads,
+        config.concurrent_downloads,
+        controls,
+    );
     tokio::pin!(stream);
 
     let mut asset_ids = FxHashSet::default();
@@ -1785,20 +1801,14 @@ async fn collect_unfiled_stream(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> CollectedUnfiledStream {
-    let (stream, token_rx) =
-        if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
-            pass.album.photo_stream_with_token(
-                config.recent,
-                stream_total_count,
-                config.concurrent_downloads,
-            )
-        } else {
-            pass.album.photo_stream_with_token_for_download(
-                config.recent,
-                stream_total_count,
-                config.concurrent_downloads,
-            )
-        };
+    let (stream, token_rx) = open_photo_stream_for_controls(
+        &pass.album,
+        config.recent,
+        stream_total_count,
+        config.concurrent_downloads,
+        config.concurrent_downloads,
+        controls,
+    );
     let stream = filter_stream_to_enumeration_bounds(stream, config, None);
     tokio::pin!(stream);
     let mut items = Vec::new();
@@ -2657,20 +2667,14 @@ async fn download_photos_full_with_token(
             let recent_frontier = recent_frontier.as_ref();
             let download_ctx = shared_download_ctx.clone();
             async move {
-                let (stream, token_rx) =
-                    if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
-                        pass.album.photo_stream_with_token(
-                            scope_frontier_limit(config, recent_frontier),
-                            *total_count,
-                            config.concurrent_downloads,
-                        )
-                    } else {
-                        pass.album.photo_stream_with_token_for_download(
-                            scope_frontier_limit(config, recent_frontier),
-                            *total_count,
-                            pass_config.concurrent_downloads,
-                        )
-                    };
+                let (stream, token_rx) = open_photo_stream_for_controls(
+                    &pass.album,
+                    scope_frontier_limit(config, recent_frontier),
+                    *total_count,
+                    config.concurrent_downloads,
+                    pass_config.concurrent_downloads,
+                    controls,
+                );
                 let stream = filter_stream_to_enumeration_bounds(stream, config, recent_frontier);
 
                 if pass.kind == crate::commands::PassKind::Album {
@@ -2840,20 +2844,14 @@ async fn download_photos_full_with_token(
             .iter()
             .zip(&pass_stream_counts)
             .map(|(pass, total_count)| {
-                let (stream, token_rx) =
-                    if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
-                        pass.album.photo_stream_with_token(
-                            scope_frontier_limit(config, recent_frontier.as_ref()),
-                            *total_count,
-                            config.concurrent_downloads,
-                        )
-                    } else {
-                        pass.album.photo_stream_with_token_for_download(
-                            scope_frontier_limit(config, recent_frontier.as_ref()),
-                            *total_count,
-                            config.concurrent_downloads,
-                        )
-                    };
+                let (stream, token_rx) = open_photo_stream_for_controls(
+                    &pass.album,
+                    scope_frontier_limit(config, recent_frontier.as_ref()),
+                    *total_count,
+                    config.concurrent_downloads,
+                    config.concurrent_downloads,
+                    controls,
+                );
                 token_receivers.push(token_rx);
                 filter_stream_to_enumeration_bounds(stream, config, recent_frontier.as_ref())
             })
