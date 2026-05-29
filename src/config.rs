@@ -1341,6 +1341,7 @@ impl Config {
             .recent_scope
             .or(persistent_recent_scope)
             .unwrap_or_default();
+        let recent_scope_was_set = sync.recent_scope.is_some() || persistent_recent_scope.is_some();
         let persistent_skip_created_before =
             toml_filters.and_then(|f| f.skip_created_before.clone());
         let persistent_skip_created_after = toml_filters.and_then(|f| f.skip_created_after.clone());
@@ -1365,13 +1366,11 @@ impl Config {
             }
         };
         anyhow::ensure!(
-            recent_raw.is_some()
-                || sync.recent_scope.is_none() && persistent_recent_scope.is_none(),
+            recent_raw.is_some() || !recent_scope_was_set,
             "`recent_scope` only applies when `recent` is set"
         );
         anyhow::ensure!(
-            !matches!(recent_raw, Some(crate::cli::RecentLimit::Days(_)))
-                || sync.recent_scope.is_none() && persistent_recent_scope.is_none(),
+            !matches!(recent_raw, Some(crate::cli::RecentLimit::Days(_))) || !recent_scope_was_set,
             "`recent_scope` only applies to count-form `recent` values, not `Nd` days windows"
         );
         let skip_created_before_str = if let Some(n) = recent_days {

@@ -371,11 +371,13 @@ impl SyncStats {
 const PAGINATION_SHORTFALL_TOLERANCE_PERCENT: u64 = 5;
 const PAGINATION_SHORTFALL_TOLERANCE_ABSOLUTE: u64 = 100;
 const ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON: &str = "album_relation_hydration_incomplete";
+const DATE_BOUNDED_FULL_ENUMERATION_REASON: &str = "date_bounded_full_enumeration";
 const RECENT_LIMITED_FULL_ENUMERATION_REASON: &str = "recent_limited_full_enumeration";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
     match reason {
         ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON
+        | DATE_BOUNDED_FULL_ENUMERATION_REASON
         | "kei_internal_token_receiver_dropped"
         | RECENT_LIMITED_FULL_ENUMERATION_REASON => "kei",
         "pagination_shortfall"
@@ -403,6 +405,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         }
         RECENT_LIMITED_FULL_ENUMERATION_REASON => {
             "a count-limited recent sync is a partial enumeration, so kei blocked token advancement"
+        }
+        DATE_BOUNDED_FULL_ENUMERATION_REASON => {
+            "a lower-date-bounded sync is a partial enumeration, so kei blocked token advancement"
         }
         ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON => {
             "album membership state is not complete enough for incremental routing yet"
@@ -1692,6 +1697,13 @@ async fn build_recent_frontier(
         }
         let asset = item?;
         let created = asset.created();
+        if config
+            .skip_created_before
+            .map(|boundary| created < boundary)
+            .unwrap_or(false)
+        {
+            break;
+        }
         oldest_created = Some(oldest_created.map_or(created, |oldest| oldest.min(created)));
         asset_ids.insert(asset.id().to_string());
         if retain_assets {
@@ -1705,25 +1717,44 @@ async fn build_recent_frontier(
     }))
 }
 
-fn filter_stream_to_recent_frontier(
+fn stream_created_lower_bound(
+    config: &DownloadConfig,
+    frontier: Option<&RecentFrontier>,
+) -> Option<DateTime<Utc>> {
+    frontier
+        .and_then(|frontier| frontier.oldest_created)
+        .into_iter()
+        .chain(config.skip_created_before)
+        .max()
+}
+
+fn filter_stream_to_enumeration_bounds(
     stream: DownloadPhotoStream,
-    frontier: &RecentFrontier,
+    config: &DownloadConfig,
+    frontier: Option<&RecentFrontier>,
 ) -> DownloadPhotoStream {
-    let asset_ids = Arc::clone(&frontier.asset_ids);
-    let oldest_created = frontier.oldest_created;
+    let asset_ids = frontier.map(|frontier| Arc::clone(&frontier.asset_ids));
+    let lower_created_bound = stream_created_lower_bound(config, frontier);
     Box::pin(
         stream
             .take_while(move |item| {
                 std::future::ready(match item {
-                    Ok(asset) => oldest_created
-                        .map(|oldest| asset.created() >= oldest)
+                    Ok(asset) => lower_created_bound
+                        .map(|boundary| asset.created() >= boundary)
                         .unwrap_or(true),
                     Err(_) => true,
                 })
             })
             .filter_map(move |item| {
                 std::future::ready(match item {
-                    Ok(asset) if asset_ids.contains(asset.id()) => Some(Ok(asset)),
+                    Ok(asset)
+                        if asset_ids
+                            .as_ref()
+                            .map(|ids| ids.contains(asset.id()))
+                            .unwrap_or(true) =>
+                    {
+                        Some(Ok(asset))
+                    }
                     Ok(_) => None,
                     Err(e) => Some(Err(e)),
                 })
@@ -1768,6 +1799,7 @@ async fn collect_unfiled_stream(
                 config.concurrent_downloads,
             )
         };
+    let stream = filter_stream_to_enumeration_bounds(stream, config, None);
     tokio::pin!(stream);
     let mut items = Vec::new();
     while let Some(item) = stream.next().await {
@@ -2402,13 +2434,13 @@ fn display_total_for_recent_scope(counts: &[u64], config: &DownloadConfig) -> u6
 }
 
 fn should_skip_pass_count_fetch(config: &DownloadConfig) -> bool {
-    // A `--recent N` run deliberately enumerates only a prefix of each pass.
-    // The Hyperion count endpoint reports the full pass size, not how many
-    // complete assets will be yielded inside that prefix, so using it as an
-    // exact undercount bound false-fires on live accounts with sparse recent
-    // windows. Recent-limited full syncs suppress the sync token below because
-    // they are not complete zone enumerations.
-    config.recent.is_some()
+    // Recent-limited and lower-date-bounded runs deliberately enumerate only a
+    // prefix of each newest-first pass. The Hyperion count endpoint reports the
+    // full pass size, not how many complete assets will be yielded inside that
+    // bounded prefix, so using it as an exact undercount bound false-fires on
+    // live accounts with sparse windows. These bounded full syncs suppress the
+    // sync token below because they are not complete zone enumerations.
+    config.recent.is_some() || config.skip_created_before.is_some()
 }
 
 async fn build_pass_count_plan(
@@ -2639,10 +2671,7 @@ async fn download_photos_full_with_token(
                             pass_config.concurrent_downloads,
                         )
                     };
-                let stream = match recent_frontier {
-                    Some(frontier) => filter_stream_to_recent_frontier(stream, frontier),
-                    None => stream,
-                };
+                let stream = filter_stream_to_enumeration_bounds(stream, config, recent_frontier);
 
                 if pass.kind == crate::commands::PassKind::Album {
                     if let Some(deferred_ids) = deferred_ids {
@@ -2826,10 +2855,7 @@ async fn download_photos_full_with_token(
                         )
                     };
                 token_receivers.push(token_rx);
-                match &recent_frontier {
-                    Some(frontier) => filter_stream_to_recent_frontier(stream, frontier),
-                    None => stream,
-                }
+                filter_stream_to_enumeration_bounds(stream, config, recent_frontier.as_ref())
             })
             .collect();
 
@@ -2916,11 +2942,12 @@ async fn download_photos_full_with_token(
     // observe one coherent snapshot.
     // Don't advance the token for read-only operations, or when pagination
     // was incomplete (would permanently skip missed assets).
-    // Do not persist a full-enumeration zone token for `--recent N`. The run
-    // intentionally stops before the full pass is drained, so advancing the
-    // token would make older, unenumerated assets invisible to later
-    // incremental syncs.
+    // Do not persist a full-enumeration zone token for count-recent or
+    // skip-created-before runs. Those runs intentionally stop before the full
+    // pass is drained, so advancing the token would make older, unenumerated
+    // assets invisible to later incremental syncs.
     let token_eligible = config.recent.is_none()
+        && config.skip_created_before.is_none()
         && !controls.run_mode.only_print_filenames()
         && !pagination_undercount
         && streaming_result.enumeration_errors == 0;
@@ -3033,18 +3060,19 @@ async fn download_photos_full_with_token(
         stats.sync_token_blocked_source = Some(sync_token_blocked_source("pagination_shortfall"));
         stats.sync_token_blocked_explanation =
             Some(sync_token_blocked_explanation("pagination_shortfall"));
-    } else if config.recent.is_some()
+    } else if (config.recent.is_some() || config.skip_created_before.is_some())
         && !controls.run_mode.only_print_filenames()
         && enumeration_errors == 0
     {
+        let bounded_reason = if config.recent.is_some() {
+            RECENT_LIMITED_FULL_ENUMERATION_REASON
+        } else {
+            DATE_BOUNDED_FULL_ENUMERATION_REASON
+        };
         stats.sync_token_blocked = true;
-        stats.sync_token_blocked_reason = Some(RECENT_LIMITED_FULL_ENUMERATION_REASON);
-        stats.sync_token_blocked_source = Some(sync_token_blocked_source(
-            RECENT_LIMITED_FULL_ENUMERATION_REASON,
-        ));
-        stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(
-            RECENT_LIMITED_FULL_ENUMERATION_REASON,
-        ));
+        stats.sync_token_blocked_reason = Some(bounded_reason);
+        stats.sync_token_blocked_source = Some(sync_token_blocked_source(bounded_reason));
+        stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(bounded_reason));
     } else if token_eligible && sync_token.is_none() {
         let reason = token_block_reason.unwrap_or("sync_token_unavailable");
         stats.sync_token_blocked = true;
@@ -6594,6 +6622,32 @@ mod tests {
     }
 
     #[test]
+    fn skip_created_before_runs_skip_pass_count_fetch() {
+        let mut config = test_config();
+        config.skip_created_before =
+            Some(DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid test timestamp"));
+
+        assert!(
+            should_skip_pass_count_fetch(&config),
+            "lower-date-bounded runs stop before the full pass is drained, so \
+             the full-pass count is not an exact pagination bound"
+        );
+    }
+
+    #[test]
+    fn skip_created_after_runs_keep_pass_count_fetch() {
+        let mut config = test_config();
+        config.skip_created_after =
+            Some(DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid test timestamp"));
+
+        assert!(
+            !should_skip_pass_count_fetch(&config),
+            "upper-date filters must still drain the stream because older \
+             assets after the skipped prefix can still match"
+        );
+    }
+
+    #[test]
     fn unbounded_runs_keep_pass_count_fetch() {
         let mut config = test_config();
         config.recent = None;
@@ -6794,6 +6848,112 @@ mod tests {
             "single album enumeration should stop at the frontier boundary"
         );
         assert_eq!(result.sync_token, None);
+    }
+
+    #[tokio::test]
+    async fn full_sync_skip_created_before_stops_at_date_boundary() {
+        let newer_assets = recent_scope_assets("date-new", 5, 1_700_000_000_000);
+        let older_assets = recent_scope_assets("date-old", 20, 1_699_000_000_000);
+        let mut album_assets = newer_assets.clone();
+        album_assets.extend(older_assets);
+        let session = RecentScopeSession::new(album_assets.clone(), album_assets);
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: recent_scope_album("Vacation", session.clone()),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.skip_created_before =
+            Some(DateTime::from_timestamp_millis(1_699_999_000_000).expect("valid test timestamp"));
+        for asset in newer_assets.iter().map(recent_scope_photo_asset) {
+            seed_existing_file_for_asset(&config, &passes[0], &asset).await;
+        }
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("date-bounded full sync should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            result.stats.assets_seen, 5,
+            "lower-date-bound enumeration should stop before older assets are \
+             handed to the download pipeline"
+        );
+        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert!(
+            session.album_offsets().len() <= 4,
+            "lower-date-bound enumeration should stop near the first old page; offsets={:?}",
+            session.album_offsets()
+        );
+        assert_eq!(
+            result.sync_token, None,
+            "date-bounded full sync must not advance a zone token"
+        );
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(DATE_BOUNDED_FULL_ENUMERATION_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_skip_created_after_drains_past_newer_prefix() {
+        let newer_assets = recent_scope_assets("date-after-new", 5, 1_700_000_000_000);
+        let older_assets = recent_scope_assets("date-after-old", 5, 1_699_000_000_000);
+        let mut album_assets = newer_assets;
+        album_assets.extend(older_assets.clone());
+        let session = RecentScopeSession::new(album_assets.clone(), album_assets);
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: recent_scope_album("Vacation", session.clone()),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.skip_created_after =
+            Some(DateTime::from_timestamp_millis(1_699_999_000_000).expect("valid test timestamp"));
+        for asset in older_assets.iter().map(recent_scope_photo_asset) {
+            seed_existing_file_for_asset(&config, &passes[0], &asset).await;
+        }
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("upper-date-filtered full sync should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            result.stats.assets_seen, 10,
+            "upper-date filters skip the newer prefix but must keep enumerating \
+             because older assets can still match"
+        );
+        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert!(
+            session.album_offsets().len() > 3,
+            "upper-date filters must not stop near the newer prefix; offsets={:?}",
+            session.album_offsets()
+        );
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token"));
     }
 
     #[tokio::test]
