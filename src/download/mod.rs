@@ -6986,10 +6986,12 @@ mod tests {
     async fn full_sync_deferred_unfiled_waits_when_album_enumeration_errors() {
         let album_ids = recent_ids("album-error", 40);
         let unfiled_ids = recent_ids("unfiled-after-error", 20);
+        let mut library_ids = album_ids.clone();
+        library_ids.extend(unfiled_ids.clone());
         let album_session = DynamicRecentPhotosSession::from_ids(album_ids.clone())
             .with_filename_prefix("album-error")
             .with_error_at_offset(20);
-        let unfiled_session = DynamicRecentPhotosSession::from_ids(unfiled_ids.clone())
+        let unfiled_session = DynamicRecentPhotosSession::from_ids(library_ids)
             .with_filename_prefix("unfiled-after-error");
         let passes = vec![
             AlbumPass {
