@@ -23,6 +23,13 @@ use super::types::{
 /// not the intended write path.
 const DEFAULT_SOURCE: &str = "icloud";
 
+fn unsupported_album_membership_api(operation: &'static str) -> StateError {
+    StateError::Invariant {
+        operation,
+        detail: "album membership snapshots are not implemented by this state store".into(),
+    }
+}
+
 /// Snapshot of an already-imported asset, returned by
 /// [`ImportStateStore::get_all_imported_records`].
 ///
@@ -38,6 +45,22 @@ pub struct ImportedRecord {
     pub local_checksum: String,
     pub imported_size: Option<u64>,
     pub imported_mtime: Option<i64>,
+}
+
+/// Live album-membership row keyed by CloudKit asset record name.
+///
+/// Album relation records refer to `PhotoAsset::asset_record_name()`, while
+/// downloaded files and legacy `assets` rows are keyed by the master record
+/// name returned by `PhotoAsset::id()`. Keep both identifiers when available
+/// so later routing can bridge relation deltas to existing download state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumMembershipRecord {
+    pub library: String,
+    pub asset_record_name: String,
+    pub master_record_name: Option<String>,
+    pub container_id: String,
+    pub generation: i64,
+    pub source: String,
 }
 
 /// State operations used by the download producer and finalizer.
@@ -181,6 +204,95 @@ pub trait MembershipStore: Send + Sync {
         &self,
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError>;
+
+    async fn upsert_album_container(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _album_name: &str,
+        _pass_kind: &str,
+    ) -> Result<(), StateError> {
+        Err(unsupported_album_membership_api("upsert_album_container"))
+    }
+    async fn mark_album_container_deleted(
+        &self,
+        _library: &str,
+        _container_id: &str,
+    ) -> Result<(), StateError> {
+        Err(unsupported_album_membership_api(
+            "mark_album_container_deleted",
+        ))
+    }
+    async fn start_album_membership_snapshot(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _enum_config_hash: Option<&str>,
+    ) -> Result<i64, StateError> {
+        Err(unsupported_album_membership_api(
+            "start_album_membership_snapshot",
+        ))
+    }
+    async fn add_album_membership_to_snapshot(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _generation: i64,
+        _asset_record_name: &str,
+        _master_record_name: Option<&str>,
+        _source: &str,
+    ) -> Result<(), StateError> {
+        Err(unsupported_album_membership_api(
+            "add_album_membership_to_snapshot",
+        ))
+    }
+    async fn complete_album_membership_snapshot(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _generation: i64,
+    ) -> Result<(), StateError> {
+        Err(unsupported_album_membership_api(
+            "complete_album_membership_snapshot",
+        ))
+    }
+    async fn invalidate_album_membership_snapshot(
+        &self,
+        _library: &str,
+        _container_id: &str,
+    ) -> Result<(), StateError> {
+        Err(unsupported_album_membership_api(
+            "invalidate_album_membership_snapshot",
+        ))
+    }
+    async fn selected_album_containers_have_complete_snapshots(
+        &self,
+        _library: &str,
+        _container_ids: &[&str],
+    ) -> Result<bool, StateError> {
+        Err(unsupported_album_membership_api(
+            "selected_album_containers_have_complete_snapshots",
+        ))
+    }
+    async fn get_live_album_memberships_for_asset(
+        &self,
+        _library: &str,
+        _asset_record_name: &str,
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        Err(unsupported_album_membership_api(
+            "get_live_album_memberships_for_asset",
+        ))
+    }
+    async fn get_live_selected_album_memberships_for_asset(
+        &self,
+        _library: &str,
+        _asset_record_name: &str,
+        _selected_container_ids: &[&str],
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        Err(unsupported_album_membership_api(
+            "get_live_selected_album_memberships_for_asset",
+        ))
+    }
 }
 
 /// Metadata rewrite markers and hashes.
@@ -521,6 +633,112 @@ pub trait StateDb: Send + Sync {
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError>;
 
+    /// Upsert a selected album container by CloudKit container ID.
+    async fn upsert_album_container(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _album_name: &str,
+        _pass_kind: &str,
+    ) -> Result<(), StateError> {
+        Err(unsupported_album_membership_api("upsert_album_container"))
+    }
+
+    /// Mark a previously known album container deleted without removing its history.
+    async fn mark_album_container_deleted(
+        &self,
+        _library: &str,
+        _container_id: &str,
+    ) -> Result<(), StateError> {
+        Err(unsupported_album_membership_api(
+            "mark_album_container_deleted",
+        ))
+    }
+
+    /// Start a durable album membership snapshot and return its generation.
+    async fn start_album_membership_snapshot(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _enum_config_hash: Option<&str>,
+    ) -> Result<i64, StateError> {
+        Err(unsupported_album_membership_api(
+            "start_album_membership_snapshot",
+        ))
+    }
+
+    /// Add or refresh an asset relation in a running membership snapshot.
+    async fn add_album_membership_to_snapshot(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _generation: i64,
+        _asset_record_name: &str,
+        _master_record_name: Option<&str>,
+        _source: &str,
+    ) -> Result<(), StateError> {
+        Err(unsupported_album_membership_api(
+            "add_album_membership_to_snapshot",
+        ))
+    }
+
+    /// Complete a membership snapshot and mark rows absent from it deleted.
+    async fn complete_album_membership_snapshot(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _generation: i64,
+    ) -> Result<(), StateError> {
+        Err(unsupported_album_membership_api(
+            "complete_album_membership_snapshot",
+        ))
+    }
+
+    /// Invalidate trusted snapshots for a container.
+    async fn invalidate_album_membership_snapshot(
+        &self,
+        _library: &str,
+        _container_id: &str,
+    ) -> Result<(), StateError> {
+        Err(unsupported_album_membership_api(
+            "invalidate_album_membership_snapshot",
+        ))
+    }
+
+    /// Return true when every selected container has a complete snapshot.
+    async fn selected_album_containers_have_complete_snapshots(
+        &self,
+        _library: &str,
+        _container_ids: &[&str],
+    ) -> Result<bool, StateError> {
+        Err(unsupported_album_membership_api(
+            "selected_album_containers_have_complete_snapshots",
+        ))
+    }
+
+    /// Lookup live album memberships for one CloudKit asset record name.
+    async fn get_live_album_memberships_for_asset(
+        &self,
+        _library: &str,
+        _asset_record_name: &str,
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        Err(unsupported_album_membership_api(
+            "get_live_album_memberships_for_asset",
+        ))
+    }
+
+    /// Lookup live memberships that also belong to the selected album set.
+    async fn get_live_selected_album_memberships_for_asset(
+        &self,
+        _library: &str,
+        _asset_record_name: &str,
+        _selected_container_ids: &[&str],
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        Err(unsupported_album_membership_api(
+            "get_live_selected_album_memberships_for_asset",
+        ))
+    }
+
     /// Mark an asset as soft-deleted (all versions under `asset_id` in
     /// `library`).
     ///
@@ -825,6 +1043,116 @@ where
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError> {
         MembershipStore::get_all_asset_people(self, library).await
+    }
+
+    async fn upsert_album_container(
+        &self,
+        library: &str,
+        container_id: &str,
+        album_name: &str,
+        pass_kind: &str,
+    ) -> Result<(), StateError> {
+        MembershipStore::upsert_album_container(self, library, container_id, album_name, pass_kind)
+            .await
+    }
+
+    async fn mark_album_container_deleted(
+        &self,
+        library: &str,
+        container_id: &str,
+    ) -> Result<(), StateError> {
+        MembershipStore::mark_album_container_deleted(self, library, container_id).await
+    }
+
+    async fn start_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        enum_config_hash: Option<&str>,
+    ) -> Result<i64, StateError> {
+        MembershipStore::start_album_membership_snapshot(
+            self,
+            library,
+            container_id,
+            enum_config_hash,
+        )
+        .await
+    }
+
+    async fn add_album_membership_to_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        generation: i64,
+        asset_record_name: &str,
+        master_record_name: Option<&str>,
+        source: &str,
+    ) -> Result<(), StateError> {
+        MembershipStore::add_album_membership_to_snapshot(
+            self,
+            library,
+            container_id,
+            generation,
+            asset_record_name,
+            master_record_name,
+            source,
+        )
+        .await
+    }
+
+    async fn complete_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        generation: i64,
+    ) -> Result<(), StateError> {
+        MembershipStore::complete_album_membership_snapshot(self, library, container_id, generation)
+            .await
+    }
+
+    async fn invalidate_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+    ) -> Result<(), StateError> {
+        MembershipStore::invalidate_album_membership_snapshot(self, library, container_id).await
+    }
+
+    async fn selected_album_containers_have_complete_snapshots(
+        &self,
+        library: &str,
+        container_ids: &[&str],
+    ) -> Result<bool, StateError> {
+        MembershipStore::selected_album_containers_have_complete_snapshots(
+            self,
+            library,
+            container_ids,
+        )
+        .await
+    }
+
+    async fn get_live_album_memberships_for_asset(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        MembershipStore::get_live_album_memberships_for_asset(self, library, asset_record_name)
+            .await
+    }
+
+    async fn get_live_selected_album_memberships_for_asset(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+        selected_container_ids: &[&str],
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        MembershipStore::get_live_selected_album_memberships_for_asset(
+            self,
+            library,
+            asset_record_name,
+            selected_container_ids,
+        )
+        .await
     }
 
     async fn mark_soft_deleted(
@@ -1153,6 +1481,104 @@ impl MembershipStore for dyn StateDb + '_ {
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError> {
         StateDb::get_all_asset_people(self, library).await
+    }
+
+    async fn upsert_album_container(
+        &self,
+        library: &str,
+        container_id: &str,
+        album_name: &str,
+        pass_kind: &str,
+    ) -> Result<(), StateError> {
+        StateDb::upsert_album_container(self, library, container_id, album_name, pass_kind).await
+    }
+
+    async fn mark_album_container_deleted(
+        &self,
+        library: &str,
+        container_id: &str,
+    ) -> Result<(), StateError> {
+        StateDb::mark_album_container_deleted(self, library, container_id).await
+    }
+
+    async fn start_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        enum_config_hash: Option<&str>,
+    ) -> Result<i64, StateError> {
+        StateDb::start_album_membership_snapshot(self, library, container_id, enum_config_hash)
+            .await
+    }
+
+    async fn add_album_membership_to_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        generation: i64,
+        asset_record_name: &str,
+        master_record_name: Option<&str>,
+        source: &str,
+    ) -> Result<(), StateError> {
+        StateDb::add_album_membership_to_snapshot(
+            self,
+            library,
+            container_id,
+            generation,
+            asset_record_name,
+            master_record_name,
+            source,
+        )
+        .await
+    }
+
+    async fn complete_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        generation: i64,
+    ) -> Result<(), StateError> {
+        StateDb::complete_album_membership_snapshot(self, library, container_id, generation).await
+    }
+
+    async fn invalidate_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+    ) -> Result<(), StateError> {
+        StateDb::invalidate_album_membership_snapshot(self, library, container_id).await
+    }
+
+    async fn selected_album_containers_have_complete_snapshots(
+        &self,
+        library: &str,
+        container_ids: &[&str],
+    ) -> Result<bool, StateError> {
+        StateDb::selected_album_containers_have_complete_snapshots(self, library, container_ids)
+            .await
+    }
+
+    async fn get_live_album_memberships_for_asset(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        StateDb::get_live_album_memberships_for_asset(self, library, asset_record_name).await
+    }
+
+    async fn get_live_selected_album_memberships_for_asset(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+        selected_container_ids: &[&str],
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        StateDb::get_live_selected_album_memberships_for_asset(
+            self,
+            library,
+            asset_record_name,
+            selected_container_ids,
+        )
+        .await
     }
 }
 
@@ -1518,6 +1944,30 @@ where
         tracing::warn!(dropped, "{label}: dropped rows with parse errors");
     }
     out
+}
+
+fn unique_sorted_strings(values: &[&str]) -> Vec<String> {
+    let mut values: Vec<String> = values.iter().map(|value| (*value).to_owned()).collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn sqlite_placeholders(len: usize) -> String {
+    std::iter::repeat_n("?", len).collect::<Vec<_>>().join(", ")
+}
+
+fn album_membership_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AlbumMembershipRecord> {
+    Ok(AlbumMembershipRecord {
+        library: row.get(0)?,
+        asset_record_name: row.get(1)?,
+        master_record_name: row.get(2)?,
+        container_id: row.get(3)?,
+        generation: row.get(4)?,
+        source: row.get(5)?,
+    })
 }
 
 impl SqliteStateDb {
@@ -2506,6 +2956,360 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn upsert_album_container(
+        &self,
+        library: &str,
+        container_id: &str,
+        album_name: &str,
+        pass_kind: &str,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let container_id = container_id.to_owned();
+        let album_name = album_name.to_owned();
+        let pass_kind = pass_kind.to_owned();
+        self.with_conn("upsert_album_container", move |conn| {
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO album_containers \
+                    (library, container_id, album_name, pass_kind, is_deleted, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5) \
+                 ON CONFLICT(library, container_id) DO UPDATE SET \
+                    album_name = excluded.album_name, \
+                    pass_kind = excluded.pass_kind, \
+                    is_deleted = 0, \
+                    updated_at = excluded.updated_at",
+                rusqlite::params![library, container_id, album_name, pass_kind, now],
+            )
+            .map_err(|e| StateError::query("upsert_album_container", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_album_container_deleted(
+        &self,
+        library: &str,
+        container_id: &str,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let container_id = container_id.to_owned();
+        self.with_conn("mark_album_container_deleted", move |conn| {
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "UPDATE album_containers \
+                 SET is_deleted = 1, updated_at = ?1 \
+                 WHERE library = ?2 AND container_id = ?3",
+                rusqlite::params![now, library, container_id],
+            )
+            .map_err(|e| StateError::query("mark_album_container_deleted", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn start_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        enum_config_hash: Option<&str>,
+    ) -> Result<i64, StateError> {
+        let library = library.to_owned();
+        let container_id = container_id.to_owned();
+        let enum_config_hash = enum_config_hash.map(ToOwned::to_owned);
+        self.with_conn_mut("start_album_membership_snapshot", move |conn| {
+            let now = Utc::now().timestamp();
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("start_album_membership_snapshot::begin", e))?;
+            let generation: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(generation), 0) + 1 \
+                     FROM album_membership_snapshots \
+                     WHERE library = ?1 AND container_id = ?2",
+                    rusqlite::params![&library, &container_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StateError::query("start_album_membership_snapshot::generation", e))?;
+            tx.execute(
+                "INSERT INTO album_membership_snapshots \
+                    (library, container_id, generation, status, enum_config_hash, started_at) \
+                 VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
+                rusqlite::params![
+                    &library,
+                    &container_id,
+                    generation,
+                    enum_config_hash.as_deref(),
+                    now
+                ],
+            )
+            .map_err(|e| StateError::query("start_album_membership_snapshot::insert", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("start_album_membership_snapshot::commit", e))?;
+            Ok(generation)
+        })
+        .await
+    }
+
+    pub(crate) async fn add_album_membership_to_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        generation: i64,
+        asset_record_name: &str,
+        master_record_name: Option<&str>,
+        source: &str,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let container_id = container_id.to_owned();
+        let asset_record_name = asset_record_name.to_owned();
+        let master_record_name = master_record_name.map(ToOwned::to_owned);
+        let source = source.to_owned();
+        self.with_conn_mut("add_album_membership_to_snapshot", move |conn| {
+            let now = Utc::now().timestamp();
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("add_album_membership_to_snapshot::begin", e))?;
+            let snapshot_exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM album_membership_snapshots \
+                     WHERE library = ?1 AND container_id = ?2 \
+                       AND generation = ?3 AND status = 'running'",
+                    rusqlite::params![&library, &container_id, generation],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|e| {
+                    StateError::query("add_album_membership_to_snapshot::snapshot", e)
+                })?
+                .is_some();
+            if !snapshot_exists {
+                return Err(StateError::Invariant {
+                    operation: "add_album_membership_to_snapshot",
+                    detail: format!(
+                        "no running snapshot for library {library} container {container_id} generation {generation}"
+                    ),
+                });
+            }
+            tx.execute(
+                "INSERT INTO asset_album_memberships \
+                    (library, asset_record_name, master_record_name, container_id, generation, \
+                     is_deleted, source, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7) \
+                 ON CONFLICT(library, asset_record_name, container_id) DO UPDATE SET \
+                    master_record_name = COALESCE(excluded.master_record_name, asset_album_memberships.master_record_name), \
+                    generation = excluded.generation, \
+                    is_deleted = 0, \
+                    source = excluded.source, \
+                    updated_at = excluded.updated_at",
+                rusqlite::params![
+                    &library,
+                    &asset_record_name,
+                    master_record_name.as_deref(),
+                    &container_id,
+                    generation,
+                    &source,
+                    now
+                ],
+            )
+            .map_err(|e| StateError::query("add_album_membership_to_snapshot::upsert", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("add_album_membership_to_snapshot::commit", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn complete_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        generation: i64,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let container_id = container_id.to_owned();
+        self.with_conn_mut("complete_album_membership_snapshot", move |conn| {
+            let now = Utc::now().timestamp();
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("complete_album_membership_snapshot::begin", e))?;
+            let updated = tx
+                .execute(
+                    "UPDATE album_membership_snapshots \
+                     SET status = 'complete', completed_at = ?1 \
+                     WHERE library = ?2 AND container_id = ?3 \
+                       AND generation = ?4 AND status = 'running'",
+                    rusqlite::params![now, &library, &container_id, generation],
+                )
+                .map_err(|e| {
+                    StateError::query("complete_album_membership_snapshot::snapshot", e)
+                })?;
+            if updated == 0 {
+                return Err(StateError::Invariant {
+                    operation: "complete_album_membership_snapshot",
+                    detail: format!(
+                        "no running snapshot for library {library} container {container_id} generation {generation}"
+                    ),
+                });
+            }
+            tx.execute(
+                "UPDATE asset_album_memberships \
+                 SET is_deleted = 1, updated_at = ?1 \
+                 WHERE library = ?2 AND container_id = ?3 \
+                   AND generation <> ?4 AND is_deleted = 0",
+                rusqlite::params![now, &library, &container_id, generation],
+            )
+            .map_err(|e| StateError::query("complete_album_membership_snapshot::prune", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("complete_album_membership_snapshot::commit", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn invalidate_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let container_id = container_id.to_owned();
+        self.with_conn("invalidate_album_membership_snapshot", move |conn| {
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "UPDATE album_membership_snapshots \
+                 SET status = 'invalidated', completed_at = COALESCE(completed_at, ?1) \
+                 WHERE library = ?2 AND container_id = ?3 \
+                   AND status IN ('running', 'complete')",
+                rusqlite::params![now, library, container_id],
+            )
+            .map_err(|e| StateError::query("invalidate_album_membership_snapshot", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn selected_album_containers_have_complete_snapshots(
+        &self,
+        library: &str,
+        container_ids: &[&str],
+    ) -> Result<bool, StateError> {
+        let container_ids = unique_sorted_strings(container_ids);
+        if container_ids.is_empty() {
+            return Ok(true);
+        }
+        let library = library.to_owned();
+        let placeholders = sqlite_placeholders(container_ids.len());
+        self.with_conn(
+            "selected_album_containers_have_complete_snapshots",
+            move |conn| {
+                let sql = format!(
+                    "SELECT COUNT(DISTINCT s.container_id) \
+                     FROM album_membership_snapshots s \
+                     JOIN album_containers c \
+                       ON c.library = s.library AND c.container_id = s.container_id \
+                     WHERE s.library = ? AND s.container_id IN ({placeholders}) \
+                       AND s.status = 'complete' AND c.is_deleted = 0"
+                );
+                let mut params: Vec<&dyn rusqlite::ToSql> =
+                    Vec::with_capacity(1 + container_ids.len());
+                params.push(&library);
+                for container_id in &container_ids {
+                    params.push(container_id);
+                }
+                let complete_count: i64 = conn
+                    .query_row(&sql, rusqlite::params_from_iter(params), |row| row.get(0))
+                    .map_err(|e| {
+                        StateError::query(
+                            "selected_album_containers_have_complete_snapshots::query",
+                            e,
+                        )
+                    })?;
+                Ok(complete_count == container_ids.len() as i64)
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn get_live_album_memberships_for_asset(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        let library = library.to_owned();
+        let asset_record_name = asset_record_name.to_owned();
+        self.with_conn("get_live_album_memberships_for_asset", move |conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT library, asset_record_name, master_record_name, container_id, \
+                            generation, source \
+                     FROM asset_album_memberships \
+                     WHERE library = ?1 AND asset_record_name = ?2 AND is_deleted = 0 \
+                     ORDER BY container_id",
+                )
+                .map_err(|e| StateError::query("get_live_album_memberships_for_asset", e))?;
+            let rows = stmt
+                .query_map(rusqlite::params![&library, &asset_record_name], |row| {
+                    album_membership_record_from_row(row)
+                })
+                .map_err(|e| StateError::query("get_live_album_memberships_for_asset", e))?;
+            Ok(collect_rows_with_warn(
+                rows,
+                "get_live_album_memberships_for_asset",
+            ))
+        })
+        .await
+    }
+
+    pub(crate) async fn get_live_selected_album_memberships_for_asset(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+        selected_container_ids: &[&str],
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        let selected_container_ids = unique_sorted_strings(selected_container_ids);
+        if selected_container_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let library = library.to_owned();
+        let asset_record_name = asset_record_name.to_owned();
+        let placeholders = sqlite_placeholders(selected_container_ids.len());
+        self.with_conn(
+            "get_live_selected_album_memberships_for_asset",
+            move |conn| {
+                let sql = format!(
+                    "SELECT library, asset_record_name, master_record_name, container_id, \
+                            generation, source \
+                     FROM asset_album_memberships \
+                     WHERE library = ? AND asset_record_name = ? AND is_deleted = 0 \
+                       AND container_id IN ({placeholders}) \
+                     ORDER BY container_id",
+                );
+                let mut params: Vec<&dyn rusqlite::ToSql> =
+                    Vec::with_capacity(2 + selected_container_ids.len());
+                params.push(&library);
+                params.push(&asset_record_name);
+                for container_id in &selected_container_ids {
+                    params.push(container_id);
+                }
+                let mut stmt = conn.prepare(&sql).map_err(|e| {
+                    StateError::query("get_live_selected_album_memberships_for_asset", e)
+                })?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(params), |row| {
+                        album_membership_record_from_row(row)
+                    })
+                    .map_err(|e| {
+                        StateError::query("get_live_selected_album_memberships_for_asset", e)
+                    })?;
+                Ok(collect_rows_with_warn(
+                    rows,
+                    "get_live_selected_album_memberships_for_asset",
+                ))
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn mark_soft_deleted(
         &self,
         library: &str,
@@ -2952,6 +3756,115 @@ impl MembershipStore for SqliteStateDb {
         library: &str,
     ) -> Result<Vec<(String, String)>, StateError> {
         SqliteStateDb::get_all_asset_people(self, library).await
+    }
+
+    async fn upsert_album_container(
+        &self,
+        library: &str,
+        container_id: &str,
+        album_name: &str,
+        pass_kind: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::upsert_album_container(self, library, container_id, album_name, pass_kind)
+            .await
+    }
+
+    async fn mark_album_container_deleted(
+        &self,
+        library: &str,
+        container_id: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::mark_album_container_deleted(self, library, container_id).await
+    }
+
+    async fn start_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        enum_config_hash: Option<&str>,
+    ) -> Result<i64, StateError> {
+        SqliteStateDb::start_album_membership_snapshot(
+            self,
+            library,
+            container_id,
+            enum_config_hash,
+        )
+        .await
+    }
+
+    async fn add_album_membership_to_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        generation: i64,
+        asset_record_name: &str,
+        master_record_name: Option<&str>,
+        source: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::add_album_membership_to_snapshot(
+            self,
+            library,
+            container_id,
+            generation,
+            asset_record_name,
+            master_record_name,
+            source,
+        )
+        .await
+    }
+
+    async fn complete_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+        generation: i64,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::complete_album_membership_snapshot(self, library, container_id, generation)
+            .await
+    }
+
+    async fn invalidate_album_membership_snapshot(
+        &self,
+        library: &str,
+        container_id: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::invalidate_album_membership_snapshot(self, library, container_id).await
+    }
+
+    async fn selected_album_containers_have_complete_snapshots(
+        &self,
+        library: &str,
+        container_ids: &[&str],
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::selected_album_containers_have_complete_snapshots(
+            self,
+            library,
+            container_ids,
+        )
+        .await
+    }
+
+    async fn get_live_album_memberships_for_asset(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        SqliteStateDb::get_live_album_memberships_for_asset(self, library, asset_record_name).await
+    }
+
+    async fn get_live_selected_album_memberships_for_asset(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+        selected_container_ids: &[&str],
+    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
+        SqliteStateDb::get_live_selected_album_memberships_for_asset(
+            self,
+            library,
+            asset_record_name,
+            selected_container_ids,
+        )
+        .await
     }
 }
 
@@ -6179,6 +7092,243 @@ mod tests {
         let shared = db.get_all_asset_albums("SharedSync-AB").await.unwrap();
         assert_eq!(primary, vec![("ID".into(), "Vacation".into())]);
         assert_eq!(shared, vec![("ID".into(), "Family".into())]);
+    }
+
+    #[tokio::test]
+    async fn album_membership_snapshot_complete_prunes_only_own_container() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for (library, container, album) in [
+            ("PrimarySync", "container-a", "Vacation"),
+            ("PrimarySync", "container-b", "Family"),
+            ("SharedSync-AB", "container-a", "Shared Vacation"),
+        ] {
+            db.upsert_album_container(library, container, album, "album")
+                .await
+                .unwrap();
+            let gen1 = db
+                .start_album_membership_snapshot(library, container, Some("hash-1"))
+                .await
+                .unwrap();
+            db.add_album_membership_to_snapshot(
+                library,
+                container,
+                gen1,
+                "asset-record-old",
+                Some("master-old"),
+                "icloud",
+            )
+            .await
+            .unwrap();
+            db.complete_album_membership_snapshot(library, container, gen1)
+                .await
+                .unwrap();
+        }
+
+        let gen2 = db
+            .start_album_membership_snapshot("PrimarySync", "container-a", Some("hash-2"))
+            .await
+            .unwrap();
+        db.add_album_membership_to_snapshot(
+            "PrimarySync",
+            "container-a",
+            gen2,
+            "asset-record-new",
+            Some("master-new"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+        db.complete_album_membership_snapshot("PrimarySync", "container-a", gen2)
+            .await
+            .unwrap();
+
+        let primary_a_old = db
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-record-old",
+                &["container-a"],
+            )
+            .await
+            .unwrap();
+        assert!(
+            primary_a_old.is_empty(),
+            "completing generation 2 must prune stale generation 1 rows for the same container",
+        );
+
+        let primary_b_old = db
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-record-old",
+                &["container-b"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            primary_b_old.len(),
+            1,
+            "pruning container-a must not delete container-b memberships",
+        );
+
+        let shared_old = db
+            .get_live_selected_album_memberships_for_asset(
+                "SharedSync-AB",
+                "asset-record-old",
+                &["container-a"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            shared_old.len(),
+            1,
+            "pruning PrimarySync must not delete another library's same container id",
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_album_snapshot_leaves_previous_complete_snapshot_trusted() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_album_container("PrimarySync", "container-a", "Vacation", "album")
+            .await
+            .unwrap();
+        let gen1 = db
+            .start_album_membership_snapshot("PrimarySync", "container-a", Some("hash-1"))
+            .await
+            .unwrap();
+        db.add_album_membership_to_snapshot(
+            "PrimarySync",
+            "container-a",
+            gen1,
+            "asset-record-old",
+            Some("master-old"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+        db.complete_album_membership_snapshot("PrimarySync", "container-a", gen1)
+            .await
+            .unwrap();
+
+        let gen2 = db
+            .start_album_membership_snapshot("PrimarySync", "container-a", Some("hash-2"))
+            .await
+            .unwrap();
+        db.add_album_membership_to_snapshot(
+            "PrimarySync",
+            "container-a",
+            gen2,
+            "asset-record-new",
+            Some("master-new"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.selected_album_containers_have_complete_snapshots("PrimarySync", &["container-a"])
+                .await
+                .unwrap(),
+            "a running replacement snapshot must not hide the previous complete generation",
+        );
+        let conn = db.acquire_lock("test").unwrap();
+        let statuses: Vec<String> = conn
+            .prepare(
+                "SELECT status FROM album_membership_snapshots \
+                 WHERE library = 'PrimarySync' AND container_id = 'container-a' \
+                 ORDER BY generation",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            statuses,
+            vec!["complete".to_string(), "running".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn album_membership_lookups_are_library_scoped() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for (library, container, master) in [
+            ("PrimarySync", "container-a", "master-primary"),
+            ("SharedSync-AB", "container-a", "master-shared"),
+        ] {
+            db.upsert_album_container(library, container, "Vacation", "album")
+                .await
+                .unwrap();
+            let generation = db
+                .start_album_membership_snapshot(library, container, None)
+                .await
+                .unwrap();
+            db.add_album_membership_to_snapshot(
+                library,
+                container,
+                generation,
+                "same-asset-record",
+                Some(master),
+                "icloud",
+            )
+            .await
+            .unwrap();
+            db.complete_album_membership_snapshot(library, container, generation)
+                .await
+                .unwrap();
+        }
+
+        let primary = db
+            .get_live_album_memberships_for_asset("PrimarySync", "same-asset-record")
+            .await
+            .unwrap();
+        let shared = db
+            .get_live_album_memberships_for_asset("SharedSync-AB", "same-asset-record")
+            .await
+            .unwrap();
+        assert_eq!(primary.len(), 1);
+        assert_eq!(shared.len(), 1);
+        assert_eq!(
+            primary[0].master_record_name.as_deref(),
+            Some("master-primary")
+        );
+        assert_eq!(
+            shared[0].master_record_name.as_deref(),
+            Some("master-shared")
+        );
+    }
+
+    #[tokio::test]
+    async fn old_asset_album_reader_ignores_trusted_membership_tables() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.add_asset_album("PrimarySync", "master-old", "Legacy Album", "icloud")
+            .await
+            .unwrap();
+        db.upsert_album_container("PrimarySync", "container-a", "Trusted Album", "album")
+            .await
+            .unwrap();
+        let generation = db
+            .start_album_membership_snapshot("PrimarySync", "container-a", None)
+            .await
+            .unwrap();
+        db.add_album_membership_to_snapshot(
+            "PrimarySync",
+            "container-a",
+            generation,
+            "asset-record-new",
+            Some("master-new"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+        db.complete_album_membership_snapshot("PrimarySync", "container-a", generation)
+            .await
+            .unwrap();
+
+        let legacy_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
+        assert_eq!(
+            legacy_rows,
+            vec![("master-old".to_string(), "Legacy Album".to_string())],
+            "trusted membership rows must not change the old asset_albums read model",
+        );
     }
 
     #[tokio::test]

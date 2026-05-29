@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 11;
+pub(crate) const SCHEMA_VERSION: i32 = 12;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -334,6 +334,56 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, S
     Ok(exists)
 }
 
+/// V12 trusted album-membership cache.
+///
+/// `asset_albums` remains the compatibility read model for reports and XMP.
+/// These tables track album containers and durable membership generations so
+/// later sync-routing work can prove when album-aware incremental routing is
+/// safe.
+const SCHEMA_V12: &str = r"
+CREATE TABLE IF NOT EXISTS album_containers (
+    library TEXT NOT NULL,
+    container_id TEXT NOT NULL,
+    album_name TEXT NOT NULL,
+    pass_kind TEXT NOT NULL,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (library, container_id)
+);
+
+CREATE TABLE IF NOT EXISTS album_membership_snapshots (
+    library TEXT NOT NULL,
+    container_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    enum_config_hash TEXT,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    PRIMARY KEY (library, container_id, generation)
+);
+
+CREATE TABLE IF NOT EXISTS asset_album_memberships (
+    library TEXT NOT NULL,
+    asset_record_name TEXT NOT NULL,
+    master_record_name TEXT,
+    container_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (library, asset_record_name, container_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_album_containers_lookup
+    ON album_containers (library, album_name);
+CREATE INDEX IF NOT EXISTS idx_album_membership_snapshots_status
+    ON album_membership_snapshots (library, container_id, status);
+CREATE INDEX IF NOT EXISTS idx_asset_album_memberships_asset
+    ON asset_album_memberships (library, asset_record_name, is_deleted);
+CREATE INDEX IF NOT EXISTS idx_asset_album_memberships_container
+    ON asset_album_memberships (library, container_id, is_deleted);
+";
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -449,6 +499,7 @@ fn migrate_to_version(
                 conn.execute_batch("ALTER TABLE assets ADD COLUMN imported_mtime INTEGER;")?;
             }
         }
+        12 => conn.execute_batch(SCHEMA_V12)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1478,6 +1529,66 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         set_schema_version(&conn, 10).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_v12_creates_album_membership_tables_and_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+        migrate(&conn).unwrap();
+
+        for table in [
+            "album_containers",
+            "album_membership_snapshots",
+            "asset_album_memberships",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "v12 must create table {table}");
+        }
+
+        for (table, column) in [
+            ("album_containers", "container_id"),
+            ("album_membership_snapshots", "enum_config_hash"),
+            ("asset_album_memberships", "asset_record_name"),
+            ("asset_album_memberships", "master_record_name"),
+        ] {
+            assert!(
+                column_exists(&conn, table, column).unwrap(),
+                "v12 must create {table}.{column}",
+            );
+        }
+
+        for idx in [
+            "idx_album_containers_lookup",
+            "idx_album_membership_snapshots_status",
+            "idx_asset_album_memberships_asset",
+            "idx_asset_album_memberships_container",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = ?1",
+                    [idx],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "v12 must create index {idx}");
+        }
+    }
+
+    #[test]
+    fn test_v12_idempotent_when_tables_exist() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        set_schema_version(&conn, 11).unwrap();
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }

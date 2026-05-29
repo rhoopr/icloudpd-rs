@@ -79,14 +79,14 @@ fn sanitize_username(username: &str) -> String {
 /// `crate::state::schema::SCHEMA_VERSION` (the production constant). The
 /// `behavioral_helper_schema_matches_production` test below pins this so
 /// any schema bump in `src/state/schema.rs` fails the suite until this
-/// helper is updated to match — preventing silent drift between the
+/// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 10;
+const HELPER_SCHEMA_VERSION: i32 = 12;
 
 /// Create a state DB at the expected path for the given username inside
-/// `data_dir`. Mirrors the v9 schema from `src/state/schema.rs` (the
-/// latest as of this writing) so the binary's migrate() loop is a no-op
-/// when it opens these DBs — i.e. tests run against the same shape
+/// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
+/// so the binary's migrate() loop is a no-op when it opens these DBs,
+/// i.e. tests run against the same shape
 /// production code writes on a fresh install. Bump `HELPER_SCHEMA_VERSION`
 /// and the DDL below together whenever schema.rs changes; the
 /// `behavioral_helper_schema_matches_production` meta test enforces it.
@@ -138,6 +138,8 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             provider_data TEXT,
             metadata_hash TEXT,
             metadata_write_failed_at INTEGER,
+            imported_size INTEGER,
+            imported_mtime INTEGER,
             PRIMARY KEY (library, id, version_size)
         );
         CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
@@ -181,6 +183,48 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
         );
         CREATE INDEX IF NOT EXISTS idx_asset_people_lookup
             ON asset_people (library, asset_id);
+
+        CREATE TABLE IF NOT EXISTS album_containers (
+            library TEXT NOT NULL,
+            container_id TEXT NOT NULL,
+            album_name TEXT NOT NULL,
+            pass_kind TEXT NOT NULL,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (library, container_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS album_membership_snapshots (
+            library TEXT NOT NULL,
+            container_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            enum_config_hash TEXT,
+            started_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            PRIMARY KEY (library, container_id, generation)
+        );
+
+        CREATE TABLE IF NOT EXISTS asset_album_memberships (
+            library TEXT NOT NULL,
+            asset_record_name TEXT NOT NULL,
+            master_record_name TEXT,
+            container_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (library, asset_record_name, container_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_album_containers_lookup
+            ON album_containers (library, album_name);
+        CREATE INDEX IF NOT EXISTS idx_album_membership_snapshots_status
+            ON album_membership_snapshots (library, container_id, status);
+        CREATE INDEX IF NOT EXISTS idx_asset_album_memberships_asset
+            ON asset_album_memberships (library, asset_record_name, is_deleted);
+        CREATE INDEX IF NOT EXISTS idx_asset_album_memberships_container
+            ON asset_album_memberships (library, container_id, is_deleted);
         ",
     )
     .unwrap();
@@ -214,9 +258,9 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 9). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 12). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
-/// same version — otherwise existing tests rely on the binary's
+/// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
 /// the fresh-DB path.
 ///
@@ -232,7 +276,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 10;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 12;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -3088,6 +3132,14 @@ fn behavioral_helper_carries_every_migrated_column() {
         has_column(&conn, "sync_runs", "enumeration_errors"),
         "v10 column sync_runs.enumeration_errors must exist in the behavioral helper's DDL"
     );
+    assert!(
+        has_column(&conn, "assets", "imported_size"),
+        "v11 column assets.imported_size must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "assets", "imported_mtime"),
+        "v11 column assets.imported_mtime must exist in the behavioral helper's DDL"
+    );
 
     let has_asset_albums: bool = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='asset_albums'")
@@ -3098,6 +3150,22 @@ fn behavioral_helper_carries_every_migrated_column() {
         has_asset_albums,
         "v5 table asset_albums must exist in the behavioral helper's DDL"
     );
+
+    for table in [
+        "album_containers",
+        "album_membership_snapshots",
+        "asset_album_memberships",
+    ] {
+        let exists: bool = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?1")
+            .unwrap()
+            .exists([table])
+            .unwrap();
+        assert!(
+            exists,
+            "v12 table {table} must exist in the behavioral helper's DDL"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
