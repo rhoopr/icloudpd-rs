@@ -376,6 +376,7 @@ const DATE_BOUNDED_FULL_ENUMERATION_REASON: &str = "date_bounded_full_enumeratio
 const RECENT_LIMITED_FULL_ENUMERATION_REASON: &str = "recent_limited_full_enumeration";
 const UNPARSABLE_RELATION_DELTA_REASON: &str = "unparsable_relation_delta";
 const UNKNOWN_ALBUM_RELATION_CONTAINER_REASON: &str = "unknown_album_relation_container";
+const UNKNOWN_ALBUM_RELATION_ASSET_REASON: &str = "unknown_album_relation_asset";
 const ALBUM_DELTA_STATE_WRITE_FAILED_REASON: &str = "album_delta_state_write_failed";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
@@ -390,6 +391,7 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | "icloud_sync_token_mismatch"
         | "icloud_sync_token_missing"
         | UNPARSABLE_RELATION_DELTA_REASON
+        | UNKNOWN_ALBUM_RELATION_ASSET_REASON
         | UNKNOWN_ALBUM_RELATION_CONTAINER_REASON => "icloud",
         _ => "unknown",
     }
@@ -424,6 +426,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         }
         UNKNOWN_ALBUM_RELATION_CONTAINER_REASON => {
             "an album relation referenced a container kei has not mapped yet"
+        }
+        UNKNOWN_ALBUM_RELATION_ASSET_REASON => {
+            "an album relation referenced an asset kei cannot hydrate for album routing yet"
         }
         ALBUM_DELTA_STATE_WRITE_FAILED_REASON => "kei could not persist album delta state safely",
         "sync_token_unavailable" | "sync_token_missing" => {
@@ -1558,10 +1563,170 @@ fn build_pass_configs_with_download_concurrency(
         .collect()
 }
 
+#[cfg(test)]
 fn incremental_requires_full_enumeration(passes: &[crate::commands::AlbumPass]) -> bool {
     passes
         .iter()
         .any(|pass| pass.kind != crate::commands::PassKind::Unfiled)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalRoutingDecision {
+    Safe,
+    NeedsFull { reason: FullEnumerationReason },
+}
+
+#[derive(Debug)]
+struct IncrementalPassRouting {
+    selected_album_passes: FxHashMap<String, Vec<usize>>,
+    selected_container_ids: Vec<String>,
+    unfiled_passes: Vec<usize>,
+}
+
+impl IncrementalPassRouting {
+    fn from_passes(passes: &[crate::commands::AlbumPass]) -> Self {
+        let mut selected_album_passes: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        let mut unfiled_passes = Vec::new();
+
+        for (index, pass) in passes.iter().enumerate() {
+            match pass.kind {
+                crate::commands::PassKind::Album => {
+                    if let Some(container_id) = pass.album.container_id() {
+                        selected_album_passes
+                            .entry(container_id.to_string())
+                            .or_default()
+                            .push(index);
+                    }
+                }
+                crate::commands::PassKind::Unfiled => unfiled_passes.push(index),
+                crate::commands::PassKind::SmartFolder => {}
+            }
+        }
+
+        let mut selected_container_ids: Vec<String> =
+            selected_album_passes.keys().cloned().collect();
+        selected_container_ids.sort_unstable();
+
+        Self {
+            selected_album_passes,
+            selected_container_ids,
+            unfiled_passes,
+        }
+    }
+
+    fn has_selected_albums(&self) -> bool {
+        !self.selected_album_passes.is_empty()
+    }
+
+    fn selected_container_refs(&self) -> Vec<&str> {
+        self.selected_container_ids
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn album_passes_for_container(&self, container_id: &str) -> Option<&[usize]> {
+        self.selected_album_passes
+            .get(container_id)
+            .map(Vec::as_slice)
+    }
+}
+
+async fn determine_incremental_routing_decision(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+) -> IncrementalRoutingDecision {
+    let has_smart_folder_pass = passes
+        .iter()
+        .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
+    if has_smart_folder_pass {
+        return IncrementalRoutingDecision::NeedsFull {
+            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
+        };
+    }
+
+    let has_unmapped_album_pass = passes.iter().any(|pass| {
+        pass.kind == crate::commands::PassKind::Album && pass.album.container_id().is_none()
+    });
+    if has_unmapped_album_pass {
+        return IncrementalRoutingDecision::NeedsFull {
+            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
+        };
+    }
+
+    let routing = IncrementalPassRouting::from_passes(passes);
+    if !routing.has_selected_albums() {
+        return IncrementalRoutingDecision::Safe;
+    }
+
+    let Some(db) = &config.state_db else {
+        return IncrementalRoutingDecision::NeedsFull {
+            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
+        };
+    };
+    let selected_container_ids = routing.selected_container_refs();
+    match db
+        .selected_album_containers_have_complete_snapshots(&config.library, &selected_container_ids)
+        .await
+    {
+        Ok(true) => IncrementalRoutingDecision::Safe,
+        Ok(false) => IncrementalRoutingDecision::NeedsFull {
+            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
+        },
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to verify album membership snapshots for incremental routing"
+            );
+            IncrementalRoutingDecision::NeedsFull {
+                reason: FullEnumerationReason::OtherStaticReason,
+            }
+        }
+    }
+}
+
+async fn route_incremental_asset_to_passes(
+    asset: &PhotoAsset,
+    routing: &IncrementalPassRouting,
+    selected_container_ids: &[&str],
+    passes_len: usize,
+    config: &DownloadConfig,
+) -> Result<Vec<usize>> {
+    if !routing.has_selected_albums() {
+        return Ok((0..passes_len).collect());
+    }
+
+    let db = config
+        .state_db
+        .as_ref()
+        .context("album-aware incremental routing requires a state DB")?;
+    let memberships = db
+        .get_live_selected_album_memberships_for_asset(
+            &config.library,
+            asset.asset_record_name(),
+            selected_container_ids,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to look up album memberships for asset {}",
+                asset.asset_record_name()
+            )
+        })?;
+
+    let mut pass_indices = FxHashSet::default();
+    for membership in &memberships {
+        if let Some(indices) = routing.album_passes_for_container(&membership.container_id) {
+            pass_indices.extend(indices.iter().copied());
+        }
+    }
+    if memberships.is_empty() {
+        pass_indices.extend(routing.unfiled_passes.iter().copied());
+    }
+
+    let mut pass_indices: Vec<usize> = pass_indices.into_iter().collect();
+    pass_indices.sort_unstable();
+    Ok(pass_indices)
 }
 
 async fn collect_pass_asset_ids(pass: &crate::commands::AlbumPass) -> Result<FxHashSet<String>> {
@@ -2437,30 +2602,6 @@ pub async fn download_photos_with_sync(
             )
             .await
         }
-        // `changes_stream` uses the zone-level `/changes/zone` endpoint, so
-        // it returns the same delta for every selected album or smart folder
-        // in a zone. Without per-asset membership info on the change events,
-        // we can't tell whether a new asset belongs in those scoped passes.
-        // The unfiled/library-wide pass is safe: every zone change belongs to
-        // that pass, and inactive album/smart-folder templates shouldn't
-        // force full enumeration on an unfiled-only sync.
-        SyncMode::Incremental { .. } if incremental_requires_full_enumeration(passes) => {
-            let reason = FullEnumerationReason::AlbumRelationHydrationIncomplete;
-            tracing::debug!(
-                full_enumeration_reason = reason.as_str(),
-                "Album or smart-folder passes require full enumeration because album \
-                 relation hydration is incomplete, skipping incremental"
-            );
-            download_photos_full_with_reason(
-                download_client,
-                passes,
-                &config,
-                controls,
-                shutdown_token.clone(),
-                reason,
-            )
-            .await
-        }
         // Incremental sync only returns new changes — it won't re-enumerate
         // pending assets from previous syncs. Fall back to full so they get
         // retried. Once everything is downloaded, incremental resumes.
@@ -2503,54 +2644,74 @@ pub async fn download_photos_with_sync(
             .await
         }
         SyncMode::Incremental { zone_sync_token } => {
-            let token = zone_sync_token.clone();
-            match download_photos_incremental(
-                download_client,
-                passes,
-                &config,
-                &token,
-                controls,
-                shutdown_token.clone(),
-            )
-            .await
-            {
-                Ok(result) => Ok(result),
-                Err(e) => {
-                    // Determine whether this error warrants a fallback to full
-                    // enumeration. Token-level errors (invalid, zone not found)
-                    // always trigger fallback. Transient errors (503, network
-                    // timeouts) should NOT — they'd fail again on full enum too.
-                    // Deserialization errors (e.g. Apple returning a different
-                    // JSON shape for an invalid token) are not transient, so
-                    // fall back for those too.
-                    let is_token_error = e
-                        .downcast_ref::<SyncTokenError>()
-                        .is_some_and(SyncTokenError::should_fallback_to_full);
-                    let is_transient = e.downcast_ref::<crate::auth::error::AuthError>().is_some()
-                        || e.downcast_ref::<reqwest::Error>().is_some_and(|r| {
-                            r.status().is_some_and(|s| s == 429 || s.as_u16() >= 500)
-                                || r.is_timeout()
-                                || r.is_connect()
-                        });
+            match determine_incremental_routing_decision(passes, &config).await {
+                IncrementalRoutingDecision::NeedsFull { reason } => {
+                    tracing::debug!(
+                        full_enumeration_reason = reason.as_str(),
+                        "Selected passes are not safe for incremental routing, skipping incremental"
+                    );
+                    download_photos_full_with_reason(
+                        download_client,
+                        passes,
+                        &config,
+                        controls,
+                        shutdown_token.clone(),
+                        reason,
+                    )
+                    .await
+                }
+                IncrementalRoutingDecision::Safe => {
+                    let token = zone_sync_token.clone();
+                    match download_photos_incremental(
+                        download_client,
+                        passes,
+                        &config,
+                        &token,
+                        controls,
+                        shutdown_token.clone(),
+                    )
+                    .await
+                    {
+                        Ok(result) => Ok(result),
+                        Err(e) => {
+                            // Determine whether this error warrants a fallback to full
+                            // enumeration. Token-level errors (invalid, zone not found)
+                            // always trigger fallback. Transient errors (503, network
+                            // timeouts) should NOT — they'd fail again on full enum too.
+                            // Deserialization errors (e.g. Apple returning a different
+                            // JSON shape for an invalid token) are not transient, so
+                            // fall back for those too.
+                            let is_token_error = e
+                                .downcast_ref::<SyncTokenError>()
+                                .is_some_and(SyncTokenError::should_fallback_to_full);
+                            let is_transient =
+                                e.downcast_ref::<crate::auth::error::AuthError>().is_some()
+                                    || e.downcast_ref::<reqwest::Error>().is_some_and(|r| {
+                                        r.status().is_some_and(|s| s == 429 || s.as_u16() >= 500)
+                                            || r.is_timeout()
+                                            || r.is_connect()
+                                    });
 
-                    if is_token_error || !is_transient {
-                        let reason = FullEnumerationReason::OtherStaticReason;
-                        tracing::warn!(
-                            error = %e,
-                            full_enumeration_reason = reason.as_str(),
-                            "Incremental sync failed, falling back to full enumeration"
-                        );
-                        download_photos_full_with_reason(
-                            download_client,
-                            passes,
-                            &config,
-                            controls,
-                            shutdown_token.clone(),
-                            reason,
-                        )
-                        .await
-                    } else {
-                        Err(e)
+                            if is_token_error || !is_transient {
+                                let reason = FullEnumerationReason::OtherStaticReason;
+                                tracing::warn!(
+                                    error = %e,
+                                    full_enumeration_reason = reason.as_str(),
+                                    "Incremental sync failed, falling back to full enumeration"
+                                );
+                                download_photos_full_with_reason(
+                                    download_client,
+                                    passes,
+                                    &config,
+                                    controls,
+                                    shutdown_token.clone(),
+                                    reason,
+                                )
+                                .await
+                            } else {
+                                Err(e)
+                            }
+                        }
                     }
                 }
             }
@@ -3332,6 +3493,8 @@ async fn download_photos_incremental(
     let mut hard_deleted_count = 0u64;
     let mut hidden_count = 0u64;
     let mut total_events = 0u64;
+    let routing = IncrementalPassRouting::from_passes(passes);
+    let selected_container_ids = routing.selected_container_refs();
 
     // `changes_stream` is zone-scoped, not album-scoped. Query it once and
     // fan created assets out through the selected passes locally; querying
@@ -3479,6 +3642,20 @@ async fn download_photos_incremental(
                     token_unsafe_reason.get_or_insert(ALBUM_DELTA_STATE_WRITE_FAILED_REASON);
                 }
             }
+
+            if !relation.is_deleted
+                && routing
+                    .album_passes_for_container(&relation.container_id)
+                    .is_some()
+                && !asset_to_master.contains_key(relation.asset_record_name.as_ref())
+            {
+                tracing::warn!(
+                    container_id = %relation.container_id,
+                    asset_record_name = %relation.asset_record_name,
+                    "Selected album relation add referenced an asset not present in the delta page set"
+                );
+                token_unsafe_reason.get_or_insert(UNKNOWN_ALBUM_RELATION_ASSET_REASON);
+            }
         }
     }
 
@@ -3494,8 +3671,30 @@ async fn download_photos_incremental(
             ChangeReason::Created => {
                 created_count += 1;
                 if let Some(asset) = &event.asset {
-                    for pass_index in 0..passes.len() {
-                        downloadable_assets.push((asset.clone(), pass_index));
+                    match route_incremental_asset_to_passes(
+                        asset,
+                        &routing,
+                        &selected_container_ids,
+                        passes.len(),
+                        config,
+                    )
+                    .await
+                    {
+                        Ok(pass_indices) => {
+                            for pass_index in pass_indices {
+                                downloadable_assets.push((asset.clone(), pass_index));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                asset_record_name = %asset.asset_record_name(),
+                                asset_id = %asset.id(),
+                                error = %e,
+                                "Failed to route incremental asset through album membership state"
+                            );
+                            token_unsafe_reason
+                                .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
+                        }
                     }
                 }
             }
@@ -3917,6 +4116,14 @@ mod tests {
     }
 
     fn changes_album(name: &str, session: impl PhotosSession + 'static) -> PhotoAlbum {
+        changes_album_with_container(name, None, session)
+    }
+
+    fn changes_album_with_container(
+        name: &str,
+        container_id: Option<&str>,
+        session: impl PhotosSession + 'static,
+    ) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),
@@ -3928,11 +4135,22 @@ mod tests {
                 page_size: 100,
                 zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
                 retry_config: RetryConfig::default(),
-                container_id: None,
+                container_id: container_id.map(Arc::from),
                 cross_zone_sources: Vec::new(),
             },
             Box::new(session),
         )
+    }
+
+    fn unused_unfiled_changes_pass() -> AlbumPass {
+        AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album(
+                "",
+                changes_zone_session(Arc::new(AtomicUsize::new(0)), Vec::new()),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }
     }
 
     #[derive(Clone)]
@@ -4042,6 +4260,36 @@ mod tests {
             "recordType": "CPLContainerRelation",
             "deleted": true
         })
+    }
+
+    async fn seed_complete_album_snapshot(
+        db: &SqliteStateDb,
+        container_id: &str,
+        album_name: &str,
+        memberships: &[(&str, &str)],
+    ) {
+        db.upsert_album_container("PrimarySync", container_id, album_name, "album")
+            .await
+            .unwrap();
+        let generation = db
+            .start_album_membership_snapshot("PrimarySync", container_id, Some("hash-test"))
+            .await
+            .unwrap();
+        for (asset_record_name, master_record_name) in memberships {
+            db.add_album_membership_to_snapshot(
+                "PrimarySync",
+                container_id,
+                generation,
+                asset_record_name,
+                Some(master_record_name),
+                "icloud",
+            )
+            .await
+            .unwrap();
+        }
+        db.complete_album_membership_snapshot("PrimarySync", container_id, generation)
+            .await
+            .unwrap();
     }
 
     fn unparsable_relation_delete_record() -> Value {
@@ -5503,6 +5751,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn album_incremental_with_complete_snapshot_uses_changes_zone() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(Arc::clone(&calls), Vec::new());
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: changes_album_with_container(
+                    "Vacation",
+                    Some("container-vacation"),
+                    session,
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            unused_unfiled_changes_pass(),
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("trusted album snapshot should allow incremental sync");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(
+            !result.full_enumeration_ran,
+            "complete album snapshots should avoid whole-library fallback"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "trusted album incremental sync should query changes/zone once"
+        );
+    }
+
+    #[tokio::test]
+    async fn album_incremental_missing_snapshot_falls_back_to_full() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(Arc::clone(&calls), Vec::new());
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: changes_album_with_container("Vacation", Some("container-vacation"), session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("missing snapshot should fall back to full enumeration");
+
+        assert!(result.full_enumeration_ran);
+        assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(FullEnumerationReason::AlbumRelationHydrationIncomplete)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "missing snapshot should not try changes/zone first"
+        );
+    }
+
+    #[tokio::test]
     async fn incremental_with_failed_rows_falls_back_to_full_enumeration() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = crate::test_helpers::TestAssetRecord::new("FAILED_BEFORE_SYNC")
@@ -5709,6 +6047,252 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "changes/zone is zone-scoped; querying once per pass repeats the same delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_changed_asset_in_selected_album_routes_to_album_path() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(
+            &db,
+            "container-vacation",
+            "Vacation",
+            &[("asset-MASTER_CHANGED", "MASTER_CHANGED")],
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            incremental_photo_records("MASTER_CHANGED"),
+        );
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: changes_album_with_container(
+                    "Vacation",
+                    Some("container-vacation"),
+                    session,
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            unused_unfiled_changes_pass(),
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.folder_structure = "Unfiled".to_string();
+        config.folder_structure_albums = Arc::from("{album}");
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("album-routed incremental sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let album_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
+        assert_eq!(
+            album_rows,
+            vec![("MASTER_CHANGED".to_string(), "Vacation".to_string())],
+            "selected album asset should route through the album pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_changed_asset_without_selected_album_routes_to_unfiled() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            incremental_photo_records("MASTER_CHANGED"),
+        );
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: changes_album_with_container(
+                    "Vacation",
+                    Some("container-vacation"),
+                    session,
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            unused_unfiled_changes_pass(),
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.folder_structure = "Unfiled".to_string();
+        config.folder_structure_albums = Arc::from("{album}");
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("unfiled-routed incremental sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let album_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
+        assert!(
+            album_rows.is_empty(),
+            "asset outside selected albums should route only through the unfiled pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_relation_add_before_photo_routes_to_album_not_unfiled() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        let mut records = vec![relation_delta_record(
+            "container-vacation",
+            "asset-MASTER_CHANGED",
+        )];
+        records.extend(incremental_photo_records("MASTER_CHANGED"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(Arc::clone(&calls), records);
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: changes_album_with_container(
+                    "Vacation",
+                    Some("container-vacation"),
+                    session,
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            unused_unfiled_changes_pass(),
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.folder_structure = "Unfiled".to_string();
+        config.folder_structure_albums = Arc::from("{album}");
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("relation-add routing should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let album_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
+        assert_eq!(
+            album_rows,
+            vec![("MASTER_CHANGED".to_string(), "Vacation".to_string())],
+            "relation add should route the photo event through the album pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_relation_delete_before_photo_routes_to_unfiled() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(
+            &db,
+            "container-vacation",
+            "Vacation",
+            &[("asset-MASTER_CHANGED", "MASTER_CHANGED")],
+        )
+        .await;
+        let mut records = vec![relation_delete_record(
+            "container-vacation",
+            "asset-MASTER_CHANGED",
+        )];
+        records.extend(incremental_photo_records("MASTER_CHANGED"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(Arc::clone(&calls), records);
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: changes_album_with_container(
+                    "Vacation",
+                    Some("container-vacation"),
+                    session,
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            unused_unfiled_changes_pass(),
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.folder_structure = "Unfiled".to_string();
+        config.folder_structure_albums = Arc::from("{album}");
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("relation-delete routing should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let album_rows = db.get_all_asset_albums("PrimarySync").await.unwrap();
+        assert!(
+            album_rows.is_empty(),
+            "relation delete should route the photo event only through the unfiled pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_relation_add_without_photo_blocks_incremental_token() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            vec![relation_delta_record(
+                "container-vacation",
+                "asset-MASTER_UNKNOWN",
+            )],
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: changes_album_with_container("Vacation", Some("container-vacation"), session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::Download, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("unknown selected relation add should not fall back to full here");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token, None);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(UNKNOWN_ALBUM_RELATION_ASSET_REASON)
         );
     }
 
