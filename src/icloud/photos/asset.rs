@@ -675,7 +675,7 @@ fn parse_relation_delta(record: &Record, reason: ChangeReason) -> ChangeEvent {
                 Some("CPLContainerRelation".into()),
                 reason,
             );
-            event.token_unsafe_reason = Some("unparseable_relation_delta");
+            event.token_unsafe_reason = Some("unparsable_relation_delta");
             event
         }
     }
@@ -1567,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_unparseable_hard_deleted_relation_is_token_unsafe() {
+    fn test_buffer_unparsable_hard_deleted_relation_is_token_unsafe() {
         let mut buffer = DeltaRecordBuffer::new();
         let relation_delete = Record {
             record_name: "not-a-relation-name".to_string(),
@@ -1581,7 +1581,7 @@ mod tests {
         assert_eq!(events[0].relation, None);
         assert_eq!(
             events[0].token_unsafe_reason,
-            Some("unparseable_relation_delta")
+            Some("unparsable_relation_delta")
         );
     }
 

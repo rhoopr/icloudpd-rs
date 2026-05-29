@@ -374,7 +374,7 @@ const PAGINATION_SHORTFALL_TOLERANCE_ABSOLUTE: u64 = 100;
 const ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON: &str = "album_relation_hydration_incomplete";
 const DATE_BOUNDED_FULL_ENUMERATION_REASON: &str = "date_bounded_full_enumeration";
 const RECENT_LIMITED_FULL_ENUMERATION_REASON: &str = "recent_limited_full_enumeration";
-const UNPARSEABLE_RELATION_DELTA_REASON: &str = "unparseable_relation_delta";
+const UNPARSABLE_RELATION_DELTA_REASON: &str = "unparsable_relation_delta";
 const UNKNOWN_ALBUM_RELATION_CONTAINER_REASON: &str = "unknown_album_relation_container";
 const ALBUM_DELTA_STATE_WRITE_FAILED_REASON: &str = "album_delta_state_write_failed";
 
@@ -389,7 +389,7 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | "icloud_blank_sync_token"
         | "icloud_sync_token_mismatch"
         | "icloud_sync_token_missing"
-        | UNPARSEABLE_RELATION_DELTA_REASON
+        | UNPARSABLE_RELATION_DELTA_REASON
         | UNKNOWN_ALBUM_RELATION_CONTAINER_REASON => "icloud",
         _ => "unknown",
     }
@@ -419,7 +419,7 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON => {
             "album membership state is not complete enough for incremental routing yet"
         }
-        UNPARSEABLE_RELATION_DELTA_REASON => {
+        UNPARSABLE_RELATION_DELTA_REASON => {
             "iCloud returned an album relation delta kei could not parse safely"
         }
         UNKNOWN_ALBUM_RELATION_CONTAINER_REASON => {
@@ -4044,7 +4044,7 @@ mod tests {
         })
     }
 
-    fn unparseable_relation_delete_record() -> Value {
+    fn unparsable_relation_delete_record() -> Value {
         json!({
             "recordName": "not-a-relation-delta",
             "recordType": "CPLContainerRelation",
@@ -5806,11 +5806,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unparseable_relation_delete_blocks_incremental_token() {
+    async fn unparsable_relation_delete_blocks_incremental_token() {
         let calls = Arc::new(AtomicUsize::new(0));
         let session = changes_zone_session(
             Arc::clone(&calls),
-            vec![unparseable_relation_delete_record()],
+            vec![unparsable_relation_delete_record()],
         );
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
@@ -5828,14 +5828,14 @@ mod tests {
             CancellationToken::new(),
         )
         .await
-        .expect("unparseable relation delete should not fall back to full here");
+        .expect("unparsable relation delete should not fall back to full here");
 
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.sync_token, None);
         assert!(result.stats.sync_token_blocked);
         assert_eq!(
             result.stats.sync_token_blocked_reason,
-            Some(UNPARSEABLE_RELATION_DELTA_REASON)
+            Some(UNPARSABLE_RELATION_DELTA_REASON)
         );
     }
 
