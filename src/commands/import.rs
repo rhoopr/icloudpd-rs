@@ -1508,6 +1508,7 @@ mod wiremock_tests {
             retry_only: false,
             max_download_attempts: 0,
             sync_mode: SyncMode::Full,
+            enum_config_hash: None,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(AssetGroupings::default()),

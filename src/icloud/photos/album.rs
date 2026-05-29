@@ -356,6 +356,10 @@ impl PhotoAlbum {
             .unwrap_or("")
     }
 
+    pub(crate) fn container_id(&self) -> Option<&str> {
+        self.container_id.as_deref()
+    }
+
     pub(crate) fn with_cross_zone_sources(mut self, sources: Vec<PhotoAlbum>) -> Self {
         self.cross_zone_sources = sources;
         self

@@ -729,6 +729,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         Arc::from(config.download.folder_structure_albums.as_str());
     let cfg_folder_structure_smart_folders: Arc<str> =
         Arc::from(config.download.folder_structure_smart_folders.as_str());
+    let enum_config_hash: Arc<str> = download::compute_config_hash(&config).into();
 
     let build_download_config = |sync_mode: download::SyncMode,
                                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
@@ -772,6 +773,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             retry_only: is_retry_failed,
             max_download_attempts: config.retry.max_download_attempts,
             sync_mode,
+            enum_config_hash: Some(Arc::clone(&enum_config_hash)),
             album_name: None,
             exclude_asset_ids,
             asset_groupings,

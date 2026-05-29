@@ -30,6 +30,7 @@ use filter::DownloadTask;
 
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -809,6 +810,9 @@ pub(crate) struct DownloadConfig {
     pub(crate) retry_only: bool,
     /// Sync mode: full enumeration or incremental delta via syncToken.
     pub(crate) sync_mode: SyncMode,
+    /// Hash of enumeration-affecting config. Full album snapshots persist this
+    /// so later routing can prove a trusted snapshot still matches the plan.
+    pub(crate) enum_config_hash: Option<Arc<str>>,
     /// Album name for `{album}` token in folder_structure. Set per-album when
     /// processing albums individually.
     pub(crate) album_name: Option<Arc<str>>,
@@ -918,6 +922,7 @@ impl DownloadConfig {
             retry_only: false,
             max_download_attempts: 0,
             sync_mode: SyncMode::Full,
+            enum_config_hash: None,
             album_name: None,
             exclude_asset_ids: Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(AssetGroupings::default()),
@@ -963,6 +968,7 @@ impl DownloadConfig {
             temp_suffix: Arc::clone(&self.temp_suffix),
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
+            enum_config_hash: self.enum_config_hash.clone(),
             exclude_asset_ids: Arc::clone(&pass.exclude_ids),
             asset_groupings: Arc::clone(&self.asset_groupings),
             bandwidth_limiter: self.bandwidth_limiter.clone(),
@@ -984,6 +990,7 @@ impl DownloadConfig {
             temp_suffix: Arc::clone(&self.temp_suffix),
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
+            enum_config_hash: self.enum_config_hash.clone(),
             album_name: self.album_name.clone(),
             exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
             asset_groupings: Arc::clone(&self.asset_groupings),
@@ -1006,6 +1013,7 @@ impl DownloadConfig {
             temp_suffix: Arc::clone(&self.temp_suffix),
             state_db: self.state_db.clone(),
             sync_mode: self.sync_mode.clone(),
+            enum_config_hash: self.enum_config_hash.clone(),
             album_name: self.album_name.clone(),
             exclude_asset_ids: exclude_ids,
             asset_groupings: Arc::clone(&self.asset_groupings),
@@ -1058,6 +1066,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("state_db", &self.state_db.is_some())
             .field("retry_only", &self.retry_only)
             .field("sync_mode", &self.sync_mode)
+            .field("enum_config_hash", &self.enum_config_hash)
             .field("album_name", &self.album_name)
             .field("exclude_asset_ids_count", &self.exclude_asset_ids.len())
             .field("max_download_attempts", &self.max_download_attempts)
@@ -1109,6 +1118,7 @@ impl DownloadConfig {
             retry_only: false,
             max_download_attempts: 10,
             sync_mode: SyncMode::Full,
+            enum_config_hash: None,
             album_name: None,
             exclude_asset_ids: std::sync::Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(AssetGroupings::default()),
@@ -1638,6 +1648,146 @@ struct FullPassStreamOptions {
     kind: crate::commands::PassKind,
     shutdown_token: CancellationToken,
     download_ctx: Option<Arc<DownloadContext>>,
+    album_snapshot: Option<AlbumSnapshotRecorder>,
+}
+
+#[derive(Clone)]
+struct AlbumSnapshotRecorder {
+    db: Arc<dyn StateDb>,
+    library: Arc<str>,
+    container_id: Arc<str>,
+    generation: i64,
+    write_failed: Arc<AtomicBool>,
+}
+
+impl AlbumSnapshotRecorder {
+    async fn start_for_pass(
+        db: Option<Arc<dyn StateDb>>,
+        pass: &crate::commands::AlbumPass,
+        enum_config_hash: Option<&str>,
+    ) -> Option<Self> {
+        if pass.kind != crate::commands::PassKind::Album {
+            return None;
+        }
+        let db = db?;
+        let Some(container_id) = pass.album.container_id() else {
+            tracing::debug!(
+                album = %pass.album.name,
+                library = %pass.album.zone_name(),
+                "Album pass has no container ID; skipping membership snapshot"
+            );
+            return None;
+        };
+        let library = pass.album.zone_name();
+        if let Err(e) = db
+            .upsert_album_container(library, container_id, &pass.album.name, "album")
+            .await
+        {
+            tracing::warn!(
+                album = %pass.album.name,
+                library,
+                container_id,
+                error = %e,
+                "Failed to upsert album container; skipping membership snapshot"
+            );
+            return None;
+        }
+        let generation = match db
+            .start_album_membership_snapshot(library, container_id, enum_config_hash)
+            .await
+        {
+            Ok(generation) => generation,
+            Err(e) => {
+                tracing::warn!(
+                    album = %pass.album.name,
+                    library,
+                    container_id,
+                    error = %e,
+                    "Failed to start album membership snapshot"
+                );
+                return None;
+            }
+        };
+        Some(Self {
+            db,
+            library: Arc::from(library),
+            container_id: Arc::from(container_id),
+            generation,
+            write_failed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    async fn record_asset(&self, asset: &PhotoAsset) {
+        if let Err(e) = self
+            .db
+            .add_album_membership_to_snapshot(
+                &self.library,
+                &self.container_id,
+                self.generation,
+                asset.asset_record_name(),
+                Some(asset.id()),
+                "icloud",
+            )
+            .await
+        {
+            self.write_failed.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                asset_id = %asset.id(),
+                asset_record_name = %asset.asset_record_name(),
+                library = %self.library,
+                container_id = %self.container_id,
+                generation = self.generation,
+                error = %e,
+                "Failed to record album membership snapshot row"
+            );
+        }
+    }
+
+    async fn complete_if_clean(&self, result: &StreamingResult) {
+        if self.write_failed.load(Ordering::Relaxed)
+            || result.enumeration_errors > 0
+            || !result.enumeration_complete
+        {
+            tracing::debug!(
+                library = %self.library,
+                container_id = %self.container_id,
+                generation = self.generation,
+                write_failed = self.write_failed.load(Ordering::Relaxed),
+                enumeration_errors = result.enumeration_errors,
+                enumeration_complete = result.enumeration_complete,
+                "Leaving album membership snapshot incomplete"
+            );
+            return;
+        }
+        if let Err(e) = self
+            .db
+            .complete_album_membership_snapshot(&self.library, &self.container_id, self.generation)
+            .await
+        {
+            tracing::warn!(
+                library = %self.library,
+                container_id = %self.container_id,
+                generation = self.generation,
+                error = %e,
+                "Failed to complete album membership snapshot"
+            );
+        }
+    }
+}
+
+fn should_record_album_snapshots(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+) -> bool {
+    !controls.run_mode.is_dry_run()
+        && !controls.run_mode.only_print_filenames()
+        && config.state_db.is_some()
+        && config.recent.is_none()
+        && config.skip_created_before.is_none()
+        && passes.iter().any(|pass| {
+            pass.kind == crate::commands::PassKind::Album && pass.album.container_id().is_some()
+        })
 }
 
 fn deferred_unfiled_index(passes: &[crate::commands::AlbumPass]) -> Option<usize> {
@@ -1844,6 +1994,20 @@ where
         options.controls.reporting.personality_mode,
     );
 
+    let snapshot = options.album_snapshot.clone();
+    let stream: DownloadPhotoStream = match snapshot {
+        Some(recorder) => Box::pin(stream.then(move |item| {
+            let recorder = recorder.clone();
+            async move {
+                if let Ok(asset) = &item {
+                    recorder.record_asset(asset).await;
+                }
+                item
+            }
+        })),
+        None => Box::pin(stream),
+    };
+
     let result = stream_and_download_from_stream(
         &download_client,
         stream,
@@ -1858,6 +2022,9 @@ where
         ),
     )
     .await?;
+    if let Some(snapshot) = &options.album_snapshot {
+        snapshot.complete_if_clean(&result).await;
+    }
 
     let elapsed = pass_start.elapsed();
     pass_pb.finish_and_clear();
@@ -2561,7 +2728,8 @@ async fn download_photos_full_with_token(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     let started = Instant::now();
-    let needs_per_pass = config.requires_per_pass_paths();
+    let record_album_snapshots = should_record_album_snapshots(passes, config, controls);
+    let needs_per_pass = config.requires_per_pass_paths() || record_album_snapshots;
 
     // Mark every unique zone as in-progress so an interrupted full
     // enumeration leaves a trail the next startup can surface to the
@@ -2667,6 +2835,16 @@ async fn download_photos_full_with_token(
             let recent_frontier = recent_frontier.as_ref();
             let download_ctx = shared_download_ctx.clone();
             async move {
+                let album_snapshot = if record_album_snapshots {
+                    AlbumSnapshotRecorder::start_for_pass(
+                        config.state_db.clone(),
+                        pass,
+                        config.enum_config_hash.as_deref(),
+                    )
+                    .await
+                } else {
+                    None
+                };
                 let (stream, token_rx) = open_photo_stream_for_controls(
                     &pass.album,
                     scope_frontier_limit(config, recent_frontier),
@@ -2698,6 +2876,7 @@ async fn download_photos_full_with_token(
                                 kind: pass.kind,
                                 shutdown_token,
                                 download_ctx: download_ctx.clone(),
+                                album_snapshot,
                             },
                         )
                         .await;
@@ -2716,6 +2895,7 @@ async fn download_photos_full_with_token(
                         kind: pass.kind,
                         shutdown_token,
                         download_ctx,
+                        album_snapshot,
                     },
                 )
                 .await
@@ -2807,6 +2987,7 @@ async fn download_photos_full_with_token(
                             kind: crate::commands::PassKind::Unfiled,
                             shutdown_token: shutdown_token.clone(),
                             download_ctx: shared_download_ctx.clone(),
+                            album_snapshot: None,
                         },
                     )
                     .await?;
@@ -3491,6 +3672,7 @@ mod tests {
     use super::*;
     use crate::commands::{AlbumPass, PassKind};
     use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
+    use crate::state::SqliteStateDb;
     use crate::test_helpers::{
         mock_photo_records_for_zone_with_filename,
         mock_photo_records_for_zone_with_filename_and_asset_date, DynamicRecentPhotosSession,
@@ -3752,7 +3934,24 @@ mod tests {
         album_with_session("PrimarySync", name, Box::new(session))
     }
 
+    fn mock_album_with_container(
+        name: &str,
+        container_id: &str,
+        session: crate::test_helpers::MockPhotosSession,
+    ) -> PhotoAlbum {
+        album_with_session_and_container("PrimarySync", name, Some(container_id), Box::new(session))
+    }
+
     fn album_with_session(zone: &str, name: &str, session: Box<dyn PhotosSession>) -> PhotoAlbum {
+        album_with_session_and_container(zone, name, None, session)
+    }
+
+    fn album_with_session_and_container(
+        zone: &str,
+        name: &str,
+        container_id: Option<&str>,
+        session: Box<dyn PhotosSession>,
+    ) -> PhotoAlbum {
         PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(HashMap::new()),
@@ -3764,7 +3963,7 @@ mod tests {
                 page_size: 100,
                 zone_id: Arc::new(json!({"zoneName": zone})),
                 retry_config: RetryConfig::default(),
-                container_id: None,
+                container_id: container_id.map(Arc::from),
                 cross_zone_sources: Vec::new(),
             },
             session,
@@ -4164,6 +4363,201 @@ mod tests {
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "filtered duplicate should not make the write-mode run partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_album_pass_records_complete_snapshot_before_planning_skips() {
+        let filtered_records = mock_photo_records_for_zone_with_filename_and_asset_date(
+            "MASTER_FILTERED",
+            "PrimarySync",
+            "filtered.jpg",
+            1_700_000_000_000,
+        );
+        let on_disk_records = mock_photo_records_for_zone_with_filename_and_asset_date(
+            "MASTER_ON_DISK",
+            "PrimarySync",
+            "on-disk.jpg",
+            1_699_000_000_000,
+        );
+        let mut records = filtered_records.clone();
+        records.extend(on_disk_records.clone());
+        let album_session = MockPhotosFlow::new()
+            .album_count(2)
+            .query_page(records, Some("zone-token"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album_with_container("Vacation", "container-vacation", album_session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.enum_config_hash = Some(Arc::from("hash-pr3"));
+        config.skip_created_after =
+            Some(DateTime::from_timestamp_millis(1_699_999_999_000).expect("valid timestamp"));
+        let on_disk_asset = PhotoAsset::new(on_disk_records[0].clone(), on_disk_records[1].clone());
+        seed_existing_file_for_asset(&config, &passes[0], &on_disk_asset).await;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("full album sync should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(
+            db.selected_album_containers_have_complete_snapshots(
+                "PrimarySync",
+                &["container-vacation"]
+            )
+            .await
+            .unwrap(),
+            "clean full pass should mark the album snapshot complete"
+        );
+        for (asset_record_name, master_record_name) in [
+            ("asset-MASTER_FILTERED", "MASTER_FILTERED"),
+            ("asset-MASTER_ON_DISK", "MASTER_ON_DISK"),
+        ] {
+            let memberships = db
+                .get_live_selected_album_memberships_for_asset(
+                    "PrimarySync",
+                    asset_record_name,
+                    &["container-vacation"],
+                )
+                .await
+                .unwrap();
+            assert_eq!(memberships.len(), 1, "{asset_record_name} membership");
+            assert_eq!(
+                memberships[0].master_record_name.as_deref(),
+                Some(master_record_name)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_album_pass_leaves_previous_complete_snapshot_trusted() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        db.upsert_album_container("PrimarySync", "container-vacation", "Vacation", "album")
+            .await
+            .unwrap();
+        let previous = db
+            .start_album_membership_snapshot("PrimarySync", "container-vacation", Some("hash-old"))
+            .await
+            .unwrap();
+        db.add_album_membership_to_snapshot(
+            "PrimarySync",
+            "container-vacation",
+            previous,
+            "asset-OLD",
+            Some("MASTER_OLD"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+        db.complete_album_membership_snapshot("PrimarySync", "container-vacation", previous)
+            .await
+            .unwrap();
+
+        let album_session = MockPhotosFlow::new()
+            .album_count(1)
+            .error("album stream failed")
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album_with_container("Vacation", "container-vacation", album_session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.enum_config_hash = Some(Arc::from("hash-new"));
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("stream errors should be reported in the sync result");
+
+        assert!(result.stats.enumeration_errors > 0);
+        assert!(
+            db.selected_album_containers_have_complete_snapshots(
+                "PrimarySync",
+                &["container-vacation"]
+            )
+            .await
+            .unwrap(),
+            "failed replacement snapshot must not invalidate the old complete generation"
+        );
+        let memberships = db
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-OLD",
+                &["container-vacation"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(
+            memberships[0].master_record_name.as_deref(),
+            Some("MASTER_OLD")
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_album_pass_does_not_complete_snapshot() {
+        let album_session = MockPhotosFlow::new()
+            .album_count(1)
+            .query_photo_page("MASTER_INTERRUPTED", Some("zone-token"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album_with_container("Vacation", "container-vacation", album_session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.enum_config_hash = Some(Arc::from("hash-interrupted"));
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            shutdown,
+        )
+        .await
+        .expect("interrupted stream should return a sync result");
+
+        assert!(result.full_enumeration_ran);
+        assert!(
+            !db.selected_album_containers_have_complete_snapshots(
+                "PrimarySync",
+                &["container-vacation"]
+            )
+            .await
+            .unwrap(),
+            "interrupted album pass must leave the new snapshot incomplete"
         );
     }
 
