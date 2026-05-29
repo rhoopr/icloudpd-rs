@@ -374,17 +374,23 @@ const PAGINATION_SHORTFALL_TOLERANCE_ABSOLUTE: u64 = 100;
 const ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON: &str = "album_relation_hydration_incomplete";
 const DATE_BOUNDED_FULL_ENUMERATION_REASON: &str = "date_bounded_full_enumeration";
 const RECENT_LIMITED_FULL_ENUMERATION_REASON: &str = "recent_limited_full_enumeration";
+const UNPARSEABLE_RELATION_DELTA_REASON: &str = "unparseable_relation_delta";
+const UNKNOWN_ALBUM_RELATION_CONTAINER_REASON: &str = "unknown_album_relation_container";
+const ALBUM_DELTA_STATE_WRITE_FAILED_REASON: &str = "album_delta_state_write_failed";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
     match reason {
         ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON
+        | ALBUM_DELTA_STATE_WRITE_FAILED_REASON
         | DATE_BOUNDED_FULL_ENUMERATION_REASON
         | "kei_internal_token_receiver_dropped"
         | RECENT_LIMITED_FULL_ENUMERATION_REASON => "kei",
         "pagination_shortfall"
         | "icloud_blank_sync_token"
         | "icloud_sync_token_mismatch"
-        | "icloud_sync_token_missing" => "icloud",
+        | "icloud_sync_token_missing"
+        | UNPARSEABLE_RELATION_DELTA_REASON
+        | UNKNOWN_ALBUM_RELATION_CONTAINER_REASON => "icloud",
         _ => "unknown",
     }
 }
@@ -413,6 +419,13 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON => {
             "album membership state is not complete enough for incremental routing yet"
         }
+        UNPARSEABLE_RELATION_DELTA_REASON => {
+            "iCloud returned an album relation delta kei could not parse safely"
+        }
+        UNKNOWN_ALBUM_RELATION_CONTAINER_REASON => {
+            "an album relation referenced a container kei has not mapped yet"
+        }
+        ALBUM_DELTA_STATE_WRITE_FAILED_REASON => "kei could not persist album delta state safely",
         "sync_token_unavailable" | "sync_token_missing" => {
             "no usable sync token was available at the end of the cycle"
         }
@@ -2353,6 +2366,15 @@ fn set_full_enumeration_reason(result: &mut SyncResult, reason: FullEnumerationR
     }
 }
 
+fn block_sync_token_for_incremental_delta(stats: &mut SyncStats, reason: &'static str) {
+    if stats.sync_token_blocked_reason.is_none() {
+        stats.sync_token_blocked_reason = Some(reason);
+        stats.sync_token_blocked_source = Some(sync_token_blocked_source(reason));
+        stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(reason));
+    }
+    stats.sync_token_blocked = true;
+}
+
 async fn download_photos_full_with_reason(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -3303,6 +3325,7 @@ async fn download_photos_incremental(
     // that prevents assets already in some user album from downloading
     // twice) can be applied downstream.
     let mut downloadable_assets: Vec<(PhotoAsset, usize)> = Vec::new();
+    let mut change_events = Vec::new();
     let mut sync_token: Option<String> = None;
     let mut created_count = 0u64;
     let mut soft_deleted_count = 0u64;
@@ -3324,73 +3347,211 @@ async fn download_photos_incremental(
             }
             let event = result?;
             total_events += 1;
-            match event.reason {
-                ChangeReason::Created => {
-                    created_count += 1;
-                    if let Some(asset) = event.asset {
-                        for pass_index in 0..passes.len() {
-                            downloadable_assets.push((asset.clone(), pass_index));
-                        }
-                    }
-                }
-                ChangeReason::SoftDeleted => {
-                    soft_deleted_count += 1;
-                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
-                    if let Some(db) = &config.state_db {
-                        let deleted_at = event.asset.as_ref().and_then(|a| a.metadata().deleted_at);
-                        if let Err(e) = db
-                            .mark_soft_deleted(&config.library, &event.record_name, deleted_at)
-                            .await
-                        {
-                            tracing::warn!(
-                                record_name = %event.record_name,
-                                error = %e,
-                                "Failed to record soft-delete in state DB"
-                            );
-                        }
-                    }
-                }
-                ChangeReason::HardDeleted => {
-                    hard_deleted_count += 1;
-                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
-                    // CloudKit returns no fields for hard-deleted records, so we
-                    // can't tell master from asset. Treat as soft-delete in DB
-                    // (sets is_deleted=1) — the row stays put so history and
-                    // local_path remain queryable.
-                    if let Some(db) = &config.state_db {
-                        if let Err(e) = db
-                            .mark_soft_deleted(&config.library, &event.record_name, None)
-                            .await
-                        {
-                            tracing::warn!(
-                                record_name = %event.record_name,
-                                error = %e,
-                                "Failed to record hard-delete in state DB"
-                            );
-                        }
-                    }
-                }
-                ChangeReason::Hidden => {
-                    hidden_count += 1;
-                    tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
-                    if let Some(db) = &config.state_db {
-                        if let Err(e) = db
-                            .mark_hidden_at_source(&config.library, &event.record_name)
-                            .await
-                        {
-                            tracing::warn!(
-                                record_name = %event.record_name,
-                                error = %e,
-                                "Failed to record hidden state in state DB"
-                            );
-                        }
-                    }
-                }
-            }
+            change_events.push(event);
         }
 
         if let Ok(token) = token_rx.await {
             sync_token = Some(token);
+        }
+    }
+
+    let mut token_unsafe_reason: Option<&'static str> = None;
+    let mut asset_to_master: FxHashMap<&str, &str> = FxHashMap::default();
+    for event in &change_events {
+        if let Some(asset) = &event.asset {
+            asset_to_master.insert(asset.asset_record_name(), asset.id());
+        }
+    }
+    let planned_album_containers: FxHashMap<&str, &str> = passes
+        .iter()
+        .filter(|pass| pass.kind == crate::commands::PassKind::Album)
+        .filter_map(|pass| {
+            pass.album
+                .container_id()
+                .map(|container_id| (container_id, pass.album.name.as_ref()))
+        })
+        .collect();
+    let mut ensured_planned_containers: FxHashSet<&str> = FxHashSet::default();
+
+    if let Some(db) = &config.state_db {
+        for event in &change_events {
+            let Some(album) = &event.album else {
+                continue;
+            };
+            let result = if album.is_deleted {
+                if let Err(e) = db
+                    .mark_album_container_deleted(&config.library, &album.container_id)
+                    .await
+                {
+                    Err(e)
+                } else {
+                    db.invalidate_album_membership_snapshot(&config.library, &album.container_id)
+                        .await
+                }
+            } else {
+                db.upsert_album_container(
+                    &config.library,
+                    &album.container_id,
+                    &album.album_name,
+                    "album",
+                )
+                .await
+            };
+            if let Err(e) = result {
+                tracing::warn!(
+                    container_id = %album.container_id,
+                    error = %e,
+                    "Failed to apply album container delta"
+                );
+                token_unsafe_reason.get_or_insert(ALBUM_DELTA_STATE_WRITE_FAILED_REASON);
+            }
+        }
+
+        for event in &change_events {
+            let Some(relation) = &event.relation else {
+                continue;
+            };
+            if let Some(album_name) = planned_album_containers.get(relation.container_id.as_ref()) {
+                let container_id = relation.container_id.as_ref();
+                if !ensured_planned_containers.contains(container_id) {
+                    match db
+                        .upsert_album_container(
+                            &config.library,
+                            &relation.container_id,
+                            album_name,
+                            "album",
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            ensured_planned_containers.insert(container_id);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                container_id = %relation.container_id,
+                                error = %e,
+                                "Failed to upsert planned album container for relation delta"
+                            );
+                            token_unsafe_reason
+                                .get_or_insert(ALBUM_DELTA_STATE_WRITE_FAILED_REASON);
+                        }
+                    }
+                }
+            }
+
+            let container_known = if relation.is_deleted {
+                db.mark_album_membership_deleted(
+                    &config.library,
+                    &relation.container_id,
+                    &relation.asset_record_name,
+                )
+                .await
+            } else {
+                db.upsert_album_membership_delta(
+                    &config.library,
+                    &relation.container_id,
+                    &relation.asset_record_name,
+                    asset_to_master
+                        .get(relation.asset_record_name.as_ref())
+                        .copied(),
+                    "icloud",
+                )
+                .await
+            };
+
+            match container_known {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        container_id = %relation.container_id,
+                        asset_record_name = %relation.asset_record_name,
+                        "Album relation delta referenced an unknown album container"
+                    );
+                    token_unsafe_reason.get_or_insert(UNKNOWN_ALBUM_RELATION_CONTAINER_REASON);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        container_id = %relation.container_id,
+                        asset_record_name = %relation.asset_record_name,
+                        error = %e,
+                        "Failed to apply album relation delta"
+                    );
+                    token_unsafe_reason.get_or_insert(ALBUM_DELTA_STATE_WRITE_FAILED_REASON);
+                }
+            }
+        }
+    }
+
+    for event in &change_events {
+        if let Some(reason) = event.token_unsafe_reason {
+            token_unsafe_reason.get_or_insert(reason);
+        }
+        if event.album.is_some() || event.relation.is_some() || event.token_unsafe_reason.is_some()
+        {
+            continue;
+        }
+        match event.reason {
+            ChangeReason::Created => {
+                created_count += 1;
+                if let Some(asset) = &event.asset {
+                    for pass_index in 0..passes.len() {
+                        downloadable_assets.push((asset.clone(), pass_index));
+                    }
+                }
+            }
+            ChangeReason::SoftDeleted => {
+                soft_deleted_count += 1;
+                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
+                if let Some(db) = &config.state_db {
+                    let deleted_at = event.asset.as_ref().and_then(|a| a.metadata().deleted_at);
+                    if let Err(e) = db
+                        .mark_soft_deleted(&config.library, &event.record_name, deleted_at)
+                        .await
+                    {
+                        tracing::warn!(
+                            record_name = %event.record_name,
+                            error = %e,
+                            "Failed to record soft-delete in state DB"
+                        );
+                    }
+                }
+            }
+            ChangeReason::HardDeleted => {
+                hard_deleted_count += 1;
+                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
+                // CloudKit returns no fields for hard-deleted photo records, so we
+                // can't tell master from asset. Treat as soft-delete in DB
+                // (sets is_deleted=1) - the row stays put so history and
+                // local_path remain queryable.
+                if let Some(db) = &config.state_db {
+                    if let Err(e) = db
+                        .mark_soft_deleted(&config.library, &event.record_name, None)
+                        .await
+                    {
+                        tracing::warn!(
+                            record_name = %event.record_name,
+                            error = %e,
+                            "Failed to record hard-delete in state DB"
+                        );
+                    }
+                }
+            }
+            ChangeReason::Hidden => {
+                hidden_count += 1;
+                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
+                if let Some(db) = &config.state_db {
+                    if let Err(e) = db
+                        .mark_hidden_at_source(&config.library, &event.record_name)
+                        .await
+                    {
+                        tracing::warn!(
+                            record_name = %event.record_name,
+                            error = %e,
+                            "Failed to record hidden state in state DB"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3403,16 +3564,19 @@ async fn download_photos_incremental(
     );
 
     if downloadable_assets.is_empty() {
-        let stats = SyncStats {
+        let mut stats = SyncStats {
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
+        if let Some(reason) = token_unsafe_reason {
+            block_sync_token_for_incremental_delta(&mut stats, reason);
+        }
         tracing::info!("No new photos to download from incremental sync");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
         return Ok(SyncResult {
             outcome: DownloadOutcome::Success,
-            sync_token,
+            sync_token: (!stats.sync_token_blocked).then_some(sync_token).flatten(),
             stats,
             full_enumeration_ran: false,
         });
@@ -3519,13 +3683,16 @@ async fn download_photos_incremental(
     }
 
     if tasks.is_empty() {
-        let stats = SyncStats {
+        let mut stats = SyncStats {
             skipped: skip_breakdown,
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
+        if let Some(reason) = token_unsafe_reason {
+            block_sync_token_for_incremental_delta(&mut stats, reason);
+        }
         tracing::info!("All incremental assets already downloaded or filtered");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
         let outcome = if enumeration_errors > 0 {
@@ -3537,7 +3704,9 @@ async fn download_photos_incremental(
         };
         return Ok(SyncResult {
             outcome,
-            sync_token: (enumeration_errors == 0).then_some(sync_token).flatten(),
+            sync_token: (enumeration_errors == 0 && !stats.sync_token_blocked)
+                .then_some(sync_token)
+                .flatten(),
             stats,
             full_enumeration_ran: false,
         });
@@ -3551,12 +3720,15 @@ async fn download_photos_incremental(
         for task in &tasks {
             println!("{}", task.download_path.display());
         }
-        let stats = SyncStats {
+        let mut stats = SyncStats {
             skipped: skip_breakdown,
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             ..SyncStats::default()
         };
+        if let Some(reason) = token_unsafe_reason {
+            block_sync_token_for_incremental_delta(&mut stats, reason);
+        }
         // Don't advance the sync token — this is a read-only operation.
         return Ok(SyncResult {
             outcome: if enumeration_errors > 0 {
@@ -3604,7 +3776,7 @@ async fn download_photos_incremental(
         }
     }
 
-    let stats = SyncStats {
+    let mut stats = SyncStats {
         assets_seen: 0, // incremental doesn't have total library count
         downloaded: succeeded,
         failed,
@@ -3628,6 +3800,9 @@ async fn download_photos_incremental(
         recap: pass_result.recap.clone(),
         ..SyncStats::default()
     };
+    if let Some(reason) = token_unsafe_reason {
+        block_sync_token_for_incremental_delta(&mut stats, reason);
+    }
     log_sync_summary(
         "\u{2500}\u{2500} Incremental Sync Summary \u{2500}\u{2500}",
         &stats,
@@ -3638,7 +3813,7 @@ async fn download_photos_incremental(
             outcome: DownloadOutcome::SessionExpired {
                 auth_error_count: pass_result.auth_errors,
             },
-            sync_token,
+            sync_token: (!stats.sync_token_blocked).then_some(sync_token).flatten(),
             stats,
             full_enumeration_ran: false,
         });
@@ -3661,7 +3836,9 @@ async fn download_photos_incremental(
 
     Ok(SyncResult {
         outcome,
-        sync_token: (enumeration_errors == 0).then_some(sync_token).flatten(),
+        sync_token: (enumeration_errors == 0 && !stats.sync_token_blocked)
+            .then_some(sync_token)
+            .flatten(),
         stats,
         full_enumeration_ran: false,
     })
@@ -3836,6 +4013,43 @@ mod tests {
                 }
             }),
         ]
+    }
+
+    fn album_delta_record(container_id: &str, album_name: &str) -> Value {
+        json!({
+            "recordName": container_id,
+            "recordType": "CPLAlbum",
+            "fields": {
+                "albumName": {"value": album_name}
+            }
+        })
+    }
+
+    fn relation_delta_record(container_id: &str, asset_record_name: &str) -> Value {
+        json!({
+            "recordName": format!("{asset_record_name}-IN-{container_id}"),
+            "recordType": "CPLContainerRelation",
+            "fields": {
+                "containerId": {"value": container_id},
+                "itemId": {"value": asset_record_name}
+            }
+        })
+    }
+
+    fn relation_delete_record(container_id: &str, asset_record_name: &str) -> Value {
+        json!({
+            "recordName": format!("{asset_record_name}-IN-{container_id}"),
+            "recordType": "CPLContainerRelation",
+            "deleted": true
+        })
+    }
+
+    fn unparseable_relation_delete_record() -> Value {
+        json!({
+            "recordName": "not-a-relation-delta",
+            "recordType": "CPLContainerRelation",
+            "deleted": true
+        })
     }
 
     #[derive(Clone)]
@@ -5495,6 +5709,133 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "changes/zone is zone-scoped; querying once per pass repeats the same delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_relation_add_writes_membership_after_album_delta() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            vec![
+                relation_delta_record("container-a", "asset-record-a"),
+                album_delta_record("container-a", "Vacation"),
+            ],
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.state_db = Some(db.clone());
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::Download, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("incremental relation delta should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        let memberships = db
+            .get_live_album_memberships_for_asset("PrimarySync", "asset-record-a")
+            .await
+            .unwrap();
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[0].container_id, "container-a");
+    }
+
+    #[tokio::test]
+    async fn incremental_relation_delete_marks_membership_deleted() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        db.upsert_album_container("PrimarySync", "container-a", "Vacation", "album")
+            .await
+            .unwrap();
+        db.upsert_album_membership_delta(
+            "PrimarySync",
+            "container-a",
+            "asset-record-a",
+            Some("master-a"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            vec![relation_delete_record("container-a", "asset-record-a")],
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: album_with_session_and_container(
+                "PrimarySync",
+                "Vacation",
+                Some("container-a"),
+                Box::new(session),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.state_db = Some(db.clone());
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::Download, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("incremental relation delete should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let memberships = db
+            .get_live_album_memberships_for_asset("PrimarySync", "asset-record-a")
+            .await
+            .unwrap();
+        assert!(memberships.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unparseable_relation_delete_blocks_incremental_token() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            vec![unparseable_relation_delete_record()],
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let config = Arc::new(test_config());
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &config,
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::Download, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("unparseable relation delete should not fall back to full here");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token, None);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(UNPARSEABLE_RELATION_DELTA_REASON)
         );
     }
 

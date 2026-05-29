@@ -4591,6 +4591,9 @@ mod tests {
             record_type: Some("CPLAsset".into()),
             reason: ChangeReason::Created,
             asset: Some(modified_asset),
+            album: None,
+            relation: None,
+            token_unsafe_reason: None,
         };
 
         // Simulate the incremental filtering: Created reason + asset present

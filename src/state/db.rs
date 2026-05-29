@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Transaction};
 
 use super::error::StateError;
 use super::schema;
@@ -28,6 +28,23 @@ fn unsupported_album_membership_api(operation: &'static str) -> StateError {
         operation,
         detail: "album membership snapshots are not implemented by this state store".into(),
     }
+}
+
+fn album_container_known_tx(
+    tx: &Transaction<'_>,
+    library: &str,
+    container_id: &str,
+    operation: &'static str,
+) -> Result<bool, StateError> {
+    tx.query_row(
+        "SELECT 1 FROM album_containers \
+         WHERE library = ?1 AND container_id = ?2",
+        rusqlite::params![library, container_id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .map_err(|e| StateError::query(operation, e))
 }
 
 /// Snapshot of an already-imported asset, returned by
@@ -244,6 +261,38 @@ pub trait MembershipStore: Send + Sync {
     ) -> Result<(), StateError> {
         Err(unsupported_album_membership_api(
             "add_album_membership_to_snapshot",
+        ))
+    }
+
+    /// Add or refresh an album relation learned from `/changes/zone`.
+    ///
+    /// Returns whether the relation's album container was already known when
+    /// the row was applied.
+    async fn upsert_album_membership_delta(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _asset_record_name: &str,
+        _master_record_name: Option<&str>,
+        _source: &str,
+    ) -> Result<bool, StateError> {
+        Err(unsupported_album_membership_api(
+            "upsert_album_membership_delta",
+        ))
+    }
+
+    /// Mark an album relation deleted from `/changes/zone`.
+    ///
+    /// Returns whether the relation's album container was already known when
+    /// the tombstone was applied.
+    async fn mark_album_membership_deleted(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _asset_record_name: &str,
+    ) -> Result<bool, StateError> {
+        Err(unsupported_album_membership_api(
+            "mark_album_membership_deleted",
         ))
     }
     async fn complete_album_membership_snapshot(
@@ -682,6 +731,38 @@ pub trait StateDb: Send + Sync {
         ))
     }
 
+    /// Add or refresh an album relation learned from `/changes/zone`.
+    ///
+    /// Returns whether the relation's album container was already known when
+    /// the row was applied.
+    async fn upsert_album_membership_delta(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _asset_record_name: &str,
+        _master_record_name: Option<&str>,
+        _source: &str,
+    ) -> Result<bool, StateError> {
+        Err(unsupported_album_membership_api(
+            "upsert_album_membership_delta",
+        ))
+    }
+
+    /// Mark an album relation deleted from `/changes/zone`.
+    ///
+    /// Returns whether the relation's album container was already known when
+    /// the tombstone was applied.
+    async fn mark_album_membership_deleted(
+        &self,
+        _library: &str,
+        _container_id: &str,
+        _asset_record_name: &str,
+    ) -> Result<bool, StateError> {
+        Err(unsupported_album_membership_api(
+            "mark_album_membership_deleted",
+        ))
+    }
+
     /// Complete a membership snapshot and mark rows absent from it deleted.
     async fn complete_album_membership_snapshot(
         &self,
@@ -1096,6 +1177,40 @@ where
             asset_record_name,
             master_record_name,
             source,
+        )
+        .await
+    }
+
+    async fn upsert_album_membership_delta(
+        &self,
+        library: &str,
+        container_id: &str,
+        asset_record_name: &str,
+        master_record_name: Option<&str>,
+        source: &str,
+    ) -> Result<bool, StateError> {
+        MembershipStore::upsert_album_membership_delta(
+            self,
+            library,
+            container_id,
+            asset_record_name,
+            master_record_name,
+            source,
+        )
+        .await
+    }
+
+    async fn mark_album_membership_deleted(
+        &self,
+        library: &str,
+        container_id: &str,
+        asset_record_name: &str,
+    ) -> Result<bool, StateError> {
+        MembershipStore::mark_album_membership_deleted(
+            self,
+            library,
+            container_id,
+            asset_record_name,
         )
         .await
     }
@@ -1530,6 +1645,34 @@ impl MembershipStore for dyn StateDb + '_ {
             source,
         )
         .await
+    }
+
+    async fn upsert_album_membership_delta(
+        &self,
+        library: &str,
+        container_id: &str,
+        asset_record_name: &str,
+        master_record_name: Option<&str>,
+        source: &str,
+    ) -> Result<bool, StateError> {
+        StateDb::upsert_album_membership_delta(
+            self,
+            library,
+            container_id,
+            asset_record_name,
+            master_record_name,
+            source,
+        )
+        .await
+    }
+
+    async fn mark_album_membership_deleted(
+        &self,
+        library: &str,
+        container_id: &str,
+        asset_record_name: &str,
+    ) -> Result<bool, StateError> {
+        StateDb::mark_album_membership_deleted(self, library, container_id, asset_record_name).await
     }
 
     async fn complete_album_membership_snapshot(
@@ -3119,6 +3262,91 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn upsert_album_membership_delta(
+        &self,
+        library: &str,
+        container_id: &str,
+        asset_record_name: &str,
+        master_record_name: Option<&str>,
+        source: &str,
+    ) -> Result<bool, StateError> {
+        let library = library.to_owned();
+        let container_id = container_id.to_owned();
+        let asset_record_name = asset_record_name.to_owned();
+        let master_record_name = master_record_name.map(ToOwned::to_owned);
+        let source = source.to_owned();
+        self.with_conn_mut("upsert_album_membership_delta", move |conn| {
+            let now = Utc::now().timestamp();
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("upsert_album_membership_delta::begin", e))?;
+            let container_known = album_container_known_tx(
+                &tx,
+                &library,
+                &container_id,
+                "upsert_album_membership_delta::container",
+            )?;
+            tx.execute(
+                "INSERT INTO asset_album_memberships \
+                    (library, asset_record_name, master_record_name, container_id, generation, \
+                     is_deleted, source, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, ?5, ?6) \
+                 ON CONFLICT(library, asset_record_name, container_id) DO UPDATE SET \
+                    master_record_name = COALESCE(excluded.master_record_name, asset_album_memberships.master_record_name), \
+                    is_deleted = 0, \
+                    source = excluded.source, \
+                    updated_at = excluded.updated_at",
+                rusqlite::params![
+                    &library,
+                    &asset_record_name,
+                    master_record_name.as_deref(),
+                    &container_id,
+                    &source,
+                    now
+                ],
+            )
+            .map_err(|e| StateError::query("upsert_album_membership_delta::upsert", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("upsert_album_membership_delta::commit", e))?;
+            Ok(container_known)
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_album_membership_deleted(
+        &self,
+        library: &str,
+        container_id: &str,
+        asset_record_name: &str,
+    ) -> Result<bool, StateError> {
+        let library = library.to_owned();
+        let container_id = container_id.to_owned();
+        let asset_record_name = asset_record_name.to_owned();
+        self.with_conn_mut("mark_album_membership_deleted", move |conn| {
+            let now = Utc::now().timestamp();
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("mark_album_membership_deleted::begin", e))?;
+            let container_known = album_container_known_tx(
+                &tx,
+                &library,
+                &container_id,
+                "mark_album_membership_deleted::container",
+            )?;
+            tx.execute(
+                "UPDATE asset_album_memberships \
+                 SET is_deleted = 1, updated_at = ?1 \
+                 WHERE library = ?2 AND container_id = ?3 AND asset_record_name = ?4",
+                rusqlite::params![now, &library, &container_id, &asset_record_name],
+            )
+            .map_err(|e| StateError::query("mark_album_membership_deleted::update", e))?;
+            tx.commit()
+                .map_err(|e| StateError::query("mark_album_membership_deleted::commit", e))?;
+            Ok(container_known)
+        })
+        .await
+    }
+
     pub(crate) async fn complete_album_membership_snapshot(
         &self,
         library: &str,
@@ -3811,6 +4039,35 @@ impl MembershipStore for SqliteStateDb {
             source,
         )
         .await
+    }
+
+    async fn upsert_album_membership_delta(
+        &self,
+        library: &str,
+        container_id: &str,
+        asset_record_name: &str,
+        master_record_name: Option<&str>,
+        source: &str,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::upsert_album_membership_delta(
+            self,
+            library,
+            container_id,
+            asset_record_name,
+            master_record_name,
+            source,
+        )
+        .await
+    }
+
+    async fn mark_album_membership_deleted(
+        &self,
+        library: &str,
+        container_id: &str,
+        asset_record_name: &str,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::mark_album_membership_deleted(self, library, container_id, asset_record_name)
+            .await
     }
 
     async fn complete_album_membership_snapshot(
@@ -7293,6 +7550,86 @@ mod tests {
         assert_eq!(
             shared[0].master_record_name.as_deref(),
             Some("master-shared")
+        );
+    }
+
+    #[tokio::test]
+    async fn album_relation_delta_add_and_delete_update_live_membership() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_album_container("PrimarySync", "container-a", "Vacation", "album")
+            .await
+            .unwrap();
+
+        let known = db
+            .upsert_album_membership_delta(
+                "PrimarySync",
+                "container-a",
+                "asset-record-a",
+                Some("master-a"),
+                "icloud",
+            )
+            .await
+            .unwrap();
+        assert!(known, "selected album container should be known");
+        let live = db
+            .get_live_album_memberships_for_asset("PrimarySync", "asset-record-a")
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].master_record_name.as_deref(), Some("master-a"));
+
+        let known = db
+            .mark_album_membership_deleted("PrimarySync", "container-a", "asset-record-a")
+            .await
+            .unwrap();
+        assert!(known, "delete should still know the album container");
+        let live = db
+            .get_live_album_memberships_for_asset("PrimarySync", "asset-record-a")
+            .await
+            .unwrap();
+        assert!(live.is_empty(), "relation delete must hide live membership");
+    }
+
+    #[tokio::test]
+    async fn album_delta_delete_invalidates_snapshot() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.upsert_album_container("PrimarySync", "container-a", "Vacation", "album")
+            .await
+            .unwrap();
+        let generation = db
+            .start_album_membership_snapshot("PrimarySync", "container-a", None)
+            .await
+            .unwrap();
+        db.add_album_membership_to_snapshot(
+            "PrimarySync",
+            "container-a",
+            generation,
+            "asset-record-a",
+            Some("master-a"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+        db.complete_album_membership_snapshot("PrimarySync", "container-a", generation)
+            .await
+            .unwrap();
+        assert!(db
+            .selected_album_containers_have_complete_snapshots("PrimarySync", &["container-a"])
+            .await
+            .unwrap());
+
+        db.mark_album_container_deleted("PrimarySync", "container-a")
+            .await
+            .unwrap();
+        db.invalidate_album_membership_snapshot("PrimarySync", "container-a")
+            .await
+            .unwrap();
+
+        assert!(
+            !db.selected_album_containers_have_complete_snapshots("PrimarySync", &["container-a"])
+                .await
+                .unwrap(),
+            "deleted album containers must not remain trusted"
         );
     }
 

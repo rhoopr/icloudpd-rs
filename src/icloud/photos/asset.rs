@@ -42,6 +42,43 @@ pub struct ChangeEvent {
     /// The photo asset, if this is a CPLMaster+CPLAsset pair that was successfully paired.
     /// None for hard-deletes, non-photo record types, or unpaired records.
     pub asset: Option<PhotoAsset>,
+    /// Album container metadata delta from `/changes/zone`.
+    pub album: Option<AlbumContainerDelta>,
+    /// Album relation delta from `/changes/zone`.
+    pub relation: Option<AlbumRelationDelta>,
+    /// A delta record that was understood well enough to make the cycle
+    /// token-unsafe, but not well enough to apply safely.
+    pub token_unsafe_reason: Option<&'static str>,
+}
+
+impl ChangeEvent {
+    fn new(record_name: Box<str>, record_type: Option<Box<str>>, reason: ChangeReason) -> Self {
+        Self {
+            record_name,
+            record_type,
+            reason,
+            asset: None,
+            album: None,
+            relation: None,
+            token_unsafe_reason: None,
+        }
+    }
+}
+
+/// Album container metadata carried by `CPLAlbum` change records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumContainerDelta {
+    pub container_id: Box<str>,
+    pub album_name: Box<str>,
+    pub is_deleted: bool,
+}
+
+/// Album membership relation carried by `CPLContainerRelation` change records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumRelationDelta {
+    pub container_id: Box<str>,
+    pub asset_record_name: Box<str>,
+    pub is_deleted: bool,
 }
 
 /// A photo or video asset from iCloud.
@@ -570,6 +607,80 @@ fn extract_master_ref(fields: &Value) -> Option<String> {
         .map(std::string::ToString::to_string)
 }
 
+fn field_value_str<'a>(fields: &'a Value, name: &str) -> Option<&'a str> {
+    fields
+        .get(name)
+        .and_then(|field| field.get("value"))
+        .and_then(Value::as_str)
+}
+
+fn parse_album_delta(record: &Record, reason: ChangeReason) -> ChangeEvent {
+    let is_deleted = matches!(
+        reason,
+        ChangeReason::HardDeleted | ChangeReason::SoftDeleted
+    );
+    let album_name = enc::decode_string(&record.fields, "albumNameEnc")
+        .or_else(|| field_value_str(&record.fields, "albumName").map(ToOwned::to_owned))
+        .unwrap_or_else(|| record.record_name.clone());
+    let mut event = ChangeEvent::new(
+        record.record_name.clone().into_boxed_str(),
+        Some(record.record_type.clone().into_boxed_str()),
+        reason,
+    );
+    event.album = Some(AlbumContainerDelta {
+        container_id: record.record_name.clone().into_boxed_str(),
+        album_name: crate::download::paths::sanitize_path_component(&album_name).into_boxed_str(),
+        is_deleted,
+    });
+    event
+}
+
+fn parse_relation_record_name(record_name: &str) -> Option<(&str, &str)> {
+    record_name
+        .rsplit_once("-IN-")
+        .filter(|(asset, container)| !asset.is_empty() && !container.is_empty())
+}
+
+fn parse_relation_delta(record: &Record, reason: ChangeReason) -> ChangeEvent {
+    let is_deleted = matches!(
+        reason,
+        ChangeReason::HardDeleted | ChangeReason::SoftDeleted
+    );
+    let parsed = if is_deleted {
+        parse_relation_record_name(&record.record_name)
+            .map(|(asset, container)| (container.to_owned(), asset.to_owned()))
+    } else {
+        field_value_str(&record.fields, "containerId")
+            .zip(field_value_str(&record.fields, "itemId"))
+            .map(|(container, item)| (container.to_owned(), item.to_owned()))
+    };
+
+    match parsed {
+        Some((container_id, asset_record_name)) => {
+            let mut event = ChangeEvent::new(
+                record.record_name.clone().into_boxed_str(),
+                Some("CPLContainerRelation".into()),
+                reason,
+            );
+            event.relation = Some(AlbumRelationDelta {
+                container_id: container_id.into_boxed_str(),
+                asset_record_name: asset_record_name.into_boxed_str(),
+                is_deleted,
+            });
+            event
+        }
+        None => {
+            let mut event = ChangeEvent::new(
+                record.record_name.clone().into_boxed_str(),
+                Some("CPLContainerRelation".into()),
+                reason,
+            );
+            event.token_unsafe_reason = Some("unparseable_relation_delta");
+            event
+        }
+    }
+}
+
 /// Buffers `CPLMaster` and `CPLAsset` records from `changes/zone` responses
 /// and pairs them into `ChangeEvent`s when both halves are available.
 ///
@@ -599,14 +710,25 @@ impl DeltaRecordBuffer {
 
             match reason {
                 ChangeReason::HardDeleted => {
+                    if record.record_type == "CPLContainerRelation" {
+                        events.push(parse_relation_delta(&record, reason));
+                        continue;
+                    }
+                    if record.record_type == "CPLAlbum" {
+                        events.push(parse_album_delta(&record, reason));
+                        continue;
+                    }
+                    if parse_relation_record_name(&record.record_name).is_some() {
+                        events.push(parse_relation_delta(&record, reason));
+                        continue;
+                    }
                     // Hard-deleted: no fields, can't tell if master or asset.
                     // Emit immediately as-is.
-                    events.push(ChangeEvent {
-                        record_name: record.record_name.into_boxed_str(),
-                        record_type: None,
+                    events.push(ChangeEvent::new(
+                        record.record_name.into_boxed_str(),
+                        None,
                         reason,
-                        asset: None,
-                    });
+                    ));
                 }
                 _ => match record.record_type.as_str() {
                     "CPLMaster" => {
@@ -631,13 +753,18 @@ impl DeltaRecordBuffer {
                             }
                         } else {
                             // CPLAsset with no masterRef -- metadata-only change
-                            events.push(ChangeEvent {
-                                record_name: record.record_name.into_boxed_str(),
-                                record_type: Some("CPLAsset".into()),
+                            events.push(ChangeEvent::new(
+                                record.record_name.into_boxed_str(),
+                                Some("CPLAsset".into()),
                                 reason,
-                                asset: None,
-                            });
+                            ));
                         }
+                    }
+                    "CPLAlbum" => {
+                        events.push(parse_album_delta(&record, reason));
+                    }
+                    "CPLContainerRelation" => {
+                        events.push(parse_relation_delta(&record, reason));
                     }
                     _ => {
                         // Non-photo record types (CPLAlbum, CPLContainerRelation, etc.)
@@ -657,22 +784,20 @@ impl DeltaRecordBuffer {
 
         for (name, record) in self.pending_masters.drain() {
             let reason = classify_change_reason(&record);
-            events.push(ChangeEvent {
-                record_name: name.into_boxed_str(),
-                record_type: Some("CPLMaster".into()),
+            events.push(ChangeEvent::new(
+                name.into_boxed_str(),
+                Some("CPLMaster".into()),
                 reason,
-                asset: None,
-            });
+            ));
         }
 
         for (_master_ref, record) in self.pending_assets.drain() {
             let reason = classify_change_reason(&record);
-            events.push(ChangeEvent {
-                record_name: record.record_name.into_boxed_str(),
-                record_type: Some("CPLAsset".into()),
+            events.push(ChangeEvent::new(
+                record.record_name.into_boxed_str(),
+                Some("CPLAsset".into()),
                 reason,
-                asset: None,
-            });
+            ));
         }
 
         events
@@ -710,12 +835,9 @@ impl DeltaRecordBuffer {
         // capacity slack that .clone().into_boxed_str() would drag along.
         let master_name: Box<str> = Box::from(master_record.record_name.as_str());
         let asset = PhotoAsset::from_records(master_record, &asset_record);
-        events.push(ChangeEvent {
-            record_name: master_name,
-            record_type: Some("CPLMaster".into()),
-            reason,
-            asset: Some(asset),
-        });
+        let mut event = ChangeEvent::new(master_name, Some("CPLMaster".into()), reason);
+        event.asset = Some(asset);
+        events.push(event);
     }
 }
 
@@ -1372,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_non_photo_records_skipped() {
+    fn test_buffer_emits_photo_album_and_relation_records() {
         let mut buffer = DeltaRecordBuffer::new();
 
         let album_record = Record {
@@ -1381,19 +1503,86 @@ mod tests {
             fields: json!({"albumName": {"value": "Vacation"}}),
             deleted: None,
         };
-        let container_record = Record {
-            record_name: "CR_1".to_string(),
+        let relation_record = Record {
+            record_name: "ASSET_1-IN-ALBUM_1".to_string(),
             record_type: "CPLContainerRelation".to_string(),
-            fields: json!({}),
+            fields: json!({
+                "containerId": {"value": "ALBUM_1"},
+                "itemId": {"value": "ASSET_1"}
+            }),
             deleted: None,
         };
 
-        let events = buffer.process_records(vec![album_record, container_record]);
-        assert!(events.is_empty(), "non-photo records should be skipped");
+        let events = buffer.process_records(vec![
+            make_master_record("M1"),
+            make_asset_record("A1", "M1"),
+            album_record,
+            relation_record,
+        ]);
+        assert_eq!(events.len(), 3);
+        assert!(events[0].asset.is_some());
+        assert_eq!(
+            events[1].album,
+            Some(AlbumContainerDelta {
+                container_id: "ALBUM_1".into(),
+                album_name: "Vacation".into(),
+                is_deleted: false,
+            })
+        );
+        assert_eq!(
+            events[2].relation,
+            Some(AlbumRelationDelta {
+                container_id: "ALBUM_1".into(),
+                asset_record_name: "ASSET_1".into(),
+                is_deleted: false,
+            })
+        );
 
-        // Flush should also be empty since non-photo records are not buffered
+        // Flush should still be empty since album/relation records are not buffered.
         let flushed = buffer.flush();
         assert!(flushed.is_empty());
+    }
+
+    #[test]
+    fn test_buffer_hard_deleted_relation_parses_record_name() {
+        let mut buffer = DeltaRecordBuffer::new();
+        let relation_delete = Record {
+            record_name: "ASSET_1-IN-ALBUM_1".to_string(),
+            record_type: "CPLContainerRelation".to_string(),
+            fields: json!({}),
+            deleted: Some(true),
+        };
+
+        let events = buffer.process_records(vec![relation_delete]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].relation,
+            Some(AlbumRelationDelta {
+                container_id: "ALBUM_1".into(),
+                asset_record_name: "ASSET_1".into(),
+                is_deleted: true,
+            })
+        );
+        assert_eq!(events[0].token_unsafe_reason, None);
+    }
+
+    #[test]
+    fn test_buffer_unparseable_hard_deleted_relation_is_token_unsafe() {
+        let mut buffer = DeltaRecordBuffer::new();
+        let relation_delete = Record {
+            record_name: "not-a-relation-name".to_string(),
+            record_type: "CPLContainerRelation".to_string(),
+            fields: json!({}),
+            deleted: Some(true),
+        };
+
+        let events = buffer.process_records(vec![relation_delete]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].relation, None);
+        assert_eq!(
+            events[0].token_unsafe_reason,
+            Some("unparseable_relation_delta")
+        );
     }
 
     #[test]
