@@ -3405,9 +3405,13 @@ fn config_show_emits_libraries_when_repeatable_named_zone() {
 #[test]
 fn config_show_round_trips_persistent_recent_and_dates() {
     let (stdout, _) = run_config_show(
-        "\n[filters]\nrecent = 100\nskip_created_before = \"2024-01-01\"\nskip_created_after = \"30d\"\n",
+        "\n[filters]\nrecent = 100\nrecent_scope = \"per-filter\"\nskip_created_before = \"2024-01-01\"\nskip_created_after = \"30d\"\n",
     );
     assert!(stdout.contains("recent = 100"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("recent_scope = \"per-filter\""),
+        "stdout: {stdout}"
+    );
     assert!(
         stdout.contains("skip_created_before = \"2024-01-01\""),
         "stdout: {stdout}"

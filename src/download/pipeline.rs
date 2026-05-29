@@ -4822,6 +4822,7 @@ mod tests {
             xmp_sidecar: false,
             concurrent_downloads: 10,
             recent: None,
+            recent_scope: crate::cli::RecentScope::Global,
             retry: crate::retry::RetryConfig {
                 max_retries: 0,
                 base_delay_secs: 0,
@@ -4908,6 +4909,7 @@ mod tests {
             xmp_sidecar: false,
             concurrent_downloads: 1,
             recent: None,
+            recent_scope: crate::cli::RecentScope::Global,
             retry: RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
             live_resolution: AssetVersionSize::LiveOriginal,

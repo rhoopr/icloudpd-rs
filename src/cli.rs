@@ -106,6 +106,28 @@ pub enum RecentLimit {
     Days(u32),
 }
 
+/// Where a count-form `--recent N` limit is applied when filters create
+/// multiple CloudKit streams.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Deserialize,
+    serde::Serialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecentScope {
+    /// Apply `recent` once to the selected library, then narrow with filters.
+    #[default]
+    Global,
+    /// Apply `recent` independently to each album, smart-folder, or unfiled pass.
+    PerFilter,
+}
+
 /// Parse `--recent N` (count) or `--recent Nd` (days). Clap `value_parser`.
 ///
 /// Rejects zero, empty, and unknown suffixes. Only `d` (days) is supported
@@ -196,13 +218,20 @@ pub struct PasswordArgs {
 /// Arguments for the sync command (also used as default when no subcommand).
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
-    /// Limit recent assets per selected library/album/smart-folder pass
-    /// (e.g. `--recent 100`) or use a days window (e.g. `--recent 30d`).
+    /// Limit to recent assets (e.g. `--recent 100`) or use a days window
+    /// (e.g. `--recent 30d`).
     /// This is not a global exact file count - filters and live-photo parts
     /// can change the final number of downloaded files. Days form maps to
     /// `--skip-created-before` internally.
     #[arg(long, value_parser = parse_recent_limit)]
     pub recent: Option<RecentLimit>,
+
+    /// Where count-form `--recent N` applies when filters create multiple streams.
+    ///
+    /// `global` means "take the library-wide recent N, then apply filters".
+    /// `per-filter` means "take up to N from each album/smart-folder/unfiled pass".
+    #[arg(long, value_enum)]
+    pub recent_scope: Option<RecentScope>,
 
     /// Do not modify local system or iCloud
     #[arg(long)]
@@ -643,6 +672,9 @@ impl SyncArgs {
         if self.recent.is_none() {
             self.recent = fallback.recent;
         }
+        if self.recent_scope.is_none() {
+            self.recent_scope = fallback.recent_scope;
+        }
         self.dry_run = self.dry_run || fallback.dry_run;
         self.no_progress_bar = self.no_progress_bar || fallback.no_progress_bar;
         if self.skip_created_before.is_none() {
@@ -848,6 +880,9 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     let mut out = Vec::new();
     if matches.value_source("recent") == Some(ValueSource::CommandLine) {
         out.push("--recent");
+    }
+    if matches.value_source("recent_scope") == Some(ValueSource::CommandLine) {
+        out.push("--recent-scope");
     }
     if matches.value_source("friendly") == Some(ValueSource::CommandLine) {
         out.push("--friendly");
@@ -1190,6 +1225,35 @@ mod tests {
     fn recent_limit_display_roundtrip() {
         assert_eq!(RecentLimit::Count(100).to_string(), "100");
         assert_eq!(RecentLimit::Days(30).to_string(), "30d");
+    }
+
+    #[test]
+    fn recent_scope_parses_global_and_per_filter() {
+        let cli = parse(&["kei", "sync", "--recent", "100", "--recent-scope", "global"]);
+        let Command::Sync { sync, .. } = cli.command.expect("sync command") else {
+            panic!("expected sync command");
+        };
+        assert_eq!(sync.recent_scope, Some(RecentScope::Global));
+
+        let cli = parse(&[
+            "kei",
+            "sync",
+            "--recent",
+            "100",
+            "--recent-scope",
+            "per-filter",
+        ]);
+        let Command::Sync { sync, .. } = cli.command.expect("sync command") else {
+            panic!("expected sync command");
+        };
+        assert_eq!(sync.recent_scope, Some(RecentScope::PerFilter));
+    }
+
+    #[test]
+    fn recent_scope_rejects_unknown_value() {
+        let err = Cli::try_parse_from(["kei", "sync", "--recent-scope", "per_album"])
+            .expect_err("invalid recent scope should fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]

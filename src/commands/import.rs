@@ -1491,6 +1491,7 @@ mod wiremock_tests {
             xmp_sidecar: false,
             concurrent_downloads: 1,
             recent: None,
+            recent_scope: crate::cli::RecentScope::Global,
             retry: RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
             live_resolution: AssetVersionSize::LiveOriginal,

@@ -755,6 +755,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             xmp_sidecar: config.metadata.xmp_sidecar,
             concurrent_downloads: config.download.threads_num as usize,
             recent: config.filters.recent,
+            recent_scope: config.filters.recent_scope,
             retry: retry_config,
             live_photo_mode: config.photos.live_photo_mode,
             live_resolution,

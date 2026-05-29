@@ -644,6 +644,14 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     );
     // `recent` affects which already-downloaded assets to trust/skip
     hash_optional_u32(&mut hasher, config.recent);
+    if config.recent.is_some() {
+        hasher.update(b"recent_scope:");
+        hasher.update(match config.recent_scope {
+            crate::cli::RecentScope::Global => b"global".as_slice(),
+            crate::cli::RecentScope::PerFilter => b"per-filter".as_slice(),
+        });
+        hasher.update(b"\0");
+    }
     finalize_hash(hasher)
 }
 
@@ -771,6 +779,7 @@ pub(crate) struct DownloadConfig {
     pub(crate) xmp_sidecar: bool,
     pub(crate) concurrent_downloads: usize,
     pub(crate) recent: Option<u32>,
+    pub(crate) recent_scope: crate::cli::RecentScope,
     pub(crate) retry: RetryConfig,
     pub(crate) live_photo_mode: LivePhotoMode,
     pub(crate) live_resolution: AssetVersionSize,
@@ -887,6 +896,7 @@ impl DownloadConfig {
             xmp_sidecar: false,
             concurrent_downloads: 1,
             recent: None,
+            recent_scope: crate::cli::RecentScope::Global,
             retry: RetryConfig::default(),
             live_photo_mode: fields.live_photo_mode,
             live_resolution: fields.live_resolution.to_asset_version_size(),
@@ -1024,6 +1034,7 @@ impl std::fmt::Debug for DownloadConfig {
             .field("xmp_sidecar", &self.xmp_sidecar);
         s.field("concurrent_downloads", &self.concurrent_downloads)
             .field("recent", &self.recent)
+            .field("recent_scope", &self.recent_scope)
             .field("retry", &self.retry)
             .field("live_photo_mode", &self.live_photo_mode)
             .field("live_resolution", &self.live_resolution)
@@ -1076,6 +1087,7 @@ impl DownloadConfig {
             xmp_sidecar: false,
             concurrent_downloads: 1,
             recent: None,
+            recent_scope: crate::cli::RecentScope::Global,
             retry: crate::retry::RetryConfig::default(),
             live_photo_mode: LivePhotoMode::Both,
             live_resolution: AssetVersionSize::LiveOriginal,
@@ -1623,6 +1635,15 @@ fn should_use_scope_recent_frontier(passes: &[crate::commands::AlbumPass]) -> bo
         .any(|pass| pass.kind != crate::commands::PassKind::Unfiled || !pass.exclude_ids.is_empty())
 }
 
+fn should_use_global_recent_frontier(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+) -> bool {
+    config.recent.is_some()
+        && config.recent_scope == crate::cli::RecentScope::Global
+        && should_use_scope_recent_frontier(passes)
+}
+
 async fn build_recent_frontier(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
@@ -1633,7 +1654,7 @@ async fn build_recent_frontier(
     let Some(recent) = config.recent else {
         return Ok(None);
     };
-    if !should_use_scope_recent_frontier(passes) {
+    if !should_use_global_recent_frontier(passes, config) {
         return Ok(None);
     }
 
@@ -2373,6 +2394,13 @@ fn capped_exact_total(counts: &[u64], recent: Option<u32>) -> u64 {
     total.min(recent.map(u64::from).unwrap_or(u64::MAX))
 }
 
+fn display_total_for_recent_scope(counts: &[u64], config: &DownloadConfig) -> u64 {
+    match (config.recent, config.recent_scope) {
+        (Some(recent), crate::cli::RecentScope::Global) => capped_exact_total(counts, Some(recent)),
+        _ => counts.iter().sum(),
+    }
+}
+
 fn should_skip_pass_count_fetch(config: &DownloadConfig) -> bool {
     // A `--recent N` run deliberately enumerates only a prefix of each pass.
     // The Hyperion count endpoint reports the full pass size, not how many
@@ -2516,11 +2544,7 @@ async fn download_photos_full_with_token(
     let mut pagination_counts = pass_counts.clone();
     let mut exact_total = pass_count_plan.exact_total;
     let len_errors = pass_count_plan.len_errors;
-    let display_total = pass_counts
-        .iter()
-        .copied()
-        .sum::<u64>()
-        .min(config.recent.map(u64::from).unwrap_or(u64::MAX));
+    let display_total = display_total_for_recent_scope(&pass_counts, config);
     let deferred_unfiled = deferred_unfiled_index(passes);
     let recent_frontier = build_recent_frontier(
         passes,
@@ -3894,6 +3918,16 @@ mod tests {
             .collect()
     }
 
+    fn recent_scope_photo_asset(asset: &RecentScopeAsset) -> PhotoAsset {
+        let records = mock_photo_records_for_zone_with_filename_and_asset_date(
+            &asset.id,
+            "PrimarySync",
+            &format!("{}.jpg", asset.id),
+            asset.asset_date,
+        );
+        PhotoAsset::new(records[0].clone(), records[1].clone())
+    }
+
     fn unique_ids_in_order(ids: Vec<String>) -> Vec<String> {
         let mut seen = FxHashSet::default();
         ids.into_iter()
@@ -4609,6 +4643,20 @@ mod tests {
         config1.recent = None;
         let mut config2 = test_config();
         config2.recent = Some(100);
+        assert_ne!(
+            hash_download_config(&config1),
+            hash_download_config(&config2)
+        );
+    }
+
+    #[test]
+    fn test_hash_download_config_changes_on_recent_scope_when_recent_is_set() {
+        let mut config1 = test_config();
+        config1.recent = Some(100);
+        config1.recent_scope = crate::cli::RecentScope::Global;
+        let mut config2 = test_config();
+        config2.recent = Some(100);
+        config2.recent_scope = crate::cli::RecentScope::PerFilter;
         assert_ne!(
             hash_download_config(&config1),
             hash_download_config(&config2)
@@ -5919,7 +5967,7 @@ mod tests {
         ]);
         let hash = hash_download_config(&config);
         assert_eq!(
-            hash, "a587ebe7d19e6b41",
+            hash, "d327fda31e8bec04",
             "hash_download_config golden hash changed -- this will trigger full re-syncs"
         );
     }
@@ -6593,6 +6641,7 @@ mod tests {
         let all_assets = recent_scope_assets("frontier", 300, 1_700_000_000_000);
         let mut album_assets = vec![all_assets[0].clone()];
         album_assets.extend(recent_scope_assets("old-album", 500, 1_699_000_000_000));
+        let asset = recent_scope_photo_asset(&all_assets[0]);
         let session = RecentScopeSession::new(all_assets, album_assets);
 
         let passes: Vec<AlbumPass> = (0..10)
@@ -6608,13 +6657,6 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
         config.recent = Some(300);
-        let records = mock_photo_records_for_zone_with_filename_and_asset_date(
-            "frontier-0000",
-            "PrimarySync",
-            "frontier-0000.jpg",
-            1_700_000_000_000,
-        );
-        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
         for pass in &passes {
             seed_existing_file_for_asset(&config, pass, &asset).await;
         }
@@ -6646,6 +6688,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_sync_recent_per_filter_scope_limits_each_pass_independently() {
+        let all_assets = recent_scope_assets("frontier", 6, 1_700_000_000_000);
+        let mut album_assets = vec![all_assets[0].clone()];
+        album_assets.extend(recent_scope_assets(
+            "old-per-filter-album",
+            20,
+            1_699_000_000_000,
+        ));
+        let expected_assets = album_assets
+            .iter()
+            .take(6)
+            .map(recent_scope_photo_asset)
+            .collect::<Vec<_>>();
+        let session = RecentScopeSession::new(all_assets, album_assets);
+
+        let passes: Vec<AlbumPass> = (0..3)
+            .map(|index| AlbumPass {
+                kind: PassKind::Album,
+                album: recent_scope_album(&format!("Album {index}"), session.clone()),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            })
+            .collect();
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.recent = Some(6);
+        config.recent_scope = crate::cli::RecentScope::PerFilter;
+
+        for pass in &passes {
+            for asset in &expected_assets {
+                seed_existing_file_for_asset(&config, pass, asset).await;
+            }
+        }
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("per-filter recent sync should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            result.stats.assets_seen, 18,
+            "per-filter recent scope should take the recent limit from each album pass"
+        );
+        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert!(
+            session.album_offsets().len() >= 9,
+            "per-filter scope should enumerate each album's recent window, not stop at the global frontier"
+        );
+        assert_eq!(result.sync_token, None);
+    }
+
+    #[tokio::test]
     async fn full_sync_recent_single_album_filters_library_frontier() {
         let all_assets = recent_scope_assets("frontier", 300, 1_700_000_000_000);
         let mut album_assets = vec![all_assets[0].clone()];
@@ -6654,6 +6757,7 @@ mod tests {
             500,
             1_699_000_000_000,
         ));
+        let asset = recent_scope_photo_asset(&all_assets[0]);
         let session = RecentScopeSession::new(all_assets, album_assets);
         let passes = vec![AlbumPass {
             kind: PassKind::Album,
@@ -6666,13 +6770,6 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
         config.recent = Some(300);
-        let records = mock_photo_records_for_zone_with_filename_and_asset_date(
-            "frontier-0000",
-            "PrimarySync",
-            "frontier-0000.jpg",
-            1_700_000_000_000,
-        );
-        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
         seed_existing_file_for_asset(&config, &passes[0], &asset).await;
 
         let result = download_photos_full_with_token(

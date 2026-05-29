@@ -118,6 +118,7 @@ pub(crate) struct TomlFilters {
     pub media: Option<Vec<MediaKind>>,
     pub filename_exclude: Option<Vec<String>>,
     pub recent: Option<crate::cli::RecentLimit>,
+    pub recent_scope: Option<crate::cli::RecentScope>,
     pub skip_created_before: Option<String>,
     pub skip_created_after: Option<String>,
 }
@@ -300,7 +301,9 @@ pub struct FilterConfig {
     pub skip_created_before: Option<DateTime<Local>>,
     pub skip_created_after: Option<DateTime<Local>>,
     pub recent: Option<u32>,
+    pub recent_scope: crate::cli::RecentScope,
     pub persistent_recent: Option<crate::cli::RecentLimit>,
+    pub persistent_recent_scope: Option<crate::cli::RecentScope>,
     pub persistent_skip_created_before: Option<String>,
     pub persistent_skip_created_after: Option<String>,
     pub skip_videos: bool,
@@ -1333,6 +1336,11 @@ impl Config {
             .collect::<anyhow::Result<_>>()?;
         let persistent_recent = toml_filters.and_then(|f| f.recent);
         let recent_raw = sync.recent.or(persistent_recent);
+        let persistent_recent_scope = toml_filters.and_then(|f| f.recent_scope);
+        let recent_scope = sync
+            .recent_scope
+            .or(persistent_recent_scope)
+            .unwrap_or_default();
         let persistent_skip_created_before =
             toml_filters.and_then(|f| f.skip_created_before.clone());
         let persistent_skip_created_after = toml_filters.and_then(|f| f.skip_created_after.clone());
@@ -1356,6 +1364,16 @@ impl Config {
                 (None, Some(n))
             }
         };
+        anyhow::ensure!(
+            recent_raw.is_some()
+                || sync.recent_scope.is_none() && persistent_recent_scope.is_none(),
+            "`recent_scope` only applies when `recent` is set"
+        );
+        anyhow::ensure!(
+            !matches!(recent_raw, Some(crate::cli::RecentLimit::Days(_)))
+                || sync.recent_scope.is_none() && persistent_recent_scope.is_none(),
+            "`recent_scope` only applies to count-form `recent` values, not `Nd` days windows"
+        );
         let skip_created_before_str = if let Some(n) = recent_days {
             Some(format!("{n}d"))
         } else {
@@ -1489,7 +1507,9 @@ impl Config {
                 skip_created_before,
                 skip_created_after,
                 recent,
+                recent_scope,
                 persistent_recent,
+                persistent_recent_scope,
                 persistent_skip_created_before,
                 persistent_skip_created_after,
                 skip_videos,
@@ -1675,6 +1695,10 @@ impl Config {
                     )
                 },
                 recent: self.filters.persistent_recent,
+                recent_scope: self
+                    .filters
+                    .persistent_recent_scope
+                    .and_then(|scope| (scope != crate::cli::RecentScope::Global).then_some(scope)),
                 skip_created_before: self.filters.persistent_skip_created_before.clone(),
                 skip_created_after: self.filters.persistent_skip_created_after.clone(),
             }),
@@ -4858,6 +4882,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.filters.recent, Some(500));
+        assert_eq!(cfg.filters.recent_scope, crate::cli::RecentScope::Global);
+    }
+
+    #[test]
+    fn test_build_recent_scope_cli_overrides_toml() {
+        let toml_str = r#"
+            [filters]
+            recent = 500
+            recent_scope = "per-filter"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.recent = Some(crate::cli::RecentLimit::Count(100));
+        sync.recent_scope = Some(crate::cli::RecentScope::Global);
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        assert_eq!(cfg.filters.recent, Some(100));
+        assert_eq!(cfg.filters.recent_scope, crate::cli::RecentScope::Global);
+    }
+
+    #[test]
+    fn test_build_recent_scope_from_toml() {
+        let toml_str = r#"
+            [filters]
+            recent = 500
+            recent_scope = "per-filter"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.filters.recent, Some(500));
+        assert_eq!(cfg.filters.recent_scope, crate::cli::RecentScope::PerFilter);
     }
 
     #[test]
@@ -5677,6 +5738,7 @@ mod tests {
         let toml_str = r#"
             [filters]
             recent = 100
+            recent_scope = "per-filter"
             skip_created_before = "2024-01-01"
             skip_created_after = "30d"
         "#;
@@ -5691,6 +5753,10 @@ mod tests {
         let serialized = cfg.to_toml();
         let filters = serialized.filters.as_ref().unwrap();
         assert_eq!(filters.recent, Some(crate::cli::RecentLimit::Count(100)));
+        assert_eq!(
+            filters.recent_scope,
+            Some(crate::cli::RecentScope::PerFilter)
+        );
         assert_eq!(filters.skip_created_before.as_deref(), Some("2024-01-01"));
         assert_eq!(filters.skip_created_after.as_deref(), Some("30d"));
     }
@@ -6761,6 +6827,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.filters.recent, Some(250));
+    }
+
+    #[test]
+    fn test_build_recent_scope_without_recent_rejected() {
+        let toml_str = r#"
+            [filters]
+            recent_scope = "per-filter"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("recent_scope"), "{err}");
+        assert!(err.contains("recent"), "{err}");
+    }
+
+    #[test]
+    fn test_build_recent_scope_with_days_rejected() {
+        let toml_str = r#"
+            [filters]
+            recent = "14d"
+            recent_scope = "per-filter"
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let err = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("recent_scope"), "{err}");
+        assert!(err.contains("count-form"), "{err}");
     }
 
     #[test]
