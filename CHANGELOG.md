@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `sync_report.json`, logs, notifications, and Prometheus metrics now include `full_enumeration_reason` when kei has to run a full enumeration, so operators can tell whether a full scan came from missing or invalid sync tokens, retry or pending rows, metadata backfill, config drift, explicit retry-failed mode, or a requested full sync. ([#511])
+- `--recent-scope` and `[filters].recent_scope` let count-form recent syncs choose either one library-wide recent frontier (`global`, the default) or a separate recent window for each selected album, smart folder, or unfiled pass (`per-filter`). ([#519])
 
 ### Fixed
 
@@ -20,11 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Password redaction now catches secrets split across adjacent log writes, so passwords passed by CLI or env are not exposed when a writer chunks the log line. ([#516])
 - HEIF XMP extraction now converts unsupported `infe` v1 metadata entries into normal metadata rewrite failures instead of panicking on malformed or unusual HEIC files. ([#516])
 - Password-file permission warnings now fire after a file first becomes readable or permissive; an earlier missing or secure file state no longer suppresses a later warning. ([#516])
+- Recent and lower-date-bounded full syncs now keep their enumeration bounded without advancing normal full-enumeration zone tokens. `skip_created_after` still drains past the newer prefix so older matching assets are not missed. ([#519])
 
 [#503]: https://github.com/rhoopr/kei/pull/503
 [#511]: https://github.com/rhoopr/kei/pull/511
 [#512]: https://github.com/rhoopr/kei/pull/512
 [#516]: https://github.com/rhoopr/kei/pull/516
+[#519]: https://github.com/rhoopr/kei/pull/519
 
 ---
 

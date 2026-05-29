@@ -36,6 +36,7 @@ unfiled = true # true also syncs photos that are not in a user album
 media = ["photos", "videos", "live-photos"] # options: photos, videos, live-photos
 filename_exclude = [] # glob patterns, for example ["*.AAE", "Screenshot*"]
 # recent = 100 # default: unset; count like 100 or window like "30d"
+# recent_scope = "per-filter" # default: global; count-form recent only
 # skip_created_before = "2024-01-01" # default: unset; ISO date/datetime or interval like "30d"
 # skip_created_after = "2024-12-31" # default: unset; ISO date/datetime or interval like "7d"
 
