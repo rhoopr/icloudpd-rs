@@ -743,7 +743,7 @@ mod tests {
         let handle = MetricsHandle::new(None);
         let stats = SyncStats {
             full_enumeration_reason: Some(
-                crate::download::FullEnumerationReason::PathTemplateRequiresFullEnumeration,
+                crate::download::FullEnumerationReason::AlbumRelationHydrationIncomplete,
             ),
             ..SyncStats::default()
         };
@@ -752,7 +752,7 @@ mod tests {
         let output = render_metrics(&handle).await;
         assert!(
             output.contains(
-                "kei_sync_full_enumeration_reason_total{reason=\"path_template_requires_full_enumeration\"} 1"
+                "kei_sync_full_enumeration_reason_total{reason=\"album_relation_hydration_incomplete\"} 1"
             ),
             "output:\n{output}"
         );

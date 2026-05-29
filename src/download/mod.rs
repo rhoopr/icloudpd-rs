@@ -81,7 +81,12 @@ pub enum FullEnumerationReason {
     RetryFailedRows,
     PendingRows,
     MetadataBackfill,
+    #[allow(
+        dead_code,
+        reason = "kept as a stable report vocabulary value for older path-template fallback reports"
+    )]
     PathTemplateRequiresFullEnumeration,
+    AlbumRelationHydrationIncomplete,
     EnumConfigHashDrift,
     ExplicitRetryFailed,
     #[allow(
@@ -100,6 +105,7 @@ impl FullEnumerationReason {
             Self::PendingRows => "pending_rows",
             Self::MetadataBackfill => "metadata_backfill",
             Self::PathTemplateRequiresFullEnumeration => "path_template_requires_full_enumeration",
+            Self::AlbumRelationHydrationIncomplete => ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON,
             Self::EnumConfigHashDrift => "enum_config_hash_drift",
             Self::ExplicitRetryFailed => "explicit_retry_failed",
             Self::TokenBlockedPreviously => "token_blocked_previously",
@@ -362,10 +368,14 @@ impl SyncStats {
 
 const PAGINATION_SHORTFALL_TOLERANCE_PERCENT: u64 = 5;
 const PAGINATION_SHORTFALL_TOLERANCE_ABSOLUTE: u64 = 100;
+const ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON: &str = "album_relation_hydration_incomplete";
+const RECENT_LIMITED_FULL_ENUMERATION_REASON: &str = "recent_limited_full_enumeration";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
     match reason {
-        "kei_internal_token_receiver_dropped" => "kei",
+        ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON
+        | "kei_internal_token_receiver_dropped"
+        | RECENT_LIMITED_FULL_ENUMERATION_REASON => "kei",
         "pagination_shortfall"
         | "icloud_blank_sync_token"
         | "icloud_sync_token_mismatch"
@@ -388,6 +398,12 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         "icloud_sync_token_mismatch" => "iCloud returned conflicting sync tokens across passes",
         "kei_internal_token_receiver_dropped" => {
             "an internal token collection channel closed before completion"
+        }
+        RECENT_LIMITED_FULL_ENUMERATION_REASON => {
+            "a count-limited recent sync is a partial enumeration, so kei blocked token advancement"
+        }
+        ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON => {
+            "album membership state is not complete enough for incremental routing yet"
         }
         "sync_token_unavailable" | "sync_token_missing" => {
             "no usable sync token was available at the end of the cycle"
@@ -2058,11 +2074,11 @@ pub async fn download_photos_with_sync(
         // that pass, and inactive album/smart-folder templates shouldn't
         // force full enumeration on an unfiled-only sync.
         SyncMode::Incremental { .. } if incremental_requires_full_enumeration(passes) => {
-            let reason = FullEnumerationReason::PathTemplateRequiresFullEnumeration;
+            let reason = FullEnumerationReason::AlbumRelationHydrationIncomplete;
             tracing::debug!(
                 full_enumeration_reason = reason.as_str(),
-                "Album or smart-folder passes require full enumeration for correct \
-                 membership routing, skipping incremental"
+                "Album or smart-folder passes require full enumeration because album \
+                 relation hydration is incomplete, skipping incremental"
             );
             download_photos_full_with_reason(
                 download_client,
@@ -2826,6 +2842,7 @@ async fn download_photos_full_with_token(
     // gate below uses this signal directly so a partial-failure run
     // whose enumeration phase finished still clears the marker.
     let enumeration_complete = streaming_result.enumeration_complete;
+    let enumeration_errors = streaming_result.enumeration_errors;
 
     // Build the outcome using the same logic as download_photos
     let (outcome, mut stats) = build_download_outcome(
@@ -2854,6 +2871,18 @@ async fn download_photos_full_with_token(
         stats.sync_token_blocked_source = Some(sync_token_blocked_source("pagination_shortfall"));
         stats.sync_token_blocked_explanation =
             Some(sync_token_blocked_explanation("pagination_shortfall"));
+    } else if config.recent.is_some()
+        && !controls.run_mode.only_print_filenames()
+        && enumeration_errors == 0
+    {
+        stats.sync_token_blocked = true;
+        stats.sync_token_blocked_reason = Some(RECENT_LIMITED_FULL_ENUMERATION_REASON);
+        stats.sync_token_blocked_source = Some(sync_token_blocked_source(
+            RECENT_LIMITED_FULL_ENUMERATION_REASON,
+        ));
+        stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(
+            RECENT_LIMITED_FULL_ENUMERATION_REASON,
+        ));
     } else if token_eligible && sync_token.is_none() {
         let reason = token_block_reason.unwrap_or("sync_token_unavailable");
         stats.sync_token_blocked = true;
@@ -4469,7 +4498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn album_incremental_records_path_template_full_enumeration_reason() {
+    async fn album_incremental_records_relation_hydration_full_enumeration_reason() {
         let session = MockPhotosFlow::new()
             .album_count(0)
             .empty_query_page(Some("zone-token-next"))
@@ -4500,7 +4529,7 @@ mod tests {
         assert!(result.full_enumeration_ran);
         assert_eq!(
             result.stats.full_enumeration_reason,
-            Some(FullEnumerationReason::PathTemplateRequiresFullEnumeration)
+            Some(FullEnumerationReason::AlbumRelationHydrationIncomplete)
         );
     }
 
@@ -6325,6 +6354,19 @@ mod tests {
             result.sync_token, None,
             "recent-limited full sync must not advance a zone token"
         );
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(RECENT_LIMITED_FULL_ENUMERATION_REASON)
+        );
+        assert_eq!(result.stats.sync_token_blocked_source, Some("kei"));
+        assert_eq!(
+            result.stats.sync_token_blocked_explanation,
+            Some(sync_token_blocked_explanation(
+                RECENT_LIMITED_FULL_ENUMERATION_REASON
+            ))
+        );
+        assert_eq!(result.stats.sync_token_expected_receivers, None);
     }
 
     #[tokio::test]
