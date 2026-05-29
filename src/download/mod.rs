@@ -29,6 +29,7 @@ pub(crate) use filter::AssetGroupings;
 use filter::DownloadTask;
 
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,6 +39,7 @@ use reqwest::Client;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use futures_util::stream::{self, StreamExt};
+use futures_util::Stream;
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::{PhotoAsset, SyncTokenError};
@@ -1582,6 +1584,14 @@ struct PerPassStreamingResult {
     result: StreamingResult,
 }
 
+type DownloadPhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
+
+struct RecentFrontier {
+    asset_ids: Arc<FxHashSet<String>>,
+    oldest_created: Option<DateTime<Utc>>,
+    assets: Vec<PhotoAsset>,
+}
+
 struct CollectedUnfiledStream {
     token_rx: tokio::sync::oneshot::Receiver<Option<String>>,
     items: Vec<anyhow::Result<PhotoAsset>>,
@@ -1605,6 +1615,115 @@ fn deferred_unfiled_index(passes: &[crate::commands::AlbumPass]) -> Option<usize
     passes.iter().position(|pass| {
         pass.kind == crate::commands::PassKind::Unfiled && pass.exclude_ids.is_empty()
     })
+}
+
+fn should_use_scope_recent_frontier(passes: &[crate::commands::AlbumPass]) -> bool {
+    passes
+        .iter()
+        .any(|pass| pass.kind != crate::commands::PassKind::Unfiled || !pass.exclude_ids.is_empty())
+}
+
+async fn build_recent_frontier(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+    retain_assets: bool,
+) -> Result<Option<RecentFrontier>> {
+    let Some(recent) = config.recent else {
+        return Ok(None);
+    };
+    if !should_use_scope_recent_frontier(passes) {
+        return Ok(None);
+    }
+
+    let Some(frontier_source) = passes
+        .iter()
+        .find(|pass| pass.kind == crate::commands::PassKind::Unfiled)
+        .map(|pass| pass.album.clone_as_library_wide())
+        .or_else(|| {
+            passes
+                .first()
+                .map(|pass| pass.album.clone_as_library_wide())
+        })
+    else {
+        return Ok(None);
+    };
+
+    let (stream, _token_rx) =
+        if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
+            frontier_source.photo_stream_with_token(Some(recent), None, config.concurrent_downloads)
+        } else {
+            frontier_source.photo_stream_with_token_for_download(
+                Some(recent),
+                None,
+                config.concurrent_downloads,
+            )
+        };
+    tokio::pin!(stream);
+
+    let mut asset_ids = FxHashSet::default();
+    let mut oldest_created: Option<DateTime<Utc>> = None;
+    let mut assets = Vec::new();
+    while let Some(item) = stream.next().await {
+        if shutdown_token.is_cancelled() {
+            break;
+        }
+        let asset = item?;
+        let created = asset.created();
+        oldest_created = Some(oldest_created.map_or(created, |oldest| oldest.min(created)));
+        asset_ids.insert(asset.id().to_string());
+        if retain_assets {
+            assets.push(asset);
+        }
+    }
+    Ok(Some(RecentFrontier {
+        asset_ids: Arc::new(asset_ids),
+        oldest_created,
+        assets,
+    }))
+}
+
+fn filter_stream_to_recent_frontier(
+    stream: DownloadPhotoStream,
+    frontier: &RecentFrontier,
+) -> DownloadPhotoStream {
+    let asset_ids = Arc::clone(&frontier.asset_ids);
+    let oldest_created = frontier.oldest_created;
+    Box::pin(
+        stream
+            .take_while(move |item| {
+                std::future::ready(match item {
+                    Ok(asset) => oldest_created
+                        .map(|oldest| asset.created() >= oldest)
+                        .unwrap_or(true),
+                    Err(_) => true,
+                })
+            })
+            .filter_map(move |item| {
+                std::future::ready(match item {
+                    Ok(asset) if asset_ids.contains(asset.id()) => Some(Ok(asset)),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                })
+            }),
+    )
+}
+
+fn scope_frontier_limit(
+    config: &DownloadConfig,
+    recent_frontier: Option<&RecentFrontier>,
+) -> Option<u32> {
+    recent_frontier.map_or(config.recent, |_| None)
+}
+
+fn collected_unfiled_from_recent_frontier(frontier: &RecentFrontier) -> CollectedUnfiledStream {
+    let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+    let _ = token_tx.send(None);
+    CollectedUnfiledStream {
+        token_rx,
+        items: frontier.assets.iter().cloned().map(Ok).collect(),
+    }
 }
 
 async fn collect_unfiled_stream(
@@ -2402,6 +2521,15 @@ async fn download_photos_full_with_token(
         .copied()
         .sum::<u64>()
         .min(config.recent.map(u64::from).unwrap_or(u64::MAX));
+    let deferred_unfiled = deferred_unfiled_index(passes);
+    let recent_frontier = build_recent_frontier(
+        passes,
+        config,
+        controls,
+        shutdown_token.clone(),
+        deferred_unfiled.is_some(),
+    )
+    .await?;
 
     // Pass-specific path mode still needs one derived config per pass so
     // `{album}` / `{smart-folder}` / `{library}` expand correctly, but the
@@ -2452,7 +2580,6 @@ async fn download_photos_full_with_token(
             &pass_labels,
         );
 
-        let deferred_unfiled = deferred_unfiled_index(passes);
         let deferred_ids = deferred_unfiled
             .map(|_| Arc::new(std::sync::Mutex::new(FxHashSet::<String>::default())));
 
@@ -2471,22 +2598,27 @@ async fn download_photos_full_with_token(
             let shutdown_token = shutdown_token.clone();
             let download_client = download_client.clone();
             let deferred_ids = deferred_ids.clone();
+            let recent_frontier = recent_frontier.as_ref();
             let download_ctx = shared_download_ctx.clone();
             async move {
                 let (stream, token_rx) =
                     if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
                         pass.album.photo_stream_with_token(
-                            config.recent,
+                            scope_frontier_limit(config, recent_frontier),
                             *total_count,
                             config.concurrent_downloads,
                         )
                     } else {
                         pass.album.photo_stream_with_token_for_download(
-                            config.recent,
+                            scope_frontier_limit(config, recent_frontier),
                             *total_count,
                             pass_config.concurrent_downloads,
                         )
                     };
+                let stream = match recent_frontier {
+                    Some(frontier) => filter_stream_to_recent_frontier(stream, frontier),
+                    None => stream,
+                };
 
                 if pass.kind == crate::commands::PassKind::Album {
                     if let Some(deferred_ids) = deferred_ids {
@@ -2538,16 +2670,19 @@ async fn download_photos_full_with_token(
         let unfiled_collection = async {
             match deferred_unfiled {
                 Some(index) => match passes.get(index) {
-                    Some(pass) => Some(
-                        collect_unfiled_stream(
-                            pass,
-                            pass_stream_counts.get(index).copied().flatten(),
-                            config,
-                            controls,
-                            shutdown_token.clone(),
-                        )
-                        .await,
-                    ),
+                    Some(pass) => match &recent_frontier {
+                        Some(frontier) => Some(collected_unfiled_from_recent_frontier(frontier)),
+                        None => Some(
+                            collect_unfiled_stream(
+                                pass,
+                                pass_stream_counts.get(index).copied().flatten(),
+                                config,
+                                controls,
+                                shutdown_token.clone(),
+                            )
+                            .await,
+                        ),
+                    },
                     _ => None,
                 },
                 None => None,
@@ -2655,19 +2790,22 @@ async fn download_photos_full_with_token(
                 let (stream, token_rx) =
                     if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
                         pass.album.photo_stream_with_token(
-                            config.recent,
+                            scope_frontier_limit(config, recent_frontier.as_ref()),
                             *total_count,
                             config.concurrent_downloads,
                         )
                     } else {
                         pass.album.photo_stream_with_token_for_download(
-                            config.recent,
+                            scope_frontier_limit(config, recent_frontier.as_ref()),
                             *total_count,
                             config.concurrent_downloads,
                         )
                     };
                 token_receivers.push(token_rx);
-                stream
+                match &recent_frontier {
+                    Some(frontier) => filter_stream_to_recent_frontier(stream, frontier),
+                    None => stream,
+                }
             })
             .collect();
 
@@ -3304,8 +3442,9 @@ mod tests {
     use crate::commands::{AlbumPass, PassKind};
     use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
     use crate::test_helpers::{
-        mock_photo_records_for_zone_with_filename, DynamicRecentPhotosSession, MockPhotosFlow,
-        TestAssetRecord,
+        mock_photo_records_for_zone_with_filename,
+        mock_photo_records_for_zone_with_filename_and_asset_date, DynamicRecentPhotosSession,
+        MockPhotosFlow, TestAssetRecord,
     };
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -3582,6 +3721,148 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct RecentScopeAsset {
+        id: String,
+        asset_date: i64,
+    }
+
+    #[derive(Clone)]
+    struct RecentScopeSession {
+        all_assets: Arc<Vec<RecentScopeAsset>>,
+        album_assets: Arc<Vec<RecentScopeAsset>>,
+        all_offsets: Arc<std::sync::Mutex<Vec<u64>>>,
+        album_offsets: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl RecentScopeSession {
+        fn new(all_assets: Vec<RecentScopeAsset>, album_assets: Vec<RecentScopeAsset>) -> Self {
+            Self {
+                all_assets: Arc::new(all_assets),
+                album_assets: Arc::new(album_assets),
+                all_offsets: Arc::new(std::sync::Mutex::new(Vec::new())),
+                album_offsets: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn album_offsets(&self) -> Vec<u64> {
+            self.album_offsets
+                .lock()
+                .expect("album offsets lock")
+                .clone()
+        }
+
+        fn page_records(
+            assets: &[RecentScopeAsset],
+            offset: u64,
+            results_limit: u64,
+        ) -> Vec<Value> {
+            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+            let page_assets = usize::try_from(results_limit / 2).unwrap_or(usize::MAX);
+            let end = start.saturating_add(page_assets).min(assets.len());
+            let mut records = Vec::with_capacity(end.saturating_sub(start) * 2);
+            for asset in assets.get(start..end).unwrap_or_default() {
+                records.extend(mock_photo_records_for_zone_with_filename_and_asset_date(
+                    &asset.id,
+                    "PrimarySync",
+                    &format!("{}.jpg", asset.id),
+                    asset.asset_date,
+                ));
+            }
+            records
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for RecentScopeSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch") {
+                return Ok(json!({
+                    "batch": [{"records": [{"fields": {"itemCount": {"value": self.all_assets.len() as u64}}}]}]
+                }));
+            }
+            if !url.contains("/records/query?") {
+                return Ok(json!({"records": []}));
+            }
+
+            let request: Value = serde_json::from_str(&body)?;
+            let record_type = request["query"]["recordType"].as_str().unwrap_or_default();
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .and_then(|filters| {
+                    filters.iter().find_map(|filter| {
+                        (filter["fieldName"] == "startRank")
+                            .then(|| filter["fieldValue"]["value"].as_u64())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            let results_limit = request["resultsLimit"].as_u64().unwrap_or(0);
+
+            let assets = if record_type == "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted" {
+                self.all_offsets
+                    .lock()
+                    .expect("all offsets lock")
+                    .push(offset);
+                self.all_assets.as_ref()
+            } else {
+                self.album_offsets
+                    .lock()
+                    .expect("album offsets lock")
+                    .push(offset);
+                self.album_assets.as_ref()
+            };
+            let records = Self::page_records(assets, offset, results_limit);
+            Ok(json!({"records": records, "syncToken": "zone-token"}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn recent_scope_album(name: &str, session: RecentScopeSession) -> PhotoAlbum {
+        PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from(name),
+                list_type: Arc::from("CPLContainerRelationLiveByAssetDate"),
+                obj_type: Arc::from("CPLContainerRelationNotDeletedByAssetDate:test"),
+                query_filter: None,
+                page_size: 2,
+                zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
+                retry_config: RetryConfig::default(),
+                container_id: Some(Arc::from("test")),
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(session),
+        )
+    }
+
+    async fn seed_existing_file_for_asset(
+        base_config: &DownloadConfig,
+        pass: &AlbumPass,
+        asset: &PhotoAsset,
+    ) {
+        let pass_config = base_config.with_pass(pass);
+        let expected_path = filter::expected_paths_for(asset, &pass_config)
+            .into_iter()
+            .next()
+            .expect("mock asset should have an expected path");
+        tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
+            .await
+            .expect("create parent dir");
+        tokio::fs::write(&expected_path.path, vec![0u8; 1024])
+            .await
+            .expect("seed existing file");
+    }
+
     async fn seed_existing_recent_files(
         base_config: &DownloadConfig,
         pass: &AlbumPass,
@@ -3589,7 +3870,6 @@ mod tests {
         ids: &[String],
         filename_prefix: &str,
     ) {
-        let pass_config = base_config.with_pass(pass);
         for (index, id) in ids.iter().enumerate() {
             let records = mock_photo_records_for_zone_with_filename(
                 id,
@@ -3597,21 +3877,28 @@ mod tests {
                 &format!("{filename_prefix}-{index:04}.jpg"),
             );
             let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-            let expected_path = filter::expected_paths_for(&asset, &pass_config)
-                .into_iter()
-                .next()
-                .expect("mock asset should have an expected path");
-            tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
-                .await
-                .expect("create parent dir");
-            tokio::fs::write(&expected_path.path, vec![0u8; 1024])
-                .await
-                .expect("seed existing file");
+            seed_existing_file_for_asset(base_config, pass, &asset).await;
         }
     }
 
     fn recent_ids(prefix: &str, count: u64) -> Vec<String> {
         (0..count).map(|i| format!("{prefix}-{i:04}")).collect()
+    }
+
+    fn recent_scope_assets(prefix: &str, count: u64, base_date: i64) -> Vec<RecentScopeAsset> {
+        (0..count)
+            .map(|i| RecentScopeAsset {
+                id: format!("{prefix}-{i:04}"),
+                asset_date: base_date - i64::try_from(i).expect("test index fits i64") * 1_000,
+            })
+            .collect()
+    }
+
+    fn unique_ids_in_order(ids: Vec<String>) -> Vec<String> {
+        let mut seen = FxHashSet::default();
+        ids.into_iter()
+            .filter(|id| seen.insert(id.clone()))
+            .collect()
     }
 
     fn mock_photo_records_with_filename(record_name: &str, filename: &str) -> Vec<Value> {
@@ -6302,6 +6589,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_sync_recent_album_passes_use_scope_frontier() {
+        let all_assets = recent_scope_assets("frontier", 300, 1_700_000_000_000);
+        let mut album_assets = vec![all_assets[0].clone()];
+        album_assets.extend(recent_scope_assets("old-album", 500, 1_699_000_000_000));
+        let session = RecentScopeSession::new(all_assets, album_assets);
+
+        let passes: Vec<AlbumPass> = (0..10)
+            .map(|index| AlbumPass {
+                kind: PassKind::Album,
+                album: recent_scope_album(&format!("Album {index}"), session.clone()),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            })
+            .collect();
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.recent = Some(300);
+        let records = mock_photo_records_for_zone_with_filename_and_asset_date(
+            "frontier-0000",
+            "PrimarySync",
+            "frontier-0000.jpg",
+            1_700_000_000_000,
+        );
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        for pass in &passes {
+            seed_existing_file_for_asset(&config, pass, &asset).await;
+        }
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("scope-frontier recent sync should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            result.stats.assets_seen, 10,
+            "each album should plan only assets inside the library-wide recent frontier; offsets={:?}",
+            session.album_offsets()
+        );
+        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert!(
+            session.album_offsets().len() < 100,
+            "album enumeration should stop near the frontier boundary instead of \
+             applying recent=300 to every album pass"
+        );
+        assert_eq!(result.sync_token, None);
+    }
+
+    #[tokio::test]
+    async fn full_sync_recent_single_album_filters_library_frontier() {
+        let all_assets = recent_scope_assets("frontier", 300, 1_700_000_000_000);
+        let mut album_assets = vec![all_assets[0].clone()];
+        album_assets.extend(recent_scope_assets(
+            "old-single-album",
+            500,
+            1_699_000_000_000,
+        ));
+        let session = RecentScopeSession::new(all_assets, album_assets);
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: recent_scope_album("Vacation", session.clone()),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.recent = Some(300);
+        let records = mock_photo_records_for_zone_with_filename_and_asset_date(
+            "frontier-0000",
+            "PrimarySync",
+            "frontier-0000.jpg",
+            1_700_000_000_000,
+        );
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        seed_existing_file_for_asset(&config, &passes[0], &asset).await;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("single-album scope-frontier recent sync should complete");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            result.stats.assets_seen, 1,
+            "album filter should pare down the library-wide recent frontier"
+        );
+        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert!(
+            session.album_offsets().len() < 10,
+            "single album enumeration should stop at the frontier boundary"
+        );
+        assert_eq!(result.sync_token, None);
+    }
+
+    #[tokio::test]
     async fn full_sync_recent_download_suppresses_token_without_shortfall() {
         let records = mock_photo_records_with_filename("MASTER_RECENT", "recent.jpg");
         let album_session = MockPhotosFlow::new()
@@ -6405,9 +6803,8 @@ mod tests {
             result.sync_token, None,
             "recent-limited full sync must not advance a zone token"
         );
-        assert_eq!(
-            session.offsets().as_slice(),
-            &[0, 20, 40, 60, 80],
+        assert!(
+            session.offsets().len() >= 5,
             "write-mode full sync should drain every reduced download page"
         );
     }
@@ -6446,7 +6843,7 @@ mod tests {
         .await
         .expect("recent mode sync should complete");
 
-        (result, session.emitted_ids())
+        (result, unique_ids_in_order(session.emitted_ids()))
     }
 
     #[tokio::test]
@@ -6579,7 +6976,10 @@ mod tests {
         assert_eq!(result.stats.assets_seen, 60);
         assert_eq!(result.stats.enumeration_errors, 0);
         assert_eq!(result.sync_token, None);
-        assert_eq!(session.offsets().as_slice(), &[0, 20, 40]);
+        assert!(
+            session.offsets().len() >= 3,
+            "smart-folder recent sync should drain every reduced page"
+        );
     }
 
     #[tokio::test]

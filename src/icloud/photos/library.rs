@@ -5,7 +5,10 @@ use anyhow::Context;
 use base64::Engine;
 use serde_json::{json, Value};
 
-use super::album::{PhotoAlbum, PhotoAlbumConfig};
+use super::album::{
+    PhotoAlbum, PhotoAlbumConfig, DEFAULT_PAGE_SIZE, QUERY_ALL_LIST, QUERY_ALL_OBJ,
+    QUERY_FOLDER_LIST,
+};
 use super::queries::encode_params;
 use super::session::PhotosSession;
 use super::smart_folders::smart_folders;
@@ -32,14 +35,6 @@ use crate::retry::RetryConfig;
 // Apple's sentinel folder IDs — these are containers, not real albums.
 const ROOT_FOLDER: &str = "----Root-Folder----";
 const PROJECT_ROOT_FOLDER: &str = "----Project-Root-Folder----";
-
-/// Default page size for `CloudKit` queries.
-const DEFAULT_PAGE_SIZE: usize = 100;
-
-// CloudKit record/query types for photo enumeration.
-const QUERY_ALL_LIST: &str = "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted";
-const QUERY_ALL_OBJ: &str = "CPLAssetByAssetDateWithoutHiddenOrDeleted";
-const QUERY_FOLDER_LIST: &str = "CPLContainerRelationLiveByAssetDate";
 
 pub struct PhotoLibrary {
     service_endpoint: Arc<str>,

@@ -571,6 +571,20 @@ pub(crate) fn mock_photo_records_for_zone_with_filename(
     zone: &str,
     filename: &str,
 ) -> Vec<Value> {
+    mock_photo_records_for_zone_with_filename_and_asset_date(
+        record_name,
+        zone,
+        filename,
+        1700000000000,
+    )
+}
+
+pub(crate) fn mock_photo_records_for_zone_with_filename_and_asset_date(
+    record_name: &str,
+    zone: &str,
+    filename: &str,
+    asset_date: i64,
+) -> Vec<Value> {
     vec![
         json!({
             "recordName": record_name,
@@ -603,8 +617,8 @@ pub(crate) fn mock_photo_records_for_zone_with_filename(
                         },
                         "type": "REFERENCE"
                     },
-                "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
-                "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                "assetDate": {"value": asset_date, "type": "TIMESTAMP"},
+                "addedDate": {"value": asset_date, "type": "TIMESTAMP"}
             },
             "recordChangeTag": "ct2"
         }),

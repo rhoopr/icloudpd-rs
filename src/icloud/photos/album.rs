@@ -28,6 +28,10 @@ use crate::retry::RetryConfig;
 /// not silently truncate enumeration; the cost on true EOF is at most
 /// `MAX_EMPTY_PAGE_PROBES - 1` extra empty requests per fetcher.
 const MAX_EMPTY_PAGE_PROBES: u32 = 5;
+pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
+pub(crate) const QUERY_ALL_LIST: &str = "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted";
+pub(crate) const QUERY_ALL_OBJ: &str = "CPLAssetByAssetDateWithoutHiddenOrDeleted";
+pub(crate) const QUERY_FOLDER_LIST: &str = "CPLContainerRelationLiveByAssetDate";
 
 /// A boxed, pinned stream of photo asset results.
 type PhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
@@ -363,6 +367,25 @@ impl PhotoAlbum {
 
     fn has_cross_zone_hydration(&self) -> bool {
         self.container_id.is_some() && !self.cross_zone_sources.is_empty()
+    }
+
+    pub(crate) fn clone_as_library_wide(&self) -> PhotoAlbum {
+        PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::clone(&self.params),
+                service_endpoint: Arc::clone(&self.service_endpoint),
+                name: Arc::from(""),
+                list_type: Arc::from(QUERY_ALL_LIST),
+                obj_type: Arc::from(QUERY_ALL_OBJ),
+                query_filter: None,
+                page_size: self.page_size,
+                zone_id: Arc::clone(&self.zone_id),
+                retry_config: self.retry_config,
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            self.session.clone_box(),
+        )
     }
 
     /// Return total item count for this album via `HyperionIndexCountLookup`.
