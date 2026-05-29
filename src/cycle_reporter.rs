@@ -434,8 +434,9 @@ mod tests {
     #[cfg(unix)]
     async fn wait_for_notification_output(path: &Path) -> String {
         for _ in 0..100 {
-            if let Ok(output) = std::fs::read_to_string(path) {
-                return output;
+            match std::fs::read_to_string(path) {
+                Ok(output) if !output.is_empty() => return output,
+                Ok(_) | Err(_) => {}
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
