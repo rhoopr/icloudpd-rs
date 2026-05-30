@@ -735,6 +735,7 @@ impl PassKind {
 /// album-member exclusions inside the download phase so album and unfiled
 /// enumeration can overlap; incremental and cleanup paths resolve those
 /// exclusions before planning tasks.
+#[derive(Clone)]
 pub(crate) struct AlbumPass {
     pub kind: PassKind,
     pub album: icloud::photos::PhotoAlbum,

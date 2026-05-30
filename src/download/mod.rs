@@ -378,6 +378,7 @@ const UNPARSABLE_RELATION_DELTA_REASON: &str = "unparsable_relation_delta";
 const UNKNOWN_ALBUM_RELATION_CONTAINER_REASON: &str = "unknown_album_relation_container";
 const UNKNOWN_ALBUM_RELATION_ASSET_REASON: &str = "unknown_album_relation_asset";
 const ALBUM_DELTA_STATE_WRITE_FAILED_REASON: &str = "album_delta_state_write_failed";
+const SMART_FOLDER_REFRESH_FAILED_REASON: &str = "smart_folder_refresh_failed";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
     match reason {
@@ -385,7 +386,8 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | ALBUM_DELTA_STATE_WRITE_FAILED_REASON
         | DATE_BOUNDED_FULL_ENUMERATION_REASON
         | "kei_internal_token_receiver_dropped"
-        | RECENT_LIMITED_FULL_ENUMERATION_REASON => "kei",
+        | RECENT_LIMITED_FULL_ENUMERATION_REASON
+        | SMART_FOLDER_REFRESH_FAILED_REASON => "kei",
         "pagination_shortfall"
         | "icloud_blank_sync_token"
         | "icloud_sync_token_mismatch"
@@ -431,6 +433,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
             "an album relation referenced an asset kei cannot hydrate for album routing yet"
         }
         ALBUM_DELTA_STATE_WRITE_FAILED_REASON => "kei could not persist album delta state safely",
+        SMART_FOLDER_REFRESH_FAILED_REASON => {
+            "a selected smart-folder refresh did not complete safely"
+        }
         "sync_token_unavailable" | "sync_token_missing" => {
             "no usable sync token was available at the end of the cycle"
         }
@@ -1040,6 +1045,27 @@ impl DownloadConfig {
             ..*self
         }
     }
+
+    fn with_recent_scope(&self, recent_scope: crate::cli::RecentScope) -> Self {
+        Self {
+            directory: Arc::clone(&self.directory),
+            folder_structure: self.folder_structure.clone(),
+            folder_structure_albums: Arc::clone(&self.folder_structure_albums),
+            folder_structure_smart_folders: Arc::clone(&self.folder_structure_smart_folders),
+            filename_exclude: Arc::clone(&self.filename_exclude),
+            temp_suffix: Arc::clone(&self.temp_suffix),
+            state_db: self.state_db.clone(),
+            sync_mode: self.sync_mode.clone(),
+            enum_config_hash: self.enum_config_hash.clone(),
+            album_name: self.album_name.clone(),
+            exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
+            asset_groupings: Arc::clone(&self.asset_groupings),
+            bandwidth_limiter: self.bandwidth_limiter.clone(),
+            library: Arc::clone(&self.library),
+            recent_scope,
+            ..*self
+        }
+    }
 }
 
 impl std::fmt::Debug for DownloadConfig {
@@ -1636,15 +1662,6 @@ async fn determine_incremental_routing_decision(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
 ) -> IncrementalRoutingDecision {
-    let has_smart_folder_pass = passes
-        .iter()
-        .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
-    if has_smart_folder_pass {
-        return IncrementalRoutingDecision::NeedsFull {
-            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
-        };
-    }
-
     let has_unmapped_album_pass = passes.iter().any(|pass| {
         pass.kind == crate::commands::PassKind::Album && pass.album.container_id().is_none()
     });
@@ -1689,11 +1706,10 @@ async fn route_incremental_asset_to_passes(
     asset: &PhotoAsset,
     routing: &IncrementalPassRouting,
     selected_container_ids: &[&str],
-    passes_len: usize,
     config: &DownloadConfig,
 ) -> Result<Vec<usize>> {
     if !routing.has_selected_albums() {
-        return Ok((0..passes_len).collect());
+        return Ok(routing.unfiled_passes.clone());
     }
 
     let db = config
@@ -1727,6 +1743,44 @@ async fn route_incremental_asset_to_passes(
     let mut pass_indices: Vec<usize> = pass_indices.into_iter().collect();
     pass_indices.sort_unstable();
     Ok(pass_indices)
+}
+
+fn split_incremental_and_smart_folder_passes(
+    passes: &[crate::commands::AlbumPass],
+) -> (
+    Vec<crate::commands::AlbumPass>,
+    Vec<crate::commands::AlbumPass>,
+) {
+    passes
+        .iter()
+        .cloned()
+        .partition(|pass| pass.kind != crate::commands::PassKind::SmartFolder)
+}
+
+fn merge_download_outcomes(left: &DownloadOutcome, right: &DownloadOutcome) -> DownloadOutcome {
+    let mut auth_error_count = 0usize;
+    let mut failed_count = 0usize;
+    for outcome in [left, right] {
+        match outcome {
+            DownloadOutcome::Success => {}
+            DownloadOutcome::SessionExpired {
+                auth_error_count: n,
+            } => {
+                auth_error_count += *n;
+            }
+            DownloadOutcome::PartialFailure { failed_count: n } => {
+                failed_count += *n;
+            }
+        }
+    }
+
+    if auth_error_count > 0 {
+        DownloadOutcome::SessionExpired { auth_error_count }
+    } else if failed_count > 0 {
+        DownloadOutcome::PartialFailure { failed_count }
+    } else {
+        DownloadOutcome::Success
+    }
 }
 
 async fn collect_pass_asset_ids(pass: &crate::commands::AlbumPass) -> Result<FxHashSet<String>> {
@@ -2555,6 +2609,93 @@ async fn download_photos_full_with_reason(
     Ok(result)
 }
 
+async fn download_photos_incremental_with_smart_folder_refresh(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    zone_sync_token: &str,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+) -> Result<SyncResult> {
+    let (incremental_passes, smart_folder_passes) =
+        split_incremental_and_smart_folder_passes(passes);
+
+    if incremental_passes.is_empty() {
+        return download_photos_full_with_token(
+            download_client,
+            &smart_folder_passes,
+            config,
+            controls,
+            shutdown_token,
+        )
+        .await;
+    }
+
+    let incremental_result = download_photos_incremental(
+        download_client,
+        &incremental_passes,
+        config,
+        zone_sync_token,
+        controls,
+        shutdown_token.clone(),
+    )
+    .await?;
+
+    if smart_folder_passes.is_empty() {
+        return Ok(incremental_result);
+    }
+
+    let smart_folder_config =
+        if config.recent.is_some() && config.recent_scope == crate::cli::RecentScope::Global {
+            Arc::new(config.with_recent_scope(crate::cli::RecentScope::PerFilter))
+        } else {
+            Arc::clone(config)
+        };
+
+    let smart_folder_result = download_photos_full_with_token(
+        download_client,
+        &smart_folder_passes,
+        &smart_folder_config,
+        controls,
+        shutdown_token,
+    )
+    .await?;
+
+    let smart_folder_refresh_failed =
+        !matches!(smart_folder_result.outcome, DownloadOutcome::Success)
+            || smart_folder_result.stats.interrupted
+            || smart_folder_result.stats.enumeration_errors > 0
+            || smart_folder_result.stats.sync_token_blocked;
+
+    let SyncResult {
+        outcome: incremental_outcome,
+        sync_token: incremental_sync_token,
+        stats: mut combined_stats,
+        full_enumeration_ran: incremental_full_enumeration_ran,
+    } = incremental_result;
+    combined_stats.accumulate(&smart_folder_result.stats);
+
+    if smart_folder_refresh_failed {
+        block_sync_token_for_incremental_delta(
+            &mut combined_stats,
+            SMART_FOLDER_REFRESH_FAILED_REASON,
+        );
+    }
+
+    let sync_token = (!combined_stats.sync_token_blocked)
+        .then_some(incremental_sync_token)
+        .flatten();
+    let outcome = merge_download_outcomes(&incremental_outcome, &smart_folder_result.outcome);
+
+    Ok(SyncResult {
+        outcome,
+        sync_token,
+        stats: combined_stats,
+        full_enumeration_ran: incremental_full_enumeration_ran
+            || smart_folder_result.full_enumeration_ran,
+    })
+}
+
 pub async fn download_photos_with_sync(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -2662,16 +2803,31 @@ pub async fn download_photos_with_sync(
                 }
                 IncrementalRoutingDecision::Safe => {
                     let token = zone_sync_token.clone();
-                    match download_photos_incremental(
-                        download_client,
-                        passes,
-                        &config,
-                        &token,
-                        controls,
-                        shutdown_token.clone(),
-                    )
-                    .await
-                    {
+                    let has_smart_folder_pass = passes
+                        .iter()
+                        .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
+                    let incremental_result = if has_smart_folder_pass {
+                        download_photos_incremental_with_smart_folder_refresh(
+                            download_client,
+                            passes,
+                            &config,
+                            &token,
+                            controls,
+                            shutdown_token.clone(),
+                        )
+                        .await
+                    } else {
+                        download_photos_incremental(
+                            download_client,
+                            passes,
+                            &config,
+                            &token,
+                            controls,
+                            shutdown_token.clone(),
+                        )
+                        .await
+                    };
+                    match incremental_result {
                         Ok(result) => Ok(result),
                         Err(e) => {
                             // Determine whether this error warrants a fallback to full
@@ -3675,7 +3831,6 @@ async fn download_photos_incremental(
                         asset,
                         &routing,
                         &selected_container_ids,
-                        passes.len(),
                         config,
                     )
                     .await
@@ -4050,7 +4205,7 @@ mod tests {
     use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
     use crate::state::SqliteStateDb;
     use crate::test_helpers::{
-        mock_photo_records_for_zone_with_filename,
+        mock_photo_query_page, mock_photo_records_for_zone_with_filename,
         mock_photo_records_for_zone_with_filename_and_asset_date, DynamicRecentPhotosSession,
         MockPhotosFlow, TestAssetRecord,
     };
@@ -4195,6 +4350,116 @@ mod tests {
         fn clone_box(&self) -> Box<dyn PhotosSession> {
             Box::new(self.clone())
         }
+    }
+
+    #[derive(Clone)]
+    struct CountingQuerySession {
+        count_query_calls: Arc<AtomicUsize>,
+        records_query_calls: Arc<AtomicUsize>,
+        page: Value,
+        asset_count: u64,
+        fail_records_query: bool,
+    }
+
+    impl CountingQuerySession {
+        fn new(page: Value, asset_count: u64) -> Self {
+            Self {
+                count_query_calls: Arc::new(AtomicUsize::new(0)),
+                records_query_calls: Arc::new(AtomicUsize::new(0)),
+                page,
+                asset_count,
+                fail_records_query: false,
+            }
+        }
+
+        fn failing(page: Value, asset_count: u64) -> Self {
+            Self {
+                fail_records_query: true,
+                ..Self::new(page, asset_count)
+            }
+        }
+
+        fn count_query_count(&self) -> usize {
+            self.count_query_calls.load(Ordering::SeqCst)
+        }
+
+        fn records_query_count(&self) -> usize {
+            self.records_query_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for CountingQuerySession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch") {
+                self.count_query_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(json!({
+                    "batch": [{"records": [{"fields": {"itemCount": {"value": self.asset_count}}}]}]
+                }));
+            }
+
+            if url.contains("/records/query?") {
+                self.records_query_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_records_query {
+                    anyhow::bail!("smart folder refresh failed");
+                }
+                return Ok(self.page.clone());
+            }
+
+            Ok(json!({"records": []}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn smart_folder_unfiled_passes(
+        changes_calls: Arc<AtomicUsize>,
+        unfiled_records: Vec<Value>,
+        smart_session: CountingQuerySession,
+    ) -> Vec<AlbumPass> {
+        vec![
+            AlbumPass {
+                kind: PassKind::SmartFolder,
+                album: changes_album("Favorites", smart_session),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: changes_album("", changes_zone_session(changes_calls, unfiled_records)),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ]
+    }
+
+    fn incremental_test_config(dir: &TempDir) -> DownloadConfig {
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+        config
+    }
+
+    async fn run_print_incremental_sync(
+        passes: &[AlbumPass],
+        config: DownloadConfig,
+    ) -> SyncResult {
+        download_photos_with_sync(
+            &Client::new(),
+            passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("print-only incremental sync should succeed")
     }
 
     fn incremental_photo_records(record_name: &str) -> Vec<Value> {
@@ -5712,6 +5977,112 @@ mod tests {
             1,
             "unfiled-only incremental sync should query changes/zone"
         );
+    }
+
+    #[tokio::test]
+    async fn smart_folder_incremental_with_unfiled_refreshes_smart_without_library_all() {
+        let changes_calls = Arc::new(AtomicUsize::new(0));
+        let smart_session = CountingQuerySession::new(
+            mock_photo_query_page("SMART_CHANGED", Some("zone-token")),
+            1,
+        );
+        let passes = smart_folder_unfiled_passes(
+            Arc::clone(&changes_calls),
+            incremental_photo_records("MASTER_CHANGED"),
+            smart_session.clone(),
+        );
+        let dir = TempDir::new().expect("temp dir");
+        let config = incremental_test_config(&dir);
+
+        let result = run_print_incremental_sync(&passes, config).await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(
+            result.full_enumeration_ran,
+            "the selected smart-folder stream still refreshes by records/query"
+        );
+        assert_eq!(
+            changes_calls.load(Ordering::SeqCst),
+            1,
+            "unfiled follow-up work should use changes/zone"
+        );
+        assert_eq!(
+            smart_session.count_query_count(),
+            1,
+            "smart-folder refresh should probe the selected smart folder"
+        );
+        assert_eq!(
+            smart_session.records_query_count(),
+            1,
+            "smart-folder refresh should enumerate the selected smart folder"
+        );
+        assert!(
+            !result.stats.sync_token_blocked,
+            "successful smart-folder refresh should not block an otherwise safe incremental cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn smart_folder_incremental_recent_global_does_not_build_library_frontier() {
+        let changes_calls = Arc::new(AtomicUsize::new(0));
+        let smart_session = CountingQuerySession::new(
+            mock_photo_query_page("SMART_CHANGED", Some("zone-token")),
+            1,
+        );
+        let passes = smart_folder_unfiled_passes(
+            Arc::clone(&changes_calls),
+            Vec::new(),
+            smart_session.clone(),
+        );
+        let dir = TempDir::new().expect("temp dir");
+        let mut config = incremental_test_config(&dir);
+        config.recent = Some(1);
+        config.recent_scope = crate::cli::RecentScope::Global;
+
+        let result = run_print_incremental_sync(&passes, config).await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(changes_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            smart_session.records_query_count(),
+            1,
+            "smart-folder refresh must enumerate only the selected smart-folder stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn smart_folder_refresh_failure_blocks_incremental_token() {
+        let changes_calls = Arc::new(AtomicUsize::new(0));
+        let smart_session = CountingQuerySession::failing(
+            mock_photo_query_page("SMART_CHANGED", Some("zone-token")),
+            1,
+        );
+        let passes = smart_folder_unfiled_passes(
+            Arc::clone(&changes_calls),
+            Vec::new(),
+            smart_session.clone(),
+        );
+        let dir = TempDir::new().expect("temp dir");
+        let config = incremental_test_config(&dir);
+
+        let result = run_print_incremental_sync(&passes, config).await;
+
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(
+            changes_calls.load(Ordering::SeqCst),
+            1,
+            "unfiled incremental changes should still be checked"
+        );
+        assert_eq!(smart_session.records_query_count(), 1);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(SMART_FOLDER_REFRESH_FAILED_REASON)
+        );
+        assert_eq!(result.sync_token, None);
     }
 
     #[tokio::test]

@@ -315,6 +315,27 @@ pub struct PhotoAlbum {
     cross_zone_sources: Vec<PhotoAlbum>,
 }
 
+impl Clone for PhotoAlbum {
+    fn clone(&self) -> Self {
+        Self::new(
+            PhotoAlbumConfig {
+                params: Arc::clone(&self.params),
+                service_endpoint: Arc::clone(&self.service_endpoint),
+                name: Arc::clone(&self.name),
+                list_type: Arc::clone(&self.list_type),
+                obj_type: Arc::clone(&self.obj_type),
+                query_filter: self.query_filter.as_ref().map(Arc::clone),
+                page_size: self.page_size,
+                zone_id: Arc::clone(&self.zone_id),
+                retry_config: self.retry_config,
+                container_id: self.container_id.as_ref().map(Arc::clone),
+                cross_zone_sources: self.cross_zone_sources.clone(),
+            },
+            self.session.clone_box(),
+        )
+    }
+}
+
 impl std::fmt::Debug for PhotoAlbum {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PhotoAlbum")
