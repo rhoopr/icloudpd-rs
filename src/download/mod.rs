@@ -3928,9 +3928,14 @@ async fn download_photos_incremental(
         }
         tracing::info!("No new photos to download from incremental sync");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
+        let sync_token = if controls.run_mode.only_print_filenames() {
+            None
+        } else {
+            (!stats.sync_token_blocked).then_some(sync_token).flatten()
+        };
         return Ok(SyncResult {
             outcome: DownloadOutcome::Success,
-            sync_token: (!stats.sync_token_blocked).then_some(sync_token).flatten(),
+            sync_token,
             stats,
             full_enumeration_ran: false,
         });
@@ -4056,11 +4061,16 @@ async fn download_photos_incremental(
         } else {
             DownloadOutcome::Success
         };
+        let sync_token = if controls.run_mode.only_print_filenames() {
+            None
+        } else {
+            (enumeration_errors == 0 && !stats.sync_token_blocked)
+                .then_some(sync_token)
+                .flatten()
+        };
         return Ok(SyncResult {
             outcome,
-            sync_token: (enumeration_errors == 0 && !stats.sync_token_blocked)
-                .then_some(sync_token)
-                .flatten(),
+            sync_token,
             stats,
             full_enumeration_ran: false,
         });
