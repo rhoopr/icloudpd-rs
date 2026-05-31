@@ -1497,8 +1497,9 @@ mod tests {
     use chrono::Utc;
     use rustc_hash::FxHashSet;
 
-    use crate::icloud::photos::PhotoAsset;
-    use crate::test_helpers::TestPhotoAsset;
+    use crate::icloud::photos::{PhotoAsset, PRIMARY_ZONE_NAME};
+    use crate::state::SqliteStateDb;
+    use crate::test_helpers::{TestAssetRecord, TestPhotoAsset};
     use crate::types::LivePhotoMode;
     use serde_json::json;
     use std::fs;
@@ -1517,6 +1518,52 @@ mod tests {
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
         filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache)
+    }
+
+    #[cfg(unix)]
+    const POST_RENAME_PRE_STATE_CHILD_ENV: &str = "KEI_POST_RENAME_PRE_STATE_SIGKILL_CHILD";
+    #[cfg(unix)]
+    const POST_RENAME_PRE_STATE_DOWNLOAD_DIR_ENV: &str = "KEI_CRASH_HARNESS_DOWNLOAD_DIR";
+    #[cfg(unix)]
+    const POST_RENAME_PRE_STATE_DB_ENV: &str = "KEI_CRASH_HARNESS_DB";
+    #[cfg(unix)]
+    const POST_RENAME_PRE_STATE_PART_ENV: &str = "KEI_CRASH_HARNESS_PART";
+    #[cfg(unix)]
+    const POST_RENAME_PRE_STATE_CHILD_TEST: &str =
+        "download::filter::tests::post_rename_pre_state_sigkill_child";
+    #[cfg(unix)]
+    const POST_RENAME_PRE_STATE_ASSET_ID: &str = "ASSET_REAL_KILL";
+    #[cfg(unix)]
+    const POST_RENAME_PRE_STATE_FILENAME: &str = "IMG_REAL_KILL.JPG";
+    #[cfg(unix)]
+    const POST_RENAME_PRE_STATE_CHECKSUM: &str = "ck_real_kill";
+    #[cfg(unix)]
+    const POST_RENAME_PRE_STATE_PART_FILE: &str = "published-before-state.kei-tmp";
+
+    #[cfg(unix)]
+    fn post_rename_pre_state_crash_asset() -> PhotoAsset {
+        TestPhotoAsset::new(POST_RENAME_PRE_STATE_ASSET_ID)
+            .filename(POST_RENAME_PRE_STATE_FILENAME)
+            .orig_size(1000)
+            .orig_url("https://p01.icloud-content.com/real-kill")
+            .orig_checksum(POST_RENAME_PRE_STATE_CHECKSUM)
+            .build()
+    }
+
+    #[cfg(unix)]
+    fn post_rename_pre_state_config(download_dir: &std::path::Path) -> DownloadConfig {
+        let mut config = test_config();
+        config.directory = Arc::from(download_dir);
+        config
+    }
+
+    #[cfg(unix)]
+    fn post_rename_pre_state_final_path_for(download_dir: &std::path::Path) -> std::path::PathBuf {
+        let asset = post_rename_pre_state_crash_asset();
+        let config = post_rename_pre_state_config(download_dir);
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        tasks[0].download_path.clone()
     }
 
     fn plain_photo_asset() -> PhotoAsset {
@@ -5117,6 +5164,133 @@ mod tests {
              (file exists at {final_path:?} with matching size); \
              got tasks: {tasks_post:?}",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_process_death_after_publish_before_mark_downloaded_recovers() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::Command;
+
+        let dir = TempDir::new().unwrap();
+        let download_dir = dir.path().join("download");
+        let db_path = dir.path().join("state.db");
+        let part_path = dir.path().join(POST_RENAME_PRE_STATE_PART_FILE);
+        let final_path = post_rename_pre_state_final_path_for(&download_dir);
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg(POST_RENAME_PRE_STATE_CHILD_TEST)
+            .arg("--nocapture")
+            .env(POST_RENAME_PRE_STATE_CHILD_ENV, "1")
+            .env(POST_RENAME_PRE_STATE_DOWNLOAD_DIR_ENV, &download_dir)
+            .env(POST_RENAME_PRE_STATE_DB_ENV, &db_path)
+            .env(POST_RENAME_PRE_STATE_PART_ENV, &part_path)
+            .output()
+            .expect("spawn crash harness child");
+
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGKILL),
+            "child should die at the post-publish/pre-state-write kill point; \
+             status={:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            final_path.exists(),
+            "final media file must survive the killed child"
+        );
+        assert!(
+            !part_path.exists(),
+            "published temp file should be gone after final-file publish"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let row = rt.block_on(async {
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            db.get_pending()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|record| {
+                    &*record.library == PRIMARY_ZONE_NAME
+                        && &*record.id == POST_RENAME_PRE_STATE_ASSET_ID
+                        && record.version_size.as_str() == "original"
+                })
+                .expect("post-kill row should remain pending")
+        });
+        assert_eq!(
+            row.local_path, None,
+            "SIGKILL before mark_downloaded must not fabricate downloaded state"
+        );
+
+        let asset = post_rename_pre_state_crash_asset();
+        let config = post_rename_pre_state_config(&download_dir);
+        let tasks_post = filter_asset_fresh(&asset, &config);
+        assert!(
+            tasks_post.is_empty(),
+            "post-kill rerun must skip via on-disk detection even when the DB \
+             row is still pending; got tasks: {tasks_post:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "spawned by real_process_death_after_publish_before_mark_downloaded_recovers"]
+    fn post_rename_pre_state_sigkill_child() {
+        use std::path::PathBuf;
+
+        if std::env::var_os(POST_RENAME_PRE_STATE_CHILD_ENV).is_none() {
+            return;
+        }
+
+        let download_dir = PathBuf::from(
+            std::env::var_os(POST_RENAME_PRE_STATE_DOWNLOAD_DIR_ENV).expect("download dir env"),
+        );
+        let db_path =
+            PathBuf::from(std::env::var_os(POST_RENAME_PRE_STATE_DB_ENV).expect("db env"));
+        let part_path =
+            PathBuf::from(std::env::var_os(POST_RENAME_PRE_STATE_PART_ENV).expect("part env"));
+        let final_path = post_rename_pre_state_final_path_for(&download_dir);
+
+        if let Some(parent) = part_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        if let Some(parent) = final_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&part_path, vec![0x42; 1000]).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            let record = TestAssetRecord::new(POST_RENAME_PRE_STATE_ASSET_ID)
+                .filename(POST_RENAME_PRE_STATE_FILENAME)
+                .checksum(POST_RENAME_PRE_STATE_CHECKSUM)
+                .size(1000)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            crate::download::file::rename_part_to_final(&part_path, &final_path)
+                .await
+                .unwrap();
+        });
+
+        // SAFETY: this child process is a dedicated crash harness. SIGKILL is
+        // the test subject: the parent asserts the final file survived while
+        // the DB row did not advance through mark_downloaded.
+        unsafe {
+            libc::raise(libc::SIGKILL);
+        }
+        std::process::exit(137);
     }
 
     // ── Gap: VideoOnly mode emits only MOV, no primary image ─────────

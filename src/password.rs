@@ -504,6 +504,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn run_password_command_rejects_non_utf8_stdout() {
+        let err = run_password_command("printf '\\377\\376'").unwrap_err();
+        assert!(
+            err.to_string().contains("not valid UTF-8"),
+            "expected invalid UTF-8 error; got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn run_password_command_strips_newline() {
         assert_eq!(
             run_password_command("echo secret_value")

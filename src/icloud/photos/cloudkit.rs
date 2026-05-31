@@ -308,6 +308,21 @@ mod tests {
     }
 
     #[test]
+    fn changes_database_response_missing_zones_defaults_empty() {
+        let json = r#"{
+            "syncToken": "db-token-no-zones",
+            "moreComing": false
+        }"#;
+        let resp: ChangesDatabaseResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.sync_token, "db-token-no-zones");
+        assert!(!resp.more_coming);
+        assert!(
+            resp.zones.is_empty(),
+            "missing zones must parse as an empty changes list"
+        );
+    }
+
+    #[test]
     fn test_changed_zone_info() {
         let json = r#"{
             "zoneID": {"zoneName": "PrimarySync"},

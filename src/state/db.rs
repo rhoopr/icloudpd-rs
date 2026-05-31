@@ -7090,6 +7090,20 @@ mod tests {
             Some("local_sha256"),
             "local_checksum should be stored"
         );
+        let conn = db.acquire_lock("verify download checksum").unwrap();
+        let download_checksum: Option<String> = conn
+            .query_row(
+                "SELECT download_checksum FROM assets \
+                 WHERE library = 'PrimarySync' AND id = 'DL_CK' AND version_size = 'original'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            download_checksum.as_deref(),
+            Some("pre_exif_sha256"),
+            "download_checksum should preserve the pre-EXIF downloaded bytes hash"
+        );
     }
 
     // ── v5 metadata round-trip ──────────────────────────────────────────
