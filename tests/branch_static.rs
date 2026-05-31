@@ -138,3 +138,25 @@ fn live_import_smoke_uses_toml_directory() {
         "live smoke download scratch should follow full-test's TMPDIR"
     );
 }
+
+#[test]
+fn live_import_rehearsal_seeds_album_with_per_filter_recent_scope() {
+    let rehearsal = repo_file("scripts/full-test/run_live_import_rehearsal.sh");
+
+    assert!(
+        rehearsal.contains("sync --recent 10 --recent-scope per-filter --no-progress-bar"),
+        "live import rehearsal must seed from the selected album's recent window, not the global library frontier"
+    );
+    assert!(
+        rehearsal.contains("set +e\n  \"$@\" >\"$out\" 2>\"$err\"\n  local rc=$?\n  set -e"),
+        "live import rehearsal must print command tails before propagating a failed command"
+    );
+    assert!(
+        rehearsal.contains("import-existing --dry-run --recent 10 --force-empty --no-progress-bar"),
+        "live import rehearsal dry-run should keep import-existing bounded to the same recent count"
+    );
+    assert!(
+        rehearsal.contains("import-existing --recent 10 --force-empty --no-progress-bar"),
+        "live import rehearsal real import should keep import-existing bounded to the same recent count"
+    );
+}

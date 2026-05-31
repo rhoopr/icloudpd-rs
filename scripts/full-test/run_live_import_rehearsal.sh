@@ -70,16 +70,20 @@ run_and_show() {
   shift
   local out="$work/$name.out"
   local err="$work/$name.err"
+  set +e
   "$@" >"$out" 2>"$err"
+  local rc=$?
+  set -e
   echo "--- $name stderr tail ---"
   tail -30 "$err"
   echo "--- $name stdout tail ---"
   tail -30 "$out"
+  return "$rc"
 }
 
-echo "--- seed sync ($album, recent 10) ---"
+echo "--- seed sync ($album, recent 10 per filter) ---"
 run_and_show seed-sync \
-  "$binary" sync --recent 10 --no-progress-bar --config "$sync_config"
+  "$binary" sync --recent 10 --recent-scope per-filter --no-progress-bar --config "$sync_config"
 
 file_count=$(find "$photos" -type f | wc -l | tr -d ' ')
 echo "seed_files=$file_count"
