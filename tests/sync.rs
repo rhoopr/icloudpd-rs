@@ -145,6 +145,15 @@ fn config_for_download_dir(
     common::write_toml_config(data_dir, "sync-live", &body)
 }
 
+fn reset_sync_tokens(cookie_dir: &std::path::Path) {
+    common::cmd()
+        .env("KEI_DATA_DIR", cookie_dir)
+        .args(["reset", "sync-token", "--yes"])
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .success();
+}
+
 // ── Metadata (no downloads) ─────────────────────────────────────────────
 
 #[test]
@@ -1784,8 +1793,8 @@ fn sync_report_json_writes_valid_schema() {
 // ── Download integrity ──────────────────────────────────────────────────
 
 /// Data-sacred invariant: if the user (or `rm -rf` accident) deletes a synced
-/// file, the next sync must restore it. A silent skip here would mean kei
-/// "loses" the file permanently.
+/// file, a full reconciliation must restore it. A silent skip here would mean
+/// kei "loses" the file permanently.
 #[test]
 #[ignore]
 fn sync_recovers_deleted_file() {
@@ -1812,7 +1821,12 @@ fn sync_recovers_deleted_file() {
         std::fs::remove_file(&victim).expect("delete victim");
         assert!(!victim.exists(), "victim deleted");
 
-        // Re-sync: full enumeration so the filter can notice the missing file.
+        // Re-sync with a full enumeration so the filter can notice the
+        // missing file. A normal incremental sync only receives new iCloud
+        // deltas, so local disk drift must be tested with the cursor reset.
+        reset_sync_tokens(&cookie_dir);
+
+        // Full enumeration can notice the missing file.
         // Captured output is included in the assertion below so an intermittent
         // skip-where-recovery-was-expected leaves a usable trail (data-sacred
         // invariant: a silent skip here means kei "loses" the file).
@@ -1838,10 +1852,10 @@ fn sync_recovers_deleted_file() {
 }
 
 /// Data-sacred invariant: a truncated file left on disk (e.g. from a crashed
-/// write) must not mask the real photo. The default `name-size-dedup-with-suffix`
-/// policy preserves the existing file untouched and downloads the real photo
-/// alongside with a size suffix in the filename. Either way, the correctly-sized
-/// photo bytes must end up on disk.
+/// write) must not mask the real photo during full reconciliation. The default
+/// `name-size-dedup-with-suffix` policy preserves the existing file untouched
+/// and downloads the real photo alongside with a size suffix in the filename.
+/// Either way, the correctly-sized photo bytes must end up on disk.
 #[test]
 #[ignore]
 fn sync_truncated_file_does_not_cause_data_loss() {
@@ -1871,6 +1885,11 @@ fn sync_truncated_file_does_not_cause_data_loss() {
             .set_len(0)
             .expect("set_len 0");
         assert_eq!(std::fs::metadata(&victim).unwrap().len(), 0);
+
+        // Re-sync with a full enumeration so path planning compares the
+        // truncated local file with iCloud's expected size. A normal
+        // incremental sync only receives new iCloud deltas.
+        reset_sync_tokens(&cookie_dir);
 
         // Captured output is included in the assertion below so an
         // intermittent skip-where-recovery-was-expected leaves a usable

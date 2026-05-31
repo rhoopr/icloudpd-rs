@@ -146,33 +146,38 @@ fi
 
 # ── 7. Simulated missing file: full re-enum re-downloads it ─────────────
 #
-# Two-stage check, each starting from a delete-from-state-and-disk seed
-# so each sync mode is exercised on a genuinely-missing file. Doing both
-# from a single delete would mask the second mode -- the first sync
-# would re-download the file, leaving the second a no-op.
+# Two-stage check from one delete-from-state-and-disk seed. Incremental
+# sync only sees new iCloud deltas, so it should not rediscover a local
+# state/disk deletion on its own. A forced full re-enumeration must
+# rediscover and re-download the file.
 echo ""
 echo "=== 7. Missing file detection ==="
-delete_and_sync() {
-    local mode_flag="$1"
-    local label="$2"
-    local f path out clean dl
+delete_one_downloaded_file() {
+    local f path
     f=$(kei_db_query "SELECT filename FROM assets WHERE status='downloaded' LIMIT 1")
     path=$(kei_db_query "SELECT local_path FROM assets WHERE filename = '$f' LIMIT 1")
     kei_db_exec "DELETE FROM assets WHERE filename = '$f'"
     rm -f "$path"
     echo "  Deleted from state + disk: $f"
-    out=$(kei_sync "$DIR" $mode_flag)
+}
+sync_and_count_downloads() {
+    local label="$1"
+    local out clean dl
+    out=$(kei_sync "$DIR")
     echo "$out" | grep -E "incremental|change|download|[Cc]ompleted"
-    echo "$out" | grep -qE "[Cc]ompleted in"; kei_check "$label completed without error"
+    echo "$out" | grep -qE "No new photos|[Cc]ompleted"; kei_check "$label completed without error"
     clean=$(echo "$out" | sed 's/\x1b\[[0-9;]*m//g')
     dl=$(echo "$clean" | grep -oE '[0-9]+ downloaded,' | head -1 | grep -oE '^[0-9]+')
     dl="${dl:-0}"
-    echo "  $label re-downloaded: $dl"
-    [ "$dl" -ge 1 ]; kei_check "$label finds missing file"
+    echo "  $label downloads: $dl"
+    DL_RESULT="$dl"
 }
-delete_and_sync "" "incremental"
+delete_one_downloaded_file
+sync_and_count_downloads "incremental"
+[ "$DL_RESULT" -eq 0 ]; kei_check "incremental leaves non-delta local drift for full reconcile"
 KEI_DATA_DIR="$COOKIES" "$KEI" reset sync-token --yes >/dev/null
-delete_and_sync "" "full re-enum"
+sync_and_count_downloads "full re-enum"
+[ "$DL_RESULT" -ge 1 ]; kei_check "full re-enum finds missing file"
 
 # ── 8. --dry-run preserves token ─────────────────────────────────────────
 echo ""
