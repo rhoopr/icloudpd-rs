@@ -32,7 +32,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -1856,6 +1856,100 @@ struct PerPassStreamingResult {
 
 type DownloadPhotoStream = Pin<Box<dyn Stream<Item = anyhow::Result<PhotoAsset>> + Send + 'static>>;
 
+const DEFERRED_UNFILED_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const DEFERRED_UNFILED_HEARTBEAT_ASSETS: u64 = 1_000;
+
+#[derive(Debug)]
+struct DeferredUnfiledHeartbeat {
+    library: Arc<str>,
+    expected_assets: Option<u64>,
+    started: Instant,
+    last_log: Instant,
+    last_logged_assets: u64,
+    assets_enumerated: u64,
+}
+
+impl DeferredUnfiledHeartbeat {
+    fn start(library: Arc<str>, expected_assets: Option<u64>) -> Self {
+        let now = Instant::now();
+        tracing::info!(
+            library = %library,
+            pass_type = "unfiled",
+            expected_assets = ?expected_assets,
+            assets_enumerated = 0_u64,
+            "Deferred unfiled enumeration started"
+        );
+        Self {
+            library,
+            expected_assets,
+            started: now,
+            last_log: now,
+            last_logged_assets: 0,
+            assets_enumerated: 0,
+        }
+    }
+
+    fn record_asset(&mut self) {
+        self.assets_enumerated = self.assets_enumerated.saturating_add(1);
+        let now = Instant::now();
+        let asset_delta = self
+            .assets_enumerated
+            .saturating_sub(self.last_logged_assets);
+        if asset_delta < DEFERRED_UNFILED_HEARTBEAT_ASSETS
+            && now.duration_since(self.last_log) < DEFERRED_UNFILED_HEARTBEAT_INTERVAL
+        {
+            return;
+        }
+
+        self.last_log = now;
+        self.last_logged_assets = self.assets_enumerated;
+        tracing::info!(
+            library = %self.library,
+            pass_type = "unfiled",
+            assets_enumerated = self.assets_enumerated,
+            expected_assets = ?self.expected_assets,
+            elapsed = %format_duration(self.started.elapsed()),
+            "Deferred unfiled enumeration progress"
+        );
+    }
+
+    fn complete(&self) {
+        tracing::info!(
+            library = %self.library,
+            pass_type = "unfiled",
+            assets_enumerated = self.assets_enumerated,
+            expected_assets = ?self.expected_assets,
+            elapsed = %format_duration(self.started.elapsed()),
+            "Deferred unfiled enumeration complete"
+        );
+    }
+}
+
+fn track_deferred_unfiled_heartbeat(
+    stream: DownloadPhotoStream,
+    library: Arc<str>,
+    expected_assets: Option<u64>,
+) -> DownloadPhotoStream {
+    let heartbeat = DeferredUnfiledHeartbeat::start(library, expected_assets);
+    Box::pin(stream::unfold(
+        (stream, heartbeat),
+        |(mut stream, mut heartbeat)| async move {
+            match stream.next().await {
+                Some(item) => {
+                    if item.is_ok() {
+                        heartbeat.record_asset();
+                    }
+                    Some((item, (stream, heartbeat)))
+                }
+                None => {
+                    heartbeat.complete();
+                    None
+                }
+            }
+        },
+    ))
+}
+
 fn open_photo_stream_for_controls(
     album: &crate::icloud::photos::PhotoAlbum,
     limit: Option<u32>,
@@ -3397,25 +3491,29 @@ async fn download_photos_full_with_token(
                 if let (Some(pass), Some(pass_config)) =
                     (passes.get(index), pass_configs.get(index).cloned())
                 {
+                    let stream_total_count = pass_stream_counts.get(index).copied().flatten();
                     let (stream, token_rx) = open_photo_stream_for_controls(
                         &pass.album,
                         scope_frontier_limit(config, recent_frontier.as_ref()),
-                        pass_stream_counts.get(index).copied().flatten(),
+                        stream_total_count,
                         config.concurrent_downloads,
                         pass_config.concurrent_downloads,
                         controls,
                     );
+                    let library = Arc::<str>::from(pass.album.zone_name());
                     let stream = filter_stream_to_enumeration_bounds(
                         stream,
                         config,
                         recent_frontier.as_ref(),
-                    )
-                    .filter(move |item| {
-                        let keep = item
-                            .as_ref()
-                            .map_or(true, |asset| !excluded_ids.contains(asset.id()));
-                        std::future::ready(keep)
-                    });
+                    );
+                    let stream =
+                        track_deferred_unfiled_heartbeat(stream, library, stream_total_count)
+                            .filter(move |item| {
+                                let keep = item
+                                    .as_ref()
+                                    .map_or(true, |asset| !excluded_ids.contains(asset.id()));
+                                std::future::ready(keep)
+                            });
                     let pass_result = run_full_pass_stream(
                         download_client.clone(),
                         stream,
@@ -4321,7 +4419,7 @@ mod tests {
     use crate::test_helpers::{
         mock_photo_query_page, mock_photo_records_for_zone_with_filename,
         mock_photo_records_for_zone_with_filename_and_asset_date, DynamicRecentPhotosSession,
-        MockPhotosFlow, TestAssetRecord,
+        MockPhotosFlow, TestAssetRecord, TracingCapture,
     };
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -5417,6 +5515,135 @@ mod tests {
         assert_eq!(
             result.stats.assets_seen, 2,
             "album and unfiled assets should both be processed after exclusions are known"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_deferred_unfiled_logs_heartbeat_and_completion() {
+        let (capture, _guard) = TracingCapture::install();
+        let album_session =
+            DynamicRecentPhotosSession::from_ids(vec!["album-heartbeat-0000".to_string()])
+                .with_filename_prefix("album-heartbeat")
+                .with_token("zone-token");
+        let unfiled_count = DEFERRED_UNFILED_HEARTBEAT_ASSETS + 1;
+        let unfiled_session =
+            DynamicRecentPhotosSession::from_ids(recent_ids("unfiled-heartbeat", unfiled_count))
+                .with_filename_prefix("unfiled-heartbeat")
+                .with_token("zone-token");
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: album_with_session("PrimarySync", "Vacation", Box::new(album_session)),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session("PrimarySync", "", Box::new(unfiled_session)),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 10;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::dry_run_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dry-run full sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let events = capture.events();
+        let start = events
+            .iter()
+            .find(|event| event.message() == Some("Deferred unfiled enumeration started"))
+            .unwrap_or_else(|| panic!("missing deferred unfiled start event: {events:?}"));
+        assert_eq!(start.field("library"), Some("PrimarySync"));
+        assert_eq!(start.field("pass_type"), Some("unfiled"));
+        assert_eq!(start.field("assets_enumerated"), Some("0"));
+
+        let progress = events
+            .iter()
+            .find(|event| event.message() == Some("Deferred unfiled enumeration progress"))
+            .unwrap_or_else(|| panic!("missing deferred unfiled progress event: {events:?}"));
+        assert_eq!(progress.field("library"), Some("PrimarySync"));
+        assert_eq!(progress.field("pass_type"), Some("unfiled"));
+        let progress_assets = DEFERRED_UNFILED_HEARTBEAT_ASSETS.to_string();
+        assert_eq!(
+            progress.field("assets_enumerated"),
+            Some(progress_assets.as_str())
+        );
+        assert!(
+            progress
+                .field("expected_assets")
+                .is_some_and(|value| value.contains(&unfiled_count.to_string())),
+            "progress event should include expected asset count: {progress:?}"
+        );
+        assert!(
+            progress.field("elapsed").is_some(),
+            "progress event should include elapsed time: {progress:?}"
+        );
+
+        let complete = events
+            .iter()
+            .find(|event| event.message() == Some("Deferred unfiled enumeration complete"))
+            .unwrap_or_else(|| panic!("missing deferred unfiled completion event: {events:?}"));
+        assert_eq!(complete.field("library"), Some("PrimarySync"));
+        assert_eq!(complete.field("pass_type"), Some("unfiled"));
+        let completion_assets = unfiled_count.to_string();
+        assert_eq!(
+            complete.field("assets_enumerated"),
+            Some(completion_assets.as_str())
+        );
+        assert!(
+            complete.field("elapsed").is_some(),
+            "completion event should include elapsed time: {complete:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_unfiled_only_does_not_log_deferred_unfiled_heartbeat() {
+        let (capture, _guard) = TracingCapture::install();
+        let unfiled_session = DynamicRecentPhotosSession::from_ids(recent_ids(
+            "unfiled-only-heartbeat",
+            DEFERRED_UNFILED_HEARTBEAT_ASSETS + 1,
+        ))
+        .with_filename_prefix("unfiled-only-heartbeat")
+        .with_token("zone-token");
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(unfiled_session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 10;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::dry_run_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dry-run full sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        let events = capture.events();
+        assert!(
+            !events.iter().any(|event| event
+                .message()
+                .is_some_and(|message| message.starts_with("Deferred unfiled enumeration"))),
+            "unfiled-only sync should not emit deferred unfiled heartbeat events: {events:?}"
         );
     }
 
