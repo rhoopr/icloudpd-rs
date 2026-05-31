@@ -1497,9 +1497,14 @@ mod tests {
     use chrono::Utc;
     use rustc_hash::FxHashSet;
 
-    use crate::icloud::photos::{PhotoAsset, PRIMARY_ZONE_NAME};
+    use crate::icloud::photos::PhotoAsset;
+    #[cfg(unix)]
+    use crate::icloud::photos::PRIMARY_ZONE_NAME;
+    #[cfg(unix)]
     use crate::state::SqliteStateDb;
-    use crate::test_helpers::{TestAssetRecord, TestPhotoAsset};
+    #[cfg(unix)]
+    use crate::test_helpers::TestAssetRecord;
+    use crate::test_helpers::TestPhotoAsset;
     use crate::types::LivePhotoMode;
     use serde_json::json;
     use std::fs;
