@@ -841,7 +841,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             cli::ServiceAction::Status => return service::status::run().await,
             cli::ServiceAction::Run(args) => {
                 let cli::ServiceRunArgs { password, sync } = *args;
-                return service::run::run(
+                return Box::pin(service::run::run(
                     &globals,
                     sync_loop::SyncArgs {
                         is_one_shot: false,
@@ -857,7 +857,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
                         personality_mode,
                         friendly_request,
                     },
-                )
+                ))
                 .await;
             }
         },

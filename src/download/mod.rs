@@ -379,6 +379,7 @@ const UNKNOWN_ALBUM_RELATION_CONTAINER_REASON: &str = "unknown_album_relation_co
 const UNKNOWN_ALBUM_RELATION_ASSET_REASON: &str = "unknown_album_relation_asset";
 const ALBUM_DELTA_STATE_WRITE_FAILED_REASON: &str = "album_delta_state_write_failed";
 const SMART_FOLDER_REFRESH_FAILED_REASON: &str = "smart_folder_refresh_failed";
+const TARGETED_ALBUM_BACKFILL_FAILED_REASON: &str = "targeted_album_backfill_failed";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
     match reason {
@@ -387,7 +388,8 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | DATE_BOUNDED_FULL_ENUMERATION_REASON
         | "kei_internal_token_receiver_dropped"
         | RECENT_LIMITED_FULL_ENUMERATION_REASON
-        | SMART_FOLDER_REFRESH_FAILED_REASON => "kei",
+        | SMART_FOLDER_REFRESH_FAILED_REASON
+        | TARGETED_ALBUM_BACKFILL_FAILED_REASON => "kei",
         "pagination_shortfall"
         | "icloud_blank_sync_token"
         | "icloud_sync_token_mismatch"
@@ -435,6 +437,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         ALBUM_DELTA_STATE_WRITE_FAILED_REASON => "kei could not persist album delta state safely",
         SMART_FOLDER_REFRESH_FAILED_REASON => {
             "a selected smart-folder refresh did not complete safely"
+        }
+        TARGETED_ALBUM_BACKFILL_FAILED_REASON => {
+            "a targeted album backfill did not complete safely"
         }
         "sync_token_unavailable" | "sync_token_missing" => {
             "no usable sync token was available at the end of the cycle"
@@ -566,6 +571,7 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
 /// field changing. That forces existing state to revalidate on disk instead
 /// of trusting paths derived under older code.
 const PATH_DERIVATION_HASH_VERSION: u8 = 2;
+const ENUMERATION_SAFETY_HASH_VERSION: u8 = 2;
 
 /// Fields shared between [`hash_download_config`] and [`compute_config_hash`]
 /// that affect path resolution and asset eligibility.
@@ -642,8 +648,8 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
 /// records (the resolved paths may differ), so we fall back to the full pipeline
 /// with filesystem existence checks.
 ///
-/// Also called from `main.rs` (via [`compute_config_hash`]) to clear sync tokens
-/// before the incremental-vs-full decision when the download config changes.
+/// Separate from [`compute_config_hash`]: path-only changes revalidate local
+/// download state without clearing CloudKit zone tokens.
 pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
     use sha2::{Digest, Sha256};
 
@@ -686,14 +692,15 @@ pub(crate) fn hash_download_config(config: &DownloadConfig) -> String {
 
 /// Compute the config hash from the app-level `Config`.
 ///
-/// Called from `main.rs` before the sync-mode decision so that stale sync
-/// tokens are cleared when the download config changes.
+/// Called before the sync-mode decision so stale sync tokens are cleared only
+/// when an unsafe eligibility/config change cannot be routed incrementally.
 ///
-/// This hash is a SUPERSET of [`hash_download_config`]: it includes all
-/// the fields that affect download paths (shared with hash_download_config)
-/// plus enumeration-filter fields (albums, library, live_photo_mode) that
-/// affect WHICH assets are eligible. Changing these filters must invalidate
-/// sync tokens so the next run does a full enumeration.
+/// This hash tracks only changes that make a stored CloudKit zone token unsafe.
+/// Path-only fields stay in [`hash_download_config`] so a folder/template
+/// change revalidates local files without discarding the CloudKit cursor.
+/// Album, library, and smart-folder selection are also excluded here: the
+/// incremental router can prove those cases from per-library tokens, trusted
+/// album snapshots, and targeted smart-folder refreshes.
 pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     use sha2::{Digest, Sha256};
 
@@ -708,65 +715,38 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
         .map(|d| d.with_timezone(&chrono::Utc));
 
     let mut hasher = Sha256::new();
-    hash_shared_fields(
-        &mut hasher,
-        &SharedHashFields {
-            directory: &config.download.directory,
-            folder_structure: &config.download.folder_structure,
-            folder_structure_albums: &config.download.folder_structure_albums,
-            folder_structure_smart_folders: &config.download.folder_structure_smart_folders,
-            resolution: config.photos.resolution,
-            live_resolution,
-            file_match_policy: config.photos.file_match_policy,
-            live_photo_mov_filename_policy: config.photos.live_photo_mov_filename_policy,
-            edited: config.photos.edited,
-            alternative: config.photos.alternative,
-            raw_policy: config.photos.raw_policy,
-            keep_unicode_in_filenames: config.photos.keep_unicode_in_filenames,
-            skip_created_before,
-            skip_created_after,
-            force_resolution: config.photos.force_resolution,
-            media: config.filters.media,
-            live_photo_mode: config.photos.live_photo_mode,
-            filename_exclude: &config.download.filename_exclude,
-        },
-    );
+    hasher.update([ENUMERATION_SAFETY_HASH_VERSION]);
+    hasher.update([config.photos.resolution as u8]);
+    hasher.update([live_resolution as u8]);
+    hasher.update([u8::from(config.photos.edited)]);
+    hasher.update([u8::from(config.photos.alternative)]);
+    hasher.update([config.photos.raw_policy as u8]);
+    hash_optional_date(&mut hasher, truncate_date_to_day(skip_created_before));
+    hash_optional_date(&mut hasher, truncate_date_to_day(skip_created_after));
+    hasher.update([u8::from(config.photos.force_resolution)]);
+    hasher.update([u8::from(config.filters.media.photos)]);
+    hasher.update([u8::from(config.filters.media.videos)]);
+    hasher.update([u8::from(config.filters.media.live_photos)]);
+    hasher.update([config.photos.live_photo_mode as u8]);
+    let mut sorted_excludes: Vec<&str> = config
+        .download
+        .filename_exclude
+        .iter()
+        .map(glob::Pattern::as_str)
+        .collect();
+    sorted_excludes.sort_unstable();
+    for pattern in &sorted_excludes {
+        hash_bytes(&mut hasher, pattern.as_bytes());
+    }
     // Note: `recent` is intentionally excluded from this enum hash.
     // Changing --recent should not invalidate sync tokens because the
     // incremental path already applies the recent cap post-fetch.
     // `recent` IS included in hash_download_config (trust-state) so
     // changing it still triggers filesystem re-verification.
 
-    // Enumeration-filter fields: changing these affects WHICH assets are
-    // fetched from iCloud, so sync tokens must be invalidated to avoid
-    // missing assets that are newly eligible under the changed filters.
-    // Tag byte distinguishes the three selection modes so switching between
-    // them (e.g. `-a A` -> `-a all`) invalidates the sync token even if no
-    // explicit album name changed.
-    for entry in config.filters.selection.albums.to_raw() {
-        hasher.update(b"album:");
-        hasher.update(entry.as_bytes());
-        hasher.update(b"\0");
-    }
-    // Library selector: stable tag bytes per shape so changing the resolved
-    // library set invalidates sync tokens. `to_raw()` emits a deterministic
-    // ordering (`primary`/`shared`/named-then-`!excluded`).
-    for entry in config.filters.selection.libraries.to_raw() {
-        hasher.update(b"library:");
-        hasher.update(entry.as_bytes());
-        hasher.update(b"\0");
-    }
-    // Smart-folder + unfiled selectors drive which CloudKit zones/views are
-    // enumerated; toggling them changes the eligible asset set, so the
-    // per-zone sync token must be invalidated. Without these fields a
-    // `--smart-folder none` → `--smart-folder all` (or `--unfiled false` →
-    // default true) change reuses a stale enumeration cursor and the next
-    // cycle silently misses every newly-eligible asset.
-    for entry in config.filters.selection.smart_folders.to_raw() {
-        hasher.update(b"smart_folder:");
-        hasher.update(entry.as_bytes());
-        hasher.update(b"\0");
-    }
+    // The unfiled selector is still unsafe to classify from the current state
+    // alone: switching it on can make old, never-enumerated unfiled assets
+    // newly eligible. Keep the full fallback for that unknown drift class.
     hasher.update(b"unfiled:");
     hasher.update([u8::from(config.filters.selection.unfiled)]);
     finalize_hash(hasher)
@@ -1596,10 +1576,16 @@ fn incremental_requires_full_enumeration(passes: &[crate::commands::AlbumPass]) 
         .any(|pass| pass.kind != crate::commands::PassKind::Unfiled)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum IncrementalRoutingDecision {
     Safe,
-    NeedsFull { reason: FullEnumerationReason },
+    TargetedAlbumBackfill {
+        pass_indices: Vec<usize>,
+        reason: FullEnumerationReason,
+    },
+    NeedsFull {
+        reason: FullEnumerationReason,
+    },
 }
 
 #[derive(Debug)]
@@ -1661,6 +1647,7 @@ impl IncrementalPassRouting {
 async fn determine_incremental_routing_decision(
     passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
+    controls: DownloadControls,
 ) -> IncrementalRoutingDecision {
     let has_unmapped_album_pass = passes.iter().any(|pass| {
         pass.kind == crate::commands::PassKind::Album && pass.album.container_id().is_none()
@@ -1681,23 +1668,44 @@ async fn determine_incremental_routing_decision(
             reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
         };
     };
-    let selected_container_ids = routing.selected_container_refs();
-    match db
-        .selected_album_containers_have_complete_snapshots(&config.library, &selected_container_ids)
-        .await
-    {
-        Ok(true) => IncrementalRoutingDecision::Safe,
-        Ok(false) => IncrementalRoutingDecision::NeedsFull {
-            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
-        },
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "Failed to verify album membership snapshots for incremental routing"
-            );
-            IncrementalRoutingDecision::NeedsFull {
-                reason: FullEnumerationReason::OtherStaticReason,
+
+    let mut backfill_pass_indices = Vec::new();
+    for (index, pass) in passes.iter().enumerate() {
+        if pass.kind != crate::commands::PassKind::Album {
+            continue;
+        }
+        let Some(container_id) = pass.album.container_id() else {
+            continue;
+        };
+        match db
+            .selected_album_containers_have_complete_snapshots(&config.library, &[container_id])
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => backfill_pass_indices.push(index),
+            Err(e) => {
+                tracing::warn!(
+                    container_id,
+                    error = %e,
+                    "Failed to verify album membership snapshot for incremental routing"
+                );
+                return IncrementalRoutingDecision::NeedsFull {
+                    reason: FullEnumerationReason::OtherStaticReason,
+                };
             }
+        }
+    }
+
+    if backfill_pass_indices.is_empty() {
+        IncrementalRoutingDecision::Safe
+    } else if should_record_album_snapshots(passes, config, controls) {
+        IncrementalRoutingDecision::TargetedAlbumBackfill {
+            pass_indices: backfill_pass_indices,
+            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
+        }
+    } else {
+        IncrementalRoutingDecision::NeedsFull {
+            reason: FullEnumerationReason::AlbumRelationHydrationIncomplete,
         }
     }
 }
@@ -2594,6 +2602,20 @@ fn block_sync_token_for_incremental_delta(stats: &mut SyncStats, reason: &'stati
     stats.sync_token_blocked = true;
 }
 
+fn clear_zone_token_block_from_targeted_backfill_stats(stats: &mut SyncStats) {
+    stats.sync_token_blocked = false;
+    stats.sync_token_blocked_reason = None;
+    stats.sync_token_blocked_source = None;
+    stats.sync_token_blocked_explanation = None;
+    stats.sync_token_blocked_zone = None;
+    stats.sync_token_expected_receivers = None;
+    stats.sync_token_receivers_with_token = None;
+    stats.sync_token_receivers_missing = None;
+    stats.sync_token_receivers_blank = None;
+    stats.sync_token_receivers_dropped = None;
+    stats.sync_token_unique_values = None;
+}
+
 async fn download_photos_full_with_reason(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -2607,6 +2629,132 @@ async fn download_photos_full_with_reason(
             .await?;
     set_full_enumeration_reason(&mut result, reason);
     Ok(result)
+}
+
+async fn targeted_backfill_snapshots_complete(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+) -> bool {
+    let Some(db) = &config.state_db else {
+        return false;
+    };
+    let container_ids: Vec<String> = passes
+        .iter()
+        .filter_map(|pass| pass.album.container_id().map(ToOwned::to_owned))
+        .collect();
+    let container_refs: Vec<&str> = container_ids.iter().map(String::as_str).collect();
+    match db
+        .selected_album_containers_have_complete_snapshots(&config.library, &container_refs)
+        .await
+    {
+        Ok(complete) => complete,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to verify targeted album backfill snapshots"
+            );
+            false
+        }
+    }
+}
+
+async fn download_photos_incremental_with_targeted_album_backfill(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    zone_sync_token: &str,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+    backfill_pass_indices: &[usize],
+    reason: FullEnumerationReason,
+) -> Result<SyncResult> {
+    let backfill_passes: Vec<crate::commands::AlbumPass> = backfill_pass_indices
+        .iter()
+        .filter_map(|index| passes.get(*index).cloned())
+        .collect();
+    let backfill_result = download_photos_full_with_reason(
+        download_client,
+        &backfill_passes,
+        config,
+        controls,
+        shutdown_token.clone(),
+        reason,
+    )
+    .await?;
+    let backfill_failed = !matches!(backfill_result.outcome, DownloadOutcome::Success)
+        || backfill_result.stats.interrupted
+        || backfill_result.stats.enumeration_errors > 0
+        || shutdown_token.is_cancelled()
+        || !targeted_backfill_snapshots_complete(&backfill_passes, config).await;
+
+    let SyncResult {
+        outcome: backfill_outcome,
+        sync_token: _,
+        stats: mut combined_stats,
+        full_enumeration_ran: backfill_full_enumeration_ran,
+    } = backfill_result;
+
+    if backfill_failed {
+        block_sync_token_for_incremental_delta(
+            &mut combined_stats,
+            TARGETED_ALBUM_BACKFILL_FAILED_REASON,
+        );
+        return Ok(SyncResult {
+            outcome: backfill_outcome,
+            sync_token: None,
+            stats: combined_stats,
+            full_enumeration_ran: backfill_full_enumeration_ran,
+        });
+    }
+
+    // Full album queries may report their own query sync-token telemetry, but
+    // targeted backfill does not use that token. The zone token may advance
+    // only after the following /changes/zone pass completes safely.
+    clear_zone_token_block_from_targeted_backfill_stats(&mut combined_stats);
+
+    let incremental_result = if passes
+        .iter()
+        .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder)
+    {
+        download_photos_incremental_with_smart_folder_refresh(
+            download_client,
+            passes,
+            config,
+            zone_sync_token,
+            controls,
+            shutdown_token,
+        )
+        .await?
+    } else {
+        download_photos_incremental(
+            download_client,
+            passes,
+            config,
+            zone_sync_token,
+            controls,
+            shutdown_token,
+        )
+        .await?
+    };
+
+    let SyncResult {
+        outcome: incremental_outcome,
+        sync_token,
+        stats: incremental_stats,
+        full_enumeration_ran: incremental_full_enumeration_ran,
+    } = incremental_result;
+    combined_stats.accumulate(&incremental_stats);
+    let outcome = merge_download_outcomes(&backfill_outcome, &incremental_outcome);
+    let sync_token = (!combined_stats.sync_token_blocked)
+        .then_some(sync_token)
+        .flatten();
+
+    Ok(SyncResult {
+        outcome,
+        sync_token,
+        stats: combined_stats,
+        full_enumeration_ran: backfill_full_enumeration_ran || incremental_full_enumeration_ran,
+    })
 }
 
 async fn download_photos_incremental_with_smart_folder_refresh(
@@ -2785,7 +2933,7 @@ pub async fn download_photos_with_sync(
             .await
         }
         SyncMode::Incremental { zone_sync_token } => {
-            match determine_incremental_routing_decision(passes, &config).await {
+            match determine_incremental_routing_decision(passes, &config, controls).await {
                 IncrementalRoutingDecision::NeedsFull { reason } => {
                     tracing::debug!(
                         full_enumeration_reason = reason.as_str(),
@@ -2797,6 +2945,27 @@ pub async fn download_photos_with_sync(
                         &config,
                         controls,
                         shutdown_token.clone(),
+                        reason,
+                    )
+                    .await
+                }
+                IncrementalRoutingDecision::TargetedAlbumBackfill {
+                    pass_indices,
+                    reason,
+                } => {
+                    tracing::debug!(
+                        full_enumeration_reason = reason.as_str(),
+                        backfill_passes = pass_indices.len(),
+                        "Backfilling missing album snapshots before incremental routing"
+                    );
+                    download_photos_incremental_with_targeted_album_backfill(
+                        download_client,
+                        passes,
+                        &config,
+                        zone_sync_token,
+                        controls,
+                        shutdown_token.clone(),
+                        &pass_indices,
                         reason,
                     )
                     .await
@@ -4429,6 +4598,45 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct BackfillAndChangesSession {
+        changes_zone_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for BackfillAndChangesSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch") {
+                return Ok(json!({
+                    "batch": [{"records": [{"fields": {"itemCount": {"value": 0}}}]}]
+                }));
+            }
+
+            if url.contains("/changes/zone?") {
+                self.changes_zone_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(json!({
+                    "zones": [{
+                        "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                        "syncToken": "zone-token-next",
+                        "moreComing": false,
+                        "records": [],
+                    }]
+                }));
+            }
+
+            Ok(json!({"records": [], "syncToken": "album-token"}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
     fn smart_folder_unfiled_passes(
         changes_calls: Arc<AtomicUsize>,
         unfiled_records: Vec<Value>,
@@ -5869,9 +6077,8 @@ mod tests {
 
     // ── compute_config_hash equivalence ────────────────────────────────
 
-    /// `compute_config_hash` includes enumeration-filter fields (albums,
-    /// library, live_photo_mode) that `hash_download_config` doesn't.
-    /// Verify it produces a valid hex hash and is deterministic.
+    /// `compute_config_hash` tracks CloudKit token safety, not local path
+    /// trust-state. Verify it produces a valid hex hash and is deterministic.
     #[test]
     fn test_compute_config_hash_matches_hash_download_config() {
         use crate::config::Config;
@@ -5900,20 +6107,24 @@ mod tests {
         )
         .unwrap();
 
-        // compute_config_hash is a superset (includes albums, library, live_photo_mode)
-        // so it won't match hash_download_config. Verify it's deterministic and valid hex.
+        // compute_config_hash tracks only CloudKit-token safety fields. Verify
+        // it is deterministic and valid hex.
         let hash1 = compute_config_hash(&app_config);
         let hash2 = compute_config_hash(&app_config);
         assert_eq!(hash1, hash2, "compute_config_hash must be deterministic");
         assert_eq!(hash1.len(), 16);
         assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // Verify album changes produce a different hash
+        // Album changes are handled by membership snapshots and targeted
+        // backfill, not by invalidating the zone token.
         let mut config_with_album = app_config;
         config_with_album.filters.selection.albums =
             crate::selection::parse_album_selector(&["Favorites".to_string()], true).unwrap();
         let hash3 = compute_config_hash(&config_with_album);
-        assert_ne!(hash1, hash3, "adding an album must change the hash");
+        assert_eq!(
+            hash1, hash3,
+            "adding an album must keep the zone-token hash"
+        );
     }
 
     // ── should_download_fast additional tests ───────────────────────────
@@ -6181,12 +6392,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn album_incremental_missing_snapshot_falls_back_to_full() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let session = changes_zone_session(Arc::clone(&calls), Vec::new());
+    async fn album_incremental_missing_snapshot_runs_targeted_backfill() {
+        let changes_zone_calls = Arc::new(AtomicUsize::new(0));
+        let album_session = BackfillAndChangesSession {
+            changes_zone_calls: Arc::clone(&changes_zone_calls),
+        };
+        let unfiled_session =
+            CountingQuerySession::new(json!({"records": [], "syncToken": "unfiled-token"}), 0);
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: changes_album_with_container(
+                    "Vacation",
+                    Some("container-vacation"),
+                    album_session,
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: changes_album("", unfiled_session.clone()),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("missing snapshot should run targeted backfill");
+
+        assert!(result.full_enumeration_ran);
+        assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(FullEnumerationReason::AlbumRelationHydrationIncomplete)
+        );
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert_eq!(
+            changes_zone_calls.load(Ordering::SeqCst),
+            1,
+            "targeted backfill should still drain the zone delta once"
+        );
+        assert_eq!(
+            unfiled_session.records_query_count(),
+            0,
+            "targeted backfill must not enumerate the library-wide unfiled pass"
+        );
+        assert!(
+            db.selected_album_containers_have_complete_snapshots(
+                "PrimarySync",
+                &["container-vacation"],
+            )
+            .await
+            .unwrap(),
+            "targeted backfill should complete the missing album snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_album_backfill_failure_blocks_incremental_token() {
+        let album_session =
+            CountingQuerySession::failing(json!({"records": [], "syncToken": "album-token"}), 1);
         let passes = vec![AlbumPass {
             kind: PassKind::Album,
-            album: changes_album_with_container("Vacation", Some("container-vacation"), session),
+            album: changes_album_with_container(
+                "Vacation",
+                Some("container-vacation"),
+                album_session,
+            ),
             exclude_ids: Arc::new(FxHashSet::default()),
         }];
 
@@ -6203,22 +6489,14 @@ mod tests {
             &Client::new(),
             &passes,
             Arc::new(config),
-            DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+            DownloadControls::download_hidden(),
             CancellationToken::new(),
         )
         .await
-        .expect("missing snapshot should fall back to full enumeration");
+        .expect("targeted backfill failure should return a token-blocked result");
 
-        assert!(result.full_enumeration_ran);
-        assert_eq!(
-            result.stats.full_enumeration_reason,
-            Some(FullEnumerationReason::AlbumRelationHydrationIncomplete)
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "missing snapshot should not try changes/zone first"
-        );
+        assert_eq!(result.sync_token, None);
+        assert!(result.stats.sync_token_blocked);
     }
 
     #[tokio::test]
@@ -7196,7 +7474,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos/a", |_| {});
         let b = build_config_with(tmp.path(), "/photos/b", |_| {});
-        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+        assert_eq!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "download directory is path-only and must not invalidate the CloudKit zone token"
+        );
     }
 
     #[test]
@@ -7226,7 +7508,11 @@ mod tests {
         let b = build_config_with(tmp.path(), "/photos", |s| {
             s.config_overrides.albums = vec!["Favorites".to_string()];
         });
-        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+        assert_eq!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "album selection changes are handled by membership snapshots and targeted backfill"
+        );
     }
 
     #[test]
@@ -7236,7 +7522,11 @@ mod tests {
         let b = build_config_with(tmp.path(), "/photos", |s| {
             s.config_overrides.albums = vec!["!Hidden".to_string()];
         });
-        assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
+        assert_eq!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "removing albums should not invalidate the CloudKit zone token"
+        );
     }
 
     #[test]
@@ -7251,22 +7541,15 @@ mod tests {
 
     #[test]
     fn test_compute_config_hash_different_smart_folders() {
-        // Toggling --smart-folder between modes (none → all, or
-        // adding a named folder) changes which assets are eligible. If
-        // this isn't reflected in the config hash, the next cycle reuses
-        // the per-zone sync token whose enumeration boundary was computed
-        // under the old selection — newly-eligible smart-folder assets
-        // are silently skipped.
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
             s.config_overrides.smart_folders = vec!["Favorites".to_string()];
         });
-        assert_ne!(
+        assert_eq!(
             compute_config_hash(&a),
             compute_config_hash(&b),
-            "changing --smart-folder must change the config hash so the \
-             stored sync token is invalidated"
+            "smart-folder selection changes are handled by targeted refresh"
         );
     }
 
@@ -7296,10 +7579,28 @@ mod tests {
         let b = build_config_with(tmp.path(), "/photos", |s| {
             s.config_overrides.libraries = vec!["all".to_string()];
         });
-        assert_ne!(
+        assert_eq!(
             compute_config_hash(&a),
             compute_config_hash(&b),
-            "changing library selection should change the config hash"
+            "library selection changes should hydrate only newly selected libraries"
+        );
+    }
+
+    #[test]
+    fn test_compute_config_hash_path_only_changes_same_hash() {
+        let tmp = TempDir::new().unwrap();
+        let a = build_config_with(tmp.path(), "/photos-a", |_| {});
+        let b = build_config_with(tmp.path(), "/photos-b", |s| {
+            s.config_overrides.folder_structure = Some("%Y/%m".to_string());
+            s.config_overrides.folder_structure_albums = Some("{album}/albums/%Y".to_string());
+            s.config_overrides.folder_structure_smart_folders =
+                Some("{smart-folder}/%Y".to_string());
+            s.config_overrides.keep_unicode_in_filenames = Some(true);
+        });
+        assert_eq!(
+            compute_config_hash(&a),
+            compute_config_hash(&b),
+            "path-only changes must not invalidate the CloudKit zone token"
         );
     }
 
@@ -7704,7 +8005,7 @@ mod tests {
         let config = build_config_with(tmp.path(), "/photos", |_| {});
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "773e1b0c8f0d38a7",
+            hash, "9c00642f0507dce7",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }
@@ -7721,25 +8022,23 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "064b0e3c5a9755d3",
-            "compute_config_hash golden hash changed -- this will invalidate sync tokens"
+            hash, "9c00642f0507dce7",
+            "album selection should not change the CloudKit zone-token hash"
         );
     }
 
     #[test]
     fn golden_compute_config_hash_with_smart_folders() {
-        // Drift detection for the smart-folder branch of the hash. Pairs
-        // with `test_compute_config_hash_different_smart_folders`: the
-        // `_different_*` test catches missing-field regressions, this
-        // test catches accidental field-format changes.
+        // Smart-folder selection is intentionally excluded from the token
+        // safety hash. This pins that selection-only changes stay stable.
         let tmp = TempDir::new().unwrap();
         let config = build_config_with(tmp.path(), "/photos", |s| {
             s.config_overrides.smart_folders = vec!["Favorites".to_string(), "Videos".to_string()];
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "80c3ab8109fc5b00",
-            "compute_config_hash golden hash changed -- this will invalidate sync tokens"
+            hash, "9c00642f0507dce7",
+            "smart-folder selection should not change the CloudKit zone-token hash"
         );
     }
 
@@ -7755,7 +8054,7 @@ mod tests {
         });
         let hash = compute_config_hash(&config);
         assert_eq!(
-            hash, "3a610f0fe148f38c",
+            hash, "c9ea2589956cbb98",
             "compute_config_hash golden hash changed -- this will invalidate sync tokens"
         );
     }

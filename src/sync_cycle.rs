@@ -246,11 +246,11 @@ pub(crate) async fn run_cycle(
     let mut db_sync_token_advance_safe = !config.runtime.dry_run && !cycle_has_stale_plan;
     let mut force_full_for_config_hash = false;
 
-    // Check if the download config changed since last sync. If so, clear
-    // sync tokens and force full enumeration for this cycle
-    // -- the stored incremental token would miss assets that are newly
-    // eligible under the changed config (e.g. a user switching
-    // [photos].resolution or changing [filters].media). The hash is
+    // Check if token-unsafe eligibility config changed since last sync. If
+    // so, clear sync tokens and force full enumeration for this cycle -- the
+    // stored incremental token would miss assets that are newly eligible
+    // under the changed config (e.g. a user switching [photos].resolution or
+    // changing [filters].media). The hash is
     // cycle-invariant across libraries,
     // so this runs once per cycle, not once per library.
     //
