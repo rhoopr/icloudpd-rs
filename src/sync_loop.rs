@@ -31,9 +31,9 @@ use crate::sync_cycle::{run_cycle, sync_token_key as make_sync_token_key, Librar
 
 #[cfg(test)]
 use crate::sync_cycle::{
-    check_and_persist_enum_config_hash, determine_sync_mode, should_store_sync_token,
-    should_store_sync_token_for_cycle, CycleResult, EnumConfigHashOutcome, ENUM_CONFIG_HASH_KEY,
-    SYNC_TOKEN_PREFIX,
+    check_and_persist_enum_config_hash, check_download_config_hash_for_cycle, determine_sync_mode,
+    should_store_sync_token, should_store_sync_token_for_cycle, CycleResult,
+    DownloadConfigHashOutcome, EnumConfigHashOutcome, ENUM_CONFIG_HASH_KEY, SYNC_TOKEN_PREFIX,
 };
 
 #[cfg(all(test, feature = "xmp"))]
@@ -4704,13 +4704,12 @@ mod tests {
             result.stats.full_enumeration_reason,
             Some(download::FullEnumerationReason::EnumConfigHashDrift)
         );
-        assert_eq!(
+        let observed_modes = observed_modes.lock().expect("recorded modes lock").clone();
+        assert!(
             observed_modes
-                .lock()
-                .expect("recorded modes lock")
-                .as_slice(),
-            &[download::SyncMode::Full],
-            "config drift must not trust a surviving old incremental token in this cycle"
+                .iter()
+                .all(|mode| matches!(mode, download::SyncMode::Full)),
+            "config drift must not trust a surviving old incremental token in this cycle: {observed_modes:?}"
         );
         assert!(
             !result.db_sync_token_advance_safe,
@@ -4733,6 +4732,78 @@ mod tests {
                 .as_deref(),
             Some("zone-tok-new"),
             "the forced full pass should still refresh the selected zone token after success"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_download_config_hash_drift_forces_full_reconciliation() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        let old_download_dir = tempfile::tempdir().expect("old download tempdir");
+        let new_download_dir = tempfile::tempdir().expect("new download tempdir");
+
+        let old_build_download_config =
+            make_run_cycle_download_config_builder(old_download_dir.path(), Arc::clone(&db));
+        let old_download_config = old_build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from("PrimarySync"),
+        );
+        let old_hash = download::hash_download_config(&old_download_config);
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, &old_hash)
+            .await
+            .expect("seed old download hash");
+        db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let lib_state = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
+            make_empty_full_album("zone-tok-new"),
+        );
+        let states = vec![&lib_state];
+        let observed_modes = Arc::new(std::sync::Mutex::new(Vec::<download::SyncMode>::new()));
+        let build_download_config = make_recording_run_cycle_download_config_builder(
+            new_download_dir.path(),
+            Arc::clone(&db),
+            Arc::clone(&observed_modes),
+        );
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(
+            result.stats.full_enumeration_reason,
+            Some(download::FullEnumerationReason::DownloadConfigHashDrift)
+        );
+        let observed_modes = observed_modes.lock().expect("recorded modes lock").clone();
+        assert!(
+            observed_modes
+                .iter()
+                .all(|mode| matches!(mode, download::SyncMode::Full)),
+            "path drift must not run an empty incremental pass against the old cursor: {observed_modes:?}"
+        );
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-new"),
+            "the forced full pass should refresh the selected zone token after success"
         );
     }
 
@@ -5366,6 +5437,35 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("tok-keep"),
+        );
+    }
+
+    #[tokio::test]
+    async fn download_config_hash_drift_clears_token() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "old-download-hash")
+            .await
+            .expect("seed old path hash");
+        db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "tok-keep")
+            .await
+            .expect("seed token");
+
+        let outcome = check_download_config_hash_for_cycle(&db, "current-download-hash").await;
+
+        assert_eq!(outcome, DownloadConfigHashOutcome::Changed);
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .unwrap(),
+            None,
+            "path hash drift cannot leave an old incremental cursor in place"
+        );
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap(),
+            Some("old-download-hash".to_string()),
+            "the download pipeline owns persisting the path hash once reconciliation starts"
         );
     }
 

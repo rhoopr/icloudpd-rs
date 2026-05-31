@@ -161,6 +161,25 @@ impl EnumConfigHashOutcome {
     }
 }
 
+/// State of the path-affecting download config hash before a cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DownloadConfigHashOutcome {
+    Unchanged,
+    Changed,
+    ReadFailed,
+    TokenPurgeFailed,
+}
+
+impl DownloadConfigHashOutcome {
+    const fn must_force_full_sync(self) -> bool {
+        !matches!(self, Self::Unchanged)
+    }
+
+    const fn token_purge_failed(self) -> bool {
+        matches!(self, Self::TokenPurgeFailed)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SyncModeDecision {
     pub(crate) mode: download::SyncMode,
@@ -214,6 +233,46 @@ where
     outcome
 }
 
+/// Check the path-affecting download config hash.
+///
+/// This hash does not prove CloudKit cursor safety. It proves local
+/// path/state trust: after a directory or filename-template change, an
+/// incremental `/changes/zone` cycle would only see new deltas and could miss
+/// already-known assets that must be written to the new local paths.
+pub(crate) async fn check_download_config_hash_for_cycle<D>(
+    db: &D,
+    current_hash: &str,
+) -> DownloadConfigHashOutcome
+where
+    D: state::SyncTokenStore + ?Sized,
+{
+    match db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY).await {
+        Ok(Some(stored)) if stored == current_hash => DownloadConfigHashOutcome::Unchanged,
+        Ok(None) => DownloadConfigHashOutcome::Unchanged,
+        Ok(Some(_stored)) => match db.delete_metadata_by_prefix(SYNC_TOKEN_PREFIX).await {
+            Ok(n) if n > 0 => {
+                tracing::debug!(
+                    cleared = n,
+                    "Cleared sync tokens after download config hash drift"
+                );
+                DownloadConfigHashOutcome::Changed
+            }
+            Ok(_) => DownloadConfigHashOutcome::Changed,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to clear sync tokens after download config hash drift"
+                );
+                DownloadConfigHashOutcome::TokenPurgeFailed
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to read download config_hash");
+            DownloadConfigHashOutcome::ReadFailed
+        }
+    }
+}
+
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
 pub(crate) async fn run_cycle(
     library_states: &[&LibraryState],
@@ -245,6 +304,7 @@ pub(crate) async fn run_cycle(
     }
     let mut db_sync_token_advance_safe = !config.runtime.dry_run && !cycle_has_stale_plan;
     let mut force_full_for_config_hash = false;
+    let mut force_full_for_download_config_hash = false;
 
     // Check if token-unsafe eligibility config changed since last sync. If
     // so, clear sync tokens and force full enumeration for this cycle -- the
@@ -272,6 +332,28 @@ pub(crate) async fn run_cycle(
         }
     }
 
+    // A path-affecting config drift does not make the CloudKit token itself
+    // unsafe, but it does make an incremental cycle insufficient: with no
+    // changed assets, `/changes/zone` would never re-plan already-known media
+    // into the new directory/template. Detect that before choosing
+    // incremental mode and force a full reconciliation for this cycle.
+    if !config.runtime.dry_run {
+        if let (Some(db), Some(first_library)) = (state_db, library_states.first()) {
+            let probe_config = build_download_config(
+                download::SyncMode::Full,
+                Arc::new(rustc_hash::FxHashSet::default()),
+                Arc::new(download::AssetGroupings::default()),
+                Arc::from(first_library.zone_name.as_str()),
+            );
+            let download_config_hash = download::hash_download_config(&probe_config);
+            let outcome = check_download_config_hash_for_cycle(db, &download_config_hash).await;
+            force_full_for_download_config_hash = outcome.must_force_full_sync();
+            if outcome.token_purge_failed() {
+                db_sync_token_advance_safe = false;
+            }
+        }
+    }
+
     for lib_state in library_states {
         if shutdown_token.is_cancelled() {
             break;
@@ -287,6 +369,17 @@ pub(crate) async fn run_cycle(
                 zone = %lib_state.zone_name,
                 full_enumeration_reason = reason.as_str(),
                 "Forcing full sync because config-hash validation invalidated stored sync tokens"
+            );
+            SyncModeDecision {
+                mode: download::SyncMode::Full,
+                full_enumeration_reason: Some(reason),
+            }
+        } else if force_full_for_download_config_hash {
+            let reason = download::FullEnumerationReason::DownloadConfigHashDrift;
+            tracing::debug!(
+                zone = %lib_state.zone_name,
+                full_enumeration_reason = reason.as_str(),
+                "Forcing full sync because download config hash drift requires local path reconciliation"
             );
             SyncModeDecision {
                 mode: download::SyncMode::Full,

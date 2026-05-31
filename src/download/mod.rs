@@ -91,6 +91,7 @@ pub enum FullEnumerationReason {
     PathTemplateRequiresFullEnumeration,
     AlbumRelationHydrationIncomplete,
     EnumConfigHashDrift,
+    DownloadConfigHashDrift,
     ExplicitRetryFailed,
     #[allow(
         dead_code,
@@ -110,6 +111,7 @@ impl FullEnumerationReason {
             Self::PathTemplateRequiresFullEnumeration => "path_template_requires_full_enumeration",
             Self::AlbumRelationHydrationIncomplete => ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON,
             Self::EnumConfigHashDrift => "enum_config_hash_drift",
+            Self::DownloadConfigHashDrift => "download_config_hash_drift",
             Self::ExplicitRetryFailed => "explicit_retry_failed",
             Self::TokenBlockedPreviously => "token_blocked_previously",
             Self::OtherStaticReason => "other_static_reason",
@@ -572,6 +574,7 @@ fn finalize_hash(hasher: sha2::Sha256) -> String {
 /// of trusting paths derived under older code.
 const PATH_DERIVATION_HASH_VERSION: u8 = 2;
 const ENUMERATION_SAFETY_HASH_VERSION: u8 = 2;
+pub(crate) const DOWNLOAD_CONFIG_HASH_KEY: &str = "config_hash";
 
 /// Fields shared between [`hash_download_config`] and [`compute_config_hash`]
 /// that affect path resolution and asset eligibility.

@@ -1246,7 +1246,10 @@ where
     // under the new filter settings.
     if let Some(db) = &state_db {
         let config_hash = super::hash_download_config(config);
-        let stored_hash = db.get_metadata("config_hash").await.unwrap_or(None);
+        let stored_hash = db
+            .get_metadata(super::DOWNLOAD_CONFIG_HASH_KEY)
+            .await
+            .unwrap_or(None);
         if stored_hash.as_deref() != Some(&config_hash) {
             if stored_hash.is_some() {
                 tracing::info!("Download config changed since last sync, verifying all files");
@@ -1263,7 +1266,10 @@ where
                     _ => {}
                 }
             }
-            if let Err(e) = db.set_metadata("config_hash", &config_hash).await {
+            if let Err(e) = db
+                .set_metadata(super::DOWNLOAD_CONFIG_HASH_KEY, &config_hash)
+                .await
+            {
                 tracing::warn!(error = %e, "Failed to persist config_hash");
             }
         }
