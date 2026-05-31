@@ -248,24 +248,44 @@ where
 {
     match db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY).await {
         Ok(Some(stored)) if stored == current_hash => DownloadConfigHashOutcome::Unchanged,
-        Ok(None) => DownloadConfigHashOutcome::Unchanged,
-        Ok(Some(_stored)) => match db.delete_metadata_by_prefix(SYNC_TOKEN_PREFIX).await {
-            Ok(n) if n > 0 => {
-                tracing::debug!(
-                    cleared = n,
-                    "Cleared sync tokens after download config hash drift"
-                );
-                DownloadConfigHashOutcome::Changed
+        Ok(None) => {
+            if let Err(e) = db
+                .set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, current_hash)
+                .await
+            {
+                tracing::warn!(error = %e, "Failed to persist download config_hash");
+                return DownloadConfigHashOutcome::ReadFailed;
             }
-            Ok(_) => DownloadConfigHashOutcome::Changed,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to clear sync tokens after download config hash drift"
-                );
-                DownloadConfigHashOutcome::TokenPurgeFailed
+            DownloadConfigHashOutcome::Unchanged
+        }
+        Ok(Some(_stored)) => {
+            tracing::info!("Download config changed since last sync, verifying all files");
+            match db.delete_metadata_by_prefix(SYNC_TOKEN_PREFIX).await {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::debug!(
+                            cleared = n,
+                            "Cleared sync tokens after download config hash drift"
+                        );
+                    }
+                    if let Err(e) = db
+                        .set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, current_hash)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "Failed to persist download config_hash");
+                        return DownloadConfigHashOutcome::TokenPurgeFailed;
+                    }
+                    DownloadConfigHashOutcome::Changed
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to clear sync tokens after download config hash drift"
+                    );
+                    DownloadConfigHashOutcome::TokenPurgeFailed
+                }
             }
-        },
+        }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to read download config_hash");
             DownloadConfigHashOutcome::ReadFailed

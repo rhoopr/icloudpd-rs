@@ -36,5 +36,5 @@ pub(crate) async fn run(globals: &config::GlobalArgs, args: sync_loop::SyncArgs)
     }
 
     #[cfg(not(target_os = "windows"))]
-    sync_loop::run_sync(globals, args).await
+    Box::pin(sync_loop::run_sync(globals, args)).await
 }

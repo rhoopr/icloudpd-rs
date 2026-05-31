@@ -1241,40 +1241,6 @@ where
         None => preload_download_context(config).await,
     };
 
-    // On flag drift, clear stored sync tokens so the next cycle falls back
-    // to full enumeration and picks up assets the old token would miss
-    // under the new filter settings.
-    if let Some(db) = &state_db {
-        let config_hash = super::hash_download_config(config);
-        let stored_hash = db
-            .get_metadata(super::DOWNLOAD_CONFIG_HASH_KEY)
-            .await
-            .unwrap_or(None);
-        if stored_hash.as_deref() != Some(&config_hash) {
-            if stored_hash.is_some() {
-                tracing::info!("Download config changed since last sync, verifying all files");
-                // Clear stored sync tokens so the next cycle/run falls back to
-                // full enumeration, picking up assets that the old incremental
-                // token would have missed under the new filter settings.
-                match db.delete_metadata_by_prefix("sync_token:").await {
-                    Ok(n) if n > 0 => {
-                        tracing::debug!(cleared = n, "Cleared stale sync tokens");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to clear sync tokens");
-                    }
-                    _ => {}
-                }
-            }
-            if let Err(e) = db
-                .set_metadata(super::DOWNLOAD_CONFIG_HASH_KEY, &config_hash)
-                .await
-            {
-                tracing::warn!(error = %e, "Failed to persist config_hash");
-            }
-        }
-    }
-
     // Start sync run tracking
     let sync_run_id = if let Some(db) = &state_db {
         match db.start_sync_run().await {
@@ -2202,6 +2168,8 @@ pub(super) async fn build_download_outcome(
             tracing::info!("── Dry Run Summary ──");
             tracing::info!("  0 files would be downloaded");
             tracing::info!(destination = %config.directory.display(), "  destination");
+        } else if streaming_result.url_expired_abort {
+            tracing::warn!("Download batch aborted because signed iCloud URLs expired");
         } else {
             tracing::info!("No new photos to download");
         }
@@ -5648,6 +5616,29 @@ mod tests {
         assert!(
             stats.interrupted,
             "expired URL aborts must not look like clean syncs"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_url_abort_with_zero_downloads_is_not_success() {
+        use crate::download::DownloadOutcome;
+
+        let streaming_result = StreamingResult {
+            url_expired_abort: true,
+            ..StreamingResult::default()
+        };
+        let (outcome, stats) =
+            build_zero_download_outcome(streaming_result, DownloadControls::download_hidden())
+                .await;
+
+        assert!(
+            matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 1 }),
+            "expired CDN URL before any success must not be reported as a clean no-op, got {outcome:?}"
+        );
+        assert_eq!(stats.downloaded, 0);
+        assert!(
+            stats.interrupted,
+            "expired URL aborts must be visible as interrupted even with zero downloads"
         );
     }
 

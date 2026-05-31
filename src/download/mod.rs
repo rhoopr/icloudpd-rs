@@ -1877,12 +1877,6 @@ fn open_photo_stream_for_controls(
 struct RecentFrontier {
     asset_ids: Arc<FxHashSet<String>>,
     oldest_created: Option<DateTime<Utc>>,
-    assets: Vec<PhotoAsset>,
-}
-
-struct CollectedUnfiledStream {
-    token_rx: tokio::sync::oneshot::Receiver<Option<String>>,
-    items: Vec<anyhow::Result<PhotoAsset>>,
 }
 
 struct FullPassStreamOptions {
@@ -2065,7 +2059,6 @@ async fn build_recent_frontier(
     config: &DownloadConfig,
     controls: DownloadControls,
     shutdown_token: CancellationToken,
-    retain_assets: bool,
 ) -> Result<Option<RecentFrontier>> {
     let Some(recent) = config.recent else {
         return Ok(None);
@@ -2099,7 +2092,6 @@ async fn build_recent_frontier(
 
     let mut asset_ids = FxHashSet::default();
     let mut oldest_created: Option<DateTime<Utc>> = None;
-    let mut assets = Vec::new();
     while let Some(item) = stream.next().await {
         if shutdown_token.is_cancelled() {
             break;
@@ -2115,14 +2107,10 @@ async fn build_recent_frontier(
         }
         oldest_created = Some(oldest_created.map_or(created, |oldest| oldest.min(created)));
         asset_ids.insert(asset.id().to_string());
-        if retain_assets {
-            assets.push(asset);
-        }
     }
     Ok(Some(RecentFrontier {
         asset_ids: Arc::new(asset_ids),
         oldest_created,
-        assets,
     }))
 }
 
@@ -2176,42 +2164,6 @@ fn scope_frontier_limit(
     recent_frontier: Option<&RecentFrontier>,
 ) -> Option<u32> {
     recent_frontier.map_or(config.recent, |_| None)
-}
-
-fn collected_unfiled_from_recent_frontier(frontier: &RecentFrontier) -> CollectedUnfiledStream {
-    let (token_tx, token_rx) = tokio::sync::oneshot::channel();
-    let _ = token_tx.send(None);
-    CollectedUnfiledStream {
-        token_rx,
-        items: frontier.assets.iter().cloned().map(Ok).collect(),
-    }
-}
-
-async fn collect_unfiled_stream(
-    pass: &crate::commands::AlbumPass,
-    stream_total_count: Option<u64>,
-    config: &DownloadConfig,
-    controls: DownloadControls,
-    shutdown_token: CancellationToken,
-) -> CollectedUnfiledStream {
-    let (stream, token_rx) = open_photo_stream_for_controls(
-        &pass.album,
-        config.recent,
-        stream_total_count,
-        config.concurrent_downloads,
-        config.concurrent_downloads,
-        controls,
-    );
-    let stream = filter_stream_to_enumeration_bounds(stream, config, None);
-    tokio::pin!(stream);
-    let mut items = Vec::new();
-    while let Some(item) = stream.next().await {
-        if shutdown_token.is_cancelled() {
-            break;
-        }
-        items.push(item);
-    }
-    CollectedUnfiledStream { token_rx, items }
 }
 
 async fn run_full_pass_stream<S>(
@@ -3267,14 +3219,8 @@ async fn download_photos_full_with_token(
     let len_errors = pass_count_plan.len_errors;
     let display_total = display_total_for_recent_scope(&pass_counts, config);
     let deferred_unfiled = deferred_unfiled_index(passes);
-    let recent_frontier = build_recent_frontier(
-        passes,
-        config,
-        controls,
-        shutdown_token.clone(),
-        deferred_unfiled.is_some(),
-    )
-    .await?;
+    let recent_frontier =
+        build_recent_frontier(passes, config, controls, shutdown_token.clone()).await?;
 
     // Pass-specific path mode still needs one derived config per pass so
     // `{album}` / `{smart-folder}` / `{library}` expand correctly, but the
@@ -3339,7 +3285,7 @@ async fn download_photos_full_with_token(
                     Some(*index) != deferred_unfiled
                 }),
         )
-        .map(|((((index, pass), &count), total_count), pass_config)| {
+        .map(|((((_index, pass), &count), total_count), pass_config)| {
             let shutdown_token = shutdown_token.clone();
             let download_client = download_client.clone();
             let deferred_ids = deferred_ids.clone();
@@ -3394,7 +3340,6 @@ async fn download_photos_full_with_token(
                     }
                 }
 
-                let _ = index;
                 run_full_pass_stream(
                     download_client,
                     stream,
@@ -3415,30 +3360,7 @@ async fn download_photos_full_with_token(
         .buffer_unordered(pass_parallelism)
         .collect::<Vec<Result<PerPassStreamingResult>>>();
 
-        let unfiled_collection = async {
-            match deferred_unfiled {
-                Some(index) => match passes.get(index) {
-                    Some(pass) => match &recent_frontier {
-                        Some(frontier) => Some(collected_unfiled_from_recent_frontier(frontier)),
-                        None => Some(
-                            collect_unfiled_stream(
-                                pass,
-                                pass_stream_counts.get(index).copied().flatten(),
-                                config,
-                                controls,
-                                shutdown_token.clone(),
-                            )
-                            .await,
-                        ),
-                    },
-                    _ => None,
-                },
-                None => None,
-            }
-        };
-
-        let (pass_results, unfiled_collection) =
-            tokio::join!(non_unfiled_results, unfiled_collection);
+        let pass_results = non_unfiled_results.await;
 
         let mut token_receivers = Vec::with_capacity(passes.len());
         let mut deferred_exclusions_complete = true;
@@ -3466,35 +3388,42 @@ async fn download_photos_full_with_token(
             merge_streaming_result(&mut combined_result, result);
         }
 
-        if let (Some(index), Some(collected)) = (deferred_unfiled, unfiled_collection) {
+        if let Some(index) = deferred_unfiled {
             if deferred_exclusions_complete {
                 let excluded_ids = deferred_ids
                     .as_ref()
                     .and_then(|ids| ids.lock().ok().map(|guard| guard.clone()))
                     .unwrap_or_default();
-                let filtered = collected.items.into_iter().filter(move |item| {
-                    item.as_ref()
-                        .map_or(true, |asset| !excluded_ids.contains(asset.id()))
-                });
-                if let Some(pass_config) = pass_configs.get(index).cloned() {
-                    let filtered_items = filtered.collect::<Vec<_>>();
-                    let filtered_count = filtered_items
-                        .iter()
-                        .filter(|item| item.is_ok())
-                        .count()
-                        .try_into()
-                        .unwrap_or(u64::MAX);
-                    if let Some(slot) = pagination_counts.get_mut(index) {
-                        *slot = filtered_count;
-                    }
+                if let (Some(pass), Some(pass_config)) =
+                    (passes.get(index), pass_configs.get(index).cloned())
+                {
+                    let (stream, token_rx) = open_photo_stream_for_controls(
+                        &pass.album,
+                        scope_frontier_limit(config, recent_frontier.as_ref()),
+                        pass_stream_counts.get(index).copied().flatten(),
+                        config.concurrent_downloads,
+                        pass_config.concurrent_downloads,
+                        controls,
+                    );
+                    let stream = filter_stream_to_enumeration_bounds(
+                        stream,
+                        config,
+                        recent_frontier.as_ref(),
+                    )
+                    .filter(move |item| {
+                        let keep = item
+                            .as_ref()
+                            .map_or(true, |asset| !excluded_ids.contains(asset.id()));
+                        std::future::ready(keep)
+                    });
                     let pass_result = run_full_pass_stream(
                         download_client.clone(),
-                        stream::iter(filtered_items),
-                        collected.token_rx,
+                        stream,
+                        token_rx,
                         pass_config,
                         FullPassStreamOptions {
                             controls,
-                            count: filtered_count,
+                            count: pass_counts.get(index).copied().unwrap_or(0),
                             kind: crate::commands::PassKind::Unfiled,
                             shutdown_token: shutdown_token.clone(),
                             download_ctx: shared_download_ctx.clone(),
@@ -3502,6 +3431,10 @@ async fn download_photos_full_with_token(
                         },
                     )
                     .await?;
+                    let filtered_count = pass_result.result.assets_seen;
+                    if let Some(slot) = pagination_counts.get_mut(index) {
+                        *slot = filtered_count;
+                    }
                     let downloaded_u64 =
                         u64::try_from(pass_result.result.downloaded).unwrap_or(u64::MAX);
                     divider.mark_done(
@@ -3515,7 +3448,6 @@ async fn download_photos_full_with_token(
                 }
             } else {
                 combined_result.enumeration_complete = false;
-                token_receivers.push(collected.token_rx);
             }
         }
         divider.finish();
@@ -4393,7 +4325,7 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tokio::time::Duration;
 
@@ -4878,6 +4810,89 @@ mod tests {
         )
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DeferredOrderKind {
+        Album,
+        Unfiled,
+    }
+
+    #[derive(Clone)]
+    struct DeferredOrderSession {
+        kind: DeferredOrderKind,
+        album_done: Arc<AtomicBool>,
+        unfiled_started_too_early: Arc<AtomicBool>,
+        record_name: Arc<str>,
+    }
+
+    impl DeferredOrderSession {
+        fn new_pair() -> (Self, Self) {
+            let album_done = Arc::new(AtomicBool::new(false));
+            let unfiled_started_too_early = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    kind: DeferredOrderKind::Album,
+                    album_done: Arc::clone(&album_done),
+                    unfiled_started_too_early: Arc::clone(&unfiled_started_too_early),
+                    record_name: Arc::from("ORDER_ALBUM"),
+                },
+                Self {
+                    kind: DeferredOrderKind::Unfiled,
+                    album_done,
+                    unfiled_started_too_early,
+                    record_name: Arc::from("ORDER_UNFILED"),
+                },
+            )
+        }
+
+        fn unfiled_started_too_early(&self) -> bool {
+            self.unfiled_started_too_early.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for DeferredOrderSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch") {
+                return Ok(json!({
+                    "batch": [{"records": [{"fields": {"itemCount": {"value": 1}}}]}]
+                }));
+            }
+
+            if url.contains("/records/query?") {
+                match self.kind {
+                    DeferredOrderKind::Album => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        self.album_done.store(true, Ordering::SeqCst);
+                    }
+                    DeferredOrderKind::Unfiled => {
+                        if !self.album_done.load(Ordering::SeqCst) {
+                            self.unfiled_started_too_early.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+                return Ok(json!({
+                    "records": mock_photo_records_for_zone_with_filename(
+                        &self.record_name,
+                        "PrimarySync",
+                        &format!("{}.jpg", self.record_name),
+                    ),
+                    "syncToken": "zone-token",
+                }));
+            }
+
+            Ok(json!({"records": []}))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
     fn mock_album(name: &str, session: crate::test_helpers::MockPhotosSession) -> PhotoAlbum {
         album_with_session("PrimarySync", name, Box::new(session))
     }
@@ -5193,6 +5208,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_sync_threads_one_keeps_pass_streams_serial() {
+        let session = ConcurrentRecordsSession::new(Duration::from_millis(25));
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: probe_album("album_a", session.clone()),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Album,
+                album: probe_album("album_b", session.clone()),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::dry_run_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dry-run full sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            session.max_in_flight(),
+            1,
+            "threads=1 should prevent multi-pass enumeration from consuming multiple cores at once"
+        );
+    }
+
+    #[tokio::test]
     async fn full_sync_deferred_unfiled_excludes_album_members() {
         let album_session = MockPhotosFlow::new()
             .album_count(1)
@@ -5311,6 +5365,58 @@ mod tests {
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "filtered duplicate should not make the write-mode run partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_deferred_unfiled_opens_stream_after_album_passes_finish() {
+        let (album_session, unfiled_session) = DeferredOrderSession::new_pair();
+        let unfiled_probe = unfiled_session.clone();
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: album_with_session("PrimarySync", "Vacation", Box::new(album_session)),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session("PrimarySync", "", Box::new(unfiled_session)),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 2;
+        for (pass, record_name) in [(&passes[0], "ORDER_ALBUM"), (&passes[1], "ORDER_UNFILED")] {
+            let records = mock_photo_records_for_zone_with_filename(
+                record_name,
+                "PrimarySync",
+                &format!("{record_name}.jpg"),
+            );
+            let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+            seed_existing_file_for_asset(&config, pass, &asset).await;
+        }
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("write-mode full sync should succeed");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(
+            !unfiled_probe.unfiled_started_too_early(),
+            "deferred unfiled must not enumerate URL-bearing assets while album passes are still running"
+        );
+        assert_eq!(
+            result.stats.assets_seen, 2,
+            "album and unfiled assets should both be processed after exclusions are known"
         );
     }
 
@@ -9195,8 +9301,8 @@ mod tests {
         assert_eq!(result.sync_token, None);
         assert_eq!(
             unfiled_session.emitted_ids().len(),
-            60,
-            "deferred unfiled collection should still drain its recent stream"
+            120,
+            "recent deferred unfiled should build the global frontier and then re-open a fresh stream for download URLs"
         );
     }
 
@@ -9305,10 +9411,6 @@ mod tests {
             "unfiled assets must not be processed when album exclusions are incomplete"
         );
         assert_eq!(result.sync_token, None);
-        assert!(
-            !unfiled_session.emitted_ids().is_empty(),
-            "the deferred unfiled stream may be collected concurrently"
-        );
     }
 
     #[test]

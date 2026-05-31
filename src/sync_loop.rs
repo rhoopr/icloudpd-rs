@@ -2768,11 +2768,19 @@ mod tests {
         zone: &str,
         session: crate::test_helpers::MockPhotosSession,
     ) -> crate::icloud::photos::PhotoAlbum {
-        make_full_album_with_boxed_session(zone, Box::new(session))
+        make_named_full_album_with_boxed_session(zone, "TestAlbum", Box::new(session))
     }
 
     fn make_full_album_with_boxed_session(
         zone: &str,
+        session: Box<dyn crate::icloud::photos::PhotosSession>,
+    ) -> crate::icloud::photos::PhotoAlbum {
+        make_named_full_album_with_boxed_session(zone, "TestAlbum", session)
+    }
+
+    fn make_named_full_album_with_boxed_session(
+        zone: &str,
+        name: &str,
         session: Box<dyn crate::icloud::photos::PhotosSession>,
     ) -> crate::icloud::photos::PhotoAlbum {
         use serde_json::json;
@@ -2780,7 +2788,7 @@ mod tests {
             crate::icloud::photos::PhotoAlbumConfig {
                 params: Arc::new(std::collections::HashMap::new()),
                 service_endpoint: Arc::from("https://example.com"),
-                name: Arc::from("TestAlbum"),
+                name: Arc::from(name),
                 list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
                 obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
                 query_filter: None,
@@ -2794,6 +2802,22 @@ mod tests {
         )
     }
 
+    fn make_named_empty_full_album(
+        zone: &str,
+        name: &str,
+        zone_sync_token: &str,
+    ) -> crate::icloud::photos::PhotoAlbum {
+        make_named_full_album_with_boxed_session(
+            zone,
+            name,
+            Box::new(
+                crate::test_helpers::MockPhotosSession::new()
+                    .ok(album_count_response(0))
+                    .ok(serde_json::json!({"records": [], "syncToken": zone_sync_token})),
+            ),
+        )
+    }
+
     fn make_empty_full_album(zone_sync_token: &str) -> crate::icloud::photos::PhotoAlbum {
         make_empty_full_album_for_zone("PrimarySync", zone_sync_token)
     }
@@ -2802,12 +2826,7 @@ mod tests {
         zone: &str,
         zone_sync_token: &str,
     ) -> crate::icloud::photos::PhotoAlbum {
-        make_full_album_with_session(
-            zone,
-            crate::test_helpers::MockPhotosSession::new()
-                .ok(album_count_response(0))
-                .ok(serde_json::json!({"records": [], "syncToken": zone_sync_token})),
-        )
+        make_named_empty_full_album(zone, "TestAlbum", zone_sync_token)
     }
 
     fn make_one_photo_full_album_for_zone(
@@ -2843,25 +2862,41 @@ mod tests {
         sync_token_key: &str,
         album: crate::icloud::photos::PhotoAlbum,
     ) -> LibraryState {
+        make_run_cycle_library_state_with_passes(
+            zone,
+            sync_token_key,
+            vec![crate::commands::AlbumPass {
+                kind: crate::commands::PassKind::Unfiled,
+                album,
+                exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+            }],
+        )
+    }
+
+    fn make_run_cycle_library_state_with_passes(
+        zone: &str,
+        sync_token_key: &str,
+        passes: Vec<crate::commands::AlbumPass>,
+    ) -> LibraryState {
         LibraryState {
             library: crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
                 Box::new(crate::test_helpers::MockPhotosSession::new()),
                 zone,
             ),
             pass_scope: PassScope {
-                include_albums: false,
-                include_smart_folders: false,
-                include_unfiled: true,
+                include_albums: passes
+                    .iter()
+                    .any(|pass| pass.kind == crate::commands::PassKind::Album),
+                include_smart_folders: passes
+                    .iter()
+                    .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder),
+                include_unfiled: passes
+                    .iter()
+                    .any(|pass| pass.kind == crate::commands::PassKind::Unfiled),
             },
             zone_name: zone.to_string(),
             sync_token_key: sync_token_key.to_string(),
-            plan: crate::commands::AlbumPlan {
-                passes: vec![crate::commands::AlbumPass {
-                    kind: crate::commands::PassKind::Unfiled,
-                    album,
-                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
-                }],
-            },
+            plan: crate::commands::AlbumPlan { passes },
             plan_is_stale: false,
             plan_needs_refresh: false,
             cross_zone_libraries: Vec::new(),
@@ -4808,6 +4843,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_multi_pass_persists_base_download_config_hash() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let passes = vec![
+            crate::commands::AlbumPass {
+                kind: crate::commands::PassKind::Album,
+                album: make_named_empty_full_album("PrimarySync", "Vacation", "zone-tok"),
+                exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+            },
+            crate::commands::AlbumPass {
+                kind: crate::commands::PassKind::Album,
+                album: make_named_empty_full_album("PrimarySync", "Family", "zone-tok"),
+                exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+            },
+            crate::commands::AlbumPass {
+                kind: crate::commands::PassKind::Unfiled,
+                album: make_named_empty_full_album("PrimarySync", "", "zone-tok"),
+                exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+            },
+        ];
+        let lib_state = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
+            passes.clone(),
+        );
+        let options = RunCycleDownloadConfigOptions {
+            per_pass_paths: true,
+            ..RunCycleDownloadConfigOptions::default()
+        };
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            options,
+        );
+        let base_config = build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from("PrimarySync"),
+        );
+        let base_hash = download::hash_download_config(&base_config);
+        let pass_hashes: Vec<String> = passes
+            .iter()
+            .map(|pass| download::hash_download_config(&base_config.with_pass(pass)))
+            .collect();
+
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("multi-pass cycle should complete");
+
+        assert_eq!(result.failed_count, 0);
+        let stored_hash = db
+            .get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+            .await
+            .expect("read stored download hash")
+            .expect("download hash should be persisted");
+        assert_eq!(
+            stored_hash, base_hash,
+            "global download config hash must be the base run-level hash"
+        );
+        assert!(
+            pass_hashes.iter().take(2).all(|hash| hash != &stored_hash),
+            "album-expanded folder templates must not overwrite the global hash: {pass_hashes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_multi_pass_second_cycle_is_not_download_config_hash_drift() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let options = RunCycleDownloadConfigOptions {
+            per_pass_paths: true,
+            ..RunCycleDownloadConfigOptions::default()
+        };
+        let first_state = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
+            vec![
+                crate::commands::AlbumPass {
+                    kind: crate::commands::PassKind::Album,
+                    album: make_named_empty_full_album("PrimarySync", "Vacation", "zone-tok-1"),
+                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                },
+                crate::commands::AlbumPass {
+                    kind: crate::commands::PassKind::Unfiled,
+                    album: make_named_empty_full_album("PrimarySync", "", "zone-tok-1"),
+                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                },
+            ],
+        );
+        let first_builder = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            options,
+        );
+        let first_result = run_cycle(
+            &[&first_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &first_builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("first multi-pass cycle should complete");
+        assert_eq!(first_result.failed_count, 0);
+
+        let second_state = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
+            vec![crate::commands::AlbumPass {
+                kind: crate::commands::PassKind::Unfiled,
+                album: make_empty_full_album("zone-tok-2"),
+                exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+            }],
+        );
+        let observed_modes = Arc::new(std::sync::Mutex::new(Vec::<download::SyncMode>::new()));
+        let base_builder = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            options,
+        );
+        let second_builder = {
+            let observed_modes = Arc::clone(&observed_modes);
+            move |sync_mode: download::SyncMode,
+                  exclude_asset_ids: Arc<rustc_hash::FxHashSet<String>>,
+                  asset_groupings: Arc<download::AssetGroupings>,
+                  library: Arc<str>| {
+                observed_modes
+                    .lock()
+                    .expect("recorded modes lock")
+                    .push(sync_mode.clone());
+                base_builder(sync_mode, exclude_asset_ids, asset_groupings, library)
+            }
+        };
+        let second_result = run_cycle(
+            &[&second_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &second_builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("second cycle should complete");
+
+        assert_ne!(
+            second_result.stats.full_enumeration_reason,
+            Some(download::FullEnumerationReason::DownloadConfigHashDrift),
+            "pass-expanded hash from first run must not force path-drift reconciliation"
+        );
+        assert!(
+            observed_modes
+                .lock()
+                .expect("recorded modes lock")
+                .iter()
+                .any(|mode| matches!(mode, download::SyncMode::Incremental { .. })),
+            "unchanged config with a stored token should reach the incremental decision path"
+        );
+    }
+
+    #[tokio::test]
     async fn run_cycle_interrupted_incremental_download_blocks_sync_token_advance() {
         let config = make_run_cycle_config();
         let inner = make_state_db();
@@ -5464,8 +5678,36 @@ mod tests {
             db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
                 .await
                 .unwrap(),
-            Some("old-download-hash".to_string()),
-            "the download pipeline owns persisting the path hash once reconciliation starts"
+            Some("current-download-hash".to_string()),
+            "the cycle owner must persist the stable run-level path hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_config_hash_initial_persists_current_hash() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "tok-keep")
+            .await
+            .expect("seed token");
+
+        let outcome = check_download_config_hash_for_cycle(&db, "current-download-hash").await;
+
+        assert_eq!(outcome, DownloadConfigHashOutcome::Unchanged);
+        assert_eq!(
+            db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("current-download-hash"),
+            "first observation should persist the stable run-level path hash"
+        );
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tok-keep"),
+            "initial hash persistence must not purge existing tokens"
         );
     }
 
