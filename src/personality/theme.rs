@@ -70,7 +70,7 @@ pub fn progress_chars(mode: Mode) -> &'static str {
 /// when crossing a power of ten.
 ///
 /// Custom keys `{rate_sparkline}` and `{smart_eta}` are registered in
-/// `pipeline::create_progress_bar` via `ProgressStyle::with_key`.
+/// `progress::single` via `ProgressStyle::with_key`.
 /// Indicatif template + the static rule strings the friendly card draws on
 /// its top and bottom lines.
 ///

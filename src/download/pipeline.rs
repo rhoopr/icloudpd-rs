@@ -3,14 +3,13 @@
 //! cleanup pass and all single-task download logic.
 
 use std::fs::FileTimes;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use reqwest::Client;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc;
@@ -866,221 +865,6 @@ where
     errored + deferred
 }
 
-/// Bar factory for per-pass loops in `download::mod.rs`. Returns the bar
-/// plus an `Arc<AtomicU64>` byte counter that the caller threads through to
-/// each pass's `stream_and_download_from_stream` call. The same counter
-/// drives the friendly bar's bandwidth sparkline / rate display, and the
-/// download loop bumps it on every successful task completion.
-pub(super) fn create_progress_bar_for_passes(
-    no_progress_bar: bool,
-    only_print_filenames: bool,
-    total: u64,
-    mode: crate::personality::Mode,
-) -> (ProgressBar, std::sync::Arc<std::sync::atomic::AtomicU64>) {
-    let bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let pb = create_progress_bar(
-        no_progress_bar,
-        only_print_filenames,
-        total,
-        mode,
-        Some(std::sync::Arc::clone(&bytes)),
-    );
-    (pb, bytes)
-}
-
-/// Create a progress bar with a consistent template.
-///
-/// Returns `ProgressBar::hidden()` when the user passed `--no-progress-bar`,
-/// `--only-print-filenames`, or stdout is not a TTY (e.g. piped output, cron
-/// jobs) — this prevents output corruption and honours the user's preference.
-///
-/// In friendly mode the template uses block-char gradients and adapts to
-/// terminal width; in off mode it reproduces the v0.13 template byte-for-byte
-/// so machine consumers (asciinema replays, log scrapers) see no diff.
-fn create_progress_bar(
-    no_progress_bar: bool,
-    only_print_filenames: bool,
-    total: u64,
-    mode: crate::personality::Mode,
-    bytes_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-) -> ProgressBar {
-    if no_progress_bar || only_print_filenames || !std::io::stdout().is_terminal() {
-        return ProgressBar::hidden();
-    }
-    // Register with the singleton MultiProgress so tracing events landing
-    // mid-redraw (via the BarSuspendingStderr in lib.rs) don't desync the
-    // bar's cursor positioning. Visual output is unchanged from a standalone
-    // ProgressBar; the registration is purely about coordination.
-    let pb = crate::personality::active_bar::register(ProgressBar::new(total));
-    let cols = console::Term::stdout().size_checked().map(|(_, c)| c);
-    let tier = crate::personality::theme::WidthTier::from_cols(cols);
-    // Default to 80 cols when detection fails (e.g. piped stdout, but we
-    // already gated those paths above to ProgressBar::hidden so this is
-    // conservative). Cap at 200 so the rule line doesn't grow unbounded.
-    let cols_for_template = cols.unwrap_or(80).min(200);
-    // iCloud is the only backend today; when Immich/Nextcloud land, plumb
-    // the source through `download::Config` and pass it here.
-    let bar_template = crate::personality::theme::download_bar_template(
-        mode,
-        tier,
-        cols_for_template,
-        total,
-        crate::personality::theme::Source::Icloud,
-    );
-    let chars = crate::personality::theme::progress_chars(mode);
-    if let Ok(mut style) = ProgressStyle::with_template(&bar_template.template) {
-        style = style.progress_chars(chars);
-        // Friendly mode registers custom template keys for the animated bar,
-        // pulsing rules, sparkline, and smart ETA. Off mode skips them since
-        // its template doesn't reference any of these names.
-        if mode.is_friendly() {
-            let bar_width =
-                crate::personality::theme::friendly_bar_width(cols_for_template) as usize;
-            let sparkline_cells =
-                crate::personality::theme::friendly_sparkline_width(cols_for_template) as usize;
-            let sparkline = std::sync::Arc::new(std::sync::Mutex::new(
-                crate::personality::sparkline::SparklineState::new(sparkline_cells),
-            ));
-
-            // Animated bar: a `BarSmoother` lerps the displayed fraction
-            // toward the true fraction across redraws so the bar slides
-            // smoothly between file completions instead of jumping several
-            // cells per file. The leading-edge cell encodes the smoothed
-            // fractional position via PARTIAL_HEIGHTS — no in-place cycling
-            // that would compete with the bar's actual motion.
-            let smoother = std::sync::Arc::new(std::sync::Mutex::new(
-                crate::personality::bar_render::BarSmoother::new(),
-            ));
-            let smoother_for_key = std::sync::Arc::clone(&smoother);
-            style = style.with_key(
-                "bar_animated",
-                move |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                    let true_frac = f64::from(state.fraction());
-                    let displayed = {
-                        let mut sm = smoother_for_key
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        sm.tick(true_frac)
-                    };
-                    let _ = write!(
-                        w,
-                        "{}",
-                        crate::personality::bar_render::animated_bar_string(displayed, bar_width),
-                    );
-                },
-            );
-
-            // Rules track the bar's fill-color tier (green / cyan / bright
-            // cyan) so the box and bar shift together as progress advances.
-            // No time-based pulse: the color change comes from progress
-            // crossing a tier threshold, not from a redraw timer.
-            let top_rule_text = bar_template.top_rule.clone();
-            style = style.with_key(
-                "top_rule",
-                move |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                    let frac = f64::from(state.fraction());
-                    let s = crate::personality::bar_render::bar_fill_style(frac);
-                    let _ = write!(w, "{}", s.apply_to(&top_rule_text));
-                },
-            );
-            let bottom_rule_text = bar_template.bottom_rule.clone();
-            style = style.with_key(
-                "bottom_rule",
-                move |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                    let frac = f64::from(state.fraction());
-                    let s = crate::personality::bar_render::bar_fill_style(frac);
-                    let _ = write!(w, "{}", s.apply_to(&bottom_rule_text));
-                },
-            );
-
-            let sparkline_for_key = std::sync::Arc::clone(&sparkline);
-            // The sparkline samples bytes when a counter is wired up
-            // (production / per-pass branch); otherwise it falls back to the
-            // bar's file-count position so off-mode-tests-using-friendly
-            // surfaces still get something sensible.
-            let bytes_for_key = bytes_counter.clone();
-            style = style.with_key(
-                "rate_sparkline",
-                move |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                    let mut sl = sparkline_for_key
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let sample = match &bytes_for_key {
-                        Some(b) => b.load(std::sync::atomic::Ordering::Relaxed),
-                        None => state.pos(),
-                    };
-                    sl.sample(sample);
-                    let rate = sl.rate_per_sec();
-                    let chart = sl.render();
-                    if bytes_for_key.is_some() {
-                        // Bytes/sec → human-readable bandwidth (B/s, KB/s,
-                        // MB/s, GB/s). Fixed-width via format_bandwidth so the
-                        // sparkline / counts / ETA to its right stay aligned.
-                        if rate > 0.0 {
-                            let _ = write!(
-                                w,
-                                "{} {chart}",
-                                crate::personality::bar_render::format_bandwidth(rate),
-                            );
-                        } else {
-                            let _ = write!(w, "{:<10} {chart}", "  --   B/s");
-                        }
-                    } else {
-                        // Fallback: file rate display. Right-align to fixed
-                        // 5-char width.
-                        if rate > 0.0 {
-                            let _ = write!(w, "{rate:>5.1}/s {chart}");
-                        } else {
-                            let _ = write!(w, "{:>5}/s {chart}", "--.-");
-                        }
-                    }
-                },
-            );
-            // Per-bar EtaPhrasing carries the "calculating..." -> "still
-            // calculating..." escalation across redraws. Shared state via
-            // Arc<Mutex<>> because indicatif::with_key requires Send+Sync;
-            // contention is nil (single-bar, single draw thread, ~10Hz).
-            let phrasing = std::sync::Arc::new(std::sync::Mutex::new(
-                crate::personality::pace::EtaPhrasing::new(),
-            ));
-            let phrasing_for_key = std::sync::Arc::clone(&phrasing);
-            style = style.with_key(
-                "smart_eta",
-                move |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                    let secs = state.eta().as_secs();
-                    let mut p = phrasing_for_key
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if secs == 0 && state.pos() < state.len().unwrap_or(u64::MAX) {
-                        let _ = write!(w, "{}", p.unknown());
-                    } else {
-                        let _ = write!(w, "{}", p.known(secs));
-                    }
-                },
-            );
-
-            // Spinner glyph next to the percent — independent motion signal
-            // even if work pauses. Moon-phase rotation (`◐◓◑◒`) sits on the
-            // baseline like the digits beside it; braille spinners cluster
-            // dots in the upper-half of their cell and read as floating high.
-            //
-            // Each glyph is repeated 4 times so the spinner advances one
-            // visible phase per ~400ms of redraw activity (1.6s per full
-            // rotation at the 10Hz steady-tick cadence) — slow enough to read
-            // as "loading" rather than "frantic". The trailing space is
-            // indicatif's "finished" frame.
-            style = style.tick_chars(crate::personality::theme::FRIENDLY_TICK_CHARS);
-        }
-        pb.set_style(style);
-    }
-    // Steady tick so the bar redraws on its own clock and doesn't drift
-    // off-screen when stderr logs scroll past or work pauses on a network
-    // round-trip. 100ms is well under the perception threshold and also
-    // under indicatif's 20Hz redraw cap, so we don't burn CPU on draws.
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    pb
-}
-
 bitflags::bitflags! {
     /// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
     /// flow; individual flags gate which fields get embedded into the media file.
@@ -1277,7 +1061,7 @@ where
         .shared_bytes
         .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let pb = runtime.shared_pb.unwrap_or_else(|| {
-        create_progress_bar(
+        crate::personality::progress::single(
             reporting.no_progress_bar,
             controls.run_mode.only_print_filenames(),
             total,
@@ -2731,7 +2515,7 @@ pub(super) async fn run_download_pass(
     // create a fresh counter here. The retry pass downloads less data on
     // average, so the bandwidth display reads as the cleanup-only rate.
     let cleanup_bytes_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let pb = create_progress_bar(
+    let pb = crate::personality::progress::single(
         config.reporting.no_progress_bar,
         false,
         tasks.len() as u64,
@@ -3978,33 +3762,6 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(3600)), "1h 00m 00s");
         assert_eq!(format_duration(Duration::from_secs(5025)), "1h 23m 45s");
         assert_eq!(format_duration(Duration::from_secs(86399)), "23h 59m 59s");
-    }
-
-    #[test]
-    fn test_create_progress_bar_hidden_when_disabled() {
-        let pb = create_progress_bar(true, false, 100, crate::personality::Mode::Off, None);
-        assert!(pb.is_hidden());
-    }
-
-    #[test]
-    fn test_create_progress_bar_hidden_when_only_print_filenames() {
-        let pb = create_progress_bar(false, true, 100, crate::personality::Mode::Off, None);
-        assert!(pb.is_hidden());
-    }
-
-    #[test]
-    fn test_create_progress_bar_with_total() {
-        // When not disabled, the bar should have the correct length.
-        // In CI/test environments stdout may not be a TTY, so the bar
-        // may be hidden — we test both branches.
-        let pb = create_progress_bar(false, false, 42, crate::personality::Mode::Off, None);
-        if std::io::stdout().is_terminal() {
-            assert!(!pb.is_hidden());
-            assert_eq!(pb.length(), Some(42));
-        } else {
-            // Non-TTY: bar is hidden regardless of the flag
-            assert!(pb.is_hidden());
-        }
     }
 
     // These tests need a larger stack due to large async futures from reqwest

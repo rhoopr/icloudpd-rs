@@ -2387,12 +2387,14 @@ where
     // user per-album awareness; the divider's done lines accumulate
     // in scrollback so completed albums don't disappear.
     let pass_start = Instant::now();
-    let (pass_pb, pass_bytes) = crate::download::pipeline::create_progress_bar_for_passes(
+    let progress = crate::personality::progress::for_passes(
         options.controls.reporting.no_progress_bar,
         options.controls.run_mode.only_print_filenames(),
         options.count,
         options.controls.reporting.personality_mode,
     );
+    let pass_pb = progress.bar;
+    let pass_bytes = progress.bytes;
 
     let snapshot = options.album_snapshot.clone();
     let stream: DownloadPhotoStream = match snapshot {

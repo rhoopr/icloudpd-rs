@@ -16,6 +16,7 @@ pub mod cycler;
 pub mod format;
 pub mod narration;
 pub mod pace;
+pub(crate) mod progress;
 pub mod sparkline;
 pub mod summary;
 pub mod theme;
