@@ -135,7 +135,25 @@ pub trait DownloadStateStore: Send + Sync {
         asset_id: &str,
         deleted_at: Option<DateTime<Utc>>,
     ) -> Result<(), StateError>;
+    async fn mark_soft_deleted_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        self.mark_soft_deleted(library, asset_id, deleted_at)
+            .await?;
+        Ok(1)
+    }
     async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError>;
+    async fn mark_hidden_at_source_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+    ) -> Result<usize, StateError> {
+        self.mark_hidden_at_source(library, asset_id).await?;
+        Ok(1)
+    }
 }
 
 /// Import-time adoption and imported-file snapshot reads.
@@ -833,9 +851,27 @@ pub trait StateDb: Send + Sync {
         asset_id: &str,
         deleted_at: Option<DateTime<Utc>>,
     ) -> Result<(), StateError>;
+    async fn mark_soft_deleted_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        self.mark_soft_deleted(library, asset_id, deleted_at)
+            .await?;
+        Ok(1)
+    }
 
     /// Mark an asset as hidden at source within `library`.
     async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError>;
+    async fn mark_hidden_at_source_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+    ) -> Result<usize, StateError> {
+        self.mark_hidden_at_source(library, asset_id).await?;
+        Ok(1)
+    }
 
     /// Record that a metadata write (EXIF embed or sidecar) failed for this
     /// asset-version pair after the bytes landed on disk. Sets
@@ -1279,8 +1315,25 @@ where
         DownloadStateStore::mark_soft_deleted(self, library, asset_id, deleted_at).await
     }
 
+    async fn mark_soft_deleted_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        DownloadStateStore::mark_soft_deleted_affected(self, library, asset_id, deleted_at).await
+    }
+
     async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
         DownloadStateStore::mark_hidden_at_source(self, library, asset_id).await
+    }
+
+    async fn mark_hidden_at_source_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+    ) -> Result<usize, StateError> {
+        DownloadStateStore::mark_hidden_at_source_affected(self, library, asset_id).await
     }
 
     async fn record_metadata_write_failure(
@@ -1460,8 +1513,25 @@ impl DownloadStateStore for dyn StateDb + '_ {
         StateDb::mark_soft_deleted(self, library, asset_id, deleted_at).await
     }
 
+    async fn mark_soft_deleted_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
+        StateDb::mark_soft_deleted_affected(self, library, asset_id, deleted_at).await
+    }
+
     async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
         StateDb::mark_hidden_at_source(self, library, asset_id).await
+    }
+
+    async fn mark_hidden_at_source_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+    ) -> Result<usize, StateError> {
+        StateDb::mark_hidden_at_source_affected(self, library, asset_id).await
     }
 }
 
@@ -1879,7 +1949,7 @@ impl SqliteStateDb {
     /// [`Self::with_conn_mut`] so the sync rusqlite call runs on the
     /// blocking pool.
     #[cfg(test)]
-    fn acquire_lock(
+    pub(crate) fn acquire_lock(
         &self,
         operation: &str,
     ) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, StateError> {
@@ -3543,17 +3613,18 @@ impl SqliteStateDb {
         library: &str,
         asset_id: &str,
         deleted_at: Option<DateTime<Utc>>,
-    ) -> Result<(), StateError> {
+    ) -> Result<usize, StateError> {
         let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         self.with_conn("mark_soft_deleted", move |conn| {
-            conn.execute(
-                "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
+            let updated = conn
+                .execute(
+                    "UPDATE assets SET is_deleted = 1, deleted_at = COALESCE(?1, deleted_at) \
                  WHERE library = ?2 AND id = ?3",
-                rusqlite::params![deleted_at.map(|dt| dt.timestamp()), library, asset_id],
-            )
-            .map_err(|e| StateError::query("mark_soft_deleted", e))?;
-            Ok(())
+                    rusqlite::params![deleted_at.map(|dt| dt.timestamp()), library, asset_id],
+                )
+                .map_err(|e| StateError::query("mark_soft_deleted", e))?;
+            Ok(updated)
         })
         .await
     }
@@ -3562,16 +3633,17 @@ impl SqliteStateDb {
         &self,
         library: &str,
         asset_id: &str,
-    ) -> Result<(), StateError> {
+    ) -> Result<usize, StateError> {
         let library = library.to_owned();
         let asset_id = asset_id.to_owned();
         self.with_conn("mark_hidden_at_source", move |conn| {
-            conn.execute(
-                "UPDATE assets SET is_hidden = 1 WHERE library = ?1 AND id = ?2",
-                rusqlite::params![library, asset_id],
-            )
-            .map_err(|e| StateError::query("mark_hidden_at_source", e))?;
-            Ok(())
+            let updated = conn
+                .execute(
+                    "UPDATE assets SET is_hidden = 1 WHERE library = ?1 AND id = ?2",
+                    rusqlite::params![library, asset_id],
+                )
+                .map_err(|e| StateError::query("mark_hidden_at_source", e))?;
+            Ok(updated)
         })
         .await
     }
@@ -3845,10 +3917,31 @@ impl DownloadStateStore for SqliteStateDb {
         asset_id: &str,
         deleted_at: Option<DateTime<Utc>>,
     ) -> Result<(), StateError> {
+        SqliteStateDb::mark_soft_deleted(self, library, asset_id, deleted_at)
+            .await
+            .map(|_| ())
+    }
+
+    async fn mark_soft_deleted_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, StateError> {
         SqliteStateDb::mark_soft_deleted(self, library, asset_id, deleted_at).await
     }
 
     async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
+        SqliteStateDb::mark_hidden_at_source(self, library, asset_id)
+            .await
+            .map(|_| ())
+    }
+
+    async fn mark_hidden_at_source_affected(
+        &self,
+        library: &str,
+        asset_id: &str,
+    ) -> Result<usize, StateError> {
         SqliteStateDb::mark_hidden_at_source(self, library, asset_id).await
     }
 }
@@ -7693,10 +7786,12 @@ mod tests {
         db.upsert_seen(&orig).await.unwrap();
         db.upsert_seen(&med).await.unwrap();
         let when = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        db.mark_soft_deleted("PrimarySync", "DEL_1", Some(when))
+        let updated = db
+            .mark_soft_deleted("PrimarySync", "DEL_1", Some(when))
             .await
             .unwrap();
 
+        assert_eq!(updated, 2);
         let pending = db.get_pending().await.unwrap();
         assert_eq!(pending.len(), 2);
         for rec in &pending {
@@ -7713,11 +7808,30 @@ mod tests {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let rec = TestAssetRecord::new("HID_1").build();
         db.upsert_seen(&rec).await.unwrap();
-        db.mark_hidden_at_source("PrimarySync", "HID_1")
+        let updated = db
+            .mark_hidden_at_source("PrimarySync", "HID_1")
             .await
             .unwrap();
+        assert_eq!(updated, 1);
         let pending = db.get_pending().await.unwrap();
         assert!(pending[0].metadata.is_hidden);
+    }
+
+    #[tokio::test]
+    async fn source_state_transitions_report_zero_rows() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let deleted = db
+            .mark_soft_deleted("PrimarySync", "MISSING_DELETE", None)
+            .await
+            .unwrap();
+        let hidden = db
+            .mark_hidden_at_source("PrimarySync", "MISSING_HIDDEN")
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(hidden, 0);
     }
 
     #[tokio::test]
