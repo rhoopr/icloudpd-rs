@@ -280,7 +280,7 @@ pub struct FriendlyArgs {
     #[arg(
         long,
         overrides_with = "no_friendly",
-        long_help = "Use friendly progress UI (verb-cycling spinners, curated phase narration, summary card, sign-off). \
+        long_help = "Use friendly progress UI (richer progress cards, curated phase narration, summary card, sign-off). \
                      Default: on for plain TTYs, off in service/container/journal contexts and whenever a \
                      machine-output mode (`--only-print-filenames` or TOML report JSON) or an explicit \
                      `--log-level` / `RUST_LOG` is in play. `--friendly` overrides the TOML `[ui] friendly` \

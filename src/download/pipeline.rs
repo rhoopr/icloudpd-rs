@@ -1076,16 +1076,7 @@ where
     // producer's skip path (which doesn't set_message) and leave the
     // wide_msg blank for the whole pass.
     //
-    // In friendly mode, the cycler also rotates a verb pool every ~600ms so
-    // the line stays alive during the listing/scan gap before the first
-    // file completes; in off mode it seeds the same static "scanning..."
-    // string and skips spawning a task. The consumer's first per-file
-    // `set_message` cancels the cycler so verbs and filenames don't race.
-    let listing_cycler = crate::personality::cycler::PhaseCycler::spawn(
-        pb.clone(),
-        config.pass_label().to_string(),
-        reporting.personality_mode,
-    );
+    pb.set_message(format!("{} \u{00b7} scanning...", config.pass_label()));
 
     if controls.run_mode.only_print_filenames() {
         // Load state DB context so we skip already-downloaded assets,
@@ -1863,9 +1854,6 @@ where
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("");
-        // Stop the listing cycler so we don't fight it for the wide_msg
-        // slot. Idempotent atomic store; cheap to call every iteration.
-        listing_cycler.cancel();
         // Prefix the active filename with the pass's album label so the user
         // can tell which album's items are downloading.
         pb.set_message(format!("{} \u{00b7} {filename}", config.pass_label()));
@@ -5125,6 +5113,40 @@ mod tests {
             fs::read_dir(dir.path()).unwrap().next().is_none(),
             "dry-run mode must not create downloaded files"
         );
+    }
+
+    #[tokio::test]
+    async fn shared_bar_seeds_static_scanning_message_before_first_file() {
+        use crate::download::{DownloadConfig, DownloadRunMode};
+        use crate::icloud::photos::PhotoAsset;
+        use crate::personality::Mode;
+        use futures_util::stream;
+
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        config.album_name = Some(std::sync::Arc::from("Trip"));
+        let config = Arc::new(config);
+        let pb = ProgressBar::hidden();
+        let controls = DownloadControls::new(
+            DownloadRunMode::Download,
+            DownloadReporting::new(false, Mode::Friendly),
+        );
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::empty::<anyhow::Result<PhotoAsset>>(),
+            &config,
+            controls,
+            0,
+            CancellationToken::new(),
+            StreamRuntime::new(Some(pb.clone()), None),
+        )
+        .await
+        .expect("empty shared-bar pass should finish");
+
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(pb.message(), "Trip \u{00b7} scanning...");
     }
 
     #[tokio::test]

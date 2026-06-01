@@ -1,6 +1,6 @@
 //! Personality layer: friendly UX wrapping for CLI output.
 //!
-//! Two modes: `Friendly` adds verb-cycling spinners, ETA wording, summary
+//! Two modes: `Friendly` adds richer progress cards, ETA wording, summary
 //! cards, and curated phase narration. `Off` keeps v0.13 behaviour byte-for-byte
 //! for journals, pipes, JSON consumers, and explicit `--log-level` users.
 //!
@@ -12,7 +12,6 @@
 pub mod active_bar;
 pub mod album_divider;
 pub mod bar_render;
-pub mod cycler;
 pub mod format;
 pub mod narration;
 pub mod pace;
@@ -22,7 +21,6 @@ pub mod summary;
 pub mod theme;
 pub mod tracing;
 pub mod tty_echo;
-pub mod verbs;
 
 use std::env;
 use std::io::IsTerminal;
@@ -30,7 +28,7 @@ use std::io::IsTerminal;
 /// Friendly UX mode resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// Verb cycling, summary card, sign-off, curated phase lines.
+    /// Rich progress card, summary card, sign-off, curated phase lines.
     Friendly,
     /// v0.13 behaviour: structured tracing with target+timestamp, plain bars.
     #[default]

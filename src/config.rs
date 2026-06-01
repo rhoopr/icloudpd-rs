@@ -31,7 +31,7 @@ pub(crate) struct TomlConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlUi {
-    /// Friendly progress UX: verb-cycling spinners, summary card, curated
+    /// Friendly progress UX: richer progress cards, summary card, curated
     /// phase narration. Defaults to `true` on a plain TTY; auto-disabled in
     /// non-TTY, service, container, systemd, machine-output, or explicit
     /// `--log-level` / `RUST_LOG` contexts. The CLI flags `--friendly` and
