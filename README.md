@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="kei logo" width="400">
 </p>
 
-<h1 align="center">kei: media sync engine</h1>
+<h1 align="center">kei: iCloud Photos to your own storage</h1>
 
 <p align="center">
   Sync your cloud photos and videos to local storage. Fast, resumable, runs unattended.<br><br>
@@ -15,79 +15,39 @@
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fgithub.com%2Fipitio%2Fbackage%2Fraw%2Findex%2Frhoopr%2Fkei%2Fkei.json&query=%24.downloads&logo=docker&label=pulls" alt="Pulls"></a></p>
 
-- Download your iCloud Photos library, including shared libraries
-- Keep local albums, smart folders, and unfiled photos organized
-- Run once, on a schedule, in Docker, or as a background service
-- Preserve originals, edited versions, RAW files, Live Photos, and metadata
-- Recover from interruptions without starting over
-- Check, repair, and adopt an existing photo archive
-- Immich, Google Takeout, Nextcloud, and Ente support are on the roadmap
+kei copies your iCloud Photos library into folders you control. Use it for a one-time export, a steady local mirror, or a small home-lab backup that runs in Docker or as a background service.
 
----
+It handles the parts that make photo backups annoying: big libraries, shared libraries, albums, Live Photos, RAW files, edited versions, retries, interrupted downloads, and existing archives you don't want to download twice.
 
 > [!WARNING]
 > kei is pre-release software. Minor versions may contain breaking changes.
-> 
-> Check [CHANGELOG.md](CHANGELOG.md) before updating.
-
-> [!IMPORTANT]
-> **v0.20 is a breaking config release.**
->
-> The old "everything can be a CLI flag or `KEI_*` env var" model was replaced by a smaller source model:
->
-> - TOML is for settings you want to keep.
-> - CLI flags are for one run or one action.
-> - Env vars are for secrets, config discovery, service-manager glue, and tests.
->
-> If you run kei from Docker, systemd, launchd, cron, or a shell alias, move your saved sync settings into `config.toml` before upgrading. Use the [v0.20 migration guide](docs/v0.20-migration.md) for old flag/env names and [example.config.toml](example.config.toml) for the full config file.
->
-> Common config moves:
->
-> | Old durable setting | New v0.20 setting |
-> |---|---|
-> | `--download-dir`, `KEI_DOWNLOAD_DIR` | `[download].directory` |
-> | `--album`, `--smart-folder`, `--library`, `--unfiled` | `[filters].albums`, `.smart_folders`, `.libraries`, `.unfiled` |
-> | `--skip-videos`, `--skip-photos` | `[filters].media` |
-> | `--size`, `--live-photo-size`, `--force-size` | `[photos].resolution`, `.live_resolution`, `.force_resolution` |
-> | `--watch-with-interval` | `[watch].interval` |
-> | `--report-json`, `--notification-script` | `[report].json`, `[notifications].script` |
-> | `--http-bind`, `--http-port` | `[server].bind`, `[server].port` |
-
-
----
+> Read [CHANGELOG.md](CHANGELOG.md) before updating.
 
 ## Install
 
 ```sh
-brew install rhoopr/kei/kei             # Homebrew
-
-docker pull ghcr.io/rhoopr/kei:latest   # latest released version
-docker pull ghcr.io/rhoopr/kei:0.21.0   # pin a specific release
-docker pull ghcr.io/rhoopr/kei:main     # newest main branch build (frequently updated)
+brew install rhoopr/kei/kei
 ```
 
-Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, FreeBSD, and other install paths, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install).
+```sh
+docker pull ghcr.io/rhoopr/kei:latest
+```
 
+Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, source builds, FreeBSD, and NAS setup, see [Install](https://github.com/rhoopr/kei/wiki/Install).
 
 > [!IMPORTANT]
-> kei needs iCloud Photos web access. If `Advanced Data Protection` is on, turn it off and enable "Access iCloud Data on the Web" in your Apple ID settings. Details: [Authentication wiki](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
+> kei needs iCloud Photos web access. If `Advanced Data Protection` is on, turn it off and enable "Access iCloud Data on the Web" in your Apple ID settings. See [Authentication](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
 
----
-
-## Quick start
+## Start
 
 ```sh
 kei config setup
 kei sync
 ```
 
-`kei config setup` writes a TOML config and can save your password in the OS
-keyring, or in an encrypted file when a keyring isn't available. You'll still
-approve 2FA on a trusted device the first time. The wizard defaults to all
-visible iCloud Photos libraries and adds `{library}` to unfiled paths when that
-keeps shared-library files separated.
+The setup wizard creates `~/.config/kei/config.toml`, asks where photos should land, and can save your password in the OS keyring. You'll still approve 2FA on a trusted Apple device the first time.
 
-Minimal config:
+A tiny config looks like this:
 
 ```toml
 [auth]
@@ -97,70 +57,91 @@ username = "you@example.com"
 directory = "~/Photos/iCloud"
 ```
 
-> [!TIP]
-> Coming from `icloudpd`? The [icloudpd migration guide](docs/migration-from-icloudpd.md) shows how to `kei sync` without re-downloading.
+After the first run:
 
----
+```sh
+kei status
+kei sync --recent 30d
+kei list albums
+```
 
-## Features
+## What kei gives you
 
-Sync what matters:
+- A local copy of your iCloud Photos media, with no Apple Photos library required.
+- Folder layouts for dates, albums, smart folders, shared libraries, and unfiled photos.
+- Original photos and videos, plus Live Photos, RAW siblings, and edited versions when you ask for them.
+- Resumable downloads and checksum checks before files are marked complete.
+- One-shot sync, watch mode, Docker, systemd, launchd, and Windows service support.
+- Maintenance commands for status checks, verification, reconcile, reset, and existing-file import.
 
-- Sync your full iCloud Photos library, selected albums, smart folders, shared libraries, or only recent media.
-- Keep unfiled photos and shared-library media organized without manual sorting.
-- Filter by media type, filename, date, and library when you only want part of the archive.
-- Details: [Configuration](https://github.com/rhoopr/kei/wiki/Configuration)
+Today kei syncs iCloud Photos. Immich, Google Takeout, Nextcloud, and Ente support are on the roadmap.
 
-Run it your way:
+## Common setups
 
-- Run kei once, on a schedule, in Docker, or as a background service.
-- Watch mode keeps syncing after the first run, with health checks and metrics for long-running setups.
-- Friendly terminal output is used for interactive runs. Services and scripts get structured logs.
-- Details: [Docker](https://github.com/rhoopr/kei/wiki/Docker), [Service](https://github.com/rhoopr/kei/wiki/Service)
+### Keep a daily mirror
 
-Preserve the media you care about:
+```toml
+[auth]
+username = "you@example.com"
 
-- Download originals, edited versions, RAW files, Live Photos, and alternate sizes.
-- Keep local folders predictable with templates for albums, smart folders, dates, and libraries.
-- Optional metadata writing can update EXIF, embed XMP, or write XMP sidecars.
-- Details: [Configuration](https://github.com/rhoopr/kei/wiki/Configuration)
+[download]
+directory = "/photos"
 
-Recover and maintain your archive:
+[watch]
+interval = 86400
+```
 
-- Interrupted downloads resume instead of starting from scratch.
-- `kei status`, `kei verify`, and `kei reconcile` help you inspect and repair local state.
-- `kei import-existing` can adopt an existing photo archive without re-downloading everything.
-- Details: [Commands](https://github.com/rhoopr/kei/wiki/Home#commands)
+Run it with `kei service run`, Docker Compose, or `kei install`.
 
----
+### Sync only part of the library
+
+```toml
+[filters]
+albums = ["Family", "Trips"]
+unfiled = false
+media = ["photos", "videos", "live-photos"]
+```
+
+You can also sync recent media for one run:
+
+```sh
+kei sync --recent 100
+kei sync --recent 30d
+```
+
+### Adopt files you already have
+
+```sh
+kei import-existing
+kei sync
+```
+
+Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-icloudpd.md).
+
+## Upgrade note
+
+v0.20 moved durable sync settings into TOML. Keep CLI flags for one run, env vars for secrets and service glue, and saved settings in `config.toml`.
+
+If an old command fails with a removed flag such as `--download-dir`, move that value into the config file:
+
+```toml
+[download]
+directory = "/photos"
+```
+
+Use the [v0.20 migration guide](docs/v0.20-migration.md) and [example.config.toml](example.config.toml) for the full map.
 
 ## Docs
 
-Everything else lives on the [wiki](https://github.com/rhoopr/kei/wiki): commands, configuration, Docker, services, credentials, filtering, folder templates, and troubleshooting.
+- [Install](https://github.com/rhoopr/kei/wiki/Install)
+- [Configuration](https://github.com/rhoopr/kei/wiki/Configuration)
+- [Docker](https://github.com/rhoopr/kei/wiki/Docker)
+- [Service mode](https://github.com/rhoopr/kei/wiki/Service)
+- [Commands](https://github.com/rhoopr/kei/wiki/Home#commands)
+- [Credentials](https://github.com/rhoopr/kei/wiki/Credentials)
+- [Troubleshooting](https://github.com/rhoopr/kei/wiki/Troubleshooting)
 
-- [Commands](https://github.com/rhoopr/kei/wiki/Home#commands) - command reference and examples
-- [Configuration](https://github.com/rhoopr/kei/wiki/Configuration) - TOML config model and source precedence
-- [Docker](https://github.com/rhoopr/kei/wiki/Docker) - Compose with mounted `config.toml` and headless 2FA
-- [Service](https://github.com/rhoopr/kei/wiki/Service) - background service setup for Linux, macOS, and Windows
-- [Synology](https://github.com/rhoopr/kei/wiki/Synology) - Container Manager setup and NAS ownership notes
-- [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) - keyring, encrypted file, password files, and commands
-- [v0.20 migration guide](docs/v0.20-migration.md)
-- [icloudpd migration guide](docs/migration-from-icloudpd.md)
-- [Complete example config](example.config.toml)
-- [Changelog](CHANGELOG.md)
-
----
-
-## Contributing
-
-Contributions welcome. Open an issue first if you're planning something big.
-
-```sh
-just gate    # local pre-push checks
-just --list  # see every recipe
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [tests/README.md](tests/README.md) for the test catalog.
+Open an issue for bugs or sharp edges: <https://github.com/rhoopr/kei/issues>
 
 ## License
 
@@ -168,4 +149,4 @@ MIT - see [LICENSE](LICENSE)
 
 ## Acknowledgments
 
-The iCloud adapter builds on years of reverse-engineering by the [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader) project. kei was originally published as `icloudpd-rs` before broadening beyond iCloud Photos. Thanks to the original maintainers for the work that made kei's iCloud support possible.
+kei's iCloud support builds on reverse-engineering from [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader). kei was originally published as `icloudpd-rs` before broadening beyond iCloud Photos.
