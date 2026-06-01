@@ -120,6 +120,14 @@ struct FetcherRange {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FetcherBehavior {
+    page_size: usize,
+    preserve_blank_sync_tokens_for_diagnostics: bool,
+    allow_unpaired_at_range_boundary: bool,
+    treat_empty_tail_as_error: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EnumerationPlan {
     page_size: usize,
@@ -598,6 +606,7 @@ impl PhotoAlbum {
             PhotoStreamProfile::FastEnumeration { concurrency },
             None,
             false,
+            false,
         );
         tokio::spawn(async move {
             let panicked = await_fetcher_handles(handles).await;
@@ -630,19 +639,32 @@ impl PhotoAlbum {
             total_count,
             PhotoStreamProfile::FastEnumeration { concurrency },
             false,
+            true,
         )
     }
 
-    /// Like `photo_stream_with_token`, but tuned for live downloads.
-    ///
-    /// This intentionally gives up parallel page fetchers and shrinks the page
-    /// size so CloudKit content URLs are produced just ahead of the download
-    /// workers instead of in a large, long-lived backlog.
-    pub(crate) fn photo_stream_with_token_for_download(
+    pub(crate) fn photo_stream_with_token_policy(
+        &self,
+        limit: Option<u32>,
+        total_count: Option<u64>,
+        concurrency: usize,
+        treat_empty_tail_as_error: bool,
+    ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
+        self.photo_stream_with_token_inner(
+            limit,
+            total_count,
+            PhotoStreamProfile::FastEnumeration { concurrency },
+            false,
+            treat_empty_tail_as_error,
+        )
+    }
+
+    pub(crate) fn photo_stream_with_token_for_download_policy(
         &self,
         limit: Option<u32>,
         total_count: Option<u64>,
         download_concurrency: usize,
+        treat_empty_tail_as_error: bool,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         self.photo_stream_with_token_inner(
             limit,
@@ -651,6 +673,7 @@ impl PhotoAlbum {
                 download_concurrency,
             },
             true,
+            treat_empty_tail_as_error,
         )
     }
 
@@ -660,6 +683,7 @@ impl PhotoAlbum {
         total_count: Option<u64>,
         profile: PhotoStreamProfile,
         preserve_blank_sync_tokens_for_diagnostics: bool,
+        treat_empty_tail_as_error: bool,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         if self.has_cross_zone_hydration() {
             return self.photo_stream_with_cross_zone_hydration(
@@ -667,6 +691,7 @@ impl PhotoAlbum {
                 total_count,
                 profile,
                 preserve_blank_sync_tokens_for_diagnostics,
+                treat_empty_tail_as_error,
             );
         }
 
@@ -680,6 +705,7 @@ impl PhotoAlbum {
             profile,
             Some(fetcher_sync_tokens.clone()),
             preserve_blank_sync_tokens_for_diagnostics,
+            treat_empty_tail_as_error,
         );
         let album_name = Arc::clone(&self.name);
 
@@ -710,6 +736,7 @@ impl PhotoAlbum {
         total_count: Option<u64>,
         profile: PhotoStreamProfile,
         preserve_blank_sync_tokens_for_diagnostics: bool,
+        treat_empty_tail_as_error: bool,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         let (tx, rx) = mpsc::channel::<anyhow::Result<PhotoAsset>>(500);
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
@@ -718,6 +745,7 @@ impl PhotoAlbum {
             total_count,
             profile,
             preserve_blank_sync_tokens_for_diagnostics,
+            treat_empty_tail_as_error,
         );
         let Some(container_id) = self.container_id.clone() else {
             let _ = token_tx.send(None);
@@ -850,6 +878,7 @@ impl PhotoAlbum {
         total_count: Option<u64>,
         profile: PhotoStreamProfile,
         preserve_blank_sync_tokens_for_diagnostics: bool,
+        treat_empty_tail_as_error: bool,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
         let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
@@ -861,6 +890,7 @@ impl PhotoAlbum {
             profile,
             Some(fetcher_sync_tokens.clone()),
             preserve_blank_sync_tokens_for_diagnostics,
+            treat_empty_tail_as_error,
         );
         let album_name = Arc::clone(&self.name);
 
@@ -1161,6 +1191,7 @@ impl PhotoAlbum {
         profile: PhotoStreamProfile,
         fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
         preserve_blank_sync_tokens_for_diagnostics: bool,
+        treat_empty_tail_as_error: bool,
     ) -> (PhotoStream, Vec<JoinHandle<()>>) {
         let plan = build_enumeration_plan(limit, total_count, self.page_size, profile);
         let (tx, rx) = mpsc::channel::<anyhow::Result<PhotoAsset>>(
@@ -1172,6 +1203,13 @@ impl PhotoAlbum {
             tracing::info!("Fetching photos from iCloud...");
         }
 
+        let allow_unpaired_at_range_boundary = plan.ranges.len() > 1;
+        let behavior = FetcherBehavior {
+            page_size: plan.page_size,
+            preserve_blank_sync_tokens_for_diagnostics,
+            allow_unpaired_at_range_boundary,
+            treat_empty_tail_as_error,
+        };
         for range in plan.ranges {
             handles.push(self.spawn_fetcher(
                 tx.clone(),
@@ -1179,8 +1217,7 @@ impl PhotoAlbum {
                 range.end,
                 range.limit,
                 fetcher_sync_tokens.clone(),
-                plan.page_size,
-                preserve_blank_sync_tokens_for_diagnostics,
+                behavior,
             ));
         }
         // Drop our sender so channel closes when all fetchers finish.
@@ -1210,8 +1247,7 @@ impl PhotoAlbum {
         end_offset: u64,
         limit: Option<u32>,
         fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
-        page_size: usize,
-        preserve_blank_sync_tokens_for_diagnostics: bool,
+        behavior: FetcherBehavior,
     ) -> JoinHandle<()> {
         let session = self.session.clone_box();
         let service_endpoint = Arc::clone(&self.service_endpoint);
@@ -1229,12 +1265,17 @@ impl PhotoAlbum {
             let mut saw_blank_sync_token = false;
             let mut pending_masters: FxHashMap<String, super::cloudkit::Record> =
                 FxHashMap::default();
+            let mut pending_assets: FxHashMap<String, super::cloudkit::Record> =
+                FxHashMap::default();
             let mut consecutive_empty_pages: u32 = 0;
+            let mut enumeration_incomplete = false;
+            let mut stopped_for_limit = false;
             let url = format!(
                 "{}/records/query?{}",
                 service_endpoint,
                 encode_params(&params)
             );
+            let max_pending_records = behavior.page_size.saturating_mul(4).max(1);
 
             loop {
                 if offset >= end_offset {
@@ -1244,7 +1285,7 @@ impl PhotoAlbum {
                 let body = Self::build_list_query(
                     &list_type,
                     query_filter.as_deref(),
-                    page_size,
+                    behavior.page_size,
                     &zone_id,
                     offset,
                     "ASCENDING",
@@ -1335,6 +1376,20 @@ impl PhotoAlbum {
                             total_sent,
                             "End of album (consecutive empty pages)"
                         );
+                        if behavior.treat_empty_tail_as_error
+                            && limit.is_none()
+                            && end_offset == u64::MAX
+                            && fetcher_sync_tokens.is_some()
+                        {
+                            enumeration_incomplete = true;
+                            let _ = tx
+                                .send(Err(anyhow::anyhow!(
+                                    "photo enumeration incomplete: records/query returned {} \
+                                     consecutive empty pages without a server completion proof",
+                                    MAX_EMPTY_PAGE_PROBES
+                                )))
+                                .await;
+                        }
                         break;
                     }
                     tracing::debug!(
@@ -1343,7 +1398,7 @@ impl PhotoAlbum {
                         probes = consecutive_empty_pages,
                         "Empty page, probing forward one page_size"
                     );
-                    offset += page_size as u64;
+                    offset += behavior.page_size as u64;
                     continue;
                 }
                 consecutive_empty_pages = 0;
@@ -1353,6 +1408,8 @@ impl PhotoAlbum {
                 let mut page_assets: FxHashMap<String, super::cloudkit::Record> =
                     FxHashMap::default();
                 let mut page_masters: Vec<super::cloudkit::Record> = Vec::new();
+                let mut masters_seen_on_page = false;
+                let mut limit_reached = false;
 
                 for rec in records {
                     tracing::debug!(record_type = %rec.record_type, "  record");
@@ -1367,6 +1424,12 @@ impl PhotoAlbum {
                             let master_id = master_id.to_string();
                             // Try to pair with a buffered master from a previous page
                             if let Some(master) = pending_masters.remove(&master_id) {
+                                if let Some(n) = limit {
+                                    if total_sent >= u64::from(n) {
+                                        limit_reached = true;
+                                        break;
+                                    }
+                                }
                                 let asset = PhotoAsset::from_records(master, &rec);
                                 if tx.send(Ok(asset)).await.is_err() {
                                     return;
@@ -1377,11 +1440,32 @@ impl PhotoAlbum {
                             }
                         }
                     } else if rec.record_type == "CPLMaster" {
-                        page_masters.push(rec);
+                        masters_seen_on_page = true;
+                        if let Some(asset_rec) = pending_assets.remove(&rec.record_name) {
+                            if let Some(n) = limit {
+                                if total_sent >= u64::from(n) {
+                                    limit_reached = true;
+                                    break;
+                                }
+                            }
+                            let asset = PhotoAsset::from_records(rec, &asset_rec);
+                            if tx.send(Ok(asset)).await.is_err() {
+                                return;
+                            }
+                            total_sent += 1;
+                            offset += 1;
+                        } else {
+                            page_masters.push(rec);
+                        }
                     }
                 }
 
-                if page_masters.is_empty() {
+                if limit_reached {
+                    stopped_for_limit = true;
+                    break;
+                }
+
+                if !masters_seen_on_page {
                     // No masters on this page. Advance offset to avoid
                     // re-requesting the same page forever. Use the unmatched
                     // asset count as a proxy for rank positions covered
@@ -1398,7 +1482,6 @@ impl PhotoAlbum {
                     );
                 }
 
-                let mut limit_reached = false;
                 for master in page_masters {
                     if let Some(n) = limit {
                         if total_sent >= u64::from(n) {
@@ -1427,26 +1510,63 @@ impl PhotoAlbum {
                 );
 
                 if limit_reached {
+                    stopped_for_limit = true;
+                    break;
+                }
+
+                pending_assets.extend(page_assets);
+                let pending_record_count = pending_masters.len() + pending_assets.len();
+                if pending_record_count > max_pending_records {
+                    enumeration_incomplete = true;
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "photo enumeration incomplete: {} unpaired CPLMaster/CPLAsset \
+                             records exceeded the pending-pair buffer",
+                            pending_record_count
+                        )))
+                        .await;
                     break;
                 }
             }
 
-            // Log any remaining unpaired masters that couldn't be paired
-            if !pending_masters.is_empty() {
+            // Surface any remaining unpaired records that couldn't be paired.
+            // A full query stream cannot safely advance a sync token if it saw
+            // only one half of a CPLMaster/CPLAsset pair.
+            if !stopped_for_limit
+                && !behavior.allow_unpaired_at_range_boundary
+                && (!pending_masters.is_empty() || !pending_assets.is_empty())
+            {
+                enumeration_incomplete = true;
                 tracing::warn!(
-                    count = pending_masters.len(),
-                    "Unpaired CPLMaster records after full enumeration (no matching CPLAsset found)"
+                    masters = pending_masters.len(),
+                    assets = pending_assets.len(),
+                    "Unpaired CPLMaster/CPLAsset records after full enumeration"
                 );
                 for id in pending_masters.keys() {
                     tracing::debug!(master_id = %id, "Unpaired CPLMaster");
                 }
+                for id in pending_assets.keys() {
+                    tracing::debug!(master_id = %id, "Unpaired CPLAsset");
+                }
+                let _ = tx
+                    .send(Err(anyhow::anyhow!(
+                        "photo enumeration incomplete: {} unpaired CPLMaster records and {} \
+                         unpaired CPLAsset records remained at end of stream",
+                        pending_masters.len(),
+                        pending_assets.len()
+                    )))
+                    .await;
             }
 
-            if let Some(shared) = &fetcher_sync_tokens {
-                if let Some(token) = last_sync_token {
-                    shared.lock().await.push(token);
-                } else if saw_blank_sync_token && preserve_blank_sync_tokens_for_diagnostics {
-                    shared.lock().await.push(String::new());
+            if !enumeration_incomplete {
+                if let Some(shared) = &fetcher_sync_tokens {
+                    if let Some(token) = last_sync_token {
+                        shared.lock().await.push(token);
+                    } else if saw_blank_sync_token
+                        && behavior.preserve_blank_sync_tokens_for_diagnostics
+                    {
+                        shared.lock().await.push(String::new());
+                    }
                 }
             }
         })
@@ -1971,7 +2091,7 @@ mod tests {
             .build();
         let album = make_album_with_session(100, Box::new(mock));
 
-        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(1), 1);
         tokio::pin!(stream);
 
         let mut count = 0u32;
@@ -1996,7 +2116,7 @@ mod tests {
             .build();
         let album = make_album_with_session(100, Box::new(mock));
 
-        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(1), 1);
         tokio::pin!(stream);
 
         while let Some(result) = stream.next().await {
@@ -2017,7 +2137,7 @@ mod tests {
             .build();
         let album = make_album_with_session(100, Box::new(mock));
 
-        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(1), 1);
         tokio::pin!(stream);
 
         while let Some(result) = stream.next().await {
@@ -2045,7 +2165,7 @@ mod tests {
             .build();
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(2), 1);
         tokio::pin!(stream);
 
         let mut count = 0u32;
@@ -2082,6 +2202,21 @@ mod tests {
         ids
     }
 
+    async fn drain_photo_stream(stream: PhotoStream) -> (Vec<String>, Vec<String>) {
+        use tokio_stream::StreamExt;
+
+        tokio::pin!(stream);
+        let mut ids = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(asset) => ids.push(asset.id().to_string()),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        (ids, errors)
+    }
+
     #[tokio::test]
     async fn offline_replay_full_pass_fixture() {
         let mock = MockPhotosFlow::new()
@@ -2090,7 +2225,7 @@ mod tests {
             .build();
         let album = make_album_with_session(100, Box::new(mock));
 
-        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(1), 1);
 
         assert_eq!(drain_photo_stream_count(stream).await, 1);
         assert_eq!(
@@ -2108,7 +2243,7 @@ mod tests {
             .build();
         let album = make_album_with_session(1, Box::new(mock));
 
-        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(2), 1);
 
         assert_eq!(drain_photo_stream_count(stream).await, 2);
         assert_eq!(
@@ -2132,12 +2267,89 @@ mod tests {
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
             false,
+            false,
         );
 
         assert_eq!(
             drain_photo_stream_count(stream).await,
             2,
             "single empty records/query page must be treated as a gap, not EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_query_asset_before_master_cross_page_emits_asset_once() {
+        let mock = MockPhotosFlow::new()
+            .query_page(
+                vec![test_asset_record("master-cross-page")],
+                Some("token-full"),
+            )
+            .query_page(
+                vec![test_master_record("master-cross-page")],
+                Some("token-full"),
+            )
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(2), 1);
+        let (ids, errors) = drain_photo_stream(stream).await;
+
+        assert_eq!(ids, vec!["master-cross-page"]);
+        assert!(errors.is_empty(), "unexpected stream errors: {errors:?}");
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("token-full")
+        );
+    }
+
+    #[tokio::test]
+    async fn full_query_unpaired_records_block_token() {
+        let mock = MockPhotosFlow::new()
+            .query_page(
+                vec![test_asset_record("master-unpaired")],
+                Some("token-full"),
+            )
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(1), 1);
+        let (ids, errors) = drain_photo_stream(stream).await;
+
+        assert!(ids.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("unpaired CPLMaster records and 1 unpaired CPLAsset records"),
+            "unexpected error: {}",
+            errors[0]
+        );
+        assert_eq!(
+            token_rx.await.expect("sync token sender"),
+            None,
+            "unpaired records must suppress the sync token"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_query_empty_page_stop_blocks_token() {
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-before-empty-tail", Some("token-full"))
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        let (ids, errors) = drain_photo_stream(stream).await;
+
+        assert_eq!(ids, vec!["master-before-empty-tail"]);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("consecutive empty pages without a server completion proof"),
+            "unexpected error: {}",
+            errors[0]
+        );
+        assert_eq!(
+            token_rx.await.expect("sync token sender"),
+            None,
+            "ambiguous empty-page termination must suppress the sync token"
         );
     }
 
@@ -2748,7 +2960,7 @@ mod tests {
         let album = make_album_with_session(100, Box::new(session.clone()));
 
         let (stream, token_rx) =
-            album.photo_stream_with_token_for_download(Some(100), Some(100), 10);
+            album.photo_stream_with_token_for_download_policy(Some(100), Some(100), 10, true);
 
         assert_eq!(
             drain_photo_stream_count(stream).await,
@@ -2775,7 +2987,8 @@ mod tests {
         let session = DynamicRecentPhotosSession::new(100);
         let album = make_album_with_session(100, Box::new(session.clone()));
 
-        let (stream, token_rx) = album.photo_stream_with_token_for_download(Some(100), None, 10);
+        let (stream, token_rx) =
+            album.photo_stream_with_token_for_download_policy(Some(100), None, 10, true);
 
         let ids = drain_photo_stream_ids(stream).await;
         assert_eq!(ids.len(), 100);
@@ -2802,10 +3015,11 @@ mod tests {
             let session = DynamicRecentPhotosSession::new(u64::from(recent));
             let album = make_album_with_session(100, Box::new(session.clone()));
 
-            let (stream, token_rx) = album.photo_stream_with_token_for_download(
+            let (stream, token_rx) = album.photo_stream_with_token_for_download_policy(
                 Some(recent),
                 Some(u64::from(recent)),
                 10,
+                true,
             );
             let ids = drain_photo_stream_ids(stream).await;
 
@@ -2873,7 +3087,7 @@ mod tests {
         let mock = MockPhotosSession::new().ok(json!({"records": []}));
         let album = make_album_with_session(100, Box::new(mock));
 
-        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(0), 1);
         tokio::pin!(stream);
 
         let items: Vec<_> = stream.collect().await;
@@ -2910,6 +3124,7 @@ mod tests {
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
             false,
+            false,
         );
         tokio::pin!(stream);
 
@@ -2932,6 +3147,7 @@ mod tests {
             Some(10),
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
             false,
         );
         tokio::pin!(stream);
@@ -2969,13 +3185,16 @@ mod tests {
             ]
         });
 
-        // Page 2: Valid paired CPLMaster + CPLAsset.
-        let page2 = mock_photo_query_page("master-ok", None);
+        // Page 2: Matching CPLMaster for page 1's asset-only record.
+        let page2 = json!({"records": [test_master_record("orphan-master")]});
+        // Page 3: Valid paired CPLMaster + CPLAsset.
+        let page3 = mock_photo_query_page("master-ok", None);
 
-        // Page 3: Empty → terminates.
+        // Page 4: Empty -> terminates.
         let mock = MockPhotosSession::new()
             .ok(page1)
             .ok(page2)
+            .ok(page3)
             .ok(json!({"records": []}));
         let album = make_album_with_session(1, Box::new(mock));
 
@@ -2984,6 +3203,7 @@ mod tests {
             None,
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
             false,
         );
         tokio::pin!(stream);
@@ -2994,8 +3214,8 @@ mod tests {
             count += 1;
         }
         assert_eq!(
-            count, 1,
-            "page 2's paired asset should be yielded despite page 1 having no masters"
+            count, 2,
+            "later pages should be yielded despite page 1 having no masters"
         );
     }
 
@@ -3023,6 +3243,7 @@ mod tests {
             None,
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
             false,
         );
         tokio::pin!(stream);
@@ -3064,6 +3285,7 @@ mod tests {
             None,
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
             false,
         );
         tokio::pin!(stream);
@@ -3108,6 +3330,7 @@ mod tests {
             None,
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
             false,
         );
         tokio::pin!(stream);

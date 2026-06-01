@@ -371,8 +371,6 @@ impl SyncStats {
     }
 }
 
-const PAGINATION_SHORTFALL_TOLERANCE_PERCENT: u64 = 5;
-const PAGINATION_SHORTFALL_TOLERANCE_ABSOLUTE: u64 = 100;
 const ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON: &str = "album_relation_hydration_incomplete";
 const DATE_BOUNDED_FULL_ENUMERATION_REASON: &str = "date_bounded_full_enumeration";
 const RECENT_LIMITED_FULL_ENUMERATION_REASON: &str = "recent_limited_full_enumeration";
@@ -1957,14 +1955,25 @@ fn open_photo_stream_for_controls(
     fast_concurrency: usize,
     download_concurrency: usize,
     controls: DownloadControls,
+    treat_empty_tail_as_error: bool,
 ) -> (
     DownloadPhotoStream,
     tokio::sync::oneshot::Receiver<Option<String>>,
 ) {
     if controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames() {
-        album.photo_stream_with_token(limit, total_count, fast_concurrency)
+        album.photo_stream_with_token_policy(
+            limit,
+            total_count,
+            fast_concurrency,
+            treat_empty_tail_as_error,
+        )
     } else {
-        album.photo_stream_with_token_for_download(limit, total_count, download_concurrency)
+        album.photo_stream_with_token_for_download_policy(
+            limit,
+            total_count,
+            download_concurrency,
+            treat_empty_tail_as_error,
+        )
     }
 }
 
@@ -2181,6 +2190,7 @@ async fn build_recent_frontier(
         config.concurrent_downloads,
         config.concurrent_downloads,
         controls,
+        false,
     );
     tokio::pin!(stream);
 
@@ -3221,12 +3231,11 @@ async fn build_pass_count_plan(
 /// Classification of how the producer-observed asset count compared with the
 /// pre-enumeration API total.
 ///
-/// Any shortfall is token-unsafe. The shortfall count is kept so logs can
-/// report how many assets were missed.
+/// Any positive shortfall is token-unsafe. The shortfall count is kept so logs
+/// can report how many assets were missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaginationShortfall {
     Match,
-    Tolerated { shortfall: u64 },
     TokenUnsafe { shortfall: u64 },
 }
 
@@ -3239,14 +3248,7 @@ fn classify_pagination_shortfall(total: u64, seen: u64) -> PaginationShortfall {
         return PaginationShortfall::Match;
     }
     let shortfall = total - seen;
-    let within_absolute = shortfall <= PAGINATION_SHORTFALL_TOLERANCE_ABSOLUTE;
-    let within_percent = shortfall.saturating_mul(100)
-        <= total.saturating_mul(PAGINATION_SHORTFALL_TOLERANCE_PERCENT);
-    if within_absolute && within_percent {
-        PaginationShortfall::Tolerated { shortfall }
-    } else {
-        PaginationShortfall::TokenUnsafe { shortfall }
-    }
+    PaginationShortfall::TokenUnsafe { shortfall }
 }
 
 /// Resolve the zone sync token from every full-enumeration pass that reported
@@ -3315,6 +3317,10 @@ async fn download_photos_full_with_token(
     let deferred_unfiled = deferred_unfiled_index(passes);
     let recent_frontier =
         build_recent_frontier(passes, config, controls, shutdown_token.clone()).await?;
+    let strict_empty_tail_errors = config.recent.is_none()
+        && config.skip_created_before.is_none()
+        && !controls.run_mode.only_print_filenames()
+        && !controls.run_mode.is_dry_run();
 
     // Pass-specific path mode still needs one derived config per pass so
     // `{album}` / `{smart-folder}` / `{library}` expand correctly, but the
@@ -3403,6 +3409,7 @@ async fn download_photos_full_with_token(
                     config.concurrent_downloads,
                     pass_config.concurrent_downloads,
                     controls,
+                    strict_empty_tail_errors,
                 );
                 let stream = filter_stream_to_enumeration_bounds(stream, config, recent_frontier);
 
@@ -3499,6 +3506,7 @@ async fn download_photos_full_with_token(
                         config.concurrent_downloads,
                         pass_config.concurrent_downloads,
                         controls,
+                        strict_empty_tail_errors,
                     );
                     let library = Arc::<str>::from(pass.album.zone_name());
                     let stream = filter_stream_to_enumeration_bounds(
@@ -3573,6 +3581,7 @@ async fn download_photos_full_with_token(
                     config.concurrent_downloads,
                     config.concurrent_downloads,
                     controls,
+                    strict_empty_tail_errors,
                 );
                 token_receivers.push(token_rx);
                 filter_stream_to_enumeration_bounds(stream, config, recent_frontier.as_ref())
@@ -3623,19 +3632,6 @@ async fn download_photos_full_with_token(
             let decision = classify_pagination_shortfall(total, streaming_result.assets_seen);
             match decision {
                 PaginationShortfall::Match => false,
-                PaginationShortfall::Tolerated { shortfall } => {
-                    pagination_shortfall_assets = shortfall;
-                    pagination_shortfall_warnings = 1;
-                    tracing::warn!(
-                        expected = total,
-                        seen = streaming_result.assets_seen,
-                        shortfall,
-                        tolerance_percent = PAGINATION_SHORTFALL_TOLERANCE_PERCENT,
-                        tolerance_assets = PAGINATION_SHORTFALL_TOLERANCE_ABSOLUTE,
-                        "Enumeration count shortfall observed, but within tolerance"
-                    );
-                    false
-                }
                 PaginationShortfall::TokenUnsafe { shortfall } => {
                     pagination_shortfall_assets = shortfall;
                     pagination_shortfall_warnings = 1;
@@ -5843,7 +5839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_sync_count_shortfall_blocks_token_without_partial_failure() {
+    async fn full_enumeration_shortfall_blocks_sync_token() {
         let records = mock_photo_records_with_filename("MASTER_SHORTFALL", "shortfall.jpg");
         let session = MockPhotosFlow::new()
             .album_count(2)
@@ -9702,26 +9698,26 @@ mod tests {
         assert_eq!(decision, PaginationShortfall::Match);
     }
 
-    /// A 1% undercount is tolerated when it is within both the percent and
-    /// absolute thresholds.
+    /// A 1% undercount is still token-unsafe. Count shortfalls are sometimes
+    /// only operator warnings, but they must not advance full-enumeration
+    /// sync tokens.
     #[test]
-    fn classify_pagination_shortfall_one_percent_below_is_tolerated() {
+    fn classify_pagination_shortfall_one_percent_below_blocks_token() {
         // 1000 expected, 990 seen -> 1% shortfall, within 5% and <= 100.
         let decision = classify_pagination_shortfall(1000, 990);
         assert_eq!(
             decision,
-            PaginationShortfall::Tolerated { shortfall: 10 },
-            "small shortfall should be tolerated"
+            PaginationShortfall::TokenUnsafe { shortfall: 10 },
+            "any positive shortfall must block the sync token"
         );
     }
 
-    /// A 4% undercount is still tolerated as long as absolute shortfall is
-    /// also within bounds.
+    /// A 4% undercount still blocks token advancement.
     #[test]
-    fn classify_pagination_shortfall_four_percent_below_is_tolerated() {
+    fn classify_pagination_shortfall_four_percent_below_blocks_token() {
         // 1000 expected, 960 seen -> 4% shortfall, 40 assets.
         let decision = classify_pagination_shortfall(1000, 960);
-        assert_eq!(decision, PaginationShortfall::Tolerated { shortfall: 40 });
+        assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 40 });
     }
 
     /// A 6% undercount exceeds the percent tolerance and blocks token
@@ -9733,28 +9729,28 @@ mod tests {
         assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 60 });
     }
 
-    /// Boundary case at exactly 5% shortfall is tolerated.
+    /// Boundary case at the old 5% tolerance still blocks tokens.
     #[test]
-    fn classify_pagination_shortfall_at_tolerance_boundary_is_tolerated() {
+    fn classify_pagination_shortfall_at_old_tolerance_boundary_blocks_token() {
         let decision = classify_pagination_shortfall(1000, 950);
-        assert_eq!(decision, PaginationShortfall::Tolerated { shortfall: 50 });
+        assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 50 });
     }
 
     /// Regression fixture for issue #498: expected=1578, seen=1533
-    /// (shortfall=45, ~2.85%). This should classify as tolerated so it does
-    /// not become a sync-failure signal.
+    /// (shortfall=45, ~2.85%). This can remain a non-fatal warning, but it
+    /// must be token-unsafe.
     #[test]
-    fn classify_pagination_shortfall_issue_498_fixture_is_tolerated() {
+    fn classify_pagination_shortfall_issue_498_fixture_blocks_token() {
         let decision = classify_pagination_shortfall(1578, 1533);
-        assert_eq!(decision, PaginationShortfall::Tolerated { shortfall: 45 });
+        assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 45 });
     }
 
     /// Regression fixture from downstream k8s-gitops mitigation:
     /// expected=31_000, seen=30_959 (shortfall=41, ~0.13%).
     #[test]
-    fn classify_pagination_shortfall_billimek_sharedsync_fixture_is_tolerated() {
+    fn classify_pagination_shortfall_billimek_sharedsync_fixture_blocks_token() {
         let decision = classify_pagination_shortfall(31_000, 30_959);
-        assert_eq!(decision, PaginationShortfall::Tolerated { shortfall: 41 });
+        assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 41 });
     }
 
     /// Large absolute shortfalls remain token-unsafe even if percent gap is
