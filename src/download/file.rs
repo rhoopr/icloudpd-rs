@@ -895,7 +895,7 @@ fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
 /// Returns:
 /// - `Some(true)` — header matches a known-valid signature
 /// - `Some(false)` — extension is recognized but header does not match
-///   (caller rejects unless another known media signature matches)
+///   (caller logs a warning; the file is still saved)
 /// - `None` — extension is not in the signature table; skip the check
 ///
 /// MOV handling intentionally differs from the other ISO-BMFF extensions.
@@ -968,11 +968,11 @@ fn is_mov_top_atom(atom: &[u8]) -> bool {
 /// incomplete: zero bytes, known HTML/JSON error bodies, known error-document
 /// content types checked before writing, or byte-count mismatches checked by
 /// the caller.
-/// Extension-specific magic mismatches remain acceptable only when the bytes
-/// match another media signature kei recognizes: iCloud sometimes assigns
-/// `.PNG` names to JPEG bytes, and filenames stay exactly as planned. A known
-/// media extension with no recognized media magic is rejected so obvious
-/// same-size CDN error bodies cannot be marked downloaded.
+/// Extension-specific magic mismatches are warnings, not hard failures: iCloud
+/// sometimes assigns `.PNG` names to JPEG bytes, and kei's signature table is
+/// intentionally not treated as a complete media catalog. Unknown-but-not-known
+/// bad headers are saved when size checks have passed. Filenames stay exactly as
+/// planned; validation never rewrites extensions.
 fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,
@@ -1034,13 +1034,8 @@ fn validate_downloaded_content(
             path = %download_path.display(),
             expected_extension = %ext,
             header = %format_args!("{preview:02x?}"),
-            "File header does not match expected extension and is not recognized by kei; rejecting download",
+            "File header does not match expected extension and is not recognized by kei; saving anyway",
         );
-        return Err(DownloadError::InvalidContent {
-            path: download_path.display().to_string().into(),
-            reason: format!("file extension .{ext} has unrecognized media header {preview:02x?}")
-                .into(),
-        });
     }
 
     Ok(())
@@ -1661,12 +1656,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_unrecognized_header_for_known_extension() {
+    fn validate_accepts_unrecognized_header_for_known_extension() {
         let (part, dest, _dir) = write_temp_file("photo.jpg", b"not media bytes");
-        assert!(matches!(
-            validate_downloaded_content(&part, &dest),
-            Err(DownloadError::InvalidContent { .. })
-        ));
+        assert!(validate_downloaded_content(&part, &dest).is_ok());
     }
 
     #[test]
@@ -2030,12 +2022,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_file_recognized_extension_unknown_magic_is_quarantined_or_failed() {
+    async fn attempt_download_promotes_unrecognized_header_under_known_extension() {
         let body = b"not media bytes";
         let client = StubDownloadClient::ok(body);
         let (download_path, part_path, _dir) = setup_download_dir("unknown_header", "jpg");
 
-        let err = attempt_download(
+        attempt_download(
             &client,
             "http://stub",
             &download_path,
@@ -2046,20 +2038,10 @@ mod tests {
             None,
         )
         .await
-        .expect_err("known media extension with unknown magic must fail");
+        .unwrap();
 
-        assert!(
-            matches!(err, DownloadError::InvalidContent { .. }),
-            "expected InvalidContent for unknown media magic, got: {err}"
-        );
-        assert!(
-            !download_path.exists(),
-            "invalid media bytes must not be promoted to the final path"
-        );
-        assert!(
-            !part_path.exists(),
-            "invalid media bytes must be removed so retry starts clean"
-        );
+        assert!(!part_path.exists(), ".part should be promoted");
+        assert_eq!(std::fs::read(&download_path).unwrap(), body);
     }
 
     #[tokio::test]
