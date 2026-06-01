@@ -413,6 +413,16 @@ impl Drop for TmpGuard<'_> {
 
 #[cfg(feature = "xmp")]
 fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite, temp_suffix: &str) -> Result<()> {
+    apply_metadata_xmp_toolkit_with_installer(path, write, temp_suffix, atomic_install)
+}
+
+#[cfg(feature = "xmp")]
+fn apply_metadata_xmp_toolkit_with_installer(
+    path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+    install: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     ensure_initialized();
 
     let tmp_path = temp_path_for(path, temp_suffix);
@@ -448,8 +458,13 @@ fn apply_metadata_xmp_toolkit(path: &Path, write: &MetadataWrite, temp_suffix: &
     })();
 
     result?;
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("Renaming {} -> {}", tmp_path.display(), path.display()))?;
+    install(&tmp_path, path).with_context(|| {
+        format!(
+            "Installing metadata {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     guard.disarm();
     tracing::debug!(path = %path.display(), "Applied metadata");
     Ok(())
@@ -1266,6 +1281,53 @@ mod tests {
         assert!(
             !tmp_path.exists(),
             ".meta-tmp must be cleaned up after a failed write"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn xmp_toolkit_rewrite_fsyncs_temp_before_part_replace() {
+        let dir = test_tmp_dir("meta_tests");
+        let path = fresh_jpeg(&dir, "durable_install.jpg");
+        let original = fs::read(&path).unwrap();
+        let install_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let install_called_in_closure = std::sync::Arc::clone(&install_called);
+        let expected_path = path.clone();
+
+        let result = apply_metadata_xmp_toolkit_with_installer(
+            &path,
+            &MetadataWrite {
+                rating: Some(3),
+                ..MetadataWrite::default()
+            },
+            ".meta-tmp",
+            move |tmp, dst| {
+                install_called_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    tmp.exists(),
+                    "metadata temp file must exist before durable install"
+                );
+                assert_eq!(dst, expected_path.as_path());
+                Err(std::io::Error::other("simulated durable install failure"))
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "durable install failure must surface to leave the asset retryable"
+        );
+        assert!(
+            install_called.load(std::sync::atomic::Ordering::SeqCst),
+            "XMP rewrite must route final replacement through the durable install primitive"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "failed metadata publish must leave original bytes intact"
+        );
+        assert!(
+            !path.with_file_name("durable_install.jpg.meta-tmp").exists(),
+            "metadata temp file must be cleaned up on durable install failure"
         );
         fs::remove_file(&path).ok();
     }

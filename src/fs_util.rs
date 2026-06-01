@@ -153,15 +153,13 @@ where
         }
         let _ = std::fs::remove_file(src);
     }
-    // Best-effort: a parent-dir fsync failure shouldn't fail the install,
-    // but it's worth logging so an operator chasing durability incidents
-    // can see it.
     if let Err(e) = fsync_parent_dir(dst) {
         tracing::warn!(
             path = %dst.display(),
             error = %e,
             "fsync of parent directory failed after atomic_install"
         );
+        return Err(e);
     }
     Ok(())
 }

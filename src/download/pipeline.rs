@@ -472,7 +472,8 @@ async fn run_metadata_rewrites<D>(
     metadata_flags: MetadataFlags,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
-) where
+) -> usize
+where
     D: MetadataRewriteStore + ?Sized,
 {
     let pending = match db
@@ -482,21 +483,24 @@ async fn run_metadata_rewrites<D>(
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to load pending metadata rewrites");
-            return;
+            return 1;
         }
     };
     if pending.is_empty() {
-        return;
+        return 0;
     }
+    let pending_count = pending.len();
     tracing::info!(
-        count = pending.len(),
+        count = pending_count,
         "Applying metadata rewrites to on-disk files"
     );
     let mut applied = 0usize;
     let mut skipped_missing = 0usize;
     let mut errored = 0usize;
-    for record in pending {
+    let mut deferred = 0usize;
+    for (idx, record) in pending.into_iter().enumerate() {
         if shutdown_token.is_cancelled() {
+            deferred += pending_count - idx;
             tracing::info!("Shutdown requested, deferring remaining metadata rewrites");
             break;
         }
@@ -654,8 +658,10 @@ async fn run_metadata_rewrites<D>(
         applied,
         errored,
         skipped_missing,
+        deferred,
         "Metadata rewrite pass complete"
     );
+    errored + deferred
 }
 
 /// Bar factory for per-pass loops in `download::mod.rs`. Returns the bar
@@ -2051,7 +2057,7 @@ where
         if let Some(db) = &state_db {
             let metadata_flags = MetadataFlags::from(config.as_ref());
             if metadata_flags.any_embed() || metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
-                run_metadata_rewrites(
+                exif_failures += run_metadata_rewrites(
                     db.as_ref(),
                     metadata_flags,
                     Arc::clone(&config.temp_suffix),
@@ -5552,6 +5558,60 @@ mod tests {
             still_pending.len(),
             1,
             "marker must survive when the file is absent so a future sync retries"
+        );
+    }
+
+    #[cfg(feature = "xmp")]
+    #[tokio::test]
+    async fn metadata_rewrite_cancel_returns_partial_and_keeps_retry_marker() {
+        use crate::state::types::AssetMetadata;
+        use crate::state::SqliteStateDb;
+
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("rewrite_cancel.jpg");
+        std::fs::write(&photo_path, minimal_jpeg_bytes()).unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let metadata = AssetMetadata {
+            rating: Some(5),
+            metadata_hash: Some("retry_hash".to_string()),
+            ..AssetMetadata::default()
+        };
+        let record = crate::test_helpers::TestAssetRecord::new("REWRITE_CANCEL")
+            .filename("rewrite_cancel.jpg")
+            .checksum("rewrite_cancel_ck")
+            .metadata(metadata)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "REWRITE_CANCEL",
+            "original",
+            &photo_path,
+            "rewrite_cancel_ck",
+            None,
+        )
+        .await
+        .unwrap();
+        db.record_metadata_write_failure("PrimarySync", "REWRITE_CANCEL", "original")
+            .await
+            .unwrap();
+
+        let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
+        let token = CancellationToken::new();
+        token.cancel();
+        let deferred =
+            run_metadata_rewrites(&db, flags, std::sync::Arc::from(".meta-tmp"), &token).await;
+
+        assert_eq!(
+            deferred, 1,
+            "cancelled metadata rewrite must count as a partial retryable item"
+        );
+        let still_pending = db.get_pending_metadata_rewrites(32).await.unwrap();
+        assert_eq!(
+            still_pending.len(),
+            1,
+            "cancelled metadata rewrite must keep marker for retry"
         );
     }
 
