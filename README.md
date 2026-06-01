@@ -118,18 +118,19 @@ kei sync
 
 Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-icloudpd.md).
 
-## Upgrade note
-
-v0.20 moved durable sync settings into TOML. Keep CLI flags for one run, env vars for secrets and service glue, and saved settings in `config.toml`.
-
-If an old command fails with a removed flag such as `--download-dir`, move that value into the config file:
-
-```toml
-[download]
-directory = "/photos"
-```
-
-Use the [v0.20 migration guide](docs/v0.20-migration.md) and [example.config.toml](example.config.toml) for the full map.
+> [!IMPORTANT]
+> **v0.20 moved durable sync settings into TOML.**
+>
+> Keep CLI flags for one run, env vars for secrets and service glue, and saved settings in `config.toml`.
+>
+> If an old command fails with a removed flag such as `--download-dir`, move that value into the config file:
+>
+> ```toml
+> [download]
+> directory = "/photos"
+> ```
+>
+> Use the [v0.20 migration guide](docs/v0.20-migration.md) and [example.config.toml](example.config.toml) for the full map.
 
 ## Docs
 
@@ -141,7 +142,7 @@ Use the [v0.20 migration guide](docs/v0.20-migration.md) and [example.config.tom
 - [Credentials](https://github.com/rhoopr/kei/wiki/Credentials)
 - [Troubleshooting](https://github.com/rhoopr/kei/wiki/Troubleshooting)
 
-Open an issue for bugs or sharp edges: <https://github.com/rhoopr/kei/issues>
+Open an issue for bugs or sharp edges: [Issues](https://github.com/rhoopr/kei/issues)
 
 ## License
 
