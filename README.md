@@ -2,10 +2,9 @@
   <img src="assets/logo.png" alt="kei logo" width="400">
 </p>
 
-<h1 align="center">kei: cloud-hosted photos to your own storage</h1>
+<h1 align="center">kei: Fast, parallel backups for cloud-hosted photos and videos.</h1>
 
 <p align="center">
-  Fast, parallel backups for cloud-hosted photos and videos. One-time exports, local mirrors, unattended Docker runs.<br><br>
   <a href="https://github.com/rhoopr/kei/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/Rust_MSRV-1.91%2B-dea584?logo=rust" alt="Rust MSRV 1.91+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
   <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/v/release/rhoopr/kei?color=blue&label=version" alt="Version"></a>
@@ -15,7 +14,7 @@
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fgithub.com%2Fipitio%2Fbackage%2Fraw%2Findex%2Frhoopr%2Fkei%2Fkei.json&query=%24.downloads&logo=docker&label=pulls" alt="Pulls"></a></p>
 
-kei copies cloud-hosted photos and videos into folders you control. Today that means iCloud Photos. The goal is a fast, parallel local backup you can run once, keep as a mirror, or leave unattended in Docker.
+kei copies cloud-hosted photos and videos into folders you control. Today that includes iCloud Photos. The goal is a fast, parallel local backup you can run once, keep as a mirror, or leave unattended in Docker.
 
 It handles the parts that make photo backups annoying: big libraries, shared libraries, albums, Live Photos, RAW files, edited versions, retries, interrupted downloads, and existing archives you don't want to download twice.
 
@@ -39,6 +38,20 @@ Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](http
 > kei needs iCloud Photos web access. If `Advanced Data Protection` is on, turn it off and enable "Access iCloud Data on the Web" in your Apple ID settings. See [Authentication](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
 
 ## Start
+
+> [!IMPORTANT]
+> **v0.20 moved durable sync settings into TOML.**
+>
+> Keep CLI flags for one run, env vars for secrets and service glue, and saved settings in `config.toml`.
+>
+> If an old command fails with a removed flag such as `--download-dir`, move that value into the config file:
+>
+> ```toml
+> [download]
+> directory = "/photos"
+> ```
+>
+> Use the [v0.20 migration guide](docs/v0.20-migration.md) and [example.config.toml](example.config.toml) for the full map.
 
 ```sh
 kei config setup
@@ -118,20 +131,6 @@ kei sync
 ```
 
 Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-icloudpd.md).
-
-> [!IMPORTANT]
-> **v0.20 moved durable sync settings into TOML.**
->
-> Keep CLI flags for one run, env vars for secrets and service glue, and saved settings in `config.toml`.
->
-> If an old command fails with a removed flag such as `--download-dir`, move that value into the config file:
->
-> ```toml
-> [download]
-> directory = "/photos"
-> ```
->
-> Use the [v0.20 migration guide](docs/v0.20-migration.md) and [example.config.toml](example.config.toml) for the full map.
 
 ## Docs
 
