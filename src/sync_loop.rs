@@ -1167,7 +1167,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
 
             // Validate session before next cycle; re-authenticate if expired.
-            reacquire_session(&shared_session, &config, &password_provider).await;
+            reacquire_session(&shared_session, &config, &password_provider).await?;
 
             // Mark album/pass plans stale after an idle sleep, but defer the
             // CloudKit refresh until `changes/database` says a selected
@@ -1720,13 +1720,15 @@ fn warn_if_multi_library_paths_commingle(
     );
 }
 
-/// Re-validate the session after an idle sleep and re-acquire the lock.
+/// Re-acquire the lock after idle sleep, then re-validate the session.
 async fn reacquire_session(
     shared_session: &auth::SharedSession,
     config: &config::Config,
     password_provider: &crate::password::PasswordProvider,
-) {
-    match attempt_reauth(
+) -> anyhow::Result<()> {
+    reacquire_session_lock_after_idle(shared_session).await?;
+
+    if let Err(e) = attempt_reauth(
         shared_session,
         &config.auth.cookie_directory,
         &config.auth.username,
@@ -1735,25 +1737,38 @@ async fn reacquire_session(
     )
     .await
     {
-        Ok(()) => {
-            // Re-acquire the lock. If attempt_reauth performed a full
-            // re-auth, the new Session already holds its own lock, so
-            // LockContention here is expected and harmless.
-            let session = shared_session.read().await;
-            if let Err(e) = session.reacquire_lock() {
-                if e.downcast_ref::<auth::error::AuthError>()
-                    .is_some_and(auth::error::AuthError::is_lock_contention)
-                {
-                    tracing::debug!("Lock held by new session after reauth");
-                } else {
-                    tracing::warn!(error = %e, "Failed to reacquire lock after idle");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Pre-cycle reauth failed, will retry mid-sync");
-        }
+        tracing::warn!(error = %e, "Pre-cycle reauth failed, will retry mid-sync");
+        reacquire_session_lock_after_idle(shared_session).await?;
     }
+
+    Ok(())
+}
+
+async fn reacquire_session_lock_after_idle(
+    shared_session: &auth::SharedSession,
+) -> anyhow::Result<()> {
+    let session = shared_session.read().await;
+    let Err(e) = session.reacquire_lock() else {
+        return Ok(());
+    };
+
+    if e.downcast_ref::<auth::error::AuthError>()
+        .is_some_and(auth::error::AuthError::is_lock_contention)
+    {
+        tracing::error!(
+            error = %e,
+            "Another kei process acquired the session lock while watch mode slept; stopping before the next sync cycle"
+        );
+    } else {
+        tracing::error!(
+            error = %e,
+            "Failed to reacquire the session lock after watch sleep"
+        );
+    }
+    Err(e.context(
+        "failed to reacquire the iCloud session lock after watch sleep; \
+         refusing to resume sync without exclusive session ownership",
+    ))
 }
 
 #[cfg(test)]
@@ -1833,6 +1848,63 @@ mod tests {
         );
         assert!(precheck.should_sync_zone("PrimarySync"));
         assert!(!precheck.should_sync_zone("SharedSync-123"));
+    }
+
+    #[tokio::test]
+    async fn watch_reacquire_lock_failure_stops_before_next_cycle() {
+        let (dir, shared_session) = make_shared_session_for_run_cycle().await;
+        shared_session.read().await.release_lock().unwrap();
+        let _holder = auth::session::Session::new(
+            dir.path(),
+            "test@example.com",
+            "https://example.com",
+            None,
+        )
+        .await
+        .expect("second session should acquire released lock");
+
+        let result = reacquire_session_lock_after_idle(&shared_session).await;
+
+        assert!(
+            result.is_err(),
+            "watch mode must not start another sync cycle after lock contention"
+        );
+        let err = result.expect_err("lock contention should stop watch mode");
+        assert!(
+            err.downcast_ref::<auth::error::AuthError>()
+                .is_some_and(auth::error::AuthError::is_lock_contention),
+            "expected LockContention, got: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("refusing to resume sync"),
+            "error should explain why watch mode stopped: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_lock_release_still_allows_reacquire_success() {
+        let (dir, shared_session) = make_shared_session_for_run_cycle().await;
+        shared_session.read().await.release_lock().unwrap();
+
+        reacquire_session_lock_after_idle(&shared_session)
+            .await
+            .expect("watch mode should reacquire an uncontended session lock");
+
+        let result = auth::session::Session::new(
+            dir.path(),
+            "test@example.com",
+            "https://example.com",
+            None,
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("reacquired watch lock should block a second session"),
+            Err(err) => assert!(
+                err.downcast_ref::<auth::error::AuthError>()
+                    .is_some_and(auth::error::AuthError::is_lock_contention),
+                "watch mode should hold the session lock after reacquire: {err:#}"
+            ),
+        }
     }
 
     fn primary() -> crate::selection::LibrarySelector {

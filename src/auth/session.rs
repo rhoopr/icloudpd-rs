@@ -858,7 +858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reacquire_fails_while_held() {
+    async fn session_reacquire_lock_contention_error_is_actionable() {
         let (_td, dir) = test_dir("lock_reacquire_contention");
         let s1 = Session::new(&dir, "user@test.com", "https://example.com", None)
             .await
@@ -872,7 +872,16 @@ mod tests {
 
         // Reacquire should fail because s2 holds the lock
         let result = s1.reacquire_lock();
-        assert!(result.is_err(), "Should fail to reacquire while held");
+        let err = result.expect_err("Should fail to reacquire while held");
+        assert!(
+            err.downcast_ref::<crate::auth::error::AuthError>()
+                .is_some_and(crate::auth::error::AuthError::is_lock_contention),
+            "Expected LockContention, got: {err:#}",
+        );
+        assert!(
+            err.to_string().contains("Another kei instance"),
+            "Lock contention error should tell the user another process has the lock: {err:#}"
+        );
     }
 
     #[tokio::test]
