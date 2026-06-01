@@ -2,7 +2,8 @@
   <img src="assets/logo.png" alt="kei logo" width="400">
 </p>
 
-<h1 align="center">kei: Fast, parallel backups for cloud-hosted photos and videos.</h1>
+<h1 align="center">kei: fast, parallel backups<br>
+  for cloud-hosted photos and videos.</h1>
 
 <p align="center">
   <a href="https://github.com/rhoopr/kei/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/Rust_MSRV-1.91%2B-dea584?logo=rust" alt="Rust MSRV 1.91+"></a>
@@ -20,6 +21,7 @@ It handles the parts that make photo backups annoying: big libraries, shared lib
 
 > [!WARNING]
 > kei is pre-release software. Minor versions may contain breaking changes.
+> 
 > Read [CHANGELOG.md](CHANGELOG.md) before updating.
 
 ## Install
