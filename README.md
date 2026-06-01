@@ -2,10 +2,10 @@
   <img src="assets/logo.png" alt="kei logo" width="400">
 </p>
 
-<h1 align="center">kei: iCloud Photos to your own storage</h1>
+<h1 align="center">kei: cloud-hosted photos to your own storage</h1>
 
 <p align="center">
-  Sync your cloud photos and videos to local storage. Fast, resumable, runs unattended.<br><br>
+  Fast, parallel backups for cloud-hosted photos and videos. One-time exports, local mirrors, unattended Docker runs.<br><br>
   <a href="https://github.com/rhoopr/kei/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/Rust_MSRV-1.91%2B-dea584?logo=rust" alt="Rust MSRV 1.91+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/rhoopr/kei?color=8b959e" alt="License: MIT"></a>
   <a href="https://github.com/rhoopr/kei/releases"><img src="https://img.shields.io/github/v/release/rhoopr/kei?color=blue&label=version" alt="Version"></a>
@@ -15,7 +15,7 @@
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/ghcr.io-kei-blue?logo=docker" alt="Docker"></a>
   <a href="https://ghcr.io/rhoopr/kei"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fgithub.com%2Fipitio%2Fbackage%2Fraw%2Findex%2Frhoopr%2Fkei%2Fkei.json&query=%24.downloads&logo=docker&label=pulls" alt="Pulls"></a></p>
 
-kei copies your iCloud Photos library into folders you control. Use it for a one-time export, a steady local mirror, or a small home-lab backup that runs in Docker or as a background service.
+kei copies cloud-hosted photos and videos into folders you control. Today that means iCloud Photos. The goal is a fast, parallel local backup you can run once, keep as a mirror, or leave unattended in Docker.
 
 It handles the parts that make photo backups annoying: big libraries, shared libraries, albums, Live Photos, RAW files, edited versions, retries, interrupted downloads, and existing archives you don't want to download twice.
 
@@ -67,7 +67,8 @@ kei list albums
 
 ## What kei gives you
 
-- A local copy of your iCloud Photos media, with no Apple Photos library required.
+- Fast, parallel downloads for large cloud photo libraries.
+- A local copy of your media, with no Apple Photos library required.
 - Folder layouts for dates, albums, smart folders, shared libraries, and unfiled photos.
 - Original photos and videos, plus Live Photos, RAW siblings, and edited versions when you ask for them.
 - Resumable downloads and checksum checks before files are marked complete.
