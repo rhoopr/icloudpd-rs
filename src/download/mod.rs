@@ -28,7 +28,7 @@ pub(crate) use filter::determine_media_type;
 pub(crate) use filter::AssetGroupings;
 use filter::DownloadTask;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1208,6 +1208,11 @@ type LibraryAssetVersionSet = FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashSet<
 type LibraryAssetVersionValueMap =
     FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>>>;
 
+/// `library -> asset_id -> (version_size -> local_path)`. Used to confirm
+/// state-backed skips still point at the currently configured path.
+type LibraryAssetVersionPathMap =
+    FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<Box<str>, PathBuf>>>;
+
 #[derive(Debug, Default)]
 struct DownloadContext {
     /// Nested map: `library` -> `asset_id` -> set of `version_sizes` that
@@ -1218,6 +1223,10 @@ struct DownloadContext {
     /// Nested map: `library` -> `asset_id` -> (`version_size` -> checksum).
     /// Used to detect checksum changes (CloudKit asset updated) without DB queries.
     downloaded_checksums: LibraryAssetVersionValueMap,
+    /// Nested map: `library` -> `asset_id` -> (`version_size` -> local_path).
+    /// Used to validate path-aware filesystem skips after state says the
+    /// remote bytes are unchanged.
+    downloaded_local_paths: LibraryAssetVersionPathMap,
     /// Nested map: `library` -> `asset_id` -> (`version_size` -> metadata_hash).
     /// Used to detect metadata-only changes (favorite toggle, keywords, GPS
     /// edit, etc.) when file bytes are unchanged but CloudKit has newer
@@ -1267,7 +1276,7 @@ impl DownloadContext {
                 Default::default()
             }
         };
-        let (ids, checksums, hashes, markers, pending, attempts, known_ids) = tokio::join!(
+        let (ids, checksums, paths, hashes, markers, pending, attempts, known_ids) = tokio::join!(
             async {
                 db.get_downloaded_ids().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load downloaded IDs from state DB");
@@ -1277,6 +1286,12 @@ impl DownloadContext {
             async {
                 db.get_downloaded_checksums().await.unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "Failed to load checksums from state DB");
+                    Default::default()
+                })
+            },
+            async {
+                db.get_downloaded_local_paths().await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to load downloaded local paths from state DB");
                     Default::default()
                 })
             },
@@ -1344,6 +1359,18 @@ impl DownloadContext {
                 .insert(version_size.into_boxed_str(), checksum.into_boxed_str());
         }
 
+        let mut downloaded_local_paths: LibraryAssetVersionPathMap = FxHashMap::default();
+        for ((library, asset_id, version_size), path) in paths {
+            let lib = intern_id(&mut interner, library);
+            let id = intern_id(&mut interner, asset_id);
+            downloaded_local_paths
+                .entry(lib)
+                .or_default()
+                .entry(id)
+                .or_default()
+                .insert(version_size.into_boxed_str(), path);
+        }
+
         let mut downloaded_metadata_hashes: LibraryAssetVersionValueMap = FxHashMap::default();
         for ((library, asset_id, version_size), metadata_hash) in hashes {
             let lib = intern_id(&mut interner, library);
@@ -1398,6 +1425,7 @@ impl DownloadContext {
         Self {
             downloaded_ids,
             downloaded_checksums,
+            downloaded_local_paths,
             downloaded_metadata_hashes,
             metadata_retry_markers,
             pending_ids,
@@ -1517,6 +1545,19 @@ impl DownloadContext {
         } else {
             None
         }
+    }
+
+    fn downloaded_local_path(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version_size: VersionSizeKey,
+    ) -> Option<&Path> {
+        self.downloaded_local_paths
+            .get(library)
+            .and_then(|m| m.get(asset_id))
+            .and_then(|versions| versions.get(version_size.as_str()))
+            .map(PathBuf::as_path)
     }
 
     fn has_downloaded_without_metadata_hash(&self) -> bool {

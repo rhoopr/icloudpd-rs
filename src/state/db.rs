@@ -123,6 +123,11 @@ pub trait DownloadStateStore: Send + Sync {
     async fn get_downloaded_checksums(
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError>;
+    async fn get_downloaded_local_paths(
+        &self,
+    ) -> Result<HashMap<(String, String, String), PathBuf>, StateError> {
+        Ok(HashMap::new())
+    }
     async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError>;
     async fn touch_last_seen_many(
         &self,
@@ -634,6 +639,18 @@ pub trait StateDb: Send + Sync {
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError>;
 
+    /// Get downloaded asset IDs with their recorded local paths.
+    ///
+    /// Returns a map of (library, id, `version_size`) -> `local_path` for
+    /// downloaded assets. Used to confirm that a state-backed skip still points
+    /// at the current configured destination before skipping size-mismatched
+    /// files that may have been changed by metadata embedding.
+    async fn get_downloaded_local_paths(
+        &self,
+    ) -> Result<HashMap<(String, String, String), PathBuf>, StateError> {
+        Ok(HashMap::new())
+    }
+
     /// Get per-asset maximum download attempt counts for failed assets.
     ///
     /// Returns a map of asset_id -> max(download_attempts).
@@ -1114,6 +1131,12 @@ where
         DownloadStateStore::get_downloaded_checksums(self).await
     }
 
+    async fn get_downloaded_local_paths(
+        &self,
+    ) -> Result<HashMap<(String, String, String), PathBuf>, StateError> {
+        DownloadStateStore::get_downloaded_local_paths(self).await
+    }
+
     async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
         DownloadStateStore::get_attempt_counts(self).await
     }
@@ -1490,6 +1513,12 @@ impl DownloadStateStore for dyn StateDb + '_ {
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError> {
         StateDb::get_downloaded_checksums(self).await
+    }
+
+    async fn get_downloaded_local_paths(
+        &self,
+    ) -> Result<HashMap<(String, String, String), PathBuf>, StateError> {
+        StateDb::get_downloaded_local_paths(self).await
     }
 
     async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
@@ -3006,6 +3035,52 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn get_downloaded_local_paths(
+        &self,
+    ) -> Result<HashMap<(String, String, String), PathBuf>, StateError> {
+        self.with_conn("get_downloaded_local_paths", move |conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM assets \
+                     WHERE status = 'downloaded' AND local_path IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StateError::query("get_downloaded_local_paths", e))?;
+            let count = usize::try_from(count).unwrap_or(0);
+
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT library, id, version_size, local_path FROM assets \
+                     WHERE status = 'downloaded' AND local_path IS NOT NULL",
+                )
+                .map_err(|e| StateError::query("get_downloaded_local_paths", e))?;
+
+            let mut paths = HashMap::with_capacity(count);
+            let rows = stmt
+                .query_map([], |row| {
+                    let local_path: String = row.get(3)?;
+                    Ok((
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ),
+                        PathBuf::from(local_path),
+                    ))
+                })
+                .map_err(|e| StateError::query("get_downloaded_local_paths", e))?;
+            for row in rows {
+                let (key, val) =
+                    row.map_err(|e| StateError::query("get_downloaded_local_paths", e))?;
+                paths.insert(key, val);
+            }
+
+            Ok(paths)
+        })
+        .await
+    }
+
     pub(crate) async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
         self.with_conn("get_attempt_counts", move |conn| {
             let mut stmt = conn
@@ -3897,6 +3972,12 @@ impl DownloadStateStore for SqliteStateDb {
         &self,
     ) -> Result<HashMap<(String, String, String), String>, StateError> {
         SqliteStateDb::get_downloaded_checksums(self).await
+    }
+
+    async fn get_downloaded_local_paths(
+        &self,
+    ) -> Result<HashMap<(String, String, String), PathBuf>, StateError> {
+        SqliteStateDb::get_downloaded_local_paths(self).await
     }
 
     async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {

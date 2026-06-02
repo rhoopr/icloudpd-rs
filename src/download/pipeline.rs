@@ -412,6 +412,46 @@ async fn adopt_pending_on_disk_skip(
     adopted
 }
 
+fn state_confirmed_current_path_exists(
+    ctx: &DownloadContext,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    task: &DownloadTask,
+    task_planner: &mut TaskPlanner,
+) -> Option<PathBuf> {
+    let stored_path =
+        ctx.downloaded_local_path(&task.library, &task.asset_id, task.version_size)?;
+
+    for derived in derive_expected_paths(asset, config) {
+        if derived.version_size != task.version_size {
+            continue;
+        }
+        let Some(existing_path) = task_planner.existing_path(&derived.path) else {
+            continue;
+        };
+        if existing_path == stored_path {
+            return Some(existing_path);
+        }
+    }
+
+    None
+}
+
+async fn record_seen_for_forwarded_task(
+    db: &dyn StateDb,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    task: &DownloadTask,
+) {
+    if let Err(e) = planner::upsert_seen_for_task(db, config, asset, task).await {
+        tracing::warn!(
+            asset_id = %task.asset_id,
+            error = %e,
+            "Failed to record asset"
+        );
+    }
+}
+
 async fn backfill_downloaded_metadata_for_on_disk_skip(
     state_db: Option<&dyn StateDb>,
     config: &DownloadConfig,
@@ -1555,20 +1595,6 @@ where
                             }
 
                             if let Some(db) = &producer_state_db {
-                                if let Err(e) = planner::upsert_seen_for_task(
-                                    db.as_ref(),
-                                    config,
-                                    &asset,
-                                    &task,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        asset_id = %task.asset_id,
-                                        error = %e,
-                                        "Failed to record asset"
-                                    );
-                                }
                                 // Per-album config (set when {album} is in folder_structure)
                                 // carries the album name so we can record membership.
                                 // In merged-stream mode album is unknown at this point;
@@ -1599,6 +1625,13 @@ where
                                 ) {
                                     Some(true) => {
                                         disposition = disposition.max(AssetDisposition::Forwarded);
+                                        record_seen_for_forwarded_task(
+                                            db.as_ref(),
+                                            config,
+                                            &asset,
+                                            &task,
+                                        )
+                                        .await;
                                         let size = task.size;
                                         if task_tx.send(task).await.is_err() {
                                             return skips;
@@ -1614,43 +1647,70 @@ where
                                             "Skipping (state confirms no download needed)"
                                         );
                                     }
-                                    None => match task_planner
-                                        .existing_path_match(&task.download_path)
-                                    {
-                                        ExistingPathMatch::Exact => {
+                                    None => {
+                                        if let Some(existing_path) =
+                                            state_confirmed_current_path_exists(
+                                                &download_ctx,
+                                                config,
+                                                &asset,
+                                                &task,
+                                                &mut task_planner,
+                                            )
+                                        {
                                             disposition = disposition.max(AssetDisposition::OnDisk);
                                             tracing::debug!(
                                                 asset_id = %task.asset_id,
-                                                path = %task.download_path.display(),
-                                                "Skipping (already downloaded)"
+                                                path = %existing_path.display(),
+                                                "Skipping (state path exists on disk)"
                                             );
+                                            continue;
                                         }
-                                        ExistingPathMatch::AmpmVariant => {
-                                            disposition =
-                                                disposition.max(AssetDisposition::AmpmVariant);
-                                            tracing::debug!(
-                                                asset_id = %task.asset_id,
-                                                path = %task.download_path.display(),
-                                                "Skipping (AM/PM variant exists on disk)"
-                                            );
-                                        }
-                                        ExistingPathMatch::Missing => {
-                                            tracing::debug!(
-                                                asset_id = %task.asset_id,
-                                                path = %task.download_path.display(),
-                                                "File missing, will re-download"
-                                            );
-                                            disposition =
-                                                disposition.max(AssetDisposition::Forwarded);
-                                            let size = task.size;
-                                            if task_tx.send(task).await.is_err() {
-                                                return skips;
+
+                                        match task_planner.existing_path_match(&task.download_path)
+                                        {
+                                            ExistingPathMatch::Exact => {
+                                                disposition =
+                                                    disposition.max(AssetDisposition::OnDisk);
+                                                tracing::debug!(
+                                                    asset_id = %task.asset_id,
+                                                    path = %task.download_path.display(),
+                                                    "Skipping (already downloaded)"
+                                                );
                                             }
-                                            if forecast_check(size) {
-                                                return skips;
+                                            ExistingPathMatch::AmpmVariant => {
+                                                disposition =
+                                                    disposition.max(AssetDisposition::AmpmVariant);
+                                                tracing::debug!(
+                                                    asset_id = %task.asset_id,
+                                                    path = %task.download_path.display(),
+                                                    "Skipping (AM/PM variant exists on disk)"
+                                                );
+                                            }
+                                            ExistingPathMatch::Missing => {
+                                                tracing::debug!(
+                                                    asset_id = %task.asset_id,
+                                                    path = %task.download_path.display(),
+                                                    "File missing, will re-download"
+                                                );
+                                                disposition =
+                                                    disposition.max(AssetDisposition::Forwarded);
+                                                record_seen_for_forwarded_task(
+                                                    db.as_ref(),
+                                                    config,
+                                                    &asset,
+                                                    &task,
+                                                )
+                                                .await;
+                                                let size = task.size;
+                                                if task_tx.send(task).await.is_err() {
+                                                    return skips;
+                                                }
+                                                if forecast_check(size) {
+                                                    return skips;
+                                                }
                                             }
                                         }
-                                    },
+                                    }
                                 }
                             } else {
                                 disposition = disposition.max(AssetDisposition::Forwarded);
@@ -5404,6 +5464,99 @@ mod tests {
             "deleted file must be forwarded for re-download (which fails against the dead URL)"
         );
         assert_eq!(&*failed[0].id, "DELETED");
+    }
+
+    /// Metadata embedding can legitimately change the local byte size after
+    /// the downloaded bytes were verified. A later sync must use the DB row's
+    /// asset identity and recorded path to skip that current-path file instead
+    /// of treating it as a same-name/different-size collision and downloading
+    /// a `-<size>` duplicate.
+    #[tokio::test]
+    async fn metadata_mutated_downloaded_file_is_not_size_dedup_redownloaded() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        fn asset() -> PhotoAsset {
+            TestPhotoAsset::new("METADATA_MUTATED")
+                .filename("IMG_4123.JPG")
+                .item_type("public.jpeg")
+                .orig_file_type("public.jpeg")
+                .orig_size(1234)
+                // Allowlisted CDN host so a regression reaches the download
+                // phase; the non-base64 checksum then fails locally without
+                // doing network I/O.
+                .orig_url("https://p01.icloud-content.com/IMG_4123.JPG")
+                .orig_checksum("ck_metadata_mutated")
+                .build()
+        }
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let existing_asset = asset();
+
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let target_path = crate::download::paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &existing_asset.created().with_timezone(&chrono::Local),
+            "IMG_4123.JPG",
+            None,
+        );
+        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        fs::write(&target_path, vec![0u8; 1500]).unwrap();
+
+        let record = crate::test_helpers::TestAssetRecord::new("METADATA_MUTATED")
+            .checksum("ck_metadata_mutated")
+            .filename("IMG_4123.JPG")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "METADATA_MUTATED",
+            "original",
+            &target_path,
+            "local_checksum_after_metadata_write",
+            Some("download_checksum_before_metadata_write"),
+        )
+        .await
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        let stream1 = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset())]);
+        let result = stream_and_download_from_stream(
+            &client,
+            stream1,
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(result.downloaded, 0, "asset must not be re-downloaded");
+        assert!(
+            result.failed.is_empty(),
+            "state-backed current path should skip before the dead URL reaches the download phase"
+        );
+        assert!(
+            !target_path.with_file_name("IMG_4123-1234.JPG").exists(),
+            "sync must not create a size-dedup duplicate"
+        );
+        let failed = db.get_failed().await.unwrap();
+        assert!(
+            failed.is_empty(),
+            "metadata-mutated downloaded file should remain downloaded, not failed"
+        );
     }
 
     // ── run_metadata_rewrites end-to-end ───────────────────────────────────
