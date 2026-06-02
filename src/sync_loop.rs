@@ -490,12 +490,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 u = config.auth.username
             );
             tracing::warn!(message = %msg, "2FA required");
-            notifier.notify(
-                notifications::Event::TwoFaRequired,
-                &msg,
-                &config.auth.username,
-                None,
-            );
+            notifier.notify(notifications::Event::TwoFaRequired, &msg, None);
 
             wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
                 auth::authenticate_with_mode(
@@ -907,7 +902,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let mut health = health::HealthStatus::new();
     let cycle_reporter =
         crate::cycle_reporter::CycleReporter::new(crate::cycle_reporter::CycleReporterConfig {
-            username: &config.auth.username,
             watch_mode: is_watch_mode,
             report_path: config.report.json.as_deref(),
             run_options: crate::report::RunOptions::from_config(&config),
@@ -975,7 +969,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             notifier.notify(
                 notifications::Event::SyncStarted,
                 "Sync cycle starting",
-                &config.auth.username,
                 None,
             );
 
@@ -1011,12 +1004,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             cycle_reporter
                 .report_completed_cycle(
                     &mut health,
-                    crate::cycle_reporter::CycleReportInput {
-                        stats: &cycle_result.stats,
-                        failed_count: cycle_result.failed_count,
-                        session_expired: cycle_result.session_expired,
-                        elapsed: cycle_started_at.elapsed(),
-                    },
+                    crate::cycle_reporter::CycleFacts::new(
+                        &cycle_result.stats,
+                        cycle_result.failed_count,
+                        cycle_result.session_expired,
+                        cycle_started_at.elapsed(),
+                    ),
                 )
                 .await;
 
@@ -1060,12 +1053,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             u = config.auth.username
                         );
                         tracing::warn!(message = %msg, "2FA required");
-                        notifier.notify(
-                            notifications::Event::TwoFaRequired,
-                            &msg,
-                            &config.auth.username,
-                            None,
-                        );
+                        notifier.notify(notifications::Event::TwoFaRequired, &msg, None);
                         if !should_wait_for_2fa(is_watch_mode, &e) {
                             return Err(e);
                         }
@@ -1090,7 +1078,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         notifier.notify(
                             notifications::Event::SessionExpired,
                             &format!("Re-authentication failed: {e}"),
-                            &config.auth.username,
                             None,
                         );
                         return Err(e);
@@ -1219,7 +1206,6 @@ async fn maybe_write_offline_fake_sync_report(
 
     let reporter = crate::cycle_reporter::CycleReporter::<state::SqliteStateDb>::new(
         crate::cycle_reporter::CycleReporterConfig {
-            username: &config.auth.username,
             watch_mode: config.watch.interval.is_some(),
             report_path: Some(report_path),
             run_options: crate::report::RunOptions::from_config(config),
@@ -1248,12 +1234,12 @@ async fn maybe_write_offline_fake_sync_report(
     reporter
         .report_completed_cycle(
             &mut health,
-            crate::cycle_reporter::CycleReportInput {
-                stats: &stats,
-                failed_count: 0,
-                session_expired: false,
-                elapsed: std::time::Duration::from_millis(125),
-            },
+            crate::cycle_reporter::CycleFacts::new(
+                &stats,
+                0,
+                false,
+                std::time::Duration::from_millis(125),
+            ),
         )
         .await;
 
@@ -1307,12 +1293,7 @@ async fn reauth_with_srp(
                 u = config.auth.username
             );
             tracing::warn!(message = %msg, "2FA required");
-            notifier.notify(
-                notifications::Event::TwoFaRequired,
-                &msg,
-                &config.auth.username,
-                None,
-            );
+            notifier.notify(notifications::Event::TwoFaRequired, &msg, None);
             wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
                 auth::authenticate_with_mode(
                     &config.auth.cookie_directory,

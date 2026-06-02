@@ -34,71 +34,6 @@ impl Event {
     }
 }
 
-/// Sync statistics passed to notification scripts as environment variables.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SyncNotificationData {
-    pub assets_seen: u64,
-    pub downloaded: usize,
-    pub failed: usize,
-    pub skipped: usize,
-    pub bytes_downloaded: u64,
-    pub disk_bytes_written: u64,
-    pub elapsed_secs: f64,
-    pub interrupted: bool,
-    pub exif_failures: usize,
-    pub state_write_failures: usize,
-    pub enumeration_errors: usize,
-    pub pagination_shortfall_warnings: usize,
-    pub pagination_shortfall_assets: u64,
-    pub sync_token_blocked: bool,
-    pub sync_token_blocked_reason: Option<&'static str>,
-    // Skip breakdown
-    pub skipped_by_state: usize,
-    pub skipped_on_disk: usize,
-    pub skipped_by_media_type: usize,
-    pub skipped_by_date_range: usize,
-    pub skipped_by_live_photo: usize,
-    pub skipped_by_filename: usize,
-    pub skipped_by_excluded_album: usize,
-    pub skipped_live_photo_variant: usize,
-    pub skipped_duplicates: usize,
-    pub skipped_retry_exhausted: usize,
-    pub skipped_retry_only: usize,
-}
-
-impl From<&crate::download::SyncStats> for SyncNotificationData {
-    fn from(s: &crate::download::SyncStats) -> Self {
-        Self {
-            assets_seen: s.assets_seen,
-            downloaded: s.downloaded,
-            failed: s.failed,
-            skipped: s.skipped.total(),
-            bytes_downloaded: s.bytes_downloaded,
-            disk_bytes_written: s.disk_bytes_written,
-            elapsed_secs: s.elapsed_secs,
-            interrupted: s.interrupted,
-            exif_failures: s.exif_failures,
-            state_write_failures: s.state_write_failures,
-            enumeration_errors: s.enumeration_errors,
-            pagination_shortfall_warnings: s.pagination_shortfall_warnings,
-            pagination_shortfall_assets: s.pagination_shortfall_assets,
-            sync_token_blocked: s.sync_token_blocked,
-            sync_token_blocked_reason: s.sync_token_blocked_reason,
-            skipped_by_state: s.skipped.by_state,
-            skipped_on_disk: s.skipped.on_disk,
-            skipped_by_media_type: s.skipped.by_media_type,
-            skipped_by_date_range: s.skipped.by_date_range,
-            skipped_by_live_photo: s.skipped.by_live_photo,
-            skipped_by_filename: s.skipped.by_filename,
-            skipped_by_excluded_album: s.skipped.by_excluded_album,
-            skipped_live_photo_variant: s.skipped.ampm_variant,
-            skipped_duplicates: s.skipped.duplicates,
-            skipped_retry_exhausted: s.skipped.retry_exhausted,
-            skipped_retry_only: s.skipped.retry_only,
-        }
-    }
-}
-
 /// Notification dispatcher. Holds an optional script path.
 /// When no script is configured, all methods are no-ops.
 #[derive(Debug, Clone)]
@@ -141,13 +76,7 @@ impl Notifier {
 
     /// Fire the notification script with the given event.
     /// Fire-and-forget: spawns the script in a background task so it never blocks sync.
-    pub fn notify(
-        &self,
-        event: Event,
-        message: &str,
-        username: &str,
-        data: Option<&SyncNotificationData>,
-    ) {
+    pub fn notify(&self, event: Event, message: &str, report_path: Option<&Path>) {
         let Some(script) = self.script.clone() else {
             return;
         };
@@ -162,8 +91,7 @@ impl Notifier {
 
         let event_str = event.as_str();
         let message = message.to_owned();
-        let username = username.to_owned();
-        let data = data.cloned();
+        let report_path = report_path.map(Path::to_path_buf);
 
         tracing::debug!(event = event_str, "Firing notification script");
 
@@ -190,7 +118,7 @@ impl Notifier {
         };
         tokio::spawn(async move {
             let _permit = permit;
-            match run_script(&script, event_str, &message, &username, data.as_ref()).await {
+            match run_script(&script, event_str, &message, report_path.as_deref()).await {
                 Ok(status) if status.success() => {
                     tracing::debug!(event = event_str, "Notification script completed");
                 }
@@ -217,8 +145,7 @@ async fn run_script(
     script: &Path,
     event: &str,
     message: &str,
-    username: &str,
-    data: Option<&SyncNotificationData>,
+    report_path: Option<&Path>,
 ) -> anyhow::Result<std::process::ExitStatus> {
     // Execute via /bin/sh to avoid ETXTBSY ("Text file busy") races when
     // the script file was recently written or replaced (e.g. config reload,
@@ -227,67 +154,12 @@ async fn run_script(
     cmd.arg(script)
         .env("KEI_EVENT", event)
         .env("KEI_MESSAGE", message)
-        .env("KEI_ICLOUD_USERNAME", username)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit());
 
-    if let Some(d) = data {
-        cmd.env("KEI_ASSETS_SEEN", d.assets_seen.to_string())
-            .env("KEI_DOWNLOADED", d.downloaded.to_string())
-            .env("KEI_FAILED", d.failed.to_string())
-            .env("KEI_SKIPPED", d.skipped.to_string())
-            .env("KEI_INTERRUPTED", d.interrupted.to_string())
-            .env("KEI_BYTES_DOWNLOADED", d.bytes_downloaded.to_string())
-            .env("KEI_DISK_BYTES", d.disk_bytes_written.to_string())
-            .env("KEI_ELAPSED_SECS", format!("{:.1}", d.elapsed_secs))
-            .env("KEI_EXIF_FAILURES", d.exif_failures.to_string())
-            .env(
-                "KEI_STATE_WRITE_FAILURES",
-                d.state_write_failures.to_string(),
-            )
-            .env("KEI_ENUMERATION_ERRORS", d.enumeration_errors.to_string())
-            .env(
-                "KEI_PAGINATION_SHORTFALL_WARNINGS",
-                d.pagination_shortfall_warnings.to_string(),
-            )
-            .env(
-                "KEI_PAGINATION_SHORTFALL_ASSETS",
-                d.pagination_shortfall_assets.to_string(),
-            )
-            .env("KEI_SYNC_TOKEN_BLOCKED", d.sync_token_blocked.to_string())
-            .env("KEI_SKIPPED_BY_STATE", d.skipped_by_state.to_string())
-            .env("KEI_SKIPPED_ON_DISK", d.skipped_on_disk.to_string())
-            .env(
-                "KEI_SKIPPED_BY_MEDIA_TYPE",
-                d.skipped_by_media_type.to_string(),
-            )
-            .env(
-                "KEI_SKIPPED_BY_DATE_RANGE",
-                d.skipped_by_date_range.to_string(),
-            )
-            .env(
-                "KEI_SKIPPED_BY_LIVE_PHOTO",
-                d.skipped_by_live_photo.to_string(),
-            )
-            .env("KEI_SKIPPED_BY_FILENAME", d.skipped_by_filename.to_string())
-            .env(
-                "KEI_SKIPPED_BY_EXCLUDED_ALBUM",
-                d.skipped_by_excluded_album.to_string(),
-            )
-            .env(
-                "KEI_SKIPPED_LIVE_PHOTO_VARIANT",
-                d.skipped_live_photo_variant.to_string(),
-            )
-            .env("KEI_SKIPPED_DUPLICATES", d.skipped_duplicates.to_string())
-            .env(
-                "KEI_SKIPPED_RETRY_EXHAUSTED",
-                d.skipped_retry_exhausted.to_string(),
-            )
-            .env("KEI_SKIPPED_RETRY_ONLY", d.skipped_retry_only.to_string());
-        if let Some(reason) = &d.sync_token_blocked_reason {
-            cmd.env("KEI_SYNC_TOKEN_BLOCK_REASON", reason);
-        }
+    if let Some(path) = report_path {
+        cmd.env("KEI_REPORT_JSON", path);
     }
 
     let mut child = cmd.spawn()?;
@@ -334,12 +206,7 @@ mod tests {
     fn notify_with_nonexistent_script() {
         let notifier = Notifier::new(Some(PathBuf::from("/tmp/codex/kei/nonexistent_notify.sh")));
         // Should not panic, just log a warning (script existence checked synchronously)
-        notifier.notify(
-            Event::SyncComplete,
-            "test message",
-            "user@example.com",
-            None,
-        );
+        notifier.notify(Event::SyncComplete, "test message", None);
     }
 
     /// Write a shell script to a temp dir. No executable permission needed
@@ -410,7 +277,7 @@ mod tests {
         let dir = notification_test_dir("run_script_success");
         let script = write_test_script(dir.path(), "success.sh", b"#!/bin/sh\nexit 0\n");
 
-        let status = run_script(&script, "test_event", "msg", "user", None)
+        let status = run_script(&script, "test_event", "msg", None)
             .await
             .unwrap_or_else(|err| panic!("run notification script {}: {err}", script.display()));
         assert!(status.success());
@@ -422,7 +289,7 @@ mod tests {
         let dir = notification_test_dir("run_script_nonzero_exit");
         let script = write_test_script(dir.path(), "fail.sh", b"#!/bin/sh\nexit 1\n");
 
-        let status = run_script(&script, "test_event", "msg", "user", None)
+        let status = run_script(&script, "test_event", "msg", None)
             .await
             .unwrap_or_else(|err| panic!("run notification script {}: {err}", script.display()));
         assert!(!status.success());
@@ -434,7 +301,7 @@ mod tests {
         let dir = notification_test_dir("notify_runs_script_with_env_vars");
         let output_path = dir.path().join("test_notify_output.txt");
         let body = format!(
-            "#!/bin/sh\necho \"$KEI_EVENT|$KEI_MESSAGE|$KEI_ICLOUD_USERNAME\" > {}\n",
+            "#!/bin/sh\necho \"$KEI_EVENT|$KEI_MESSAGE\" > {}\n",
             output_path.display()
         );
         let script_path = write_test_script(dir.path(), "test_notify.sh", body.as_bytes());
@@ -443,7 +310,6 @@ mod tests {
             &script_path,
             Event::TwoFaRequired.as_str(),
             "Need 2FA code",
-            "test@example.com",
             None,
         )
         .await
@@ -451,42 +317,33 @@ mod tests {
         assert!(status.success());
 
         let output = read_script_output(&output_path);
-        assert_eq!(output.trim(), "2fa_required|Need 2FA code|test@example.com");
+        assert_eq!(output.trim(), "2fa_required|Need 2FA code");
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn notify_with_sync_data_sets_extended_env_vars() {
-        let dir = notification_test_dir("notify_with_sync_data_sets_extended_env_vars");
+    async fn notify_with_report_path_sets_report_json_env_var() {
+        let dir = notification_test_dir("notify_with_report_path_sets_report_json_env_var");
         let output_path = dir.path().join("test_data_output.txt");
+        let report_path = dir.path().join("sync_report.json");
         let body = format!(
-            "#!/bin/sh\necho \"$KEI_DOWNLOADED|$KEI_FAILED|$KEI_SKIPPED|$KEI_BYTES_DOWNLOADED|$KEI_SKIPPED_BY_STATE\" > {}\n",
+            "#!/bin/sh\necho \"$KEI_REPORT_JSON\" > {}\n",
             output_path.display()
         );
         let script_path = write_test_script(dir.path(), "test_data.sh", body.as_bytes());
-
-        let data = SyncNotificationData {
-            downloaded: 42,
-            failed: 3,
-            skipped: 100,
-            bytes_downloaded: 1_500_000,
-            skipped_by_state: 80,
-            ..SyncNotificationData::default()
-        };
 
         let status = run_script(
             &script_path,
             Event::SyncComplete.as_str(),
             "test",
-            "user@example.com",
-            Some(&data),
+            Some(&report_path),
         )
         .await
-        .expect("run notification script with sync data");
+        .expect("run notification script with report path");
         assert!(status.success());
 
         let output = read_script_output(&output_path);
-        assert_eq!(output.trim(), "42|3|100|1500000|80");
+        assert_eq!(output.trim(), report_path.display().to_string());
     }
 
     /// The semaphore itself is the concurrency contract. Acquire every
@@ -555,7 +412,7 @@ mod tests {
             "test must hold every permit before calling notify"
         );
 
-        notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
+        notifier.notify(Event::SyncStarted, "msg", None);
 
         let events = capture.events();
         let saturated = events
@@ -582,7 +439,7 @@ mod tests {
         );
 
         drop(held);
-        notifier.notify(Event::SyncStarted, "msg", "user@example.com", None);
+        notifier.notify(Event::SyncStarted, "msg", None);
         wait_until_file_contains(&output_path, "fresh").await;
         wait_until_available_permits(&notifier.concurrency, NOTIFIER_MAX_INFLIGHT).await;
         assert_eq!(
@@ -594,27 +451,21 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn notify_without_data_omits_extended_vars() {
+    async fn notify_without_report_path_omits_report_env() {
         let dir = notification_test_dir("notify_without_data_omits_extended_vars");
         let output_path = dir.path().join("test_no_data.txt");
         let body = format!(
-            "#!/bin/sh\necho \"${{KEI_DOWNLOADED:-unset}}|${{KEI_FAILED:-unset}}\" > {}\n",
+            "#!/bin/sh\necho \"${{KEI_REPORT_JSON:-unset}}\" > {}\n",
             output_path.display()
         );
         let script_path = write_test_script(dir.path(), "test_no_data.sh", body.as_bytes());
 
-        let status = run_script(
-            &script_path,
-            Event::SyncComplete.as_str(),
-            "test",
-            "user@example.com",
-            None,
-        )
-        .await
-        .expect("run notification script without sync data");
+        let status = run_script(&script_path, Event::SyncComplete.as_str(), "test", None)
+            .await
+            .expect("run notification script without sync data");
         assert!(status.success());
 
         let output = read_script_output(&output_path);
-        assert_eq!(output.trim(), "unset|unset");
+        assert_eq!(output.trim(), "unset");
     }
 }

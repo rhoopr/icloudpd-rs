@@ -150,37 +150,6 @@ impl RunOptions {
     }
 }
 
-/// Derive the `status` field for `sync_report.json` from the cycle outcome.
-///
-/// Priority: `session_expired` > `interrupted` > `partial_failure` > `success`.
-///
-/// `session_expired` wins over everything because session loss explains any
-/// per-asset failures and the correct caller action is re-authenticate, not
-/// retry. `interrupted` wins over `partial_failure` because a cycle cut short
-/// by SIGINT/SIGTERM/SIGHUP often records transient failures (downloads that
-/// were mid-flight when we cancelled); the operator usually does not want
-/// those to alert, whereas a true `partial_failure` without an interrupt
-/// signal means the server or network actually returned errors.
-///
-/// A zero-asset sync with no failures and no interrupt resolves to `"success"`
-/// so operator automation sees status-success when a library legitimately has
-/// no matching assets.
-pub(crate) fn sync_status_str(
-    session_expired: bool,
-    interrupted: bool,
-    failed_count: usize,
-) -> &'static str {
-    if session_expired {
-        "session_expired"
-    } else if interrupted {
-        "interrupted"
-    } else if failed_count > 0 {
-        "partial_failure"
-    } else {
-        "success"
-    }
-}
-
 /// Write a JSON report to the given path atomically.
 ///
 /// Serialization runs synchronously (small — typically a few KB), but the
@@ -209,63 +178,6 @@ pub(crate) async fn write_report(path: &Path, report: &SyncReport) -> anyhow::Re
 mod tests {
     use super::*;
     use crate::download::SkipBreakdown;
-
-    #[test]
-    fn sync_status_zero_assets_no_failures_is_success() {
-        assert_eq!(sync_status_str(false, false, 0), "success");
-    }
-
-    #[test]
-    fn sync_status_any_failure_is_partial_failure() {
-        assert_eq!(sync_status_str(false, false, 1), "partial_failure");
-        assert_eq!(sync_status_str(false, false, 999), "partial_failure");
-    }
-
-    #[test]
-    fn sync_status_session_expired_dominates_failure_count() {
-        assert_eq!(
-            sync_status_str(true, false, 0),
-            "session_expired",
-            "session expiration with no per-asset failures is still session_expired"
-        );
-        assert_eq!(
-            sync_status_str(true, false, 42),
-            "session_expired",
-            "session expiration dominates failed_count because the failures are attributable to session loss, not per-asset errors"
-        );
-    }
-
-    #[test]
-    fn sync_status_interrupted_reported_when_cycle_cut_short() {
-        assert_eq!(
-            sync_status_str(false, true, 0),
-            "interrupted",
-            "clean interrupt with no failures is 'interrupted', not 'success'"
-        );
-    }
-
-    #[test]
-    fn sync_status_interrupted_beats_partial_failure() {
-        assert_eq!(
-            sync_status_str(false, true, 5),
-            "interrupted",
-            "failures recorded during a cancelled cycle are usually mid-flight artifacts — don't alert on them as partial_failure"
-        );
-    }
-
-    #[test]
-    fn sync_status_session_expired_beats_interrupted() {
-        assert_eq!(
-            sync_status_str(true, true, 0),
-            "session_expired",
-            "session_expired is the actionable signal; interrupt is secondary when auth is broken"
-        );
-        assert_eq!(
-            sync_status_str(true, true, 7),
-            "session_expired",
-            "session_expired still wins when interrupt and failures coexist"
-        );
-    }
 
     #[test]
     fn report_serialization_roundtrip() {

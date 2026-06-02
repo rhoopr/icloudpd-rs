@@ -231,7 +231,7 @@ password for future runs.
 | `--log-level` | `--log-level` or `log_level` | `debug`, `info`, `warn`, `error`. |
 | `--only-print-filenames` | `--only-print-filenames` | Per-run flag that prints paths and doesn't download. |
 | `--dry-run` | `--dry-run` | Per-run flag that doesn't modify local state or iCloud. |
-| `--notification-script` | `[notifications].script` | kei sends `KEI_EVENT`, `KEI_MESSAGE`, and `KEI_ICLOUD_USERNAME`. |
+| `--notification-script` | `[notifications].script` | kei sends `KEI_EVENT`, `KEI_MESSAGE`, and `KEI_REPORT_JSON` when a report path is configured. |
 
 ## Python flags without a kei equivalent
 
