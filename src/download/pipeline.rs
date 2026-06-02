@@ -1729,6 +1729,7 @@ where
                 || auth_errors >= AUTH_ERROR_THRESHOLD
                 || producer_panicked
                 || url_expired_abort,
+            ..Default::default()
         };
         if let Err(e) = db.complete_sync_run(run_id, &stats).await {
             tracing::warn!(error = %e, "Failed to complete sync run tracking");
@@ -3749,6 +3750,13 @@ mod tests {
             _limit: u32,
         ) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()
+        }
+
+        async fn start_sync_run_at(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<i64, StateError> {
+            Ok(1)
         }
 
         async fn start_sync_run(&self) -> Result<i64, StateError> {

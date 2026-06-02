@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 12;
+pub(crate) const SCHEMA_VERSION: i32 = 13;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -500,6 +500,40 @@ fn migrate_to_version(
             }
         }
         12 => conn.execute_batch(SCHEMA_V12)?,
+        13 => {
+            // sync_runs.api_total_at_start: count-only CloudKit inventory
+            // observed at the start of a reliable full enumeration. The
+            // inventory-drop columns capture the latest cross-cycle warning
+            // so `kei status` can surface it without grepping logs.
+            if !column_exists(conn, "sync_runs", "api_total_at_start")? {
+                conn.execute_batch("ALTER TABLE sync_runs ADD COLUMN api_total_at_start INTEGER;")?;
+            }
+            if !column_exists(conn, "sync_runs", "api_total_at_start_partial")? {
+                conn.execute_batch(
+                    "ALTER TABLE sync_runs ADD COLUMN api_total_at_start_partial INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !column_exists(conn, "sync_runs", "inventory_drop_detected")? {
+                conn.execute_batch(
+                    "ALTER TABLE sync_runs ADD COLUMN inventory_drop_detected INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            if !column_exists(conn, "sync_runs", "inventory_drop_previous_total")? {
+                conn.execute_batch(
+                    "ALTER TABLE sync_runs ADD COLUMN inventory_drop_previous_total INTEGER;",
+                )?;
+            }
+            if !column_exists(conn, "sync_runs", "inventory_drop_current_total")? {
+                conn.execute_batch(
+                    "ALTER TABLE sync_runs ADD COLUMN inventory_drop_current_total INTEGER;",
+                )?;
+            }
+            if !column_exists(conn, "sync_runs", "inventory_drop_library")? {
+                conn.execute_batch(
+                    "ALTER TABLE sync_runs ADD COLUMN inventory_drop_library TEXT;",
+                )?;
+            }
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1499,6 +1533,45 @@ mod tests {
         set_schema_version(&conn, 9).unwrap();
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// v13 persists the count-only CloudKit inventory snapshot and latest
+    /// cross-cycle drop warning fields on `sync_runs`.
+    #[test]
+    fn test_v13_adds_inventory_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+        migrate(&conn).unwrap();
+
+        for column in [
+            "api_total_at_start",
+            "api_total_at_start_partial",
+            "inventory_drop_detected",
+            "inventory_drop_previous_total",
+            "inventory_drop_current_total",
+            "inventory_drop_library",
+        ] {
+            assert!(
+                column_exists(&conn, "sync_runs", column).unwrap(),
+                "v13 must add sync_runs.{column}"
+            );
+        }
+
+        conn.execute(
+            "INSERT INTO sync_runs (started_at) VALUES (?1)",
+            [1700000000_i64],
+        )
+        .unwrap();
+        let defaults: (i64, i64) = conn
+            .query_row(
+                "SELECT api_total_at_start_partial, inventory_drop_detected \
+                 FROM sync_runs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(defaults, (0, 0));
     }
 
     /// v11 introduces `imported_size` and `imported_mtime` on `assets`.

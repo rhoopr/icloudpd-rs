@@ -50,10 +50,54 @@ pub(crate) const ENUM_CONFIG_HASH_KEY: &str = "enum_config_hash";
 /// table. Cleared en masse when [`ENUM_CONFIG_HASH_KEY`] changes so the
 /// next cycle falls back to full enumeration.
 pub(crate) const SYNC_TOKEN_PREFIX: &str = "sync_token:";
+const INVENTORY_ANCHOR_PREFIX: &str = "inventory_anchor:";
+const INVENTORY_DROP_THRESHOLD_PERCENT: f64 = 5.0;
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct InventoryAnchor {
+    api_total_at_start: u64,
+    assets_seen: u64,
+    completed_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct InventoryDrop {
+    previous_total: u64,
+    current_total: u64,
+    drop_assets: u64,
+    drop_percent: f64,
+}
 
 /// Return the metadata key that stores the CloudKit sync token for a zone.
 pub(crate) fn sync_token_key(zone_name: &str) -> String {
     format!("{SYNC_TOKEN_PREFIX}{zone_name}")
+}
+
+fn inventory_anchor_key(enum_config_hash: &str, zone_name: &str) -> String {
+    format!("{INVENTORY_ANCHOR_PREFIX}{enum_config_hash}:{zone_name}")
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "inventory totals are operator diagnostics; f64 percent is only for warning/report context"
+)]
+fn classify_inventory_drop(previous_total: u64, current_total: u64) -> Option<InventoryDrop> {
+    if previous_total == 0 || current_total >= previous_total {
+        return None;
+    }
+
+    let drop_assets = previous_total - current_total;
+    let drop_percent = (drop_assets as f64 / previous_total as f64) * 100.0;
+    if drop_percent < INVENTORY_DROP_THRESHOLD_PERCENT {
+        return None;
+    }
+
+    Some(InventoryDrop {
+        previous_total,
+        current_total,
+        drop_assets,
+        drop_percent,
+    })
 }
 
 /// Outcome of a single sync cycle across all libraries.
@@ -116,6 +160,86 @@ fn should_warn_zero_assets(
         && !is_retry_failed
         && sync_result.stats.assets_seen == 0
         && has_active_passes(lib_state)
+}
+
+async fn update_inventory_anchor_for_cycle<D>(
+    db: &D,
+    enum_config_hash: &str,
+    zone_name: &str,
+    stats: &mut download::SyncStats,
+) where
+    D: state::SyncTokenStore + ?Sized,
+{
+    let Some(current_total) = stats.api_total_at_start else {
+        return;
+    };
+    let key = inventory_anchor_key(enum_config_hash, zone_name);
+    match db.get_metadata(&key).await {
+        Ok(Some(raw)) => match serde_json::from_str::<InventoryAnchor>(&raw) {
+            Ok(anchor) => {
+                if let Some(drop) =
+                    classify_inventory_drop(anchor.api_total_at_start, current_total)
+                {
+                    tracing::warn!(
+                        library = zone_name,
+                        previous_api_total = drop.previous_total,
+                        current_api_total = drop.current_total,
+                        drop_assets = drop.drop_assets,
+                        drop_percent = drop.drop_percent,
+                        threshold_percent = INVENTORY_DROP_THRESHOLD_PERCENT,
+                        strict_inventory = false,
+                        enum_config_hash,
+                        "Inventory dropped below previous comparable full run"
+                    );
+                    stats.inventory_drop_warnings = stats.inventory_drop_warnings.saturating_add(1);
+                    stats.inventory_drop_assets = drop.drop_assets;
+                    stats.inventory_drop_percent = Some(drop.drop_percent);
+                    stats.inventory_drop_previous_total = Some(drop.previous_total);
+                    stats.inventory_drop_current_total = Some(drop.current_total);
+                    stats.inventory_drop_library = Some(zone_name.to_string());
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    library = zone_name,
+                    "Ignoring unreadable inventory anchor"
+                );
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                library = zone_name,
+                "Failed to read inventory anchor"
+            );
+        }
+    }
+
+    let anchor = InventoryAnchor {
+        api_total_at_start: current_total,
+        assets_seen: stats.assets_seen,
+        completed_at: chrono::Utc::now().timestamp(),
+    };
+    match serde_json::to_string(&anchor) {
+        Ok(value) => {
+            if let Err(e) = db.set_metadata(&key, &value).await {
+                tracing::debug!(
+                    error = %e,
+                    library = zone_name,
+                    "Failed to persist inventory anchor"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                library = zone_name,
+                "Failed to serialize inventory anchor"
+            );
+        }
+    }
 }
 
 /// Closure shape used to derive a per-library `DownloadConfig` from the
@@ -316,6 +440,7 @@ pub(crate) async fn run_cycle(
     let mut db_sync_token_advance_safe = !config.runtime.dry_run && !cycle_has_stale_plan;
     let mut force_full_for_config_hash = false;
     let mut force_full_for_download_config_hash = false;
+    let enum_config_hash = download::compute_config_hash(config);
 
     // Check if token-unsafe eligibility config changed since last sync. If
     // so, clear sync tokens and force full enumeration for this cycle -- the
@@ -331,8 +456,8 @@ pub(crate) async fn run_cycle(
     // each other every cycle, permanently preventing incremental sync.
     if !config.runtime.dry_run {
         if let Some(db) = state_db {
-            let config_hash = download::compute_config_hash(config);
-            let config_hash_outcome = check_and_persist_enum_config_hash(db, &config_hash).await;
+            let config_hash_outcome =
+                check_and_persist_enum_config_hash(db, &enum_config_hash).await;
             force_full_for_config_hash = config_hash_outcome.must_force_full_sync();
             if matches!(
                 config_hash_outcome,
@@ -474,6 +599,20 @@ pub(crate) async fn run_cycle(
                 "Sync completed after enumerating zero assets; check iCloud library \
                  access and filters if this was unexpected"
             );
+        }
+        if library_completed_without_errors
+            && !cycle_has_stale_plan
+            && download_controls.run_mode.downloads_files()
+        {
+            if let Some(db) = state_db {
+                update_inventory_anchor_for_cycle(
+                    db,
+                    &enum_config_hash,
+                    &lib_state.zone_name,
+                    &mut sync_result.stats,
+                )
+                .await;
+            }
         }
 
         // Store the zone token only after the download engine has returned a
@@ -812,6 +951,89 @@ mod tests {
             false,
             &make_library_state(true),
         ));
+    }
+
+    #[test]
+    fn inventory_drop_classifier_uses_five_percent_threshold() {
+        assert_eq!(classify_inventory_drop(100, 96), None);
+        assert_eq!(
+            classify_inventory_drop(100, 95),
+            Some(InventoryDrop {
+                previous_total: 100,
+                current_total: 95,
+                drop_assets: 5,
+                drop_percent: 5.0,
+            })
+        );
+        assert_eq!(classify_inventory_drop(0, 0), None);
+        assert_eq!(classify_inventory_drop(100, 101), None);
+    }
+
+    #[tokio::test]
+    async fn inventory_anchor_warns_and_updates_on_comparable_drop() {
+        let db = state::SqliteStateDb::open_in_memory().expect("state db");
+        let key = inventory_anchor_key("hash-a", "PrimarySync");
+        let prior = InventoryAnchor {
+            api_total_at_start: 100,
+            assets_seen: 100,
+            completed_at: 1_700_000_000,
+        };
+        db.set_metadata(&key, &serde_json::to_string(&prior).unwrap())
+            .await
+            .expect("seed anchor");
+
+        let mut stats = download::SyncStats {
+            api_total_at_start: Some(80),
+            assets_seen: 80,
+            ..download::SyncStats::default()
+        };
+        update_inventory_anchor_for_cycle(&db, "hash-a", "PrimarySync", &mut stats).await;
+
+        assert_eq!(stats.inventory_drop_warnings, 1);
+        assert_eq!(stats.inventory_drop_assets, 20);
+        assert_eq!(stats.inventory_drop_previous_total, Some(100));
+        assert_eq!(stats.inventory_drop_current_total, Some(80));
+        assert_eq!(
+            stats.inventory_drop_library,
+            Some("PrimarySync".to_string())
+        );
+        let raw = db
+            .get_metadata(&key)
+            .await
+            .expect("read anchor")
+            .expect("anchor exists");
+        let updated: InventoryAnchor = serde_json::from_str(&raw).expect("anchor json");
+        assert_eq!(updated.api_total_at_start, 80);
+    }
+
+    #[tokio::test]
+    async fn inventory_anchor_is_scoped_by_enum_config_hash() {
+        let db = state::SqliteStateDb::open_in_memory().expect("state db");
+        let old_key = inventory_anchor_key("old-hash", "PrimarySync");
+        let prior = InventoryAnchor {
+            api_total_at_start: 100,
+            assets_seen: 100,
+            completed_at: 1_700_000_000,
+        };
+        db.set_metadata(&old_key, &serde_json::to_string(&prior).unwrap())
+            .await
+            .expect("seed anchor");
+
+        let mut stats = download::SyncStats {
+            api_total_at_start: Some(80),
+            assets_seen: 80,
+            ..download::SyncStats::default()
+        };
+        update_inventory_anchor_for_cycle(&db, "new-hash", "PrimarySync", &mut stats).await;
+
+        assert_eq!(stats.inventory_drop_warnings, 0);
+        assert!(
+            db.get_metadata(&inventory_anchor_key("new-hash", "PrimarySync"))
+                .await
+                .expect("read new anchor")
+                .is_some(),
+            "new hash should get an independent anchor"
+        );
     }
 
     #[tokio::test]

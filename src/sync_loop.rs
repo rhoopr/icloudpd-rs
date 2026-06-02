@@ -982,6 +982,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             );
 
             let cycle_started_at = std::time::Instant::now();
+            let cycle_wall_started_at = chrono::Utc::now();
             let cycle_result = run_cycle(
                 &cycle_library_states,
                 &config,
@@ -993,6 +994,40 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &shutdown_token,
             )
             .await?;
+            if let Some(db) = state_db.as_deref() {
+                let stats = state::SyncRunStats {
+                    assets_seen: cycle_result.stats.assets_seen,
+                    assets_downloaded: u64::try_from(cycle_result.stats.downloaded)
+                        .unwrap_or(u64::MAX),
+                    assets_failed: u64::try_from(cycle_result.stats.failed).unwrap_or(u64::MAX),
+                    enumeration_errors: u64::try_from(cycle_result.stats.enumeration_errors)
+                        .unwrap_or(u64::MAX),
+                    interrupted: cycle_result.stats.interrupted,
+                    api_total_at_start: cycle_result.stats.api_total_at_start,
+                    api_total_at_start_partial: cycle_result.stats.api_total_at_start_partial,
+                    inventory_drop_warnings: u64::try_from(
+                        cycle_result.stats.inventory_drop_warnings,
+                    )
+                    .unwrap_or(u64::MAX),
+                    inventory_drop_previous_total: cycle_result.stats.inventory_drop_previous_total,
+                    inventory_drop_current_total: cycle_result.stats.inventory_drop_current_total,
+                    inventory_drop_library: cycle_result.stats.inventory_drop_library.clone(),
+                };
+                match db.start_sync_run_at(cycle_wall_started_at).await {
+                    Ok(run_id) => {
+                        if let Err(e) = db.complete_sync_run(run_id, &stats).await {
+                            tracing::warn!(
+                                error = %e,
+                                run_id,
+                                "Failed to complete sync_runs ledger row"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to start sync_runs ledger row");
+                    }
+                }
+            }
 
             if let Some(token) = watch_precheck.db_sync_token_after_success() {
                 if !cycle_result.session_expired
@@ -3724,6 +3759,13 @@ mod tests {
             limit: u32,
         ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
             self.inner.get_downloaded_page(offset, limit).await
+        }
+
+        async fn start_sync_run_at(
+            &self,
+            started_at: chrono::DateTime<chrono::Utc>,
+        ) -> Result<i64, state::error::StateError> {
+            self.inner.start_sync_run_at(started_at).await
         }
 
         async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {

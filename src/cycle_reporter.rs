@@ -731,6 +731,13 @@ mod tests {
                     assets_failed: u64::try_from(case.stats.failed).unwrap(),
                     enumeration_errors: u64::try_from(case.stats.enumeration_errors).unwrap(),
                     interrupted: case.stats.interrupted,
+                    api_total_at_start: case.stats.api_total_at_start,
+                    api_total_at_start_partial: case.stats.api_total_at_start_partial,
+                    inventory_drop_warnings: u64::try_from(case.stats.inventory_drop_warnings)
+                        .unwrap(),
+                    inventory_drop_previous_total: case.stats.inventory_drop_previous_total,
+                    inventory_drop_current_total: case.stats.inventory_drop_current_total,
+                    inventory_drop_library: case.stats.inventory_drop_library.clone(),
                 },
             )
             .await

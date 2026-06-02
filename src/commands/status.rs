@@ -51,6 +51,30 @@ pub(crate) async fn run_status(
             completed.format("%Y-%m-%d %H:%M:%S UTC")
         );
     }
+    if let Some(api_total) = summary.last_api_total_at_start {
+        if summary.last_api_total_at_start_partial {
+            println!("Last API total at start: partial, {api_total}");
+        } else {
+            println!("Last API total at start: {api_total}");
+        }
+    }
+    if summary.last_inventory_drop_detected {
+        let library = summary
+            .last_inventory_drop_library
+            .as_deref()
+            .unwrap_or("unknown library");
+        if let (Some(previous), Some(current)) = (
+            summary.last_inventory_drop_previous_total,
+            summary.last_inventory_drop_current_total,
+        ) {
+            let drop = previous.saturating_sub(current);
+            println!(
+                "Inventory warning: {library} dropped {drop} assets since the previous comparable full run ({previous} -> {current})"
+            );
+        } else {
+            println!("Inventory warning: {library} dropped below the previous comparable full run");
+        }
+    }
 
     if args.failed && summary.failed > 0 {
         println!();

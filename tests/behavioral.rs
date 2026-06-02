@@ -157,7 +157,13 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             assets_failed INTEGER DEFAULT 0,
             interrupted INTEGER DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'running',
-            enumeration_errors INTEGER NOT NULL DEFAULT 0
+            enumeration_errors INTEGER NOT NULL DEFAULT 0,
+            api_total_at_start INTEGER,
+            api_total_at_start_partial INTEGER NOT NULL DEFAULT 0,
+            inventory_drop_detected INTEGER NOT NULL DEFAULT 0,
+            inventory_drop_previous_total INTEGER,
+            inventory_drop_current_total INTEGER,
+            inventory_drop_library TEXT
         );
 
         CREATE TABLE IF NOT EXISTS metadata (
@@ -1428,6 +1434,91 @@ fn status_shows_counts() {
     assert!(stdout.contains("Failed:     1"), "stdout: {stdout}");
     assert!(stdout.contains("Pending:    1"), "stdout: {stdout}");
 }
+
+#[test]
+fn status_shows_api_total_and_inventory_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "a1",
+        "downloaded",
+        "photo1.jpg",
+        Some("/p/photo1.jpg"),
+        None,
+        None,
+    );
+    conn.execute(
+        "INSERT INTO sync_runs (
+            started_at, completed_at, status, api_total_at_start,
+            inventory_drop_detected, inventory_drop_previous_total,
+            inventory_drop_current_total, inventory_drop_library
+         ) VALUES (?1, ?2, 'complete', ?3, 1, ?4, ?5, ?6)",
+        rusqlite::params![
+            1_700_000_000_i64,
+            1_700_000_010_i64,
+            95_i64,
+            100_i64,
+            95_i64,
+            "PrimarySync"
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Last API total at start: 95"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "Inventory warning: PrimarySync dropped 5 assets since the previous comparable full run (100 -> 95)"
+        ),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn status_shows_partial_api_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(&conn, "a1", "pending", "photo1.jpg", None, None, None);
+    conn.execute(
+        "INSERT INTO sync_runs (
+            started_at, completed_at, status, api_total_at_start,
+            api_total_at_start_partial
+         ) VALUES (?1, ?2, 'complete', ?3, 1)",
+        rusqlite::params![1_700_000_000_i64, 1_700_000_010_i64, 95_i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Last API total at start: partial, 95"),
+        "stdout: {stdout}"
+    );
+}
+
 #[test]
 fn status_failed_shows_error_messages() {
     let dir = tempfile::tempdir().unwrap();
@@ -3139,6 +3230,14 @@ fn behavioral_helper_carries_every_migrated_column() {
     assert!(
         has_column(&conn, "assets", "imported_mtime"),
         "v11 column assets.imported_mtime must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "sync_runs", "api_total_at_start"),
+        "v13 column sync_runs.api_total_at_start must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "sync_runs", "inventory_drop_detected"),
+        "v13 column sync_runs.inventory_drop_detected must exist in the behavioral helper's DDL"
     );
 
     let has_asset_albums: bool = conn

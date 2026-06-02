@@ -224,6 +224,7 @@ pub trait ReportStateStore: Send + Sync {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<AssetRecord>, StateError>;
+    async fn start_sync_run_at(&self, started_at: DateTime<Utc>) -> Result<i64, StateError>;
     async fn start_sync_run(&self) -> Result<i64, StateError>;
     async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError>;
     async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError>;
@@ -1223,21 +1224,70 @@ impl SqliteStateDb {
                 })
                 .map_err(|e| StateError::query("get_summary", e))?;
 
-            let last_sync: Option<(Option<i64>, Option<i64>)> = conn
+            type LastSyncRow = (
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                i32,
+                i32,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+            );
+            let last_sync: Option<LastSyncRow> = conn
                 .query_row(
-                    "SELECT started_at, completed_at FROM sync_runs ORDER BY id DESC LIMIT 1",
+                    "SELECT started_at, completed_at, api_total_at_start, \
+                            api_total_at_start_partial, inventory_drop_detected, \
+                            inventory_drop_previous_total, inventory_drop_current_total, \
+                            inventory_drop_library \
+                     FROM sync_runs ORDER BY id DESC LIMIT 1",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|e| StateError::query("get_summary", e))?;
 
-            let (last_sync_started, last_sync_completed) = match last_sync {
-                Some((started, completed)) => (
+            let (
+                last_sync_started,
+                last_sync_completed,
+                last_api_total_at_start,
+                last_api_total_at_start_partial,
+                last_inventory_drop_detected,
+                last_inventory_drop_previous_total,
+                last_inventory_drop_current_total,
+                last_inventory_drop_library,
+            ) = match last_sync {
+                Some((
+                    started,
+                    completed,
+                    api_total,
+                    api_total_partial,
+                    drop_detected,
+                    drop_previous,
+                    drop_current,
+                    drop_library,
+                )) => (
                     started.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
                     completed.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+                    api_total.and_then(|n| u64::try_from(n).ok()),
+                    api_total_partial != 0,
+                    drop_detected != 0,
+                    drop_previous.and_then(|n| u64::try_from(n).ok()),
+                    drop_current.and_then(|n| u64::try_from(n).ok()),
+                    drop_library,
                 ),
-                None => (None, None),
+                None => (None, None, None, false, false, None, None, None),
             };
 
             Ok(SyncSummary {
@@ -1248,6 +1298,12 @@ impl SqliteStateDb {
                 downloaded_bytes,
                 last_sync_completed,
                 last_sync_started,
+                last_api_total_at_start,
+                last_api_total_at_start_partial,
+                last_inventory_drop_detected,
+                last_inventory_drop_previous_total,
+                last_inventory_drop_current_total,
+                last_inventory_drop_library,
             })
         })
         .await
@@ -1282,7 +1338,14 @@ impl SqliteStateDb {
     }
 
     pub(crate) async fn start_sync_run(&self) -> Result<i64, StateError> {
-        let started_at = Utc::now().timestamp();
+        self.start_sync_run_at(Utc::now()).await
+    }
+
+    pub(crate) async fn start_sync_run_at(
+        &self,
+        started_at: DateTime<Utc>,
+    ) -> Result<i64, StateError> {
+        let started_at = started_at.timestamp();
         self.with_conn("start_sync_run", move |conn| {
             conn.execute(
                 "INSERT INTO sync_runs (started_at, status) VALUES (?1, 'running')",
@@ -1305,6 +1368,18 @@ impl SqliteStateDb {
         let assets_downloaded = i64::try_from(stats.assets_downloaded).unwrap_or(i64::MAX);
         let assets_failed = i64::try_from(stats.assets_failed).unwrap_or(i64::MAX);
         let enumeration_errors = i64::try_from(stats.enumeration_errors).unwrap_or(i64::MAX);
+        let api_total_at_start = stats
+            .api_total_at_start
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+        let api_total_at_start_partial = i32::from(stats.api_total_at_start_partial);
+        let inventory_drop_detected = i32::from(stats.inventory_drop_warnings > 0);
+        let inventory_drop_previous_total = stats
+            .inventory_drop_previous_total
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+        let inventory_drop_current_total = stats
+            .inventory_drop_current_total
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+        let inventory_drop_library = stats.inventory_drop_library.clone();
         let interrupted_i32 = i32::from(stats.interrupted);
         let status = if stats.interrupted {
             "interrupted"
@@ -1315,8 +1390,11 @@ impl SqliteStateDb {
         self.with_conn("complete_sync_run", move |conn| {
             let rows = conn.execute(
                 "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, \
-                 assets_failed = ?4, interrupted = ?5, status = ?6, enumeration_errors = ?7 \
-                 WHERE id = ?8",
+                 assets_failed = ?4, interrupted = ?5, status = ?6, enumeration_errors = ?7, \
+                 api_total_at_start = ?8, api_total_at_start_partial = ?9, \
+                 inventory_drop_detected = ?10, inventory_drop_previous_total = ?11, \
+                 inventory_drop_current_total = ?12, inventory_drop_library = ?13 \
+                 WHERE id = ?14",
                 rusqlite::params![
                     completed_at,
                     assets_seen,
@@ -1325,6 +1403,12 @@ impl SqliteStateDb {
                     interrupted_i32,
                     status,
                     enumeration_errors,
+                    api_total_at_start,
+                    api_total_at_start_partial,
+                    inventory_drop_detected,
+                    inventory_drop_previous_total,
+                    inventory_drop_current_total,
+                    inventory_drop_library,
                     run_id
                 ],
             )
@@ -2706,6 +2790,10 @@ impl ReportStateStore for SqliteStateDb {
         SqliteStateDb::get_downloaded_page(self, offset, limit).await
     }
 
+    async fn start_sync_run_at(&self, started_at: DateTime<Utc>) -> Result<i64, StateError> {
+        SqliteStateDb::start_sync_run_at(self, started_at).await
+    }
+
     async fn start_sync_run(&self) -> Result<i64, StateError> {
         SqliteStateDb::start_sync_run(self).await
     }
@@ -3738,6 +3826,7 @@ mod tests {
             assets_failed: 5,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
 
         db.complete_sync_run(run_id, &stats).await.unwrap();
@@ -3770,6 +3859,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
         assert_eq!(status_of(&db, run_id), "complete");
@@ -3787,6 +3877,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 17,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
 
@@ -3805,6 +3896,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_sync_run_persists_inventory_columns() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let stats = SyncRunStats {
+            api_total_at_start: Some(95),
+            api_total_at_start_partial: true,
+            inventory_drop_warnings: 1,
+            inventory_drop_previous_total: Some(100),
+            inventory_drop_current_total: Some(95),
+            inventory_drop_library: Some("PrimarySync".to_string()),
+            ..Default::default()
+        };
+        db.complete_sync_run(run_id, &stats).await.unwrap();
+
+        let conn = db.acquire_lock("test_inventory_columns").unwrap();
+        let stored: (
+            Option<i64>,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT api_total_at_start, api_total_at_start_partial, \
+                        inventory_drop_detected, inventory_drop_previous_total, \
+                        inventory_drop_current_total, inventory_drop_library \
+                 FROM sync_runs WHERE id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                Some(95),
+                1,
+                1,
+                Some(100),
+                Some(95),
+                Some("PrimarySync".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn complete_sync_run_unknown_id_returns_error() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let stats = SyncRunStats {
@@ -3813,6 +3959,7 @@ mod tests {
             assets_failed: 1,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
 
         let err = db
@@ -3847,6 +3994,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: true,
+            ..Default::default()
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
         assert_eq!(status_of(&db, run_id), "interrupted");
@@ -3865,6 +4013,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(c, &clean).await.unwrap();
 
@@ -3886,6 +4035,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
 
@@ -3968,6 +4118,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(r1, &stats).await.unwrap();
 
@@ -5011,6 +5162,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
 

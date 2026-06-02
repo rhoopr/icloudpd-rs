@@ -1135,6 +1135,12 @@ mod tests {
             downloaded_bytes,
             last_sync_completed: None,
             last_sync_started: None,
+            last_api_total_at_start: None,
+            last_api_total_at_start_partial: false,
+            last_inventory_drop_detected: false,
+            last_inventory_drop_previous_total: None,
+            last_inventory_drop_current_total: None,
+            last_inventory_drop_library: None,
         }
     }
 

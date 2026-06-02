@@ -234,6 +234,10 @@ pub struct SyncResult {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SyncStats {
     pub assets_seen: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_total_at_start: Option<u64>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub api_total_at_start_partial: bool,
     pub downloaded: usize,
     pub failed: usize,
     pub skipped: SkipBreakdown,
@@ -260,6 +264,22 @@ pub struct SyncStats {
     /// True when the asset producer stopped before naturally exhausting the
     /// iCloud stream for a reason other than an external interrupt.
     pub enumeration_incomplete: bool,
+    /// Number of cross-cycle inventory-drop warnings observed.
+    pub inventory_drop_warnings: usize,
+    /// Largest cross-cycle API inventory drop observed.
+    pub inventory_drop_assets: u64,
+    /// Drop percentage for the largest cross-cycle inventory warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_drop_percent: Option<f64>,
+    /// Previous API total for the largest cross-cycle inventory warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_drop_previous_total: Option<u64>,
+    /// Current API total for the largest cross-cycle inventory warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_drop_current_total: Option<u64>,
+    /// Library where the largest cross-cycle inventory warning occurred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_drop_library: Option<String>,
     /// Whether sync-token advancement was blocked for safety despite no
     /// download failure.
     pub sync_token_blocked: bool,
@@ -348,6 +368,17 @@ impl SyncStats {
     /// syncs.
     pub fn accumulate(&mut self, other: &SyncStats) {
         self.assets_seen += other.assets_seen;
+        let had_api_total = self.api_total_at_start.is_some();
+        let other_has_api_total = other.api_total_at_start.is_some();
+        self.api_total_at_start = match (self.api_total_at_start, other.api_total_at_start) {
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        self.api_total_at_start_partial = self.api_total_at_start_partial
+            || other.api_total_at_start_partial
+            || (had_api_total != other_has_api_total && self.api_total_at_start.is_some());
         self.downloaded += other.downloaded;
         self.failed += other.failed;
         self.skipped.accumulate(&other.skipped);
@@ -361,6 +392,14 @@ impl SyncStats {
         self.pagination_shortfall_warnings += other.pagination_shortfall_warnings;
         self.pagination_shortfall_assets += other.pagination_shortfall_assets;
         self.enumeration_incomplete = self.enumeration_incomplete || other.enumeration_incomplete;
+        self.inventory_drop_warnings += other.inventory_drop_warnings;
+        if other.inventory_drop_assets > self.inventory_drop_assets {
+            self.inventory_drop_assets = other.inventory_drop_assets;
+            self.inventory_drop_percent = other.inventory_drop_percent;
+            self.inventory_drop_previous_total = other.inventory_drop_previous_total;
+            self.inventory_drop_current_total = other.inventory_drop_current_total;
+            self.inventory_drop_library = other.inventory_drop_library.clone();
+        }
         self.sync_token_blocked = self.sync_token_blocked || other.sync_token_blocked;
         if self.sync_token_blocked_reason.is_none() {
             self.sync_token_blocked_reason = other.sync_token_blocked_reason;
@@ -402,6 +441,10 @@ impl SyncStats {
         self.videos_downloaded += other.videos_downloaded;
         self.recap.merge(other.recap.clone());
     }
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 const ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON: &str = "album_relation_hydration_incomplete";
@@ -3870,6 +3913,16 @@ async fn download_photos_full_with_token(
     if exact_total.is_some() {
         exact_total = Some(capped_exact_total(&pagination_counts, config.recent));
     }
+    let api_total_at_start = if len_errors == 0
+        && config.recent.is_none()
+        && config.skip_created_before.is_none()
+        && !controls.run_mode.only_print_filenames()
+        && !controls.run_mode.is_dry_run()
+    {
+        exact_total
+    } else {
+        None
+    };
 
     // Check if enumeration saw significantly fewer assets than the API reported.
     // This catches silent pagination truncation, dropped pages, or API hiccups
@@ -4037,6 +4090,7 @@ async fn download_photos_full_with_token(
     stats.pagination_shortfall_warnings = pagination_shortfall_warnings;
     stats.pagination_shortfall_assets = pagination_shortfall_assets;
     stats.count_probe_failures = len_errors;
+    stats.api_total_at_start = api_total_at_start;
     if token_eligible {
         stats.sync_token_expected_receivers = token_expected_receivers;
         stats.sync_token_receivers_with_token = token_receivers_with_token;
@@ -5818,6 +5872,11 @@ mod tests {
         assert_eq!(
             result.stats.enumeration_errors, 0,
             "deferred unfiled exclusions are intentional and must not be counted as pagination undercount"
+        );
+        assert_eq!(
+            result.stats.api_total_at_start,
+            Some(1),
+            "reliable full-enumeration count should be persisted for cross-cycle inventory checks"
         );
         assert_eq!(
             result.sync_token.as_deref(),
@@ -9581,6 +9640,8 @@ mod tests {
     fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
         let lib_a = SyncStats {
             assets_seen: 10,
+            api_total_at_start: Some(12),
+            api_total_at_start_partial: false,
             downloaded: 4,
             failed: 1,
             skipped: SkipBreakdown {
@@ -9606,6 +9667,12 @@ mod tests {
             pagination_shortfall_warnings: 1,
             pagination_shortfall_assets: 9,
             enumeration_incomplete: false,
+            inventory_drop_warnings: 1,
+            inventory_drop_assets: 5,
+            inventory_drop_percent: Some(5.0),
+            inventory_drop_previous_total: Some(100),
+            inventory_drop_current_total: Some(95),
+            inventory_drop_library: Some("PrimarySync".to_string()),
             sync_token_blocked: true,
             sync_token_blocked_reason: Some("pagination_shortfall"),
             sync_token_blocked_source: Some("icloud"),
@@ -9630,6 +9697,8 @@ mod tests {
 
         let lib_b = SyncStats {
             assets_seen: 20,
+            api_total_at_start: Some(22),
+            api_total_at_start_partial: true,
             downloaded: 11,
             failed: 2,
             skipped: SkipBreakdown {
@@ -9655,6 +9724,12 @@ mod tests {
             pagination_shortfall_warnings: 2,
             pagination_shortfall_assets: 11,
             enumeration_incomplete: true,
+            inventory_drop_warnings: 2,
+            inventory_drop_assets: 11,
+            inventory_drop_percent: Some(10.0),
+            inventory_drop_previous_total: Some(110),
+            inventory_drop_current_total: Some(99),
+            inventory_drop_library: Some("SharedSync-abc".to_string()),
             sync_token_blocked: false,
             sync_token_blocked_reason: None,
             sync_token_blocked_source: Some("kei"),
@@ -9680,6 +9755,15 @@ mod tests {
         acc.accumulate(&lib_b);
 
         assert_eq!(acc.assets_seen, 30, "assets_seen must sum");
+        assert_eq!(
+            acc.api_total_at_start,
+            Some(34),
+            "api_total_at_start must sum known library totals"
+        );
+        assert!(
+            acc.api_total_at_start_partial,
+            "api_total_at_start_partial must OR"
+        );
         assert_eq!(acc.downloaded, 15, "downloaded must sum");
         assert_eq!(acc.failed, 3, "failed must sum");
         assert_eq!(acc.bytes_downloaded, 3_500, "bytes_downloaded must sum");
@@ -9704,6 +9788,21 @@ mod tests {
             "pagination shortfall assets must sum"
         );
         assert!(acc.enumeration_incomplete, "enumeration_incomplete must OR");
+        assert_eq!(
+            acc.inventory_drop_warnings, 3,
+            "inventory drop warnings must sum"
+        );
+        assert_eq!(
+            acc.inventory_drop_assets, 11,
+            "largest inventory drop must win"
+        );
+        assert_eq!(acc.inventory_drop_percent, Some(10.0));
+        assert_eq!(acc.inventory_drop_previous_total, Some(110));
+        assert_eq!(acc.inventory_drop_current_total, Some(99));
+        assert_eq!(
+            acc.inventory_drop_library,
+            Some("SharedSync-abc".to_string())
+        );
         assert!(acc.sync_token_blocked, "sync_token_blocked must OR");
         assert_eq!(acc.sync_token_blocked_reason, Some("pagination_shortfall"));
         assert_eq!(acc.sync_token_blocked_source, Some("icloud"));
@@ -10311,6 +10410,10 @@ mod tests {
         assert_eq!(
             result.stats.enumeration_errors, 0,
             "recent-limited count shortfalls are not exact enumeration errors"
+        );
+        assert_eq!(
+            result.stats.api_total_at_start, None,
+            "recent-limited runs must not seed comparable inventory totals"
         );
         assert_eq!(
             result.sync_token, None,

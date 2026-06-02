@@ -214,6 +214,7 @@ mod tests {
             },
             stats: SyncStats {
                 assets_seen: 400,
+                api_total_at_start: Some(405),
                 downloaded: 50,
                 failed: 2,
                 skipped: SkipBreakdown {
@@ -225,6 +226,12 @@ mod tests {
                 },
                 bytes_downloaded: 1_200_000_000,
                 disk_bytes_written: 1_300_000_000,
+                inventory_drop_warnings: 1,
+                inventory_drop_assets: 5,
+                inventory_drop_percent: Some(1.2),
+                inventory_drop_previous_total: Some(410),
+                inventory_drop_current_total: Some(405),
+                inventory_drop_library: Some("PrimarySync".to_string()),
                 elapsed_secs: 263.5,
                 ..SyncStats::default()
             },
@@ -238,6 +245,11 @@ mod tests {
         assert_eq!(parsed["version"], "2");
         assert_eq!(parsed["status"], "success");
         assert_eq!(parsed["stats"]["downloaded"], 50);
+        assert_eq!(parsed["stats"]["api_total_at_start"], 405);
+        assert_eq!(parsed["stats"]["inventory_drop_warnings"], 1);
+        assert_eq!(parsed["stats"]["inventory_drop_previous_total"], 410);
+        assert_eq!(parsed["stats"]["inventory_drop_current_total"], 405);
+        assert_eq!(parsed["stats"]["inventory_drop_library"], "PrimarySync");
         assert_eq!(parsed["stats"]["skipped"]["by_state"], 300);
         assert_eq!(parsed["options"]["username"], "user@example.com");
         assert!(parsed["options"]["set_exif_datetime"]
