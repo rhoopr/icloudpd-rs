@@ -1,4 +1,7 @@
 use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+use anyhow::Context;
 
 use crate::auth;
 use crate::icloud;
@@ -197,21 +200,53 @@ pub(crate) async fn attempt_reauth(
 /// Interval between polls when waiting for a 2FA code submission.
 const TWO_FA_POLL_SECS: u64 = 5;
 
-/// Wait for `submit-code` to update persisted auth state, with no network traffic.
+/// Maximum time to wait for `submit-code` to update persisted auth state.
+const TWO_FA_WAIT_TIMEOUT_SECS: u64 = 10 * 60;
+
+#[derive(Clone, Copy, Debug)]
+struct TwoFaWaitConfig {
+    poll_interval: Duration,
+    timeout: Duration,
+}
+
+impl Default for TwoFaWaitConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(TWO_FA_POLL_SECS),
+            timeout: Duration::from_secs(TWO_FA_WAIT_TIMEOUT_SECS),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthRetryErrorClass {
+    TwoFactorRequired,
+    LockContention,
+    Other,
+}
+
+/// Classify auth retry outcomes at the service orchestration boundary.
 ///
-/// Polls the session, cookie jar, and validation cache modification times every
-/// 5 seconds. Most Apple 2FA flows update session headers during trust, but the
-/// Extended Device Protection 409 shape can accept the code without changing
-/// the session file. `submit-code` still writes a fresh validation cache after
-/// the trusted accountLogin succeeds, and that is enough to wake the service
-/// loop so it can retry authentication.
-async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
-    wait_for_2fa_submit_with_interval(
-        cookie_dir,
-        username,
-        std::time::Duration::from_secs(TWO_FA_POLL_SECS),
-    )
-    .await;
+/// The original `anyhow::Error` is still returned unchanged when callers need
+/// to propagate it. This helper only centralizes the local retry/continue
+/// decision so the 2FA wait loop and lock-contention retry loop cannot drift.
+fn classify_auth_retry_error(err: &anyhow::Error) -> AuthRetryErrorClass {
+    let Some(auth_err) = err.downcast_ref::<auth::error::AuthError>() else {
+        return AuthRetryErrorClass::Other;
+    };
+    if auth_err.is_two_factor_required() {
+        AuthRetryErrorClass::TwoFactorRequired
+    } else if auth_err.is_lock_contention() {
+        AuthRetryErrorClass::LockContention
+    } else {
+        AuthRetryErrorClass::Other
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AuthSignalSnapshot {
+    modified: Option<SystemTime>,
+    contents: Option<Vec<u8>>,
 }
 
 fn auth_signal_paths(cookie_dir: &Path, username: &str) -> [std::path::PathBuf; 3] {
@@ -222,48 +257,133 @@ fn auth_signal_paths(cookie_dir: &Path, username: &str) -> [std::path::PathBuf; 
     ]
 }
 
-async fn auth_signal_mtimes(paths: &[std::path::PathBuf]) -> Vec<Option<std::time::SystemTime>> {
-    let mut mtimes = Vec::with_capacity(paths.len());
-    for path in paths {
-        mtimes.push(
-            tokio::fs::metadata(path)
-                .await
-                .and_then(|m| m.modified())
-                .ok(),
-        );
-    }
-    mtimes
+async fn read_required_session_signal(session_path: &Path) -> anyhow::Result<AuthSignalSnapshot> {
+    let contents = tokio::fs::read(session_path).await.map_err(|e| {
+        let reason = match e.kind() {
+            std::io::ErrorKind::NotFound => "missing",
+            std::io::ErrorKind::PermissionDenied => "unreadable",
+            _ => "unavailable",
+        };
+        anyhow::anyhow!(
+            "Cannot wait for 2FA submission because session metadata file is {reason}: {path}. \
+             Run `kei login get-code`, then `kei login submit-code <CODE>`, and restart the \
+             service or rerun kei. Error: {e}",
+            path = session_path.display()
+        )
+    })?;
+
+    let modified = tokio::fs::metadata(session_path)
+        .await
+        .with_context(|| {
+            format!(
+                "Cannot wait for 2FA submission because session metadata file is unavailable: {}",
+                session_path.display()
+            )
+        })?
+        .modified()
+        .with_context(|| {
+            format!(
+                "Cannot wait for 2FA submission because session metadata timestamp is unavailable: {}",
+                session_path.display()
+            )
+        })?;
+
+    Ok(AuthSignalSnapshot {
+        modified: Some(modified),
+        contents: Some(contents),
+    })
 }
 
-async fn wait_for_2fa_submit_with_interval(
+async fn read_optional_auth_signal(path: &Path) -> AuthSignalSnapshot {
+    let modified = tokio::fs::metadata(path)
+        .await
+        .and_then(|m| m.modified())
+        .ok();
+    let contents = tokio::fs::read(path).await.ok();
+    AuthSignalSnapshot { modified, contents }
+}
+
+async fn read_auth_signal_snapshot(
+    paths: &[std::path::PathBuf],
+) -> anyhow::Result<Vec<AuthSignalSnapshot>> {
+    let Some((session_path, optional_paths)) = paths.split_first() else {
+        return Ok(Vec::new());
+    };
+
+    let mut snapshot = Vec::with_capacity(paths.len());
+    snapshot.push(read_required_session_signal(session_path).await?);
+    for path in optional_paths {
+        snapshot.push(read_optional_auth_signal(path).await);
+    }
+    Ok(snapshot)
+}
+
+/// Wait for `submit-code` to update persisted auth state, with no network traffic.
+///
+/// Polls the session, cookie jar, and validation cache every 5 seconds. Most
+/// Apple 2FA flows update session headers during trust, but the Extended Device
+/// Protection 409 shape can accept the code without changing the session file.
+/// `submit-code` still writes a fresh validation cache after accountLogin
+/// succeeds, and that is enough to wake the service loop so it can retry auth.
+async fn wait_for_2fa_submit_until(
     cookie_dir: &Path,
     username: &str,
-    poll_interval: std::time::Duration,
-) {
+    config: TwoFaWaitConfig,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
     let signal_paths = auth_signal_paths(cookie_dir, username);
-    let initial_mtimes = auth_signal_mtimes(&signal_paths).await;
+    let initial = read_auth_signal_snapshot(&signal_paths).await?;
+    let session_path = &signal_paths[0];
 
-    tracing::info!("Waiting for 2FA code submission...");
+    tracing::info!(
+        session_path = %session_path.display(),
+        wait_mode = "auth_state_update",
+        timeout_secs = config.timeout.as_secs(),
+        poll_secs = config.poll_interval.as_secs(),
+        "Waiting for 2FA code submission"
+    );
 
     loop {
-        tokio::time::sleep(poll_interval).await;
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            tracing::warn!(
+                session_path = %session_path.display(),
+                wait_mode = "auth_state_update",
+                timeout_secs = config.timeout.as_secs(),
+                "Timed out waiting for 2FA code submission"
+            );
+            anyhow::bail!(
+                "Timed out after {timeout_secs}s waiting for 2FA submission via persisted auth \
+                 state under {path}. Run `kei login get-code`, then `kei login submit-code \
+                 <CODE>`, and restart the service or rerun kei.",
+                timeout_secs = config.timeout.as_secs(),
+                path = cookie_dir.display()
+            );
+        }
 
-        let current_mtimes = auth_signal_mtimes(&signal_paths).await;
-        if current_mtimes != initial_mtimes {
-            tracing::debug!("Auth state updated, retrying authentication");
-            break;
+        tokio::time::sleep(config.poll_interval.min(remaining)).await;
+
+        let current = read_auth_signal_snapshot(&signal_paths).await?;
+        if current != initial {
+            tracing::debug!(
+                session_path = %session_path.display(),
+                wait_mode = "auth_state_update",
+                "Auth state updated, retrying authentication"
+            );
+            return Ok(());
         }
     }
 }
 
 /// Wait for a 2FA code submission, then retry authentication with back-off.
 ///
-/// Polls `wait_for_2fa_submit` in a loop. After each auth-state change,
-/// retries the provided `auth_fn` up to 3 times with 5-second back-off to
-/// handle lock contention (submit-code may still be running when mtime
-/// changes). False wakeups from get-code's SRP writes (which change persisted
-/// auth files before the session is trusted) are handled by looping back to
-/// wait.
+/// Polls persisted auth state in a loop. After each auth-state change, retries
+/// the provided `auth_fn` up to 3 times with 5-second back-off to handle lock
+/// contention because `submit-code` may still be running when auth state
+/// changes. False wakeups from get-code's SRP writes are handled by looping
+/// back to wait when Apple still reports 2FA required.
 pub(crate) async fn wait_and_retry_2fa<T, F, Fut>(
     cookie_dir: &Path,
     username: &str,
@@ -273,8 +393,23 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
+    wait_and_retry_2fa_with_config(cookie_dir, username, auth_fn, TwoFaWaitConfig::default()).await
+}
+
+async fn wait_and_retry_2fa_with_config<T, F, Fut>(
+    cookie_dir: &Path,
+    username: &str,
+    auth_fn: F,
+    config: TwoFaWaitConfig,
+) -> anyhow::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + config.timeout;
+
     loop {
-        wait_for_2fa_submit(cookie_dir, username).await;
+        wait_for_2fa_submit_until(cookie_dir, username, config, deadline).await?;
 
         // Invalidate the validation cache so authenticate() actually checks
         // with Apple instead of returning stale cached data from before 2FA.
@@ -291,20 +426,16 @@ where
             }
             match (auth_fn)().await {
                 Ok(result) => return Ok(result),
-                Err(e)
-                    if e.downcast_ref::<auth::error::AuthError>()
-                        .is_some_and(auth::error::AuthError::is_two_factor_required) =>
-                {
-                    tracing::debug!("Session not yet trusted, continuing to wait...");
-                    break; // Back to outer loop (wait_for_2fa_submit)
-                }
-                Err(e)
-                    if e.downcast_ref::<auth::error::AuthError>()
-                        .is_some_and(auth::error::AuthError::is_lock_contention) =>
-                {
-                    tracing::debug!("Lock held by another process, retrying...");
-                }
-                Err(e) => return Err(e),
+                Err(e) => match classify_auth_retry_error(&e) {
+                    AuthRetryErrorClass::TwoFactorRequired => {
+                        tracing::debug!("Session not yet trusted, continuing to wait...");
+                        break;
+                    }
+                    AuthRetryErrorClass::LockContention => {
+                        tracing::debug!("Lock held by another process, retrying...");
+                    }
+                    AuthRetryErrorClass::Other => return Err(e),
+                },
             }
         }
         tracing::debug!("Lock still held after retries, resuming wait...");
@@ -328,10 +459,7 @@ where
     for attempt in 0..MAX_ATTEMPTS {
         match (auth_fn)().await {
             Ok(result) => return Ok(result),
-            Err(e)
-                if e.downcast_ref::<auth::error::AuthError>()
-                    .is_some_and(auth::error::AuthError::is_lock_contention) =>
-            {
+            Err(e) if classify_auth_retry_error(&e) == AuthRetryErrorClass::LockContention => {
                 tracing::warn!(
                     attempt = attempt + 1,
                     max_attempts = MAX_ATTEMPTS,
@@ -1244,6 +1372,123 @@ mod tests {
     use crate::test_helpers::MockPhotosSession;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn short_2fa_wait_config(timeout: Duration) -> TwoFaWaitConfig {
+        TwoFaWaitConfig {
+            poll_interval: Duration::from_millis(10),
+            timeout,
+        }
+    }
+
+    fn classify_auth_retry_error_for(err: auth::error::AuthError) -> AuthRetryErrorClass {
+        let err = anyhow::Error::new(err);
+        classify_auth_retry_error(&err)
+    }
+
+    // ── auth retry classifier tests ──────────────────────────────────
+
+    #[test]
+    fn classify_auth_retry_error_detects_two_factor_required() {
+        assert_eq!(
+            classify_auth_retry_error_for(auth::error::AuthError::TwoFactorRequired),
+            AuthRetryErrorClass::TwoFactorRequired
+        );
+    }
+
+    #[test]
+    fn classify_auth_retry_error_detects_lock_contention() {
+        assert_eq!(
+            classify_auth_retry_error_for(auth::error::AuthError::LockContention(
+                "session.lock".into()
+            )),
+            AuthRetryErrorClass::LockContention
+        );
+    }
+
+    #[test]
+    fn classify_auth_retry_error_treats_failed_login_as_other() {
+        assert_eq!(
+            classify_auth_retry_error_for(auth::error::AuthError::FailedLogin(
+                "bad credentials".into()
+            )),
+            AuthRetryErrorClass::Other
+        );
+    }
+
+    #[test]
+    fn classify_auth_retry_error_treats_plain_anyhow_as_other() {
+        let err = anyhow::anyhow!("plain failure");
+        assert_eq!(classify_auth_retry_error(&err), AuthRetryErrorClass::Other);
+    }
+
+    #[test]
+    fn classify_auth_retry_error_detects_context_wrapped_auth_errors() {
+        let two_factor =
+            anyhow::Error::new(auth::error::AuthError::TwoFactorRequired).context("service retry");
+        assert_eq!(
+            classify_auth_retry_error(&two_factor),
+            AuthRetryErrorClass::TwoFactorRequired
+        );
+
+        let lock = anyhow::Error::new(auth::error::AuthError::LockContention(
+            "session.lock".into(),
+        ))
+        .context("service retry");
+        assert_eq!(
+            classify_auth_retry_error(&lock),
+            AuthRetryErrorClass::LockContention
+        );
+    }
+
+    // ── service 2FA wait tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wait_and_retry_2fa_succeeds_after_session_metadata_update() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let cookie_dir = tempdir.path().to_path_buf();
+        let username = "service-wait@example.com";
+        let session_path = auth::session_file_path(&cookie_dir, username);
+        tokio::fs::write(&session_path, br#"{"session_token":"before"}"#)
+            .await
+            .expect("write initial session metadata");
+
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let cookie_dir = cookie_dir.clone();
+            let auth_calls = Arc::clone(&auth_calls);
+            async move {
+                wait_and_retry_2fa_with_config(
+                    &cookie_dir,
+                    username,
+                    || {
+                        let auth_calls = Arc::clone(&auth_calls);
+                        async move {
+                            auth_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, anyhow::Error>("authenticated")
+                        }
+                    },
+                    short_2fa_wait_config(Duration::from_secs(3)),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::fs::write(&session_path, br#"{"session_token":"after"}"#)
+            .await
+            .expect("update session metadata");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("2FA wait should finish")
+            .expect("task should not panic")
+            .expect("updated metadata should retry auth");
+
+        assert_eq!(result, "authenticated");
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn wait_for_2fa_submit_wakes_when_validation_cache_changes() {
@@ -1284,23 +1529,136 @@ mod tests {
         contents: &'static [u8],
         context: &'static str,
     ) {
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let session_path = auth::session_file_path(cookie_dir, username);
+        tokio::fs::write(&session_path, br#"{"session_token":"before"}"#)
+            .await
+            .expect("write initial session metadata");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
             tokio::join!(
-                wait_for_2fa_submit_with_interval(
+                wait_for_2fa_submit_until(
                     cookie_dir,
                     username,
-                    std::time::Duration::from_millis(10),
+                    short_2fa_wait_config(Duration::from_secs(1)),
+                    tokio::time::Instant::now() + Duration::from_secs(1),
                 ),
                 async {
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
                     tokio::fs::write(signal_path, contents)
                         .await
                         .expect(context);
                 }
-            );
+            )
+            .0
+            .expect("auth state write should wake the 2FA waiter");
         })
         .await
-        .expect("auth state write should wake the 2FA waiter");
+        .expect("auth state write should wake before timeout");
+    }
+
+    #[tokio::test]
+    async fn wait_and_retry_2fa_fails_when_session_metadata_missing() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+
+        let err = wait_and_retry_2fa_with_config(
+            tempdir.path(),
+            "missing-metadata@example.com",
+            || {
+                let auth_calls = Arc::clone(&auth_calls);
+                async move {
+                    auth_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, anyhow::Error>(())
+                }
+            },
+            short_2fa_wait_config(Duration::from_secs(1)),
+        )
+        .await
+        .expect_err("missing metadata must fail before waiting forever");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("session metadata file is missing"),
+            "msg: {msg}"
+        );
+        assert!(
+            msg.contains("kei login get-code") && msg.contains("kei login submit-code <CODE>"),
+            "msg: {msg}"
+        );
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_and_retry_2fa_fails_when_session_metadata_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let username = "unreadable-metadata@example.com";
+        let session_path = auth::session_file_path(tempdir.path(), username);
+        tokio::fs::write(&session_path, br#"{"session_token":"before"}"#)
+            .await
+            .expect("write initial session metadata");
+        tokio::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o000))
+            .await
+            .expect("make session metadata unreadable");
+
+        let err = wait_and_retry_2fa_with_config(
+            tempdir.path(),
+            username,
+            || async { Ok::<_, anyhow::Error>(()) },
+            short_2fa_wait_config(Duration::from_millis(30)),
+        )
+        .await
+        .expect_err("unreadable metadata must fail instead of waiting forever");
+
+        tokio::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .expect("restore permissions for tempdir cleanup");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("session metadata file is unreadable"),
+            "msg: {msg}"
+        );
+        assert!(
+            msg.contains(&session_path.display().to_string()),
+            "msg: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_and_retry_2fa_times_out_when_code_never_submitted() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let username = "timeout@example.com";
+        let session_path = auth::session_file_path(tempdir.path(), username);
+        tokio::fs::write(&session_path, br#"{"session_token":"before"}"#)
+            .await
+            .expect("write initial session metadata");
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+
+        let err = wait_and_retry_2fa_with_config(
+            tempdir.path(),
+            username,
+            || {
+                let auth_calls = Arc::clone(&auth_calls);
+                async move {
+                    auth_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, anyhow::Error>(())
+                }
+            },
+            short_2fa_wait_config(Duration::from_millis(30)),
+        )
+        .await
+        .expect_err("never-submitted 2FA must time out");
+
+        let msg = err.to_string();
+        assert!(msg.contains("Timed out after"), "msg: {msg}");
+        assert!(
+            msg.contains(&tempdir.path().display().to_string()),
+            "msg: {msg}"
+        );
+        assert_eq!(auth_calls.load(Ordering::SeqCst), 0);
     }
 
     /// Build a `PhotoLibrary` stub with a preconfigured mock session.
@@ -1771,9 +2129,9 @@ mod tests {
     #[tokio::test]
     async fn init_photos_service_recovers_from_421() {
         use wiremock::matchers::{method, path_regex};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, ResponseTemplate};
 
-        let mock_server = MockServer::start().await;
+        let mock_server = crate::start_wiremock_or_skip!();
 
         // First call → 421; second call → 200 with a valid CheckIndexingState body.
         let success_body = serde_json::json!({
@@ -1826,9 +2184,9 @@ mod tests {
     #[tokio::test]
     async fn init_photos_service_fails_on_double_421() {
         use wiremock::matchers::{method, path_regex};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, ResponseTemplate};
 
-        let mock_server = MockServer::start().await;
+        let mock_server = crate::start_wiremock_or_skip!();
 
         Mock::given(method("POST"))
             .and(path_regex(
