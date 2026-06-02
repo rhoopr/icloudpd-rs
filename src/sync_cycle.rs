@@ -295,7 +295,7 @@ where
 pub(crate) async fn run_cycle(
     library_states: &[&LibraryState],
     config: &config::Config,
-    state_db: Option<&dyn state::StateDb>,
+    state_db: Option<&dyn download::DownloadStore>,
     is_retry_failed: bool,
     build_download_config: &BuildDownloadConfigFn<'_>,
     download_controls: download::DownloadControls,

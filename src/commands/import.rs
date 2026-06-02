@@ -1238,7 +1238,9 @@ mod wiremock_tests {
     use crate::icloud::photos::session::PhotosSession;
     use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotoAsset};
     use crate::retry::RetryConfig;
-    use crate::state::{AssetStatus, SqliteStateDb, StateDb, VersionSizeKey};
+    use crate::state::{
+        AssetStatus, ImportStateStore, ReportStateStore, SqliteStateDb, VersionSizeKey,
+    };
     use crate::types::{
         AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy, RawPolicy,
     };
@@ -1453,7 +1455,7 @@ mod wiremock_tests {
     }
 
     /// Convenience: fetch every downloaded row.
-    async fn all_downloaded(db: &dyn StateDb) -> Vec<crate::state::AssetRecord> {
+    async fn all_downloaded(db: &dyn ReportStateStore) -> Vec<crate::state::AssetRecord> {
         db.get_downloaded_page(0, 1024)
             .await
             .expect("get_downloaded_page")
@@ -1581,7 +1583,7 @@ mod wiremock_tests {
     async fn run_import(
         server: &MockServer,
         assets: &[WiremockAsset],
-        db: &dyn StateDb,
+        db: &dyn ImportStateStore,
         config: &DownloadConfig,
         dry_run: bool,
     ) -> ImportStats {
@@ -1591,7 +1593,7 @@ mod wiremock_tests {
     async fn run_import_with_strict(
         server: &MockServer,
         assets: &[WiremockAsset],
-        db: &dyn StateDb,
+        db: &dyn ImportStateStore,
         config: &DownloadConfig,
         dry_run: bool,
         strict_verifier: Option<&dyn StrictImportVerifier>,

@@ -47,7 +47,10 @@ use tokio_util::sync::CancellationToken;
 use crate::icloud::photos::asset::ChangeEvent;
 use crate::icloud::photos::{PhotoAsset, SyncTokenError};
 use crate::retry::RetryConfig;
-use crate::state::{DownloadStateStore, MetadataRewriteStore, StateDb, VersionSizeKey};
+use crate::state::{
+    DownloadStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore, SyncTokenStore,
+    VersionSizeKey,
+};
 use crate::types::{
     AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
     RawPolicy,
@@ -76,6 +79,20 @@ pub enum SyncMode {
         /// The stored syncToken for the zone being synced.
         zone_sync_token: String,
     },
+}
+
+pub(crate) trait DownloadStore:
+    DownloadStateStore + MembershipStore + MetadataRewriteStore + ReportStateStore + SyncTokenStore
+{
+}
+
+impl<T> DownloadStore for T where
+    T: DownloadStateStore
+        + MembershipStore
+        + MetadataRewriteStore
+        + ReportStateStore
+        + SyncTokenStore
+{
 }
 
 /// Bounded reason vocabulary for full enumeration runs.
@@ -868,7 +885,7 @@ pub(crate) struct DownloadConfig {
     /// Temp file suffix for partial downloads (e.g. `.kei-tmp`).
     pub(crate) temp_suffix: Arc<str>,
     /// State database for tracking download progress.
-    pub(crate) state_db: Option<Arc<dyn StateDb>>,
+    pub(crate) state_db: Option<Arc<dyn DownloadStore>>,
     /// When true (retry-failed mode), only download assets already known to the
     /// state DB. Skip new assets discovered from iCloud that were never synced.
     pub(crate) retry_only: bool,
@@ -2100,7 +2117,7 @@ struct FullPassStreamOptions {
 
 #[derive(Clone)]
 struct AlbumSnapshotRecorder {
-    db: Arc<dyn StateDb>,
+    db: Arc<dyn DownloadStore>,
     library: Arc<str>,
     container_id: Arc<str>,
     generation: i64,
@@ -2109,7 +2126,7 @@ struct AlbumSnapshotRecorder {
 
 impl AlbumSnapshotRecorder {
     async fn start_for_pass(
-        db: Option<Arc<dyn StateDb>>,
+        db: Option<Arc<dyn DownloadStore>>,
         pass: &crate::commands::AlbumPass,
         enum_config_hash: Option<&str>,
     ) -> Option<Self> {
@@ -5479,7 +5496,7 @@ mod tests {
         let db = match &base_config.state_db {
             Some(db) => Arc::clone(db),
             None => {
-                let db: Arc<dyn StateDb> =
+                let db: Arc<dyn DownloadStore> =
                     Arc::new(SqliteStateDb::open_in_memory().expect("open state db"));
                 base_config.state_db = Some(Arc::clone(&db));
                 db
@@ -6031,7 +6048,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.enum_config_hash = Some(Arc::from("hash-pr3"));
         config.skip_created_after =
             Some(DateTime::from_timestamp_millis(1_699_999_999_000).expect("valid timestamp"));
@@ -6115,7 +6132,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.enum_config_hash = Some(Arc::from("hash-new"));
 
         let result = download_photos_full_with_token(
@@ -6169,7 +6186,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.enum_config_hash = Some(Arc::from("hash-interrupted"));
         let shutdown = CancellationToken::new();
         shutdown.cancel();
@@ -7592,7 +7609,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "zone-token-prev".to_string(),
         };
@@ -7648,7 +7665,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "zone-token-prev".to_string(),
         };
@@ -8017,7 +8034,7 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.folder_structure = "Unfiled".to_string();
         config.folder_structure_albums = Arc::from("{album}");
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let result = download_photos_incremental(
             &Client::new(),
             &passes,
@@ -8065,7 +8082,7 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.folder_structure = "Unfiled".to_string();
         config.folder_structure_albums = Arc::from("{album}");
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let result = download_photos_incremental(
             &Client::new(),
             &passes,
@@ -8114,7 +8131,7 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.folder_structure = "Unfiled".to_string();
         config.folder_structure_albums = Arc::from("{album}");
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let result = download_photos_incremental(
             &Client::new(),
             &passes,
@@ -8170,7 +8187,7 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.folder_structure = "Unfiled".to_string();
         config.folder_structure_albums = Arc::from("{album}");
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let result = download_photos_incremental(
             &Client::new(),
             &passes,
@@ -8209,7 +8226,7 @@ mod tests {
         }];
 
         let mut config = test_config();
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let result = download_photos_incremental(
             &Client::new(),
             &passes,

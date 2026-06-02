@@ -429,7 +429,7 @@ impl MetricsHandle {
 
     /// Increment the counter for failed DB summary reads.
     ///
-    /// Call this whenever [`get_summary`](crate::state::StateDb::get_summary)
+    /// Call this whenever [`get_summary`](crate::state::ReportStateStore::get_summary)
     /// returns an error during a metrics update so the failure is visible in
     /// the `/metrics` output rather than only in the log.
     pub(crate) fn record_db_summary_failure(&self) {

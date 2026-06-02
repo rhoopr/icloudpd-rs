@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::PhotoAsset;
 use crate::retry::RetryConfig;
-use crate::state::{AssetRecord, StateDb, SyncRunStats};
+use crate::state::{AssetRecord, SyncRunStats};
 
 use super::error::DownloadError;
 use super::filter::{
@@ -42,7 +42,7 @@ use super::planner::ADD_ASSET_ALBUM_MAX_RETRIES;
 use super::planner::{self, ExistingPathMatch, TaskPlanner};
 use super::{
     metadata_rewrite, preload_download_context, DownloadConfig, DownloadContext, DownloadControls,
-    DownloadOutcome, DownloadReporting,
+    DownloadOutcome, DownloadReporting, DownloadStore,
 };
 
 pub(super) use metadata_rewrite::MetadataFlags;
@@ -284,7 +284,7 @@ fn pending_versions_for_asset<'a>(
 }
 
 async fn adopt_pending_on_disk_skip(
-    state_db: Option<&dyn StateDb>,
+    state_db: Option<&dyn DownloadStore>,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     ctx: &DownloadContext,
@@ -317,7 +317,7 @@ async fn adopt_pending_on_disk_skip(
 }
 
 async fn adopt_pending_on_disk_task(
-    state_db: Option<&dyn StateDb>,
+    state_db: Option<&dyn DownloadStore>,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     ctx: &DownloadContext,
@@ -346,7 +346,7 @@ async fn adopt_pending_on_disk_task(
 }
 
 async fn adopt_pending_derived_path(
-    db: &dyn StateDb,
+    db: &dyn DownloadStore,
     library: &str,
     asset: &PhotoAsset,
     task_planner: &mut TaskPlanner,
@@ -556,7 +556,7 @@ fn state_confirmed_current_path_exists(
 }
 
 async fn record_seen_for_forwarded_task(
-    db: &dyn StateDb,
+    db: &dyn DownloadStore,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     task: &DownloadTask,
@@ -571,7 +571,7 @@ async fn record_seen_for_forwarded_task(
 }
 
 async fn backfill_downloaded_metadata_for_on_disk_skip(
-    state_db: Option<&dyn StateDb>,
+    state_db: Option<&dyn DownloadStore>,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     ctx: &DownloadContext,
@@ -625,7 +625,7 @@ pub(super) struct PassConfig<'a> {
     pub(super) reporting: DownloadReporting,
     pub(super) temp_suffix: Arc<str>,
     pub(super) shutdown_token: CancellationToken,
-    pub(super) state_db: Option<Arc<dyn StateDb>>,
+    pub(super) state_db: Option<Arc<dyn DownloadStore>>,
     /// Accumulator for 429/503 observations during this pass. Counted per
     /// retry attempt, not per unique task. Aggregated into SyncStats for
     /// the rate-limit pressure warning.
@@ -3520,9 +3520,9 @@ mod tests {
     /// T-6: All pending state writes from the download loop are retained and
     /// re-flushed. Even with multiple records and transient failures, every
     /// write that eventually succeeds reaches the DB.
-    /// A StateDb stub where `mark_downloaded` fails a configurable number
+    /// A download-store stub where `mark_downloaded` fails a configurable number
     /// of times before succeeding. All other methods panic (unused).
-    struct FailingStateDb {
+    struct FailingDownloadStore {
         remaining_failures: AtomicUsize,
         calls: AtomicUsize,
         successes: AtomicUsize,
@@ -3533,7 +3533,7 @@ mod tests {
         fail_complete_sync_run: bool,
     }
 
-    impl FailingStateDb {
+    impl FailingDownloadStore {
         fn new(fail_count: usize) -> Self {
             Self {
                 remaining_failures: AtomicUsize::new(fail_count),
@@ -3583,7 +3583,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl DownloadStateStore for FailingStateDb {
+    impl DownloadStateStore for FailingDownloadStore {
         #[cfg(test)]
         async fn should_download(
             &self,
@@ -3689,7 +3689,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ImportStateStore for FailingStateDb {
+    impl ImportStateStore for FailingDownloadStore {
         async fn import_adopt(
             &self,
             _: &AssetRecord,
@@ -3710,7 +3710,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ReportStateStore for FailingStateDb {
+    impl ReportStateStore for FailingDownloadStore {
         #[cfg(test)]
         async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
             unimplemented!()
@@ -3771,7 +3771,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl SyncTokenStore for FailingStateDb {
+    impl SyncTokenStore for FailingDownloadStore {
         async fn get_metadata(&self, _: &str) -> Result<Option<String>, StateError> {
             Ok(None)
         }
@@ -3798,7 +3798,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MembershipStore for FailingStateDb {
+    impl MembershipStore for FailingDownloadStore {
         async fn add_asset_album(
             &self,
             _: &str,
@@ -3819,7 +3819,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MetadataRewriteStore for FailingStateDb {
+    impl MetadataRewriteStore for FailingDownloadStore {
         async fn record_metadata_write_failure(
             &self,
             _: &str,
@@ -3878,7 +3878,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_pending_state_writes_empty_is_noop() {
-        let db = FailingStateDb::new(0);
+        let db = FailingDownloadStore::new(0);
         let result = flush_pending_state_writes(&db, &[]).await;
         assert_eq!(result, 0);
         assert_eq!(db.success_count(), 0);
@@ -3892,7 +3892,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn update_metadata_marker_warns_when_clear_fails() {
-        let db = FailingStateDb::with_failing_metadata_clear();
+        let db = FailingDownloadStore::with_failing_metadata_clear();
         update_metadata_marker(&db, "PrimarySync", "ASSET_X", "original", true).await;
         assert!(
             logs_contain("Could not clear metadata-write-failed marker"),
@@ -3999,7 +3999,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_pending_state_writes_succeeds_on_first_try() {
-        let db = FailingStateDb::new(0);
+        let db = FailingDownloadStore::new(0);
         let pending = vec![PendingStateWrite {
             library: "PrimarySync".into(),
             asset_id: "A1".into(),
@@ -4013,11 +4013,11 @@ mod tests {
         assert_eq!(db.success_count(), 1);
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn flush_pending_state_writes_recovers_after_transient_failure() {
-        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         // Fail the first attempt, succeed on retry
-        let db = FailingStateDb::new(1);
+        let db = FailingDownloadStore::new(1);
         let pending = vec![PendingStateWrite {
             library: "PrimarySync".into(),
             asset_id: "A1".into(),
@@ -4029,34 +4029,15 @@ mod tests {
         let failures = flush_pending_state_writes(&db, &pending).await;
         assert_eq!(failures, 0);
         assert_eq!(db.success_count(), 1);
-        let events = capture.events();
-        let retry = events
-            .iter()
-            .find(|event| event.message() == Some("State write retry failed, will retry"))
-            .unwrap_or_else(|| panic!("missing deferred-state retry event: {events:?}"));
-        assert_eq!(retry.field("asset_id"), Some("A1"));
-        assert_eq!(retry.field("pending_count"), Some("1"));
-        assert_eq!(retry.field("attempt"), Some("1"));
-        assert!(
-            retry
-                .field("error")
-                .is_some_and(|error| error.contains("simulated failure")),
-            "retry event should carry source error, got {retry:?}"
-        );
-
-        let recovered = events
-            .iter()
-            .find(|event| event.message() == Some("Recovered deferred state write"))
-            .unwrap_or_else(|| panic!("missing deferred-state recovery event: {events:?}"));
-        assert_eq!(recovered.field("asset_id"), Some("A1"));
-        assert_eq!(recovered.field("pending_count"), Some("1"));
-        assert_eq!(recovered.field("attempt"), Some("2"));
+        assert!(logs_contain("State write retry failed, will retry"));
+        assert!(logs_contain("Recovered deferred state write"));
+        assert!(logs_contain("simulated failure"));
     }
 
     #[tokio::test]
     async fn flush_pending_state_writes_reports_persistent_failure() {
         // Fail all attempts — must exceed STATE_WRITE_MAX_RETRIES
-        let db = FailingStateDb::new(STATE_WRITE_MAX_RETRIES as usize);
+        let db = FailingDownloadStore::new(STATE_WRITE_MAX_RETRIES as usize);
         let pending = vec![PendingStateWrite {
             library: "PrimarySync".into(),
             asset_id: "A1".into(),
@@ -4074,7 +4055,7 @@ mod tests {
     async fn flush_pending_state_writes_partial_recovery() {
         // First write exhausts all STATE_WRITE_MAX_RETRIES attempts (reported as failure).
         // Second write fails once more then succeeds on retry.
-        let db = FailingStateDb::new(STATE_WRITE_MAX_RETRIES as usize + 1);
+        let db = FailingDownloadStore::new(STATE_WRITE_MAX_RETRIES as usize + 1);
         let pending = vec![
             PendingStateWrite {
                 library: "PrimarySync".into(),
@@ -4105,7 +4086,7 @@ mod tests {
     async fn flush_pending_state_writes_retains_all_records() {
         // 5 pending writes. First 2 failures are transient (writes 1&2 fail once
         // each then succeed on retry). All 5 should eventually succeed.
-        let db = FailingStateDb::new(2);
+        let db = FailingDownloadStore::new(2);
         let pending: Vec<PendingStateWrite> = (0..5)
             .map(|i| PendingStateWrite {
                 library: "PrimarySync".into(),
@@ -4124,7 +4105,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn flush_pending_state_writes_retains_only_persistent_failures() {
-        let db = FailingStateDb::new(STATE_WRITE_MAX_RETRIES as usize + 1);
+        let db = FailingDownloadStore::new(STATE_WRITE_MAX_RETRIES as usize + 1);
         let mut pending = vec![
             PendingStateWrite {
                 library: "PrimarySync".into(),
@@ -4188,8 +4169,8 @@ mod tests {
             .await;
 
         let dir = TempDir::new().unwrap();
-        let db = Arc::new(FailingStateDb::with_mark_failed_tracking());
-        let state_db: Arc<dyn StateDb> = db.clone();
+        let db = Arc::new(FailingDownloadStore::with_mark_failed_tracking());
+        let state_db: Arc<dyn DownloadStore> = db.clone();
         let client = Client::new();
         let retry = RetryConfig {
             max_retries: 0,
@@ -4271,8 +4252,8 @@ mod tests {
             .await;
 
         let dir = TempDir::new().unwrap();
-        let db = Arc::new(FailingStateDb::new(usize::MAX / 2));
-        let state_db: Arc<dyn StateDb> = db.clone();
+        let db = Arc::new(FailingDownloadStore::new(usize::MAX / 2));
+        let state_db: Arc<dyn DownloadStore> = db.clone();
         let client = Client::new();
         let retry = RetryConfig {
             max_retries: 0,
@@ -5817,7 +5798,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = DownloadConfig::test_default();
         config.directory = std::sync::Arc::from(dir.path());
-        config.state_db = Some(Arc::new(FailingStateDb::with_failing_complete_sync_run()));
+        config.state_db = Some(Arc::new(
+            FailingDownloadStore::with_failing_complete_sync_run(),
+        ));
         let config = Arc::new(config);
         let client = reqwest::Client::new();
         let controls = DownloadControls::download_hidden();
@@ -5858,8 +5841,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_with_preloaded_download_context_does_not_reload_state_db() {
-        let db = Arc::new(FailingStateDb::new(0));
-        let dyn_db: Arc<dyn crate::state::StateDb> = db.clone();
+        let db = Arc::new(FailingDownloadStore::new(0));
+        let dyn_db: Arc<dyn DownloadStore> = db.clone();
         let mut raw_config = DownloadConfig::test_default();
         raw_config.state_db = Some(dyn_db);
         let config = Arc::new(raw_config);

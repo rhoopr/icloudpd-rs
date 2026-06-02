@@ -187,7 +187,7 @@ fn shared_library_notice_recently_checked(checked_at: Option<&str>, now_ts: i64)
 async fn maybe_notify_shared_libraries(
     selector: &crate::selection::LibrarySelector,
     photos_service: &mut crate::icloud::photos::PhotosService,
-    state_db: Option<&dyn state::StateDb>,
+    state_db: Option<&dyn state::SyncTokenStore>,
 ) {
     let Some(db) = state_db else {
         tracing::debug!("shared-library notice: no state DB available; skipping uncached probe");
@@ -603,7 +603,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Skip for --dry-run so a preview doesn't create the DB or poison
     // sync tokens, which would cause a subsequent real sync to believe
     // nothing has changed and download 0 photos.
-    let state_db: Option<Arc<dyn state::StateDb>> = if config.runtime.dry_run {
+    let state_db: Option<Arc<dyn download::DownloadStore>> = if config.runtime.dry_run {
         None
     } else {
         let db_path = config.auth.cookie_directory.join(format!(
@@ -668,7 +668,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     }
                 }
 
-                Some(db as Arc<dyn state::StateDb>)
+                Some(db as Arc<dyn download::DownloadStore>)
             }
             Err(e) => {
                 anyhow::bail!("Could not open state database {}: {e}", db_path.display());
@@ -682,7 +682,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     maybe_notify_shared_libraries(
         &config.filters.selection.libraries,
         &mut photos_service,
-        state_db.as_deref(),
+        state_db
+            .as_deref()
+            .map(|db| db as &dyn state::SyncTokenStore),
     )
     .await;
 
@@ -942,7 +944,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // No-change cycles should cost one CloudKit request, not a full
         // album/pass refresh per selected library.
         let watch_precheck = if is_watch_mode {
-            check_changes_database(state_db.as_deref(), &library_states, &mut photos_service).await
+            check_changes_database(
+                state_db
+                    .as_deref()
+                    .map(|db| db as &dyn state::SyncTokenStore),
+                &library_states,
+                &mut photos_service,
+            )
+            .await
         } else {
             WatchPrecheck::proceed_all()
         };
@@ -992,7 +1001,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     && cycle_result.db_sync_token_advance_safe
                 {
                     if let Some(db) = state_db.as_deref() {
-                        store_db_sync_token(db, token).await;
+                        store_db_sync_token(db as &dyn state::SyncTokenStore, token).await;
                     }
                 } else {
                     tracing::debug!(
@@ -1111,7 +1120,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             && should_reconcile_this_cycle(cycle_index, config.watch.reconcile_every_n_cycles)
         {
             if let Some(db) = state_db.as_ref() {
-                run_periodic_reconcile(db.as_ref(), cycle_index).await;
+                run_periodic_reconcile(db.as_ref() as &dyn state::ReportStateStore, cycle_index)
+                    .await;
             }
         }
 
@@ -1322,7 +1332,7 @@ async fn reauth_with_srp(
 /// Errors from the DB scan are logged at `warn!` rather than propagated:
 /// the periodic walk is a diagnostic, not a load-bearing correctness gate,
 /// and a transient SQLite hiccup must not crash the watch daemon.
-async fn run_periodic_reconcile(db: &dyn state::StateDb, cycle_index: u64) {
+async fn run_periodic_reconcile(db: &dyn state::ReportStateStore, cycle_index: u64) {
     use crate::commands::reconcile::{scan_missing, MissingAsset};
     tracing::info!(
         cycle_index,
@@ -1470,7 +1480,7 @@ async fn refresh_needed_library_plans(
     }
 }
 
-async fn store_db_sync_token(db: &dyn state::StateDb, token: &str) {
+async fn store_db_sync_token(db: &dyn state::SyncTokenStore, token: &str) {
     if let Err(e) = db.set_metadata(DB_SYNC_TOKEN_KEY, token).await {
         tracing::warn!(error = %e, "Failed to store db_sync_token");
     }
@@ -1482,7 +1492,7 @@ async fn store_db_sync_token(db: &dyn state::StateDb, token: &str) {
 /// An empty complete page still skips the cycle but keeps the previous
 /// `db_sync_token`, so the next watch wakeup rechecks from the same point.
 async fn check_changes_database(
-    state_db: Option<&dyn state::StateDb>,
+    state_db: Option<&dyn state::SyncTokenStore>,
     library_states: &[LibraryState],
     photos_service: &mut crate::icloud::photos::PhotosService,
 ) -> WatchPrecheck {
@@ -2972,7 +2982,7 @@ mod tests {
 
     fn make_run_cycle_download_config_builder(
         download_dir: &std::path::Path,
-        db: Arc<dyn state::StateDb>,
+        db: Arc<dyn download::DownloadStore>,
     ) -> impl Fn(
         download::SyncMode,
         Arc<rustc_hash::FxHashSet<String>>,
@@ -2989,7 +2999,7 @@ mod tests {
 
     fn make_run_cycle_download_config_builder_with_options(
         download_dir: &std::path::Path,
-        db: Arc<dyn state::StateDb>,
+        db: Arc<dyn download::DownloadStore>,
         options: RunCycleDownloadConfigOptions,
     ) -> impl Fn(
         download::SyncMode,
@@ -3020,7 +3030,7 @@ mod tests {
 
     fn make_recording_run_cycle_download_config_builder(
         download_dir: &std::path::Path,
-        db: Arc<dyn state::StateDb>,
+        db: Arc<dyn download::DownloadStore>,
         observed_modes: Arc<std::sync::Mutex<Vec<download::SyncMode>>>,
     ) -> impl Fn(
         download::SyncMode,
@@ -3428,7 +3438,7 @@ mod tests {
     // the world (waste) or (b) skip previously-failed assets (silent loss).
     // None of the four critical branches had a direct unit test before.
 
-    fn make_state_db() -> Arc<dyn state::StateDb> {
+    fn make_state_db() -> Arc<dyn download::DownloadStore> {
         Arc::new(state::SqliteStateDb::open_in_memory().expect("open in-memory state DB"))
     }
 
@@ -3448,7 +3458,7 @@ mod tests {
     }
 
     struct FailingMetadataSetDb {
-        inner: Arc<dyn state::StateDb>,
+        inner: Arc<dyn download::DownloadStore>,
         failure: MetadataSetFailure,
         get_failure: Option<MetadataSetFailure>,
         delete_prefix_failure: Option<&'static str>,
@@ -3470,7 +3480,7 @@ mod tests {
 
     impl FailingMetadataSetDb {
         fn new(
-            inner: Arc<dyn state::StateDb>,
+            inner: Arc<dyn download::DownloadStore>,
             failure: MetadataSetFailure,
             message: &'static str,
         ) -> Self {
@@ -3485,7 +3495,10 @@ mod tests {
             }
         }
 
-        fn without_set_failure(inner: Arc<dyn state::StateDb>, message: &'static str) -> Self {
+        fn without_set_failure(
+            inner: Arc<dyn download::DownloadStore>,
+            message: &'static str,
+        ) -> Self {
             Self::new(
                 inner,
                 MetadataSetFailure::Exact("__unused_metadata_key__"),
@@ -3515,7 +3528,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl state::StateDb for FailingMetadataSetDb {
+    impl state::DownloadStateStore for FailingMetadataSetDb {
         #[cfg(test)]
         async fn should_download(
             &self,
@@ -3569,25 +3582,6 @@ mod tests {
                 .await
         }
 
-        async fn import_adopt(
-            &self,
-            record: &state::types::AssetRecord,
-            local_path: &std::path::Path,
-            local_checksum: &str,
-            imported_size: u64,
-            imported_mtime: Option<i64>,
-        ) -> Result<(), state::error::StateError> {
-            self.inner
-                .import_adopt(
-                    record,
-                    local_path,
-                    local_checksum,
-                    imported_size,
-                    imported_mtime,
-                )
-                .await
-        }
-
         async fn mark_failed(
             &self,
             library: &str,
@@ -3600,65 +3594,10 @@ mod tests {
                 .await
         }
 
-        async fn get_failed(
-            &self,
-        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
-            self.inner.get_failed().await
-        }
-
-        async fn get_failed_sample(
-            &self,
-            limit: u32,
-        ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError> {
-            self.inner.get_failed_sample(limit).await
-        }
-
         async fn get_pending(
             &self,
         ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
             self.inner.get_pending().await
-        }
-
-        async fn get_summary(&self) -> Result<state::types::SyncSummary, state::error::StateError> {
-            self.inner.get_summary().await
-        }
-
-        async fn get_downloaded_page(
-            &self,
-            offset: u64,
-            limit: u32,
-        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
-            self.inner.get_downloaded_page(offset, limit).await
-        }
-
-        async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
-            self.inner.start_sync_run().await
-        }
-
-        async fn complete_sync_run(
-            &self,
-            run_id: i64,
-            stats: &state::types::SyncRunStats,
-        ) -> Result<(), state::error::StateError> {
-            self.inner.complete_sync_run(run_id, stats).await
-        }
-
-        async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
-            self.inner.promote_orphaned_sync_runs().await
-        }
-
-        async fn begin_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
-            self.inner.begin_enum_progress(zone).await
-        }
-
-        async fn end_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
-            self.inner.end_enum_progress(zone).await
-        }
-
-        async fn list_interrupted_enumerations(
-            &self,
-        ) -> Result<Vec<String>, state::error::StateError> {
-            self.inner.list_interrupted_enumerations().await
         }
 
         async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
@@ -3701,12 +3640,111 @@ mod tests {
             self.inner.get_downloaded_checksums().await
         }
 
+        async fn get_downloaded_local_paths(
+            &self,
+        ) -> Result<
+            std::collections::HashMap<(String, String, String), std::path::PathBuf>,
+            state::error::StateError,
+        > {
+            self.inner.get_downloaded_local_paths().await
+        }
+
         async fn get_attempt_counts(
             &self,
         ) -> Result<std::collections::HashMap<String, u32>, state::error::StateError> {
             self.inner.get_attempt_counts().await
         }
 
+        async fn touch_last_seen_many(
+            &self,
+            library: &str,
+            asset_ids: &[&str],
+        ) -> Result<(), state::error::StateError> {
+            self.inner.touch_last_seen_many(library, asset_ids).await
+        }
+
+        async fn mark_soft_deleted(
+            &self,
+            library: &str,
+            asset_id: &str,
+            deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .mark_soft_deleted(library, asset_id, deleted_at)
+                .await
+        }
+
+        async fn mark_hidden_at_source(
+            &self,
+            library: &str,
+            asset_id: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner.mark_hidden_at_source(library, asset_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl state::ReportStateStore for FailingMetadataSetDb {
+        async fn get_failed(
+            &self,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_failed().await
+        }
+
+        async fn get_failed_sample(
+            &self,
+            limit: u32,
+        ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError> {
+            self.inner.get_failed_sample(limit).await
+        }
+
+        async fn get_failed_page(
+            &self,
+            offset: u64,
+            limit: u32,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_failed_page(offset, limit).await
+        }
+
+        async fn get_pending_page(
+            &self,
+            offset: u64,
+            limit: u32,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_pending_page(offset, limit).await
+        }
+
+        async fn get_summary(&self) -> Result<state::types::SyncSummary, state::error::StateError> {
+            self.inner.get_summary().await
+        }
+
+        async fn get_downloaded_page(
+            &self,
+            offset: u64,
+            limit: u32,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_downloaded_page(offset, limit).await
+        }
+
+        async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
+            self.inner.start_sync_run().await
+        }
+
+        async fn complete_sync_run(
+            &self,
+            run_id: i64,
+            stats: &state::types::SyncRunStats,
+        ) -> Result<(), state::error::StateError> {
+            self.inner.complete_sync_run(run_id, stats).await
+        }
+
+        async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
+            self.inner.promote_orphaned_sync_runs().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl state::SyncTokenStore for FailingMetadataSetDb {
         async fn get_metadata(
             &self,
             key: &str,
@@ -3741,14 +3779,23 @@ mod tests {
             }
         }
 
-        async fn touch_last_seen_many(
-            &self,
-            library: &str,
-            asset_ids: &[&str],
-        ) -> Result<(), state::error::StateError> {
-            self.inner.touch_last_seen_many(library, asset_ids).await
+        async fn begin_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
+            self.inner.begin_enum_progress(zone).await
         }
 
+        async fn end_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
+            self.inner.end_enum_progress(zone).await
+        }
+
+        async fn list_interrupted_enumerations(
+            &self,
+        ) -> Result<Vec<String>, state::error::StateError> {
+            self.inner.list_interrupted_enumerations().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl state::MembershipStore for FailingMetadataSetDb {
         async fn add_asset_album(
             &self,
             library: &str,
@@ -3775,25 +3822,149 @@ mod tests {
             self.inner.get_all_asset_people(library).await
         }
 
-        async fn mark_soft_deleted(
+        async fn upsert_album_container(
             &self,
             library: &str,
-            asset_id: &str,
-            deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+            container_id: &str,
+            album_name: &str,
+            pass_kind: &str,
         ) -> Result<(), state::error::StateError> {
             self.inner
-                .mark_soft_deleted(library, asset_id, deleted_at)
+                .upsert_album_container(library, container_id, album_name, pass_kind)
                 .await
         }
 
-        async fn mark_hidden_at_source(
+        async fn mark_album_container_deleted(
             &self,
             library: &str,
-            asset_id: &str,
+            container_id: &str,
         ) -> Result<(), state::error::StateError> {
-            self.inner.mark_hidden_at_source(library, asset_id).await
+            self.inner
+                .mark_album_container_deleted(library, container_id)
+                .await
         }
 
+        async fn start_album_membership_snapshot(
+            &self,
+            library: &str,
+            container_id: &str,
+            enum_config_hash: Option<&str>,
+        ) -> Result<i64, state::error::StateError> {
+            self.inner
+                .start_album_membership_snapshot(library, container_id, enum_config_hash)
+                .await
+        }
+
+        async fn add_album_membership_to_snapshot(
+            &self,
+            library: &str,
+            container_id: &str,
+            generation: i64,
+            asset_record_name: &str,
+            master_record_name: Option<&str>,
+            source: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .add_album_membership_to_snapshot(
+                    library,
+                    container_id,
+                    generation,
+                    asset_record_name,
+                    master_record_name,
+                    source,
+                )
+                .await
+        }
+
+        async fn upsert_album_membership_delta(
+            &self,
+            library: &str,
+            container_id: &str,
+            asset_record_name: &str,
+            master_record_name: Option<&str>,
+            source: &str,
+        ) -> Result<bool, state::error::StateError> {
+            self.inner
+                .upsert_album_membership_delta(
+                    library,
+                    container_id,
+                    asset_record_name,
+                    master_record_name,
+                    source,
+                )
+                .await
+        }
+
+        async fn mark_album_membership_deleted(
+            &self,
+            library: &str,
+            container_id: &str,
+            asset_record_name: &str,
+        ) -> Result<bool, state::error::StateError> {
+            self.inner
+                .mark_album_membership_deleted(library, container_id, asset_record_name)
+                .await
+        }
+
+        async fn complete_album_membership_snapshot(
+            &self,
+            library: &str,
+            container_id: &str,
+            generation: i64,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .complete_album_membership_snapshot(library, container_id, generation)
+                .await
+        }
+
+        async fn invalidate_album_membership_snapshot(
+            &self,
+            library: &str,
+            container_id: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .invalidate_album_membership_snapshot(library, container_id)
+                .await
+        }
+
+        async fn selected_album_containers_have_complete_snapshots(
+            &self,
+            library: &str,
+            container_ids: &[&str],
+        ) -> Result<bool, state::error::StateError> {
+            self.inner
+                .selected_album_containers_have_complete_snapshots(library, container_ids)
+                .await
+        }
+
+        async fn get_live_album_memberships_for_asset(
+            &self,
+            library: &str,
+            asset_record_name: &str,
+        ) -> Result<Vec<state::db::AlbumMembershipRecord>, state::error::StateError> {
+            self.inner
+                .get_live_album_memberships_for_asset(library, asset_record_name)
+                .await
+        }
+
+        async fn get_live_selected_album_memberships_for_asset(
+            &self,
+            library: &str,
+            asset_record_name: &str,
+            selected_container_ids: &[&str],
+        ) -> Result<Vec<state::db::AlbumMembershipRecord>, state::error::StateError> {
+            self.inner
+                .get_live_selected_album_memberships_for_asset(
+                    library,
+                    asset_record_name,
+                    selected_container_ids,
+                )
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl state::MetadataRewriteStore for FailingMetadataSetDb {
         async fn record_metadata_write_failure(
             &self,
             library: &str,
@@ -4071,11 +4242,16 @@ mod tests {
     }
 
     async fn check_single_library_changes_database(
-        db: Option<&dyn state::StateDb>,
+        db: Option<&dyn download::DownloadStore>,
         lib_state: &LibraryState,
         svc: &mut crate::icloud::photos::PhotosService,
     ) -> WatchPrecheck {
-        check_changes_database(db, std::slice::from_ref(lib_state), svc).await
+        check_changes_database(
+            db.map(|db| db as &dyn state::SyncTokenStore),
+            std::slice::from_ref(lib_state),
+            svc,
+        )
+        .await
     }
 
     /// `more_coming=true` with empty zones must NOT skip the cycle.
@@ -4095,7 +4271,7 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let db: Arc<dyn state::StateDb> = make_state_db();
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         // Pre-populate a stored sync token so the function actually
         // makes the changes/database HTTP call (the `has_token` early
         // return otherwise short-circuits).
@@ -4144,7 +4320,7 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let db: Arc<dyn state::StateDb> = make_state_db();
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("set token");
@@ -4189,7 +4365,7 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let db: Arc<dyn state::StateDb> = make_state_db();
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("set token");
@@ -4223,7 +4399,7 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let db: Arc<dyn state::StateDb> = make_state_db();
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         db.set_metadata("sync_token:PrimarySync", "primary-tok-prev")
             .await
             .expect("set primary token");
@@ -4258,7 +4434,7 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let db: Arc<dyn state::StateDb> = make_state_db();
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         db.set_metadata("sync_token:PrimarySync", "primary-tok-prev")
             .await
             .expect("set primary token");
@@ -4291,7 +4467,7 @@ mod tests {
         );
 
         // Empty DB — no `sync_token:PrimarySync` set.
-        let db: Arc<dyn state::StateDb> = make_state_db();
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
 
         let precheck =
@@ -4320,7 +4496,7 @@ mod tests {
             .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("seed token");
-        let db: Arc<dyn state::StateDb> = Arc::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(inner, "simulated zone-token read failure")
                 .with_get_failure(MetadataSetFailure::Exact("sync_token:PrimarySync")),
         );
@@ -4352,7 +4528,7 @@ mod tests {
             .set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
             .await
             .expect("seed db token");
-        let db: Arc<dyn state::StateDb> = Arc::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(inner, "simulated db-token read failure")
                 .with_get_failure(MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY)),
         );
@@ -4467,7 +4643,7 @@ mod tests {
             .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("seed token");
-        let db: Arc<dyn state::StateDb> = Arc::new(FailingMetadataSetDb::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
             inner,
             MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY),
             "simulated db_sync_token write failure",
@@ -4504,7 +4680,7 @@ mod tests {
     #[tokio::test]
     async fn preload_asset_groupings_partial_people_failure_keeps_albums() {
         struct PartialDb {
-            inner: Arc<dyn state::StateDb>,
+            inner: Arc<dyn download::DownloadStore>,
         }
 
         #[async_trait::async_trait]
@@ -4793,7 +4969,7 @@ mod tests {
             .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("seed zone token");
-        let db: Arc<dyn state::StateDb> = Arc::new(FailingMetadataSetDb::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
             Arc::clone(&inner),
             MetadataSetFailure::Prefix(SYNC_TOKEN_PREFIX),
             "simulated sync-token write failure",
@@ -4851,7 +5027,7 @@ mod tests {
             .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("seed zone token");
-        let db: Arc<dyn state::StateDb> = Arc::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(
                 Arc::clone(&inner),
                 "simulated token purge failure",
@@ -5183,7 +5359,7 @@ mod tests {
             .await
             .expect("seed zone token");
         let shutdown_token = CancellationToken::new();
-        let db: Arc<dyn state::StateDb> = Arc::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(Arc::clone(&inner), "unused")
                 .with_cancel_on_upsert(shutdown_token.clone()),
         );
@@ -5243,7 +5419,7 @@ mod tests {
         let inner = make_state_db();
         let download_dir = tempfile::tempdir().expect("download tempdir");
         let download_root = download_dir.path().to_path_buf();
-        let db: Arc<dyn state::StateDb> = Arc::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(Arc::clone(&inner), "unused")
                 .with_download_dir_replaced_on_upsert(download_root.clone()),
         );
@@ -5754,7 +5930,7 @@ mod tests {
             .set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "old-zone-token")
             .await
             .expect("seed zone token");
-        let db: Arc<dyn state::StateDb> = Arc::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(
                 Arc::clone(&inner),
                 "simulated token purge failure",
