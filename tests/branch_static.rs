@@ -178,3 +178,37 @@ fn live_import_rehearsal_seeds_album_with_per_filter_recent_scope() {
         "live import rehearsal real import should keep import-existing bounded to the same recent count"
     );
 }
+
+#[test]
+fn full_test_cross_zone_album_phase_is_opt_in_and_checks_source_zone() {
+    let run_all = repo_file("scripts/full-test/run_all.sh");
+    let script = repo_file("scripts/full-test/run_cross_zone_album_hydration.sh");
+    let readme = repo_file("tests/README.md");
+
+    assert!(
+        run_all.contains(r#"if [[ -n "${KEI_FULL_TEST_CROSS_ZONE_ALBUM:-}" ]]; then"#),
+        "cross-zone live full-test phase must stay opt-in"
+    );
+    assert!(
+        run_all.contains(
+            r#"run_live_phase live_cross_zone_album -- "$script_dir/run_cross_zone_album_hydration.sh""#
+        ),
+        "cross-zone album phase must use live phase wrapping for prereq and rate-limit handling"
+    );
+    assert!(
+        script.contains("libraries = [\"all\"]"),
+        "cross-zone fixture sync must include all visible libraries"
+    );
+    assert!(
+        script.contains("a.library <> 'PrimarySync'"),
+        "cross-zone fixture assertion must prove a non-primary source zone"
+    );
+    assert!(
+        script.contains("JOIN asset_albums aa"),
+        "cross-zone fixture assertion must be tied to the selected album membership"
+    );
+    assert!(
+        readme.contains("KEI_FULL_TEST_CROSS_ZONE_ALBUM"),
+        "tests README must document the opt-in cross-zone fixture"
+    );
+}

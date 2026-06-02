@@ -45,6 +45,16 @@ kei_cookie_dir() {
     fi
 }
 
+kei_copy_session_without_state() {
+    local dest="${1:?destination dir required}"
+    local cookies
+    cookies="$(kei_cookie_dir)"
+    mkdir -p "$dest"
+    cp "$cookies/"* "$dest/" 2>/dev/null || true
+    cp "$cookies/".* "$dest/" 2>/dev/null || true
+    rm -f "$dest/"*.lock "$dest/.lock" "$dest/"*.db "$dest/health.json" 2>/dev/null || true
+}
+
 kei_db_path() {
     printf '%s/%s.db' "$(kei_cookie_dir)" "$(kei_user_slug)"
 }

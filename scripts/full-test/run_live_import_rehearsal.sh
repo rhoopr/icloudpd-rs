@@ -22,7 +22,6 @@ kei_require_release_binary
 
 binary=$(kei_release_bin)
 album=$(kei_album)
-cookies=$(kei_cookie_dir)
 work=$(mktemp -d "${TMPDIR:-/tmp/codex/kei/full-test/tmp}/kei-live-import-rehearsal-XXXXX")
 trap 'rm -rf "$work"' EXIT
 
@@ -31,15 +30,8 @@ import_data="$work/import-data"
 photos="$work/photos"
 mkdir -p "$sync_data" "$import_data" "$photos"
 
-copy_session() {
-  local dest="$1"
-  cp "$cookies/"* "$dest/" 2>/dev/null || true
-  cp "$cookies/".* "$dest/" 2>/dev/null || true
-  rm -f "$dest/"*.lock "$dest/.lock" "$dest/"*.db "$dest/health.json" 2>/dev/null || true
-}
-
-copy_session "$sync_data"
-copy_session "$import_data"
+kei_copy_session_without_state "$sync_data"
+kei_copy_session_without_state "$import_data"
 
 write_config() {
   local data_dir="$1"

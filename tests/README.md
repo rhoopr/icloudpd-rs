@@ -37,6 +37,7 @@ tests/
 | `tests/shell/state-machine.sh` | 20 | yes | `just test state` |
 | `tests/shell/docker.sh` | 16 | yes | `just test docker` |
 | `scripts/full-test/run_live_import_rehearsal.sh` | 1 | yes | `just full-test` |
+| `scripts/full-test/run_cross_zone_album_hydration.sh` | 1 | yes | `just full-test` when `KEI_FULL_TEST_CROSS_ZONE_ALBUM` is set |
 | `scripts/full-test/run_docker_puid_smoke.sh` | 1 | no | `just full-test` |
 | `scripts/full-test/run_release_archive_smoke.sh` | 1 | no | `just full-test` |
 | `scripts/full-test/run_release_regression_smoke.sh` | 8 | no | `just release-smoke` |
@@ -120,6 +121,8 @@ details are baked into test code.
 | `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image under test |
 | `KEI_TEST_SCRATCH_DIR` | `/tmp/codex/kei/shell-tests-$USER` | Base dir for standalone shell-suite scratch; `just full-test` overrides this to `/tmp/codex/kei/full-test/shell` |
 | `KEI_IMPORT_FIXTURE_DIR` | `/tmp/codex/kei/import-fixture` | Where `import_existing_live.rs` caches its `--recent 100` sync fixture across runs |
+| `KEI_FULL_TEST_CROSS_ZONE_ALBUM` | unset | Optional full-test album fixture for cross-zone hydration. The album must include at least one asset from a non-primary source zone. |
+| `KEI_FULL_TEST_CROSS_ZONE_MIN_FILES` | `1` | Minimum non-primary downloaded asset rows required when `KEI_FULL_TEST_CROSS_ZONE_ALBUM` is set. |
 | `KEI_FULL_TEST_REAL_SERVICE` | unset | Set to `1` to let `just full-test` install, start, status-check, and uninstall a real Linux user systemd service |
 | `KEI_FULL_TEST_EXPECT_VERSION` | unset | Optional exact Cargo package version expected by the release-archive smoke |
 
@@ -127,6 +130,22 @@ details are baked into test code.
 repo's maintainer setup. Override in your environment to point at your
 own account. Cookie dir falls through to the harness default
 (`./.test-cookies`); set `ICLOUD_TEST_COOKIE_DIR` to override.
+
+### Cross-zone album fixture
+
+`just full-test` skips cross-zone album hydration by default. To enable it,
+prepare a named album that includes at least one asset whose source library is
+not `PrimarySync`, then run:
+
+```sh
+KEI_FULL_TEST_CROSS_ZONE_ALBUM="album-name" just full-test
+```
+
+The phase syncs that album with `libraries = ["all"]` using the release
+binary. It then checks the fresh state DB for downloaded album rows where
+`assets.library <> 'PrimarySync'`. Set
+`KEI_FULL_TEST_CROSS_ZONE_MIN_FILES` if the fixture should prove more than one
+non-primary asset.
 
 ## Rate limits
 
@@ -194,6 +213,10 @@ happens:
 - **`scripts/full-test/run_live_import_rehearsal.sh`** - live mini rehearsal
   for v0.20's TOML-first import path: seed a tiny real tree, import it into a
   fresh DB, and verify a repeat dry-run stays matched.
+- **`scripts/full-test/run_cross_zone_album_hydration.sh`** - opt-in live
+  release-binary check for accounts with a prepared cross-zone album fixture.
+  It selects the named album with `libraries = ["all"]` and fails unless the
+  sync records at least one downloaded asset from a non-primary source zone.
 - **`service-smoke` workflow** - per-platform CI smoke for `kei install`
   / `kei uninstall`. Builds the release binary on
   `ubuntu-latest`/`macos-latest`/`windows-latest`, runs `kei install

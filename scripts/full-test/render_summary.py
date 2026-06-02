@@ -34,6 +34,7 @@ PHASE_ORDER = {
     "live_reconcile_dryrun": 66,
     "live_password_backend": 67,
     "live_import_dryrun": 68,
+    "live_cross_zone_album": 69,
     "service_smoke": 70,
 }
 

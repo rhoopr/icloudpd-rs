@@ -23,6 +23,7 @@
 #   4  test_shell_*    auto-discovered shell suites       --live
 #   5  live_*          binary smokes (run_live_smokes.sh) --live
 #   5.5  live_import_rehearsal                            --live
+#   opt  live_cross_zone_album when KEI_FULL_TEST_CROSS_ZONE_ALBUM is set --live
 #   6  service_smoke   just service-smoke when supported
 #   opt  real_service_lifecycle when KEI_FULL_TEST_REAL_SERVICE=1 --live
 #   finalize_run + diff_runs on success
@@ -164,6 +165,9 @@ current_phase="test_shell"
 current_phase="live_smokes"
 "$script_dir/run_live_smokes.sh"
 run_live_phase live_import_rehearsal -- "$script_dir/run_live_import_rehearsal.sh"
+if [[ -n "${KEI_FULL_TEST_CROSS_ZONE_ALBUM:-}" ]]; then
+  run_live_phase live_cross_zone_album -- "$script_dir/run_cross_zone_album_hydration.sh"
+fi
 
 # --- Phase 6: service smoke ------------------------------------------------
 if ! command -v systemd-analyze >/dev/null 2>&1 && ! command -v plutil >/dev/null 2>&1; then

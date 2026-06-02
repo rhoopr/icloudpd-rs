@@ -85,6 +85,7 @@ PHASE_META = {
     "live_reconcile_dryrun":    (66, "5", None),
     "live_password_backend":    (67, "5", None),
     "live_import_dryrun":       (68, "5", None),
+    "live_cross_zone_album":    (69, "5.6", None),
     "service_smoke":            (70, "6", None),
 }
 
