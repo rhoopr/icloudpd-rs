@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 13;
+pub(crate) const SCHEMA_VERSION: i32 = 14;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -384,6 +384,26 @@ CREATE INDEX IF NOT EXISTS idx_asset_album_memberships_container
     ON asset_album_memberships (library, container_id, is_deleted);
 ";
 
+/// V14 scoped database-level `/changes/database` token provenance.
+///
+/// These rows are pre-check cursors only. They prove that the exact stored
+/// scope can ask CloudKit whether selected zones changed; they do not prove
+/// per-zone coverage for `/changes/zone` incremental sync.
+const SCHEMA_V14: &str = r"
+CREATE TABLE IF NOT EXISTS scoped_db_sync_tokens (
+    provider TEXT NOT NULL,
+    account TEXT NOT NULL,
+    shape_version INTEGER NOT NULL,
+    scope_hash TEXT NOT NULL,
+    selected_zones_json TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    token TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (provider, account, shape_version, scope_hash)
+);
+";
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -534,6 +554,7 @@ fn migrate_to_version(
                 )?;
             }
         }
+        14 => conn.execute_batch(SCHEMA_V14)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1664,5 +1685,39 @@ mod tests {
         set_schema_version(&conn, 11).unwrap();
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_v14_creates_scoped_db_sync_tokens_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+        migrate(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'scoped_db_sync_tokens'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "v14 must create scoped_db_sync_tokens");
+
+        for column in [
+            "provider",
+            "account",
+            "shape_version",
+            "scope_hash",
+            "selected_zones_json",
+            "scope_json",
+            "token",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                column_exists(&conn, "scoped_db_sync_tokens", column).unwrap(),
+                "v14 must create scoped_db_sync_tokens.{column}",
+            );
+        }
     }
 }

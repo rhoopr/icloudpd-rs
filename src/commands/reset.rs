@@ -93,10 +93,13 @@ pub(crate) async fn run_reset_sync_token(
     let db = state::SqliteStateDb::open(&db_path).await?;
     db.set_metadata("db_sync_token", "").await?;
     let cleared = db.delete_metadata_by_prefix("sync_token:").await?;
+    let scoped_cleared = db.delete_scoped_db_sync_tokens().await?;
     println!(
-        "Cleared sync tokens ({} zone token{} + db token). Next sync will do a full enumeration.",
+        "Cleared sync tokens ({} zone token{} + db token + {} scoped db token{}). Next sync will do a full enumeration.",
         cleared,
-        if cleared == 1 { "" } else { "s" }
+        if cleared == 1 { "" } else { "s" },
+        scoped_cleared,
+        if scoped_cleared == 1 { "" } else { "s" }
     );
 
     Ok(())

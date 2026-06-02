@@ -80,6 +80,22 @@ pub struct AlbumMembershipRecord {
     pub source: String,
 }
 
+/// Scoped database-level `/changes/database` pre-check token.
+///
+/// This is not a per-zone coverage token. The canonical JSON fields are
+/// stored alongside the hash so a hash match alone never proves that a
+/// watch-mode no-change skip is safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedDbSyncToken {
+    pub provider: String,
+    pub account: String,
+    pub shape_version: i64,
+    pub scope_hash: String,
+    pub selected_zones_json: String,
+    pub scope_json: String,
+    pub token: String,
+}
+
 /// State operations used by the download producer and finalizer.
 #[allow(
     dead_code,
@@ -240,6 +256,27 @@ pub trait SyncTokenStore: Send + Sync {
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError>;
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError>;
+    async fn get_scoped_db_sync_token(
+        &self,
+        _provider: &str,
+        _account: &str,
+        _shape_version: i64,
+        _scope_hash: &str,
+    ) -> Result<Option<ScopedDbSyncToken>, StateError> {
+        Ok(None)
+    }
+    async fn upsert_scoped_db_sync_token(
+        &self,
+        _token: ScopedDbSyncToken,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "upsert_scoped_db_sync_token",
+            detail: "scoped db sync tokens are not implemented by this state store".into(),
+        })
+    }
+    async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, StateError> {
+        Ok(0)
+    }
     async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError>;
     async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError>;
     async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError>;
@@ -1831,6 +1868,82 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn get_scoped_db_sync_token(
+        &self,
+        provider: &str,
+        account: &str,
+        shape_version: i64,
+        scope_hash: &str,
+    ) -> Result<Option<ScopedDbSyncToken>, StateError> {
+        let provider = provider.to_owned();
+        let account = account.to_owned();
+        let scope_hash = scope_hash.to_owned();
+        self.with_conn("get_scoped_db_sync_token", move |conn| {
+            conn.query_row(
+                "SELECT selected_zones_json, scope_json, token \
+                 FROM scoped_db_sync_tokens \
+                 WHERE provider = ?1 AND account = ?2 AND shape_version = ?3 AND scope_hash = ?4",
+                rusqlite::params![provider, account, shape_version, scope_hash],
+                |row| {
+                    Ok(ScopedDbSyncToken {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                        shape_version,
+                        scope_hash: scope_hash.clone(),
+                        selected_zones_json: row.get(0)?,
+                        scope_json: row.get(1)?,
+                        token: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| StateError::query("get_scoped_db_sync_token", e))
+        })
+        .await
+    }
+
+    pub(crate) async fn upsert_scoped_db_sync_token(
+        &self,
+        token: ScopedDbSyncToken,
+    ) -> Result<(), StateError> {
+        self.with_conn("upsert_scoped_db_sync_token", move |conn| {
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO scoped_db_sync_tokens \
+                    (provider, account, shape_version, scope_hash, selected_zones_json, scope_json, token, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8) \
+                 ON CONFLICT(provider, account, shape_version, scope_hash) DO UPDATE SET \
+                    selected_zones_json = excluded.selected_zones_json, \
+                    scope_json = excluded.scope_json, \
+                    token = excluded.token, \
+                    updated_at = excluded.updated_at",
+                rusqlite::params![
+                    token.provider,
+                    token.account,
+                    token.shape_version,
+                    token.scope_hash,
+                    token.selected_zones_json,
+                    token.scope_json,
+                    token.token,
+                    now,
+                ],
+            )
+            .map_err(|e| StateError::query("upsert_scoped_db_sync_token", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, StateError> {
+        self.with_conn("delete_scoped_db_sync_tokens", move |conn| {
+            let deleted = conn
+                .execute("DELETE FROM scoped_db_sync_tokens", [])
+                .map_err(|e| StateError::query("delete_scoped_db_sync_tokens", e))?;
+            Ok(deleted as u64)
+        })
+        .await
+    }
+
     pub(crate) async fn touch_last_seen_many(
         &self,
         library: &str,
@@ -2819,6 +2932,28 @@ impl SyncTokenStore for SqliteStateDb {
 
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
         SqliteStateDb::delete_metadata_by_prefix(self, prefix).await
+    }
+
+    async fn get_scoped_db_sync_token(
+        &self,
+        provider: &str,
+        account: &str,
+        shape_version: i64,
+        scope_hash: &str,
+    ) -> Result<Option<ScopedDbSyncToken>, StateError> {
+        SqliteStateDb::get_scoped_db_sync_token(self, provider, account, shape_version, scope_hash)
+            .await
+    }
+
+    async fn upsert_scoped_db_sync_token(
+        &self,
+        token: ScopedDbSyncToken,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::upsert_scoped_db_sync_token(self, token).await
+    }
+
+    async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, StateError> {
+        SqliteStateDb::delete_scoped_db_sync_tokens(self).await
     }
 
     async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
@@ -4768,6 +4903,75 @@ mod tests {
         // No-op when nothing matches
         let deleted = db.delete_metadata_by_prefix("nonexistent:").await.unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn scoped_db_sync_token_roundtrips_by_exact_scope_key() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let row = ScopedDbSyncToken {
+            provider: "icloud".to_string(),
+            account: "test@example.com".to_string(),
+            shape_version: 1,
+            scope_hash: "scope-a".to_string(),
+            selected_zones_json: r#"["PrimarySync"]"#.to_string(),
+            scope_json: r#"{"coverage":{"kind":"bounded-recent-count","count":1000}}"#.to_string(),
+            token: "db-token-a".to_string(),
+        };
+
+        db.upsert_scoped_db_sync_token(row.clone()).await.unwrap();
+
+        let loaded = db
+            .get_scoped_db_sync_token("icloud", "test@example.com", 1, "scope-a")
+            .await
+            .unwrap()
+            .expect("scoped token should exist");
+        assert_eq!(loaded, row);
+        assert!(
+            db.get_scoped_db_sync_token("icloud", "test@example.com", 1, "scope-b")
+                .await
+                .unwrap()
+                .is_none(),
+            "different scope hash must not reuse the token"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_db_sync_token_upsert_preserves_created_at_and_updates_token() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let mut row = ScopedDbSyncToken {
+            provider: "icloud".to_string(),
+            account: "test@example.com".to_string(),
+            shape_version: 1,
+            scope_hash: "scope-a".to_string(),
+            selected_zones_json: r#"["PrimarySync"]"#.to_string(),
+            scope_json: r#"{"coverage":{"kind":"complete"}}"#.to_string(),
+            token: "db-token-a".to_string(),
+        };
+        db.upsert_scoped_db_sync_token(row.clone()).await.unwrap();
+        row.token = "db-token-b".to_string();
+        db.upsert_scoped_db_sync_token(row.clone()).await.unwrap();
+
+        let loaded = db
+            .get_scoped_db_sync_token("icloud", "test@example.com", 1, "scope-a")
+            .await
+            .unwrap()
+            .expect("scoped token should exist");
+        assert_eq!(loaded.token, "db-token-b");
+
+        let conn = db.conn.lock().unwrap();
+        let (created_at, updated_at): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, updated_at FROM scoped_db_sync_tokens \
+                 WHERE provider = 'icloud' AND account = 'test@example.com' \
+                    AND shape_version = 1 AND scope_hash = 'scope-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            updated_at >= created_at,
+            "updated_at must not move backwards"
+        );
     }
 
     #[tokio::test]

@@ -81,7 +81,7 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 12;
+const HELPER_SCHEMA_VERSION: i32 = 14;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -231,6 +231,19 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             ON asset_album_memberships (library, asset_record_name, is_deleted);
         CREATE INDEX IF NOT EXISTS idx_asset_album_memberships_container
             ON asset_album_memberships (library, container_id, is_deleted);
+
+        CREATE TABLE IF NOT EXISTS scoped_db_sync_tokens (
+            provider TEXT NOT NULL,
+            account TEXT NOT NULL,
+            shape_version INTEGER NOT NULL,
+            scope_hash TEXT NOT NULL,
+            selected_zones_json TEXT NOT NULL,
+            scope_json TEXT NOT NULL,
+            token TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (provider, account, shape_version, scope_hash)
+        );
         ",
     )
     .unwrap();
@@ -264,7 +277,7 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 12). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 14). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -282,7 +295,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 12;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 14;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -1796,6 +1809,13 @@ fn reset_sync_token_clears_tokens() {
         [],
     )
     .unwrap();
+    conn.execute(
+        "INSERT INTO scoped_db_sync_tokens \
+            (provider, account, shape_version, scope_hash, selected_zones_json, scope_json, token, created_at, updated_at) \
+         VALUES ('icloud', 'test@example.com', 1, 'scope-a', '[\"PrimarySync\"]', '{\"scope\":\"a\"}', 'scoped-tok-123', 1, 1)",
+        [],
+    )
+    .unwrap();
     drop(conn);
 
     let out = clean_cmd()
@@ -1833,6 +1853,12 @@ fn reset_sync_token_clears_tokens() {
         .unwrap();
     // db_sync_token is set to empty string, not deleted
     assert_eq!(db_token, "", "db_sync_token should be cleared to empty");
+    let scoped_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM scoped_db_sync_tokens", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(scoped_count, 0, "scoped db tokens should be deleted");
 }
 #[test]
 fn reset_state_without_yes_on_non_tty() {

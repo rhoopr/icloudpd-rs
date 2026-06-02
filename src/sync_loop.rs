@@ -4,6 +4,7 @@
 //! The public entry point is [`run_sync`], which handles config resolution,
 //! authentication, the download loop, and watch-mode re-sync.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -103,8 +104,216 @@ const SHARED_LIBRARY_NOTICE_KEY: &str = "shared_library_notice_shown_v1";
 const SHARED_LIBRARY_NOTICE_CHECKED_KEY: &str = "shared_library_notice_checked_at_v1";
 const SHARED_LIBRARY_NOTICE_CHECK_TTL_SECS: i64 = 24 * 60 * 60;
 
-/// Metadata key for the database-level token used by `/changes/database`.
+/// Legacy metadata key for the unscoped database-level token used by
+/// `/changes/database` before scoped provenance rows.
+#[cfg(test)]
 const DB_SYNC_TOKEN_KEY: &str = "db_sync_token";
+const SCOPED_DB_SYNC_TOKEN_PROVIDER: &str = "icloud";
+const SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION: i64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbPrecheckScope {
+    provider: String,
+    account: String,
+    shape_version: i64,
+    scope_hash: String,
+    selected_zones_json: String,
+    scope_json: String,
+}
+
+impl DbPrecheckScope {
+    fn from_config(
+        config: &config::Config,
+        library_states: &[LibraryState],
+        build_download_config: &crate::sync_cycle::BuildDownloadConfigFn<'_>,
+        enum_config_hash: &str,
+    ) -> anyhow::Result<Self> {
+        let mut selected_zones: Vec<String> =
+            library_states.iter().map(|s| s.zone_name.clone()).collect();
+        selected_zones.sort();
+
+        let download_config_hash = build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from(
+                selected_zones
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or(crate::icloud::photos::PRIMARY_ZONE_NAME),
+            ),
+        );
+        let download_config_hash = download::hash_download_config(&download_config_hash);
+
+        let selected_zones_json = serde_json::to_string(&selected_zones)
+            .context("serialize scoped database token selected zones")?;
+        let scope_json = scoped_db_precheck_scope_json(
+            config,
+            &selected_zones,
+            enum_config_hash,
+            &download_config_hash,
+        )?;
+        let scope_hash =
+            hash_scoped_db_precheck_scope(SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION, &scope_json);
+
+        Ok(Self {
+            provider: SCOPED_DB_SYNC_TOKEN_PROVIDER.to_string(),
+            account: config.auth.username.clone(),
+            shape_version: SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION,
+            scope_hash,
+            selected_zones_json,
+            scope_json,
+        })
+    }
+
+    fn to_state_row(&self, token: &str) -> state::ScopedDbSyncToken {
+        state::ScopedDbSyncToken {
+            provider: self.provider.clone(),
+            account: self.account.clone(),
+            shape_version: self.shape_version,
+            scope_hash: self.scope_hash.clone(),
+            selected_zones_json: self.selected_zones_json.clone(),
+            scope_json: self.scope_json.clone(),
+            token: token.to_string(),
+        }
+    }
+}
+
+fn selector_set_json(set: &BTreeSet<String>) -> serde_json::Value {
+    let values: Vec<&str> = set.iter().map(String::as_str).collect();
+    serde_json::json!(values)
+}
+
+fn album_selector_json(selector: &crate::selection::AlbumSelector) -> serde_json::Value {
+    use crate::selection::AlbumSelector;
+    match selector {
+        AlbumSelector::None => serde_json::json!({"kind": "none"}),
+        AlbumSelector::All { excluded } => {
+            serde_json::json!({"kind": "all", "excluded": selector_set_json(excluded)})
+        }
+        AlbumSelector::Named { included, excluded } => serde_json::json!({
+            "kind": "named",
+            "included": selector_set_json(included),
+            "excluded": selector_set_json(excluded),
+        }),
+    }
+}
+
+fn smart_folder_selector_json(
+    selector: &crate::selection::SmartFolderSelector,
+) -> serde_json::Value {
+    use crate::selection::SmartFolderSelector;
+    match selector {
+        SmartFolderSelector::None => serde_json::json!({"kind": "none"}),
+        SmartFolderSelector::All {
+            include_sensitive,
+            excluded,
+        } => serde_json::json!({
+            "kind": "all",
+            "include_sensitive": include_sensitive,
+            "excluded": selector_set_json(excluded),
+        }),
+        SmartFolderSelector::Named { included, excluded } => serde_json::json!({
+            "kind": "named",
+            "included": selector_set_json(included),
+            "excluded": selector_set_json(excluded),
+        }),
+    }
+}
+
+fn library_selector_json(selector: &crate::selection::LibrarySelector) -> serde_json::Value {
+    serde_json::json!({
+        "primary": selector.primary,
+        "shared_all": selector.shared_all,
+        "named": selector_set_json(&selector.named),
+        "excluded": selector_set_json(&selector.excluded),
+    })
+}
+
+fn scoped_db_precheck_scope_json(
+    config: &config::Config,
+    selected_zones: &[String],
+    enum_config_hash: &str,
+    download_config_hash: &str,
+) -> anyhow::Result<String> {
+    let skip_created_before = config
+        .filters
+        .skip_created_before
+        .map(|d| d.with_timezone(&chrono::Utc).to_rfc3339());
+    let skip_created_after = config
+        .filters
+        .skip_created_after
+        .map(|d| d.with_timezone(&chrono::Utc).to_rfc3339());
+    let mut filename_exclude: Vec<&str> = config
+        .download
+        .filename_exclude
+        .iter()
+        .map(glob::Pattern::as_str)
+        .collect();
+    filename_exclude.sort_unstable();
+    let coverage = if let Some(count) = config.filters.recent {
+        serde_json::json!({
+            "kind": "bounded-recent-count",
+            "count": count,
+            "recent_scope": config.filters.recent_scope,
+        })
+    } else if skip_created_before.is_some() || skip_created_after.is_some() {
+        serde_json::json!({
+            "kind": "bounded-date-window",
+            "skip_created_before": skip_created_before,
+            "skip_created_after": skip_created_after,
+        })
+    } else {
+        serde_json::json!({"kind": "complete"})
+    };
+
+    serde_json::to_string(&serde_json::json!({
+        "provider": SCOPED_DB_SYNC_TOKEN_PROVIDER,
+        "domain": config.auth.domain.as_str(),
+        "shape_version": SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION,
+        "selected_zones": selected_zones,
+        "selection": {
+            "albums": album_selector_json(&config.filters.selection.albums),
+            "albums_explicit": config.filters.selection.albums_explicit,
+            "smart_folders": smart_folder_selector_json(&config.filters.selection.smart_folders),
+            "smart_folders_explicit": config.filters.selection.smart_folders_explicit,
+            "libraries": library_selector_json(&config.filters.selection.libraries),
+            "unfiled": config.filters.selection.unfiled,
+        },
+        "filters": {
+            "media": {
+                "photos": config.filters.media.photos,
+                "videos": config.filters.media.videos,
+                "live_photos": config.filters.media.live_photos,
+            },
+            "filename_exclude": filename_exclude,
+            "skip_created_before": skip_created_before,
+            "skip_created_after": skip_created_after,
+            "recent": config.filters.recent,
+            "recent_scope": config.filters.recent_scope,
+        },
+        "coverage": coverage,
+        "enum_config_hash": enum_config_hash,
+        "download_config_hash": download_config_hash,
+    }))
+    .context("serialize scoped database token scope")
+}
+
+fn hash_scoped_db_precheck_scope(shape_version: i64, scope_json: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let mut hasher = Sha256::new();
+    hasher.update(shape_version.to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(scope_json.as_bytes());
+    let hash = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in hash {
+        let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+    }
+    hex
+}
 
 /// Classify whether an error from `init_photos_service` or
 /// `resolve_libraries` indicates a stale session / routing state that
@@ -873,6 +1082,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         &config.download.folder_structure_albums,
         &config.download.folder_structure_smart_folders,
     );
+    let db_precheck_scope = DbPrecheckScope::from_config(
+        &config,
+        &library_states,
+        &build_download_config,
+        enum_config_hash.as_ref(),
+    )?;
     sd_notifier.notify_ready();
     let _systemd_watchdog_task = sd_notifier.start_watchdog_heartbeat(shutdown_token.clone());
     // Friendly-mode greeting. Lands above any future bar via
@@ -950,6 +1165,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     .map(|db| db as &dyn state::SyncTokenStore),
                 &library_states,
                 &mut photos_service,
+                &db_precheck_scope,
             )
             .await
         } else {
@@ -1036,7 +1252,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     && cycle_result.db_sync_token_advance_safe
                 {
                     if let Some(db) = state_db.as_deref() {
-                        store_db_sync_token(db as &dyn state::SyncTokenStore, token).await;
+                        store_scoped_db_sync_token(
+                            db as &dyn state::SyncTokenStore,
+                            &db_precheck_scope,
+                            token,
+                        )
+                        .await;
                     }
                 } else {
                     tracing::debug!(
@@ -1515,9 +1736,16 @@ async fn refresh_needed_library_plans(
     }
 }
 
-async fn store_db_sync_token(db: &dyn state::SyncTokenStore, token: &str) {
-    if let Err(e) = db.set_metadata(DB_SYNC_TOKEN_KEY, token).await {
-        tracing::warn!(error = %e, "Failed to store db_sync_token");
+async fn store_scoped_db_sync_token(
+    db: &dyn state::SyncTokenStore,
+    scope: &DbPrecheckScope,
+    token: &str,
+) {
+    if let Err(e) = db
+        .upsert_scoped_db_sync_token(scope.to_state_row(token))
+        .await
+    {
+        tracing::warn!(error = %e, "Failed to store scoped db sync token");
     }
 }
 
@@ -1525,11 +1753,12 @@ async fn store_db_sync_token(db: &dyn state::SyncTokenStore, token: &str) {
 ///
 /// Returns `SkipAll` when a complete pre-check reports no selected-zone changes.
 /// An empty complete page still skips the cycle but keeps the previous
-/// `db_sync_token`, so the next watch wakeup rechecks from the same point.
+/// scoped DB token, so the next watch wakeup rechecks from the same point.
 async fn check_changes_database(
     state_db: Option<&dyn state::SyncTokenStore>,
     library_states: &[LibraryState],
     photos_service: &mut crate::icloud::photos::PhotosService,
+    scope: &DbPrecheckScope,
 ) -> WatchPrecheck {
     let Some(db) = state_db else {
         return WatchPrecheck::proceed_all();
@@ -1537,35 +1766,80 @@ async fn check_changes_database(
     if library_states.is_empty() {
         return WatchPrecheck::SkipAll;
     }
-    for lib_state in library_states {
-        let has_token = match db.get_metadata(&lib_state.sync_token_key).await {
-            Ok(token) => token.is_some_and(|t| !t.is_empty()),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    zone = %lib_state.zone_name,
-                    metadata_key = %lib_state.sync_token_key,
-                    "Failed to read zone sync token; proceeding with sync"
-                );
-                return WatchPrecheck::proceed_all();
-            }
-        };
-        if !has_token {
-            return WatchPrecheck::proceed_all();
+    let scoped_token = match db
+        .get_scoped_db_sync_token(
+            &scope.provider,
+            &scope.account,
+            scope.shape_version,
+            &scope.scope_hash,
+        )
+        .await
+    {
+        Ok(Some(token)) if !token.token.trim().is_empty() => token,
+        Ok(_) => {
+            return match photos_service.changes_database(None).await {
+                Ok(db_resp) if !db_resp.more_coming => WatchPrecheck::Proceed {
+                    changed_zones: None,
+                    db_sync_token_after_success: Some(db_resp.sync_token),
+                },
+                Ok(db_resp) => {
+                    tracing::debug!(
+                        zones = db_resp.zones.len(),
+                        "changes/database bootstrap had more pages; scoped db sync token not stored"
+                    );
+                    WatchPrecheck::proceed_all()
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "changes/database bootstrap failed; proceeding with sync"
+                    );
+                    WatchPrecheck::proceed_all()
+                }
+            };
         }
-    }
-    let db_token = match db.get_metadata(DB_SYNC_TOKEN_KEY).await {
-        Ok(token) => token.filter(|t| !t.is_empty()),
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                metadata_key = DB_SYNC_TOKEN_KEY,
-                "Failed to read changes/database sync token; proceeding with sync"
+                scope_hash = %scope.scope_hash,
+                "Failed to read scoped changes/database sync token; proceeding with sync"
             );
             return WatchPrecheck::proceed_all();
         }
     };
-    match photos_service.changes_database(db_token.as_deref()).await {
+    if serde_json::from_str::<serde_json::Value>(&scoped_token.scope_json).is_err() {
+        tracing::debug!(
+            scope_hash = %scope.scope_hash,
+            "Stored scoped changes/database scope JSON is invalid; proceeding with sync"
+        );
+        return WatchPrecheck::proceed_all();
+    }
+    if scoped_token.scope_json != scope.scope_json {
+        tracing::debug!(
+            scope_hash = %scope.scope_hash,
+            "Stored scoped changes/database scope JSON mismatch; proceeding with sync"
+        );
+        return WatchPrecheck::proceed_all();
+    }
+    if serde_json::from_str::<Vec<String>>(&scoped_token.selected_zones_json).is_err() {
+        tracing::debug!(
+            scope_hash = %scope.scope_hash,
+            "Stored scoped changes/database selected-zone JSON is invalid; proceeding with sync"
+        );
+        return WatchPrecheck::proceed_all();
+    }
+    if scoped_token.selected_zones_json != scope.selected_zones_json {
+        tracing::debug!(
+            scope_hash = %scope.scope_hash,
+            "Stored scoped changes/database selected zones mismatch; proceeding with sync"
+        );
+        return WatchPrecheck::proceed_all();
+    }
+
+    match photos_service
+        .changes_database(Some(scoped_token.token.as_str()))
+        .await
+    {
         Ok(db_resp) => {
             let selected_zones: rustc_hash::FxHashSet<&str> = library_states
                 .iter()
@@ -1595,10 +1869,10 @@ async fn check_changes_database(
                     };
                 }
                 if has_any_changed_zone {
-                    store_db_sync_token(db, &db_resp.sync_token).await;
+                    store_scoped_db_sync_token(db, scope, &db_resp.sync_token).await;
                 } else {
                     tracing::debug!(
-                        "changes/database returned an empty complete page; skipping without advancing db_sync_token"
+                        "changes/database returned an empty complete page; skipping without advancing scoped db sync token"
                     );
                 }
                 tracing::info!(
@@ -3477,6 +3751,8 @@ mod tests {
         Arc::new(state::SqliteStateDb::open_in_memory().expect("open in-memory state DB"))
     }
 
+    const SCOPED_DB_SYNC_TOKEN_FAILURE_KEY: &str = "scoped_db_sync_token";
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum MetadataSetFailure {
         Exact(&'static str),
@@ -3819,6 +4095,40 @@ mod tests {
             } else {
                 self.inner.delete_metadata_by_prefix(prefix).await
             }
+        }
+
+        async fn get_scoped_db_sync_token(
+            &self,
+            provider: &str,
+            account: &str,
+            shape_version: i64,
+            scope_hash: &str,
+        ) -> Result<Option<state::ScopedDbSyncToken>, state::error::StateError> {
+            if self
+                .get_failure
+                .is_some_and(|failure| failure.matches(SCOPED_DB_SYNC_TOKEN_FAILURE_KEY))
+            {
+                Err(state::error::StateError::LockPoisoned(self.message.into()))
+            } else {
+                self.inner
+                    .get_scoped_db_sync_token(provider, account, shape_version, scope_hash)
+                    .await
+            }
+        }
+
+        async fn upsert_scoped_db_sync_token(
+            &self,
+            token: state::ScopedDbSyncToken,
+        ) -> Result<(), state::error::StateError> {
+            if self.failure.matches(SCOPED_DB_SYNC_TOKEN_FAILURE_KEY) {
+                Err(state::error::StateError::LockPoisoned(self.message.into()))
+            } else {
+                self.inner.upsert_scoped_db_sync_token(token).await
+            }
+        }
+
+        async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, state::error::StateError> {
+            self.inner.delete_scoped_db_sync_tokens().await
         }
 
         async fn begin_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
@@ -4283,15 +4593,60 @@ mod tests {
         assert_eq!(db_token, expected_db);
     }
 
+    fn test_precheck_scope_for_states(states: &[LibraryState], scope_id: &str) -> DbPrecheckScope {
+        let mut zones: Vec<String> = states.iter().map(|s| s.zone_name.clone()).collect();
+        zones.sort();
+        let selected_zones_json = serde_json::to_string(&zones).expect("serialize zones");
+        let scope_json = serde_json::to_string(&serde_json::json!({
+            "test_scope": scope_id,
+            "selected_zones": zones,
+        }))
+        .expect("serialize scope");
+        DbPrecheckScope {
+            provider: SCOPED_DB_SYNC_TOKEN_PROVIDER.to_string(),
+            account: "test@example.com".to_string(),
+            shape_version: SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION,
+            scope_hash: scope_id.to_string(),
+            selected_zones_json,
+            scope_json,
+        }
+    }
+
+    async fn seed_scoped_db_token(
+        db: &dyn state::SyncTokenStore,
+        scope: &DbPrecheckScope,
+        token: &str,
+    ) {
+        db.upsert_scoped_db_sync_token(scope.to_state_row(token))
+            .await
+            .expect("seed scoped db token");
+    }
+
+    async fn read_scoped_db_token(
+        db: &dyn state::SyncTokenStore,
+        scope: &DbPrecheckScope,
+    ) -> Option<state::ScopedDbSyncToken> {
+        db.get_scoped_db_sync_token(
+            &scope.provider,
+            &scope.account,
+            scope.shape_version,
+            &scope.scope_hash,
+        )
+        .await
+        .expect("read scoped db token")
+    }
+
     async fn check_single_library_changes_database(
         db: Option<&dyn download::DownloadStore>,
         lib_state: &LibraryState,
         svc: &mut crate::icloud::photos::PhotosService,
+        scope: &DbPrecheckScope,
     ) -> WatchPrecheck {
         check_changes_database(
             db.map(|db| db as &dyn state::SyncTokenStore),
             std::slice::from_ref(lib_state),
             svc,
+            scope,
         )
         .await
     }
@@ -4314,17 +4669,13 @@ mod tests {
         );
 
         let db: Arc<dyn download::DownloadStore> = make_state_db();
-        // Pre-populate a stored sync token so the function actually
-        // makes the changes/database HTTP call (the `has_token` early
-        // return otherwise short-circuits).
-        db.set_metadata("sync_token:PrimarySync", "zone-tok-1")
-            .await
-            .expect("set token");
-
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope = test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-more");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
 
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
 
         assert!(
             matches!(
@@ -4336,21 +4687,18 @@ mod tests {
             ),
             "more_coming=true must not skip the cycle (more pages pending)"
         );
-        assert!(
-            db.get_metadata(DB_SYNC_TOKEN_KEY)
-                .await
-                .expect("read db_sync_token")
-                .is_none(),
-            "more_coming=true must defer db_sync_token advancement until the sync cycle succeeds"
-        );
+        let stored = read_scoped_db_token(db.as_ref(), &scope)
+            .await
+            .expect("scoped token should remain present");
+        assert_eq!(stored.token, "db-tok-prev");
     }
 
     /// Empty zones + `more_coming=false` still skip this watch cycle, but
-    /// must not advance `db_sync_token`.
+    /// must not advance the scoped DB token.
     /// A suspicious empty page should self-heal on the next wakeup by
     /// rechecking from the last persisted token.
     #[tokio::test]
-    async fn check_changes_database_empty_zones_skip_without_advancing_db_sync_token() {
+    async fn check_changes_database_empty_zones_skip_without_advancing_scoped_db_token() {
         use serde_json::json;
         let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
             "syncToken": "db-tok-3",
@@ -4363,29 +4711,23 @@ mod tests {
         );
 
         let db: Arc<dyn download::DownloadStore> = make_state_db();
-        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-            .await
-            .expect("set token");
-        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
-            .await
-            .expect("seed previous db token");
-
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope = test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-empty");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
 
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
 
         assert_eq!(
             precheck,
             WatchPrecheck::SkipAll,
             "empty zones + more_coming=false must skip the cycle"
         );
-        let stored = db
-            .get_metadata(DB_SYNC_TOKEN_KEY)
+        let stored = read_scoped_db_token(db.as_ref(), &scope)
             .await
-            .expect("read db_sync_token")
-            .expect("token should still be present");
-        assert_eq!(stored, "db-tok-prev");
+            .expect("scoped token should still be present");
+        assert_eq!(stored.token, "db-tok-prev");
     }
 
     /// A non-empty zones list MUST NOT skip — even
@@ -4408,22 +4750,19 @@ mod tests {
         );
 
         let db: Arc<dyn download::DownloadStore> = make_state_db();
-        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-            .await
-            .expect("set token");
-
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope =
+            test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-changed");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
 
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
         assert_proceed_changed(&precheck, "PrimarySync", "db-tok-4");
-        assert!(
-            db.get_metadata(DB_SYNC_TOKEN_KEY)
-                .await
-                .expect("read db_sync_token")
-                .is_none(),
-            "changed-zone precheck must not advance db_sync_token before the sync succeeds"
-        );
+        let stored = read_scoped_db_token(db.as_ref(), &scope)
+            .await
+            .expect("scoped token should remain present");
+        assert_eq!(stored.token, "db-tok-prev");
     }
 
     #[tokio::test]
@@ -4442,22 +4781,15 @@ mod tests {
         );
 
         let db: Arc<dyn download::DownloadStore> = make_state_db();
-        db.set_metadata("sync_token:PrimarySync", "primary-tok-prev")
-            .await
-            .expect("set primary token");
-        db.set_metadata("sync_token:SharedSync-ABCD", "shared-tok-prev")
-            .await
-            .expect("set shared token");
-        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
-            .await
-            .expect("set db token");
 
         let states = vec![
             make_library_state("PrimarySync", "sync_token:PrimarySync"),
             make_library_state("SharedSync-ABCD", "sync_token:SharedSync-ABCD"),
         ];
+        let scope = test_precheck_scope_for_states(&states, "scope-shared");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
 
-        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc).await;
+        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc, &scope).await;
         assert_proceed_changed(&precheck, "SharedSync-ABCD", "db-tok-shared");
     }
 
@@ -4477,112 +4809,166 @@ mod tests {
         );
 
         let db: Arc<dyn download::DownloadStore> = make_state_db();
-        db.set_metadata("sync_token:PrimarySync", "primary-tok-prev")
-            .await
-            .expect("set primary token");
-        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
-            .await
-            .expect("set db token");
-
         let states = vec![make_library_state("PrimarySync", "sync_token:PrimarySync")];
+        let scope = test_precheck_scope_for_states(&states, "scope-unselected");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
 
-        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc).await;
+        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc, &scope).await;
         assert_eq!(precheck, WatchPrecheck::SkipAll);
-        let stored = db
-            .get_metadata(DB_SYNC_TOKEN_KEY)
+        let stored = read_scoped_db_token(db.as_ref(), &scope)
             .await
-            .expect("read db_sync_token")
             .expect("token persisted");
-        assert_eq!(stored, "db-tok-unselected");
+        assert_eq!(stored.token, "db-tok-unselected");
     }
 
-    /// No stored sync token at all must return false (don't
-    /// skip) without making the HTTP call. Pinning this prevents a future
-    /// refactor that flipped the early return from silently consuming an
-    /// Apple call slot on bootstrap.
+    /// No stored scoped DB token must not skip, but can capture a
+    /// changes/database token before the cycle. The token is only persisted
+    /// after the cycle completes cleanly, so concurrent changes remain safe.
     #[tokio::test]
-    async fn check_changes_database_no_stored_token_does_not_skip() {
-        let session = crate::test_helpers::MockPhotosSession::new();
+    async fn check_changes_database_no_stored_token_bootstraps_without_skipping() {
+        use serde_json::json;
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-token-bootstrap",
+            "moreComing": false,
+            "zones": [
+                {
+                    "zoneID": {"zoneName": "PrimarySync"},
+                    "syncToken": "zone-token-bootstrap"
+                }
+            ]
+        }));
         let mut svc = crate::icloud::photos::PhotosService::for_testing(
             Box::new(session),
             std::collections::HashMap::new(),
         );
 
-        // Empty DB — no `sync_token:PrimarySync` set.
+        // Empty DB - no scoped database pre-check row set.
         let db: Arc<dyn download::DownloadStore> = make_state_db();
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope =
+            test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-missing");
 
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
         assert!(
             matches!(
                 precheck,
                 WatchPrecheck::Proceed {
                     changed_zones: None,
-                    db_sync_token_after_success: None
-                }
+                    db_sync_token_after_success: Some(ref token)
+                } if token == "db-token-bootstrap"
             ),
-            "no stored token must continue without a changes/database call"
+            "bootstrap token must be deferred until the cycle succeeds"
         );
     }
 
     #[tokio::test]
-    async fn check_changes_database_zone_token_read_failure_proceeds_without_precheck() {
+    async fn check_changes_database_scoped_token_read_failure_proceeds_without_precheck() {
         let session = crate::test_helpers::MockPhotosSession::new();
         let mut svc = crate::icloud::photos::PhotosService::for_testing(
             Box::new(session),
             std::collections::HashMap::new(),
         );
         let inner = make_state_db();
-        inner
-            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-            .await
-            .expect("seed token");
         let db: Arc<dyn download::DownloadStore> = Arc::new(
-            FailingMetadataSetDb::without_set_failure(inner, "simulated zone-token read failure")
-                .with_get_failure(MetadataSetFailure::Exact("sync_token:PrimarySync")),
+            FailingMetadataSetDb::without_set_failure(inner, "simulated scoped-token read failure")
+                .with_get_failure(MetadataSetFailure::Exact(SCOPED_DB_SYNC_TOKEN_FAILURE_KEY)),
         );
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope =
+            test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-read-failure");
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
 
         assert_eq!(
             precheck,
             WatchPrecheck::proceed_all(),
-            "metadata read failure should fall back to the safe full cycle path"
+            "scoped token read failure should fall back to the safe full cycle path"
         );
     }
 
     #[tokio::test]
-    async fn check_changes_database_db_token_read_failure_proceeds_without_precheck() {
+    async fn check_changes_database_legacy_db_token_without_scoped_row_does_not_skip() {
         let session = crate::test_helpers::MockPhotosSession::new();
         let mut svc = crate::icloud::photos::PhotosService::for_testing(
             Box::new(session),
             std::collections::HashMap::new(),
         );
-        let inner = make_state_db();
-        inner
-            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
-            .expect("seed zone token");
-        inner
-            .set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
+            .expect("seed legacy zone token");
+        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
             .await
-            .expect("seed db token");
-        let db: Arc<dyn download::DownloadStore> = Arc::new(
-            FailingMetadataSetDb::without_set_failure(inner, "simulated db-token read failure")
-                .with_get_failure(MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY)),
-        );
+            .expect("seed legacy db token");
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope = test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-new");
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
 
         assert_eq!(
             precheck,
             WatchPrecheck::proceed_all(),
-            "db token read failure should fall back to the safe full cycle path"
+            "legacy unscoped db tokens are not scoped proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_changes_database_scope_hash_mismatch_does_not_skip() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
+        let states = vec![make_library_state("PrimarySync", "sync_token:PrimarySync")];
+        let narrow_scope = test_precheck_scope_for_states(&states, "recent-500");
+        let broad_scope = test_precheck_scope_for_states(&states, "recent-1000");
+        seed_scoped_db_token(db.as_ref(), &narrow_scope, "db-tok-narrow").await;
+
+        let precheck =
+            check_changes_database(Some(db.as_ref()), &states, &mut svc, &broad_scope).await;
+
+        assert_eq!(
+            precheck,
+            WatchPrecheck::proceed_all(),
+            "Phase 1 must require exact scope hash match"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_changes_database_corrupt_stored_scope_json_does_not_skip() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
+        let states = vec![make_library_state("PrimarySync", "sync_token:PrimarySync")];
+        let scope = test_precheck_scope_for_states(&states, "corrupt-scope");
+        db.upsert_scoped_db_sync_token(state::ScopedDbSyncToken {
+            provider: scope.provider.clone(),
+            account: scope.account.clone(),
+            shape_version: scope.shape_version,
+            scope_hash: scope.scope_hash.clone(),
+            selected_zones_json: scope.selected_zones_json.clone(),
+            scope_json: "{not valid json".to_string(),
+            token: "db-tok-corrupt".to_string(),
+        })
+        .await
+        .expect("seed corrupt scoped token row");
+
+        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc, &scope).await;
+
+        assert_eq!(
+            precheck,
+            WatchPrecheck::proceed_all(),
+            "corrupt stored scope JSON must fall back to enumeration"
         );
     }
 
@@ -4675,20 +5061,20 @@ mod tests {
         assert_eq!(failures, 0);
     }
 
-    /// A `set_metadata(DB_SYNC_TOKEN_KEY, ...)` write failure on the
+    /// A scoped-token write failure on the
     /// unselected-zone skip path must not break watch mode.
     #[tokio::test]
     async fn check_changes_database_unselected_zone_token_persist_failure_still_skips() {
         use serde_json::json;
         let inner = make_state_db();
-        inner
-            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-            .await
-            .expect("seed token");
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope =
+            test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-write-fail");
+        seed_scoped_db_token(inner.as_ref(), &scope, "db-tok-prev").await;
         let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
             inner,
-            MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY),
-            "simulated db_sync_token write failure",
+            MetadataSetFailure::Exact(SCOPED_DB_SYNC_TOKEN_FAILURE_KEY),
+            "simulated scoped db sync token write failure",
         ));
 
         let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
@@ -4703,9 +5089,9 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
         assert_eq!(precheck, WatchPrecheck::SkipAll);
     }
 
