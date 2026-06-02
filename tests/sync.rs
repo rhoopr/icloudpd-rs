@@ -1018,14 +1018,14 @@ fn sync_xmp_sidecar_writes_sidecar_file() {
     });
 }
 
-/// [metadata].embed_xmp on a HEIC file: kei routes through the mp4-atom HEIC writer
-/// rather than xmp_toolkit. The resulting HEIC must carry an XMP packet
-/// as a MIME item inside the `meta` box; we detect it by looking for the
-/// `<x:xmpmeta` magic in the file bytes.
+/// [metadata].embed_xmp on a HEIC file: embedded HEIC writes are temporarily
+/// skipped because the previous mp4-atom writer could corrupt Apple HEIC item
+/// graphs. Sync should still succeed and leave the downloaded HEIC usable;
+/// sidecars remain the supported HEIC metadata export path.
 #[cfg(feature = "xmp")]
 #[test]
 #[ignore]
-fn sync_embed_xmp_on_heic_writes_mime_item() {
+fn sync_embed_xmp_on_heic_skips_embedded_write() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
@@ -1066,16 +1066,9 @@ fn sync_embed_xmp_on_heic_writes_mime_item() {
             return;
         }
 
-        let bytes = std::fs::read(heics[0]).expect("read HEIC");
-        // <x:xmpmeta is the opening tag the xmp_toolkit serializer emits.
-        // mp4-atom embeds that packet unchanged inside the HEIC `mime` item.
-        let needle = b"<x:xmpmeta";
-        let found = bytes
-            .windows(needle.len())
-            .any(|w| w.eq_ignore_ascii_case(needle));
         assert!(
-            found,
-            "HEIC `{}` must carry an XMP packet after embed_xmp",
+            std::fs::metadata(heics[0]).expect("stat HEIC").len() > 0,
+            "HEIC `{}` should still be downloaded when embed_xmp is enabled",
             heics[0].display()
         );
     });

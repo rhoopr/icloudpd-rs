@@ -1,22 +1,20 @@
-//! ISO-BMFF atom surgery for inserting XMP into HEIC / HEIF / AVIF files.
+//! ISO-BMFF helpers for reading XMP from HEIC / HEIF / AVIF files.
 //!
-//! Adobe's XMP Toolkit has no HEIF handler, so the HEIC write path edits the
-//! container directly via [`mp4_atom`]. The goal is narrow: add (or replace)
-//! an XMP `mime` item inside the `meta` box without touching the encoded
-//! image bytes in `mdat` — invariant 2.
+//! Adobe's XMP Toolkit has no HEIF handler, so kei reads HEIF item metadata
+//! directly via [`mp4_atom`]. Embedded HEIC writes are temporarily disabled
+//! because the previous mp4-atom-backed writer could lossy-round-trip Apple
+//! item graphs.
 //!
-//! Strategy: append the XMP payload as a new trailing `mdat`, record it in
-//! `iinf` + `iloc` with `construction_method = 0` (file-absolute offsets),
-//! and remap every other `iloc` entry so the existing image data stays
-//! byte-for-byte identical in its new location after `meta` grows.
+//! The old insertion code remains compiled for unit tests so existing parser
+//! fixtures can still seed XMP packets while the replacement writer is spiked.
 
+#[cfg(test)]
 use std::io::Write;
 use std::path::Path;
 
-use mp4_atom::{
-    Any, Atom, Buf, DecodeMaybe, Encode, FourCC, Header, Iinf, Iloc, ItemInfoEntry, ItemLocation,
-    ItemLocationExtent, Mdat, Meta,
-};
+#[cfg(test)]
+use mp4_atom::{Any, Encode, ItemInfoEntry, ItemLocation, ItemLocationExtent, Mdat, Meta};
+use mp4_atom::{Atom, Buf, DecodeMaybe, FourCC, Header, Iinf, Iloc};
 
 /// Typed failures from the HEIC writer. Each variant names the precise mode
 /// so call-site logging and any future fall-back logic can distinguish
@@ -28,6 +26,7 @@ use mp4_atom::{
 /// while kei adds the byte offset / atom kind context.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HeifError {
+    #[cfg(test)]
     #[error("ISO-BMFF decode failed at byte offset {offset}/{total}: {source}")]
     Decode {
         offset: u64,
@@ -36,6 +35,7 @@ pub(crate) enum HeifError {
         source: mp4_atom::Error,
     },
 
+    #[cfg(test)]
     #[error("Unparsable trailing bytes at offset {offset}/{total} (file likely truncated)")]
     UnparsableTail { offset: u64, total: u64 },
 
@@ -46,9 +46,11 @@ pub(crate) enum HeifError {
         source: mp4_atom::Error,
     },
 
+    #[cfg(test)]
     #[error("HEIC has no `meta` box at the top level ({input_len} bytes scanned)")]
     MissingMeta { input_len: usize },
 
+    #[cfg(test)]
     #[error("Failed to re-encode `{kind}` atom: {source}")]
     Encode {
         kind: FourCC,
@@ -359,6 +361,7 @@ fn iinf_entry_count(body: &[u8], version: u8) -> Option<u32> {
 /// Writing to a `Write` (typically `BufWriter<File>`) rather than returning
 /// a `Vec<u8>` eliminates one full-file-sized allocation on the metadata-
 /// embed path — meaningful for large ProRAW HEICs under high concurrency.
+#[cfg(test)]
 #[allow(
     clippy::indexing_slicing,
     reason = "meta_idx comes from .position() over atoms; new_mdat_idx is atoms.len() - 1 \
@@ -549,6 +552,7 @@ pub(crate) fn insert_xmp<W: Write>(
 /// Criteria: an iinf entry flagged as `mime` + `application/rdf+xml`, its
 /// iloc entry references a range that lies entirely within a single trailing
 /// mdat atom, and no other iloc entry references into that atom.
+#[cfg(test)]
 #[allow(
     clippy::indexing_slicing,
     reason = "meta_idx is caller-validated and idx comes from atoms.iter().enumerate() \
@@ -625,6 +629,7 @@ fn locate_stale_kei_mdat(
 /// Byte size of an atom's box header (the length field + 4-byte kind code).
 /// mp4-atom always emits a 32-bit-length header for atoms that fit — large
 /// mdats (>4GB) would use a 16-byte header, but kei isn't going to hit that.
+#[cfg(test)]
 fn header_size_of(_atom: &Any) -> u64 {
     8
 }
@@ -632,6 +637,7 @@ fn header_size_of(_atom: &Any) -> u64 {
 /// Return a vector where entry `i` is the byte offset at which atom `i` will
 /// sit in the re-serialized output (i.e. the running sum of preceding atom
 /// sizes).
+#[cfg(test)]
 fn running_offsets(atoms: &[Any]) -> Vec<u64> {
     let mut offsets = Vec::with_capacity(atoms.len());
     let mut running = 0u64;
@@ -646,6 +652,7 @@ fn running_offsets(atoms: &[Any]) -> Vec<u64> {
 /// offset" to "new file offset", using the per-atom old_start/old_end/new_start
 /// table. An offset that falls within `[old_start, old_end)` is rebased onto
 /// `new_start` with the same intra-atom position.
+#[cfg(test)]
 fn remap_file_offsets(iloc: &mut Iloc, ranges: &[(u64, u64, u64)]) {
     for loc in &mut iloc.item_locations {
         if loc.construction_method != 0 {
@@ -665,6 +672,7 @@ fn remap_file_offsets(iloc: &mut Iloc, ranges: &[(u64, u64, u64)]) {
     }
 }
 
+#[cfg(test)]
 fn remap_point(file_offset: u64, ranges: &[(u64, u64, u64)]) -> Option<u64> {
     for &(old_start, old_end, new_start) in ranges {
         if file_offset >= old_start && file_offset < old_end {
@@ -674,6 +682,7 @@ fn remap_point(file_offset: u64, ranges: &[(u64, u64, u64)]) -> Option<u64> {
     None
 }
 
+#[cfg(test)]
 fn encoded_size(atom: &Any) -> u64 {
     let mut sink = Vec::new();
     if let Err(e) = atom.encode(&mut sink) {
@@ -686,6 +695,7 @@ fn encoded_size(atom: &Any) -> u64 {
     sink.len() as u64
 }
 
+#[cfg(test)]
 fn remove_existing_xmp_items(meta: &mut Meta) -> Vec<u32> {
     let mut removed = Vec::new();
     if let Some(iinf) = meta.get_mut::<Iinf>() {
@@ -703,6 +713,7 @@ fn remove_existing_xmp_items(meta: &mut Meta) -> Vec<u32> {
     removed
 }
 
+#[cfg(test)]
 fn next_free_item_id(meta: &Meta) -> u32 {
     meta.get::<Iinf>()
         .map(|iinf| {
@@ -716,6 +727,7 @@ fn next_free_item_id(meta: &Meta) -> u32 {
         .unwrap_or(1)
 }
 
+#[cfg(test)]
 fn push_iinf_entry(meta: &mut Meta, entry: ItemInfoEntry) {
     match meta.get_mut::<Iinf>() {
         Some(iinf) => iinf.item_infos.push(entry),
@@ -725,6 +737,7 @@ fn push_iinf_entry(meta: &mut Meta, entry: ItemInfoEntry) {
     }
 }
 
+#[cfg(test)]
 fn push_iloc_entry(meta: &mut Meta, loc: ItemLocation) {
     match meta.get_mut::<Iloc>() {
         Some(iloc) => iloc.item_locations.push(loc),
