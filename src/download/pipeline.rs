@@ -731,6 +731,51 @@ impl StreamRuntime {
     }
 }
 
+#[derive(Clone, Default)]
+struct StreamProducerMetrics {
+    assets_seen: Arc<std::sync::atomic::AtomicU64>,
+    enum_errors: Arc<std::sync::atomic::AtomicUsize>,
+    enumeration_complete: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct StreamProducer {
+    handle: tokio::task::JoinHandle<ProducerSkipSummary>,
+    metrics: StreamProducerMetrics,
+}
+
+#[derive(Clone)]
+struct StreamPipelineShared {
+    config: Arc<DownloadConfig>,
+    state_db: Option<Arc<dyn DownloadStore>>,
+    pb: ProgressBar,
+    pipeline_shutdown: CancellationToken,
+}
+
+struct StreamConsumerSettings {
+    retry_config: RetryConfig,
+    metadata_flags: MetadataFlags,
+    concurrency: usize,
+    mode: crate::personality::Mode,
+    bytes_counter: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[derive(Default)]
+struct StreamConsumerResult {
+    downloaded: usize,
+    exif_failures: usize,
+    failed: Vec<DownloadTask>,
+    auth_errors: usize,
+    pending_state_writes: Vec<PendingStateWrite>,
+    bytes_downloaded_total: u64,
+    disk_bytes_total: u64,
+    url_expired_abort: bool,
+    rate_limit_observations: usize,
+    photos_downloaded: usize,
+    videos_downloaded: usize,
+    recap: super::recap::RunRecap,
+    state_write_circuit_error: Option<anyhow::Error>,
+}
+
 pub(super) async fn stream_and_download_from_stream_with_context<S>(
     download_client: &Client,
     combined: S,
@@ -950,32 +995,7 @@ where
         tracing::info!("Backfilling metadata for existing assets (one-time after upgrade)");
     }
 
-    let mut downloaded = 0usize;
-    let mut exif_failures = 0usize;
-    let mut failed: Vec<DownloadTask> = Vec::new();
-    let mut auth_errors = 0usize;
-    let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
-    let mut bytes_downloaded_total: u64 = 0;
-    let mut disk_bytes_total: u64 = 0;
-    let mut url_expired_abort = false;
-    let mut photos_downloaded = 0usize;
-    let mut videos_downloaded = 0usize;
-    let mut recap = super::recap::RunRecap::default();
-
     let (task_tx, task_rx) = mpsc::channel::<DownloadTask>(concurrency * 2);
-
-    let assets_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let assets_seen_producer = Arc::clone(&assets_seen);
-    let enum_errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let enum_errors_producer = Arc::clone(&enum_errors);
-    // Signal whether the producer reached the natural end of the API
-    // stream. Used by the caller to decide whether to clear the
-    // `enum_in_progress:<zone>` marker. `true` only when the producer's
-    // outer `while let Some(...)` loop exited because the stream returned
-    // `None` (stream exhausted) AND no shutdown was triggered. Channel-close
-    // early returns and shutdown breaks both leave it `false`.
-    let enumeration_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let enumeration_complete_producer = Arc::clone(&enumeration_complete);
 
     // Batch-size forecast: snapshot free space at enumeration start and
     // track bytes queued to consumers. Emit a one-time warn at 90% and
@@ -1002,15 +1022,63 @@ where
             ));
         }
     }
+
     let pipeline_shutdown = shutdown_token.child_token();
+    let shared = StreamPipelineShared {
+        config: Arc::clone(config),
+        state_db: state_db.clone(),
+        pb: pb.clone(),
+        pipeline_shutdown: pipeline_shutdown.clone(),
+    };
+    let producer = spawn_stream_download_producer(
+        combined,
+        Arc::clone(&download_ctx),
+        task_tx,
+        initial_free_at_start,
+        shared.clone(),
+    );
+
+    let consumer_result = consume_stream_download_tasks(
+        task_rx,
+        download_client,
+        shared.clone(),
+        StreamConsumerSettings {
+            retry_config,
+            metadata_flags,
+            concurrency,
+            mode,
+            bytes_counter: Arc::clone(&bytes_counter),
+        },
+    )
+    .await;
+
+    finalize_streaming_download(producer, consumer_result, sync_run_id, owns_pb, shared).await
+}
+
+fn spawn_stream_download_producer<S>(
+    combined: S,
+    download_ctx: Arc<DownloadContext>,
+    task_tx: mpsc::Sender<DownloadTask>,
+    initial_free_at_start: Option<u64>,
+    shared: StreamPipelineShared,
+) -> StreamProducer
+where
+    S: futures_util::Stream<Item = anyhow::Result<crate::icloud::photos::PhotoAsset>>
+        + Send
+        + 'static,
+{
+    let metrics = StreamProducerMetrics::default();
+    let producer_config = shared.config;
+    let producer_state_db = shared.state_db;
+    let producer_shutdown = shared.pipeline_shutdown;
+    let producer_pb = shared.pb;
+    let assets_seen_producer = Arc::clone(&metrics.assets_seen);
+    let enum_errors_producer = Arc::clone(&metrics.enum_errors);
+    let enumeration_complete_producer = Arc::clone(&metrics.enumeration_complete);
     let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let producer_config = Arc::clone(config);
-    let producer_state_db = state_db.clone();
-    let producer_shutdown = pipeline_shutdown.clone();
-    let producer_pb = pb.clone();
-    let producer = tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let config = &producer_config;
         let mut task_planner = TaskPlanner::new();
         let mut seen_ids: FxHashSet<Arc<str>> = FxHashSet::default();
@@ -1507,9 +1575,29 @@ where
         skips
     });
 
+    StreamProducer { handle, metrics }
+}
+
+async fn consume_stream_download_tasks(
+    task_rx: mpsc::Receiver<DownloadTask>,
+    download_client: Client,
+    shared: StreamPipelineShared,
+    settings: StreamConsumerSettings,
+) -> StreamConsumerResult {
+    let StreamConsumerSettings {
+        retry_config,
+        metadata_flags,
+        concurrency,
+        mode,
+        bytes_counter,
+    } = settings;
+    let config = &shared.config;
+    let pb = &shared.pb;
+    let pipeline_shutdown = shared.pipeline_shutdown;
+    let state_db = shared.state_db;
     let temp_suffix: Arc<str> = Arc::clone(&config.temp_suffix);
-    let rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let bandwidth_limiter = config.bandwidth_limiter.clone();
+    let rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
             let client = download_client.clone();
@@ -1544,6 +1632,17 @@ where
     // the producer's own cancellation (which closes task_tx, naturally
     // ending this stream). The 30s watchdog in shutdown.rs is the backstop
     // if a hung download blocks the drain.
+    let mut downloaded = 0usize;
+    let mut exif_failures = 0usize;
+    let mut failed: Vec<DownloadTask> = Vec::new();
+    let mut auth_errors = 0usize;
+    let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
+    let mut bytes_downloaded_total: u64 = 0;
+    let mut disk_bytes_total: u64 = 0;
+    let mut url_expired_abort = false;
+    let mut photos_downloaded = 0usize;
+    let mut videos_downloaded = 0usize;
+    let mut recap = super::recap::RunRecap::default();
     let mut drain_logged = false;
     let mut state_write_circuit_error: Option<anyhow::Error> = None;
     while let Some((task, result)) = download_stream.next().await {
@@ -1635,7 +1734,7 @@ where
             }
             Err(e) => {
                 if is_interrupted_download(&e) {
-                    log_interrupted_download(&pb, &task, &e);
+                    log_interrupted_download(pb, &task, &e);
                     continue;
                 } else if let Some(download_err) = e.downcast_ref::<DownloadError>() {
                     if download_err.is_session_expired() {
@@ -1695,7 +1794,37 @@ where
         }
     }
 
-    let (producer_panicked, producer_skips) = match producer.await {
+    StreamConsumerResult {
+        downloaded,
+        exif_failures,
+        failed,
+        auth_errors,
+        pending_state_writes,
+        bytes_downloaded_total,
+        disk_bytes_total,
+        url_expired_abort,
+        rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
+        photos_downloaded,
+        videos_downloaded,
+        recap,
+        state_write_circuit_error,
+    }
+}
+
+async fn finalize_streaming_download(
+    producer: StreamProducer,
+    mut consumer: StreamConsumerResult,
+    sync_run_id: Option<i64>,
+    owns_pb: bool,
+    shared: StreamPipelineShared,
+) -> Result<StreamingResult> {
+    let StreamProducer { handle, metrics } = producer;
+    let config = shared.config;
+    let state_db = shared.state_db;
+    let pb = shared.pb;
+    let pipeline_shutdown = shared.pipeline_shutdown;
+
+    let (producer_panicked, producer_skips) = match handle.await {
         Ok(skips) => (false, skips),
         Err(e) if e.is_panic() => {
             tracing::error!(error = ?e, "Asset producer task panicked");
@@ -1707,7 +1836,9 @@ where
         }
     };
 
-    let assets_seen_count = assets_seen.load(std::sync::atomic::Ordering::Relaxed);
+    let assets_seen_count = metrics
+        .assets_seen
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // Only finish the bar when we created it ourselves; if the caller passed
     // a shared bar (per-pass loop), they'll finish it after the last pass.
@@ -1719,16 +1850,18 @@ where
     if let (Some(db), Some(run_id)) = (&state_db, sync_run_id) {
         let stats = SyncRunStats {
             assets_seen: assets_seen_count,
-            assets_downloaded: downloaded as u64,
-            assets_failed: failed.len() as u64,
+            assets_downloaded: consumer.downloaded as u64,
+            assets_failed: consumer.failed.len() as u64,
             enumeration_errors: u64::try_from(
-                enum_errors.load(std::sync::atomic::Ordering::Relaxed),
+                metrics
+                    .enum_errors
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )
             .unwrap_or(u64::MAX),
             interrupted: pipeline_shutdown.is_cancelled()
-                || auth_errors >= AUTH_ERROR_THRESHOLD
+                || consumer.auth_errors >= AUTH_ERROR_THRESHOLD
                 || producer_panicked
-                || url_expired_abort,
+                || consumer.url_expired_abort,
             ..Default::default()
         };
         if let Err(e) = db.complete_sync_run(run_id, &stats).await {
@@ -1738,8 +1871,8 @@ where
             tracing::debug!(
                 run_id,
                 assets_seen = assets_seen_count,
-                downloaded,
-                failed = failed.len(),
+                downloaded = consumer.downloaded,
+                failed = consumer.failed.len(),
                 "Completed sync run"
             );
         }
@@ -1751,34 +1884,38 @@ where
     // next sync re-downloads them and the pending-retry safety net becomes
     // a no-op on panic paths.
     let final_state_flush = if let Some(db) = &state_db {
-        if state_write_circuit_error.is_some() {
+        if consumer.state_write_circuit_error.is_some() {
             StateWriteFlush {
-                attempted: pending_state_writes.len(),
-                failures: pending_state_writes.len(),
+                attempted: consumer.pending_state_writes.len(),
+                failures: consumer.pending_state_writes.len(),
             }
         } else {
-            flush_pending_state_writes_retaining_failures(db.as_ref(), &mut pending_state_writes)
-                .await
+            flush_pending_state_writes_retaining_failures(
+                db.as_ref(),
+                &mut consumer.pending_state_writes,
+            )
+            .await
         }
     } else {
         StateWriteFlush::default()
     };
     let state_write_failures = final_state_flush.failures + usize::from(complete_sync_failed);
-    if state_write_circuit_error.is_none()
+    if consumer.state_write_circuit_error.is_none()
         && state_write_circuit_breaker_tripped(&final_state_flush)
     {
-        state_write_circuit_error = Some(state_db_unwritable_error(final_state_flush.attempted));
+        consumer.state_write_circuit_error =
+            Some(state_db_unwritable_error(final_state_flush.attempted));
     }
 
     // Drain metadata-rewrite markers set earlier in this cycle (or left over
     // from a previous one). This re-applies EXIF/XMP on the existing files
     // without re-downloading bytes; the alternative was to leave markers
     // accumulating in the DB forever.
-    if state_write_circuit_error.is_none() {
+    if consumer.state_write_circuit_error.is_none() {
         if let Some(db) = &state_db {
             let metadata_flags = MetadataFlags::from(config.as_ref());
             if metadata_flags.has_any_write() {
-                exif_failures += metadata_rewrite::run_pending(
+                consumer.exif_failures += metadata_rewrite::run_pending(
                     db.as_ref(),
                     metadata_flags,
                     Arc::clone(&config.temp_suffix),
@@ -1789,7 +1926,7 @@ where
         }
     }
 
-    if let Some(err) = state_write_circuit_error {
+    if let Some(err) = consumer.state_write_circuit_error {
         return Err(err);
     }
 
@@ -1805,26 +1942,30 @@ where
     // path above was suppressed. `producer_panicked` is checked above,
     // but if a future change ever returns Ok despite a panic, the flag
     // here protects the `enum_in_progress` marker.
-    let enumeration_complete_flag =
-        !producer_panicked && enumeration_complete.load(std::sync::atomic::Ordering::Relaxed);
+    let enumeration_complete_flag = !producer_panicked
+        && metrics
+            .enumeration_complete
+            .load(std::sync::atomic::Ordering::Relaxed);
 
     Ok(StreamingResult {
-        downloaded,
-        exif_failures,
-        failed,
-        auth_errors,
+        downloaded: consumer.downloaded,
+        exif_failures: consumer.exif_failures,
+        failed: consumer.failed,
+        auth_errors: consumer.auth_errors,
         state_write_failures,
-        enumeration_errors: enum_errors.load(std::sync::atomic::Ordering::Relaxed),
+        enumeration_errors: metrics
+            .enum_errors
+            .load(std::sync::atomic::Ordering::Relaxed),
         assets_seen: assets_seen_count,
         skip_summary: producer_skips,
-        bytes_downloaded: bytes_downloaded_total,
-        disk_bytes_written: disk_bytes_total,
-        rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
+        bytes_downloaded: consumer.bytes_downloaded_total,
+        disk_bytes_written: consumer.disk_bytes_total,
+        rate_limit_observations: consumer.rate_limit_observations,
         enumeration_complete: enumeration_complete_flag,
-        photos_downloaded,
-        videos_downloaded,
-        recap,
-        url_expired_abort,
+        photos_downloaded: consumer.photos_downloaded,
+        videos_downloaded: consumer.videos_downloaded,
+        recap: consumer.recap,
+        url_expired_abort: consumer.url_expired_abort,
     })
 }
 
