@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 
-use crate::personality::{active_bar, bar_render, pace, sparkline, theme, Mode};
+use crate::personality::{active_bar, progress_card, Mode};
 
 /// Progress bar plus shared byte counter for multi-pass download loops.
 #[derive(Debug)]
@@ -64,25 +64,22 @@ pub(crate) fn single(
     // ProgressBar; the registration is purely about coordination.
     let pb = active_bar::register(ProgressBar::new(total));
     let cols = console::Term::stdout().size_checked().map(|(_, c)| c);
-    let tier = theme::WidthTier::from_cols(cols);
     // Default to 80 cols when detection fails (e.g. piped stdout, but we
     // already gated those paths above to ProgressBar::hidden so this is
     // conservative). Cap at 200 so the rule line doesn't grow unbounded.
     let cols_for_template = cols.unwrap_or(80).min(200);
-    // iCloud is the only backend today; when Immich/Nextcloud land, plumb
-    // the source through `download::Config` and pass it here.
-    let bar_template =
-        theme::download_bar_template(mode, tier, cols_for_template, total, theme::Source::Icloud);
-    let chars = theme::progress_chars(mode);
+    let bar_template = progress_card::template(mode, cols_for_template, total);
+    let chars = progress_card::progress_chars(mode);
     if let Ok(mut style) = ProgressStyle::with_template(&bar_template.template) {
         style = style.progress_chars(chars);
         // Friendly mode registers custom template keys for the animated bar,
         // pulsing rules, sparkline, and smart ETA. Off mode skips them since
         // its template doesn't reference any of these names.
         if mode.is_friendly() {
-            let bar_width = theme::friendly_bar_width(cols_for_template) as usize;
-            let sparkline_cells = theme::friendly_sparkline_width(cols_for_template) as usize;
-            let sparkline = Arc::new(Mutex::new(sparkline::SparklineState::new(sparkline_cells)));
+            let bar_width = bar_template.bar_width;
+            let sparkline = Arc::new(Mutex::new(progress_card::SparklineState::new(
+                bar_template.sparkline_width,
+            )));
 
             // Animated bar: a `BarSmoother` lerps the displayed fraction
             // toward the true fraction across redraws so the bar slides
@@ -90,7 +87,7 @@ pub(crate) fn single(
             // cells per file. The leading-edge cell encodes the smoothed
             // fractional position via PARTIAL_HEIGHTS - no in-place cycling
             // that would compete with the bar's actual motion.
-            let smoother = Arc::new(Mutex::new(bar_render::BarSmoother::new()));
+            let smoother = Arc::new(Mutex::new(progress_card::BarSmoother::new()));
             let smoother_for_key = Arc::clone(&smoother);
             style = style.with_key(
                 "bar_animated",
@@ -102,11 +99,7 @@ pub(crate) fn single(
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         sm.tick(true_frac)
                     };
-                    let _ = write!(
-                        w,
-                        "{}",
-                        bar_render::animated_bar_string(displayed, bar_width),
-                    );
+                    let _ = write!(w, "{}", progress_card::render_bar(displayed, bar_width),);
                 },
             );
 
@@ -119,7 +112,7 @@ pub(crate) fn single(
                 "top_rule",
                 move |state: &ProgressState, w: &mut dyn std::fmt::Write| {
                     let frac = f64::from(state.fraction());
-                    let s = bar_render::bar_fill_style(frac);
+                    let s = progress_card::fill_style(frac);
                     let _ = write!(w, "{}", s.apply_to(&top_rule_text));
                 },
             );
@@ -128,7 +121,7 @@ pub(crate) fn single(
                 "bottom_rule",
                 move |state: &ProgressState, w: &mut dyn std::fmt::Write| {
                     let frac = f64::from(state.fraction());
-                    let s = bar_render::bar_fill_style(frac);
+                    let s = progress_card::fill_style(frac);
                     let _ = write!(w, "{}", s.apply_to(&bottom_rule_text));
                 },
             );
@@ -157,7 +150,7 @@ pub(crate) fn single(
                         // MB/s, GB/s). Fixed-width via format_bandwidth so the
                         // sparkline / counts / ETA to its right stay aligned.
                         if rate > 0.0 {
-                            let bandwidth = bar_render::format_bandwidth(rate);
+                            let bandwidth = progress_card::format_bandwidth(rate);
                             let _ = write!(w, "{bandwidth} {chart}");
                         } else {
                             let _ = write!(w, "{:<10} {chart}", "  --   B/s");
@@ -177,7 +170,7 @@ pub(crate) fn single(
             // calculating..." escalation across redraws. Shared state via
             // Arc<Mutex<>> because indicatif::with_key requires Send+Sync;
             // contention is nil (single-bar, single draw thread, ~10Hz).
-            let phrasing = Arc::new(Mutex::new(pace::EtaPhrasing::new()));
+            let phrasing = Arc::new(Mutex::new(progress_card::EtaPhrasing::new()));
             let phrasing_for_key = Arc::clone(&phrasing);
             style = style.with_key(
                 "smart_eta",
@@ -204,7 +197,7 @@ pub(crate) fn single(
             // rotation at the 10Hz steady-tick cadence) - slow enough to read
             // as "loading" rather than "frantic". The trailing space is
             // indicatif's "finished" frame.
-            style = style.tick_chars(theme::FRIENDLY_TICK_CHARS);
+            style = style.tick_chars(progress_card::FRIENDLY_TICK_CHARS);
         }
         pb.set_style(style);
     }

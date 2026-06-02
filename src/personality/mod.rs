@@ -11,14 +11,10 @@
 
 pub mod active_bar;
 pub mod album_divider;
-pub mod bar_render;
-pub mod format;
 pub mod narration;
-pub mod pace;
 pub(crate) mod progress;
-pub mod sparkline;
+pub(crate) mod progress_card;
 pub mod summary;
-pub mod theme;
 pub mod tracing;
 pub mod tty_echo;
 

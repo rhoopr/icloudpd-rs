@@ -95,8 +95,8 @@ pub fn downloaded_phase_to_stderr(
     if !mode.is_friendly() || downloaded == 0 {
         return;
     }
-    let before = crate::personality::format::format_bytes(library_before_bytes);
-    let after = crate::personality::format::format_bytes(library_after_bytes);
+    let before = crate::personality::summary::format_bytes(library_before_bytes);
+    let after = crate::personality::summary::format_bytes(library_after_bytes);
     let plural = if downloaded == 1 { "" } else { "s" };
     line_to_stderr(
         mode,
