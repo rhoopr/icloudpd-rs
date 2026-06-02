@@ -98,6 +98,12 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<bool, StateError>;
 
     async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError>;
+    /// Persist the result of a landed local file.
+    ///
+    /// `mark_downloaded` and `mark_soft_deleted` may target the same
+    /// `(library, id, version_size)` row during incremental sync. Keep this
+    /// method limited to download-result columns so provider tombstones
+    /// (`is_deleted`, `deleted_at`) survive regardless of writer ordering.
     async fn mark_downloaded(
         &self,
         library: &str,
@@ -142,6 +148,12 @@ pub trait DownloadStateStore: Send + Sync {
         library: &str,
         asset_ids: &[&str],
     ) -> Result<(), StateError>;
+    /// Persist a provider tombstone without changing local download state.
+    ///
+    /// A row can legitimately be both `status = 'downloaded'` and
+    /// `is_deleted = 1`: the local file landed, and the provider later reported
+    /// the source asset deleted. Do not clear download status, local paths,
+    /// checksums, or error state here.
     async fn mark_soft_deleted(
         &self,
         library: &str,
@@ -3115,6 +3127,65 @@ mod tests {
 
     fn test_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[derive(Debug)]
+    struct AssetWriterContractRow {
+        status: String,
+        downloaded_at: Option<i64>,
+        local_path: Option<String>,
+        local_checksum: Option<String>,
+        download_checksum: Option<String>,
+        last_error: Option<String>,
+        is_deleted: bool,
+        deleted_at: Option<i64>,
+    }
+
+    fn read_asset_writer_contract_row(
+        db: &SqliteStateDb,
+        asset_id: &str,
+    ) -> AssetWriterContractRow {
+        let conn = db.acquire_lock("read_asset_writer_contract_row").unwrap();
+        conn.query_row(
+            "SELECT status, downloaded_at, local_path, local_checksum, download_checksum, \
+             last_error, is_deleted, deleted_at FROM assets \
+             WHERE library = 'PrimarySync' AND id = ?1 AND version_size = 'original'",
+            [asset_id],
+            |row| {
+                let is_deleted: i64 = row.get(6)?;
+                Ok(AssetWriterContractRow {
+                    status: row.get(0)?,
+                    downloaded_at: row.get(1)?,
+                    local_path: row.get(2)?,
+                    local_checksum: row.get(3)?,
+                    download_checksum: row.get(4)?,
+                    last_error: row.get(5)?,
+                    is_deleted: is_deleted != 0,
+                    deleted_at: row.get(7)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_downloaded_tombstone_row(
+        db: &SqliteStateDb,
+        asset_id: &str,
+        path: &Path,
+        deleted_at: DateTime<Utc>,
+    ) {
+        let row = read_asset_writer_contract_row(db, asset_id);
+        assert_eq!(row.status, "downloaded");
+        assert!(
+            row.downloaded_at.is_some(),
+            "download writer state must preserve downloaded_at"
+        );
+        assert_eq!(row.local_path, Some(path.to_string_lossy().into_owned()));
+        assert_eq!(row.local_checksum.as_deref(), Some("local_hash"));
+        assert_eq!(row.download_checksum.as_deref(), Some("download_hash"));
+        assert_eq!(row.last_error, None);
+        assert!(row.is_deleted);
+        assert_eq!(row.deleted_at, Some(deleted_at.timestamp()));
     }
 
     #[tokio::test]
@@ -6599,6 +6670,68 @@ mod tests {
             );
             assert_eq!(rec.metadata.deleted_at, Some(when));
         }
+    }
+
+    #[tokio::test]
+    async fn mark_soft_deleted_then_mark_downloaded_preserves_tombstone() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("DEL_DL_1")
+            .checksum("remote_hash")
+            .build();
+        db.upsert_seen(&rec).await.unwrap();
+        db.mark_failed("PrimarySync", "DEL_DL_1", "original", "prior failure")
+            .await
+            .unwrap();
+        let deleted_at = Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+        db.mark_soft_deleted("PrimarySync", "DEL_DL_1", Some(deleted_at))
+            .await
+            .unwrap();
+
+        let dir = test_dir();
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(&path, b"x").unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "DEL_DL_1",
+            "original",
+            &path,
+            "local_hash",
+            Some("download_hash"),
+        )
+        .await
+        .unwrap();
+
+        assert_downloaded_tombstone_row(&db, "DEL_DL_1", &path, deleted_at);
+    }
+
+    #[tokio::test]
+    async fn mark_downloaded_then_mark_soft_deleted_preserves_download_state() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("DL_DEL_1")
+            .checksum("remote_hash")
+            .build();
+        db.upsert_seen(&rec).await.unwrap();
+
+        let dir = test_dir();
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(&path, b"x").unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "DL_DEL_1",
+            "original",
+            &path,
+            "local_hash",
+            Some("download_hash"),
+        )
+        .await
+        .unwrap();
+
+        let deleted_at = Utc.timestamp_opt(1_700_000_002, 0).unwrap();
+        db.mark_soft_deleted("PrimarySync", "DL_DEL_1", Some(deleted_at))
+            .await
+            .unwrap();
+
+        assert_downloaded_tombstone_row(&db, "DL_DEL_1", &path, deleted_at);
     }
 
     #[tokio::test]
