@@ -11,6 +11,7 @@ pub(crate) mod finalize;
 pub(crate) mod heif;
 pub(crate) mod limiter;
 pub mod metadata;
+pub(crate) mod metadata_rewrite;
 pub mod paths;
 pub(crate) mod pipeline;
 pub(crate) mod planner;
@@ -1301,7 +1302,7 @@ impl DownloadContext {
     /// Load the download context from the state database. All state queries
     /// are independent and run concurrently so sync start doesn't serialize
     /// on round-trip latency across them.
-    async fn load<D>(db: &D, retry_only: bool) -> Self
+    async fn load<D>(db: &D, retry_only: bool, metadata_writes_enabled: bool) -> Self
     where
         D: DownloadStateStore + MetadataRewriteStore + ?Sized,
     {
@@ -1343,10 +1344,14 @@ impl DownloadContext {
                     })
             },
             async {
-                db.get_metadata_retry_markers().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
+                if metadata_writes_enabled {
+                    db.get_metadata_retry_markers().await.unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
+                        Default::default()
+                    })
+                } else {
                     Default::default()
-                })
+                }
             },
             async {
                 db.get_pending().await.unwrap_or_else(|e| {
@@ -1629,7 +1634,8 @@ fn count_value_map_entries(map: &LibraryAssetVersionValueMap) -> usize {
 async fn preload_download_context(config: &DownloadConfig) -> Arc<DownloadContext> {
     let download_ctx = if let Some(db) = &config.state_db {
         tracing::debug!("Pre-loading download state from database");
-        DownloadContext::load(db.as_ref(), config.retry_only).await
+        let metadata_writes_enabled = MetadataFlags::from(config).has_any_write();
+        DownloadContext::load(db.as_ref(), config.retry_only, metadata_writes_enabled).await
     } else {
         DownloadContext::default()
     };
