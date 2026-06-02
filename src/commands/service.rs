@@ -22,8 +22,8 @@ const ICLOUD_CLIENT_MASTERING_NUMBER: &str = "2522B2";
 /// path (covering the case where stale session routing headers are pinning
 /// the request to the wrong partition).
 ///
-/// `mode` controls friendly-mode narration around the 421 retry; off-mode
-/// callers see the existing `tracing::warn!` events unchanged.
+/// `mode` controls friendly-mode recovery narration if the retry succeeds;
+/// off-mode callers see the existing `tracing::warn!` events unchanged.
 pub(crate) async fn init_photos_service(
     mut auth_result: auth::AuthResult,
     api_retry_config: retry::RetryConfig,
@@ -90,7 +90,6 @@ pub(crate) async fn init_photos_service(
     // also 421s, surface `MisdirectedRequest` so `sync_loop` can invalidate
     // the cache and force SRP (where stale routing headers are the likely
     // cause).
-    crate::personality::narration::wobble_to_stderr(mode);
     tracing::warn!(
         url = %ckdatabasews_url,
         "Service returned 421 Misdirected Request, retrying with fresh connection pool"

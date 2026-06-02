@@ -1145,19 +1145,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
             tracing::info!(interval_secs = interval, "Waiting before next cycle");
-            // `interval` is u64 seconds; chrono Add panics on overflow.
-            // Skip the heartbeat for the (impossible-in-practice) case where
-            // the interval doesn't fit in a wall-clock instant.
-            if let Some(wake_at) = i64::try_from(interval)
-                .ok()
-                .and_then(chrono::Duration::try_seconds)
-                .and_then(|d| chrono::Local::now().checked_add_signed(d))
-            {
-                crate::personality::narration::sleeping_until_to_stderr(
-                    config.ui.personality_mode,
-                    wake_at,
-                );
-            }
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
                 () = shutdown_token.cancelled() => {

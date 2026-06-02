@@ -1,8 +1,8 @@
 //! Personality layer: friendly UX wrapping for CLI output.
 //!
-//! Two modes: `Friendly` adds richer progress cards, ETA wording, summary
-//! cards, and curated phase narration. `Off` keeps v0.13 behaviour byte-for-byte
-//! for journals, pipes, JSON consumers, and explicit `--log-level` users.
+//! Two modes: `Friendly` adds terminal progress, short narration, and concise
+//! summaries. `Off` keeps v0.13 behaviour byte-for-byte for journals, pipes,
+//! JSON consumers, and explicit `--log-level` users.
 //!
 //! The gate is a single function (`resolve_mode`) so every consumer sees the
 //! same answer for a given environment. New surfaces should call
@@ -24,7 +24,7 @@ use std::io::IsTerminal;
 /// Friendly UX mode resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// Rich progress card, summary card, sign-off, curated phase lines.
+    /// Terminal progress, short narration, and concise summaries.
     Friendly,
     /// v0.13 behaviour: structured tracing with target+timestamp, plain bars.
     #[default]

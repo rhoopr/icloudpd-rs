@@ -117,8 +117,7 @@ where
 
 /// Retry an async operation with friendly-mode narration around each
 /// pause. Identical to `retry_with_backoff` except `mode` controls
-/// whether `iCloud hiccup. Retrying in Ns...` / `Back on track.` /
-/// `That one is being stubborn...` lines fire above the active bar.
+/// whether retry-pause / retry-recovery lines fire above the active bar.
 /// Off-mode is a strict no-op on the narration side - tracing events
 /// are unchanged either way.
 /// # Errors
@@ -138,9 +137,8 @@ where
     E: std::fmt::Display,
 {
     let total_attempts = config.max_retries.saturating_add(1);
-    // Bookend lines ("Back on track." / "That one is being stubborn...")
-    // only make sense if there was a prior retry-pause line for them to
-    // close out. One-shot failures stay silent.
+    // Bookend lines only make sense if there was a prior retry-pause line
+    // for them to close out. One-shot failures stay silent.
     let mut paused_at_least_once = false;
 
     for attempt in 0..total_attempts {

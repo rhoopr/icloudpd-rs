@@ -278,9 +278,9 @@ pub(super) struct DownloadTask {
     pub(super) version_size: VersionSizeKey,
     /// Resolved media type at task-creation time. Carried on the task so
     /// the post-success site can split the run's downloaded count by
-    /// photos vs videos for the friendly summary card without re-running
-    /// `determine_media_type` (and without holding the heavier
-    /// `PhotoAsset` reference past the filter stage).
+    /// photos vs videos without re-running `determine_media_type` (and
+    /// without holding the heavier `PhotoAsset` reference past the filter
+    /// stage).
     pub(super) media_type: MediaType,
 }
 

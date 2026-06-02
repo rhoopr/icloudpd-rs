@@ -157,8 +157,7 @@ pub(super) async fn download_file<C: DownloadClient>(
 }
 
 /// Friendly-mode variant of `download_file`. Identical except `mode`
-/// controls the `iCloud hiccup. Retrying in Ns...` / `Back on track.` /
-/// `That one is being stubborn...` narration around retry pauses.
+/// controls retry-pause and retry-recovery narration.
 #[allow(
     clippy::too_many_arguments,
     reason = "mode is a UX gate, not a behavior knob, so folding it into DownloadOpts/DownloadLimits would muddy those types' semantics"

@@ -90,7 +90,7 @@ impl AlbumDivider {
         });
     }
 
-    /// Blank separator after all passes, before the summary card.
+    /// Blank separator after all passes, before the final summary.
     pub fn finish(&self) {
         if !self.mode.is_friendly() || self.label_width == 0 {
             return;

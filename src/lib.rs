@@ -210,7 +210,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
 /// `pb.suspend(|| tracing::warn!(...))` while already holding indicatif's
 /// `MultiProgress` write lock - a `println` call from inside the closure
 /// would re-enter that same `RwLock` and deadlock. Narration outside that
-/// context (greeting, sign-off, stop-signal) routes through `println`
+/// context (greeting, final summary, stop-signal) routes through `println`
 /// directly via `personality::active_bar::println_above_bars`.
 pub(crate) struct BarSuspendingStderr;
 

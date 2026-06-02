@@ -43,8 +43,9 @@ pub(crate) async fn run_list(
 
     let api_retry_config = retry::RetryConfig::default();
     // `kei list` has no friendly progress bar (it just prints names to stdout),
-    // so 421 narration would have nothing to coexist with. Off-mode preserves
-    // today's exact output for scripted consumers parsing the album list.
+    // so recovery narration would have nothing to coexist with. Off-mode
+    // preserves today's exact output for scripted consumers parsing the album
+    // list.
     let (_shared_session, mut photos_service) =
         init_photos_service(auth_result, api_retry_config, crate::personality::Mode::Off).await?;
 

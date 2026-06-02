@@ -1598,9 +1598,9 @@ fn generate_toml(answers: &SetupAnswers) -> String {
         writeln!(out, "[report]")?;
         writeln!(out, "# json = \"/path/to/last-run.json\"")?;
 
-        // [ui] - friendly progress UX. Default-on-for-TTY at runtime, so
-        // we only emit an active line when the user explicitly opted out;
-        // otherwise the section is hint-only.
+        // [ui] - friendly terminal progress and summaries. Default-on-for-TTY
+        // at runtime, so we only emit an active line when the user explicitly
+        // opted out; otherwise the section is hint-only.
         writeln!(out)?;
         writeln!(out, "[ui]")?;
         match answers.ui_friendly {

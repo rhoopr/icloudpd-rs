@@ -2,8 +2,7 @@
 //!
 //! Tracing in friendly mode is filtered to WARN+, so successful sync events
 //! never reach the user via logging. This module fills that gap with
-//! curated lines printed to stderr (the same stream the bar uses) wrapped
-//! in `MultiProgress::suspend` so an in-flight redraw doesn't collide.
+//! short lines printed to stderr (the same stream the bar uses).
 //!
 //! Off mode is a strict no-op: nothing is written, no allocation, no lock
 //! contention.
@@ -48,9 +47,9 @@ pub fn line_to_stderr(mode: Mode, text: &str) {
 /// sync cycle runs.
 pub fn greet_to_stderr(mode: Mode, watch_mode: bool) {
     let text = if watch_mode {
-        "Hi! Watching iCloud for new photos."
+        "Watching iCloud for new photos."
     } else {
-        "Hi! Checking iCloud for new photos."
+        "Checking iCloud for new photos."
     };
     line_to_stderr(mode, text);
 }
@@ -64,8 +63,7 @@ pub fn auth_ok_to_stderr(mode: Mode, username: &str) {
 
 /// Post-library-resolve narration: how many libraries kei is going to walk.
 /// Asset and album totals aren't known until streaming enumeration finishes,
-/// so this line stays at the library-count level and the post-download phase
-/// line carries the richer counts.
+/// so this line stays at the library-count level.
 pub fn libraries_resolved_to_stderr(mode: Mode, library_count: usize) {
     let text = match library_count {
         0 => "No libraries available; nothing to sync.".to_string(),
@@ -73,51 +71,6 @@ pub fn libraries_resolved_to_stderr(mode: Mode, library_count: usize) {
         n => format!("✓ Listed {n} libraries"),
     };
     line_to_stderr(mode, &text);
-}
-
-/// Post-download phase narration: how many new files the cycle pulled and
-/// how that moved the on-disk library size. `library_before_bytes` is the
-/// total downloaded bytes recorded in the state DB before this cycle ran;
-/// `library_after_bytes` is the same query after the cycle's state writes
-/// settle. The difference equals `bytes_downloaded` modulo any concurrent
-/// reconcile / verify pass; either way the displayed deltas give the user
-/// a visual on the library growing.
-///
-/// No-op when `downloaded == 0`: cycles that add nothing don't merit the
-/// phase line. Off mode is silent (the existing `log_sync_summary` tracing
-/// events already cover journal consumers).
-pub fn downloaded_phase_to_stderr(
-    mode: Mode,
-    downloaded: u64,
-    library_before_bytes: u64,
-    library_after_bytes: u64,
-) {
-    if !mode.is_friendly() || downloaded == 0 {
-        return;
-    }
-    let before = crate::personality::summary::format_bytes(library_before_bytes);
-    let after = crate::personality::summary::format_bytes(library_after_bytes);
-    let plural = if downloaded == 1 { "" } else { "s" };
-    line_to_stderr(
-        mode,
-        &format!("✓ Downloaded {downloaded} new file{plural} ({before} → {after})"),
-    );
-}
-
-/// Post-cycle verify-phase narration. kei does atomic rename only after a
-/// successful checksum match, so every counted download is by definition
-/// verified; the line still fires because users want the explicit "yes,
-/// the bytes match" closure that the bar can't show. No-op when nothing
-/// downloaded.
-pub fn verified_phase_to_stderr(mode: Mode, downloaded: u64) {
-    if !mode.is_friendly() || downloaded == 0 {
-        return;
-    }
-    let plural = if downloaded == 1 { "" } else { "s" };
-    line_to_stderr(
-        mode,
-        &format!("✓ Verified {downloaded} file{plural} ({downloaded} of {downloaded} matched)"),
-    );
 }
 
 /// First-Ctrl+C acknowledgement. Friendly mode filters `tracing::info` to
@@ -131,27 +84,11 @@ pub fn stop_signal_to_stderr(mode: Mode) {
     );
 }
 
-/// Pre-sleep heartbeat in watch mode: tells the user when the next cycle
-/// will start so an idle-looking process is legible. Local clock; the
-/// existing `tracing::info!(interval_secs)` event at the same call site
-/// keeps the journal-friendly form for off-mode users.
-pub fn sleeping_until_to_stderr(mode: Mode, wake_at: chrono::DateTime<chrono::Local>) {
-    line_to_stderr(mode, &render_sleeping_until(wake_at));
-}
-
 /// Final line on a graceful Ctrl+C exit, after in-flight downloads drain.
 /// Off mode is silent; the existing `tracing::info!` "Shutdown..." lines
 /// already serve journal consumers.
 pub fn farewell_to_stderr(mode: Mode) {
     line_to_stderr(mode, FAREWELL_LINE);
-}
-
-/// Friendly framing for a CloudKit 421 Misdirected Request. Printed just
-/// before the HTTP/2 connection pool is reset so the user sees a brief
-/// human explanation alongside the existing diagnostic `tracing::warn!`.
-/// Off mode is silent.
-pub fn wobble_to_stderr(mode: Mode) {
-    line_to_stderr(mode, WOBBLE_LINE);
 }
 
 /// Pre-sleep narration before a retry. The existing `tracing::warn!` in
@@ -162,10 +99,9 @@ pub fn retry_pause_to_stderr(mode: Mode, delay: std::time::Duration) {
     line_to_stderr(mode, &render_retry_pause(delay));
 }
 
-/// Confirms a 421 retry, retry-with-backoff sequence, or other
-/// recoverable hiccup actually recovered, so the prior framing line
-/// (wobble / retry pause) doesn't sit in scrollback as the last thing
-/// the user saw before downloads resumed. Off mode is silent.
+/// Confirms a visible retry recovered so the prior warning or retry pause
+/// doesn't sit in scrollback as the last thing the user saw before downloads
+/// resumed. Off mode is silent.
 pub fn back_on_track_to_stderr(mode: Mode) {
     line_to_stderr(mode, BACK_ON_TRACK_LINE);
 }
@@ -186,106 +122,23 @@ pub fn two_fa_prompt_to_stderr(mode: Mode) {
     line_to_stderr(mode, TWO_FA_PROMPT_LINE);
 }
 
-const FAREWELL_LINE: &str = "Done. See you next time.";
-const WOBBLE_LINE: &str = "iCloud connection wobbled. Resetting...";
+const FAREWELL_LINE: &str = "Stopped.";
 const BACK_ON_TRACK_LINE: &str = "Back on track.";
-const GIVING_UP_LINE: &str = "That one is being stubborn. Skipping for now, will retry next sync.";
+const GIVING_UP_LINE: &str = "Skipping this item; it will retry on the next sync.";
 const TWO_FA_PROMPT_LINE: &str =
     "Sent a code to your trusted devices. Approve the push and enter the 6-digit code below.";
-
-fn render_sleeping_until(wake_at: chrono::DateTime<chrono::Local>) -> String {
-    format!(
-        "Sleeping until {} (local time). Press Ctrl+C to stop.",
-        wake_at.format("%H:%M"),
-    )
-}
 
 fn render_retry_pause(delay: std::time::Duration) -> String {
     // Sub-second delays still surface as "1s" so the user has a concrete
     // number rather than "0s" (which reads as "no pause" and undermines
     // the friendly framing).
     let secs = delay.as_secs().max(1);
-    format!("iCloud hiccup. Retrying in {secs}s...")
-}
-
-/// Post-cycle sign-off summarising what the cycle did. Friendly-only;
-/// callers in off mode keep relying on `log_sync_summary` for journals.
-pub fn signoff_to_stderr(mode: Mode, summary: &CycleSummary) {
-    if !mode.is_friendly() {
-        return;
-    }
-    line_to_stderr(mode, &summary.render());
-}
-
-/// Cycle summary ready for human rendering. Held off the `download::SyncStats`
-/// surface so narration stays a leaf module - sync_loop maps stats into this
-/// before calling `signoff_to_stderr`.
-#[derive(Debug, Clone)]
-pub struct CycleSummary {
-    pub downloaded: u64,
-    pub failed: u64,
-    pub elapsed: std::time::Duration,
-    pub watch_mode: bool,
-}
-
-impl CycleSummary {
-    fn render(&self) -> String {
-        let elapsed = format_elapsed(self.elapsed);
-        let body = match (self.downloaded, self.failed) {
-            (0, 0) => format!("Done. Nothing new in {elapsed}."),
-            (n, 0) => format!(
-                "Done. {n} new file{s} in {elapsed}.",
-                s = if n == 1 { "" } else { "s" },
-            ),
-            (0, f) => format!(
-                "Finished with {f} failure{s} in {elapsed}.",
-                s = if f == 1 { "" } else { "s" },
-            ),
-            (n, f) => format!(
-                "Done with {n} new file{ns} and {f} failure{fs} in {elapsed}.",
-                ns = if n == 1 { "" } else { "s" },
-                fs = if f == 1 { "" } else { "s" },
-            ),
-        };
-        if self.watch_mode {
-            format!("{body} Will check again on the next cycle.")
-        } else {
-            body
-        }
-    }
-}
-
-/// Format an elapsed duration as a friendly phrase. Short syncs round to
-/// seconds; longer ones surface minutes and hours.
-fn format_elapsed(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        if secs <= 1 {
-            "a second".to_string()
-        } else {
-            format!("{secs} seconds")
-        }
-    } else if secs < 3600 {
-        let minutes = secs / 60;
-        format!(
-            "{minutes} minute{s}",
-            s = if minutes == 1 { "" } else { "s" },
-        )
-    } else {
-        let hours = secs / 3600;
-        let minutes = (secs % 3600) / 60;
-        if minutes == 0 {
-            format!("{hours} hour{s}", s = if hours == 1 { "" } else { "s" })
-        } else {
-            format!("{hours}h {minutes}m",)
-        }
-    }
+    format!("Retrying after iCloud error in {secs}s.")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use std::time::Duration;
 
     fn capture(mode: Mode, f: impl FnOnce(&mut Vec<u8>, Mode)) -> String {
@@ -350,13 +203,12 @@ mod tests {
     }
 
     #[test]
-    fn wobble_back_on_track_and_giving_up_lines_are_stable_text() {
+    fn retry_recovery_and_giving_up_lines_are_stable_text() {
         // Pin user-visible strings; reword behind a deliberate diff.
-        assert_eq!(WOBBLE_LINE, "iCloud connection wobbled. Resetting...");
         assert_eq!(BACK_ON_TRACK_LINE, "Back on track.");
         assert_eq!(
             GIVING_UP_LINE,
-            "That one is being stubborn. Skipping for now, will retry next sync.",
+            "Skipping this item; it will retry on the next sync.",
         );
     }
 
@@ -409,11 +261,11 @@ mod tests {
     fn render_retry_pause_with_seconds() {
         assert_eq!(
             render_retry_pause(Duration::from_secs(4)),
-            "iCloud hiccup. Retrying in 4s...",
+            "Retrying after iCloud error in 4s.",
         );
         assert_eq!(
             render_retry_pause(Duration::from_secs(60)),
-            "iCloud hiccup. Retrying in 60s...",
+            "Retrying after iCloud error in 60s.",
         );
     }
 
@@ -423,125 +275,17 @@ mod tests {
         // so the user gets a concrete number rather than "0s".
         assert_eq!(
             render_retry_pause(Duration::from_millis(500)),
-            "iCloud hiccup. Retrying in 1s...",
+            "Retrying after iCloud error in 1s.",
         );
         assert_eq!(
             render_retry_pause(Duration::from_secs(0)),
-            "iCloud hiccup. Retrying in 1s...",
+            "Retrying after iCloud error in 1s.",
         );
-    }
-
-    #[test]
-    fn cycle_summary_no_changes_says_nothing_new() {
-        let s = CycleSummary {
-            downloaded: 0,
-            failed: 0,
-            elapsed: Duration::from_secs(2),
-            watch_mode: false,
-        };
-        assert_eq!(s.render(), "Done. Nothing new in 2 seconds.");
-    }
-
-    #[test]
-    fn cycle_summary_pluralises_files() {
-        let one = CycleSummary {
-            downloaded: 1,
-            failed: 0,
-            elapsed: Duration::from_secs(5),
-            watch_mode: false,
-        };
-        assert_eq!(one.render(), "Done. 1 new file in 5 seconds.");
-        let many = CycleSummary {
-            downloaded: 42,
-            failed: 0,
-            elapsed: Duration::from_secs(120),
-            watch_mode: false,
-        };
-        assert_eq!(many.render(), "Done. 42 new files in 2 minutes.");
-    }
-
-    #[test]
-    fn cycle_summary_failures_only() {
-        let s = CycleSummary {
-            downloaded: 0,
-            failed: 3,
-            elapsed: Duration::from_secs(30),
-            watch_mode: false,
-        };
-        assert_eq!(s.render(), "Finished with 3 failures in 30 seconds.");
-    }
-
-    #[test]
-    fn cycle_summary_mixed_downloaded_and_failures() {
-        let s = CycleSummary {
-            downloaded: 12,
-            failed: 1,
-            elapsed: Duration::from_secs(180),
-            watch_mode: false,
-        };
-        assert_eq!(
-            s.render(),
-            "Done with 12 new files and 1 failure in 3 minutes.",
-        );
-    }
-
-    #[test]
-    fn cycle_summary_watch_mode_appends_next_cycle_line() {
-        let s = CycleSummary {
-            downloaded: 0,
-            failed: 0,
-            elapsed: Duration::from_secs(5),
-            watch_mode: true,
-        };
-        assert_eq!(
-            s.render(),
-            "Done. Nothing new in 5 seconds. Will check again on the next cycle.",
-        );
-    }
-
-    #[test]
-    fn format_elapsed_under_one_second_says_a_second() {
-        assert_eq!(format_elapsed(Duration::from_millis(0)), "a second");
-        assert_eq!(format_elapsed(Duration::from_millis(900)), "a second");
     }
 
     #[test]
     fn farewell_line_is_stable_text() {
         // Pin the user-visible string so accidental rewording goes through review.
-        assert_eq!(FAREWELL_LINE, "Done. See you next time.");
-    }
-
-    #[test]
-    fn render_sleeping_until_uses_24h_local_clock() {
-        let wake_at = chrono::Local
-            .with_ymd_and_hms(2026, 5, 9, 14, 32, 0)
-            .single()
-            .expect("unambiguous local time");
-        assert_eq!(
-            render_sleeping_until(wake_at),
-            "Sleeping until 14:32 (local time). Press Ctrl+C to stop.",
-        );
-    }
-
-    #[test]
-    fn render_sleeping_until_zero_pads_single_digits() {
-        let wake_at = chrono::Local
-            .with_ymd_and_hms(2026, 5, 9, 4, 5, 0)
-            .single()
-            .expect("unambiguous local time");
-        assert_eq!(
-            render_sleeping_until(wake_at),
-            "Sleeping until 04:05 (local time). Press Ctrl+C to stop.",
-        );
-    }
-
-    #[test]
-    fn format_elapsed_seconds_minutes_hours() {
-        assert_eq!(format_elapsed(Duration::from_secs(2)), "2 seconds");
-        assert_eq!(format_elapsed(Duration::from_secs(60)), "1 minute");
-        assert_eq!(format_elapsed(Duration::from_secs(120)), "2 minutes");
-        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1 hour");
-        assert_eq!(format_elapsed(Duration::from_secs(7200)), "2 hours");
-        assert_eq!(format_elapsed(Duration::from_secs(7320)), "2h 2m");
+        assert_eq!(FAREWELL_LINE, "Stopped.");
     }
 }

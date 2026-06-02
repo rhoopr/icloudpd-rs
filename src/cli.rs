@@ -276,11 +276,11 @@ pub struct SyncArgs {
 /// running terminal rendering or force friendly mode off.
 #[derive(Parser, Debug, Clone, Default)]
 pub struct FriendlyArgs {
-    /// Use friendly progress UI (default on interactive terminals)
+    /// Use friendly terminal progress and summaries (default on interactive terminals)
     #[arg(
         long,
         overrides_with = "no_friendly",
-        long_help = "Use friendly progress UI (richer progress cards, curated phase narration, summary card, sign-off). \
+        long_help = "Use friendly terminal progress and summaries. \
                      Default: on for plain TTYs, off in service/container/journal contexts and whenever a \
                      machine-output mode (`--only-print-filenames` or TOML report JSON) or an explicit \
                      `--log-level` / `RUST_LOG` is in play. `--friendly` overrides the TOML `[ui] friendly` \
@@ -288,11 +288,11 @@ pub struct FriendlyArgs {
     )]
     pub friendly: bool,
 
-    /// Disable friendly progress UI
+    /// Disable friendly terminal progress and summaries
     #[arg(
         long,
         overrides_with = "friendly",
-        long_help = "Force friendly progress messages off and use the plain tracing output. \
+        long_help = "Force friendly terminal progress and summaries off and use the plain tracing output. \
                      Overrides `--friendly`, the TOML `[ui] friendly` setting, and the auto-detected default. \
                      Use this when piping kei output to a log aggregator on an interactive TTY where \
                      auto-detection would otherwise enable friendly mode."

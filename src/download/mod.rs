@@ -148,7 +148,7 @@ impl DownloadRunMode {
 /// Presentation knobs for the download pipeline.
 ///
 /// The core config owns what to download. This owns how progress and friendly
-/// narration are shown while that work runs.
+/// retry narration are shown while that work runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DownloadReporting {
     pub(crate) no_progress_bar: bool,

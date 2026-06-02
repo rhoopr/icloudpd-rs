@@ -77,7 +77,7 @@ bind = "0.0.0.0" # default: 0.0.0.0; use 127.0.0.1 for local-only
 port = 9090 # /healthz and /metrics port
 
 [ui]
-# friendly = true # default: auto on plain TTYs, off in service/container/machine-output contexts
+# friendly = true # friendly terminal progress and summaries; auto off in service/container/machine-output contexts
 progress_bar = true # false is the durable form of --no-progress-bar
 
 [import]

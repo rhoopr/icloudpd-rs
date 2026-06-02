@@ -1,4 +1,4 @@
-//! Per-run highlights for the friendly summary card.
+//! Per-run highlights collected by friendly-mode download stats.
 //!
 //! Tracks three "interesting facts" about each sync cycle: the largest
 //! file downloaded, the oldest by EXIF date, and the album whose
@@ -8,10 +8,10 @@
 //! so "newest album" is operationalised as "album whose newest asset is
 //! newest" (i.e. the album that just gained the latest-captured photo).
 //!
-//! Off mode never observes anything: the renderer guards on
+//! Off mode never observes anything: the download pipeline guards on
 //! `Mode::is_friendly()` and the structures here are tiny enough that
-//! the dead-code path in off mode allocates only a handful of bytes per
-//! cycle (Default::default()).
+//! the off path allocates only a handful of bytes per cycle
+//! (`Default::default()`).
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -40,9 +40,8 @@ pub struct RunRecap {
     pub biggest: Option<RecapAsset>,
     /// Earliest by `created_local` — the "oldest backfilled photo".
     pub oldest: Option<RecapAsset>,
-    /// Per-album newest-asset tracker. Reduced to a single highlight by
-    /// `top_album`; held as a map so multi-pass runs accumulate without
-    /// losing per-album resolution.
+    /// Per-album newest-asset tracker. Held as a map so multi-pass runs
+    /// accumulate without losing per-album resolution.
     pub albums: HashMap<String, RecapAsset>,
 }
 
@@ -109,23 +108,6 @@ impl RunRecap {
                 .or_insert(asset);
         }
     }
-
-    /// Return the `(album_label, newest_asset)` whose newest asset has
-    /// the most recent `created_local`. `None` when no albums were
-    /// observed (e.g. unfiled-only run with the unfiled label still
-    /// present, in which case it's returned as the sole entry).
-    pub fn top_album(&self) -> Option<(&str, &RecapAsset)> {
-        self.albums
-            .iter()
-            .max_by_key(|(_, asset)| asset.created_local)
-            .map(|(label, asset)| (label.as_str(), asset))
-    }
-
-    /// True when nothing was observed; render path uses this to suppress
-    /// the recap section entirely on no-op cycles.
-    pub fn is_empty(&self) -> bool {
-        self.biggest.is_none() && self.oldest.is_none() && self.albums.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -170,24 +152,6 @@ mod tests {
         assert_eq!(family.filename, "b.jpg", "Family must keep the newer asset");
         let travel = &r.albums["Travel"];
         assert_eq!(travel.filename, "c.jpg");
-    }
-
-    #[test]
-    fn top_album_picks_most_recent_capture() {
-        let mut r = RunRecap::default();
-        r.observe("Family", asset("a.jpg", 100, 2010));
-        r.observe("Travel", asset("b.jpg", 100, 2024));
-        r.observe("Pets", asset("c.jpg", 100, 2018));
-        let (label, asset) = r.top_album().unwrap();
-        assert_eq!(label, "Travel");
-        assert_eq!(asset.filename, "b.jpg");
-    }
-
-    #[test]
-    fn top_album_none_when_empty() {
-        let r = RunRecap::default();
-        assert!(r.top_album().is_none());
-        assert!(r.is_empty());
     }
 
     #[test]

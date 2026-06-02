@@ -139,8 +139,8 @@ impl MediaType {
     }
 
     /// True for `Photo` and the still-image side of a Live Photo. Used by
-    /// the friendly summary card to bucket the cycle's downloads as
-    /// "photos" vs "videos" without each call site re-spelling the match.
+    /// sync stats to bucket the cycle's downloads as "photos" vs "videos"
+    /// without each call site re-spelling the match.
     pub fn is_photo_like(self) -> bool {
         matches!(self, Self::Photo | Self::LivePhotoImage)
     }

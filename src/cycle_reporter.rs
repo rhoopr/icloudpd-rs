@@ -144,7 +144,7 @@ where
             Err(e) => {
                 tracing::debug!(
                     error = %e,
-                    "post-cycle summary unavailable; rendering card without library totals"
+                    "post-cycle summary unavailable; rendering friendly summary without library totals"
                 );
                 None
             }
@@ -157,53 +157,24 @@ where
         library_after_summary: Option<&state::types::SyncSummary>,
     ) {
         let downloaded_u64 = u64::try_from(input.stats.downloaded).unwrap_or(u64::MAX);
-        if let Some(library_after) = library_after_summary {
-            let after = library_after.downloaded_bytes;
-            let before = after.saturating_sub(input.stats.bytes_downloaded);
-            crate::personality::narration::downloaded_phase_to_stderr(
-                self.personality_mode,
-                downloaded_u64,
-                before,
-                after,
-            );
-        }
-        crate::personality::narration::verified_phase_to_stderr(
-            self.personality_mode,
-            downloaded_u64,
-        );
-        if let Some(library_after) = library_after_summary {
-            let stats = input.stats;
-            let card = crate::personality::summary::SummaryCard {
-                photos_new: u64::try_from(stats.photos_downloaded).unwrap_or(u64::MAX),
-                videos_new: u64::try_from(stats.videos_downloaded).unwrap_or(u64::MAX),
-                skipped_total: u64::try_from(stats.skipped.total() - stats.skipped.duplicates)
-                    .unwrap_or(u64::MAX),
-                skipped_already_present: u64::try_from(
-                    stats.skipped.by_state + stats.skipped.on_disk,
-                )
-                .unwrap_or(u64::MAX),
-                failed: u64::try_from(stats.failed).unwrap_or(u64::MAX),
-                elapsed: input.elapsed,
-                bytes_downloaded: stats.bytes_downloaded,
-                library_total_assets: library_after.total_assets,
-                library_total_bytes: library_after.downloaded_bytes,
-            };
-            card.print_to_stderr(self.personality_mode);
-            crate::personality::summary::print_recap_to_stderr(
-                self.personality_mode,
-                &input.stats.recap,
-            );
-        }
-
-        crate::personality::narration::signoff_to_stderr(
-            self.personality_mode,
-            &crate::personality::narration::CycleSummary {
-                downloaded: downloaded_u64,
-                failed: u64::try_from(input.failed_count).unwrap_or(u64::MAX),
-                elapsed: input.elapsed,
-                watch_mode: self.watch_mode,
-            },
-        );
+        let skipped_total = input
+            .stats
+            .skipped
+            .total()
+            .saturating_sub(input.stats.skipped.duplicates);
+        let library_totals =
+            library_after_summary.map(|summary| crate::personality::summary::LibraryTotals {
+                files: summary.downloaded,
+                bytes: summary.downloaded_bytes,
+            });
+        let summary = crate::personality::summary::FinalSummary {
+            downloaded: downloaded_u64,
+            skipped_total: u64::try_from(skipped_total).unwrap_or(u64::MAX),
+            failed: u64::try_from(input.failed_count).unwrap_or(u64::MAX),
+            elapsed: input.elapsed,
+            library_totals,
+        };
+        summary.print_to_stderr(self.personality_mode);
     }
 
     fn update_health(&self, health: &mut HealthStatus, input: &CycleReportInput<'_>) {

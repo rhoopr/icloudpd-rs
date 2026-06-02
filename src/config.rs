@@ -31,11 +31,11 @@ pub(crate) struct TomlConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TomlUi {
-    /// Friendly progress UX: richer progress cards, summary card, curated
-    /// phase narration. Defaults to `true` on a plain TTY; auto-disabled in
-    /// non-TTY, service, container, systemd, machine-output, or explicit
-    /// `--log-level` / `RUST_LOG` contexts. The CLI flags `--friendly` and
-    /// `--no-friendly` override this value for one invocation.
+    /// Friendly terminal progress and summaries. Defaults to `true` on a plain
+    /// TTY; auto-disabled in non-TTY, service, container, systemd,
+    /// machine-output, or explicit `--log-level` / `RUST_LOG` contexts. The
+    /// CLI flags `--friendly` and `--no-friendly` override this value for one
+    /// invocation.
     pub friendly: Option<bool>,
     /// Durable progress-bar default. Defaults to true. The CLI
     /// `--no-progress-bar` flag remains a one-run disable override.

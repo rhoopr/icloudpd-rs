@@ -189,7 +189,7 @@ fn friendly_card(cols: u16, total: u64, with_smart_eta: bool) -> CardTemplate {
     // tick chars.
     // Leading `\n` on the template gives the card one blank line of
     // breathing room above the top rule, separating it from prior
-    // scrollback (greeting, narration, the previous cycle's sign-off)
+    // scrollback (greeting, narration, the previous cycle's summary)
     // without the user having to read a wall of stacked content. The
     // empty line is part of the bar's tracked draw region so it scrolls
     // with the bar instead of accumulating.
