@@ -3,7 +3,7 @@
 //! cleanup pass and all single-task download logic.
 
 use std::fs::FileTimes;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
