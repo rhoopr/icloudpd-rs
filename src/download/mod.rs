@@ -388,6 +388,7 @@ const INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON: &str = "incremental_hidden_s
 const INCREMENTAL_HIDDEN_ZERO_ROWS_REASON: &str = "incremental_hidden_no_matching_state";
 const SMART_FOLDER_REFRESH_FAILED_REASON: &str = "smart_folder_refresh_failed";
 const TARGETED_ALBUM_BACKFILL_FAILED_REASON: &str = "targeted_album_backfill_failed";
+const ICLOUD_ALBUM_COUNT_ERROR_REASON: &str = "icloud_album_count_error";
 pub(super) const PRODUCER_ENUMERATION_INCOMPLETE_REASON: &str = "producer_enumeration_incomplete";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
@@ -404,6 +405,7 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | TARGETED_ALBUM_BACKFILL_FAILED_REASON => "kei",
         INCREMENTAL_DELETE_ZERO_ROWS_REASON
         | INCREMENTAL_HIDDEN_ZERO_ROWS_REASON
+        | ICLOUD_ALBUM_COUNT_ERROR_REASON
         | "pagination_shortfall"
         | "icloud_blank_sync_token"
         | "icloud_sync_token_mismatch"
@@ -419,6 +421,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
     match reason {
         "pagination_shortfall" => {
             "enumeration counts did not line up safely, so kei blocked token advancement"
+        }
+        ICLOUD_ALBUM_COUNT_ERROR_REASON => {
+            "iCloud returned a missing or malformed album count response"
         }
         "icloud_sync_token_missing" => {
             "iCloud did not return a sync token for this full enumeration"
@@ -3771,13 +3776,16 @@ async fn download_photos_full_with_token(
 
     // Check if enumeration saw significantly fewer assets than the API reported.
     // This catches silent pagination truncation, dropped pages, or API hiccups
-    // that would otherwise go unnoticed. Any `len()` failure also forces
-    // suppression because the recorded `total` is missing those passes.
+    // that would otherwise go unnoticed. Count lookup failures are tracked
+    // separately below so reports can distinguish malformed provider count
+    // responses from producer shortfalls.
     let mut pagination_shortfall_assets = 0u64;
     let mut pagination_shortfall_warnings = 0usize;
-    let pagination_undercount = if len_errors > 0 {
-        true
-    } else if !controls.run_mode.only_print_filenames() && !controls.run_mode.is_dry_run() {
+    let count_lookup_failed = len_errors > 0;
+    let pagination_undercount = if !count_lookup_failed
+        && !controls.run_mode.only_print_filenames()
+        && !controls.run_mode.is_dry_run()
+    {
         if let Some(total) = exact_total.filter(|total| *total > 0) {
             let duplicate_asset_ids =
                 u64::try_from(streaming_result.skip_summary.duplicates).unwrap_or(u64::MAX);
@@ -3833,6 +3841,7 @@ async fn download_photos_full_with_token(
     let token_eligible = config.recent.is_none()
         && config.skip_created_before.is_none()
         && !controls.run_mode.only_print_filenames()
+        && !count_lookup_failed
         && !pagination_undercount
         && streaming_result.enumeration_errors == 0;
     let mut token_block_reason: Option<&'static str> = None;
@@ -3938,7 +3947,15 @@ async fn download_photos_full_with_token(
         stats.sync_token_receivers_dropped = token_receivers_dropped;
         stats.sync_token_unique_values = token_unique_values;
     }
-    if pagination_undercount {
+    if count_lookup_failed {
+        stats.sync_token_blocked = true;
+        stats.sync_token_blocked_reason = Some(ICLOUD_ALBUM_COUNT_ERROR_REASON);
+        stats.sync_token_blocked_source =
+            Some(sync_token_blocked_source(ICLOUD_ALBUM_COUNT_ERROR_REASON));
+        stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(
+            ICLOUD_ALBUM_COUNT_ERROR_REASON,
+        ));
+    } else if pagination_undercount {
         stats.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some("pagination_shortfall");
         stats.sync_token_blocked_source = Some(sync_token_blocked_source("pagination_shortfall"));
@@ -4732,6 +4749,12 @@ mod tests {
                         "moreComing": false,
                         "records": self.records.clone(),
                     }]
+                }));
+            }
+
+            if url.contains("/internal/records/query/batch") {
+                return Ok(json!({
+                    "batch": [{"records": [{"fields": {"itemCount": {"value": 0}}}]}]
                 }));
             }
 
@@ -6153,6 +6176,133 @@ mod tests {
         assert_eq!(result.stats.sync_token_receivers_dropped, None);
         assert_eq!(result.stats.sync_token_unique_values, None);
         assert_eq!(result.sync_token, None, "token should stay blocked");
+    }
+
+    #[tokio::test]
+    async fn malformed_album_count_is_enumeration_error_and_blocks_sync_token() {
+        let session = MockPhotosFlow::new()
+            .album_count_response(json!({
+                "batch": [{"records": [{"fields": {"itemCount": {"value": "not-a-count"}}}]}]
+            }))
+            .empty_query_page(Some("zone-token"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Hidden", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("malformed album count should produce a sync result");
+
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(result.stats.enumeration_errors, 1);
+        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(result.stats.pagination_shortfall_assets, 0);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(ICLOUD_ALBUM_COUNT_ERROR_REASON)
+        );
+        assert_eq!(result.stats.sync_token_blocked_source, Some("icloud"));
+        assert_eq!(
+            result.stats.sync_token_blocked_explanation,
+            Some(sync_token_blocked_explanation(
+                ICLOUD_ALBUM_COUNT_ERROR_REASON
+            ))
+        );
+        assert_eq!(result.sync_token, None);
+    }
+
+    #[tokio::test]
+    async fn missing_album_count_item_count_is_enumeration_error_not_zero() {
+        let session = MockPhotosFlow::new()
+            .album_count_response(json!({
+                "batch": [{"records": [{"fields": {}}]}]
+            }))
+            .empty_query_page(Some("zone-token"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Hidden", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("missing album count should produce a sync result");
+
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(result.stats.assets_seen, 0);
+        assert_eq!(result.stats.enumeration_errors, 1);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(ICLOUD_ALBUM_COUNT_ERROR_REASON)
+        );
+        assert_eq!(result.sync_token, None);
+    }
+
+    #[tokio::test]
+    async fn well_formed_zero_album_count_allows_empty_token_capture() {
+        let session = MockPhotosFlow::new()
+            .album_count(0)
+            .empty_query_page(Some("zone-token"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Hidden", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("well-formed zero count should complete cleanly");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.assets_seen, 0);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token"));
     }
 
     #[tokio::test]

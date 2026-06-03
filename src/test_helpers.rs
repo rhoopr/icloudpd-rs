@@ -457,6 +457,11 @@ impl MockPhotosFlow {
         self
     }
 
+    pub fn album_count_response(mut self, response: Value) -> Self {
+        self.session = self.session.ok(response);
+        self
+    }
+
     pub fn query_page(mut self, records: Vec<Value>, sync_token: Option<&str>) -> Self {
         let mut page = json!({ "records": records });
         if let Some(token) = sync_token {
@@ -857,11 +862,27 @@ impl PhotosSession for MockPhotosSession {
             _body: body,
         });
 
-        let response = self.responses.lock().expect("poisoned").pop_front();
+        let response = {
+            let mut responses = self.responses.lock().expect("poisoned");
+            if url.contains("/internal/records/query/batch") {
+                match responses.front() {
+                    Some(MockResponse::Ok(value)) if value.get("batch").is_some() => {
+                        responses.pop_front()
+                    }
+                    Some(MockResponse::Err(_)) => responses.pop_front(),
+                    _ => None,
+                }
+            } else {
+                responses.pop_front()
+            }
+        };
 
         match response {
             Some(MockResponse::Ok(v)) => Ok(v),
             Some(MockResponse::Err(msg)) => Err(anyhow::anyhow!("{msg}")),
+            None if url.contains("/internal/records/query/batch") => Ok(json!({
+                "batch": [{"records": [{"fields": {"itemCount": {"value": 0}}}]}]
+            })),
             None => Ok(json!({"records": []})),
         }
     }

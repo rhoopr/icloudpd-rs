@@ -443,7 +443,7 @@ impl PhotoAlbum {
 
         let batch: super::cloudkit::BatchQueryResponse =
             serde_json::from_value(response).context("failed to parse album count response")?;
-        Ok(Self::count_from_query(batch.batch.first()))
+        Self::count_from_query(batch.batch.first()).context("failed to read album count response")
     }
 
     /// Return item counts for a same-library pass set with one
@@ -513,11 +513,12 @@ impl PhotoAlbum {
 
         (0..albums.len())
             .map(|index| {
-                batch
-                    .batch
-                    .get(index)
-                    .map(|query| Self::count_from_query(Some(query)))
-                    .ok_or_else(|| anyhow::anyhow!("missing batched count result for pass {index}"))
+                let query = batch.batch.get(index).ok_or_else(|| {
+                    anyhow::anyhow!("missing batched count result for pass {index}")
+                })?;
+                Self::count_from_query(Some(query)).with_context(|| {
+                    format!("failed to read batched album count result for pass {index}")
+                })
             })
             .collect()
     }
@@ -541,16 +542,22 @@ impl PhotoAlbum {
         })
     }
 
-    fn count_from_query(query: Option<&super::cloudkit::QueryResponse>) -> u64 {
-        query
-            .and_then(|q| q.records.first())
-            .and_then(|r| {
-                r.fields
-                    .get("itemCount")
-                    .and_then(|f| f.get("value"))
-                    .and_then(Value::as_u64)
-            })
-            .unwrap_or(0)
+    fn count_from_query(query: Option<&super::cloudkit::QueryResponse>) -> anyhow::Result<u64> {
+        let query = query.context("missing album count query result")?;
+        let record = query
+            .records
+            .first()
+            .context("album count query returned no records")?;
+        let item_count = record
+            .fields
+            .get("itemCount")
+            .context("album count record missing itemCount")?;
+        let value = item_count
+            .get("value")
+            .context("album count itemCount missing value")?;
+        value.as_u64().with_context(|| {
+            format!("album count itemCount value was not an unsigned integer: {value}")
+        })
     }
 
     /// Convenience wrapper over `photo_stream()` that collects all assets
@@ -1815,6 +1822,48 @@ mod tests {
         assert_eq!(counts, vec![10, 20, 30]);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(*batch_sizes.lock().unwrap(), vec![3]);
+    }
+
+    fn count_query_from_fields(fields: Value) -> crate::icloud::photos::cloudkit::QueryResponse {
+        let batch: crate::icloud::photos::cloudkit::BatchQueryResponse =
+            serde_json::from_value(json!({
+                "batch": [{"records": [{"fields": fields}]}]
+            }))
+            .expect("test count batch parses");
+        batch.batch.into_iter().next().expect("count query exists")
+    }
+
+    #[test]
+    fn count_from_query_accepts_well_formed_zero() {
+        let query = count_query_from_fields(json!({"itemCount": {"value": 0}}));
+
+        let count = PhotoAlbum::count_from_query(Some(&query)).expect("zero is a valid count");
+
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn count_from_query_rejects_missing_item_count() {
+        let query = count_query_from_fields(json!({}));
+
+        let err = PhotoAlbum::count_from_query(Some(&query)).expect_err("missing count fails");
+
+        assert!(
+            err.to_string().contains("missing itemCount"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn count_from_query_rejects_malformed_item_count() {
+        let query = count_query_from_fields(json!({"itemCount": {"value": "0"}}));
+
+        let err = PhotoAlbum::count_from_query(Some(&query)).expect_err("malformed count fails");
+
+        assert!(
+            err.to_string().contains("was not an unsigned integer"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
