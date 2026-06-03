@@ -4174,7 +4174,10 @@ mod tests {
             unimplemented!()
         }
 
-        async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+        async fn prepare_for_retry(
+            &self,
+            _library: Option<&str>,
+        ) -> Result<(u64, u64, u64), StateError> {
             Ok((0, 0, 0))
         }
 

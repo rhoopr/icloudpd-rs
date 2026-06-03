@@ -3042,7 +3042,7 @@ pub async fn download_photos_with_sync(
     // failed -> pending (with attempts reset), and stale attempt counts on
     // pending assets cleared so the per-sync cap starts from zero.
     let (retry_failed_count, total_pending) = if let Some(db) = &config.state_db {
-        match db.prepare_for_retry().await {
+        match db.prepare_for_retry(Some(&config.library)).await {
             Ok((failed, stale, total_pending)) => {
                 if failed > 0 {
                     tracing::debug!(count = failed, "Reset failed assets for retry");
@@ -3356,23 +3356,39 @@ async fn build_pass_count_plan(
 /// Classification of how the producer-observed asset count compared with the
 /// pre-enumeration API total.
 ///
-/// Any positive shortfall is token-unsafe. The shortfall count is kept so logs
-/// can report how many assets were missed.
+/// A positive shortfall is token-unsafe unless the only gap is duplicate asset
+/// IDs already observed from the API stream. CloudKit's count endpoint can
+/// include those duplicate rows, while the producer intentionally counts only
+/// unique assets after duplicate suppression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaginationShortfall {
     Match,
+    DuplicateCompensated { shortfall: u64 },
     TokenUnsafe { shortfall: u64 },
 }
 
 /// Pure classifier for the pagination-undercount gate. `total` is the
-/// pre-enumeration API count (post `--recent` cap and known filters); `seen`
-/// is the producer's `assets_seen` count. Caller is responsible for the
-/// `total > 0` guard and any dry-run / print-only suppression.
-fn classify_pagination_shortfall(total: u64, seen: u64) -> PaginationShortfall {
-    if seen >= total {
+/// pre-enumeration API count (post `--recent` cap and known filters);
+/// `unique_seen` is the producer's `assets_seen` count after duplicate asset
+/// IDs have been suppressed. Caller is responsible for the `total > 0` guard
+/// and any dry-run / print-only suppression.
+fn classify_pagination_shortfall(
+    total: u64,
+    unique_seen: u64,
+    duplicate_asset_ids: u64,
+) -> PaginationShortfall {
+    if unique_seen >= total {
         return PaginationShortfall::Match;
     }
-    let shortfall = total - seen;
+
+    let raw_seen = unique_seen.saturating_add(duplicate_asset_ids);
+    if raw_seen >= total {
+        return PaginationShortfall::DuplicateCompensated {
+            shortfall: total - unique_seen,
+        };
+    }
+
+    let shortfall = total - raw_seen;
     PaginationShortfall::TokenUnsafe { shortfall }
 }
 
@@ -3754,15 +3770,33 @@ async fn download_photos_full_with_token(
         true
     } else if !controls.run_mode.only_print_filenames() && !controls.run_mode.is_dry_run() {
         if let Some(total) = exact_total.filter(|total| *total > 0) {
-            let decision = classify_pagination_shortfall(total, streaming_result.assets_seen);
+            let duplicate_asset_ids =
+                u64::try_from(streaming_result.skip_summary.duplicates).unwrap_or(u64::MAX);
+            let decision = classify_pagination_shortfall(
+                total,
+                streaming_result.assets_seen,
+                duplicate_asset_ids,
+            );
             match decision {
                 PaginationShortfall::Match => false,
+                PaginationShortfall::DuplicateCompensated { shortfall } => {
+                    tracing::warn!(
+                        expected = total,
+                        seen = streaming_result.assets_seen,
+                        shortfall,
+                        duplicate_asset_ids,
+                        "Enumeration count shortfall was explained by duplicate asset IDs; \
+                         continuing sync token capture"
+                    );
+                    false
+                }
                 PaginationShortfall::TokenUnsafe { shortfall } => {
                     pagination_shortfall_assets = shortfall;
                     pagination_shortfall_warnings = 1;
                     tracing::warn!(
                         expected = total,
                         seen = streaming_result.assets_seen,
+                        duplicate_asset_ids,
                         shortfall,
                         "Enumeration saw fewer assets than expected — blocking sync token \
                          advancement to force full re-enumeration on next run"
@@ -6050,6 +6084,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_enumeration_duplicate_asset_ids_do_not_block_sync_token() {
+        let records = mock_photo_records_with_filename("MASTER_DUPLICATE", "duplicate.jpg");
+        let session = MockPhotosFlow::new()
+            .album_count(2)
+            .query_page(records.clone(), Some("zone-token"))
+            .query_page(records.clone(), Some("zone-token"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Hidden", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+
+        // Seed the destination so the unique asset is skipped on-disk and the
+        // test isolates duplicate API asset-id accounting.
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let pass_config = config.with_pass(&passes[0]);
+        let expected_path = filter::expected_paths_for(&asset, &pass_config)
+            .into_iter()
+            .next()
+            .expect("mock asset should have an expected path");
+        tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
+            .await
+            .expect("create parent dir");
+        tokio::fs::write(&expected_path.path, vec![0u8; 1024])
+            .await
+            .expect("seed existing file");
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("duplicate asset-id shortfall should not error");
+
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "duplicate asset IDs should be treated as producer skips, not partial failure"
+        );
+        assert_eq!(result.stats.assets_seen, 1);
+        assert_eq!(result.stats.skipped.duplicates, 1);
+        assert_eq!(result.stats.pagination_shortfall_warnings, 0);
+        assert_eq!(result.stats.pagination_shortfall_assets, 0);
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.stats.sync_token_expected_receivers, Some(1));
+        assert_eq!(result.stats.sync_token_receivers_with_token, Some(1));
+        assert_eq!(result.stats.sync_token_unique_values, Some(1));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token"));
+    }
+
+    #[tokio::test]
     async fn full_sync_blank_query_sync_token_blocks_advancement() {
         let records = mock_photo_records_with_filename("MASTER_BLANK_TOKEN", "blank-token.jpg");
         let session = MockPhotosFlow::new()
@@ -7277,6 +7370,53 @@ mod tests {
             result.stats.full_enumeration_reason,
             Some(FullEnumerationReason::PendingRows)
         );
+    }
+
+    #[tokio::test]
+    async fn incremental_ignores_pending_rows_from_other_libraries() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = crate::test_helpers::TestAssetRecord::new("SHARED_PENDING_BEFORE_SYNC")
+            .library("SharedSync-ONE")
+            .filename("shared-pending-before-sync.jpg")
+            .checksum("ck_shared_pending_before_sync")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record)
+            .await
+            .expect("seed shared pending row");
+
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(Vec::new(), "zone-token-next", false)
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("other-library pending rows must not force full enumeration");
+
+        assert!(
+            !result.full_enumeration_ran,
+            "PrimarySync should remain incremental when only SharedSync has pending work"
+        );
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
     }
 
     #[tokio::test]
@@ -10040,8 +10180,20 @@ mod tests {
     /// assets as the API reported.
     #[test]
     fn classify_pagination_shortfall_exact_match_is_silent() {
-        let decision = classify_pagination_shortfall(1000, 1000);
+        let decision = classify_pagination_shortfall(1000, 1000, 0);
         assert_eq!(decision, PaginationShortfall::Match);
+    }
+
+    /// Duplicate API asset IDs can explain a count gap because they are
+    /// included in the pre-enumeration count but suppressed by the producer
+    /// before `assets_seen` advances.
+    #[test]
+    fn classify_pagination_shortfall_duplicate_compensated_allows_token() {
+        let decision = classify_pagination_shortfall(23555, 23549, 6);
+        assert_eq!(
+            decision,
+            PaginationShortfall::DuplicateCompensated { shortfall: 6 }
+        );
     }
 
     /// A 1% undercount is still token-unsafe. Count shortfalls are sometimes
@@ -10050,7 +10202,7 @@ mod tests {
     #[test]
     fn classify_pagination_shortfall_one_percent_below_blocks_token() {
         // 1000 expected, 990 seen -> 1% shortfall, within 5% and <= 100.
-        let decision = classify_pagination_shortfall(1000, 990);
+        let decision = classify_pagination_shortfall(1000, 990, 0);
         assert_eq!(
             decision,
             PaginationShortfall::TokenUnsafe { shortfall: 10 },
@@ -10062,7 +10214,7 @@ mod tests {
     #[test]
     fn classify_pagination_shortfall_four_percent_below_blocks_token() {
         // 1000 expected, 960 seen -> 4% shortfall, 40 assets.
-        let decision = classify_pagination_shortfall(1000, 960);
+        let decision = classify_pagination_shortfall(1000, 960, 0);
         assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 40 });
     }
 
@@ -10071,14 +10223,14 @@ mod tests {
     #[test]
     fn classify_pagination_shortfall_six_percent_below_blocks_token() {
         // 1000 expected, 940 seen -> 6% shortfall.
-        let decision = classify_pagination_shortfall(1000, 940);
+        let decision = classify_pagination_shortfall(1000, 940, 0);
         assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 60 });
     }
 
     /// Boundary case at the old 5% tolerance still blocks tokens.
     #[test]
     fn classify_pagination_shortfall_at_old_tolerance_boundary_blocks_token() {
-        let decision = classify_pagination_shortfall(1000, 950);
+        let decision = classify_pagination_shortfall(1000, 950, 0);
         assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 50 });
     }
 
@@ -10087,7 +10239,7 @@ mod tests {
     /// must be token-unsafe.
     #[test]
     fn classify_pagination_shortfall_issue_498_fixture_blocks_token() {
-        let decision = classify_pagination_shortfall(1578, 1533);
+        let decision = classify_pagination_shortfall(1578, 1533, 0);
         assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 45 });
     }
 
@@ -10095,7 +10247,7 @@ mod tests {
     /// expected=31_000, seen=30_959 (shortfall=41, ~0.13%).
     #[test]
     fn classify_pagination_shortfall_billimek_sharedsync_fixture_blocks_token() {
-        let decision = classify_pagination_shortfall(31_000, 30_959);
+        let decision = classify_pagination_shortfall(31_000, 30_959, 0);
         assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 41 });
     }
 
@@ -10104,7 +10256,7 @@ mod tests {
     #[test]
     fn classify_pagination_shortfall_large_absolute_gap_blocks_token() {
         // 10_000 expected, 9_890 seen -> 1.1% shortfall, but 110 assets.
-        let decision = classify_pagination_shortfall(10_000, 9_890);
+        let decision = classify_pagination_shortfall(10_000, 9_890, 0);
         assert_eq!(
             decision,
             PaginationShortfall::TokenUnsafe { shortfall: 110 }

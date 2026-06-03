@@ -3648,8 +3648,11 @@ mod tests {
             self.inner.reset_failed().await
         }
 
-        async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), state::error::StateError> {
-            self.inner.prepare_for_retry().await
+        async fn prepare_for_retry(
+            &self,
+            library: Option<&str>,
+        ) -> Result<(u64, u64, u64), state::error::StateError> {
+            self.inner.prepare_for_retry(library).await
         }
 
         async fn promote_pending_to_failed(

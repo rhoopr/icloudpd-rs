@@ -116,7 +116,8 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<(), StateError>;
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
     async fn reset_failed(&self) -> Result<u64, StateError>;
-    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError>;
+    async fn prepare_for_retry(&self, library: Option<&str>)
+        -> Result<(u64, u64, u64), StateError>;
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError>;
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError>;
     async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError>;
@@ -594,12 +595,15 @@ pub trait StateDb: Send + Sync {
     /// Returns the number of assets reset.
     async fn reset_failed(&self) -> Result<u64, StateError>;
 
-    /// Reset all non-downloaded assets for a fresh sync attempt.
+    /// Reset non-downloaded assets for a fresh sync attempt.
     ///
     /// Moves failed -> pending and clears stale attempt counts on pending
-    /// assets, all in one lock acquisition. Returns
+    /// assets, all in one lock acquisition. When `library` is provided, only
+    /// rows for that library are considered so retry work in one CloudKit zone
+    /// does not force unrelated zones back to full enumeration. Returns
     /// (failed_reset, pending_reset, total_pending).
-    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError>;
+    async fn prepare_for_retry(&self, library: Option<&str>)
+        -> Result<(u64, u64, u64), StateError>;
 
     /// Promote stuck pending assets to failed.
     ///
@@ -1109,8 +1113,11 @@ where
         DownloadStateStore::reset_failed(self).await
     }
 
-    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
-        DownloadStateStore::prepare_for_retry(self).await
+    async fn prepare_for_retry(
+        &self,
+        library: Option<&str>,
+    ) -> Result<(u64, u64, u64), StateError> {
+        DownloadStateStore::prepare_for_retry(self, library).await
     }
 
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
@@ -1493,8 +1500,11 @@ impl DownloadStateStore for dyn StateDb + '_ {
         StateDb::reset_failed(self).await
     }
 
-    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
-        StateDb::prepare_for_retry(self).await
+    async fn prepare_for_retry(
+        &self,
+        library: Option<&str>,
+    ) -> Result<(u64, u64, u64), StateError> {
+        StateDb::prepare_for_retry(self, library).await
     }
 
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
@@ -2876,35 +2886,62 @@ impl SqliteStateDb {
     }
 
     pub(crate) async fn reset_failed(&self) -> Result<u64, StateError> {
-        let (failed, _, _) = self.prepare_for_retry().await?;
+        let (failed, _, _) = self.prepare_for_retry(None).await?;
         Ok(failed)
     }
 
-    pub(crate) async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
+    pub(crate) async fn prepare_for_retry(
+        &self,
+        library: Option<&str>,
+    ) -> Result<(u64, u64, u64), StateError> {
+        let library = library.map(ToOwned::to_owned);
         self.with_conn("prepare_for_retry", move |conn| {
-            let failed = conn
-                .execute(
+            let failed = if let Some(library) = library.as_deref() {
+                conn.execute(
+                    "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
+                     WHERE status = 'failed' AND library = ?1",
+                    rusqlite::params![library],
+                )
+            } else {
+                conn.execute(
                     "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
                      WHERE status = 'failed'",
                     [],
                 )
-                .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
+            }
+            .map_err(|e| StateError::query("prepare_for_retry", e))?
+                as u64;
 
-            let pending =
+            let pending = if let Some(library) = library.as_deref() {
+                conn.execute(
+                    "UPDATE assets SET download_attempts = 0, last_error = NULL \
+                     WHERE status = 'pending' AND download_attempts > 0 AND library = ?1",
+                    rusqlite::params![library],
+                )
+            } else {
                 conn.execute(
                     "UPDATE assets SET download_attempts = 0, last_error = NULL \
                      WHERE status = 'pending' AND download_attempts > 0",
                     [],
                 )
-                .map_err(|e| StateError::query("prepare_for_retry", e))? as u64;
+            }
+            .map_err(|e| StateError::query("prepare_for_retry", e))?
+                as u64;
 
-            let total_pending: i64 = conn
-                .query_row(
+            let total_pending: i64 = if let Some(library) = library.as_deref() {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM assets WHERE status = 'pending' AND library = ?1",
+                    rusqlite::params![library],
+                    |row| row.get(0),
+                )
+            } else {
+                conn.query_row(
                     "SELECT COUNT(*) FROM assets WHERE status = 'pending'",
                     [],
                     |row| row.get(0),
                 )
-                .map_err(|e| StateError::query("prepare_for_retry", e))?;
+            }
+            .map_err(|e| StateError::query("prepare_for_retry", e))?;
             #[allow(clippy::cast_sign_loss, reason = "SQL COUNT(*) is always non-negative")]
             let total_pending = total_pending as u64;
 
@@ -3952,8 +3989,11 @@ impl DownloadStateStore for SqliteStateDb {
         SqliteStateDb::reset_failed(self).await
     }
 
-    async fn prepare_for_retry(&self) -> Result<(u64, u64, u64), StateError> {
-        SqliteStateDb::prepare_for_retry(self).await
+    async fn prepare_for_retry(
+        &self,
+        library: Option<&str>,
+    ) -> Result<(u64, u64, u64), StateError> {
+        SqliteStateDb::prepare_for_retry(self, library).await
     }
 
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
@@ -6529,7 +6569,8 @@ mod tests {
         assert_eq!(before.pending, 2); // normal + stuck
         assert_eq!(before.failed, 2);
 
-        let (failed_reset, pending_reset, total_pending) = db.prepare_for_retry().await.unwrap();
+        let (failed_reset, pending_reset, total_pending) =
+            db.prepare_for_retry(None).await.unwrap();
 
         assert_eq!(failed_reset, 2);
         assert_eq!(pending_reset, 1); // only the stuck one
@@ -6543,6 +6584,63 @@ mod tests {
         // Verify attempt counts are all zero now
         let attempts = db.get_attempt_counts().await.unwrap();
         assert!(attempts.is_empty(), "all attempt counts should be zero");
+    }
+
+    #[tokio::test]
+    async fn prepare_for_retry_can_scope_pending_work_by_library() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let shared = "SharedSync-ONE";
+
+        for (library, suffix) in [("PrimarySync", "primary"), (shared, "shared")] {
+            let pending_id = format!("APending-{suffix}");
+            let pending = TestAssetRecord::new(&pending_id)
+                .library(library)
+                .checksum(&format!("pending-{suffix}"))
+                .filename(&format!("pending-{suffix}.jpg"))
+                .build();
+            db.upsert_seen(&pending).await.unwrap();
+            db.mark_failed(library, &pending_id, "original", "transient")
+                .await
+                .unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE assets SET status = 'pending' WHERE library = ?1 AND id = ?2",
+                    rusqlite::params![library, pending_id],
+                )
+                .unwrap();
+
+            let failed_id = format!("AFailed-{suffix}");
+            let failed = TestAssetRecord::new(&failed_id)
+                .library(library)
+                .checksum(&format!("failed-{suffix}"))
+                .filename(&format!("failed-{suffix}.jpg"))
+                .build();
+            db.upsert_seen(&failed).await.unwrap();
+            db.mark_failed(library, &failed_id, "original", "HTTP 500")
+                .await
+                .unwrap();
+        }
+
+        let (failed_reset, pending_reset, total_pending) =
+            db.prepare_for_retry(Some("PrimarySync")).await.unwrap();
+
+        assert_eq!(failed_reset, 1);
+        assert_eq!(pending_reset, 1);
+        assert_eq!(
+            total_pending, 2,
+            "only PrimarySync pending rows should drive the retry fallback gate"
+        );
+
+        let (shared_failed_reset, shared_pending_reset, shared_total_pending) =
+            db.prepare_for_retry(Some(shared)).await.unwrap();
+        assert_eq!(shared_failed_reset, 1);
+        assert_eq!(shared_pending_reset, 1);
+        assert_eq!(
+            shared_total_pending, 2,
+            "SharedSync retry work should remain untouched until its own library pass"
+        );
     }
 
     #[tokio::test]
