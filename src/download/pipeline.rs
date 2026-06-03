@@ -2239,6 +2239,37 @@ where
     })
 }
 
+fn producer_enumeration_incomplete(
+    result: &StreamingResult,
+    shutdown_token: &CancellationToken,
+) -> bool {
+    !result.enumeration_complete
+        && result.assets_seen > 0
+        && !shutdown_token.is_cancelled()
+        && !result.url_expired_abort
+}
+
+fn mark_producer_enumeration_incomplete(stats: &mut super::SyncStats, incomplete: bool) {
+    if !incomplete {
+        return;
+    }
+    stats.enumeration_incomplete = true;
+    stats.sync_token_blocked = true;
+    if stats.sync_token_blocked_reason.is_none() {
+        stats.sync_token_blocked_reason = Some(super::PRODUCER_ENUMERATION_INCOMPLETE_REASON);
+        stats.sync_token_blocked_source = Some(super::sync_token_blocked_source(
+            super::PRODUCER_ENUMERATION_INCOMPLETE_REASON,
+        ));
+        stats.sync_token_blocked_explanation = Some(super::sync_token_blocked_explanation(
+            super::PRODUCER_ENUMERATION_INCOMPLETE_REASON,
+        ));
+    }
+    tracing::warn!(
+        reason = super::PRODUCER_ENUMERATION_INCOMPLETE_REASON,
+        "Asset producer stopped before iCloud enumeration completed; treating sync as partial failure"
+    );
+}
+
 /// Build a `DownloadOutcome` from a `StreamingResult`, running a cleanup
 /// pass if there were failures. Shared between `download_photos` and
 /// `download_photos_full_with_token`.
@@ -2254,10 +2285,12 @@ pub(super) async fn build_download_outcome(
     let run_mode = controls.run_mode;
     let downloaded = streaming_result.downloaded;
     let mut exif_failures = streaming_result.exif_failures;
-    let failed_tasks = streaming_result.failed;
     let auth_errors = streaming_result.auth_errors;
     let mut state_write_failures = streaming_result.state_write_failures;
     let enumeration_errors = streaming_result.enumeration_errors;
+    let enumeration_incomplete =
+        producer_enumeration_incomplete(&streaming_result, &shutdown_token);
+    let failed_tasks = streaming_result.failed;
     let skip_breakdown: super::SkipBreakdown = streaming_result.skip_summary.into();
 
     if auth_errors >= AUTH_ERROR_THRESHOLD {
@@ -2273,6 +2306,7 @@ pub(super) async fn build_download_outcome(
             enumeration_errors,
             pagination_shortfall_warnings: 0,
             pagination_shortfall_assets: 0,
+            enumeration_incomplete,
             sync_token_blocked: false,
             sync_token_blocked_reason: None,
             elapsed_secs: started.elapsed().as_secs_f64(),
@@ -2293,7 +2327,7 @@ pub(super) async fn build_download_outcome(
 
     if downloaded == 0 && failed_tasks.is_empty() {
         let retry_exhausted = skip_breakdown.retry_exhausted;
-        let stats = super::SyncStats {
+        let mut stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             skipped: skip_breakdown,
             state_write_failures,
@@ -2302,6 +2336,7 @@ pub(super) async fn build_download_outcome(
             interrupted: shutdown_token.is_cancelled() || streaming_result.url_expired_abort,
             ..super::SyncStats::default()
         };
+        mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
         if run_mode.is_dry_run() {
             tracing::info!("── Dry Run Summary ──");
             tracing::info!("  0 files would be downloaded");
@@ -2314,7 +2349,8 @@ pub(super) async fn build_download_outcome(
         let failed_count = state_write_failures
             + retry_exhausted
             + enumeration_errors
-            + usize::from(streaming_result.url_expired_abort);
+            + usize::from(streaming_result.url_expired_abort)
+            + usize::from(enumeration_incomplete);
         if failed_count > 0 {
             return Ok((DownloadOutcome::PartialFailure { failed_count }, stats));
         }
@@ -2322,7 +2358,7 @@ pub(super) async fn build_download_outcome(
     }
 
     if run_mode.is_dry_run() {
-        let stats = super::SyncStats {
+        let mut stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
             enumeration_errors,
@@ -2331,6 +2367,7 @@ pub(super) async fn build_download_outcome(
             interrupted: shutdown_token.is_cancelled(),
             ..super::SyncStats::default()
         };
+        mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
         tracing::info!("── Dry Run Summary ──");
         if shutdown_token.is_cancelled() {
             tracing::info!(scanned = downloaded, "  Interrupted before shutdown");
@@ -2339,20 +2376,16 @@ pub(super) async fn build_download_outcome(
         }
         tracing::info!(destination = %config.directory.display(), "  destination");
         tracing::info!(concurrency = config.concurrent_downloads, "  concurrency");
-        if enumeration_errors > 0 {
-            return Ok((
-                DownloadOutcome::PartialFailure {
-                    failed_count: enumeration_errors,
-                },
-                stats,
-            ));
+        let failed_count = enumeration_errors + usize::from(enumeration_incomplete);
+        if failed_count > 0 {
+            return Ok((DownloadOutcome::PartialFailure { failed_count }, stats));
         }
         return Ok((DownloadOutcome::Success, stats));
     }
 
     if streaming_result.url_expired_abort {
         let retry_exhausted = skip_breakdown.retry_exhausted;
-        let stats = super::SyncStats {
+        let mut stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
             failed: failed_tasks.len(),
@@ -2364,6 +2397,7 @@ pub(super) async fn build_download_outcome(
             enumeration_errors,
             pagination_shortfall_warnings: 0,
             pagination_shortfall_assets: 0,
+            enumeration_incomplete,
             sync_token_blocked: false,
             sync_token_blocked_reason: None,
             elapsed_secs: started.elapsed().as_secs_f64(),
@@ -2374,6 +2408,7 @@ pub(super) async fn build_download_outcome(
             recap: streaming_result.recap.clone(),
             ..super::SyncStats::default()
         };
+        mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
         log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
         return Ok((
             DownloadOutcome::PartialFailure {
@@ -2390,7 +2425,7 @@ pub(super) async fn build_download_outcome(
 
     if failed_tasks.is_empty() {
         let retry_exhausted = skip_breakdown.retry_exhausted;
-        let stats = super::SyncStats {
+        let mut stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
             failed: 0,
@@ -2412,18 +2447,21 @@ pub(super) async fn build_download_outcome(
             recap: streaming_result.recap.clone(),
             ..super::SyncStats::default()
         };
+        mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
         log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
         if state_write_failures > 0
             || enumeration_errors > 0
             || exif_failures > 0
             || retry_exhausted > 0
+            || enumeration_incomplete
         {
             return Ok((
                 DownloadOutcome::PartialFailure {
                     failed_count: state_write_failures
                         + enumeration_errors
                         + exif_failures
-                        + retry_exhausted,
+                        + retry_exhausted
+                        + usize::from(enumeration_incomplete),
                 },
                 stats,
             ));
@@ -2515,7 +2553,12 @@ pub(super) async fn build_download_outcome(
     // across prior syncs — they belong in the failure total so Docker /
     // systemd / k8s exit-code signalling can notice a chronic backlog.
     let retry_exhausted = skip_breakdown.retry_exhausted;
-    let total_failures = failed + state_write_failures + exif_failures + retry_exhausted;
+    let total_failures = failed
+        + state_write_failures
+        + exif_failures
+        + enumeration_errors
+        + retry_exhausted
+        + usize::from(enumeration_incomplete);
     if total_failures > 0 {
         for task in &remaining_failed {
             tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");
@@ -2524,7 +2567,7 @@ pub(super) async fn build_download_outcome(
 
     let mut merged_recap = streaming_result.recap.clone();
     merged_recap.merge(pass_result.recap.clone());
-    let stats = super::SyncStats {
+    let mut stats = super::SyncStats {
         assets_seen: streaming_result.assets_seen,
         downloaded: succeeded,
         failed,
@@ -2536,6 +2579,7 @@ pub(super) async fn build_download_outcome(
         enumeration_errors,
         pagination_shortfall_warnings: 0,
         pagination_shortfall_assets: 0,
+        enumeration_incomplete,
         sync_token_blocked: false,
         sync_token_blocked_reason: None,
         elapsed_secs: started.elapsed().as_secs_f64(),
@@ -2547,6 +2591,7 @@ pub(super) async fn build_download_outcome(
         recap: merged_recap,
         ..super::SyncStats::default()
     };
+    mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
     maybe_warn_rate_limit_pressure(&stats);
     log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
 
@@ -3166,6 +3211,11 @@ pub(super) fn log_sync_summary(title: &str, stats: &super::SyncStats) {
             stats.exif_failures,
             stats.state_write_failures,
             stats.enumeration_errors
+        );
+    }
+    if stats.enumeration_incomplete {
+        tracing::info!(
+            "  Enumeration incomplete; sync token blocked and next cycle will replay changes"
         );
     }
 
@@ -5913,6 +5963,116 @@ mod tests {
             "expected PartialFailure with failed_count=3, got {outcome:?}"
         );
         assert_eq!(stats.enumeration_errors, 3);
+    }
+
+    #[tokio::test]
+    async fn producer_incomplete_enumeration_returns_partial_failure_and_blocks_token() {
+        use crate::download::DownloadOutcome;
+
+        let streaming_result = StreamingResult {
+            assets_seen: 1,
+            enumeration_complete: false,
+            ..StreamingResult::default()
+        };
+        let (outcome, stats) =
+            build_zero_download_outcome(streaming_result, DownloadControls::download_hidden())
+                .await;
+
+        assert!(
+            matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 1 }),
+            "incomplete producer enumeration must not report Success, got {outcome:?}"
+        );
+        assert!(stats.enumeration_incomplete);
+        assert!(stats.sync_token_blocked);
+        assert_eq!(
+            stats.sync_token_blocked_reason,
+            Some(super::super::PRODUCER_ENUMERATION_INCOMPLETE_REASON)
+        );
+        assert!(
+            !crate::sync_cycle::should_store_sync_token(&outcome, false),
+            "partial incomplete-enumeration outcomes must not advance sync tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn free_space_forecast_cancel_before_stream_exhaustion_is_partial_failure() {
+        use crate::download::{DownloadConfig, DownloadOutcome};
+        use crate::icloud::photos::PhotoAsset;
+        use crate::retry::RetryConfig;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let oversized = TestPhotoAsset::new("TOO_BIG_FOR_DISK")
+            .filename("too-big.jpg")
+            .orig_size(8_000_000_000_000)
+            .orig_url("https://p01.icloud-content.com/too-big.jpg")
+            .orig_checksum("not-valid-base64")
+            .build();
+        let undiscovered = TestPhotoAsset::new("UNDISCOVERED_AFTER_CANCEL")
+            .filename("undiscovered.jpg")
+            .orig_url("https://p01.icloud-content.com/undiscovered.jpg")
+            .orig_checksum("BAUG")
+            .build();
+        let stream = stream::iter(vec![
+            Ok::<PhotoAsset, anyhow::Error>(oversized),
+            Ok::<PhotoAsset, anyhow::Error>(undiscovered),
+        ]);
+
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let config = Arc::new(config);
+        let client = reqwest::Client::new();
+        let controls = DownloadControls::download_hidden();
+
+        let streaming_result = stream_and_download_from_stream(
+            &client,
+            stream,
+            &config,
+            controls,
+            0,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("free-space forecast cancellation should return a streaming result");
+
+        assert_eq!(
+            streaming_result.assets_seen, 1,
+            "producer should stop before reading the second stream item"
+        );
+        assert!(
+            !streaming_result.enumeration_complete,
+            "forecast cancellation must leave enumeration incomplete"
+        );
+
+        let (outcome, stats) = build_download_outcome(
+            &client,
+            &[],
+            &config,
+            controls,
+            streaming_result,
+            Instant::now(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("outcome should build after forecast cancellation");
+
+        assert!(
+            matches!(outcome, DownloadOutcome::PartialFailure { .. }),
+            "forecast cancellation must not report clean success, got {outcome:?}"
+        );
+        assert!(stats.enumeration_incomplete);
+        assert_eq!(
+            stats.sync_token_blocked_reason,
+            Some(super::super::PRODUCER_ENUMERATION_INCOMPLETE_REASON)
+        );
+        assert!(!crate::sync_cycle::should_store_sync_token(&outcome, false));
     }
 
     #[tokio::test]

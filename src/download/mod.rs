@@ -230,6 +230,9 @@ pub struct SyncStats {
     /// Sum of missing assets reported by tolerated or token-unsafe
     /// pagination shortfalls.
     pub pagination_shortfall_assets: u64,
+    /// True when the asset producer stopped before naturally exhausting the
+    /// iCloud stream for a reason other than an external interrupt.
+    pub enumeration_incomplete: bool,
     /// Whether sync-token advancement was blocked for safety despite no
     /// download failure.
     pub sync_token_blocked: bool,
@@ -328,6 +331,7 @@ impl SyncStats {
         self.enumeration_errors += other.enumeration_errors;
         self.pagination_shortfall_warnings += other.pagination_shortfall_warnings;
         self.pagination_shortfall_assets += other.pagination_shortfall_assets;
+        self.enumeration_incomplete = self.enumeration_incomplete || other.enumeration_incomplete;
         self.sync_token_blocked = self.sync_token_blocked || other.sync_token_blocked;
         if self.sync_token_blocked_reason.is_none() {
             self.sync_token_blocked_reason = other.sync_token_blocked_reason;
@@ -384,6 +388,7 @@ const INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON: &str = "incremental_hidden_s
 const INCREMENTAL_HIDDEN_ZERO_ROWS_REASON: &str = "incremental_hidden_no_matching_state";
 const SMART_FOLDER_REFRESH_FAILED_REASON: &str = "smart_folder_refresh_failed";
 const TARGETED_ALBUM_BACKFILL_FAILED_REASON: &str = "targeted_album_backfill_failed";
+pub(super) const PRODUCER_ENUMERATION_INCOMPLETE_REASON: &str = "producer_enumeration_incomplete";
 
 pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
     match reason {
@@ -393,6 +398,7 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON
         | INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON
         | "kei_internal_token_receiver_dropped"
+        | PRODUCER_ENUMERATION_INCOMPLETE_REASON
         | RECENT_LIMITED_FULL_ENUMERATION_REASON
         | SMART_FOLDER_REFRESH_FAILED_REASON
         | TARGETED_ALBUM_BACKFILL_FAILED_REASON => "kei",
@@ -423,6 +429,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         "icloud_sync_token_mismatch" => "iCloud returned conflicting sync tokens across passes",
         "kei_internal_token_receiver_dropped" => {
             "an internal token collection channel closed before completion"
+        }
+        PRODUCER_ENUMERATION_INCOMPLETE_REASON => {
+            "kei stopped before iCloud enumeration reached the natural end of the stream"
         }
         RECENT_LIMITED_FULL_ENUMERATION_REASON => {
             "a count-limited recent sync is a partial enumeration, so kei blocked token advancement"
@@ -9198,6 +9207,7 @@ mod tests {
             enumeration_errors: 3,
             pagination_shortfall_warnings: 1,
             pagination_shortfall_assets: 9,
+            enumeration_incomplete: false,
             sync_token_blocked: true,
             sync_token_blocked_reason: Some("pagination_shortfall"),
             sync_token_blocked_source: Some("icloud"),
@@ -9244,6 +9254,7 @@ mod tests {
             enumeration_errors: 6,
             pagination_shortfall_warnings: 2,
             pagination_shortfall_assets: 11,
+            enumeration_incomplete: true,
             sync_token_blocked: false,
             sync_token_blocked_reason: None,
             sync_token_blocked_source: Some("kei"),
@@ -9284,6 +9295,7 @@ mod tests {
             acc.pagination_shortfall_assets, 20,
             "pagination shortfall assets must sum"
         );
+        assert!(acc.enumeration_incomplete, "enumeration_incomplete must OR");
         assert!(acc.sync_token_blocked, "sync_token_blocked must OR");
         assert_eq!(acc.sync_token_blocked_reason, Some("pagination_shortfall"));
         assert_eq!(acc.sync_token_blocked_source, Some("icloud"));
