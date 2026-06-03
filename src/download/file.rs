@@ -895,7 +895,7 @@ fn detect_error_sentinel(header: &[u8]) -> Option<&'static str> {
 /// Returns:
 /// - `Some(true)` — header matches a known-valid signature
 /// - `Some(false)` — extension is recognized but header does not match
-///   (caller logs a warning; the file is still saved)
+///   (caller decides whether another known media signature can safely pass)
 /// - `None` — extension is not in the signature table; skip the check
 ///
 /// MOV handling intentionally differs from the other ISO-BMFF extensions.
@@ -962,17 +962,19 @@ fn is_mov_top_atom(atom: &[u8]) -> bool {
     )
 }
 
-/// Validate downloaded content using kei's permissive valid-media policy.
+/// Validate downloaded content using kei's media-body policy.
 ///
-/// Hard-fail only when kei has positive evidence the file is unsafe or
-/// incomplete: zero bytes, known HTML/JSON error bodies, known error-document
-/// content types checked before writing, or byte-count mismatches checked by
-/// the caller.
-/// Extension-specific magic mismatches are warnings, not hard failures: iCloud
-/// sometimes assigns `.PNG` names to JPEG bytes, and kei's signature table is
-/// intentionally not treated as a complete media catalog. Unknown-but-not-known
-/// bad headers are saved when size checks have passed. Filenames stay exactly as
-/// planned; validation never rewrites extensions.
+/// Hard-fail when kei has positive evidence the file is unsafe or incomplete:
+/// zero bytes, known HTML/JSON error bodies, known error-document content types
+/// checked before writing, byte-count mismatches checked by the caller, or a
+/// known media extension whose bytes are neither the expected media type nor
+/// any other media type kei recognizes.
+///
+/// Extension-specific media mismatches are warnings, not hard failures: iCloud
+/// sometimes assigns `.PNG` names to JPEG bytes. Filenames stay exactly as
+/// planned; validation never rewrites extensions. Unknown extensions remain
+/// permissive so provider-side sidecars or new formats are not silently blocked
+/// before kei has a type-specific policy for them.
 fn validate_downloaded_content(
     part_path: &Path,
     download_path: &Path,
@@ -1030,12 +1032,13 @@ fn validate_downloaded_content(
             );
             return Ok(());
         }
-        tracing::warn!(
-            path = %download_path.display(),
-            expected_extension = %ext,
-            header = %format_args!("{preview:02x?}"),
-            "File header does not match expected extension and is not recognized by kei; saving anyway",
-        );
+        return Err(DownloadError::InvalidContent {
+            path: download_path.display().to_string().into(),
+            reason: format!(
+                "file header does not match expected .{ext} media and is not recognized as another supported media type (first bytes: {preview:02x?})"
+            )
+            .into(),
+        });
     }
 
     Ok(())
@@ -1656,9 +1659,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_unrecognized_header_for_known_extension() {
+    fn validate_rejects_unrecognized_header_for_known_extension() {
         let (part, dest, _dir) = write_temp_file("photo.jpg", b"not media bytes");
-        assert!(validate_downloaded_content(&part, &dest).is_ok());
+        let err = validate_downloaded_content(&part, &dest).unwrap_err();
+        assert!(matches!(err, DownloadError::InvalidContent { .. }));
+        assert!(
+            err.to_string()
+                .contains("not recognized as another supported media type"),
+            "error should explain why unknown media bytes failed: {err}"
+        );
     }
 
     #[test]
@@ -2022,12 +2031,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attempt_download_promotes_unrecognized_header_under_known_extension() {
+    async fn attempt_download_rejects_same_size_unknown_media_body_under_known_extension() {
         let body = b"not media bytes";
         let client = StubDownloadClient::ok(body);
         let (download_path, part_path, _dir) = setup_download_dir("unknown_header", "jpg");
 
-        attempt_download(
+        let err = attempt_download(
             &client,
             "http://stub",
             &download_path,
@@ -2038,10 +2047,14 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert!(!part_path.exists(), ".part should be promoted");
-        assert_eq!(std::fs::read(&download_path).unwrap(), body);
+        assert!(
+            matches!(err, DownloadError::InvalidContent { .. }),
+            "expected InvalidContent, got: {err}"
+        );
+        assert!(!part_path.exists(), ".part should be removed");
+        assert!(!download_path.exists(), "final path must not exist");
     }
 
     #[tokio::test]

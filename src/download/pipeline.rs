@@ -4203,7 +4203,9 @@ mod tests {
         remaining_failures: AtomicUsize,
         calls: AtomicUsize,
         successes: AtomicUsize,
+        failed_calls: AtomicUsize,
         downloaded_id_loads: AtomicUsize,
+        track_failed_calls: bool,
         fail_metadata_clear: bool,
         fail_complete_sync_run: bool,
     }
@@ -4214,10 +4216,18 @@ mod tests {
                 remaining_failures: AtomicUsize::new(fail_count),
                 calls: AtomicUsize::new(0),
                 successes: AtomicUsize::new(0),
+                failed_calls: AtomicUsize::new(0),
                 downloaded_id_loads: AtomicUsize::new(0),
+                track_failed_calls: false,
                 fail_metadata_clear: false,
                 fail_complete_sync_run: false,
             }
+        }
+
+        fn with_mark_failed_tracking() -> Self {
+            let mut s = Self::new(0);
+            s.track_failed_calls = true;
+            s
         }
 
         fn with_failing_metadata_clear() -> Self {
@@ -4242,6 +4252,10 @@ mod tests {
 
         fn downloaded_id_load_count(&self) -> usize {
             self.downloaded_id_loads.load(Ordering::Relaxed)
+        }
+
+        fn failed_call_count(&self) -> usize {
+            self.failed_calls.load(Ordering::Relaxed)
         }
     }
 
@@ -4284,7 +4298,12 @@ mod tests {
         }
 
         async fn mark_failed(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), StateError> {
-            unimplemented!()
+            if self.track_failed_calls {
+                self.failed_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            } else {
+                unimplemented!()
+            }
         }
 
         #[cfg(test)]
@@ -4830,6 +4849,85 @@ mod tests {
             attempted: STATE_DB_UNWRITABLE_THRESHOLD,
             failures: STATE_DB_UNWRITABLE_THRESHOLD,
         }));
+    }
+
+    #[tokio::test]
+    async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
+        use base64::Engine as _;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = b"not media bytes";
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(FailingStateDb::with_mark_failed_tracking());
+        let state_db: Arc<dyn StateDb> = db.clone();
+        let client = Client::new();
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let checksum = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+        let download_path = dir.path().join("unknown_header.jpg");
+        let part_path =
+            super::super::file::temp_download_path(&download_path, &checksum, ".kei-tmp")
+                .expect("valid temp path");
+        let task = DownloadTask {
+            url: format!("{}/photo.jpg", server.uri()).into(),
+            download_path: download_path.clone(),
+            checksum: checksum.into(),
+            asset_id: "UNKNOWN_MEDIA".into(),
+            library: "PrimarySync".into(),
+            metadata: Arc::new(MetadataPayload::default()),
+            size: body.len() as u64,
+            created_local: chrono::Local::now(),
+            version_size: VersionSizeKey::Original,
+            media_type: crate::state::MediaType::Photo,
+        };
+
+        let result = run_download_pass(
+            PassConfig {
+                client: &client,
+                retry_config: &retry,
+                metadata: MetadataFlags::default(),
+                concurrency: 1,
+                reporting: DownloadReporting::hidden(),
+                temp_suffix: std::sync::Arc::from(".kei-tmp"),
+                shutdown_token: CancellationToken::new(),
+                state_db: Some(state_db),
+                rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                bandwidth_limiter: None,
+                library: std::sync::Arc::from("PrimarySync"),
+            },
+            vec![task],
+        )
+        .await;
+
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(db.call_count(), 0, "invalid media must not mark_downloaded");
+        assert_eq!(
+            db.failed_call_count(),
+            1,
+            "invalid media should be recorded failed"
+        );
+        assert!(
+            !download_path.exists(),
+            "invalid media must not publish final path"
+        );
+        assert!(!part_path.exists(), "invalid media .part should be removed");
+        let outcome = crate::download::DownloadOutcome::PartialFailure {
+            failed_count: result.failed.len(),
+        };
+        assert!(
+            !crate::sync_cycle::should_store_sync_token(&outcome, false),
+            "partial media-download failures must block sync-token advancement"
+        );
     }
 
     #[tokio::test(start_paused = true)]
