@@ -1117,6 +1117,27 @@ enum CollisionStrategy {
     SkipIfExists,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathResolution {
+    Download(PathBuf),
+    Skip(PathBuf),
+}
+
+impl PathResolution {
+    fn download_path(self) -> Option<PathBuf> {
+        match self {
+            Self::Download(path) => Some(path),
+            Self::Skip(_) => None,
+        }
+    }
+
+    fn effective_path(&self) -> &Path {
+        match self {
+            Self::Download(path) | Self::Skip(path) => path.as_path(),
+        }
+    }
+}
+
 /// Shared context for `resolve_download_path` -- groups the mutable/config
 /// references that every call needs so the function stays under clippy's
 /// argument limit.
@@ -1131,7 +1152,8 @@ struct ResolveContext<'a> {
 /// Resolve the final download path for a single version, handling on-disk
 /// files, AM/PM whitespace variants, and in-flight claimed paths.
 ///
-/// Returns `Some(path)` when the file should be downloaded, or `None` to skip.
+/// Returns [`PathResolution::Download`] when the file should be downloaded, or
+/// [`PathResolution::Skip`] when an on-disk or in-flight path already covers it.
 ///
 /// `check_ampm`: when true, also checks AM/PM whitespace variants on disk
 /// (relevant for primary photos whose timestamps contain AM/PM).
@@ -1147,33 +1169,37 @@ fn resolve_download_path(
     check_ampm: bool,
     make_dedup_filename: impl FnOnce() -> String,
     label: &str,
-) -> Option<PathBuf> {
+) -> PathResolution {
     // Check for the file on disk. For primary photos, also check AM/PM
     // whitespace variants (e.g., "1.40.01 PM.PNG" vs "1.40.01\u{202F}PM.PNG").
-    let on_disk_size = ctx.dir_cache.file_size(download_path).or_else(|| {
-        if !check_ampm {
-            return None;
-        }
-        let variant = ctx.dir_cache.find_ampm_variant(download_path)?;
-        Some(ctx.dir_cache.file_size(&variant).unwrap_or(0))
-    });
+    let on_disk_match = ctx
+        .dir_cache
+        .file_size(download_path)
+        .map(|size| (size, download_path.to_path_buf()))
+        .or_else(|| {
+            if !check_ampm {
+                return None;
+            }
+            let variant = ctx.dir_cache.find_ampm_variant(download_path)?;
+            Some((ctx.dir_cache.file_size(&variant).unwrap_or(0), variant))
+        });
 
     // Determine whether the existing size (on disk or in-flight) is a match.
     // `source` is used only for log messages.
-    let (existing_size, source) = if let Some(size) = on_disk_size {
-        (Some(size), "on-disk")
+    let existing_match = if let Some((size, path)) = on_disk_match {
+        Some((size, "on-disk", path))
     } else {
         let normalized = NormalizedPath::normalize(download_path);
         if let Some(&size) = ctx.claimed_paths.get(normalized.as_ref()) {
-            (Some(size), "in-flight")
+            Some((size, "in-flight", download_path.to_path_buf()))
         } else {
-            (None, "")
+            None
         }
     };
 
-    let Some(existing_size) = existing_size else {
+    let Some((existing_size, source, matched_path)) = existing_match else {
         // Path is unclaimed -- use it directly.
-        return Some(download_path.to_path_buf());
+        return PathResolution::Download(download_path.to_path_buf());
     };
 
     match strategy {
@@ -1191,7 +1217,7 @@ fn resolve_download_path(
                     "Skipping {label}: path claimed in-flight (name-id7)"
                 );
             }
-            None
+            PathResolution::Skip(matched_path)
         }
         CollisionStrategy::SizeDedup { skip_zero_size } => {
             let sizes_match =
@@ -1213,7 +1239,7 @@ fn resolve_download_path(
                         "Skipping {label}: {source} download has same name and size"
                     );
                 }
-                return None;
+                return PathResolution::Skip(matched_path);
             }
 
             // Different size -- deduplicate.
@@ -1226,9 +1252,9 @@ fn resolve_download_path(
                 ctx.config.album_name.as_deref(),
             );
             let dedup_key = NormalizedPath::normalize(&dedup_path);
-            if ctx.dir_cache.exists(&dedup_path)
-                || ctx.claimed_paths.contains_key(dedup_key.as_ref())
-            {
+            let dedup_exists = ctx.dir_cache.exists(&dedup_path);
+            let dedup_claimed = ctx.claimed_paths.contains_key(dedup_key.as_ref());
+            if dedup_exists || dedup_claimed {
                 if source == "on-disk" {
                     tracing::info!(
                         asset_id,
@@ -1242,7 +1268,7 @@ fn resolve_download_path(
                         "Skipping {label}: dedup path already claimed in-flight"
                     );
                 }
-                None
+                PathResolution::Skip(dedup_path)
             } else {
                 if source == "on-disk" {
                     tracing::debug!(
@@ -1261,7 +1287,7 @@ fn resolve_download_path(
                         "{label} {source} collision: claimed with different size"
                     );
                 }
-                Some(dedup_path)
+                PathResolution::Download(dedup_path)
             }
         }
     }
@@ -1337,7 +1363,7 @@ pub(super) fn filter_asset_to_tasks(
             version_size,
             check_ampm_on_disk,
         } = d;
-        let final_path = {
+        let primary_resolution = {
             let mut rctx = ResolveContext {
                 config,
                 created_local: &ctx.created_local,
@@ -1356,12 +1382,14 @@ pub(super) fn filter_asset_to_tasks(
             )
         };
 
-        if let Some(p) = &final_path {
-            if let Some(stem) = p.file_name().and_then(|f| f.to_str()) {
-                effective_primary_filename = Some(stem.to_string());
-            }
+        if let Some(stem) = primary_resolution
+            .effective_path()
+            .file_name()
+            .and_then(|f| f.to_str())
+        {
+            effective_primary_filename = Some(stem.to_string());
         }
-        if let Some(p) = final_path {
+        if let Some(p) = primary_resolution.download_path() {
             claimed_paths.insert(NormalizedPath::new(&p), size);
             seen_urls.push(url.clone());
             tasks.push(DownloadTask {
@@ -1411,6 +1439,7 @@ pub(super) fn filter_asset_to_tasks(
                 || paths::add_dedup_suffix(&filename, size),
                 "asset extra",
             )
+            .download_path()
         };
 
         if let Some(p) = final_path {
@@ -1466,6 +1495,7 @@ pub(super) fn filter_asset_to_tasks(
                 || paths::insert_suffix(&filename, asset_id),
                 "live photo MOV",
             )
+            .download_path()
         };
 
         if let Some(p) = final_mov_path {
@@ -2999,6 +3029,78 @@ mod tests {
             mov2_path.contains("-4000"),
             "MOV companion should derive from deduped HEIC name (contain '-4000'), got: {}",
             mov2_path,
+        );
+    }
+
+    #[test]
+    fn live_photo_mov_reuses_existing_deduped_primary_stem_after_primary_skip() {
+        let dir = TempDir::new().unwrap();
+
+        let asset = TestPhotoAsset::new("AV0P9wRWvFhGzyYKSmpJu89S3bY6")
+            .filename("FullSizeRender.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(2_067_405)
+            .orig_url("https://p01.icloud-content.com/heic")
+            .orig_checksum("heic_ck")
+            .live_photo("https://p01.icloud-content.com/mov", "mov_ck", 2_266_088)
+            .build();
+
+        let mut config = test_config();
+        config.directory = std::sync::Arc::from(dir.path());
+
+        let natural_heic = paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &asset.created().with_timezone(&Local),
+            "FullSizeRender.HEIC",
+            None,
+        );
+        let deduped_heic = paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &asset.created().with_timezone(&Local),
+            "FullSizeRender-2067405.HEIC",
+            None,
+        );
+        let natural_mov = paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &asset.created().with_timezone(&Local),
+            "FullSizeRender_HEVC.MOV",
+            None,
+        );
+        let paired_mov = paths::local_download_path(
+            &config.directory,
+            &config.folder_structure,
+            &asset.created().with_timezone(&Local),
+            "FullSizeRender-2067405_HEVC.MOV",
+            None,
+        );
+        fs::create_dir_all(natural_heic.parent().unwrap()).unwrap();
+        fs::write(&natural_heic, vec![0u8; 1_808_776]).unwrap();
+        fs::write(&deduped_heic, vec![0u8; 2_067_405]).unwrap();
+        fs::write(&natural_mov, vec![0u8; 123]).unwrap();
+
+        let mut claimed_paths = FxHashMap::default();
+        let mut dir_cache = paths::DirCache::new();
+        let tasks = filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "only the missing paired MOV should be planned"
+        );
+        assert_eq!(
+            tasks[0].download_path, paired_mov,
+            "MOV must inherit the existing deduped HEIC stem instead of falling back to an asset-id suffix"
+        );
+
+        fs::write(&paired_mov, vec![0u8; 2_266_088]).unwrap();
+        dir_cache.clear();
+        let tasks = filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        assert!(
+            tasks.is_empty(),
+            "existing dedup-paired MOV must skip instead of planning a duplicate"
         );
     }
 
