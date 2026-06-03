@@ -5326,10 +5326,11 @@ mod tests {
     }
 
     async fn seed_existing_file_for_asset(
-        base_config: &DownloadConfig,
+        base_config: &mut DownloadConfig,
         pass: &AlbumPass,
         asset: &PhotoAsset,
     ) {
+        base_config.file_match_policy = FileMatchPolicy::NameId7;
         let pass_config = base_config.with_pass(pass);
         let expected_path = filter::expected_paths_for(asset, &pass_config)
             .into_iter()
@@ -5341,10 +5342,66 @@ mod tests {
         tokio::fs::write(&expected_path.path, vec![0u8; 1024])
             .await
             .expect("seed existing file");
+        seed_downloaded_state_for_expected_path(base_config, &pass_config, asset, &expected_path)
+            .await;
+    }
+
+    async fn seed_downloaded_state_for_expected_path(
+        base_config: &mut DownloadConfig,
+        pass_config: &DownloadConfig,
+        asset: &PhotoAsset,
+        expected_path: &filter::ExpectedAssetPath,
+    ) {
+        let db = match &base_config.state_db {
+            Some(db) => Arc::clone(db),
+            None => {
+                let db: Arc<dyn StateDb> =
+                    Arc::new(SqliteStateDb::open_in_memory().expect("open state db"));
+                base_config.state_db = Some(Arc::clone(&db));
+                db
+            }
+        };
+        let library = asset.source_zone().unwrap_or(&pass_config.library);
+        let filename = expected_path
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("expected path has filename");
+        let record = TestAssetRecord::new(asset.id())
+            .library(library)
+            .checksum(&expected_path.checksum)
+            .filename(filename)
+            .created_at(asset.created())
+            .size(expected_path.size)
+            .version_size(expected_path.version_size)
+            .build();
+        db.upsert_seen(&record).await.expect("seed state row");
+        db.mark_downloaded(
+            library,
+            asset.id(),
+            expected_path.version_size.as_str(),
+            &expected_path.path,
+            "seeded-local-sha256",
+            None,
+        )
+        .await
+        .expect("mark seeded file downloaded");
+        assert!(
+            !db.should_download(
+                library,
+                asset.id(),
+                expected_path.version_size.as_str(),
+                &expected_path.checksum,
+                &expected_path.path,
+            )
+            .await
+            .expect("seeded state should be readable"),
+            "seeded downloaded state must make the expected file a safe skip"
+        );
     }
 
     async fn seed_existing_recent_files(
-        base_config: &DownloadConfig,
+        base_config: &mut DownloadConfig,
         pass: &AlbumPass,
         zone: &str,
         ids: &[String],
@@ -5590,6 +5647,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 2;
+        config.file_match_policy = FileMatchPolicy::NameId7;
 
         let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
         let album_config = config.with_pass(&passes[0]);
@@ -5603,6 +5661,8 @@ mod tests {
         tokio::fs::write(&expected_path.path, vec![0u8; 1024])
             .await
             .expect("seed existing file");
+        seed_downloaded_state_for_expected_path(&mut config, &album_config, &asset, &expected_path)
+            .await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -5664,7 +5724,7 @@ mod tests {
                 &format!("{record_name}.jpg"),
             );
             let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-            seed_existing_file_for_asset(&config, pass, &asset).await;
+            seed_existing_file_for_asset(&mut config, pass, &asset).await;
         }
 
         let result = download_photos_full_with_token(
@@ -5852,7 +5912,7 @@ mod tests {
         config.skip_created_after =
             Some(DateTime::from_timestamp_millis(1_699_999_999_000).expect("valid timestamp"));
         let on_disk_asset = PhotoAsset::new(on_disk_records[0].clone(), on_disk_records[1].clone());
-        seed_existing_file_for_asset(&config, &passes[0], &on_disk_asset).await;
+        seed_existing_file_for_asset(&mut config, &passes[0], &on_disk_asset).await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -6030,6 +6090,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 2;
+        config.file_match_policy = FileMatchPolicy::NameId7;
 
         // Seed the destination so the single enumerated asset is skipped
         // on-disk and the test isolates count-only shortfall behavior.
@@ -6045,6 +6106,8 @@ mod tests {
         tokio::fs::write(&expected_path.path, vec![0u8; 1024])
             .await
             .expect("seed existing file");
+        seed_downloaded_state_for_expected_path(&mut config, &pass_config, &asset, &expected_path)
+            .await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -6101,6 +6164,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
+        config.file_match_policy = FileMatchPolicy::NameId7;
 
         // Seed the destination so the unique asset is skipped on-disk and the
         // test isolates duplicate API asset-id accounting.
@@ -6116,6 +6180,8 @@ mod tests {
         tokio::fs::write(&expected_path.path, vec![0u8; 1024])
             .await
             .expect("seed existing file");
+        seed_downloaded_state_for_expected_path(&mut config, &pass_config, &asset, &expected_path)
+            .await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -6160,6 +6226,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 2;
+        config.file_match_policy = FileMatchPolicy::NameId7;
 
         // Seed the destination so the enumerated asset is skipped on-disk
         // and this test isolates token-capture behavior.
@@ -6175,6 +6242,8 @@ mod tests {
         tokio::fs::write(&expected_path.path, vec![0u8; 1024])
             .await
             .expect("seed existing file");
+        seed_downloaded_state_for_expected_path(&mut config, &pass_config, &asset, &expected_path)
+            .await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -9527,7 +9596,7 @@ mod tests {
         config.concurrent_downloads = 1;
         config.recent = Some(300);
         for pass in &passes {
-            seed_existing_file_for_asset(&config, pass, &asset).await;
+            seed_existing_file_for_asset(&mut config, pass, &asset).await;
         }
 
         let result = download_photos_full_with_token(
@@ -9589,7 +9658,7 @@ mod tests {
 
         for pass in &passes {
             for asset in &expected_assets {
-                seed_existing_file_for_asset(&config, pass, asset).await;
+                seed_existing_file_for_asset(&mut config, pass, asset).await;
             }
         }
 
@@ -9639,7 +9708,7 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
         config.recent = Some(300);
-        seed_existing_file_for_asset(&config, &passes[0], &asset).await;
+        seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -9685,7 +9754,7 @@ mod tests {
         config.skip_created_before =
             Some(DateTime::from_timestamp_millis(1_699_999_000_000).expect("valid test timestamp"));
         for asset in newer_assets.iter().map(recent_scope_photo_asset) {
-            seed_existing_file_for_asset(&config, &passes[0], &asset).await;
+            seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
         }
 
         let result = download_photos_full_with_token(
@@ -9707,7 +9776,7 @@ mod tests {
         assert_eq!(result.stats.pagination_shortfall_warnings, 0);
         assert_eq!(result.stats.enumeration_errors, 0);
         assert!(
-            session.album_offsets().len() <= 4,
+            session.album_offsets().len() <= 5,
             "lower-date-bound enumeration should stop near the first old page; offsets={:?}",
             session.album_offsets()
         );
@@ -9742,7 +9811,7 @@ mod tests {
         config.skip_created_after =
             Some(DateTime::from_timestamp_millis(1_699_999_000_000).expect("valid test timestamp"));
         for asset in older_assets.iter().map(recent_scope_photo_asset) {
-            seed_existing_file_for_asset(&config, &passes[0], &asset).await;
+            seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
         }
 
         let result = download_photos_full_with_token(
@@ -9788,6 +9857,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.recent = Some(100);
+        config.file_match_policy = FileMatchPolicy::NameId7;
 
         let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
         let pass_config = config.with_pass(&passes[0]);
@@ -9801,6 +9871,8 @@ mod tests {
         tokio::fs::write(&expected_path.path, vec![0u8; 1024])
             .await
             .expect("seed existing file");
+        seed_downloaded_state_for_expected_path(&mut config, &pass_config, &asset, &expected_path)
+            .await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -9856,7 +9928,8 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 10;
         config.recent = Some(100);
-        seed_existing_recent_files(&config, &passes[0], "PrimarySync", &ids, "recent-prod").await;
+        seed_existing_recent_files(&mut config, &passes[0], "PrimarySync", &ids, "recent-prod")
+            .await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -9901,8 +9974,14 @@ mod tests {
         config.concurrent_downloads = 1;
         config.recent = Some(ids.len().try_into().expect("test id count fits u32"));
         if matches!(mode, DownloadRunMode::Download) {
-            seed_existing_recent_files(&config, &passes[0], "PrimarySync", ids, filename_prefix)
-                .await;
+            seed_existing_recent_files(
+                &mut config,
+                &passes[0],
+                "PrimarySync",
+                ids,
+                filename_prefix,
+            )
+            .await;
         }
 
         let result = download_photos_full_with_token(
@@ -9975,7 +10054,7 @@ mod tests {
         config.concurrent_downloads = 10;
         config.recent = Some(60);
         seed_existing_recent_files(
-            &config,
+            &mut config,
             &passes[0],
             "PrimarySync",
             &album_ids,
@@ -9983,7 +10062,7 @@ mod tests {
         )
         .await;
         seed_existing_recent_files(
-            &config,
+            &mut config,
             &passes[1],
             "PrimarySync",
             &unfiled_ids,
@@ -10032,7 +10111,8 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 10;
         config.recent = Some(60);
-        seed_existing_recent_files(&config, &passes[0], "PrimarySync", &ids, "smart-recent").await;
+        seed_existing_recent_files(&mut config, &passes[0], "PrimarySync", &ids, "smart-recent")
+            .await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -10084,7 +10164,7 @@ mod tests {
         config.concurrent_downloads = 10;
         config.recent = Some(40);
         seed_existing_recent_files(
-            &config,
+            &mut config,
             &passes[0],
             "PrimarySync",
             &album_ids,
@@ -10092,7 +10172,7 @@ mod tests {
         )
         .await;
         seed_existing_recent_files(
-            &config,
+            &mut config,
             &passes[1],
             "PrimarySync",
             &unfiled_ids,

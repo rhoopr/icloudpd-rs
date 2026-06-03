@@ -317,6 +317,16 @@ fn asset_record_for_derived_path(
     .with_metadata_arc(asset.metadata_arc())
 }
 
+fn pending_versions_for_asset<'a>(
+    ctx: &'a DownloadContext,
+    library: &str,
+    asset: &PhotoAsset,
+) -> Option<&'a FxHashSet<Box<str>>> {
+    ctx.pending_ids
+        .get(library)
+        .and_then(|assets| assets.get(asset.id()))
+}
+
 async fn adopt_pending_on_disk_skip(
     state_db: Option<&dyn StateDb>,
     config: &DownloadConfig,
@@ -328,10 +338,7 @@ async fn adopt_pending_on_disk_skip(
         return 0;
     };
     let library = effective_asset_library(asset, config);
-    let pending_versions = ctx
-        .pending_ids
-        .get(library)
-        .and_then(|assets| assets.get(asset.id()));
+    let pending_versions = pending_versions_for_asset(ctx, library, asset);
     let Some(pending_versions) = pending_versions else {
         return 0;
     };
@@ -342,74 +349,113 @@ async fn adopt_pending_on_disk_skip(
         if !pending_versions.contains(version_size) {
             continue;
         }
-        let Some(existing_path) = task_planner.existing_path(&derived.path) else {
-            continue;
-        };
-        let Ok(metadata) = tokio::fs::metadata(&existing_path).await else {
-            continue;
-        };
-        if metadata.len() != derived.size {
-            continue;
-        }
-
-        let record = asset_record_for_derived_path(
-            effective_asset_library_arc(asset, config),
-            asset,
-            &derived,
-        );
-        if let Err(e) = db.upsert_seen(&record).await {
-            tracing::warn!(
-                asset_id = %asset.id(),
-                version_size,
-                error = %e,
-                "Failed to refresh pending asset before adopting on-disk file"
-            );
-            continue;
-        }
-
-        let local_checksum = match super::file::compute_sha256(&existing_path).await {
-            Ok(checksum) => checksum,
-            Err(e) => {
-                tracing::warn!(
-                    asset_id = %asset.id(),
-                    version_size,
-                    path = %existing_path.display(),
-                    error = %e,
-                    "Failed to hash on-disk file for pending asset"
-                );
-                continue;
-            }
-        };
-        if let Err(e) = db
-            .mark_downloaded(
-                library,
-                asset.id(),
-                version_size,
-                &existing_path,
-                &local_checksum,
-                None,
-            )
+        if adopt_pending_derived_path(db, library, asset, task_planner, &derived)
             .await
+            .is_some()
         {
+            adopted += 1;
+        }
+    }
+
+    adopted
+}
+
+async fn adopt_pending_on_disk_task(
+    state_db: Option<&dyn StateDb>,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+    ctx: &DownloadContext,
+    task_planner: &mut TaskPlanner,
+    task: &DownloadTask,
+) -> Option<PathBuf> {
+    let db = state_db?;
+    let library = effective_asset_library(asset, config);
+    let pending_versions = pending_versions_for_asset(ctx, library, asset)?;
+    if !pending_versions.contains(task.version_size.as_str()) {
+        return None;
+    }
+
+    for derived in derive_expected_paths(asset, config) {
+        if derived.version_size != task.version_size {
+            continue;
+        }
+        if let Some(path) =
+            adopt_pending_derived_path(db, library, asset, task_planner, &derived).await
+        {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+async fn adopt_pending_derived_path(
+    db: &dyn StateDb,
+    library: &str,
+    asset: &PhotoAsset,
+    task_planner: &mut TaskPlanner,
+    derived: &DerivedPath,
+) -> Option<PathBuf> {
+    let version_size = derived.version_size.as_str();
+    let existing_path = task_planner.existing_path(&derived.path)?;
+    let Ok(metadata) = tokio::fs::metadata(&existing_path).await else {
+        return None;
+    };
+    if metadata.len() != derived.size {
+        return None;
+    }
+
+    let record = asset_record_for_derived_path(Arc::from(library), asset, derived);
+    if let Err(e) = db.upsert_seen(&record).await {
+        tracing::warn!(
+            asset_id = %asset.id(),
+            version_size,
+            error = %e,
+            "Failed to refresh pending asset before adopting on-disk file"
+        );
+        return None;
+    }
+
+    let local_checksum = match super::file::compute_sha256(&existing_path).await {
+        Ok(checksum) => checksum,
+        Err(e) => {
             tracing::warn!(
                 asset_id = %asset.id(),
                 version_size,
                 path = %existing_path.display(),
                 error = %e,
-                "Failed to mark pending asset downloaded from on-disk file"
+                "Failed to hash on-disk file for pending asset"
             );
-            continue;
+            return None;
         }
-        tracing::info!(
+    };
+    if let Err(e) = db
+        .mark_downloaded(
+            library,
+            asset.id(),
+            version_size,
+            &existing_path,
+            &local_checksum,
+            None,
+        )
+        .await
+    {
+        tracing::warn!(
             asset_id = %asset.id(),
             version_size,
             path = %existing_path.display(),
-            "Resolved pending asset from existing on-disk file"
+            error = %e,
+            "Failed to mark pending asset downloaded from on-disk file"
         );
-        adopted += 1;
+        return None;
     }
-
-    adopted
+    tracing::info!(
+        asset_id = %asset.id(),
+        version_size,
+        path = %existing_path.display(),
+        "Resolved pending asset from existing on-disk file"
+    );
+    Some(existing_path)
 }
 
 fn state_confirmed_current_path_exists(
@@ -1616,6 +1662,25 @@ where
                                     }
                                 }
 
+                                if let Some(existing_path) = adopt_pending_on_disk_task(
+                                    producer_state_db.as_deref(),
+                                    config,
+                                    &asset,
+                                    &download_ctx,
+                                    &mut task_planner,
+                                    &task,
+                                )
+                                .await
+                                {
+                                    disposition = disposition.max(AssetDisposition::OnDisk);
+                                    tracing::debug!(
+                                        asset_id = %task.asset_id,
+                                        path = %existing_path.display(),
+                                        "Skipping (pending state adopted existing file)"
+                                    );
+                                    continue;
+                                }
+
                                 match download_ctx.should_download_fast(
                                     &task.library,
                                     &task.asset_id,
@@ -1663,6 +1728,13 @@ where
                                                 path = %existing_path.display(),
                                                 "Skipping (state path exists on disk)"
                                             );
+                                            backfill_downloaded_metadata_for_on_disk_skip(
+                                                producer_state_db.as_deref(),
+                                                config,
+                                                &asset,
+                                                &download_ctx,
+                                            )
+                                            .await;
                                             continue;
                                         }
 
@@ -5193,15 +5265,15 @@ mod tests {
         assert_eq!(summary.failed, 0);
     }
 
-    /// Producer-side regression for resolving pending rows on on-disk skip.
+    /// Producer-side regression for resolving pending rows when the expected
+    /// file already exists on disk.
     ///
     /// A pending row carried over from a prior interrupted sync, whose
-    /// new sync hits the on-disk-skip path (the `tasks.is_empty()`
-    /// branch at the producer's filter step), must be adopted as downloaded
-    /// when the expected file already exists with the same name and size.
+    /// new sync sees the expected file at the natural path, must be adopted as
+    /// downloaded when the file already exists with the same name and size.
     /// Otherwise standard sync resets failed assets to pending, full
-    /// enumeration skips the already-present file, and the same row is
-    /// promoted back to failed every run.
+    /// enumeration routes the path collision through a deterministic alternate
+    /// path, and the same row is promoted back to failed every run.
     #[tokio::test]
     async fn producer_adopts_pending_on_disk_skip_as_downloaded() {
         use crate::download::DownloadConfig;
@@ -5241,8 +5313,9 @@ mod tests {
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
 
-        // Pre-create the on-disk file at the path the producer will compute
-        // so `filter_asset_to_tasks` returns no tasks.
+        // Pre-create the on-disk file at the expected natural path. The path
+        // layer now emits an identity collision task for this same-size file,
+        // so the producer must still adopt the pending row before forwarding.
         let asset = carryover_asset();
         let target_path = crate::download::filter::expected_paths_for(&asset, &config)
             .first()
@@ -5279,6 +5352,54 @@ mod tests {
         assert_eq!(summary.downloaded, 1);
         assert_eq!(summary.pending, 0);
         assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn producer_plans_distinct_same_path_same_size_assets() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let asset_a = TestPhotoAsset::new("SAME_SIZE_A")
+            .filename("IMG_0001.JPG")
+            .orig_size(5000)
+            .orig_url("https://p01.icloud-content.com/a.jpg")
+            .orig_checksum("ck_same_size_a")
+            .build();
+        let asset_b = TestPhotoAsset::new("SAME_SIZE_B")
+            .filename("IMG_0001.JPG")
+            .orig_size(5000)
+            .orig_url("https://p01.icloud-content.com/b.jpg")
+            .orig_checksum("ck_same_size_b")
+            .build();
+
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        let config = Arc::new(config);
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![
+                Ok::<PhotoAsset, anyhow::Error>(asset_a),
+                Ok::<PhotoAsset, anyhow::Error>(asset_b),
+            ]),
+            &config,
+            DownloadControls::dry_run_hidden(),
+            2,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("same-size collision planning should complete");
+
+        assert_eq!(result.downloaded, 2, "unexpected result: {result:?}");
+        assert!(result.failed.is_empty());
+        assert!(
+            fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "dry-run planning must not create files"
+        );
     }
 
     /// v5 metadata backfill regression: a previously downloaded row with a

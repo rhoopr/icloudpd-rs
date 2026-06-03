@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planner_skips_existing_same_size_file_on_disk() {
+    async fn planner_routes_existing_same_size_file_to_identity_path() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let asset = TestPhotoAsset::new("ON_DISK")
@@ -310,7 +310,16 @@ mod tests {
         let mut second = TaskPlanner::new();
         let plan = second.plan_asset(&asset, &config).await;
         assert_eq!(plan.filter_reason, None);
-        assert!(plan.tasks.is_empty(), "existing same-size file should skip");
+        assert_eq!(plan.tasks.len(), 1);
+        assert!(
+            plan.tasks[0]
+                .download_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("ON_DISK")),
+            "same-size on-disk collision should use an identity path: {:?}",
+            plan.tasks[0].download_path
+        );
     }
 
     #[tokio::test]

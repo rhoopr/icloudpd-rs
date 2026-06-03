@@ -1108,7 +1108,9 @@ pub(super) async fn pre_ensure_asset_dir(
 /// How to resolve a path that collides with an existing file or in-flight download.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CollisionStrategy {
-    /// Compare sizes: same size = skip, different size = generate a dedup path.
+    /// Compare sizes to detect collisions and choose a deterministic alternate
+    /// path. Same-name/same-size is not enough identity to skip; the caller's
+    /// state-backed path check owns safe skips for already-downloaded assets.
     /// When `skip_zero_size` is true, a version with size 0 is treated as
     /// "size unknown" and never matches (always dedup).
     SizeDedup { skip_zero_size: bool },
@@ -1149,6 +1151,108 @@ struct ResolveContext<'a> {
     dir_cache: &'a mut paths::DirCache,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollisionFilenameKind {
+    /// The policy's historical collision filename: size suffix for primary
+    /// media, asset-id suffix for live-photo MOV companions.
+    Default,
+    /// Asset-id suffix. Used when a same-size collision cannot be proven to be
+    /// the same asset/version by the state layer.
+    AssetIdentity,
+    /// Stable fallback when the plain asset-id path is also occupied.
+    AssetIdentityOrdinal(u64),
+}
+
+fn size_or_identity_collision_filename(
+    filename: &str,
+    size: u64,
+    asset_id: &str,
+    kind: CollisionFilenameKind,
+) -> String {
+    match kind {
+        CollisionFilenameKind::Default => paths::add_dedup_suffix(filename, size),
+        CollisionFilenameKind::AssetIdentity => paths::insert_suffix(filename, asset_id),
+        CollisionFilenameKind::AssetIdentityOrdinal(n) => {
+            paths::insert_suffix(filename, &format!("{asset_id}-{n}"))
+        }
+    }
+}
+
+fn identity_collision_filename(
+    filename: &str,
+    asset_id: &str,
+    kind: CollisionFilenameKind,
+) -> String {
+    match kind {
+        CollisionFilenameKind::Default | CollisionFilenameKind::AssetIdentity => {
+            paths::insert_suffix(filename, asset_id)
+        }
+        CollisionFilenameKind::AssetIdentityOrdinal(n) => {
+            paths::insert_suffix(filename, &format!("{asset_id}-{n}"))
+        }
+    }
+}
+
+fn collision_path_for_filename(ctx: &ResolveContext<'_>, filename: &str) -> PathBuf {
+    paths::local_download_path(
+        &ctx.config.directory,
+        &ctx.config.folder_structure,
+        ctx.created_local,
+        filename,
+        ctx.config.album_name.as_deref(),
+    )
+}
+
+fn first_available_collision_path(
+    ctx: &mut ResolveContext<'_>,
+    preferred: CollisionFilenameKind,
+    make_filename: impl Fn(CollisionFilenameKind) -> String,
+) -> PathBuf {
+    let mut tried = SmallVec::<[Box<str>; 4]>::new();
+
+    for kind in [preferred, CollisionFilenameKind::AssetIdentity] {
+        if let Some(path) = available_collision_path(ctx, &make_filename, kind, &mut tried) {
+            return path;
+        }
+    }
+
+    let mut ordinal = 2u64;
+    loop {
+        if let Some(path) = available_collision_path(
+            ctx,
+            &make_filename,
+            CollisionFilenameKind::AssetIdentityOrdinal(ordinal),
+            &mut tried,
+        ) {
+            return path;
+        }
+        ordinal = ordinal.checked_add(1).unwrap_or(2);
+    }
+}
+
+fn available_collision_path(
+    ctx: &mut ResolveContext<'_>,
+    make_filename: &impl Fn(CollisionFilenameKind) -> String,
+    kind: CollisionFilenameKind,
+    tried: &mut SmallVec<[Box<str>; 4]>,
+) -> Option<PathBuf> {
+    let filename = make_filename(kind);
+    let path = collision_path_for_filename(ctx, &filename);
+    let normalized = NormalizedPath::normalize(&path).into_owned();
+    if tried.iter().any(|seen| seen.as_ref() == normalized) {
+        return None;
+    }
+
+    let unavailable =
+        ctx.dir_cache.exists(&path) || ctx.claimed_paths.contains_key(normalized.as_str());
+    tried.push(normalized.into_boxed_str());
+    if unavailable {
+        None
+    } else {
+        Some(path)
+    }
+}
+
 /// Resolve the final download path for a single version, handling on-disk
 /// files, AM/PM whitespace variants, and in-flight claimed paths.
 ///
@@ -1158,8 +1262,8 @@ struct ResolveContext<'a> {
 /// `check_ampm`: when true, also checks AM/PM whitespace variants on disk
 /// (relevant for primary photos whose timestamps contain AM/PM).
 ///
-/// `make_dedup_filename`: called when a collision with a different-sized file
-/// is detected. Returns the deduplicated filename to try.
+/// `make_collision_filename`: called when a collision is detected. Returns the
+/// deterministic alternate filename to try.
 fn resolve_download_path(
     download_path: &Path,
     version_size: u64,
@@ -1167,7 +1271,7 @@ fn resolve_download_path(
     strategy: CollisionStrategy,
     ctx: &mut ResolveContext<'_>,
     check_ampm: bool,
-    make_dedup_filename: impl FnOnce() -> String,
+    make_collision_filename: impl Fn(CollisionFilenameKind) -> String,
     label: &str,
 ) -> PathResolution {
     // Check for the file on disk. For primary photos, also check AM/PM
@@ -1223,72 +1327,35 @@ fn resolve_download_path(
             let sizes_match =
                 (!skip_zero_size || version_size > 0) && existing_size == version_size;
 
-            if sizes_match {
-                if source == "on-disk" {
-                    tracing::info!(
-                        asset_id,
-                        path = %download_path.display(),
-                        size = version_size,
-                        "Skipping {label}: file exists with same name and size"
-                    );
-                } else {
-                    tracing::info!(
-                        asset_id,
-                        path = %download_path.display(),
-                        size = version_size,
-                        "Skipping {label}: {source} download has same name and size"
-                    );
-                }
-                return PathResolution::Skip(matched_path);
-            }
-
-            // Different size -- deduplicate.
-            let dedup_filename = make_dedup_filename();
-            let dedup_path = paths::local_download_path(
-                &ctx.config.directory,
-                &ctx.config.folder_structure,
-                ctx.created_local,
-                &dedup_filename,
-                ctx.config.album_name.as_deref(),
-            );
-            let dedup_key = NormalizedPath::normalize(&dedup_path);
-            let dedup_exists = ctx.dir_cache.exists(&dedup_path);
-            let dedup_claimed = ctx.claimed_paths.contains_key(dedup_key.as_ref());
-            if dedup_exists || dedup_claimed {
-                if source == "on-disk" {
-                    tracing::info!(
-                        asset_id,
-                        path = %dedup_path.display(),
-                        "Skipping {label}: dedup path already exists"
-                    );
-                } else {
-                    tracing::info!(
-                        asset_id,
-                        path = %dedup_path.display(),
-                        "Skipping {label}: dedup path already claimed in-flight"
-                    );
-                }
-                PathResolution::Skip(dedup_path)
+            let preferred = if sizes_match {
+                CollisionFilenameKind::AssetIdentity
             } else {
-                if source == "on-disk" {
-                    tracing::debug!(
-                        path = %download_path.display(),
-                        on_disk_size = existing_size,
-                        expected_size = version_size,
-                        dedup_path = %dedup_path.display(),
-                        "{label} collision: already exists with different size"
-                    );
-                } else {
-                    tracing::debug!(
-                        path = %download_path.display(),
-                        claimed_size = existing_size,
-                        expected_size = version_size,
-                        dedup_path = %dedup_path.display(),
-                        "{label} {source} collision: claimed with different size"
-                    );
-                }
-                PathResolution::Download(dedup_path)
+                CollisionFilenameKind::Default
+            };
+            let collision_path =
+                first_available_collision_path(ctx, preferred, make_collision_filename);
+            if source == "on-disk" {
+                tracing::debug!(
+                    asset_id,
+                    path = %download_path.display(),
+                    on_disk_size = existing_size,
+                    expected_size = version_size,
+                    collision_path = %collision_path.display(),
+                    same_size = sizes_match,
+                    "Resolved {label} path collision"
+                );
+            } else {
+                tracing::debug!(
+                    asset_id,
+                    path = %download_path.display(),
+                    claimed_size = existing_size,
+                    expected_size = version_size,
+                    collision_path = %collision_path.display(),
+                    same_size = sizes_match,
+                    "Resolved {label} {source} path collision"
+                );
             }
+            PathResolution::Download(collision_path)
         }
     }
 }
@@ -1377,7 +1444,7 @@ pub(super) fn filter_asset_to_tasks(
                 strategy,
                 &mut rctx,
                 check_ampm_on_disk,
-                || paths::add_dedup_suffix(&filename, size),
+                |kind| size_or_identity_collision_filename(&filename, size, asset.id(), kind),
                 "asset",
             )
         };
@@ -1436,7 +1503,7 @@ pub(super) fn filter_asset_to_tasks(
                 },
                 &mut rctx,
                 check_ampm_on_disk,
-                || paths::add_dedup_suffix(&filename, size),
+                |kind| size_or_identity_collision_filename(&filename, size, asset.id(), kind),
                 "asset extra",
             )
             .download_path()
@@ -1492,7 +1559,7 @@ pub(super) fn filter_asset_to_tasks(
                 },
                 &mut rctx,
                 check_ampm_on_disk,
-                || paths::insert_suffix(&filename, asset_id),
+                |kind| identity_collision_filename(&filename, asset_id, kind),
                 "live photo MOV",
             )
             .download_path()
@@ -2817,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_skips_existing_file() {
+    fn test_filter_routes_existing_same_size_file_to_identity_path_without_state() {
         let dir = TempDir::new().unwrap();
         let asset = TestPhotoAsset::new("TEST_1").build();
         let mut config = test_config();
@@ -2827,10 +2894,22 @@ mod tests {
         let tasks = filter_asset_fresh(&asset, &config);
         assert_eq!(tasks.len(), 1);
 
-        // Create the file with matching size (1000 bytes), second call should skip
+        // Create the file with matching size (1000 bytes). The path layer no
+        // longer treats same name + same size as proof of identity; production
+        // state checks own safe already-downloaded skips.
         fs::create_dir_all(tasks[0].download_path.parent().unwrap()).unwrap();
         fs::write(&tasks[0].download_path, vec![0u8; 1000]).unwrap();
-        assert!(filter_asset_fresh(&asset, &config).is_empty());
+        let tasks = filter_asset_fresh(&asset, &config);
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            tasks[0]
+                .download_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("TEST_1")),
+            "same-size collision must use an identity path, got {:?}",
+            tasks[0].download_path
+        );
     }
 
     #[test]
@@ -2930,10 +3009,20 @@ mod tests {
         fs::create_dir_all(tasks[1].download_path.parent().unwrap()).unwrap();
         fs::write(&tasks[1].download_path, vec![0u8; 3000]).unwrap();
 
-        // Second call: only the photo task (MOV already exists with matching size)
+        // Second call: the MOV cannot be proven identical by path+size alone,
+        // so it is routed to an identity collision path.
         let tasks = filter_asset_fresh(&asset, &config);
-        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks.len(), 2);
         assert_eq!(&*tasks[0].url, "https://p01.icloud-content.com/heic_orig");
+        assert!(
+            tasks[1]
+                .download_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("LIVE_1")),
+            "same-size MOV collision must use an identity path, got {:?}",
+            tasks[1].download_path
+        );
     }
 
     #[test]
@@ -3087,20 +3176,30 @@ mod tests {
         let tasks = filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
         assert_eq!(
             tasks.len(),
-            1,
-            "only the missing paired MOV should be planned"
+            2,
+            "without state identity, the existing same-size HEIC is routed to an identity path"
         );
-        assert_eq!(
-            tasks[0].download_path, paired_mov,
-            "MOV must inherit the existing deduped HEIC stem instead of falling back to an asset-id suffix"
+        assert!(
+            tasks[0]
+                .download_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("AV0P9wRWvFhGzyYKSmpJu89S3bY6")),
+            "same-size HEIC collision must use an identity path: {:?}",
+            tasks[0].download_path
+        );
+        assert_ne!(
+            tasks[1].download_path, paired_mov,
+            "MOV pairing follows the newly planned identity-path primary when state has not proven the existing HEIC"
         );
 
         fs::write(&paired_mov, vec![0u8; 2_266_088]).unwrap();
         dir_cache.clear();
         let tasks = filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
-        assert!(
-            tasks.is_empty(),
-            "existing dedup-paired MOV must skip instead of planning a duplicate"
+        assert_eq!(
+            tasks.len(),
+            2,
+            "same-size existing HEIC/MOV files are not safe skips without state identity"
         );
     }
 
@@ -4434,13 +4533,11 @@ mod tests {
         );
     }
 
-    /// A path pre-seeded into claimed_paths (as a startup load from the
-    /// state DB's downloaded rows would do) must case-insensitively match
-    /// an incoming asset's target and dedupe it — otherwise cross-batch
-    /// collisions silently overwrite prior downloads on case-insensitive
-    /// filesystems.
+    /// A path pre-seeded into claimed_paths must case-insensitively match an
+    /// incoming asset's target and route it to a collision path. Same size is
+    /// not proof that the claimed file is the same asset/version.
     #[test]
-    fn filter_cross_batch_case_insensitive_collision_is_deduped() {
+    fn filter_cross_batch_case_insensitive_same_size_collision_uses_identity_path() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.directory = std::sync::Arc::from(dir.path());
@@ -4462,10 +4559,14 @@ mod tests {
         let mut dir_cache = paths::DirCache::new();
         let second_tasks =
             filter_asset_to_tasks(&asset, &config, &mut claimed_paths, &mut dir_cache);
+        assert_eq!(second_tasks.len(), 1);
         assert!(
-            second_tasks.is_empty(),
-            "asset whose target path case-insensitively matches a claimed \
-             path of the same size must be skipped; got tasks: {second_tasks:?}"
+            second_tasks[0]
+                .download_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("CROSS_BATCH_1")),
+            "same-size claimed-path collision must use an identity path: {second_tasks:?}"
         );
     }
 
@@ -4914,15 +5015,10 @@ mod tests {
         assert!(tasks[0].download_path.to_str().unwrap().contains(".MOV"));
     }
 
-    // ── Gap: two assets with same filename, same date, same size ──────
-    //
-    // When two distinct iCloud assets resolve to the same local path AND have
-    // the same file size, the NameSizeDedupWithSuffix policy treats the second
-    // as "already present" and silently skips it. This is by design -- but
-    // there was no test verifying this exact scenario.
+    // ── Same filename, same date, same size collision ─────────────────
 
     #[test]
-    fn filter_two_assets_same_path_same_size_second_skipped() {
+    fn filter_two_assets_same_path_same_size_second_uses_identity_path() {
         // Arrange: two assets with identical filename, date, and size but
         // different checksums (different photos that happen to share a name).
         let asset_a = TestPhotoAsset::new("ASSET_A")
@@ -4946,12 +5042,22 @@ mod tests {
         let tasks_a = filter_asset_to_tasks(&asset_a, &config, &mut claimed_paths, &mut dir_cache);
         let tasks_b = filter_asset_to_tasks(&asset_b, &config, &mut claimed_paths, &mut dir_cache);
 
-        // Assert: first asset gets a task, second is skipped (same size = "match")
+        // Assert: first asset gets the natural path, second gets an identity
+        // collision path instead of being silently skipped.
         assert_eq!(tasks_a.len(), 1, "first asset should produce a task");
+        assert_eq!(
+            tasks_b.len(),
+            1,
+            "second asset with same path and same size must not be skipped"
+        );
         assert!(
-            tasks_b.is_empty(),
-            "second asset with same path and same size should be skipped, but got {} tasks",
-            tasks_b.len()
+            tasks_b[0]
+                .download_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("ASSET_B")),
+            "second asset should use an identity collision path, got {:?}",
+            tasks_b[0].download_path
         );
     }
 
@@ -5092,8 +5198,12 @@ mod tests {
         let second = run_collision_set(dir.path(), &assets);
         assert_eq!(first, second, "collision resolution must be deterministic");
         assert!(
-            first[1].is_empty(),
-            "same filename and same size should be treated as the same on-disk file"
+            first[1][0]
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("REP_B")),
+            "same filename and same size should get an identity collision path: {:?}",
+            first[1]
         );
         assert!(
             first[2][0]
@@ -5261,15 +5371,16 @@ mod tests {
         fs::create_dir_all(final_path.parent().unwrap()).unwrap();
         fs::write(&final_path, vec![0u8; 1000]).unwrap();
 
-        // Step 3: re-run filter against the same asset. Crash recovery
-        // must skip without re-emitting a task, even though no DB row
-        // backs the file.
+        // Step 3: re-run filter against the same asset. The path layer must
+        // not silently skip based on same name + same size; producer state
+        // adoption owns the post-rename crash recovery path.
         let tasks_post = filter_asset_fresh(&asset, &config);
-        assert!(
-            tasks_post.is_empty(),
-            "post-kill rerun must skip via on-disk detection \
-             (file exists at {final_path:?} with matching size); \
-             got tasks: {tasks_post:?}",
+        assert_eq!(
+            tasks_post.len(),
+            1,
+            "post-kill filter rerun should emit an identity collision task; \
+             producer state adoption handles the pending DB row. final_path={final_path:?}, \
+             tasks={tasks_post:?}",
         );
     }
 
@@ -5340,10 +5451,11 @@ mod tests {
         let asset = post_rename_pre_state_crash_asset();
         let config = post_rename_pre_state_config(&download_dir);
         let tasks_post = filter_asset_fresh(&asset, &config);
-        assert!(
-            tasks_post.is_empty(),
-            "post-kill rerun must skip via on-disk detection even when the DB \
-             row is still pending; got tasks: {tasks_post:?}"
+        assert_eq!(
+            tasks_post.len(),
+            1,
+            "filter must not silently skip a same-size on-disk file; producer \
+             state adoption handles the pending row. got tasks: {tasks_post:?}"
         );
     }
 
