@@ -379,7 +379,32 @@ pub(crate) fn available_disk_space(path: &Path) -> Option<u64> {
     Some(widen(stat.f_bavail) * widen(stat.f_frsize))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn available_disk_space(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_bytes_available = 0u64;
+    // SAFETY: `wide_path` is a NUL-terminated UTF-16 string that outlives
+    // the call. The output pointers are valid for writes for the duration of
+    // the call, and null total-byte pointers are allowed by the Win32 API.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide_path.as_ptr(),
+            &raw mut free_bytes_available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free_bytes_available)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn available_disk_space(_path: &Path) -> Option<u64> {
     None
 }
