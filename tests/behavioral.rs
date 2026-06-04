@@ -1973,7 +1973,7 @@ fn password_command_failure() {
         .assert()
         .code(3)
         .stderr(
-            predicate::str::contains("No password available")
+            predicate::str::contains("No password was available")
                 .or(predicate::str::contains("exited with status")),
         );
 }
