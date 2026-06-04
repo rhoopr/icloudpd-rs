@@ -460,9 +460,7 @@ fn import_existing_requires_directory() {
         .args(["import-existing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "[download] directory is required for import-existing",
-        ));
+        .stderr(predicate::str::contains("Set [download].directory"));
 }
 
 // ── Removed durable boolean flags fail ─────────────────────────────────
@@ -932,7 +930,7 @@ fn exit_code_1_on_missing_username() {
         .timeout(std::time::Duration::from_secs(30))
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("username is required"));
+        .stderr(predicate::str::contains("Set your iCloud username"));
 }
 
 /// Exit code 3 (auth failure) when password file is empty.
@@ -966,7 +964,7 @@ fn exit_code_3_on_empty_password_file() {
         .timeout(std::time::Duration::from_secs(30))
         .assert()
         .code(3)
-        .stderr(predicate::str::contains("No password available"));
+        .stderr(predicate::str::contains("No password was available"));
 }
 
 /// Exit code 3 (auth failure) when password file contains only a newline.
@@ -997,7 +995,7 @@ fn exit_code_3_on_newline_only_password_file() {
         .timeout(std::time::Duration::from_secs(30))
         .assert()
         .code(3)
-        .stderr(predicate::str::contains("No password available"));
+        .stderr(predicate::str::contains("No password was available"));
 }
 
 /// Exit code 2 (clap validation error) for invalid argument values.
@@ -1310,7 +1308,7 @@ fn submit_code_fails_without_username() {
         .timeout(std::time::Duration::from_secs(30))
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error").or(predicate::str::contains("required")));
+        .stderr(predicate::str::contains("Set your iCloud username"));
 }
 
 // ── --report-json removed from public sync CLI ───────────────────────
