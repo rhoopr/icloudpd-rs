@@ -4673,10 +4673,10 @@ mod tests {
         );
     }
 
-    /// A cycle that consumed a stale plan from a prior
-    /// failed `resolve_passes` MUST NOT advance the sync token even when the
-    /// per-library outcome is `Success`. A reused plan can route assets to
-    /// the wrong pass; advancing the token would skip the change events
+    /// A library that consumed a stale plan from a prior failed
+    /// `resolve_passes` MUST NOT advance its sync token even when its
+    /// outcome is `Success`. A reused plan can route assets to the wrong
+    /// pass; advancing the affected zone token would skip the change events
     /// that would surface the corrected membership on the next cycle.
     #[test]
     fn sync_loop_stale_plan_blocks_sync_token_advance_even_on_success() {
@@ -4686,7 +4686,7 @@ mod tests {
         // With a stale plan: even Success must NOT advance the token.
         assert!(
             !should_store_sync_token_for_cycle(&outcome, false, true),
-            "stale-plan flag must veto token advancement on Success"
+            "same-library stale-plan flag must veto token advancement on Success"
         );
     }
 
@@ -4706,9 +4706,70 @@ mod tests {
         assert!(!should_store_sync_token_for_cycle(&success, true, false));
         assert!(!should_store_sync_token_for_cycle(&success, true, true));
 
-        // Only (Success, dry_run=false, stale=false) advances.
+        // Only (Success, dry_run=false, library_stale=false) advances.
         assert!(should_store_sync_token_for_cycle(&success, false, false));
         assert!(!should_store_sync_token_for_cycle(&success, false, true));
+    }
+
+    #[tokio::test]
+    async fn run_cycle_clean_zone_advances_despite_other_stale_plan() {
+        let config = make_run_cycle_config();
+        let db = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "primary-prev")
+            .await
+            .expect("seed primary token");
+        db.set_metadata("sync_token:SharedSync-TEST", "shared-prev")
+            .await
+            .expect("seed shared token");
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let clean_state =
+            make_run_cycle_library_state("PrimarySync", "sync_token:PrimarySync", "primary-new");
+        let mut stale_state = make_run_cycle_library_state(
+            "SharedSync-TEST",
+            "sync_token:SharedSync-TEST",
+            "shared-new",
+        );
+        stale_state.plan_is_stale = true;
+        let states = vec![&clean_state, &stale_state];
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(result.failed_count, 0);
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "database precheck token must wait for every selected zone to be clean"
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read primary token")
+                .as_deref(),
+            Some("primary-new"),
+            "unaffected clean zone should advance its own token"
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:SharedSync-TEST")
+                .await
+                .expect("read shared token")
+                .as_deref(),
+            Some("shared-prev"),
+            "stale zone must keep its old token"
+        );
     }
 
     #[tokio::test]

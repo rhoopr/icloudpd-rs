@@ -119,6 +119,13 @@ pub trait DownloadStateStore: Send + Sync {
     async fn prepare_for_retry(&self, library: Option<&str>)
         -> Result<(u64, u64, u64), StateError>;
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError>;
+    async fn prune_stale_pending_not_seen_since(
+        &self,
+        _library: &str,
+        _seen_since: i64,
+    ) -> Result<u64, StateError> {
+        Ok(0)
+    }
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError>;
     async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError>;
     async fn get_downloaded_checksums(
@@ -620,6 +627,13 @@ pub trait StateDb: Send + Sync {
     ///
     /// Returns the number of assets promoted.
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError>;
+    async fn prune_stale_pending_not_seen_since(
+        &self,
+        _library: &str,
+        _seen_since: i64,
+    ) -> Result<u64, StateError> {
+        Ok(0)
+    }
 
     // ── Bulk read operations ──
 
@@ -1124,6 +1138,14 @@ where
         DownloadStateStore::promote_pending_to_failed(self, seen_since).await
     }
 
+    async fn prune_stale_pending_not_seen_since(
+        &self,
+        library: &str,
+        seen_since: i64,
+    ) -> Result<u64, StateError> {
+        DownloadStateStore::prune_stale_pending_not_seen_since(self, library, seen_since).await
+    }
+
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
         DownloadStateStore::get_downloaded_ids(self).await
     }
@@ -1509,6 +1531,14 @@ impl DownloadStateStore for dyn StateDb + '_ {
 
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
         StateDb::promote_pending_to_failed(self, seen_since).await
+    }
+
+    async fn prune_stale_pending_not_seen_since(
+        &self,
+        library: &str,
+        seen_since: i64,
+    ) -> Result<u64, StateError> {
+        StateDb::prune_stale_pending_not_seen_since(self, library, seen_since).await
     }
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
@@ -2973,6 +3003,27 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn prune_stale_pending_not_seen_since(
+        &self,
+        library: &str,
+        seen_since: i64,
+    ) -> Result<u64, StateError> {
+        let library = library.to_string();
+        self.with_conn("prune_stale_pending_not_seen_since", move |conn| {
+            let pruned = conn
+                .execute(
+                    "DELETE FROM assets \
+                     WHERE library = ?1 AND status = 'pending' AND last_seen_at < ?2",
+                    rusqlite::params![library, seen_since],
+                )
+                .map_err(|e| StateError::query("prune_stale_pending_not_seen_since", e))?
+                as u64;
+
+            Ok(pruned)
+        })
+        .await
+    }
+
     pub(crate) async fn get_downloaded_ids(
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError> {
@@ -3998,6 +4049,14 @@ impl DownloadStateStore for SqliteStateDb {
 
     async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
         SqliteStateDb::promote_pending_to_failed(self, seen_since).await
+    }
+
+    async fn prune_stale_pending_not_seen_since(
+        &self,
+        library: &str,
+        seen_since: i64,
+    ) -> Result<u64, StateError> {
+        SqliteStateDb::prune_stale_pending_not_seen_since(self, library, seen_since).await
     }
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
@@ -7199,6 +7258,65 @@ mod tests {
         let failed = db.get_failed().await.unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(&*failed[0].id, "NEW_ASSET");
+    }
+
+    #[tokio::test]
+    async fn prune_stale_pending_not_seen_since_deletes_only_old_pending_for_library() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let old_primary = TestAssetRecord::new("OLD_PRIMARY")
+            .checksum("ck_old_primary")
+            .filename("old-primary.jpg")
+            .size(1000)
+            .build();
+        let fresh_primary = TestAssetRecord::new("FRESH_PRIMARY")
+            .checksum("ck_fresh_primary")
+            .filename("fresh-primary.jpg")
+            .size(1000)
+            .build();
+        let old_shared = TestAssetRecord::new("OLD_SHARED")
+            .library("SharedSync")
+            .checksum("ck_old_shared")
+            .filename("old-shared.jpg")
+            .size(1000)
+            .build();
+        let downloaded = TestAssetRecord::new("DOWNLOADED_PRIMARY")
+            .checksum("ck_downloaded_primary")
+            .filename("downloaded-primary.jpg")
+            .size(1000)
+            .build();
+
+        db.upsert_seen(&old_primary).await.unwrap();
+        db.upsert_seen(&fresh_primary).await.unwrap();
+        db.upsert_seen(&old_shared).await.unwrap();
+        db.upsert_seen(&downloaded).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "DOWNLOADED_PRIMARY",
+            "original",
+            Path::new("/tmp/downloaded-primary.jpg"),
+            "local",
+            Some("download"),
+        )
+        .await
+        .unwrap();
+
+        let sync_started_at = chrono::Utc::now().timestamp() - 1800;
+        db.backdate_last_seen("OLD_PRIMARY", sync_started_at - 10);
+        db.backdate_last_seen("OLD_SHARED", sync_started_at - 10);
+
+        let pruned = db
+            .prune_stale_pending_not_seen_since("PrimarySync", sync_started_at)
+            .await
+            .unwrap();
+
+        assert_eq!(pruned, 1);
+        let pending = db.get_pending().await.unwrap();
+        let ids: HashSet<&str> = pending.iter().map(|row| row.id.as_ref()).collect();
+        assert!(!ids.contains("OLD_PRIMARY"));
+        assert!(ids.contains("FRESH_PRIMARY"));
+        assert!(ids.contains("OLD_SHARED"));
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.downloaded, 1, "downloaded rows must not change");
     }
 
     // Regression test for #211: a pending asset the producer didn't enumerate

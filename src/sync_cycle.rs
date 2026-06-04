@@ -84,21 +84,19 @@ pub(crate) fn should_store_sync_token(outcome: &download::DownloadOutcome, dry_r
     matches!(outcome, download::DownloadOutcome::Success) && !dry_run
 }
 
-/// Cycle-level gate that combines the per-library outcome check with the
-/// cross-library "any plan is stale" override.
+/// Library-level gate that combines the per-library outcome check with the
+/// stale-plan flag for the same zone.
 ///
-/// If any library entered the cycle with a reused plan (the prior
-/// album refresh failed), suppress sync-token advancement for every library
-/// in the cycle. A stale plan can route assets created or moved between
-/// cycles to the wrong pass; advancing the token would skip the change
-/// events that would surface those assets correctly on the next refresh,
-/// leaving `asset_albums` permanently incomplete.
+/// A reused album plan can route assets created or moved between cycles to
+/// the wrong pass, so the affected zone must not advance. Unaffected zones
+/// can still store their own zone tokens; the broader database pre-check
+/// token remains conservative until every selected zone is clean.
 pub(crate) fn should_store_sync_token_for_cycle(
     outcome: &download::DownloadOutcome,
     dry_run: bool,
-    cycle_has_stale_plan: bool,
+    library_plan_is_stale: bool,
 ) -> bool {
-    should_store_sync_token(outcome, dry_run) && !cycle_has_stale_plan
+    should_store_sync_token(outcome, dry_run) && !library_plan_is_stale
 }
 
 fn has_active_passes(lib_state: &LibraryState) -> bool {
@@ -308,18 +306,11 @@ pub(crate) async fn run_cycle(
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
 
-    // If ANY library entered the cycle with a stale plan (the prior
-    // album refresh failed and the previous plan is being reused), suppress
-    // sync-token advancement for every library in this cycle. A reused plan
-    // can route assets created or moved between cycles to the wrong pass and
-    // produce silently incomplete `asset_albums` data; without this gate the
-    // change events for those assets sit behind the advanced token and
-    // never replay.
     let cycle_has_stale_plan = library_states.iter().any(|s| s.plan_is_stale);
     if cycle_has_stale_plan {
         tracing::warn!(
             "One or more libraries are running on a stale album plan; sync \
-             token will not advance this cycle"
+             database pre-check token will not advance this cycle"
         );
     }
     let mut db_sync_token_advance_safe = !config.runtime.dry_run && !cycle_has_stale_plan;
@@ -494,7 +485,7 @@ pub(crate) async fn run_cycle(
         let should_store_token = should_store_sync_token_for_cycle(
             &sync_result.outcome,
             config.runtime.dry_run,
-            cycle_has_stale_plan,
+            lib_state.plan_is_stale,
         ) && !sync_result.stats.interrupted
             && !shutdown_token.is_cancelled();
         if should_store_token {
@@ -504,6 +495,13 @@ pub(crate) async fn run_cycle(
                         db_sync_token_advance_safe = false;
                         tracing::warn!(error = %e, "Failed to store sync token");
                     } else {
+                        if cycle_has_stale_plan && !lib_state.plan_is_stale {
+                            tracing::warn!(
+                                zone = %lib_state.zone_name,
+                                diagnostic = "stale_plan_unaffected_zone",
+                                "Stored clean zone sync token despite another selected zone's stale plan"
+                            );
+                        }
                         tracing::debug!(zone = %lib_state.zone_name, "Stored sync token for next incremental sync");
                     }
                 }
