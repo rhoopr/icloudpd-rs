@@ -16,7 +16,7 @@
 //! All tests are gated `#[ignore]`. Run with:
 //!
 //! ```sh
-//! cargo test --test import_existing_live -- --ignored --test-threads=1
+//! cargo test --all-features --test import_existing_live -- --ignored --test-threads=1
 //! ```
 //!
 //! The fixture is intentionally not cleaned up between runs — the next

@@ -122,6 +122,24 @@ fn full_test_routes_child_tempdirs_to_tmp_codex() {
 }
 
 #[test]
+fn live_test_recipe_forces_all_features_after_nodefault_phase() {
+    let justfile = repo_file("justfile");
+    let live_case = justfile
+        .split("live)")
+        .nth(1)
+        .and_then(|tail| tail.split(";;").next())
+        .expect("justfile must have a live test recipe case");
+
+    for suite in ["sync", "state_auth", "import_existing_live"] {
+        let expected = format!("cargo test --all-features --test {suite}");
+        assert!(
+            live_case.contains(&expected),
+            "`just test live` must rebuild {suite}'s child binary with XMP after full-test's no-default phase"
+        );
+    }
+}
+
+#[test]
 fn live_import_smoke_uses_toml_directory() {
     let smokes = repo_file("scripts/full-test/run_live_smokes.sh");
 

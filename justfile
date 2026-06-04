@@ -90,9 +90,9 @@ test MODE="":
             ;;
         live)
             _live_env
-            cargo test --test sync -- --ignored --test-threads=1
-            cargo test --test state_auth -- --ignored --test-threads=1
-            cargo test --test import_existing_live -- --ignored --test-threads=1
+            cargo test --all-features --test sync -- --ignored --test-threads=1
+            cargo test --all-features --test state_auth -- --ignored --test-threads=1
+            cargo test --all-features --test import_existing_live -- --ignored --test-threads=1
             ;;
         concurrency)
             _live_env

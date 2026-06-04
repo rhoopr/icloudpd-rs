@@ -4,7 +4,7 @@
 //! against real iCloud data. All tests are `#[ignore]` — run with:
 //!
 //! ```sh
-//! cargo test --test state_auth -- --ignored --test-threads=1
+//! cargo test --all-features --test state_auth -- --ignored --test-threads=1
 //! ```
 
 #![allow(

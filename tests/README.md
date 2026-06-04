@@ -30,9 +30,9 @@ tests/
 | `cargo test --bin kei` | 1550 | no | `just test fast` |
 | `cargo test --test cli` | 95 | no | `just test fast` |
 | `cargo test --test behavioral` | 112 | no | `just test fast` |
-| `cargo test --test sync` | 43 `#[ignore]` | yes | `just test live` |
-| `cargo test --test state_auth` | 17 `#[ignore]` | yes | `just test live` |
-| `cargo test --test import_existing_live` | 9 `#[ignore]` | yes | `just test live` |
+| `cargo test --all-features --test sync` | 43 `#[ignore]` | yes | `just test live` |
+| `cargo test --all-features --test state_auth` | 17 `#[ignore]` | yes | `just test live` |
+| `cargo test --all-features --test import_existing_live` | 9 `#[ignore]` | yes | `just test live` |
 | `tests/shell/concurrency.sh` | 8 | yes | `just test concurrency` |
 | `tests/shell/state-machine.sh` | 20 | yes | `just test state` |
 | `tests/shell/docker.sh` | 16 | yes | `just test docker` |
@@ -63,7 +63,7 @@ Without `just`, run the raw commands directly:
 
 ```sh
 cargo test --bin kei --test cli --test behavioral
-cargo test --test sync --test state_auth -- --ignored --test-threads=1
+cargo test --all-features --test sync --test state_auth -- --ignored --test-threads=1
 ./tests/shell/concurrency.sh
 ```
 

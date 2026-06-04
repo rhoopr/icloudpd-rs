@@ -14,7 +14,7 @@
 //! live Apple API. Run with:
 //!
 //! ```sh
-//! cargo test --test sync -- --ignored --test-threads=1
+//! cargo test --all-features --test sync -- --ignored --test-threads=1
 //! ```
 
 #![allow(
