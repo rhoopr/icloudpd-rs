@@ -635,7 +635,7 @@ fn login_requires_username() {
         .args(["login"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("username is required"));
+        .stderr(predicate::str::contains("Set your iCloud username"));
 }
 #[test]
 fn list_albums_requires_username() {
@@ -644,7 +644,7 @@ fn list_albums_requires_username() {
         .args(["list", "albums"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("username is required"));
+        .stderr(predicate::str::contains("Set your iCloud username"));
 }
 #[test]
 fn password_set_requires_username() {
@@ -653,7 +653,7 @@ fn password_set_requires_username() {
         .args(["password", "set"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("username is required"));
+        .stderr(predicate::str::contains("Set your iCloud username"));
 }
 #[test]
 fn password_clear_requires_username() {
@@ -662,7 +662,7 @@ fn password_clear_requires_username() {
         .args(["password", "clear"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("username is required"));
+        .stderr(predicate::str::contains("Set your iCloud username"));
 }
 #[test]
 fn password_backend_requires_username() {
@@ -671,7 +671,7 @@ fn password_backend_requires_username() {
         .args(["password", "backend"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("username is required"));
+        .stderr(predicate::str::contains("Set your iCloud username"));
 }
 
 /// `password backend` against a fresh cookie dir prints the credential
@@ -721,7 +721,7 @@ fn sync_requires_username() {
         .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("username is required"));
+        .stderr(predicate::str::contains("Set your iCloud username"));
 }
 
 #[test]
@@ -744,7 +744,7 @@ fn service_run_uses_sync_worker_path_and_requires_username() {
         .stderr(predicate::str::contains(
             "service mode: applied default watch interval",
         ))
-        .stderr(predicate::str::contains("username is required"));
+        .stderr(predicate::str::contains("Set your iCloud username"));
 }
 
 #[test]
@@ -756,7 +756,7 @@ fn sync_requires_directory() {
         .args(["sync"])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("[download] directory is required"));
+        .stderr(predicate::str::contains("Set [download].directory"));
 }
 #[test]
 fn import_existing_requires_directory() {
@@ -767,9 +767,7 @@ fn import_existing_requires_directory() {
         .args(["import-existing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "[download] directory is required for import-existing",
-        ));
+        .stderr(predicate::str::contains("Set [download].directory"));
 }
 #[test]
 fn import_existing_rejects_nonexistent_directory() {
@@ -787,7 +785,7 @@ fn import_existing_rejects_nonexistent_directory() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "Cannot read download directory /does/not/exist/anywhere",
+            "Could not read download directory /does/not/exist/anywhere",
         ));
 }
 
@@ -1017,7 +1015,7 @@ fn config_empty_username_in_toml() {
         .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("must not be empty"));
+        .stderr(predicate::str::contains("cannot be empty"));
 }
 #[test]
 fn config_toml_password_field_rejected() {
@@ -1034,7 +1032,7 @@ fn config_toml_password_field_rejected() {
         .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("`[auth] password`"))
+        .stderr(predicate::str::contains("`[auth].password`"))
         .stderr(predicate::str::contains("kei password set"));
 }
 
@@ -1058,7 +1056,7 @@ fn config_multiple_password_sources_in_toml() {
         .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("pick one"));
+        .stderr(predicate::str::contains("Pick one"));
 }
 #[test]
 fn config_strftime_folder_structure_accepted() {
@@ -2000,7 +1998,7 @@ fn exit_1_for_missing_directory_on_sync() {
         .args(["sync"])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("[download] directory is required"));
+        .stderr(predicate::str::contains("Set [download].directory"));
 }
 
 #[cfg(unix)]
@@ -2038,7 +2036,9 @@ fn sync_unwritable_download_directory_errors_before_auth() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("is not writable"));
+        .stderr(predicate::str::contains(
+            "Cannot write to download directory",
+        ));
 
     std::fs::set_permissions(&download_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
@@ -2057,7 +2057,7 @@ fn exit_1_for_missing_username_on_sync() {
         .args(["sync", "--config", config_path.to_str().unwrap()])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("username is required"));
+        .stderr(predicate::str::contains("Set your iCloud username"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2181,7 +2181,7 @@ fn config_setup_requires_interactive_terminal() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains(
-            "The setup wizard requires an interactive terminal",
+            "The setup wizard needs an interactive terminal",
         ));
 }
 
@@ -3274,7 +3274,7 @@ fn removed_legacy_album_in_cli_errors() {
 fn removed_legacy_album_in_toml_errors() {
     let stderr = run_config_show_error("folder_structure = \"{album}/%B\"\n");
     assert!(
-        stderr.contains("'{album}' is not valid in --folder-structure")
+        stderr.contains("`{album}` cannot be used in --folder-structure")
             && stderr.contains("--folder-structure-albums"),
         "stderr: {stderr}"
     );
@@ -3286,7 +3286,7 @@ fn removed_legacy_album_env_is_ignored() {
         .arg("--only-print-filenames")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("'{album}' is not valid in --folder-structure").not());
+        .stderr(predicate::str::contains("`{album}` cannot be used in --folder-structure").not());
 }
 #[test]
 fn removed_legacy_album_errors_even_with_user_set_albums_template() {
@@ -3294,7 +3294,7 @@ fn removed_legacy_album_errors_even_with_user_set_albums_template() {
         "folder_structure = \"{album}/%Y\"\nfolder_structure_albums = \"{album}/custom\"\n",
     );
     assert!(
-        stderr.contains("'{album}' is not valid in --folder-structure")
+        stderr.contains("`{album}` cannot be used in --folder-structure")
             && stderr.contains("--folder-structure-albums"),
         "stderr: {stderr}"
     );
@@ -3411,7 +3411,7 @@ fn sync_bails_on_within_album_contradiction() {
     sync_cmd_for_config_body("\n[filters]\nalbums = [\"Family\", \"!Family\"]\n")
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("include and exclude"))
+        .stderr(predicate::str::contains("includes and excludes"))
         .stderr(predicate::str::contains("Family"));
 }
 #[test]
@@ -3584,7 +3584,7 @@ fn removed_sync_env_vars_do_not_supply_sync_config() {
         .clone();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("[download] directory is required"),
+        stderr.contains("Set [download].directory"),
         "stale sync env vars must not provide durable config; stderr: {stderr}"
     );
     assert_removed_env_config_hint(&stderr);
@@ -3613,7 +3613,7 @@ fn removed_sync_env_vars_do_not_supply_import_config() {
         .clone();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("[download] directory is required for import-existing"),
+        stderr.contains("Set [download].directory"),
         "stale sync env vars must not provide import config; stderr: {stderr}"
     );
     assert_removed_env_config_hint(&stderr);
