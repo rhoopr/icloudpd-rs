@@ -176,7 +176,7 @@ fn dry_run_install_system_rejects_root_preview_user() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "could not determine which user the system unit would run as",
+            "Could not determine which user the system service would run as",
         ));
 }
 
@@ -193,7 +193,7 @@ fn dry_run_install_system_rejects_control_character_preview_user() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "could not determine which user the system unit would run as",
+            "Could not determine which user the system service would run as",
         ));
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(
