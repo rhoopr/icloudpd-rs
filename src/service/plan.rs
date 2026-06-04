@@ -71,17 +71,12 @@ impl InstallPlan {
     reason = "platform backend modules are compiled cross-platform; Windows builds do not call the macOS rejection helper"
 )]
 pub(crate) fn reject_macos_system_install() -> Result<()> {
-    bail!(
-        "macOS only ships a per-user LaunchAgent; \
-         rerun without --system (or with --user) to install."
-    )
+    bail!("macOS service install is per-user only. Run `kei install --user` or omit `--system`.")
 }
 
 pub(crate) fn reject_windows_system_install() -> Result<()> {
     bail!(
-        "`kei install --system` is not supported on Windows; \
-         use `kei install` (per-user) so the service shares your Credential Manager vault \
-         and `~/.config/kei` state directory"
+        "`kei install --system` is not supported on Windows. Use `kei install` for a per-user service that can access your Credential Manager vault and `~/.config/kei` state directory."
     )
 }
 
@@ -107,9 +102,7 @@ fn ensure_linux_system_apply_is_root(config_path: &Path) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "`kei install --system` must be run as root (EUID=0); \
-         rerun:  sudo kei install --system --config {}  \
-         Or use `kei install --user` for a per-user install.",
+        "`kei install --system` must be run as root (EUID=0). Run `sudo kei install --system --config {}` or use `kei install --user` for a per-user install.",
         config_path.display()
     )
 }
@@ -120,8 +113,7 @@ fn linux_sudo_user() -> Result<String> {
         return Ok(user);
     }
     bail!(
-        "$SUDO_USER not set; rerun via `sudo kei install --system` so the service \
-         can be configured to run as your account rather than root"
+        "$SUDO_USER is not set. Re-run with `sudo kei install --system` so kei can configure the service to run as your account instead of root."
     )
 }
 
@@ -133,8 +125,7 @@ fn linux_system_preview_user() -> Result<String> {
 
     if effective_uid() == 0 {
         bail!(
-            "$SUDO_USER not set; rerun via `sudo kei install --system --dry-run` so the service \
-             can be previewed for your account rather than root"
+            "$SUDO_USER is not set. Re-run with `sudo kei install --system --dry-run` so kei can preview the service for your account instead of root."
         );
     }
 
@@ -144,8 +135,7 @@ fn linux_system_preview_user() -> Result<String> {
         }
     }
     bail!(
-        "could not determine which user the system unit would run as; \
-         set SUDO_USER or USER before running `kei install --system --dry-run`"
+        "Could not determine which user the system service would run as. Set SUDO_USER or USER before running `kei install --system --dry-run`."
     )
 }
 
@@ -202,7 +192,7 @@ mod tests {
         assert!(reject_macos_system_install()
             .expect_err("macOS system install must fail")
             .to_string()
-            .contains("per-user LaunchAgent"));
+            .contains("per-user only"));
         assert!(reject_windows_system_install()
             .expect_err("Windows system install must fail")
             .to_string()

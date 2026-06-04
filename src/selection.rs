@@ -150,7 +150,7 @@ fn selector_token<'a>(raw: &'a str, flag: &str) -> anyhow::Result<SelectorToken<
     if let Some(literal) = raw.strip_prefix('=') {
         anyhow::ensure!(
             !literal.is_empty(),
-            "--{flag} literal value must not be empty"
+            "`--{flag}` literal value cannot be empty."
         );
         return Ok(SelectorToken {
             name: literal,
@@ -160,10 +160,10 @@ fn selector_token<'a>(raw: &'a str, flag: &str) -> anyhow::Result<SelectorToken<
     }
 
     let (name, exclude) = raw.strip_prefix('!').map_or((raw, false), |r| (r, true));
-    anyhow::ensure!(!name.is_empty(), "--{flag} value must not be empty");
+    anyhow::ensure!(!name.is_empty(), "`--{flag}` needs a value.");
     anyhow::ensure!(
         !name.starts_with('='),
-        "`!=value` is not supported for --{flag}; use `=value` for a literal value or `!value` for an exclusion"
+        "`!=value` is not valid for `--{flag}`. Use `=value` for a literal value or `!value` for an exclusion."
     );
     Ok(SelectorToken {
         name,
@@ -195,7 +195,7 @@ fn insert_unique(
     display_name: impl FnOnce() -> String,
 ) -> anyhow::Result<()> {
     if !set.insert(value) {
-        anyhow::bail!("--{flag} '{}' specified more than once", display_name());
+        anyhow::bail!("`--{flag} {}` was provided more than once.", display_name());
     }
     Ok(())
 }
@@ -222,19 +222,19 @@ pub(crate) fn parse_album_selector(
 
     for entry in raw {
         let trimmed = entry.trim();
-        anyhow::ensure!(!trimmed.is_empty(), "--album value must not be empty");
+        anyhow::ensure!(!trimmed.is_empty(), "`--album` needs a value.");
         let token = selector_token(trimmed, "album")?;
         let name = token.name;
         if name.eq_ignore_ascii_case("all") && !token.escaped {
             anyhow::ensure!(
                 !token.exclude,
-                "'!all' is not a valid --album value; pass --album none instead"
+                "`--album !all` is not valid. Use `--album none` instead."
             );
             has_all = true;
         } else if name.eq_ignore_ascii_case("none") && !token.escaped {
             anyhow::ensure!(
                 !token.exclude,
-                "'!none' is not a valid --album value; just omit it"
+                "`--album !none` is not valid. Omit that value instead."
             );
             has_none = true;
         } else if token.exclude {
@@ -253,14 +253,14 @@ pub(crate) fn parse_album_selector(
     if has_none {
         anyhow::ensure!(
             !has_all && included.is_empty() && excluded.is_empty(),
-            "'--album none' cannot be combined with other --album values"
+            "`--album none` cannot be combined with other `--album` values."
         );
         return Ok(AlbumSelector::None);
     }
     if has_all {
         anyhow::ensure!(
             included.is_empty(),
-            "'--album all' cannot be combined with literal album names; use '!name' to exclude one"
+            "`--album all` cannot be combined with album names. Use `--album !name` to exclude one."
         );
         return Ok(AlbumSelector::All { excluded });
     }
@@ -286,26 +286,20 @@ pub(crate) fn parse_smart_folder_selector(raw: &[String]) -> anyhow::Result<Smar
 
     for entry in raw {
         let trimmed = entry.trim();
-        anyhow::ensure!(
-            !trimmed.is_empty(),
-            "--smart-folder value must not be empty"
-        );
+        anyhow::ensure!(!trimmed.is_empty(), "`--smart-folder` needs a value.");
         let token = selector_token(trimmed, "smart-folder")?;
         let name = token.name;
         if name.eq_ignore_ascii_case("all") && !token.escaped {
-            anyhow::ensure!(!token.exclude, "'!all' is not a valid --smart-folder value");
+            anyhow::ensure!(!token.exclude, "`--smart-folder !all` is not valid.");
             has_all = true;
         } else if name.eq_ignore_ascii_case("all-with-sensitive") && !token.escaped {
             anyhow::ensure!(
                 !token.exclude,
-                "'!all-with-sensitive' is not a valid --smart-folder value"
+                "`--smart-folder !all-with-sensitive` is not valid."
             );
             has_all_sensitive = true;
         } else if name.eq_ignore_ascii_case("none") && !token.escaped {
-            anyhow::ensure!(
-                !token.exclude,
-                "'!none' is not a valid --smart-folder value"
-            );
+            anyhow::ensure!(!token.exclude, "`--smart-folder !none` is not valid.");
             has_none = true;
         } else if token.exclude {
             insert_unique(&mut excluded, name.to_string(), "smart-folder", || {
@@ -323,18 +317,18 @@ pub(crate) fn parse_smart_folder_selector(raw: &[String]) -> anyhow::Result<Smar
     if has_none {
         anyhow::ensure!(
             !has_all && !has_all_sensitive && included.is_empty() && excluded.is_empty(),
-            "'--smart-folder none' cannot be combined with other --smart-folder values"
+            "`--smart-folder none` cannot be combined with other `--smart-folder` values."
         );
         return Ok(SmartFolderSelector::None);
     }
     if has_all || has_all_sensitive {
         anyhow::ensure!(
             !(has_all && has_all_sensitive),
-            "'--smart-folder all' and '--smart-folder all-with-sensitive' are mutually exclusive"
+            "`--smart-folder all` and `--smart-folder all-with-sensitive` cannot be used together."
         );
         anyhow::ensure!(
             included.is_empty(),
-            "'--smart-folder all' cannot be combined with literal names; use '!name' to exclude one"
+            "`--smart-folder all` cannot be combined with smart folder names. Use `--smart-folder !name` to exclude one."
         );
         return Ok(SmartFolderSelector::All {
             include_sensitive: has_all_sensitive,
@@ -375,7 +369,7 @@ pub(crate) fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySe
 
     for entry in raw {
         let trimmed = entry.trim();
-        anyhow::ensure!(!trimmed.is_empty(), "--library value must not be empty");
+        anyhow::ensure!(!trimmed.is_empty(), "`--library` needs a value.");
         let token = selector_token(trimmed, "library")?;
         let name = token.name;
         // CloudKit zone names use `-`, never `:`. The `:` forms are an old
@@ -384,15 +378,15 @@ pub(crate) fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySe
         // users don't get a "not found" surprise after a network round-trip.
         if name.contains(':') {
             anyhow::bail!(
-                "--library values are bare names (`primary`, `shared`, `all`) or zone names (`PrimarySync`, `SharedSync-XYZ`); \
-                 friendly forms like '{name}' are not supported. Run `kei list libraries` to see every zone."
+                "`--library` accepts `primary`, `shared`, `all`, or zone names like `PrimarySync` and `SharedSync-XYZ`. \
+                 `{name}` is not supported. Run `kei list libraries` to see the available zone names."
             );
         }
         if name.eq_ignore_ascii_case("all") && !token.escaped {
-            anyhow::ensure!(!token.exclude, "'!all' is not a valid --library value");
+            anyhow::ensure!(!token.exclude, "`--library !all` is not valid.");
             has_all = true;
         } else if name.eq_ignore_ascii_case("none") && !token.escaped {
-            anyhow::ensure!(!token.exclude, "'!none' is not a valid --library value");
+            anyhow::ensure!(!token.exclude, "`--library !none` is not valid.");
             has_none = true;
         } else if name.eq_ignore_ascii_case("primary") && !token.escaped {
             if token.exclude {
@@ -423,7 +417,7 @@ pub(crate) fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySe
 
     if has_none {
         anyhow::bail!(
-            "'--library none' is not allowed: kei needs at least one source library to sync"
+            "`--library none` is not allowed because kei needs at least one iCloud library to sync."
         );
     }
     if has_all {
@@ -442,7 +436,7 @@ pub(crate) fn parse_library_selector(raw: &[String]) -> anyhow::Result<LibrarySe
 
     if sel.is_empty() {
         anyhow::bail!(
-            "--library resolved to no libraries; pass at least one of primary / shared / a zone name"
+            "`--library` did not select any libraries. Choose `primary`, `shared`, or a zone name."
         );
     }
     Ok(sel)
@@ -457,7 +451,7 @@ fn contradiction_check(
     excluded: &BTreeSet<String>,
 ) -> anyhow::Result<()> {
     if let Some(name) = included.intersection(excluded).next() {
-        anyhow::bail!("cannot both include and exclude '{name}' in --{category}; pick one");
+        anyhow::bail!("`--{category}` includes and excludes `{name}`. Pick one.");
     }
     Ok(())
 }
@@ -677,13 +671,13 @@ mod tests {
     #[test]
     fn album_all_plus_named_bails() {
         let err = parse_album_selector(&s(&["all", "Vacation"]), false).unwrap_err();
-        assert!(err.to_string().contains("'--album all'"));
+        assert!(err.to_string().contains("`--album all`"));
     }
 
     #[test]
     fn album_none_plus_other_bails() {
         let err = parse_album_selector(&s(&["none", "Vacation"]), false).unwrap_err();
-        assert!(err.to_string().contains("'--album none'"));
+        assert!(err.to_string().contains("`--album none`"));
     }
 
     #[test]
@@ -695,13 +689,13 @@ mod tests {
     #[test]
     fn album_empty_string_bails() {
         let err = parse_album_selector(&s(&[""]), false).unwrap_err();
-        assert!(err.to_string().contains("must not be empty"));
+        assert!(err.to_string().contains("needs a value"));
     }
 
     #[test]
     fn album_bang_sentinel_bails() {
         let err = parse_album_selector(&s(&["!all"]), false).unwrap_err();
-        assert!(err.to_string().contains("'!all'"));
+        assert!(err.to_string().contains("`--album !all`"));
     }
 
     #[test]
@@ -816,7 +810,7 @@ mod tests {
     #[test]
     fn smart_folder_all_and_all_with_sensitive_mutually_exclusive() {
         let err = parse_smart_folder_selector(&s(&["all", "all-with-sensitive"])).unwrap_err();
-        assert!(err.to_string().contains("mutually exclusive"));
+        assert!(err.to_string().contains("cannot be used together"));
     }
 
     #[test]
@@ -846,7 +840,7 @@ mod tests {
     #[test]
     fn smart_folder_none_plus_other_bails() {
         let err = parse_smart_folder_selector(&s(&["none", "Favorites"])).unwrap_err();
-        assert!(err.to_string().contains("'--smart-folder none'"));
+        assert!(err.to_string().contains("`--smart-folder none`"));
     }
 
     #[test]
@@ -942,7 +936,7 @@ mod tests {
     #[test]
     fn bang_equals_escape_form_is_rejected() {
         let err = parse_library_selector(&s(&["!=primary"])).unwrap_err();
-        assert!(err.to_string().contains("not supported"));
+        assert!(err.to_string().contains("not valid"));
     }
 
     #[test]
@@ -966,7 +960,7 @@ mod tests {
     #[test]
     fn library_none_bails() {
         let err = parse_library_selector(&s(&["none"])).unwrap_err();
-        assert!(err.to_string().contains("'--library none'"));
+        assert!(err.to_string().contains("`--library none`"));
     }
 
     #[test]
@@ -1271,7 +1265,7 @@ mod tests {
         );
         let msg = r.unwrap_err().to_string();
         assert!(
-            msg.contains("must not be empty") || msg.contains("empty"),
+            msg.contains("needs a value"),
             "error must name the empty-input cause; got: {msg}"
         );
     }

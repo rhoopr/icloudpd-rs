@@ -123,7 +123,7 @@ impl PhotosSession for crate::auth::SharedSession {
 /// the payload without re-requesting. Truncated to keep memory bounded
 /// when CloudKit occasionally returns large HTML error pages.
 #[derive(Debug, thiserror::Error)]
-#[error("HTTP {status} for {url}")]
+#[error("Apple returned HTTP {status} for {url}")]
 pub(crate) struct HttpStatusError {
     pub status: u16,
     pub url: String,
@@ -200,7 +200,7 @@ const SERVICE_NOT_ACTIVATED_ERRORS: &[&str] = &["ZONE_NOT_FOUND", "AUTHENTICATIO
 /// Error type for `CloudKit` server errors embedded in the JSON response body.
 /// These are distinct from HTTP-level errors and represent API-level failures.
 #[derive(Debug, thiserror::Error)]
-#[error("CloudKit server error: {code} — {reason}")]
+#[error("Apple CloudKit reported {code}: {reason}")]
 pub struct CloudKitServerError {
     pub(crate) code: Box<str>,
     pub(crate) reason: Box<str>,
@@ -383,14 +383,14 @@ pub async fn retry_post(
 #[derive(Debug, thiserror::Error)]
 pub enum SyncTokenError {
     /// Token is invalid/corrupted — fall back to full enumeration
-    #[error("Invalid sync token: {reason}")]
+    #[error("The saved iCloud sync token is no longer valid: {reason}")]
     InvalidToken { reason: Box<str> },
     /// Zone no longer exists — stop syncing this zone
-    #[error("Zone not found: {zone_name}")]
+    #[error("Apple no longer reports iCloud Photos zone {zone_name}")]
     ZoneNotFound { zone_name: Box<str> },
     /// Unexpected zone-level error (e.g. `RETRY_LATER`, THROTTLED) —
     /// treat as transient; do NOT advance the sync token.
-    #[error("Unexpected zone error in {zone_name}: {error_code}")]
+    #[error("Apple returned an unexpected iCloud Photos zone error for {zone_name}: {error_code}")]
     UnexpectedZoneError {
         zone_name: Box<str>,
         error_code: Box<str>,
@@ -761,7 +761,10 @@ mod tests {
         let err = SyncTokenError::InvalidToken {
             reason: "bad token".into(),
         };
-        assert_eq!(err.to_string(), "Invalid sync token: bad token");
+        assert_eq!(
+            err.to_string(),
+            "The saved iCloud sync token is no longer valid: bad token"
+        );
     }
 
     #[test]
@@ -769,7 +772,10 @@ mod tests {
         let err = SyncTokenError::ZoneNotFound {
             zone_name: "SharedSync-ABC".into(),
         };
-        assert_eq!(err.to_string(), "Zone not found: SharedSync-ABC");
+        assert_eq!(
+            err.to_string(),
+            "Apple no longer reports iCloud Photos zone SharedSync-ABC"
+        );
     }
 
     #[test]
@@ -782,14 +788,17 @@ mod tests {
         assert!(downcasted.is_some());
         assert_eq!(
             downcasted.unwrap().to_string(),
-            "Invalid sync token: expired"
+            "The saved iCloud sync token is no longer valid: expired"
         );
     }
 
     #[test]
     fn test_sync_token_error_display_empty_reason() {
         let err = SyncTokenError::InvalidToken { reason: "".into() };
-        assert_eq!(err.to_string(), "Invalid sync token: ");
+        assert_eq!(
+            err.to_string(),
+            "The saved iCloud sync token is no longer valid: "
+        );
     }
 
     /// T-2: Mock session returns HTTP 503 on first call, 200 on second.

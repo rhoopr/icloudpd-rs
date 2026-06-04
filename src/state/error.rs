@@ -14,25 +14,25 @@ pub enum StateError {
     /// file" on a fresh install (issue #264). This variant surfaces the
     /// underlying mkdir failure (e.g. permission denied) distinctly from
     /// a SQLite-level open error.
-    #[error("Failed to create parent directory {path}: {source}")]
+    #[error("Could not create the state database directory {path}: {source}")]
     ParentDir {
         path: PathBuf,
         source: std::io::Error,
     },
 
     /// Failed to open or create the database file.
-    #[error("Failed to open database at {path}: {source}")]
+    #[error("Could not open the state database at {path}: {source}")]
     Open {
         path: PathBuf,
         source: rusqlite::Error,
     },
 
     /// Failed to run a database migration.
-    #[error("Database migration failed: {0}")]
+    #[error("Could not update the state database schema: {0}")]
     Migration(#[from] rusqlite::Error),
 
     /// A query failed.
-    #[error("Database query failed ({operation}): {source}")]
+    #[error("State database operation failed while {operation}: {source}")]
     Query {
         operation: &'static str,
         #[source]
@@ -40,22 +40,22 @@ pub enum StateError {
     },
 
     /// Failed to acquire the database lock (mutex poisoned).
-    #[error("Database lock acquisition failed ({0})")]
+    #[error("Could not lock the state database ({0})")]
     LockPoisoned(String),
 
     /// Failed to spawn a blocking task.
-    #[error("Failed to spawn blocking task: {0}")]
+    #[error("Could not start a background database task: {0}")]
     Spawn(#[from] tokio::task::JoinError),
 
     /// The database schema version is newer than supported.
-    #[error("Database schema version {found} is newer than supported version {expected}")]
+    #[error("This state database is from a newer kei version (schema {found}); this kei supports schema {expected}")]
     UnsupportedSchemaVersion { found: i32, expected: i32 },
 
     /// A producer-dispatch invariant was violated — typically a write
     /// path was reached without the corresponding `upsert_seen` having
     /// run first. The asset row didn't exist, so the operation became a
     /// no-op. Surface it loudly rather than silently swallow.
-    #[error("State invariant violated ({operation}): {detail}")]
+    #[error("State database consistency check failed while {operation}: {detail}")]
     Invariant {
         operation: &'static str,
         detail: String,
@@ -64,7 +64,7 @@ pub enum StateError {
     /// `mark_downloaded` matched zero rows. The asset row should have
     /// been upserted before this call; its absence indicates a missed
     /// upsert step or out-of-band row deletion.
-    #[error("mark_downloaded: no row for asset {asset_id} version_size {version_size}")]
+    #[error("Could not mark asset {asset_id} ({version_size}) downloaded because it was not in the state database")]
     AssetRowMissing {
         asset_id: String,
         version_size: String,
@@ -96,7 +96,7 @@ mod tests {
         };
         let display = err.to_string();
         assert!(
-            display.starts_with("Database query failed (test_op): "),
+            display.starts_with("State database operation failed while test_op: "),
             "unexpected display: {display}"
         );
     }
@@ -121,7 +121,7 @@ mod tests {
         let err = StateError::LockPoisoned("get_metadata: poisoned".to_string());
         assert_eq!(
             err.to_string(),
-            "Database lock acquisition failed (get_metadata: poisoned)"
+            "Could not lock the state database (get_metadata: poisoned)"
         );
     }
 
@@ -138,7 +138,7 @@ mod tests {
         );
         assert_eq!(
             display,
-            "Database schema version 5 is newer than supported version 3"
+            "This state database is from a newer kei version (schema 5); this kei supports schema 3"
         );
     }
 
@@ -170,7 +170,7 @@ mod tests {
             "expected path in display, got: {display}"
         );
         assert!(
-            display.starts_with("Failed to open database at"),
+            display.starts_with("Could not open the state database at"),
             "unexpected prefix: {display}"
         );
     }
@@ -187,7 +187,7 @@ mod tests {
             "expected path in display, got: {display}"
         );
         assert!(
-            display.starts_with("Failed to create parent directory"),
+            display.starts_with("Could not create the state database directory"),
             "unexpected prefix: {display}"
         );
         assert!(

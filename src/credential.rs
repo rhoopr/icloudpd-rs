@@ -141,14 +141,14 @@ impl CredentialStore {
 
     fn keyring_entry(&self) -> Result<keyring::Entry> {
         keyring::Entry::new(KEYRING_SERVICE, &self.username)
-            .context("Failed to create keyring entry")
+            .context("Could not open the OS keyring entry")
     }
 
     fn keyring_store(&self, password: &str) -> Result<()> {
         let entry = self.keyring_entry()?;
         entry
             .set_password(password)
-            .context("Failed to store password in keyring")
+            .context("Could not store password in the OS keyring")
     }
 
     fn keyring_retrieve(&self) -> Result<Option<SecretString>> {
@@ -156,7 +156,9 @@ impl CredentialStore {
         match entry.get_password() {
             Ok(pw) => Ok(Some(SecretString::from(pw))),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!(e).context("Failed to retrieve from keyring")),
+            Err(e) => {
+                Err(anyhow::anyhow!(e).context("Could not read password from the OS keyring"))
+            }
         }
     }
 
@@ -194,11 +196,12 @@ impl CredentialStore {
     fn load_or_create_key(&self) -> Result<[u8; 32]> {
         let key_path = self.key_file_path();
         if key_path.exists() {
-            let data = std::fs::read(&key_path)
-                .with_context(|| format!("Failed to read key file: {}", key_path.display()))?;
+            let data = std::fs::read(&key_path).with_context(|| {
+                format!("Could not read credential key file {}", key_path.display())
+            })?;
             anyhow::ensure!(
                 data.len() == 32,
-                "Credential key file is corrupt (expected 32 bytes, got {})",
+                "Credential key file is corrupt: expected 32 bytes, got {}.",
                 data.len()
             );
             let mut key = [0u8; 32];
@@ -214,18 +217,18 @@ impl CredentialStore {
     fn file_store(&self, password: &str) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir).with_context(|| {
             format!(
-                "Failed to create config directory: {}",
+                "Could not create config directory {}",
                 self.config_dir.display()
             )
         })?;
 
         let key_bytes = self.load_or_create_key()?;
-        let cipher =
-            Aes256Gcm::new_from_slice(&key_bytes).context("Failed to create AES cipher")?;
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+            .context("Could not initialize credential encryption")?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ciphertext = cipher
             .encrypt(&nonce, password.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Could not encrypt credential: {e}"))?;
 
         // File format: 12-byte nonce ‖ ciphertext
         let mut data = Vec::with_capacity(12 + ciphertext.len());
@@ -250,24 +253,24 @@ impl CredentialStore {
 
         let key_bytes = self.load_or_create_key()?;
         let data = std::fs::read(&cred_path)
-            .with_context(|| format!("Failed to read credential file: {}", cred_path.display()))?;
+            .with_context(|| format!("Could not read credential file {}", cred_path.display()))?;
 
         anyhow::ensure!(
             data.len() > 12,
-            "Credential file is corrupt (too short): {}",
+            "Credential file is corrupt or incomplete: {}",
             cred_path.display()
         );
 
         let (nonce_bytes, ciphertext) = data.split_at(12);
         let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-        let cipher =
-            Aes256Gcm::new_from_slice(&key_bytes).context("Failed to create AES cipher")?;
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+            .context("Could not initialize credential decryption")?;
         let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_e| {
-            anyhow::anyhow!("Failed to decrypt credential (wrong key or corrupt file)")
+            anyhow::anyhow!("Could not decrypt stored credential. The key may be wrong or the credential file may be corrupt.")
         })?;
 
         let password =
-            String::from_utf8(plaintext).context("Decrypted credential is not valid UTF-8")?;
+            String::from_utf8(plaintext).context("Stored credential is not valid UTF-8")?;
         Ok(Some(SecretString::from(password)))
     }
 
@@ -277,7 +280,7 @@ impl CredentialStore {
             DeleteOutcome::Deleted => Ok(()),
             DeleteOutcome::NotFound => {
                 anyhow::bail!(
-                    "No credential file found: {}",
+                    "No credential file found at {}",
                     self.credential_file_path().display()
                 )
             }
@@ -294,7 +297,7 @@ impl CredentialStore {
             Ok(()) => DeleteOutcome::Deleted,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => DeleteOutcome::NotFound,
             Err(e) => DeleteOutcome::Failed(anyhow::anyhow!(e).context(format!(
-                "Failed to delete credential file: {}",
+                "Could not delete credential file {}",
                 cred_path.display()
             ))),
         }
@@ -311,9 +314,9 @@ fn keyring_delete_error_outcome(error: keyring::Error) -> DeleteOutcome {
             );
             DeleteOutcome::NotFound
         }
-        e => {
-            DeleteOutcome::Failed(anyhow::anyhow!(e).context("Failed to delete keyring credential"))
-        }
+        e => DeleteOutcome::Failed(
+            anyhow::anyhow!(e).context("Could not delete the OS keyring credential"),
+        ),
     }
 }
 
@@ -347,7 +350,7 @@ fn finish_delete(
 
     if failed.is_empty() {
         if deleted.is_empty() {
-            anyhow::bail!("No stored credential found for {username}");
+            anyhow::bail!("No stored credential was found for {username}.");
         }
         return Ok(());
     }
@@ -363,10 +366,10 @@ fn finish_delete(
         .collect::<Vec<_>>()
         .join("; ");
     if deleted.is_empty() {
-        anyhow::bail!("Failed to delete credential backend(s) {failed_names}: {details}");
+        anyhow::bail!("Could not delete credential from {failed_names}: {details}");
     }
     anyhow::bail!(
-        "Credential deletion partially failed; deleted from {}, but failed backend(s) {failed_names}: {details}",
+        "Credential was deleted from {}, but kei could not delete it from {failed_names}: {details}",
         deleted.join(", ")
     );
 }
@@ -487,7 +490,7 @@ mod tests {
         .to_string();
         assert!(
             partial.contains("deleted from encrypted-file")
-                && partial.contains("failed backend(s) keyring"),
+                && partial.contains("could not delete it from keyring"),
             "partial delete must preserve which backend succeeded and which failed: {partial}"
         );
 
@@ -499,7 +502,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            missing.contains("No stored credential found"),
+            missing.contains("No stored credential was found"),
             "two missing backends must not be treated as file-only success: {missing}"
         );
     }
@@ -513,7 +516,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("No stored credential found"),
+            err.to_string().contains("No stored credential was found"),
             "expected no-credential error, got: {err}"
         );
     }
@@ -528,7 +531,7 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("partially failed") && msg.contains("encrypted-file"),
+            msg.contains("could not delete it from encrypted-file"),
             "partial failure must name the failed backend: {msg}"
         );
     }

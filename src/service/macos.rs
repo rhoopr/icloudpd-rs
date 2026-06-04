@@ -138,7 +138,7 @@ fn kei_state_dir() -> Option<PathBuf> {
 pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Result<()> {
     let exe = current_executable()?;
     let home = dirs::home_dir().ok_or_else(|| {
-        anyhow!("could not resolve $HOME; required for plist + LaunchAgents path")
+        anyhow!("Could not find $HOME, which is needed for the LaunchAgents plist path.")
     })?;
     let plist_path = home.join(LAUNCH_AGENTS_SUBDIR).join(PLIST_FILE_NAME);
     let log_dir = home.join(LOG_SUBDIR);
@@ -157,7 +157,7 @@ pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Resul
     }
 
     std::fs::create_dir_all(&log_dir)
-        .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
+        .with_context(|| format!("Could not create log directory {}", log_dir.display()))?;
 
     write_plist(&plist_path, &xml)?;
     tracing::info!(
@@ -206,7 +206,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
 
     if args.purge {
         let Some(kei_dir) = kei_state_dir() else {
-            bail!("--purge requested but $HOME does not resolve; cannot locate kei state");
+            bail!("`--purge` needs $HOME so kei can find its state.");
         };
         let extras: Vec<PathBuf> = user_log_dir().into_iter().collect();
         purge_kei_state(&kei_dir, &extras)?;
@@ -301,27 +301,29 @@ fn write_plist(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
-                "failed to create LaunchAgents directory {}",
+                "Could not create LaunchAgents directory {}",
                 parent.display()
             )
         })?;
     }
     std::fs::write(path, contents)
-        .with_context(|| format!("failed to write plist {}", path.display()))
+        .with_context(|| format!("Could not write launchd plist {}", path.display()))
 }
 
 fn remove_plist_file(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("failed to remove plist {}", path.display())),
+        Err(e) => {
+            Err(e).with_context(|| format!("Could not remove launchd plist {}", path.display()))
+        }
     }
 }
 
 fn serialize_plist(dict: &Dictionary) -> Result<String> {
     let mut buf = Vec::new();
-    plist::to_writer_xml(&mut buf, dict).context("failed to serialize launchd plist to XML")?;
-    String::from_utf8(buf).context("plist serializer emitted non-UTF-8 bytes")
+    plist::to_writer_xml(&mut buf, dict).context("Could not build launchd plist XML")?;
+    String::from_utf8(buf).context("launchd plist XML was not valid UTF-8")
 }
 
 /// Tries `launchctl bootstrap gui/<uid>` first; falls back to the legacy
@@ -402,7 +404,7 @@ async fn run_launchctl(args: &[&str]) -> Result<()> {
         .args(args)
         .output()
         .await
-        .context("failed to invoke `launchctl` (is this macOS?)")?;
+        .context("Could not run `launchctl`. Is this macOS?")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -422,7 +424,7 @@ async fn launchctl_print() -> Result<StatusInputs> {
         .args(["print", &target])
         .output()
         .await
-        .context("failed to invoke `launchctl print`")?;
+        .context("Could not run `launchctl print`")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if is_domain_unavailable(&stderr) || is_not_loaded(&stderr) {

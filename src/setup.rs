@@ -234,7 +234,7 @@ fn print_toml_preview(toml_content: &str) {
 
 pub(crate) fn run_setup(config_path: &Path) -> anyhow::Result<SetupResult> {
     if !std::io::stdin().is_terminal() {
-        bail!("The setup wizard requires an interactive terminal.");
+        bail!("The setup wizard needs an interactive terminal.");
     }
 
     println!();
@@ -462,7 +462,7 @@ fn write_setup_files_with_store(
 ) -> anyhow::Result<SetupWriteResult> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            .with_context(|| format!("Could not create directory {}", parent.display()))?;
     }
 
     let (credential_backend, write_env) = match &answers.secret_source {
@@ -493,7 +493,7 @@ fn write_setup_files_with_store(
 
 fn write_config_file(config_path: &Path, toml_content: &str) -> anyhow::Result<()> {
     std::fs::write(config_path, toml_content)
-        .with_context(|| format!("Failed to write {}", config_path.display()))?;
+        .with_context(|| format!("Could not write {}", config_path.display()))?;
     #[cfg(unix)]
     set_restricted_permissions(config_path)?;
     Ok(())
@@ -516,7 +516,7 @@ fn write_env_file(config_path: &Path, answers: &SetupAnswers) -> anyhow::Result<
     let env_content =
         format!("ICLOUD_USERNAME='{escaped_user}'\nICLOUD_PASSWORD='{escaped_pass}'\n",);
     std::fs::write(&env_path, &env_content)
-        .with_context(|| format!("Failed to write {}", env_path.display()))?;
+        .with_context(|| format!("Could not write {}", env_path.display()))?;
     #[cfg(unix)]
     set_restricted_permissions(&env_path)?;
     Ok(env_path)
@@ -531,7 +531,7 @@ fn set_restricted_permissions(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("Failed to set permissions on {}", path.display()))
+        .with_context(|| format!("Could not set secure permissions on {}", path.display()))
 }
 
 fn print_secret_summary(answers: &SetupAnswers, write_result: &SetupWriteResult) {
@@ -731,7 +731,7 @@ fn ask_secret_source(answers: &mut SetupAnswers) -> anyhow::Result<()> {
                 .with_prompt("Password file path")
                 .validate_with(|input: &String| {
                     if input.trim().is_empty() {
-                        Err("password file path cannot be empty")
+                        Err("Password file path cannot be empty.")
                     } else {
                         Ok(())
                     }
@@ -744,7 +744,7 @@ fn ask_secret_source(answers: &mut SetupAnswers) -> anyhow::Result<()> {
                 .with_prompt("Password command")
                 .validate_with(|input: &String| {
                     if input.trim().is_empty() {
-                        Err("password command cannot be empty")
+                        Err("Password command cannot be empty.")
                     } else {
                         Ok(())
                     }
@@ -1018,12 +1018,12 @@ fn parse_positive_or_blank<T: std::str::FromStr>(s: &str) -> Result<Option<T>, S
         return Ok(None);
     }
     if trimmed == "0" {
-        return Err("must be greater than zero (or leave blank to disable)".to_string());
+        return Err("Enter a number greater than zero, or leave blank to disable.".to_string());
     }
     trimmed
         .parse::<T>()
         .map(Some)
-        .map_err(|_e| "must be a positive integer or blank".to_string())
+        .map_err(|_e| "Enter a positive integer, or leave blank.".to_string())
 }
 
 // ── Step 7: Running mode ───────────────────────────────────────────
@@ -1049,7 +1049,7 @@ fn ask_running_mode(answers: &mut SetupAnswers) -> anyhow::Result<()> {
                 if (60..=86400).contains(n) {
                     Ok(())
                 } else {
-                    Err("must be between 60 and 86400 seconds".to_string())
+                    Err("Enter a value between 60 and 86400 seconds.".to_string())
                 }
             })
             .interact_text()?;
@@ -1177,7 +1177,7 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             if (1..=64).contains(n) {
                 Ok(())
             } else {
-                Err("must be between 1 and 64".to_string())
+                Err("Enter a value between 1 and 64.".to_string())
             }
         })
         .interact_text()?;
@@ -1192,7 +1192,7 @@ fn ask_extras(answers: &mut SetupAnswers) -> anyhow::Result<()> {
             if (0..=100).contains(n) {
                 Ok(())
             } else {
-                Err("must be between 0 and 100".to_string())
+                Err("Enter a value between 0 and 100.".to_string())
             }
         })
         .interact_text()?;

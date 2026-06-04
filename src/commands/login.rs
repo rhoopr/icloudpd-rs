@@ -19,7 +19,9 @@ pub(crate) async fn run_login(
     let (username, password, domain, cookie_directory) = config::resolve_auth(globals, pw, toml);
 
     if username.is_empty() {
-        anyhow::bail!("username is required for login (set ICLOUD_USERNAME or [auth].username)");
+        anyhow::bail!(
+            "Set your iCloud username with ICLOUD_USERNAME or [auth].username before logging in."
+        );
     }
 
     let password_provider =

@@ -423,7 +423,7 @@ pub(crate) fn load_toml_config(path: &Path, required: bool) -> anyhow::Result<Op
             Ok(Some(config))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => Ok(None),
-        Err(e) => Err(e).context(format!("Failed to read config file {}", path.display()))?,
+        Err(e) => Err(e).context(format!("Could not read config file {}", path.display()))?,
     }
 }
 
@@ -452,7 +452,7 @@ pub(crate) fn resolve_media_selection(
     skip_photos_override: Option<bool>,
 ) -> anyhow::Result<MediaSelection> {
     let mut selection = if let Some(kinds) = toml_filters.and_then(|f| f.media.as_ref()) {
-        anyhow::ensure!(!kinds.is_empty(), "[filters] media must not be empty");
+        anyhow::ensure!(!kinds.is_empty(), "[filters].media cannot be empty.");
         let mut seen = BTreeSet::new();
         let mut selection = MediaSelection {
             photos: false,
@@ -462,7 +462,7 @@ pub(crate) fn resolve_media_selection(
         for kind in kinds {
             anyhow::ensure!(
                 seen.insert(*kind),
-                "[filters] media contains duplicate `{}`",
+                "[filters].media contains duplicate `{}`.",
                 media_kind_name(*kind)
             );
             match kind {
@@ -485,7 +485,7 @@ pub(crate) fn resolve_media_selection(
 
     anyhow::ensure!(
         selection.photos || selection.videos || selection.live_photos,
-        "[filters] media must select at least one media category"
+        "[filters].media must select at least one media category."
     );
 
     Ok(selection)
@@ -575,7 +575,7 @@ fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyho
         }
         if stripped.contains(token) {
             anyhow::bail!(
-                "'{token}' is not valid in {flag}; move it to {owner} (template was \"{folder_structure}\")"
+                "`{token}` cannot be used in {flag}. Move it to {owner}. Template: \"{folder_structure}\""
             );
         }
     }
@@ -587,7 +587,7 @@ fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyho
         let count = stripped.matches(token).count();
         if count > 1 {
             anyhow::bail!(
-                "'{token}' may only appear once in {flag}; got {count} occurrences in \"{folder_structure}\""
+                "`{token}` can appear only once in {flag}. Found {count} in \"{folder_structure}\"."
             );
         }
     }
@@ -597,7 +597,7 @@ fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyho
 
     if has_library && segments.first() != Some(&TOKEN_LIBRARY) {
         anyhow::bail!(
-            "'{TOKEN_LIBRARY}' must be the first path segment of {flag}; got \"{folder_structure}\""
+            "`{TOKEN_LIBRARY}` must be the first path segment in {flag}. Template: \"{folder_structure}\""
         );
     }
     if let Some(cat) = category.filter(|c| stripped.contains(*c)) {
@@ -608,7 +608,7 @@ fn validate_template_tokens(folder_structure: &str, kind: TemplateKind) -> anyho
             } else {
                 "must be the first path segment"
             };
-            anyhow::bail!("'{cat}' {position} of {flag}; got \"{folder_structure}\"");
+            anyhow::bail!("`{cat}` {position} in {flag}. Template: \"{folder_structure}\"");
         }
     }
 
@@ -712,7 +712,7 @@ pub(crate) fn validate_download_dir(path: &Path) -> anyhow::Result<()> {
     // trimmed.is_empty() catches "/" (trimmed to "")
     if trimmed.is_empty() || DENIED.contains(&trimmed) {
         anyhow::bail!(
-            "Refusing to use system directory '{}' as download directory",
+            "Refusing to use system directory '{}' as the download directory.",
             path.display()
         );
     }
@@ -859,7 +859,7 @@ pub(crate) fn resolve_path_derivation_fields(
     let alternative = resolve_flag(cli.alternative, toml_photos.and_then(|p| p.alternative));
     anyhow::ensure!(
         resolution != PhotoResolution::None || edited || alternative,
-        "photos.resolution = \"none\" requires photos.edited = true or photos.alternative = true"
+        "[photos].resolution = \"none\" requires [photos].edited = true or [photos].alternative = true."
     );
     let raw_policy = resolve(
         cli.raw_policy,
@@ -1105,7 +1105,7 @@ impl Config {
         // (`kei password set`), password files, and shell-command sources.
         if toml_auth.and_then(|a| a.password.as_ref()).is_some() {
             anyhow::bail!(
-                "config file sets `[auth] password`, which is not accepted. \
+                "The config file sets `[auth].password`, which kei no longer accepts. \
                  Plaintext passwords in config files are a security risk. \
                  Use one of: `kei password set` (OS keyring or encrypted file), \
                  `[auth] password_file`, or `[auth] password_command` instead."
@@ -1124,8 +1124,7 @@ impl Config {
         #[cfg(windows)]
         if password_command.is_some() {
             anyhow::bail!(
-                "`--password-command` / `[auth] password_command` is not supported on Windows: \
-                 kei runs commands via `sh -c`, which isn't on the stock Windows PATH. \
+                "`--password-command` and `[auth].password_command` are not supported on Windows because kei runs commands through `sh -c`, which is not on the default Windows PATH. \
                  Use `--password-file` / `[auth] password_file`, or run kei under WSL."
             );
         }
@@ -1137,10 +1136,10 @@ impl Config {
                 .and_then(|t| t.auth.as_ref()?.username.as_ref())
                 .is_some()
         {
-            anyhow::ensure!(!username.is_empty(), "username must not be empty");
+            anyhow::ensure!(!username.is_empty(), "The iCloud username cannot be empty.");
         }
         if let Some(pw_str) = &password_str {
-            anyhow::ensure!(!pw_str.is_empty(), "password must not be empty");
+            anyhow::ensure!(!pw_str.is_empty(), "The iCloud password cannot be empty.");
         }
 
         // Reject both `password_file` and `password_command` in the same TOML
@@ -1148,8 +1147,7 @@ impl Config {
         if let Some(toml_a) = toml_auth {
             anyhow::ensure!(
                 !(toml_a.password_file.is_some() && toml_a.password_command.is_some()),
-                "config file sets both `[auth] password_file` and \
-                 `[auth] password_command` — pick one"
+                "The config file sets both `[auth].password_file` and `[auth].password_command`. Pick one password source."
             );
         }
 
@@ -1162,13 +1160,13 @@ impl Config {
         if let Some(existing) = cookie_directory.ancestors().find(|a| a.exists()) {
             anyhow::ensure!(
                 existing.is_dir(),
-                "cookie directory path contains a non-directory component: {}",
+                "The cookie directory path contains a file where a directory is needed: {}",
                 existing.display()
             );
         }
         std::fs::create_dir_all(&cookie_directory).map_err(|e| {
             anyhow::anyhow!(
-                "cannot create cookie directory {}: {e}",
+                "Could not create cookie directory {}: {e}",
                 cookie_directory.display()
             )
         })?;
@@ -1197,7 +1195,7 @@ impl Config {
             Some(n)
         } else if let Some(s) = toml_dl.and_then(|d| d.bandwidth_limit.as_ref()) {
             Some(crate::cli::parse_bandwidth_limit(s).map_err(|e| {
-                anyhow::anyhow!("invalid [download].bandwidth_limit in config: {e}")
+                anyhow::anyhow!("Invalid [download].bandwidth_limit in config: {e}")
             })?)
         } else {
             None
@@ -1221,7 +1219,7 @@ impl Config {
             .unwrap_or(threads_default);
         anyhow::ensure!(
             (1..=64).contains(&threads_num),
-            "threads must be in 1..=64, got {threads_num}"
+            "[download].threads must be between 1 and 64, got {threads_num}."
         );
         let temp_suffix = resolve(
             overrides.temp_suffix,
@@ -1277,7 +1275,7 @@ impl Config {
         );
         anyhow::ensure!(
             max_retries <= 100,
-            "retry per_transfer must be <= 100, got {max_retries}"
+            "[download.retry].per_transfer must be 100 or less, got {max_retries}."
         );
         // Lifetime cap on download attempts per asset (0 disables). CLI >
         // TOML > 10, matching every other resolved value. The runtime
@@ -1331,7 +1329,7 @@ impl Config {
             .iter()
             .map(|p| {
                 glob::Pattern::new(p)
-                    .map_err(|e| anyhow::anyhow!("invalid --filename-exclude pattern '{p}': {e}"))
+                    .map_err(|e| anyhow::anyhow!("Invalid --filename-exclude pattern '{p}': {e}"))
             })
             .collect::<anyhow::Result<_>>()?;
         let persistent_recent = toml_filters.and_then(|f| f.recent);
@@ -1360,18 +1358,18 @@ impl Config {
             Some(crate::cli::RecentLimit::Days(n)) => {
                 anyhow::ensure!(
                     explicit_skip_created_before_str.is_none(),
-                    "`--recent {n}d` and `--skip-created-before` are equivalent controls - pick one"
+                    "`--recent {n}d` and `--skip-created-before` do the same thing. Pick one."
                 );
                 (None, Some(n))
             }
         };
         anyhow::ensure!(
             recent_raw.is_some() || !recent_scope_was_set,
-            "`recent_scope` only applies when `recent` is set"
+            "`recent_scope` only applies when `recent` is set."
         );
         anyhow::ensure!(
             !matches!(recent_raw, Some(crate::cli::RecentLimit::Days(_))) || !recent_scope_was_set,
-            "`recent_scope` only applies to count-form `recent` values, not `Nd` days windows"
+            "`recent_scope` only applies to count-form `recent` values, not `Nd` day windows."
         );
         let skip_created_before_str = if let Some(n) = recent_days {
             Some(format!("{n}d"))
@@ -1462,7 +1460,7 @@ impl Config {
             Some(addr) => addr,
             None => match toml_server.and_then(|s| s.bind.as_deref()) {
                 Some(raw) => raw.parse::<std::net::IpAddr>().map_err(|e| {
-                    anyhow::anyhow!("[server] bind is not a valid IP address ({raw:?}): {e}")
+                    anyhow::anyhow!("[server].bind must be an IP address, but got {raw:?}: {e}")
                 })?,
                 None => DEFAULT_HTTP_BIND,
             },
@@ -1474,8 +1472,7 @@ impl Config {
             && live_photo_mode == LivePhotoMode::Skip
         {
             anyhow::bail!(
-                "[filters] media selects only live-photos, but [photos] live_photo_mode = \"skip\" \
-                 would download nothing. Enable photos or videos, or change live_photo_mode."
+                "[filters].media selects only live photos, but [photos].live_photo_mode = \"skip\" would download nothing. Enable photos or videos, or change live_photo_mode."
             );
         }
 
@@ -1953,18 +1950,23 @@ pub(crate) fn persist_first_run_config(
     }
 
     let content = toml::to_string_pretty(&minimal)
-        .map_err(|e| anyhow::anyhow!("failed to serialize config: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Could not serialize config: {e}"))?;
 
     let output = format!("# Generated by kei on first run. Edit freely.\n\n{content}");
     std::fs::write(config_path, &output)
-        .with_context(|| format!("writing config to {}", config_path.display()))?;
+        .with_context(|| format!("Could not write config to {}", config_path.display()))?;
 
     // Restrict permissions on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0o600 on {}", config_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "Could not set secure permissions on {}",
+                    config_path.display()
+                )
+            })?;
     }
 
     tracing::info!(path = %config_path.display(), "Saved configuration for future runs");
@@ -1980,8 +1982,8 @@ pub(crate) fn persist_first_run_config(
 pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>> {
     if let Some(days_str) = s.strip_suffix('d') {
         if let Ok(days) = days_str.parse::<u64>() {
-            let days =
-                i64::try_from(days).map_err(|_e| anyhow::anyhow!("interval '{s}' is too large"))?;
+            let days = i64::try_from(days)
+                .map_err(|_e| anyhow::anyhow!("Date interval '{s}' is too large"))?;
             return Ok(Local::now() - chrono::Duration::days(days));
         }
     }
@@ -1998,8 +2000,7 @@ pub(crate) fn parse_date_or_interval(s: &str) -> anyhow::Result<DateTime<Local>>
         }
     }
     anyhow::bail!(
-        "Cannot parse '{s}' as a date. Expected ISO date (2025-01-02), \
-         datetime (2025-01-02T14:30:00), or interval (20d)"
+        "Could not parse '{s}' as a date. Use a date like 2025-01-02, a datetime like 2025-01-02T14:30:00, or an interval like 20d."
     )
 }
 
@@ -2064,13 +2065,13 @@ mod tests {
         let err = validate_template_tokens("%Y/{library}/%m", TemplateKind::Unfiled).unwrap_err();
         assert!(
             err.to_string()
-                .contains("'{library}' must be the first path segment"),
+                .contains("`{library}` must be the first path segment"),
             "{err}"
         );
         let err =
             validate_template_tokens("{album}/{library}/%Y", TemplateKind::Albums).unwrap_err();
         assert!(
-            err.to_string().contains("'{library}' must be the first"),
+            err.to_string().contains("`{library}` must be the first"),
             "{err}"
         );
     }
@@ -2108,10 +2109,10 @@ mod tests {
     fn validate_template_tokens_rejects_duplicate_tokens() {
         let err = validate_template_tokens("{library}/{library}/{album}", TemplateKind::Albums)
             .unwrap_err();
-        assert!(err.to_string().contains("only appear once"), "{err}");
+        assert!(err.to_string().contains("can appear only once"), "{err}");
 
         let err = validate_template_tokens("{album}/{album}", TemplateKind::Albums).unwrap_err();
-        assert!(err.to_string().contains("only appear once"), "{err}");
+        assert!(err.to_string().contains("can appear only once"), "{err}");
     }
 
     #[test]
@@ -2360,7 +2361,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("Failed to read config file"),
+            err.contains("Could not read config file"),
             "Error should mention config file: {err}"
         );
     }
@@ -2893,7 +2894,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None)
             .expect_err("`{library}` not as first segment must bail");
         assert!(
-            err.to_string().contains("'{library}' must be the first"),
+            err.to_string().contains("`{library}` must be the first"),
             "{err}"
         );
     }
@@ -3229,7 +3230,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("`[auth] password`"),
+            err.contains("`[auth].password`"),
             "Error should name the rejected field; got: {err}"
         );
         assert!(
@@ -3256,7 +3257,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("`[auth] password`"),
+                .contains("`[auth].password`"),
             "Error should name the rejected field even for empty values"
         );
     }
@@ -4544,7 +4545,7 @@ mod tests {
         let err = resolve_path_derivation_fields(PathDerivationCliArgs::default(), Some(&toml))
             .expect_err("resolution none needs an extra");
         assert!(
-            err.to_string().contains("requires photos.edited"),
+            err.to_string().contains("requires [photos].edited"),
             "unexpected error: {err}"
         );
     }
@@ -5226,7 +5227,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("'--album all' cannot be combined with literal album names"),
+            msg.contains("`--album all` cannot be combined with album names"),
             "unexpected error: {msg}"
         );
     }
@@ -5322,7 +5323,7 @@ mod tests {
         sync.config_overrides.albums = vec!["Vacation".to_string(), "!Vacation".to_string()];
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
-            err.to_string().contains("cannot both include and exclude"),
+            err.to_string().contains("includes and excludes"),
             "unexpected error: {err}"
         );
     }
@@ -5334,7 +5335,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("'--album none' cannot be combined"),
+                .contains("`--album none` cannot be combined"),
             "unexpected error: {err}"
         );
     }
@@ -5346,7 +5347,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("'{album}' is not valid in --folder-structure"),
+                .contains("`{album}` cannot be used in --folder-structure"),
             "unexpected error: {err}"
         );
     }
@@ -5358,7 +5359,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("'{album}' is not valid in --folder-structure"),
+                .contains("`{album}` cannot be used in --folder-structure"),
             "unexpected error: {err}"
         );
     }
@@ -5370,7 +5371,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("'{album}' is not valid in --folder-structure"),
+                .contains("`{album}` cannot be used in --folder-structure"),
             "unexpected error: {err}"
         );
     }
@@ -5382,7 +5383,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("'{album}' is not valid in --folder-structure"),
+                .contains("`{album}` cannot be used in --folder-structure"),
             "unexpected error: {err}"
         );
     }
@@ -6121,7 +6122,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(err
             .to_string()
-            .contains("invalid --filename-exclude pattern"));
+            .contains("Invalid --filename-exclude pattern"));
     }
 
     #[test]
@@ -6252,7 +6253,7 @@ mod tests {
         sync.config_overrides.smart_folders =
             vec!["all".to_string(), "all-with-sensitive".to_string()];
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
-        assert!(err.to_string().contains("mutually exclusive"));
+        assert!(err.to_string().contains("cannot be used together"));
     }
 
     fn build_with_unfiled(cli: Option<bool>, toml_str: Option<&str>) -> Config {
@@ -6778,7 +6779,7 @@ mod tests {
             .to_string();
         assert!(err.contains("--recent 30d"), "{err}");
         assert!(err.contains("--skip-created-before"), "{err}");
-        assert!(err.contains("pick one"), "{err}");
+        assert!(err.contains("Pick one"), "{err}");
     }
 
     #[test]
@@ -6928,7 +6929,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("media must not be empty"), "{err}");
+        assert!(err.contains("[filters].media cannot be empty"), "{err}");
     }
 
     #[test]

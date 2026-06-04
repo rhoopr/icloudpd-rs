@@ -71,6 +71,6 @@ async fn dispatch(plan: InstallPlan, config_path: &Path) -> Result<()> {
         "preparing to install kei service",
     );
     Err(anyhow::anyhow!(
-        "`kei install` is not implemented on this platform"
+        "`kei install` is not available on this platform."
     ))
 }

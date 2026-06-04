@@ -7,20 +7,20 @@ use thiserror::Error;
 /// permanent ones (auth errors, disk failures) so the retry loop can abort early.
 #[derive(Debug, Error)]
 pub(crate) enum DownloadError {
-    #[error("HTTP error {status} downloading {path}")]
+    #[error("Apple returned HTTP {status} while downloading {path}")]
     HttpStatus { status: u16, path: Box<str> },
 
-    #[error("Content-length mismatch for {path}: expected {expected} bytes, received {received}")]
+    #[error("Download size changed for {path}: expected {expected} bytes, received {received}")]
     ContentLengthMismatch {
         path: Box<str>,
         expected: u64,
         received: u64,
     },
 
-    #[error("Disk error: {0}")]
+    #[error("Could not write to disk: {0}")]
     Disk(Box<std::io::Error>),
 
-    #[error("HTTP error downloading {path} (status={status}, content_length={content_length:?}, bytes_so_far={bytes_written}): {source}")]
+    #[error("Download failed for {path} after {bytes_written} bytes (HTTP {status}, content length {content_length:?}): {source}")]
     Http {
         source: Box<dyn std::error::Error + Send + Sync>,
         path: Box<str>,
@@ -29,10 +29,10 @@ pub(crate) enum DownloadError {
         bytes_written: u64,
     },
 
-    #[error("Invalid content for {path}: {reason}")]
+    #[error("Downloaded content for {path} did not pass validation: {reason}")]
     InvalidContent { path: Box<str>, reason: Box<str> },
 
-    #[error("Download interrupted for {path} after {bytes_written} bytes")]
+    #[error("Download was interrupted for {path} after {bytes_written} bytes")]
     Interrupted { path: Box<str>, bytes_written: u64 },
 
     #[error(transparent)]

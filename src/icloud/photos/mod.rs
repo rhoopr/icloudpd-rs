@@ -119,7 +119,7 @@ impl PhotosService {
             return Ok(lib);
         }
         anyhow::bail!(
-            "Unknown library: '{name}'. Run `kei list libraries` to see available libraries."
+            "iCloud Photos library `{name}` was not found. Run `kei list libraries` to see available libraries."
         )
     }
 
@@ -152,7 +152,7 @@ impl PhotosService {
         }
         self.private_libraries
             .as_ref()
-            .context("internal error: private libraries were not cached")
+            .context("Internal error: private iCloud Photos libraries were not cached")
     }
 
     /// Fetch shared libraries (lazily, first call triggers the HTTP request).
@@ -165,7 +165,7 @@ impl PhotosService {
         }
         self.shared_libraries
             .as_ref()
-            .context("internal error: shared libraries were not cached")
+            .context("Internal error: shared iCloud Photos libraries were not cached")
     }
 
     async fn fetch_libraries(
@@ -226,7 +226,7 @@ impl PhotosService {
                 }
                 Err(e) => {
                     tracing::error!(zone = %zone_name, error = %e, "Failed to load library zone");
-                    anyhow::bail!("Failed to load library zone {zone_name}: {e}");
+                    anyhow::bail!("Could not load iCloud Photos library zone {zone_name}: {e}");
                 }
             }
         }
@@ -260,7 +260,7 @@ impl PhotosService {
         )
         .await?;
         let parsed: ChangesDatabaseResponse = serde_json::from_value(response)
-            .context("failed to parse changes database response")?;
+            .context("Could not read Apple's changes/database response")?;
         Ok(parsed)
     }
 }
@@ -740,7 +740,7 @@ mod tests {
         let err = svc.get_library("DoesNotExist").await.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("Unknown library") && msg.contains("DoesNotExist"),
+            msg.contains("iCloud Photos library") && msg.contains("DoesNotExist"),
             "error should name the unknown library: {msg}"
         );
     }

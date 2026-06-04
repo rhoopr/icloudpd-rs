@@ -441,9 +441,10 @@ impl PhotoAlbum {
         )
         .await?;
 
-        let batch: super::cloudkit::BatchQueryResponse =
-            serde_json::from_value(response).context("failed to parse album count response")?;
-        Self::count_from_query(batch.batch.first()).context("failed to read album count response")
+        let batch: super::cloudkit::BatchQueryResponse = serde_json::from_value(response)
+            .context("Could not read Apple's album count response")?;
+        Self::count_from_query(batch.batch.first())
+            .context("Could not find the album count in Apple's response")
     }
 
     /// Return item counts for a same-library pass set with one
@@ -514,10 +515,10 @@ impl PhotoAlbum {
         (0..albums.len())
             .map(|index| {
                 let query = batch.batch.get(index).ok_or_else(|| {
-                    anyhow::anyhow!("missing batched count result for pass {index}")
+                    anyhow::anyhow!("Apple did not return an album count for pass {index}.")
                 })?;
                 Self::count_from_query(Some(query)).with_context(|| {
-                    format!("failed to read batched album count result for pass {index}")
+                    format!("Could not read Apple's album count result for pass {index}")
                 })
             })
             .collect()
@@ -543,20 +544,20 @@ impl PhotoAlbum {
     }
 
     fn count_from_query(query: Option<&super::cloudkit::QueryResponse>) -> anyhow::Result<u64> {
-        let query = query.context("missing album count query result")?;
+        let query = query.context("Apple did not return an album count query result")?;
         let record = query
             .records
             .first()
-            .context("album count query returned no records")?;
+            .context("Apple's album count query returned no records")?;
         let item_count = record
             .fields
             .get("itemCount")
-            .context("album count record missing itemCount")?;
+            .context("Apple's album count record did not include itemCount")?;
         let value = item_count
             .get("value")
-            .context("album count itemCount missing value")?;
+            .context("Apple's album count itemCount did not include a value")?;
         value.as_u64().with_context(|| {
-            format!("album count itemCount value was not an unsigned integer: {value}")
+            format!("Apple's album count itemCount was not a non-negative integer: {value}")
         })
     }
 
@@ -575,8 +576,7 @@ impl PhotoAlbum {
         let items = stream.collect::<Result<Vec<_>, _>>().await?;
         if panic_rx.await.unwrap_or(false) {
             anyhow::bail!(
-                "photo enumeration aborted: a fetcher task panicked; \
-                 results are incomplete, see earlier error log"
+                "Photo enumeration stopped because a fetcher task crashed. Results are incomplete; see the earlier error log."
             );
         }
         Ok(items)
@@ -1035,7 +1035,7 @@ impl PhotoAlbum {
 
             let changes_resp: ChangesZoneResponse = serde_json::from_value(response)?;
             let Some(zone_result) = changes_resp.zones.into_iter().next() else {
-                anyhow::bail!("changes/zone returned empty zones array");
+                anyhow::bail!("Apple changes/zone returned no zones.");
             };
             let zone_name = zone_result.zone_id.zone_name.clone();
             check_changes_zone_error(
@@ -1115,7 +1115,7 @@ impl PhotoAlbum {
                 };
 
                 let Some(zone_result) = changes_resp.zones.into_iter().next() else {
-                    break Some(anyhow::anyhow!("changes/zone returned empty zones array"));
+                    break Some(anyhow::anyhow!("Apple changes/zone returned no zones."));
                 };
 
                 // Check for zone-level errors BEFORE advancing current_token.
@@ -1391,8 +1391,7 @@ impl PhotoAlbum {
                             enumeration_incomplete = true;
                             let _ = tx
                                 .send(Err(anyhow::anyhow!(
-                                    "photo enumeration incomplete: records/query returned {} \
-                                     consecutive empty pages without a server completion proof",
+                                    "Photo enumeration is incomplete: Apple returned {} consecutive empty pages without confirming the end of the stream.",
                                     MAX_EMPTY_PAGE_PROBES
                                 )))
                                 .await;
@@ -1527,8 +1526,7 @@ impl PhotoAlbum {
                     enumeration_incomplete = true;
                     let _ = tx
                         .send(Err(anyhow::anyhow!(
-                            "photo enumeration incomplete: {} unpaired CPLMaster/CPLAsset \
-                             records exceeded the pending-pair buffer",
+                            "Photo enumeration is incomplete: {} unpaired CPLMaster/CPLAsset records exceeded the pending-pair buffer.",
                             pending_record_count
                         )))
                         .await;
@@ -1557,8 +1555,7 @@ impl PhotoAlbum {
                 }
                 let _ = tx
                     .send(Err(anyhow::anyhow!(
-                        "photo enumeration incomplete: {} unpaired CPLMaster records and {} \
-                         unpaired CPLAsset records remained at end of stream",
+                        "Photo enumeration is incomplete: {} unpaired CPLMaster records and {} unpaired CPLAsset records remained at the end of the stream.",
                         pending_masters.len(),
                         pending_assets.len()
                     )))
@@ -1849,7 +1846,7 @@ mod tests {
         let err = PhotoAlbum::count_from_query(Some(&query)).expect_err("missing count fails");
 
         assert!(
-            err.to_string().contains("missing itemCount"),
+            err.to_string().contains("did not include itemCount"),
             "unexpected error: {err:#}"
         );
     }
@@ -1861,7 +1858,7 @@ mod tests {
         let err = PhotoAlbum::count_from_query(Some(&query)).expect_err("malformed count fails");
 
         assert!(
-            err.to_string().contains("was not an unsigned integer"),
+            err.to_string().contains("was not a non-negative integer"),
             "unexpected error: {err:#}"
         );
     }
@@ -2391,7 +2388,7 @@ mod tests {
         assert_eq!(ids, vec!["master-before-empty-tail"]);
         assert_eq!(errors.len(), 1);
         assert!(
-            errors[0].contains("consecutive empty pages without a server completion proof"),
+            errors[0].contains("without confirming the end of the stream"),
             "unexpected error: {}",
             errors[0]
         );
@@ -3569,7 +3566,7 @@ mod tests {
         assert!(err.is_err());
         let err_msg = format!("{}", err.unwrap_err());
         assert!(
-            err_msg.contains("Invalid sync token"),
+            err_msg.contains("sync token is no longer valid"),
             "error should mention invalid sync token, got: {err_msg}"
         );
 

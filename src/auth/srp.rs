@@ -355,7 +355,7 @@ pub async fn authenticate_srp(
     domain: &str,
 ) -> Result<()> {
     let n = BigUint::parse_bytes(N_HEX.as_bytes(), 16)
-        .ok_or_else(|| anyhow::anyhow!("Failed to parse SRP prime"))?;
+        .ok_or_else(|| anyhow::anyhow!("Could not initialize Apple SRP login parameters."))?;
     let g = BigUint::from(G_VAL);
 
     let mut a_bytes = vec![0u8; 32];
@@ -435,24 +435,25 @@ pub async fn authenticate_srp(
     let body: super::responses::SrpInitResponse = response.json().with_context(|| {
         let text = response.text();
         format!(
-            "SRP init: expected JSON but got (HTTP {}): {:?}",
+            "Apple login returned an unexpected response during SRP setup (HTTP {}): {:?}",
             response.status,
             crate::truncate_str(&text, 200)
         )
     })?;
 
-    let iterations = u32::try_from(body.iteration).context("SRP iteration count exceeds u32")?;
+    let iterations =
+        u32::try_from(body.iteration).context("Apple SRP iteration count is too large")?;
     anyhow::ensure!(
         iterations <= 1_000_000,
-        "SRP iteration count {iterations} exceeds safety limit"
+        "Apple SRP iteration count {iterations} exceeds kei's safety limit."
     );
 
     let salt = BASE64
         .decode(&body.salt)
-        .context("Failed to decode SRP salt")?;
+        .context("Could not decode Apple SRP salt")?;
     let b_pub_bytes = BASE64
         .decode(&body.b)
-        .context("Failed to decode SRP public key")?;
+        .context("Could not decode Apple SRP public key")?;
     let b_pub = BigUint::from_bytes_be(&b_pub_bytes);
 
     let password_key = derive_apple_password(password, &body.protocol, &salt, iterations);
@@ -467,10 +468,16 @@ pub async fn authenticate_srp(
     let u = compute_u(&a_pub, &b_pub, &n);
 
     if u == BigUint::ZERO {
-        return Err(AuthError::FailedLogin("SRP: u is zero, aborting".into()).into());
+        return Err(AuthError::FailedLogin(
+            "Apple SRP login returned an invalid challenge.".into(),
+        )
+        .into());
     }
     if &b_pub % &n == BigUint::ZERO {
-        return Err(AuthError::FailedLogin("SRP: B mod N is zero, aborting".into()).into());
+        return Err(AuthError::FailedLogin(
+            "Apple SRP login returned an invalid public key.".into(),
+        )
+        .into());
     }
 
     let v = g.modpow(&x, &n);
@@ -582,7 +589,7 @@ pub async fn authenticate_srp(
         if !repair_response.is_success() {
             return Err(AuthError::ApiError {
                 code: 412,
-                message: format!("Repair failed: {}", repair_response.text()),
+                message: format!("Apple account repair failed: {}", repair_response.text()),
             }
             .into());
         }
@@ -597,8 +604,7 @@ pub async fn authenticate_srp(
         return Err(AuthError::ApiError {
             code: status,
             message: format!(
-                "Apple returned HTTP {status}{detail} — this is usually a temporary \
-                 Apple server issue, try again in a few minutes"
+                "Apple returned HTTP {status}{detail}. This is usually a temporary Apple server issue; try again in a few minutes."
             ),
         }
         .into());
@@ -629,9 +635,10 @@ pub async fn authenticate_srp(
         } else {
             format!(": {body}")
         };
-        return Err(
-            AuthError::FailedLogin(format!("Invalid email/password combination{detail}")).into(),
-        );
+        return Err(AuthError::FailedLogin(format!(
+            "Apple rejected the iCloud username or password{detail}"
+        ))
+        .into());
     } else if response.status == 429 {
         return Err(AuthError::ApiError {
             code: 429,
@@ -736,7 +743,9 @@ where
     if let Some(resp) = last_transient {
         return Ok(resp);
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("SRP {step}: retry loop exhausted")))
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!("Apple SRP login step `{step}` did not succeed after all retries.")
+    }))
 }
 
 #[cfg(test)]
@@ -1023,7 +1032,9 @@ mod tests {
         let err = run_srp(vec![response(200, b"not json".to_vec())])
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("SRP init: expected JSON"));
+        assert!(err
+            .to_string()
+            .contains("Apple login returned an unexpected response during SRP setup"));
     }
 
     #[tokio::test]
@@ -1031,7 +1042,7 @@ mod tests {
         let err = run_srp(vec![response(200, srp_init_body(&BASE64.encode([0u8])))])
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("B mod N is zero"));
+        assert!(err.to_string().contains("invalid public key"));
     }
 
     #[tokio::test]

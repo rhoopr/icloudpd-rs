@@ -400,14 +400,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     tracing::info!(concurrency = config.download.threads_num, "Starting kei");
 
     if config.auth.username.is_empty() {
-        anyhow::bail!("username is required (set ICLOUD_USERNAME or [auth].username)");
+        anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
     }
 
     // retry-failed + dry-run is unsupported: dry-run skips the state DB,
     // but retry-failed needs it to know which assets failed.
     if is_retry_failed && config.runtime.dry_run {
         anyhow::bail!(
-            "--dry-run cannot be used with retry-failed (retry needs the state database)"
+            "`--dry-run` cannot be used with `--retry-failed` because retrying failed downloads needs to update the state database."
         );
     }
 
@@ -415,8 +415,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // when the user simply forgot the destination.
     if config.download.directory.as_os_str().is_empty() {
         let message = crate::upgrade_hints::with_stale_env_hint(String::from(
-            "[download] directory is required for downloading \
-             (set it in the config file)",
+            "Set [download].directory in the config file before syncing.",
         ));
         anyhow::bail!(message);
     }
@@ -426,14 +425,14 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         .await
         .with_context(|| {
             format!(
-                "Failed to create download directory {}",
+                "Could not create download directory {}",
                 config.download.directory.display()
             )
         })?;
     let probe = config.download.directory.join(".kei_probe");
     tokio::fs::write(&probe, b"").await.with_context(|| {
         format!(
-            "Download directory {} is not writable",
+            "Cannot write to download directory {}",
             config.download.directory.display()
         )
     })?;
@@ -677,7 +676,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 Some(db as Arc<dyn state::StateDb>)
             }
             Err(e) => {
-                anyhow::bail!("Failed to open state database {}: {e}", db_path.display());
+                anyhow::bail!("Could not open state database {}: {e}", db_path.display());
             }
         }
     };
@@ -1025,7 +1024,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 reauth_attempts += 1;
                 if reauth_attempts >= MAX_REAUTH_ATTEMPTS {
                     anyhow::bail!(
-                        "Session expired, giving up after {MAX_REAUTH_ATTEMPTS} re-auth attempts"
+                        "Your iCloud session expired and kei could not refresh it after {MAX_REAUTH_ATTEMPTS} attempts. Run `kei login` and try again."
                     );
                 }
                 tracing::warn!(
@@ -1766,8 +1765,7 @@ async fn reacquire_session_lock_after_idle(
         );
     }
     Err(e.context(
-        "failed to reacquire the iCloud session lock after watch sleep; \
-         refusing to resume sync without exclusive session ownership",
+        "Could not regain the iCloud session lock after watch mode slept. Stopping so another kei process cannot use the same session at the same time.",
     ))
 }
 
@@ -1876,7 +1874,7 @@ mod tests {
             "expected LockContention, got: {err:#}"
         );
         assert!(
-            format!("{err:#}").contains("refusing to resume sync"),
+            format!("{err:#}").contains("Stopping so another kei process"),
             "error should explain why watch mode stopped: {err:#}"
         );
     }
@@ -5336,8 +5334,8 @@ mod tests {
         assert_eq!(failed.len(), 1, "failed asset should be persisted");
         let last_error = failed[0].last_error.as_deref().expect("failed asset error");
         assert!(
-            last_error.contains("Failed to open temp download file")
-                || last_error.contains("failed to create directory"),
+            last_error.contains("Could not open temporary download file")
+                || last_error.contains("Could not create directory"),
             "failed asset error should name the failing filesystem operation, got: {last_error}"
         );
         let root = download_root.display().to_string();

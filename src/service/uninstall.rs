@@ -46,6 +46,6 @@ async fn dispatch(args: UninstallArgs) -> Result<()> {
         "preparing to uninstall kei service",
     );
     Err(anyhow::anyhow!(
-        "`kei uninstall` is not implemented on this platform"
+        "`kei uninstall` is not available on this platform."
     ))
 }

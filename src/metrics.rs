@@ -570,7 +570,7 @@ pub(crate) fn spawn_server(
 
     let addr = SocketAddr::new(bind, port);
     let std_listener = std::net::TcpListener::bind(addr)
-        .map_err(|e| anyhow::anyhow!("Failed to bind HTTP server on {bind}:{port}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Could not start the HTTP server on {bind}:{port}: {e}"))?;
     let local_addr = std_listener.local_addr()?;
     std_listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(std_listener)?;

@@ -2,17 +2,17 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum ICloudError {
-    #[error("Connection error: {0}")]
+    #[error("Could not connect to iCloud: {0}")]
     Connection(String),
     #[error(
-        "iCloud service not activated ({code}): {reason}\n\n\
+        "iCloud Photos is not available through Apple's web API ({code}): {reason}\n\n\
          This usually means one of:\n  \
          1. Advanced Data Protection (ADP) is enabled, which blocks third-party iCloud access.\n     \
             To fix, change both settings on your iPhone/iPad:\n     \
             - Disable ADP: Settings > Apple ID > iCloud > Advanced Data Protection\n     \
             - Enable web access: Settings > Apple ID > iCloud > Access iCloud Data on the Web\n  \
          2. iCloud setup is incomplete.\n     \
-            → Log into https://icloud.com/ and finish setting up your iCloud service."
+            Log in to https://icloud.com/ and finish setting up iCloud Photos."
     )]
     ServiceNotActivated { code: String, reason: String },
     /// CloudKit rejected the request with an auth-class HTTP status. Typically
@@ -20,12 +20,12 @@ pub enum ICloudError {
     /// not caught earlier), or - rarely - another 4xx that maps to the same
     /// recovery path. The caller should invalidate any cached session data
     /// and re-authenticate with SRP before retrying.
-    #[error("Session expired (HTTP {status} from CloudKit)")]
+    #[error("Your iCloud session expired (CloudKit HTTP {status})")]
     SessionExpired { status: u16 },
     /// CloudKit returned HTTP 421 Misdirected Request. The HTTP/2 connection
     /// was routed to the wrong CloudKit partition; the caller should reset
     /// the connection pool and retry on a fresh connection.
-    #[error("Misdirected Request (HTTP 421 from CloudKit)")]
+    #[error("Apple routed the iCloud request to the wrong CloudKit partition (HTTP 421)")]
     MisdirectedRequest,
     #[error(transparent)]
     Http(Box<reqwest::Error>),

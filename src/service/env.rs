@@ -155,7 +155,7 @@ pub(crate) fn purge_kei_state(kei_dir: &Path, extra_dirs: &[PathBuf]) -> Result<
             Ok(())
         }
         Err(e) => Err(e)
-            .with_context(|| format!("failed to remove state directory {}", kei_dir.display())),
+            .with_context(|| format!("Could not remove state directory {}", kei_dir.display())),
     }
 }
 
@@ -177,9 +177,9 @@ pub(crate) fn kei_state_dir_dotted() -> Option<PathBuf> {
 /// `canonicalize` resolves those so the registry entry points at the
 /// real binary.
 pub(crate) fn current_executable() -> Result<PathBuf> {
-    let raw = std::env::current_exe().context("failed to resolve current executable path")?;
+    let raw = std::env::current_exe().context("Could not find the current executable path")?;
     raw.canonicalize()
-        .with_context(|| format!("failed to canonicalize executable path {}", raw.display()))
+        .with_context(|| format!("Could not resolve executable path {}", raw.display()))
 }
 
 #[cfg(test)]

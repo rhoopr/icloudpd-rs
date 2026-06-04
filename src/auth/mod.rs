@@ -192,8 +192,7 @@ async fn authenticate_inner(
                     .is_some_and(AuthError::is_transient_apple_failure)
                 {
                     return Err(e.context(
-                        "Apple's auth service is returning transient errors (HTTP 429/5xx). \
-                         Wait a few minutes and retry",
+                        "Apple's authentication service is temporarily failing (HTTP 429/5xx). Wait a few minutes and retry.",
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
@@ -273,7 +272,9 @@ async fn authenticate_inner(
         let password = crate::password::invoke_password_provider(password_provider)
             .await
             .ok_or_else(|| {
-                AuthError::FailedLogin("No password available (see error above for details)".into())
+                AuthError::FailedLogin(
+                    "No password was available. Check the password-source error above.".into(),
+                )
             })?;
 
         tracing::debug!(apple_id = %apple_id, "Authenticating");
@@ -312,7 +313,8 @@ async fn authenticate_inner(
         data = Some(account_data);
     }
 
-    let data = data.ok_or_else(|| anyhow::anyhow!("Authentication produced no account data"))?;
+    let data =
+        data.ok_or_else(|| anyhow::anyhow!("Apple authentication did not return account data."))?;
 
     let requires_2fa = check_requires_2fa(&data);
     if requires_2fa {
@@ -449,8 +451,7 @@ pub async fn send_2fa_push(
                     .is_some_and(AuthError::is_transient_apple_failure)
                 {
                     return Err(e.context(
-                        "Apple's auth service is returning transient errors (HTTP 429/5xx). \
-                         Wait a few minutes and retry",
+                        "Apple's authentication service is temporarily failing (HTTP 429/5xx). Wait a few minutes and retry.",
                     ));
                 }
                 if e.downcast_ref::<AuthError>()
@@ -500,7 +501,9 @@ pub async fn send_2fa_push(
         let password = crate::password::invoke_password_provider(password_provider)
             .await
             .ok_or_else(|| {
-                AuthError::FailedLogin("No password available (see error above for details)".into())
+                AuthError::FailedLogin(
+                    "No password was available. Check the password-source error above.".into(),
+                )
             })?;
         srp::authenticate_srp(
             &mut session,
@@ -530,10 +533,11 @@ pub async fn send_2fa_push(
         data = Some(account_data);
     }
 
-    let data = data.ok_or_else(|| anyhow::anyhow!("Authentication produced no account data"))?;
+    let data =
+        data.ok_or_else(|| anyhow::anyhow!("Apple authentication did not return account data."))?;
 
     if !check_requires_2fa(&data) {
-        anyhow::bail!("Session is already authenticated, 2FA is not required");
+        anyhow::bail!("This iCloud session is already authenticated; no 2FA code is needed.");
     }
 
     twofa::trigger_push_notification(&mut session, &endpoints, &client_id, domain).await
@@ -747,7 +751,7 @@ mod tests {
         .expect_err("unsupported domain should fail before session auth");
 
         assert!(
-            err.to_string().contains("not supported"),
+            err.to_string().contains("Unsupported iCloud domain"),
             "unexpected error: {err:#}"
         );
         assert!(
@@ -771,7 +775,7 @@ mod tests {
             .expect_err("unsupported domain should fail before SRP");
 
         assert!(
-            err.to_string().contains("not supported"),
+            err.to_string().contains("Unsupported iCloud domain"),
             "unexpected error: {err:#}"
         );
         assert!(

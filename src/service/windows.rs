@@ -57,8 +57,9 @@ const FAILURE_RESET_PERIOD: Duration = Duration::from_secs(86_400);
 /// `--user` and the default both produce the same per-user SCM entry).
 pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Result<()> {
     let exe = current_executable()?;
-    let user = current_user_name()
-        .context("could not resolve current Windows user (USERNAME / USERPROFILE unset?)")?;
+    let user = current_user_name().context(
+        "Could not determine the current Windows user. USERNAME or USERPROFILE is not set.",
+    )?;
 
     let inputs = ServiceInfoInputs {
         exec: &exe,
@@ -115,9 +116,8 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
     }
 
     if args.purge {
-        let kei_dir = kei_state_dir().ok_or_else(|| {
-            anyhow!("--purge requested but USERPROFILE is not set; cannot locate kei state")
-        })?;
+        let kei_dir = kei_state_dir()
+            .ok_or_else(|| anyhow!("`--purge` needs USERPROFILE so kei can find its state."))?;
         purge_kei_state(&kei_dir, &[])?;
     }
 
@@ -309,7 +309,7 @@ fn prompt_windows_password(user: &str) -> Result<String> {
         "Windows password for {user} (used by SCM to launch kei under your account; \
          stored as an LSA secret, not in kei): "
     );
-    rpassword::prompt_password(prompt).context("failed to read Windows password from stdin")
+    rpassword::prompt_password(prompt).context("Could not read Windows password from stdin")
 }
 
 // ── SCM glue ───────────────────────────────────────────────────────────
@@ -428,10 +428,10 @@ mod scm_impl {
                 &info,
                 ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
             )
-            .context("CreateServiceW failed (run from an elevated PowerShell?)")?;
+            .context("Could not create the Windows service. Run from an elevated PowerShell.")?;
         service
             .set_description(SERVICE_DESCRIPTION)
-            .context("ChangeServiceConfig2W (description) failed")?;
+            .context("Could not set the Windows service description")?;
         service
             .update_failure_actions(ServiceFailureActions {
                 reset_period: ServiceFailureResetPeriod::After(FAILURE_RESET_PERIOD),
@@ -445,9 +445,11 @@ mod scm_impl {
                     RESTART_COUNT
                 ]),
             })
-            .context("ChangeServiceConfig2W (failure actions) failed")?;
+            .context("Could not set Windows service failure actions")?;
         let no_args: &[&str] = &[];
-        service.start(no_args).context("StartServiceW failed")?;
+        service
+            .start(no_args)
+            .context("Could not start the Windows service")?;
         Ok(())
     }
 
@@ -465,7 +467,7 @@ mod scm_impl {
             Err(ref e) if raw_os_error(e) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
                 return Ok(false);
             }
-            Err(e) => return Err(anyhow!("OpenServiceW failed: {e}")),
+            Err(e) => return Err(anyhow!("Could not open the Windows service: {e}")),
         };
 
         if let Ok(status) = service.query_status() {
@@ -474,7 +476,9 @@ mod scm_impl {
                 wait_for_stop(&service, Duration::from_secs(30));
             }
         }
-        service.delete().context("DeleteService failed")?;
+        service
+            .delete()
+            .context("Could not delete the Windows service")?;
         Ok(true)
     }
 
@@ -505,11 +509,11 @@ mod scm_impl {
             Err(ref e) if raw_os_error(e) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
                 return Ok(StatusInputs::NotInstalled);
             }
-            Err(e) => return Err(anyhow!("OpenServiceW failed: {e}")),
+            Err(e) => return Err(anyhow!("Could not open the Windows service: {e}")),
         };
         let status = service
             .query_status()
-            .context("QueryServiceStatusEx failed")?;
+            .context("Could not query the Windows service status")?;
         Ok(StatusInputs::Probed {
             state: service_state_view(status.current_state),
             pid: status.process_id,
@@ -518,8 +522,7 @@ mod scm_impl {
 
     fn open_manager(access: ServiceManagerAccess) -> Result<ServiceManager> {
         ServiceManager::local_computer(None::<&str>, access).context(
-            "OpenSCManagerW failed -- `kei install` and `kei uninstall` on Windows require an \
-             elevated PowerShell or Command Prompt",
+            "Could not open the Windows Service Control Manager. `kei install` and `kei uninstall` on Windows require an elevated PowerShell or Command Prompt.",
         )
     }
 
@@ -551,7 +554,7 @@ mod scm_impl {
             service_dispatcher::start(SERVICE_NAME, ffi_service_main)
         })
         .await
-        .context("SCM dispatcher task panicked")?;
+        .context("Windows service dispatcher task crashed")?;
 
         match dispatcher_result {
             Ok(()) => {
@@ -568,7 +571,9 @@ mod scm_impl {
                     .ok_or_else(|| anyhow!("internal: SCM payload missing on foreground path"))?;
                 crate::sync_loop::run_sync(&payload.globals, payload.sync).await
             }
-            Err(e) => Err(anyhow!("StartServiceCtrlDispatcher failed: {e}")),
+            Err(e) => Err(anyhow!(
+                "Could not start the Windows service dispatcher: {e}"
+            )),
         }
     }
 
@@ -604,11 +609,11 @@ mod scm_impl {
         };
 
         let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
-            .context("RegisterServiceCtrlHandlerExW failed")?;
+            .context("Could not register the Windows service control handler")?;
 
         status_handle
             .set_service_status(service_status(ServiceState::Running, 0))
-            .context("set_service_status(running) failed")?;
+            .context("Could not report the Windows service as running")?;
 
         let outcome = run_payload_under_scm(shutdown_rx);
 
@@ -626,9 +631,9 @@ mod scm_impl {
     }
 
     fn run_payload_under_scm(mut shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
-        let payload = lock_scm_payload()?
-            .take()
-            .ok_or_else(|| anyhow!("kei service main started without a stashed payload"))?;
+        let payload = lock_scm_payload()?.take().ok_or_else(|| {
+            anyhow!("Internal error: kei service main started without service state.")
+        })?;
 
         // Dedicated single-thread runtime for the sync loop. Lives on
         // the OS thread SCM spawned for service main; the foreground
@@ -636,7 +641,7 @@ mod scm_impl {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .context("failed to build SCM-mode tokio runtime")?;
+            .context("Could not start the Windows service runtime")?;
 
         runtime.block_on(async move {
             tokio::select! {

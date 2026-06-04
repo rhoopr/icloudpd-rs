@@ -45,7 +45,7 @@ pub(crate) async fn init_photos_service(
         .as_ref()
         .and_then(|ws| ws.ckdatabasews.as_ref())
         .map(|ep| ep.url.clone())
-        .ok_or_else(|| anyhow::anyhow!("No ckdatabasews URL"))?;
+        .ok_or_else(|| anyhow::anyhow!("Apple did not return the CloudKit Photos service URL."))?;
 
     // Persist the active ckdatabasews URL so validate_session can detect
     // partition changes during watch-mode revalidation.
@@ -424,16 +424,14 @@ pub(crate) async fn resolve_libraries(
             .map(icloud::photos::PhotoLibrary::zone_name)
             .collect();
         anyhow::bail!(
-            "--library '{missed}' not found. Available zones: {}. Run `kei list libraries` to see every zone with its truncated form.",
+            "`--library {missed}` did not match any iCloud Photos library. Available zones: {}. Run `kei list libraries` to see every zone with its truncated form.",
             known.join(", ")
         );
     }
 
     if chosen.is_empty() {
         anyhow::bail!(
-            "--library resolved to zero libraries against this account; \
-             pass at least one of primary / shared / a zone name without \
-             excluding everything"
+            "`--library` did not select any libraries for this account. Choose `primary`, `shared`, or a zone name, and do not exclude everything."
         );
     }
 
@@ -459,10 +457,7 @@ pub(crate) async fn resolve_libraries(
         let mut sorted = zones.clone();
         sorted.sort_unstable();
         anyhow::bail!(
-            "Multiple selected libraries collapse to the same `{{library}}` path \
-             segment `{truncated}`: [{full}]. The 8-char shared-library prefix \
-             collides; pin one of these zones via `--library <longer-prefix>` \
-             (use `kei list libraries` to see every zone with its truncated form).",
+            "Multiple selected libraries would use the same `{{library}}` folder name `{truncated}`: [{full}]. Select one explicitly with a longer `--library <prefix>` value. Run `kei list libraries` to see the full zone names.",
             full = sorted.join(", "),
         );
     }
@@ -494,7 +489,7 @@ where
 
     all_libraries
         .await
-        .context("failed to resolve cross-zone album hydration libraries")
+        .context("Could not resolve libraries needed for cross-library album matching")
 }
 
 /// Match a `--library` entry (full zone name or truncated 8-char form)
@@ -626,7 +621,7 @@ fn validate_collection_album_selector(
             for name in included {
                 if smart_names.contains(name.as_str()) {
                     anyhow::bail!(
-                        "'{name}' is a smart folder; pass `--smart-folder {name}` instead of `--album`"
+                        "`{name}` is a smart folder. Use `--smart-folder {name}` instead of `--album {name}`."
                     );
                 }
                 if excluded.contains(name) {
@@ -635,7 +630,7 @@ fn validate_collection_album_selector(
                 if !collection_album_names.contains(name) {
                     let available: Vec<&str> =
                         collection_album_names.iter().map(String::as_str).collect();
-                    anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
+                    anyhow::bail!("Album `{name}` was not found. Available albums: {available:?}");
                 }
             }
             bail_unknown_excluded_collection_albums(excluded, collection_album_names)
@@ -650,7 +645,7 @@ fn bail_unknown_excluded_collection_albums(
     for name in excluded {
         if !collection_album_names.contains(name) {
             let available: Vec<&str> = collection_album_names.iter().map(String::as_str).collect();
-            anyhow::bail!("Excluded album '{name}' not found. Available albums: {available:?}");
+            anyhow::bail!("Excluded album `{name}` was not found. Available albums: {available:?}");
         }
     }
     Ok(())
@@ -688,7 +683,7 @@ fn pick_selected_smart_folder_names(
                     let mut available: Vec<&str> = smart_names.iter().copied().collect();
                     available.sort();
                     anyhow::bail!(
-                        "'{name}' is not an Apple smart folder. Available: {available:?}"
+                        "`{name}` is not an Apple smart folder. Available smart folders: {available:?}"
                     );
                 }
             }
@@ -779,7 +774,7 @@ async fn collect_album_asset_ids(
     let count = album
         .len()
         .await
-        .with_context(|| format!("failed to get asset count for album '{}'", album.name))?;
+        .with_context(|| format!("Could not count assets in album `{}`", album.name))?;
     let (stream, _token_rx) = album.photo_stream_with_token(None, Some(count), 1);
     tokio::pin!(stream);
     while let Some(result) = stream.next().await {
@@ -1017,7 +1012,7 @@ fn pick_album_names(
             for name in included {
                 if smart_names.contains(name.as_str()) {
                     anyhow::bail!(
-                        "'{name}' is a smart folder; pass `--smart-folder {name}` instead of `--album`"
+                        "`{name}` is a smart folder. Use `--smart-folder {name}` instead of `--album {name}`."
                     );
                 }
                 if excluded.contains(name) {
@@ -1031,7 +1026,7 @@ fn pick_album_names(
                         .filter(|k| !smart_names.contains(k.as_str()))
                         .collect();
                     available.sort();
-                    anyhow::bail!("Album '{name}' not found. Available albums: {available:?}");
+                    anyhow::bail!("Album `{name}` was not found. Available albums: {available:?}");
                 }
             }
             bail_unknown_excluded_albums(excluded, album_map, smart_names)?;
@@ -1055,7 +1050,7 @@ fn bail_unknown_excluded_albums(
                 .filter(|k| !smart_names.contains(k.as_str()))
                 .collect();
             available.sort();
-            anyhow::bail!("Excluded album '{name}' not found. Available albums: {available:?}");
+            anyhow::bail!("Excluded album `{name}` was not found. Available albums: {available:?}");
         }
     }
     Ok(())
@@ -1068,7 +1063,9 @@ fn bail_excluded_not_a_smart_folder(
     if !smart_names.contains(name) {
         let mut available: Vec<&str> = smart_names.iter().copied().collect();
         available.sort();
-        anyhow::bail!("Excluded '{name}' is not an Apple smart folder. Available: {available:?}");
+        anyhow::bail!(
+            "Excluded smart folder `{name}` was not found. Available smart folders: {available:?}"
+        );
     }
     Ok(())
 }
@@ -1833,7 +1830,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("failed to resolve cross-zone album hydration libraries"),
+            msg.contains("Could not resolve libraries needed for cross-library album matching"),
             "missing context: {msg}"
         );
         assert!(
@@ -2406,7 +2403,7 @@ libraries = ["shared"]
         let sel = selector_from(&["primary", "!primary"]);
         let err = resolve_libraries(&sel, &mut ps).await.unwrap_err();
         assert!(
-            err.to_string().contains("zero libraries"),
+            err.to_string().contains("did not select any libraries"),
             "unexpected error: {err}"
         );
     }

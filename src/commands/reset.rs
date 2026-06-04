@@ -72,9 +72,7 @@ pub(crate) async fn run_reset_sync_token(
         use std::io::Write;
         if !std::io::stdin().is_terminal() {
             anyhow::bail!(
-                "reset sync-token needs `--yes` when stdin is not a terminal. \
-                 Next sync will re-enumerate every asset, which can take a long \
-                 time on a large library; pass `--yes` to confirm."
+                "`kei reset sync-token` needs `--yes` when stdin is not a terminal. The next sync will re-enumerate every asset, which can take a long time on a large library."
             );
         }
         println!("This will clear stored sync tokens at:");

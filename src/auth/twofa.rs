@@ -200,7 +200,7 @@ async fn retry_auth_request(
         tokio::time::sleep(delay).await;
     }
     Err(anyhow::anyhow!(
-        "{log_label}: retry loop exhausted without a decisive response"
+        "{log_label}: Apple did not return a usable response after all retries."
     ))
 }
 
@@ -397,7 +397,7 @@ pub async fn trust_session(
     session
         .get(&url, Some(headers))
         .await
-        .context("Failed to trust session")?;
+        .context("Could not mark the iCloud session trusted")?;
     tracing::debug!("Session trusted successfully");
     Ok(true)
 }
@@ -440,7 +440,7 @@ pub async fn validate_token(
     let text = read_response_body(response, "validate_token body").await;
     let data: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
         format!(
-            "Validate: expected JSON but got: {:?}",
+            "Apple session validation returned an unexpected response: {:?}",
             crate::truncate_str(&text, 200)
         )
     })?;
@@ -486,7 +486,7 @@ pub async fn authenticate_with_token(
     let text = read_response_body(response, "accountLogin body").await;
     let body: AccountLoginResponse = serde_json::from_str(&text).with_context(|| {
         format!(
-            "Account login: expected JSON but got: {:?}",
+            "Apple account login returned an unexpected response: {:?}",
             crate::truncate_str(&text, 200)
         )
     })?;
@@ -498,7 +498,7 @@ pub async fn authenticate_with_token(
     // re-run with auth.domain = "cn" to use the correct regional endpoint.
     if let Some(domain_to_use) = &body.domain_to_use {
         return Err(anyhow::anyhow!(
-            "Apple insists on using {domain_to_use} for your request. Please set auth.domain in config"
+            "Apple requires iCloud domain `{domain_to_use}` for this account. Set [auth].domain in the config file."
         ));
     }
 

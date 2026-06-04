@@ -149,7 +149,7 @@ impl PasswordSource {
             Self::Interactive => {
                 if !std::io::stdin().is_terminal() {
                     anyhow::bail!(
-                        "No password configured and stdin is not a terminal. \
+                        "No iCloud password is configured, and kei cannot prompt because stdin is not a terminal. \
                          Set a password with one of:\n  \
                          - ICLOUD_PASSWORD environment variable\n  \
                          - kei password set (OS keyring or encrypted file)\n  \
@@ -200,7 +200,7 @@ pub fn build_password_source(
 pub(crate) fn read_password_file(path: &Path) -> anyhow::Result<SecretString> {
     warn_if_permissive_mode(path);
     let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read password file: {}", path.display()))?;
+        .with_context(|| format!("Could not read password file {}", path.display()))?;
     let trimmed = strip_trailing_newline(&contents);
     anyhow::ensure!(
         !trimmed.is_empty(),
@@ -299,7 +299,7 @@ fn run_password_command_with_timeout(
         let _ = (cmd, timeout);
         anyhow::bail!(
             "`--password-command` / `[auth] password_command` is not supported on Windows: \
-             kei runs commands via `sh -c`, which isn't on the stock Windows PATH. \
+             kei runs commands through `sh -c`, which is not on the default Windows PATH. \
              Use `--password-file` / `[auth] password_file`, or run kei under WSL."
         );
     }
@@ -314,7 +314,7 @@ fn run_password_command_with_timeout(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .spawn()
-            .with_context(|| format!("Failed to execute password command: {cmd}"))?;
+            .with_context(|| format!("Could not run password command: {cmd}"))?;
 
         // Poll with 5ms → 50ms backoff; clamp each sleep to the remaining
         // deadline so we never overshoot the timeout budget.
@@ -330,7 +330,7 @@ fn run_password_command_with_timeout(
                         let _ = child.kill();
                         let _ = child.wait();
                         anyhow::bail!(
-                            "password command timed out after {}s: {cmd}",
+                            "Password command timed out after {} seconds: {cmd}",
                             timeout.as_secs()
                         );
                     }
@@ -353,14 +353,14 @@ fn run_password_command_with_timeout(
         if let Some(mut stdout) = child.stdout.take() {
             stdout
                 .read_to_end(&mut buf)
-                .with_context(|| format!("reading password command stdout: {cmd}"))?;
+                .with_context(|| format!("Could not read password command output: {cmd}"))?;
         }
         let stdout =
             String::from_utf8(buf).context("Password command output is not valid UTF-8")?;
         let trimmed = strip_trailing_newline(&stdout);
         anyhow::ensure!(
             !trimmed.is_empty(),
-            "Password command produced empty output: {cmd}"
+            "Password command did not print a password: {cmd}"
         );
         Ok(SecretString::from(trimmed.to_string()))
     }
@@ -469,7 +469,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.txt");
         let err = read_password_file(&path).unwrap_err();
-        assert!(err.to_string().contains("Failed to read"), "{err}");
+        assert!(err.to_string().contains("Could not read"), "{err}");
     }
 
     // ── run_password_command ────────────────────────────────────────
@@ -499,7 +499,10 @@ mod tests {
     #[test]
     fn run_password_command_empty() {
         let err = run_password_command("printf ''").unwrap_err();
-        assert!(err.to_string().contains("empty"), "{err}");
+        assert!(
+            err.to_string().contains("did not print a password"),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]

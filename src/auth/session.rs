@@ -154,13 +154,13 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
             .truncate(true)
             .open(&tmp)
             .await
-            .with_context(|| format!("Failed to open temp file {}", tmp.display()))?;
+            .with_context(|| format!("Could not open temporary file {}", tmp.display()))?;
         f.write_all(data)
             .await
-            .with_context(|| format!("Failed to write temp file {}", tmp.display()))?;
+            .with_context(|| format!("Could not write temporary file {}", tmp.display()))?;
         f.sync_all()
             .await
-            .with_context(|| format!("Failed to fsync temp file {}", tmp.display()))?;
+            .with_context(|| format!("Could not fsync temporary file {}", tmp.display()))?;
     }
     #[cfg(unix)]
     {
@@ -169,7 +169,7 @@ async fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     }
     fs::rename(&tmp, path)
         .await
-        .with_context(|| format!("Failed to rename {} to {}", tmp.display(), path.display()))?;
+        .with_context(|| format!("Could not rename {} to {}", tmp.display(), path.display()))?;
     crate::fs_util::fsync_parent_dir_async_best_effort(path).await;
     Ok(())
 }
@@ -314,10 +314,7 @@ impl Session {
         let cookie_dir = cookie_dir.to_path_buf();
 
         fs::create_dir_all(&cookie_dir).await.with_context(|| {
-            format!(
-                "Failed to create cookie directory: {}",
-                cookie_dir.display()
-            )
+            format!("Could not create cookie directory {}", cookie_dir.display())
         })?;
 
         // Acquire an exclusive file lock to prevent concurrent instances for
@@ -327,16 +324,14 @@ impl Session {
             let lock_path = lock_path.clone();
             move || {
                 let file = std::fs::File::create(&lock_path).with_context(|| {
-                    format!("Failed to create lock file: {}", lock_path.display())
+                    format!("Could not create session lock file {}", lock_path.display())
                 })?;
                 let acquired = file
                     .try_lock_exclusive()
-                    .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))?;
+                    .with_context(|| format!("Could not acquire session lock {}", lock_path.display()))?;
                 if !acquired {
                     return Err(crate::auth::error::AuthError::LockContention(format!(
-                        "Another kei instance is running for this account (lock: {}). \
-                         If running in Docker, check for orphaned containers with \
-                         `docker ps` and stop them with `docker stop <name>`.",
+                        "Another kei instance is running for this account (lock: {}). If running in Docker, check for orphaned containers with `docker ps` and stop them with `docker stop <name>`.",
                         lock_path.display()
                     ))
                     .into());
@@ -543,7 +538,7 @@ impl Session {
     /// Release the exclusive file lock without dropping the Session.
     /// This allows a new Session to acquire the lock (e.g. during re-authentication).
     pub(crate) fn release_lock(&self) -> Result<()> {
-        FileExt::unlock(&self.lock_file).context("Failed to release session lock file")
+        FileExt::unlock(&self.lock_file).context("Could not release the session lock file")
     }
 
     /// Re-acquire the exclusive file lock after a prior `release_lock()`.
@@ -554,10 +549,10 @@ impl Session {
         let acquired = self
             .lock_file
             .try_lock_exclusive()
-            .context("Failed to re-acquire session lock")?;
+            .context("Could not reacquire the session lock")?;
         if !acquired {
             return Err(crate::auth::error::AuthError::LockContention(
-                "Another kei instance acquired the lock while it was released".into(),
+                "Another kei instance acquired the session lock while it was released.".into(),
             )
             .into());
         }
@@ -645,7 +640,7 @@ impl Session {
             atomic_write(&session_path, json.as_bytes())
                 .await
                 .with_context(|| {
-                    format!("Failed to write session data to {}", session_path.display())
+                    format!("Could not write session data to {}", session_path.display())
                 })?;
             tracing::debug!("Saved session data to file");
         }
@@ -733,7 +728,7 @@ impl Session {
             serde_json::to_string_pretty(&entries)?.as_bytes(),
         )
         .await
-        .with_context(|| format!("Failed to write cookies to {}", cookiejar_path.display()))?;
+        .with_context(|| format!("Could not write cookies to {}", cookiejar_path.display()))?;
 
         Ok(())
     }

@@ -1823,7 +1823,7 @@ async fn route_incremental_asset_to_passes(
     let db = config
         .state_db
         .as_ref()
-        .context("album-aware incremental routing requires a state DB")?;
+        .context("Album-aware incremental routing requires a state database")?;
     let memberships = db
         .get_live_selected_album_memberships_for_asset(
             &config.library,
@@ -1833,7 +1833,7 @@ async fn route_incremental_asset_to_passes(
         .await
         .with_context(|| {
             format!(
-                "failed to look up album memberships for asset {}",
+                "Could not look up album memberships for asset {}",
                 asset.asset_record_name()
             )
         })?;
@@ -1892,10 +1892,11 @@ fn merge_download_outcomes(left: &DownloadOutcome, right: &DownloadOutcome) -> D
 }
 
 async fn collect_pass_asset_ids(pass: &crate::commands::AlbumPass) -> Result<FxHashSet<String>> {
-    let count =
-        pass.album.len().await.with_context(|| {
-            format!("failed to get asset count for album '{}'", pass.album.name)
-        })?;
+    let count = pass
+        .album
+        .len()
+        .await
+        .with_context(|| format!("Could not count assets in album `{}`", pass.album.name))?;
     let (stream, _token_rx) = pass.album.photo_stream_with_token(None, Some(count), 1);
     tokio::pin!(stream);
     let mut ids = FxHashSet::default();

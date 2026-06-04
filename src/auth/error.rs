@@ -23,28 +23,28 @@ const INVALID_CREDENTIALS_RECOVERY: &str = "Update kei's stored password, then r
 /// Custom error types for iCloud authentication.
 #[derive(Debug, Error)]
 pub enum AuthError {
-    #[error("Failed login: {0}")]
+    #[error("Could not log in to iCloud: {0}")]
     FailedLogin(String),
 
-    #[error("Invalid authentication token: {0}")]
+    #[error("The saved iCloud login token is no longer valid: {0}")]
     InvalidToken(String),
 
-    #[error("API error (HTTP {code}): {message}")]
+    #[error("Apple authentication returned HTTP {code}: {message}")]
     ApiError { code: u16, message: String },
 
-    #[error("Two-factor authentication failed: {0}")]
+    #[error("Two-factor authentication did not complete: {0}")]
     TwoFactorFailed(String),
 
-    #[error("Apple service error ({code}): {message}")]
+    #[error("Apple authentication service returned {code}: {message}")]
     ServiceError { code: String, message: String },
 
     #[error(
-        "Terminal Apple authentication error ({code}): {message}. {}",
+        "Apple authentication needs your attention ({code}): {message}. {}",
         terminal_apple_auth_recovery(code)
     )]
     TerminalAppleAuth { code: String, message: String },
 
-    #[error("Two-factor authentication is required (no code provided)")]
+    #[error("Two-factor authentication is required. Run `kei login get-code`, then `kei login submit-code <CODE>`.")]
     TwoFactorRequired,
 
     /// The Apple ID has FIDO/WebAuthn hardware security keys registered.
@@ -54,14 +54,14 @@ pub enum AuthError {
     /// user hit that downstream failure and loop through re-auth.
     #[error(
         "This Apple ID has FIDO/WebAuthn hardware security keys registered{}. \
-         kei does not yet support this authentication method (see issue #221).\n\n\
+         kei cannot use Apple accounts that require security keys yet (see issue #221).\n\n\
          To use kei with this account, remove the security keys at:\n  \
          Settings > Apple ID & iCloud > Sign-In & Security > Security Keys",
         format_fido_keys(key_names)
     )]
     FidoNotSupported { key_names: Vec<String> },
 
-    #[error("Session lock held by another instance: {0}")]
+    #[error("Another kei process is using the iCloud session: {0}")]
     LockContention(String),
 
     #[error(transparent)]
@@ -252,20 +252,23 @@ mod tests {
         let err = AuthError::TwoFactorRequired;
         assert_eq!(
             err.to_string(),
-            "Two-factor authentication is required (no code provided)"
+            "Two-factor authentication is required. Run `kei login get-code`, then `kei login submit-code <CODE>`."
         );
     }
 
     #[test]
     fn failed_login_display() {
         let err = AuthError::FailedLogin("bad password".into());
-        assert_eq!(err.to_string(), "Failed login: bad password");
+        assert_eq!(err.to_string(), "Could not log in to iCloud: bad password");
     }
 
     #[test]
     fn invalid_token_display() {
         let err = AuthError::InvalidToken("expired".into());
-        assert_eq!(err.to_string(), "Invalid authentication token: expired");
+        assert_eq!(
+            err.to_string(),
+            "The saved iCloud login token is no longer valid: expired"
+        );
     }
 
     #[test]

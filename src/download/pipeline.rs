@@ -1413,9 +1413,7 @@ where
     if let Some(free) = initial_free_at_start {
         if free < MIN_FREE_BYTES_HARD {
             return Err(anyhow::anyhow!(
-                "Insufficient free disk space: only {} bytes available on {}, \
-                 need at least {MIN_FREE_BYTES_HARD} bytes. Free up space or choose a \
-                 different [download] directory.",
+                "Not enough free disk space: only {} bytes are available on {}, but kei needs at least {MIN_FREE_BYTES_HARD} bytes. Free up space or choose a different [download].directory.",
                 free,
                 config.directory.display(),
             ));
@@ -2216,7 +2214,7 @@ where
 
     if producer_panicked {
         return Err(anyhow::anyhow!(
-            "Asset producer panicked — sync may be incomplete ({} pending state writes flushed)",
+            "The asset producer task crashed, so sync may be incomplete ({} pending state writes were flushed).",
             state_write_failures,
         ));
     }
@@ -2984,7 +2982,7 @@ async fn download_single_task(
     if let Some(parent) = task.download_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+            .with_context(|| format!("Could not create directory {}", parent.display()))?;
     }
 
     tracing::debug!(
@@ -3029,7 +3027,7 @@ async fn download_single_task(
                 &task.checksum,
                 context.temp_suffix,
             )
-            .context("failed to compute part path")?,
+            .context("Could not compute temporary download path")?,
         )
     } else {
         None
@@ -5229,7 +5227,7 @@ mod tests {
         .await
         .expect_err("should propagate producer panic");
         assert!(
-            err.to_string().contains("producer panicked"),
+            err.to_string().contains("producer task crashed"),
             "Expected producer panic error, got: {err}"
         );
     }

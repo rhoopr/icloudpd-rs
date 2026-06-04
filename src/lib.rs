@@ -425,7 +425,7 @@ pub(crate) fn check_min_disk_space(available_bytes: u64, directory: &Path) -> an
     if available_bytes < MIN_FREE_BYTES {
         let avail_mb = available_bytes / (1024 * 1024);
         anyhow::bail!(
-            "Insufficient disk space: only {avail_mb} MiB available in {} (minimum 1 GiB)",
+            "Not enough disk space: only {avail_mb} MiB is available in {}. kei needs at least 1 GiB.",
             directory.display()
         );
     }
@@ -487,7 +487,7 @@ fn get_db_path(globals: &config::GlobalArgs, toml: Option<&TomlConfig>) -> anyho
     let (username, _, _, cookie_dir) =
         config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
     if username.is_empty() {
-        anyhow::bail!("username is required (set ICLOUD_USERNAME or [auth].username)");
+        anyhow::bail!("Set your iCloud username with ICLOUD_USERNAME or [auth].username.");
     }
     Ok(cookie_dir.join(format!(
         "{}.db",
@@ -1422,11 +1422,11 @@ mod tests {
             );
             let msg = format!("{:#}", r.expect_err("expected Err"));
             assert!(
-                msg.contains("Insufficient disk space"),
+                msg.contains("Not enough disk space"),
                 "error message must call out the disk-space reason; got: {msg}"
             );
             assert!(
-                msg.contains("minimum 1 GiB"),
+                msg.contains("at least 1 GiB"),
                 "error message must state the minimum so operators know what to free; got: {msg}"
             );
         }

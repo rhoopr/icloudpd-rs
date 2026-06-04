@@ -67,10 +67,10 @@ fn migrate_file(src: &Path, dst: &Path) -> anyhow::Result<bool> {
     }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating parent directory {}", parent.display()))?;
+            .with_context(|| format!("Could not create parent directory {}", parent.display()))?;
     }
     std::fs::copy(src, dst)
-        .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+        .with_context(|| format!("Could not copy {} to {}", src.display(), dst.display()))?;
     Ok(true)
 }
 
@@ -79,12 +79,16 @@ fn migrate_file(src: &Path, dst: &Path) -> anyhow::Result<bool> {
 /// Returns the number of files successfully copied.
 fn migrate_directory_contents(src_dir: &Path, dst_dir: &Path) -> anyhow::Result<usize> {
     use anyhow::Context;
-    std::fs::create_dir_all(dst_dir)
-        .with_context(|| format!("creating destination directory {}", dst_dir.display()))?;
+    std::fs::create_dir_all(dst_dir).with_context(|| {
+        format!(
+            "Could not create destination directory {}",
+            dst_dir.display()
+        )
+    })?;
 
     let mut count = 0;
-    for entry in
-        std::fs::read_dir(src_dir).with_context(|| format!("reading {}", src_dir.display()))?
+    for entry in std::fs::read_dir(src_dir)
+        .with_context(|| format!("Could not read {}", src_dir.display()))?
     {
         let entry = entry?;
         let file_type = entry.file_type()?;

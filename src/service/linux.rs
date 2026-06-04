@@ -159,7 +159,7 @@ pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Resul
     let previous_linger = current_linger_state().await;
     let contents = render_user_unit_with_linger(&exe, config_path, previous_linger);
     let unit_path =
-        user_unit_path().ok_or_else(|| anyhow!("could not resolve XDG_CONFIG_HOME or $HOME"))?;
+        user_unit_path().ok_or_else(|| anyhow!("Could not find XDG_CONFIG_HOME or $HOME."))?;
     write_unit(&unit_path, &contents)?;
     tracing::info!(
         service = SERVICE_IDENTIFIER,
@@ -247,8 +247,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
     if let Some(path) = system_path.as_ref() {
         if !is_root() {
             bail!(
-                "system-wide kei.service is registered at {}; \
-                 rerun `kei uninstall` as root to remove it",
+                "system-wide kei.service is registered at {}. Run `kei uninstall` as root to remove it.",
                 path.display()
             );
         }
@@ -260,7 +259,7 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
 
     if args.purge {
         let Some(config_dir) = dirs::config_dir() else {
-            bail!("--purge requested but no XDG config dir resolves; cannot locate kei state");
+            bail!("`--purge` needs XDG_CONFIG_HOME or a home directory so kei can find its state.");
         };
         purge_kei_state(&config_dir.join("kei"), &[])?;
     }
@@ -418,18 +417,24 @@ fn parse_systemd_timestamp(raw: &str) -> Option<DateTime<Utc>> {
 
 fn write_unit(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create unit directory {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Could not create systemd unit directory {}",
+                parent.display()
+            )
+        })?;
     }
     std::fs::write(path, contents)
-        .with_context(|| format!("failed to write unit file {}", path.display()))
+        .with_context(|| format!("Could not write systemd unit file {}", path.display()))
 }
 
 fn remove_unit_file(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("failed to remove unit file {}", path.display())),
+        Err(e) => {
+            Err(e).with_context(|| format!("Could not remove systemd unit file {}", path.display()))
+        }
     }
 }
 
@@ -660,7 +665,7 @@ where
         .args(&args)
         .output()
         .await
-        .context("failed to invoke `systemctl` (is systemd installed and on PATH?)")?;
+        .context("Could not run `systemctl`. Is systemd installed and on PATH?")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let argv = args
@@ -689,7 +694,7 @@ async fn show_unit(scope: &[&str]) -> Result<ProbeOutcome> {
         .args(&argv)
         .output()
         .await
-        .context("failed to invoke `systemctl show`")?;
+        .context("Could not run `systemctl show`")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if is_session_bus_unavailable(&stderr) {

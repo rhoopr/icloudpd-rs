@@ -85,9 +85,9 @@ pub(super) fn temp_download_path(
 ) -> anyhow::Result<PathBuf> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(checksum)
-        .context("Failed to decode base64 checksum")?;
+        .context("Could not decode the base64 checksum from Apple")?;
     if decoded.is_empty() {
-        anyhow::bail!("Decoded checksum is empty");
+        anyhow::bail!("Apple returned an empty checksum.");
     }
     let encoded = data_encoding::BASE32_NOPAD.encode(&decoded);
     let download_dir = download_path.parent().unwrap_or_else(|| Path::new("."));
@@ -377,13 +377,11 @@ async fn attempt_download<C: DownloadClient>(
             .await
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::AlreadyExists => DownloadError::Other(anyhow::anyhow!(
-                    "Concurrent writer detected on {}: another kei instance appears to be \
-                     downloading the same file. Only one kei instance may target a given \
-                     directory at a time",
+                    "Another kei process is already writing {}. Only one kei instance may use the same download directory at a time.",
                     part_path.display()
                 )),
                 _ => {
-                    DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {e}"))
+                    DownloadError::Other(anyhow::anyhow!("Could not open temporary download file: {e}"))
                 }
             })?
     } else {
@@ -393,7 +391,9 @@ async fn attempt_download<C: DownloadClient>(
             .open(&part_path)
             .await
             .map_err(|e| {
-                DownloadError::Other(anyhow::anyhow!("Failed to open temp download file: {e}"))
+                DownloadError::Other(anyhow::anyhow!(
+                    "Could not open temporary download file: {e}"
+                ))
             })?
     };
 
@@ -546,7 +546,7 @@ pub(super) async fn rename_part_to_final(
         }
         Err(e) => Err(e).with_context(|| {
             format!(
-                "failed to rename {} to {}",
+                "Could not move completed download from {} to {}",
                 part_path.display(),
                 final_path.display()
             )
@@ -725,7 +725,7 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut file = std::fs::File::open(&path)
-            .with_context(|| format!("opening {} for SHA-256", path.display()))?;
+            .with_context(|| format!("Could not open {} for SHA-256", path.display()))?;
         let mut sha256 = Sha256::new();
         // 64 KiB reduces read() syscalls ~8x vs 8 KiB on multi-GB videos
         // without meaningful RSS impact on the blocking pool.
@@ -734,7 +734,7 @@ pub(crate) async fn compute_sha256(path: &Path) -> anyhow::Result<String> {
             use std::io::Read;
             let n = file
                 .read(&mut buf)
-                .with_context(|| format!("reading {} for SHA-256", path.display()))?;
+                .with_context(|| format!("Could not read {} for SHA-256", path.display()))?;
             if n == 0 {
                 break;
             }
@@ -765,14 +765,14 @@ struct DecodedChecksum {
 fn decode_api_checksum(base64_checksum: &str) -> anyhow::Result<DecodedChecksum> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(base64_checksum)
-        .context("Failed to decode API checksum from base64")?;
+        .context("Could not decode API checksum from base64")?;
     let (hash_bytes, is_sha1) = match bytes.len() {
         20 => (&bytes[..], true),
         21 => (&bytes[1..], true),
         32 => (&bytes[..], false),
         33 => (&bytes[1..], false),
         other => anyhow::bail!(
-            "Unexpected API checksum length: {other} bytes (expected 20, 21, 32, or 33)"
+            "Apple returned an unsupported checksum length: {other} bytes (expected 20, 21, 32, or 33)."
         ),
     };
     let mut hex = String::with_capacity(hash_bytes.len() * 2);

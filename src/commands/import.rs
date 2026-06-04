@@ -158,7 +158,7 @@ async fn verify_strict_prefix(
 
     let prefix_len_u64 = expected_size.min(STRICT_IMPORT_PREFIX_BYTES);
     let prefix_len = usize::try_from(prefix_len_u64)
-        .context("strict import prefix length does not fit in usize")?;
+        .context("Strict import prefix length is too large for this system")?;
     if prefix_len == 0 {
         return Ok(StrictImportDecision::Accepted);
     }
@@ -166,11 +166,13 @@ async fn verify_strict_prefix(
     let mut local_prefix = vec![0_u8; prefix_len];
     let mut local = tokio::fs::File::open(local_path)
         .await
-        .with_context(|| format!("opening {} for strict import", local_path.display()))?;
-    local
-        .read_exact(&mut local_prefix)
-        .await
-        .with_context(|| format!("reading strict prefix from {}", local_path.display()))?;
+        .with_context(|| format!("Could not open {} for strict import", local_path.display()))?;
+    local.read_exact(&mut local_prefix).await.with_context(|| {
+        format!(
+            "Could not read strict import prefix from {}",
+            local_path.display()
+        )
+    })?;
 
     let range_end = prefix_len_u64.saturating_sub(1);
     let response = client
@@ -178,10 +180,10 @@ async fn verify_strict_prefix(
         .header(reqwest::header::RANGE, format!("bytes=0-{range_end}"))
         .send()
         .await
-        .with_context(|| format!("fetching strict import prefix from {cloud_url}"))?;
+        .with_context(|| format!("Could not fetch strict import prefix from {cloud_url}"))?;
     let status = response.status();
     if !(status == reqwest::StatusCode::PARTIAL_CONTENT || status == reqwest::StatusCode::OK) {
-        anyhow::bail!("strict import prefix fetch returned HTTP {status}");
+        anyhow::bail!("Strict import prefix check returned HTTP {status}.");
     }
 
     let mut cloud_prefix = Vec::with_capacity(prefix_len);
@@ -190,17 +192,17 @@ async fn verify_strict_prefix(
         let Some(chunk) = stream.next().await else {
             break;
         };
-        let chunk = chunk.context("reading strict import prefix response")?;
+        let chunk = chunk.context("Could not read strict import prefix response")?;
         let remaining = prefix_len - cloud_prefix.len();
         let take = chunk.len().min(remaining);
         let Some(prefix) = chunk.get(..take) else {
-            anyhow::bail!("strict import prefix chunk shorter than expected");
+            anyhow::bail!("Strict import prefix response ended sooner than expected.");
         };
         cloud_prefix.extend_from_slice(prefix);
     }
     if cloud_prefix.len() < prefix_len {
         anyhow::bail!(
-            "strict import prefix fetch returned {} bytes, expected {prefix_len}",
+            "Strict import prefix check returned {} bytes, expected {prefix_len}.",
             cloud_prefix.len()
         );
     }
@@ -459,7 +461,7 @@ where
             tokio::select! {
                 () = shutdown_token.cancelled() => {
                     anyhow::bail!(
-                        "import-existing interrupted by shutdown signal for library '{library_label}'"
+                        "Import was interrupted while scanning library `{library_label}`."
                     );
                 }
                 result = stream.next() => result,
@@ -491,7 +493,7 @@ where
                 // report as clean, leaving unmatched files to re-download
                 // on the next sync.
                 anyhow::bail!(
-                    "import scan aborted for library '{library_label}': fetcher returned error: {e}"
+                    "Import scan stopped for library `{library_label}` because iCloud returned an error: {e}"
                 );
             }
         };
@@ -705,8 +707,7 @@ where
     // on panic; absence of a send is the clean-exit signal.
     if panic_rx.await.unwrap_or(false) {
         anyhow::bail!(
-            "import scan aborted for library '{library_label}': a fetcher task panicked; \
-             results are incomplete, see earlier error log"
+            "Import scan stopped for library `{library_label}` because a fetcher task crashed. Results are incomplete; see the earlier error log."
         );
     }
 
@@ -742,9 +743,7 @@ pub(crate) async fn run_import_existing(
         Some(crate::cli::RecentLimit::Count(n)) => Some(n),
         Some(crate::cli::RecentLimit::Days(n)) => {
             anyhow::bail!(
-                "`--recent {n}d` isn't supported for import-existing (which scans \
-                 existing files rather than filtering by iCloud date). Use a plain \
-                 count like `--recent 1000` instead."
+                "`--recent {n}d` is not supported for import-existing because it scans existing files instead of filtering by iCloud date. Use a count like `--recent 1000` instead."
             );
         }
     };
@@ -753,9 +752,9 @@ pub(crate) async fn run_import_existing(
     // swallows read errors and would otherwise report "0 files matched".
     match tokio::fs::metadata(&directory).await {
         Ok(m) if m.is_dir() => {}
-        Ok(_) => anyhow::bail!("Not a directory: {}", directory.display()),
+        Ok(_) => anyhow::bail!("Download path is not a directory: {}", directory.display()),
         Err(e) => anyhow::bail!(
-            "Cannot read download directory {}: {e}",
+            "Could not read download directory {}: {e}",
             directory.display()
         ),
     }
@@ -819,16 +818,15 @@ pub(crate) async fn run_import_existing(
     let prior_db_total = db.get_summary().await?.total_assets;
     if prior_db_total > 0 && !args.force_empty {
         use futures_util::{StreamExt, TryStreamExt};
-        let counts: Vec<u64> =
-            futures_util::stream::iter(libraries.iter())
-                .map(|library| async move {
-                    library.all().len().await.with_context(|| {
-                        format!("counting assets in library {}", library.zone_name())
-                    })
+        let counts: Vec<u64> = futures_util::stream::iter(libraries.iter())
+            .map(|library| async move {
+                library.all().len().await.with_context(|| {
+                    format!("Could not count assets in library {}", library.zone_name())
                 })
-                .buffered(libraries.len().max(1))
-                .try_collect()
-                .await?;
+            })
+            .buffered(libraries.len().max(1))
+            .try_collect()
+            .await?;
         let empty_zones: Vec<&str> = libraries
             .iter()
             .zip(&counts)
@@ -969,12 +967,7 @@ fn validate_non_empty_libraries(empty_zones: &[&str], prior_db_total: u64) -> an
         format!("libraries {}", empty_zones.join(", "))
     };
     anyhow::bail!(
-        "{zones} returned 0 assets but the state DB has {prior_db_total} prior asset \
-         rows -- aborting to avoid a misleading `matched: 0` report. Most often this \
-         is a transient iCloud permissions glitch or stale auth; re-run after \
-         confirming via `kei list libraries` or the iCloud web UI. Pass --force-empty \
-         (or set KEI_FORCE_EMPTY=true) if you genuinely emptied the library or are \
-         attaching a new sub-library to an account that already has data."
+        "{zones} returned 0 assets, but the state database already has {prior_db_total} asset rows. Stopping to avoid a misleading `matched: 0` import. This is usually a temporary iCloud permission or stale-login problem. Check with `kei list libraries` or the iCloud web UI, then retry. Use `--force-empty` (or KEI_FORCE_EMPTY=true) only if that library is intentionally empty."
     );
 }
 
@@ -1003,7 +996,7 @@ fn build_import_download_config(
         .unwrap_or_default();
     if directory_str.is_empty() {
         anyhow::bail!(crate::upgrade_hints::with_stale_env_hint(String::from(
-            "[download] directory is required for import-existing",
+            "Set [download].directory in the config file before running import-existing.",
         )));
     }
     let directory_path = config::expand_tilde(&directory_str);
@@ -3471,7 +3464,7 @@ mod build_config_tests {
         let err = build_import_download_config(None).expect_err("empty directory should bail");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("[download] directory is required for import-existing"),
+            msg.contains("Set [download].directory"),
             "error must name the missing TOML field, got: {msg}"
         );
     }

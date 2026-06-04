@@ -160,12 +160,12 @@ impl PhotoLibrary {
         });
         let Some(indexing_state) = indexing_state else {
             return Err(ICloudError::Connection(
-                "Photo library indexing state is missing; results may be incomplete".into(),
+                "Apple did not report whether the photo library is fully indexed; results may be incomplete".into(),
             ));
         };
         if indexing_state != "FINISHED" {
             return Err(ICloudError::Connection(format!(
-                "Photo library indexing state is {indexing_state}; expected FINISHED"
+                "Apple says the photo library is still indexing ({indexing_state}); wait until indexing is finished, then retry."
             )));
         }
 
@@ -336,7 +336,7 @@ impl PhotoLibrary {
             .await?;
 
             let query: super::cloudkit::QueryResponse = serde_json::from_value(response)
-                .context("failed to parse library query response")?;
+                .context("Could not read Apple's library query response")?;
 
             let page_size = query.records.len();
             all_records.extend(query.records);
@@ -515,7 +515,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            err.to_string().contains("RUNNING") && err.to_string().contains("FINISHED"),
+            err.to_string().contains("RUNNING") && err.to_string().contains("indexing is finished"),
             "error should name observed and expected indexing states: {err}"
         );
     }
@@ -527,7 +527,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.to_string().contains("indexing state is missing"),
+            err.to_string()
+                .contains("did not report whether the photo library is fully indexed"),
             "missing indexing state must fail closed: {err}"
         );
     }

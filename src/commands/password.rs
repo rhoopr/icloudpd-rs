@@ -18,7 +18,7 @@ pub(crate) fn run_password(
 
     if username.is_empty() {
         anyhow::bail!(
-            "username is required for password management (set ICLOUD_USERNAME or [auth].username)"
+            "Set your iCloud username with ICLOUD_USERNAME or [auth].username before managing a password."
         );
     }
 
@@ -27,8 +27,8 @@ pub(crate) fn run_password(
     match action {
         cli::PasswordAction::Set => {
             let input = rpassword::prompt_password("iCloud Password: ")
-                .map_err(|e| anyhow::anyhow!("Failed to read password: {e}"))?;
-            anyhow::ensure!(!input.is_empty(), "Password must not be empty");
+                .map_err(|e| anyhow::anyhow!("Could not read password: {e}"))?;
+            anyhow::ensure!(!input.is_empty(), "Password cannot be empty.");
             let backend = store.store(&input)?;
             println!("Password stored in {} backend.", backend.as_str());
         }

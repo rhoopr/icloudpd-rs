@@ -38,7 +38,7 @@ async fn dispatch() -> Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 async fn dispatch() -> Result<()> {
     Err(anyhow::anyhow!(
-        "`kei service status` is not implemented on this platform"
+        "`kei service status` is not available on this platform."
     ))
 }
 

@@ -122,7 +122,9 @@ pub(crate) async fn run_verify(
     }
 
     if missing > 0 || corrupted > 0 {
-        anyhow::bail!("verify failed: {missing} missing, {corrupted} corrupted");
+        anyhow::bail!(
+            "Verification found {missing} missing files and {corrupted} corrupted files."
+        );
     }
 
     Ok(())

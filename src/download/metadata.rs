@@ -97,7 +97,7 @@ fn probe_exif_xmp(path: &Path) -> Result<ExifProbe> {
 
 #[cfg(feature = "xmp")]
 fn probe_exif_xmp_toolkit(path: &Path) -> Result<ExifProbe> {
-    let mut file = XmpFile::new().context("creating XmpFile handle")?;
+    let mut file = XmpFile::new().context("Could not create XMP handle")?;
     if file
         .open_file(path, OpenFileOptions::default().for_read().only_xmp())
         .is_err()
@@ -358,7 +358,10 @@ pub(crate) fn write_sidecar(
     ensure_initialized();
 
     let Some(name) = media_path.file_name() else {
-        anyhow::bail!("sidecar target has no filename: {}", media_path.display());
+        anyhow::bail!(
+            "Cannot write an XMP sidecar because the media path has no filename: {}",
+            media_path.display()
+        );
     };
     let mut sidecar_name = name.to_os_string();
     sidecar_name.push(".xmp");
@@ -385,18 +388,26 @@ pub(crate) fn write_sidecar(
             XmpMeta::new().context("creating XmpMeta")?
         }
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("Reading existing sidecar {}", sidecar_path.display()));
+            return Err(e).with_context(|| {
+                format!(
+                    "Could not read existing XMP sidecar {}",
+                    sidecar_path.display()
+                )
+            });
         }
     };
     apply_to_xmp(&mut meta, write)?;
     let bytes = meta.to_string().into_bytes();
 
-    std::fs::write(&tmp_path, &bytes)
-        .with_context(|| format!("Writing XMP sidecar {}", tmp_path.display()))?;
+    std::fs::write(&tmp_path, &bytes).with_context(|| {
+        format!(
+            "Could not write temporary XMP sidecar {}",
+            tmp_path.display()
+        )
+    })?;
     atomic_install(&tmp_path, &sidecar_path).with_context(|| {
         format!(
-            "Installing XMP sidecar {} -> {}",
+            "Could not install XMP sidecar {} -> {}",
             tmp_path.display(),
             sidecar_path.display()
         )
@@ -446,18 +457,23 @@ fn apply_metadata_xmp_toolkit_with_installer(
     ensure_initialized();
 
     let tmp_path = temp_path_for(path, temp_suffix);
-    std::fs::copy(path, &tmp_path)
-        .with_context(|| format!("Copying {} -> {}", path.display(), tmp_path.display()))?;
+    std::fs::copy(path, &tmp_path).with_context(|| {
+        format!(
+            "Could not copy {} to {}",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
 
     let guard = TmpGuard::new(&tmp_path);
 
     let result: Result<()> = (|| {
-        let mut file = XmpFile::new().context("creating XmpFile handle")?;
+        let mut file = XmpFile::new().context("Could not create XMP handle")?;
         file.open_file(
             &tmp_path,
             OpenFileOptions::default().for_update().use_smart_handler(),
         )
-        .with_context(|| format!("Opening {} for XMP update", tmp_path.display()))?;
+        .with_context(|| format!("Could not open {} for XMP update", tmp_path.display()))?;
 
         let mut meta = file
             .xmp()
@@ -466,21 +482,21 @@ fn apply_metadata_xmp_toolkit_with_installer(
 
         if !file.can_put_xmp(&meta) {
             anyhow::bail!(
-                "format handler for {} does not support writing XMP",
+                "The XMP format handler cannot write metadata to {}",
                 tmp_path.display()
             );
         }
         file.put_xmp(&meta)
-            .with_context(|| format!("Writing XMP into {}", tmp_path.display()))?;
+            .with_context(|| format!("Could not write XMP metadata into {}", tmp_path.display()))?;
         file.try_close()
-            .with_context(|| format!("Closing {} after XMP update", tmp_path.display()))?;
+            .with_context(|| format!("Could not close {} after XMP update", tmp_path.display()))?;
         Ok(())
     })();
 
     result?;
     install(&tmp_path, path).with_context(|| {
         format!(
-            "Installing metadata {} -> {}",
+            "Could not install metadata update {} -> {}",
             tmp_path.display(),
             path.display()
         )
@@ -493,7 +509,7 @@ fn apply_metadata_xmp_toolkit_with_installer(
 #[cfg(not(feature = "xmp"))]
 fn apply_metadata_native(path: &Path, write: &MetadataWrite, temp_suffix: &str) -> Result<()> {
     let input = std::fs::read(path)
-        .with_context(|| format!("Reading {} for native EXIF update", path.display()))?;
+        .with_context(|| format!("Could not read {} for native EXIF update", path.display()))?;
     let Some(file_type) = native_file_type(&input, path) else {
         tracing::debug!(
             path = %path.display(),
@@ -505,7 +521,9 @@ fn apply_metadata_native(path: &Path, write: &MetadataWrite, temp_suffix: &str) 
     let mut metadata = match Metadata::new_from_vec(&input, file_type) {
         Ok(metadata) => metadata,
         Err(e) if e.to_string().contains("No EXIF data found") => Metadata::new(),
-        Err(e) => return Err(e).with_context(|| format!("Reading EXIF from {}", path.display())),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Could not read EXIF from {}", path.display()))
+        }
     };
     if let Some(dt) = &write.datetime {
         metadata.set_tag(ExifTag::DateTimeOriginal(dt.clone()));
@@ -550,13 +568,21 @@ fn apply_metadata_native(path: &Path, write: &MetadataWrite, temp_suffix: &str) 
     let mut output = input;
     metadata
         .write_to_vec(&mut output, file_type)
-        .with_context(|| format!("Writing native EXIF into {}", path.display()))?;
+        .with_context(|| format!("Could not write native EXIF into {}", path.display()))?;
     let tmp_path = temp_path_for(path, temp_suffix);
-    std::fs::write(&tmp_path, &output)
-        .with_context(|| format!("Writing native EXIF temp {}", tmp_path.display()))?;
+    std::fs::write(&tmp_path, &output).with_context(|| {
+        format!(
+            "Could not write native EXIF temp file {}",
+            tmp_path.display()
+        )
+    })?;
     let guard = TmpGuard::new(&tmp_path);
-    atomic_install(&tmp_path, path)
-        .with_context(|| format!("Installing native EXIF {}", path.display()))?;
+    atomic_install(&tmp_path, path).with_context(|| {
+        format!(
+            "Could not install native EXIF update for {}",
+            path.display()
+        )
+    })?;
     guard.disarm();
     tracing::debug!(path = %path.display(), "Applied native EXIF metadata");
     Ok(())
@@ -717,16 +743,18 @@ fn apply_to_xmp(meta: &mut XmpMeta, write: &MetadataWrite) -> xmp_toolkit::XmpRe
 #[cfg(test)]
 fn validate_heif_post_rewrite(file: &mut std::fs::File, tmp_path: &Path) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
-    file.seek(SeekFrom::Start(0))
-        .with_context(|| format!("Rewinding {} for magic-byte probe", tmp_path.display()))?;
+    file.seek(SeekFrom::Start(0)).with_context(|| {
+        format!(
+            "Could not rewind {} for media validation",
+            tmp_path.display()
+        )
+    })?;
     let mut head = [0u8; 12];
     file.read_exact(&mut head)
-        .with_context(|| format!("Reading magic bytes of {}", tmp_path.display()))?;
+        .with_context(|| format!("Could not read magic bytes of {}", tmp_path.display()))?;
     if !heif::is_heif_content(&head) {
         anyhow::bail!(
-            "Post-rewrite HEIC at {} lacks an ISO-BMFF ftyp/HEIF brand in the \
-             first 12 bytes (got {:02x?}); refusing to atomic-rename a \
-             corrupt file over the user's data",
+            "HEIC metadata rewrite produced invalid media at {}: the first 12 bytes did not include an ISO-BMFF ftyp/HEIF brand (got {:02x?}). Refusing to replace the user's file.",
             tmp_path.display(),
             head
         );
@@ -740,7 +768,7 @@ fn validate_heif_post_rewrite(file: &mut std::fs::File, tmp_path: &Path) -> Resu
 #[cfg(all(test, feature = "xmp"))]
 fn build_xmp_packet(write: &MetadataWrite) -> Result<Vec<u8>> {
     ensure_initialized();
-    let mut meta = XmpMeta::new().context("creating XmpMeta")?;
+    let mut meta = XmpMeta::new().context("Could not create XMP metadata")?;
     apply_to_xmp(&mut meta, write)?;
     Ok(meta.to_string().into_bytes())
 }

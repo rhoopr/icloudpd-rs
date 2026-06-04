@@ -226,7 +226,7 @@ pub(crate) async fn run_reconcile(
     }
 
     if mark_errors > 0 {
-        anyhow::bail!("reconcile partially failed: {mark_errors} state updates errored");
+        anyhow::bail!("Reconcile found {mark_errors} missing files that could not be marked failed in the state database.");
     }
 
     Ok(())

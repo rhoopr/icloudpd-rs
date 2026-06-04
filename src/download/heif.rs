@@ -27,7 +27,7 @@ use mp4_atom::{Atom, Buf, DecodeMaybe, FourCC, Header, Iinf, Iloc};
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HeifError {
     #[cfg(test)]
-    #[error("ISO-BMFF decode failed at byte offset {offset}/{total}: {source}")]
+    #[error("Could not read HEIC metadata at byte {offset} of {total}: {source}")]
     Decode {
         offset: u64,
         total: u64,
@@ -36,10 +36,12 @@ pub(crate) enum HeifError {
     },
 
     #[cfg(test)]
-    #[error("Unparsable trailing bytes at offset {offset}/{total} (file likely truncated)")]
+    #[error(
+        "Could not read trailing HEIC bytes at byte {offset} of {total}; the file may be truncated"
+    )]
     UnparsableTail { offset: u64, total: u64 },
 
-    #[error("`{kind}` sub-box of `meta` failed to decode: {source}")]
+    #[error("Could not read HEIC metadata box `{kind}`: {source}")]
     MetaSubBoxDecode {
         kind: FourCC,
         #[source]
@@ -47,11 +49,11 @@ pub(crate) enum HeifError {
     },
 
     #[cfg(test)]
-    #[error("HEIC has no `meta` box at the top level ({input_len} bytes scanned)")]
+    #[error("Could not find a top-level HEIC `meta` box after scanning {input_len} bytes")]
     MissingMeta { input_len: usize },
 
     #[cfg(test)]
-    #[error("Failed to re-encode `{kind}` atom: {source}")]
+    #[error("Could not rewrite HEIC atom `{kind}`: {source}")]
     Encode {
         kind: FourCC,
         #[source]

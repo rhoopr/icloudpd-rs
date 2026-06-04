@@ -195,9 +195,9 @@ pub(crate) async fn write_report(path: &Path, report: &SyncReport) -> anyhow::Re
         let temp_path = parent.join(format!(".kei-report-{}.tmp", std::process::id()));
 
         std::fs::write(&temp_path, json.as_bytes())
-            .with_context(|| format!("writing report to {}", temp_path.display()))?;
+            .with_context(|| format!("Could not write report to {}", temp_path.display()))?;
         atomic_install(&temp_path, &path)
-            .with_context(|| format!("installing report at {}", path.display()))?;
+            .with_context(|| format!("Could not install report at {}", path.display()))?;
 
         tracing::debug!(path = %path.display(), "Wrote JSON report");
         Ok(())

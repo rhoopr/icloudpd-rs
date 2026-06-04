@@ -45,7 +45,7 @@ impl Endpoints {
                 home: "https://www.icloud.com.cn",
                 setup: "https://setup.icloud.com.cn/setup/ws/1",
             }),
-            _ => anyhow::bail!("Domain '{domain}' is not supported yet"),
+            _ => anyhow::bail!("Unsupported iCloud domain `{domain}`. Use `com` or `cn`."),
         }
     }
 }

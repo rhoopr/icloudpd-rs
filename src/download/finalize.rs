@@ -293,9 +293,7 @@ pub(super) fn state_write_circuit_breaker_tripped(flush: &StateWriteFlush) -> bo
 
 pub(super) fn state_db_unwritable_error(pending_total: usize) -> anyhow::Error {
     anyhow::anyhow!(
-        "State DB appears unwritable: all {pending_total} deferred state writes failed after \
-         {STATE_WRITE_MAX_RETRIES} retries each. Check disk space and permissions on the state \
-         DB file; halting sync to avoid re-downloading into an untracked tree."
+        "The state database appears unwritable: all {pending_total} deferred state writes failed after {STATE_WRITE_MAX_RETRIES} retries each. Check disk space and permissions on the state database file. Stopping sync to avoid downloading files that kei cannot track."
     )
 }
 
