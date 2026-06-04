@@ -3151,6 +3151,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_cycle_recent_full_download_does_not_store_zone_token() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let mut config = make_run_cycle_config();
         config.filters.recent = Some(40);
         let db = make_state_db();
@@ -3194,6 +3195,55 @@ mod tests {
                 .expect("read zone token"),
             None,
             "recent-limited full cycle must not persist a zone token"
+        );
+        let events = capture.events();
+        assert!(
+            events.iter().any(|event| {
+                event.level == tracing::Level::INFO
+                    && event.field("reason") == Some("recent_limited_full_enumeration")
+                    && event.message().is_some_and(|message| {
+                        message.contains("--recent mode is bounded")
+                            && message.contains("does not persist a full enumeration sync token")
+                    })
+            }),
+            "recent-limited token suppression should log at info: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.level == tracing::Level::WARN
+                    && event.field("reason") == Some("recent_limited_full_enumeration")
+            }),
+            "recent-limited token suppression must not warn: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_true_token_unsafe_condition_still_warns() {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+
+        let result = run_full_cycle_with_album(
+            make_empty_full_album(""),
+            false,
+            download::DownloadControls::download_hidden(),
+        )
+        .await;
+
+        assert_eq!(result.failed_count, 0);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some("icloud_blank_sync_token")
+        );
+        let events = capture.events();
+        assert!(
+            events.iter().any(|event| {
+                event.level == tracing::Level::WARN
+                    && event.field("reason") == Some("icloud_blank_sync_token")
+                    && event
+                        .message()
+                        .is_some_and(|message| message.contains("Sync token did not advance"))
+            }),
+            "true token-unsafe sync-token suppression should still warn: {events:?}"
         );
     }
 

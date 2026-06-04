@@ -546,16 +546,28 @@ pub(crate) async fn run_cycle(
                         _ => "No per-pass sync token observation details were collected for this reason"
                             .to_string(),
                     };
-                    tracing::warn!(
-                        zone = %lib_state.zone_name,
-                        reason,
-                        source,
-                        explanation,
-                        observation,
-                        "Sync token did not advance after this successful sync. Here's why: {}. {}. Next cycle will run full enumeration",
-                        explanation,
-                        observation
-                    );
+                    if let Some(message) = download::sync_token_blocked_bounded_log_message(reason)
+                    {
+                        tracing::info!(
+                            zone = %lib_state.zone_name,
+                            reason,
+                            source,
+                            explanation,
+                            observation,
+                            "{message}"
+                        );
+                    } else {
+                        tracing::warn!(
+                            zone = %lib_state.zone_name,
+                            reason,
+                            source,
+                            explanation,
+                            observation,
+                            "Sync token did not advance after this successful sync. Here's why: {}. {}. Next cycle will run full enumeration",
+                            explanation,
+                            observation
+                        );
+                    }
                 }
             }
         } else if sync_result.sync_token.is_some() {

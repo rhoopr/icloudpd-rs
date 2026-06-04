@@ -417,6 +417,20 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
     }
 }
 
+pub(crate) fn sync_token_blocked_bounded_log_message(reason: &str) -> Option<&'static str> {
+    match reason {
+        RECENT_LIMITED_FULL_ENUMERATION_REASON => Some(
+            "--recent mode is bounded and does not persist a full enumeration sync token. Run \
+             without --recent for checkpointed incremental token flow.",
+        ),
+        DATE_BOUNDED_FULL_ENUMERATION_REASON => Some(
+            "Date-bounded mode is bounded and does not persist a full enumeration sync token. \
+             Run without the lower date bound for checkpointed incremental token flow.",
+        ),
+        _ => None,
+    }
+}
+
 pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
     match reason {
         "pagination_shortfall" => {
@@ -439,10 +453,10 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
             "kei stopped before iCloud enumeration reached the natural end of the stream"
         }
         RECENT_LIMITED_FULL_ENUMERATION_REASON => {
-            "a count-limited recent sync is a partial enumeration, so kei blocked token advancement"
+            "a count-limited recent sync is a bounded enumeration, so kei intentionally did not persist a full-enumeration sync token"
         }
         DATE_BOUNDED_FULL_ENUMERATION_REASON => {
-            "a lower-date-bounded sync is a partial enumeration, so kei blocked token advancement"
+            "a lower-date-bounded sync is a bounded enumeration, so kei intentionally did not persist a full-enumeration sync token"
         }
         ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON => {
             "album membership state is not complete enough for incremental routing yet"
