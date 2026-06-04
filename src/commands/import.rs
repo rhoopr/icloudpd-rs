@@ -3066,11 +3066,11 @@ mod wiremock_tests {
         .expect_err("must bail on fetcher Err");
         let msg = format!("{err}");
         assert!(
-            msg.contains("import scan aborted") && msg.contains("test-all"),
+            msg.contains("Import scan stopped") && msg.contains("test-all"),
             "error message must name the abort + library label, got: {msg}",
         );
         assert!(
-            msg.contains("fetcher returned error"),
+            msg.contains("iCloud returned an error"),
             "error message must name the fetcher source, got: {msg}",
         );
 
