@@ -996,10 +996,8 @@ fn roundtrip_name_id7_sync_skips_after_import() {
     });
 }
 
-/// Import with videos disabled, sync without that filter. Sync still must NOT
-/// re-download the photos imported. Videos (which import skipped) should
-/// also be skipped by sync because the state DB has nothing on them and
-/// the on-disk files match.
+/// Import and sync with videos disabled. Sync still must NOT re-download the
+/// photos imported under the media-filtered state DB.
 #[test]
 #[ignore]
 fn roundtrip_skip_videos_sync_skips_imported_photos() {
@@ -1010,11 +1008,8 @@ fn roundtrip_skip_videos_sync_skips_imported_photos() {
         // import-existing doesn't expose media selection as a flag. Use TOML
         // to force it.
         let test_data = tempdir().unwrap();
-        let toml_path = write_kei_toml(
-            test_data.path(),
-            download_dir,
-            "[filters]\nmedia = [\"photos\", \"live-photos\"]\n",
-        );
+        let media_filter_toml = "[filters]\nmedia = [\"photos\", \"live-photos\"]\n";
+        let toml_path = write_kei_toml(test_data.path(), download_dir, media_filter_toml);
 
         let recent = ROUNDTRIP_RECENT.to_string();
         let import_out = import_cmd(
@@ -1036,8 +1031,13 @@ fn roundtrip_skip_videos_sync_skips_imported_photos() {
             return;
         }
 
-        let (downloaded, _skipped) =
-            run_sync_against_fixture(&username, &password, download_dir, test_data.path(), "");
+        let (downloaded, _skipped) = run_sync_against_fixture(
+            &username,
+            &password,
+            download_dir,
+            test_data.path(),
+            media_filter_toml,
+        );
         assert_eq!(
             downloaded, 0,
             "sync re-downloaded {downloaded} after media-filtered import; matched={}",

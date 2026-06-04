@@ -397,11 +397,8 @@ async fn adopt_pending_derived_path(
     derived: &DerivedPath,
 ) -> Option<PathBuf> {
     let version_size = derived.version_size.as_str();
-    let existing_path = task_planner.existing_path(&derived.path)?;
-    let Ok(metadata) = tokio::fs::metadata(&existing_path).await else {
-        return None;
-    };
-    if metadata.len() != derived.size {
+    let (existing_path, existing_size) = task_planner.existing_path_with_size(&derived.path)?;
+    if existing_size != derived.size {
         return None;
     }
 
@@ -472,10 +469,23 @@ fn state_confirmed_current_path_exists(
         if derived.version_size != task.version_size {
             continue;
         }
-        let Some(existing_path) = task_planner.existing_path(&derived.path) else {
+        let Some((existing_path, existing_size)) =
+            task_planner.existing_path_with_size(&derived.path)
+        else {
             continue;
         };
         if existing_path == stored_path {
+            if derived.size > 0 && existing_size < derived.size {
+                tracing::warn!(
+                    asset_id = %asset.id(),
+                    version_size = %derived.version_size.as_str(),
+                    path = %existing_path.display(),
+                    on_disk_size = existing_size,
+                    expected_size = derived.size,
+                    "State path is smaller than expected; re-downloading instead of skipping"
+                );
+                return None;
+            }
             return Some(existing_path);
         }
     }
@@ -5829,6 +5839,100 @@ mod tests {
             failed.is_empty(),
             "metadata-mutated downloaded file should remain downloaded, not failed"
         );
+    }
+
+    /// Data-sacred regression for state-backed on-disk skips.
+    ///
+    /// A downloaded DB row with a matching remote checksum is not enough to
+    /// trust a too-small local file. If the stored current path exists but is
+    /// shorter than the API-reported size, the producer must route the asset
+    /// back through the download phase instead of letting the truncated file
+    /// mask the real media.
+    #[tokio::test]
+    async fn truncated_downloaded_file_is_forwarded_not_on_disk_skipped() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        fn asset() -> PhotoAsset {
+            TestPhotoAsset::new("TRUNCATED_DOWNLOADED")
+                .filename("IMG_TRUNCATED.JPG")
+                .item_type("public.jpeg")
+                .orig_file_type("public.jpeg")
+                .orig_size(1234)
+                // Allowlisted CDN host so the asset reaches the download
+                // phase; the non-base64 checksum fails locally without
+                // doing network I/O.
+                .orig_url("https://p01.icloud-content.com/IMG_TRUNCATED.JPG")
+                .orig_checksum("ck_truncated_downloaded")
+                .build()
+        }
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let existing_asset = asset();
+
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let target_path = crate::download::filter::expected_paths_for(&existing_asset, &config)
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
+        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        fs::write(&target_path, []).unwrap();
+
+        let record = crate::test_helpers::TestAssetRecord::new("TRUNCATED_DOWNLOADED")
+            .checksum("ck_truncated_downloaded")
+            .filename("IMG_TRUNCATED.JPG")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "TRUNCATED_DOWNLOADED",
+            "original",
+            &target_path,
+            "local_checksum_for_truncated_file",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        let stream1 = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset())]);
+        let result = stream_and_download_from_stream(
+            &client,
+            stream1,
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(
+            result.downloaded, 0,
+            "dead test URL should not produce a successful download"
+        );
+        assert_eq!(
+            result.skip_summary.on_disk, 0,
+            "truncated downloaded file must not be counted as an on-disk skip"
+        );
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(
+            failed.len(),
+            1,
+            "truncated file must be forwarded for re-download (which fails against the dead URL)"
+        );
+        assert_eq!(&*failed[0].id, "TRUNCATED_DOWNLOADED");
     }
 
     // ── run_metadata_rewrites end-to-end ───────────────────────────────────

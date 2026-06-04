@@ -73,10 +73,19 @@ impl TaskPlanner {
     }
 
     pub(super) fn existing_path(&mut self, path: &Path) -> Option<std::path::PathBuf> {
-        if self.dir_cache.exists(path) {
-            Some(path.to_path_buf())
+        self.existing_path_with_size(path).map(|(path, _)| path)
+    }
+
+    pub(super) fn existing_path_with_size(
+        &mut self,
+        path: &Path,
+    ) -> Option<(std::path::PathBuf, u64)> {
+        if let Some(size) = self.dir_cache.file_size(path) {
+            Some((path.to_path_buf(), size))
         } else {
-            self.dir_cache.find_ampm_variant(path)
+            let variant = self.dir_cache.find_ampm_variant(path)?;
+            let size = self.dir_cache.file_size(&variant)?;
+            Some((variant, size))
         }
     }
 }
