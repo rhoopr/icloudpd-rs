@@ -3650,7 +3650,7 @@ async fn download_photos_full_with_token(
                     config.concurrent_downloads,
                     pass_config.concurrent_downloads,
                     controls,
-                    strict_empty_tail_errors && total_count.is_some(),
+                    strict_empty_tail_errors,
                 );
                 let stream = filter_stream_to_enumeration_bounds(stream, config, recent_frontier);
 
@@ -3747,7 +3747,7 @@ async fn download_photos_full_with_token(
                         config.concurrent_downloads,
                         pass_config.concurrent_downloads,
                         controls,
-                        strict_empty_tail_errors && stream_total_count.is_some(),
+                        strict_empty_tail_errors,
                     );
                     let library = Arc::<str>::from(pass.album.zone_name());
                     let stream = filter_stream_to_enumeration_bounds(
@@ -3822,7 +3822,7 @@ async fn download_photos_full_with_token(
                     config.concurrent_downloads,
                     config.concurrent_downloads,
                     controls,
-                    strict_empty_tail_errors && total_count.is_some(),
+                    strict_empty_tail_errors,
                 );
                 token_receivers.push(token_rx);
                 filter_stream_to_enumeration_bounds(stream, config, recent_frontier.as_ref())
@@ -6217,19 +6217,7 @@ mod tests {
         // Seed the destination so the single enumerated asset is skipped
         // on-disk and the test isolates count-only shortfall behavior.
         let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-        let pass_config = config.with_pass(&passes[0]);
-        let expected_path = filter::expected_paths_for(&asset, &pass_config)
-            .into_iter()
-            .next()
-            .expect("mock asset should have an expected path");
-        tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
-            .await
-            .expect("create parent dir");
-        tokio::fs::write(&expected_path.path, vec![0u8; 1024])
-            .await
-            .expect("seed existing file");
-        seed_downloaded_state_for_expected_path(&mut config, &pass_config, &asset, &expected_path)
-            .await;
+        seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -6269,12 +6257,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_album_count_is_diagnostic_when_stream_completes() {
+    async fn malformed_album_count_blocks_token_on_ambiguous_empty_tail() {
+        let records = mock_photo_records_with_filename("MASTER_BEFORE_GAP", "before-gap.jpg");
+        let later_records = mock_photo_records_with_filename("MASTER_AFTER_GAP", "after-gap.jpg");
         let session = MockPhotosFlow::new()
             .album_count_response(json!({
                 "batch": [{"records": [{"fields": {"itemCount": {"value": "not-a-count"}}}]}]
             }))
+            .query_page(records.clone(), Some("zone-token"))
             .empty_query_page(Some("zone-token"))
+            .empty_query_page(Some("zone-token"))
+            .empty_query_page(Some("zone-token"))
+            .empty_query_page(Some("zone-token"))
+            .empty_query_page(Some("zone-token"))
+            .query_page(later_records, Some("zone-token"))
             .build();
         let passes = vec![AlbumPass {
             kind: PassKind::Album,
@@ -6286,6 +6282,10 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
+        config.file_match_policy = FileMatchPolicy::NameId7;
+
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -6297,21 +6297,28 @@ mod tests {
         .await
         .expect("malformed album count should produce a sync result");
 
-        assert!(
-            matches!(result.outcome, DownloadOutcome::Success),
-            "unexpected result: {result:?}"
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(
+            result.stats.assets_seen, 1,
+            "enumeration must not walk past the ambiguous empty-tail terminator"
         );
-        assert_eq!(result.stats.enumeration_errors, 0);
+        assert_eq!(result.stats.enumeration_errors, 1);
         assert_eq!(result.stats.count_probe_failures, 1);
         assert_eq!(result.stats.pagination_shortfall_warnings, 0);
         assert_eq!(result.stats.pagination_shortfall_assets, 0);
-        assert!(!result.stats.sync_token_blocked);
-        assert_eq!(result.stats.sync_token_blocked_reason, None);
-        assert_eq!(result.sync_token.as_deref(), Some("zone-token"));
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(ICLOUD_ALBUM_COUNT_ERROR_REASON)
+        );
+        assert_eq!(result.sync_token, None);
     }
 
     #[tokio::test]
-    async fn missing_album_count_item_count_is_diagnostic_not_zero() {
+    async fn missing_album_count_item_count_blocks_ambiguous_empty_tail() {
         let session = MockPhotosFlow::new()
             .album_count_response(json!({
                 "batch": [{"records": [{"fields": {}}]}]
@@ -6339,12 +6346,19 @@ mod tests {
         .await
         .expect("missing album count should produce a sync result");
 
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
         assert_eq!(result.stats.assets_seen, 0);
-        assert_eq!(result.stats.enumeration_errors, 0);
+        assert_eq!(result.stats.enumeration_errors, 1);
         assert_eq!(result.stats.count_probe_failures, 1);
-        assert_eq!(result.stats.sync_token_blocked_reason, None);
-        assert_eq!(result.sync_token.as_deref(), Some("zone-token"));
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(ICLOUD_ALBUM_COUNT_ERROR_REASON)
+        );
+        assert_eq!(result.sync_token, None);
     }
 
     #[tokio::test]
