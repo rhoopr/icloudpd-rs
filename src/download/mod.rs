@@ -2779,6 +2779,10 @@ impl IncrementalStateTransition {
             Self::Hidden => INCREMENTAL_HIDDEN_ZERO_ROWS_REASON,
         }
     }
+
+    fn zero_rows_is_noop(self, record_type: Option<&str>) -> bool {
+        matches!(self, Self::SoftDelete) && matches!(record_type, Some("CPLMaster"))
+    }
 }
 
 fn record_incremental_state_transition_result(
@@ -2791,6 +2795,14 @@ fn record_incremental_state_transition_result(
 ) {
     match result {
         Ok(updated) if updated > 0 => {}
+        Ok(_) if transition.zero_rows_is_noop(record_type) => {
+            tracing::debug!(
+                record_name,
+                record_type,
+                transition = transition.label(),
+                "Incremental source-state transition was already absent from state DB"
+            );
+        }
         Ok(_) => {
             *state_transition_failures += 1;
             token_unsafe_reason.get_or_insert(transition.zero_rows_reason());
@@ -6655,6 +6667,14 @@ mod tests {
         records
     }
 
+    fn soft_deleted_cpl_asset_record(record_name: &str, master_ref: &str) -> Value {
+        let mut records = incremental_photo_records(master_ref);
+        let mut asset = records.remove(1);
+        asset["recordName"] = json!(record_name);
+        asset["fields"]["isDeleted"] = json!({"value": 1, "type": "INT64"});
+        asset
+    }
+
     fn assert_source_flags(
         records: &[crate::state::AssetRecord],
         asset_id: &str,
@@ -6820,6 +6840,87 @@ mod tests {
         assert_eq!(
             result.stats.sync_token_blocked_reason,
             Some(INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_untracked_cplmaster_soft_delete_zero_rows_advances_sync_token() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(
+                flagged_incremental_records("UNTRACKED_SOFT_DELETE", ("isDeleted", 1)),
+                "zone-token-after",
+                false,
+            )
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("Library", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.state_db = Some(db.clone());
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-before",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
+        assert!(db.get_pending().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incremental_cplasset_soft_delete_zero_rows_still_blocks_sync_token() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(
+                vec![soft_deleted_cpl_asset_record(
+                    "asset-UNTRACKED_SOFT_DELETE",
+                    "UNTRACKED_SOFT_DELETE",
+                )],
+                "zone-token-after",
+                false,
+            )
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("Library", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.state_db = Some(db);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-before",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(result.sync_token, None);
+        assert_eq!(result.stats.state_write_failures, 1);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(INCREMENTAL_DELETE_ZERO_ROWS_REASON)
         );
     }
 
