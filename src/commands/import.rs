@@ -2951,7 +2951,7 @@ mod wiremock_tests {
 
         let msg = format!("{err}");
         assert!(
-            msg.contains("import-existing interrupted by shutdown signal")
+            msg.contains("Import was interrupted while scanning library")
                 && msg.contains("test-all"),
             "error message must name the shutdown and library label, got: {msg}",
         );
@@ -2986,7 +2986,7 @@ mod wiremock_tests {
         .expect_err("must bail on fetcher panic");
         let msg = format!("{err}");
         assert!(
-            msg.contains("import scan aborted") && msg.contains("test-all"),
+            msg.contains("Import scan stopped") && msg.contains("test-all"),
             "error message must name the abort + label, got: {msg}"
         );
     }
