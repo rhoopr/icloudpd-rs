@@ -150,7 +150,7 @@ fn install_system_is_rejected_with_clear_message() {
         .args(["install", "--system", "--dry-run"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("per-user LaunchAgent"));
+        .stderr(predicate::str::contains("per-user only"));
 }
 
 #[test]
