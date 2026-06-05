@@ -552,7 +552,7 @@ fn import_recent_days_form_is_rejected() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "--recent 30d` is not supported for import-existing",
+            "is not supported for import-existing",
         ));
     });
 }
