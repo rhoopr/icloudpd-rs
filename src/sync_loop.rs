@@ -877,6 +877,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         &config.download.folder_structure_smart_folders,
     );
     sd_notifier.notify_ready();
+    let _systemd_watchdog_task = sd_notifier.start_watchdog_heartbeat(shutdown_token.clone());
     // Friendly-mode greeting. Lands above any future bar via
     // active_bar::with_suspended; no-op in off mode. Once per process.
     crate::personality::narration::greet_to_stderr(config.ui.personality_mode, is_watch_mode);
