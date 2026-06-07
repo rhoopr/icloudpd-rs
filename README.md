@@ -92,6 +92,14 @@ Today kei syncs iCloud Photos. Immich, Google Takeout, Nextcloud, and Ente suppo
 > [!IMPORTANT]
 > kei needs iCloud Photos web access. If `Advanced Data Protection` is on, turn it off and enable "Access iCloud Data on the Web" in your Apple ID settings. See [Authentication](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
 
+## Product direction
+
+kei is built around reliable local backup: safe file writes, explainable state,
+service-friendly operation, and no destructive behavior unless you explicitly
+ask for it.
+
+Read the [product charter](docs/product-charter.md) and
+[roadmap](docs/roadmap.md) for current priorities.
 
 ## Common setups
 
@@ -144,6 +152,8 @@ Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-iclou
 - [Commands](https://github.com/rhoopr/kei/wiki/Home#commands)
 - [Credentials](https://github.com/rhoopr/kei/wiki/Credentials)
 - [Troubleshooting](https://github.com/rhoopr/kei/wiki/Troubleshooting)
+- [Product charter](docs/product-charter.md)
+- [Roadmap](docs/roadmap.md)
 
 Open an issue for bugs or sharp edges: [Issues](https://github.com/rhoopr/kei/issues)
 
