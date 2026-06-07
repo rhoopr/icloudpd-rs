@@ -46,7 +46,11 @@ destructive cleanup, provider-to-provider sync, or downstream upload workflows.
 
 ## Current focus
 
-The next product focus is backup confidence.
+The near-term requirement is stability and reliability. No new product surface
+should be prioritized until normal sync, interrupted-run recovery, reporting,
+retry behavior, token safety, and support paths feel rock solid.
+
+Backup confidence is the user-visible proof of that reliability.
 
 Users should be able to answer practical questions without reading logs:
 
@@ -54,12 +58,15 @@ Users should be able to answer practical questions without reading logs:
 - What is it working on?
 - What is already backed up?
 - What failed?
+- Can the next run recover safely?
+- Did sync tokens advance only when it was safe?
 - Are any local files missing or damaged?
 - What should I send when I need help?
 
-This points to status improvements, manifest export, local drift detection,
-support diagnostics, and better retry workflows before larger destination or
-deletion features.
+This points first to hardening existing sync, recovery, status, reports, and
+retry behavior. Support tools such as manifest export or a redacted diagnostic
+bundle should come only when they help prove or debug reliability. Catalog query,
+provider expansion, destination work, UI, and deletion workflows are later.
 
 ## Non-goals
 

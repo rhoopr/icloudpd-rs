@@ -5,33 +5,42 @@ release work.
 
 ## Current focus
 
-Backup confidence.
+Stability and reliability, with backup confidence as the user-visible proof.
 
 kei already does the hard parts of local iCloud Photos backup: resumable
 downloads, safe file landing, checksum checks, stateful retries, service mode,
-reports, and selected-library sync. The next product step is to make that safety
-visible to users.
+reports, and selected-library sync. The near-term job is to make normal sync,
+interrupted-run recovery, reports, retry behavior, token safety, and support
+paths feel rock solid.
+
+New product surface should wait unless it directly proves or debugs reliability.
 
 ## Roadmap themes
 
 ### Backup confidence
 
-Help users prove their archive is healthy.
+Help users prove kei is syncing safely and recovering correctly.
 
 Candidate work:
 
+- Harden normal sync stability.
+- Harden interrupted sync recovery.
+- Improve failed-download visibility and retry behavior.
+- Guard against unsafe sync-token advancement.
 - Show active sync work in `kei status`.
 - Detect missing or damaged local files during incremental sync.
-- Retry failed downloads without scanning the whole library.
-- Export a local manifest in JSON and CSV.
-- Add `kei doctor` with a redacted support bundle.
-- Add a first read-only local catalog query command.
+- Add manifest export as reliability/support tooling once core sync and
+  reporting feel solid.
+- Add `kei doctor` or a redacted support bundle once core sync and reporting
+  feel solid.
 
 Success criteria:
 
+- Normal sync is dependable.
+- Interrupted sync resumes correctly.
+- Failed downloads are visible and recoverable.
+- Sync tokens advance only after safe, complete work.
 - Users can see what kei is doing during a long unattended run.
-- Users can export what kei believes is backed up.
-- Users can diagnose common setup and state problems without sharing secrets.
 - A damaged or missing local file can be found and repaired without guesswork.
 
 ### Headless operations
@@ -127,32 +136,42 @@ Success criteria:
 
 ## Near-term milestones
 
-### v0.22 - Backup confidence
+### v0.22 - Stability and reliability
 
-Goal: make kei's local backup state visible and auditable.
+Goal: make normal sync, recovery, reporting, and token safety feel rock solid.
 
-User outcome: a user can tell what is backed up, what is damaged or missing, and
-what information to send when they need help.
+User outcome: a user can trust routine sync, recover from interruption or
+failure, and tell whether their local backup is safe.
 
 Candidate work:
 
-- Active sync work in `kei status`.
-- Manifest export.
-- Local drift detection for incremental sync.
+- Normal sync stability.
+- Interrupted sync recovery.
+- Failed-download visibility and retry behavior.
 - State-write failure token-blocking regression coverage.
-- Targeted failed-download retry, if it fits the release.
-- First `kei doctor` slice, if manifest and status primitives are ready.
+- Active sync work in `kei status`.
+- Local missing or damaged file detection.
+- Manifest export as reliability/support tooling, only after core sync,
+  recovery, and reporting feel solid.
+- First `kei doctor` slice only if it directly helps prove or debug
+  reliability.
 
 Out of scope:
 
+- General catalog query.
 - Local file deletion.
 - iCloud-side deletion.
 - Immich upload.
+- Provider expansion.
+- UI work.
 
 Success criteria:
 
-- Backup status is understandable without reading debug logs.
-- Manifest output is read-only and state-backed.
+- Normal sync is stable enough to trust as the default path.
+- Interrupted sync resumes correctly.
+- Failed downloads are visible and recoverable.
+- Sync tokens do not advance after unsafe or incomplete work.
+- Status and reports explain whether the user is safe without debug logs.
 - Missing or damaged local files are visible during routine maintenance.
 
 ### v0.23 - Headless operations
