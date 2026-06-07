@@ -4844,6 +4844,7 @@ mod tests {
         let event = ChangeEvent {
             record_name: "MODIFIED_ASSET_1".into(),
             record_type: Some("CPLAsset".into()),
+            master_record_name: None,
             reason: ChangeReason::Created,
             asset: Some(modified_asset),
             album: None,

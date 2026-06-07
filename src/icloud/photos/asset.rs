@@ -37,6 +37,13 @@ pub struct ChangeEvent {
     pub record_name: Box<str>,
     /// The record type, if known (None for hard-deletes)
     pub record_type: Option<Box<str>>,
+    /// Master record referenced by an unpaired `CPLAsset`.
+    ///
+    /// Download state is keyed by the master record name, while `CPLAsset`
+    /// soft-delete deltas can arrive without their matching `CPLMaster`. Keep
+    /// the reference so state transitions can update or no-op against the
+    /// same key that normal downloads use.
+    pub master_record_name: Option<Box<str>>,
     /// Why this record changed
     pub reason: ChangeReason,
     /// The photo asset, if this is a CPLMaster+CPLAsset pair that was successfully paired.
@@ -56,6 +63,7 @@ impl ChangeEvent {
         Self {
             record_name,
             record_type,
+            master_record_name: None,
             reason,
             asset: None,
             album: None,
@@ -791,13 +799,15 @@ impl DeltaRecordBuffer {
             ));
         }
 
-        for (_master_ref, record) in self.pending_assets.drain() {
+        for (master_ref, record) in self.pending_assets.drain() {
             let reason = classify_change_reason(&record);
-            events.push(ChangeEvent::new(
+            let mut event = ChangeEvent::new(
                 record.record_name.into_boxed_str(),
                 Some("CPLAsset".into()),
                 reason,
-            ));
+            );
+            event.master_record_name = Some(master_ref.into_boxed_str());
+            events.push(event);
         }
 
         events
@@ -1613,6 +1623,7 @@ mod tests {
                 }
                 "A_ORPHAN" => {
                     assert_eq!(event.record_type.as_deref(), Some("CPLAsset"));
+                    assert_eq!(event.master_record_name.as_deref(), Some("M_MISSING"));
                 }
                 _ => panic!("unexpected record name: {}", event.record_name),
             }
@@ -1667,6 +1678,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(&*events[0].record_name, "A_NO_REF");
         assert_eq!(events[0].record_type.as_deref(), Some("CPLAsset"));
+        assert_eq!(events[0].master_record_name, None);
         assert!(events[0].asset.is_none());
     }
 
@@ -1871,6 +1883,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(&*events[0].record_name, "A_STANDALONE");
         assert_eq!(events[0].record_type.as_deref(), Some("CPLAsset"));
+        assert_eq!(events[0].master_record_name, None);
         assert_eq!(events[0].reason, ChangeReason::Created);
         assert!(
             events[0].asset.is_none(),

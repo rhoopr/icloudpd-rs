@@ -43,6 +43,7 @@ use futures_util::stream::{self, StreamExt};
 use futures_util::Stream;
 use tokio_util::sync::CancellationToken;
 
+use crate::icloud::photos::asset::ChangeEvent;
 use crate::icloud::photos::{PhotoAsset, SyncTokenError};
 use crate::retry::RetryConfig;
 use crate::state::{DownloadStateStore, MetadataRewriteStore, StateDb, VersionSizeKey};
@@ -2801,17 +2802,6 @@ impl IncrementalStateTransition {
             Self::Hidden => INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON,
         }
     }
-
-    const fn zero_rows_reason(self) -> &'static str {
-        match self {
-            Self::SoftDelete | Self::HardDelete => INCREMENTAL_DELETE_ZERO_ROWS_REASON,
-            Self::Hidden => INCREMENTAL_HIDDEN_ZERO_ROWS_REASON,
-        }
-    }
-
-    fn zero_rows_is_noop(self, record_type: Option<&str>) -> bool {
-        matches!(self, Self::SoftDelete) && matches!(record_type, Some("CPLMaster"))
-    }
 }
 
 fn record_incremental_state_transition_result(
@@ -2824,22 +2814,12 @@ fn record_incremental_state_transition_result(
 ) {
     match result {
         Ok(updated) if updated > 0 => {}
-        Ok(_) if transition.zero_rows_is_noop(record_type) => {
+        Ok(_) => {
             tracing::debug!(
                 record_name,
                 record_type,
                 transition = transition.label(),
                 "Incremental source-state transition was already absent from state DB"
-            );
-        }
-        Ok(_) => {
-            *state_transition_failures += 1;
-            token_unsafe_reason.get_or_insert(transition.zero_rows_reason());
-            tracing::warn!(
-                record_name,
-                record_type,
-                transition = transition.label(),
-                "Incremental source-state transition did not match any state DB row"
             );
         }
         Err(e) => {
@@ -2853,6 +2833,16 @@ fn record_incremental_state_transition_result(
             );
         }
     }
+}
+
+fn source_state_transition_key(event: &ChangeEvent) -> (&str, Option<&str>) {
+    if matches!(event.record_type.as_deref(), Some("CPLAsset")) {
+        if let Some(master_record_name) = event.master_record_name.as_deref() {
+            return (master_record_name, Some("CPLMaster"));
+        }
+    }
+
+    (&event.record_name, event.record_type.as_deref())
 }
 
 fn clear_zone_token_block_from_targeted_backfill_stats(stats: &mut SyncStats) {
@@ -4333,14 +4323,15 @@ async fn download_photos_incremental(
                 tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
                 if let Some(db) = &config.state_db {
                     let deleted_at = event.asset.as_ref().and_then(|a| a.metadata().deleted_at);
+                    let (state_record_name, state_record_type) = source_state_transition_key(event);
                     let result = db
-                        .mark_soft_deleted_affected(&config.library, &event.record_name, deleted_at)
+                        .mark_soft_deleted_affected(&config.library, state_record_name, deleted_at)
                         .await;
                     record_incremental_state_transition_result(
                         result,
                         IncrementalStateTransition::SoftDelete,
-                        &event.record_name,
-                        event.record_type.as_deref(),
+                        state_record_name,
+                        state_record_type,
                         &mut state_transition_failures,
                         &mut token_unsafe_reason,
                     );
@@ -4354,14 +4345,15 @@ async fn download_photos_incremental(
                 // (sets is_deleted=1) - the row stays put so history and
                 // local_path remain queryable.
                 if let Some(db) = &config.state_db {
+                    let (state_record_name, state_record_type) = source_state_transition_key(event);
                     let result = db
-                        .mark_soft_deleted_affected(&config.library, &event.record_name, None)
+                        .mark_soft_deleted_affected(&config.library, state_record_name, None)
                         .await;
                     record_incremental_state_transition_result(
                         result,
                         IncrementalStateTransition::HardDelete,
-                        &event.record_name,
-                        event.record_type.as_deref(),
+                        state_record_name,
+                        state_record_type,
                         &mut state_transition_failures,
                         &mut token_unsafe_reason,
                     );
@@ -4371,14 +4363,15 @@ async fn download_photos_incremental(
                 hidden_count += 1;
                 tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
                 if let Some(db) = &config.state_db {
+                    let (state_record_name, state_record_type) = source_state_transition_key(event);
                     let result = db
-                        .mark_hidden_at_source_affected(&config.library, &event.record_name)
+                        .mark_hidden_at_source_affected(&config.library, state_record_name)
                         .await;
                     record_incremental_state_transition_result(
                         result,
                         IncrementalStateTransition::Hidden,
-                        &event.record_name,
-                        event.record_type.as_deref(),
+                        state_record_name,
+                        state_record_type,
                         &mut state_transition_failures,
                         &mut token_unsafe_reason,
                     );
@@ -6775,11 +6768,25 @@ mod tests {
         records
     }
 
-    fn soft_deleted_cpl_asset_record(record_name: &str, master_ref: &str) -> Value {
+    fn flagged_cpl_asset_record(record_name: &str, master_ref: &str, flag: (&str, i64)) -> Value {
         let mut records = incremental_photo_records(master_ref);
         let mut asset = records.remove(1);
         asset["recordName"] = json!(record_name);
-        asset["fields"]["isDeleted"] = json!({"value": 1, "type": "INT64"});
+        asset["fields"][flag.0] = json!({"value": flag.1, "type": "INT64"});
+        asset
+    }
+
+    fn soft_deleted_cpl_asset_record(record_name: &str, master_ref: &str) -> Value {
+        flagged_cpl_asset_record(record_name, master_ref, ("isDeleted", 1))
+    }
+
+    fn hidden_cpl_asset_record(record_name: &str, master_ref: &str) -> Value {
+        flagged_cpl_asset_record(record_name, master_ref, ("isHidden", 1))
+    }
+
+    fn soft_deleted_cpl_asset_record_without_master_ref(record_name: &str) -> Value {
+        let mut asset = soft_deleted_cpl_asset_record(record_name, "MISSING_MASTER_REF");
+        asset["fields"].as_object_mut().unwrap().remove("masterRef");
         asset
     }
 
@@ -6801,6 +6808,33 @@ mod tests {
             record.metadata.is_hidden, expected_hidden,
             "is_hidden mismatch for {asset_id}"
         );
+    }
+
+    async fn run_incremental_change_records(
+        db: Arc<crate::state::SqliteStateDb>,
+        records: Vec<Value>,
+    ) -> SyncResult {
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(records, "zone-token-after", false)
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("Library", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.state_db = Some(db);
+        download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-before",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -6863,31 +6897,11 @@ mod tests {
             let conn = db.acquire_lock("test").unwrap();
             conn.execute("DROP TABLE assets", []).unwrap();
         }
-        let session = MockPhotosFlow::new()
-            .changes_zone_page(
-                flagged_incremental_records("SOFT_DELETE_ERR", ("isDeleted", 1)),
-                "zone-token-after",
-                false,
-            )
-            .build();
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: mock_album("Library", session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
-
-        let mut config = test_config();
-        config.state_db = Some(db);
-        let result = download_photos_incremental(
-            &Client::new(),
-            &passes,
-            &Arc::new(config),
-            "zone-token-before",
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
+        let result = run_incremental_change_records(
+            db,
+            flagged_incremental_records("SOFT_DELETE_ERR", ("isDeleted", 1)),
         )
-        .await
-        .unwrap();
+        .await;
 
         assert!(matches!(
             result.outcome,
@@ -6912,31 +6926,11 @@ mod tests {
             let conn = db.acquire_lock("test").unwrap();
             conn.execute("DROP TABLE assets", []).unwrap();
         }
-        let session = MockPhotosFlow::new()
-            .changes_zone_page(
-                flagged_incremental_records("HIDDEN_ERR", ("isHidden", 1)),
-                "zone-token-after",
-                false,
-            )
-            .build();
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: mock_album("Library", session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
-
-        let mut config = test_config();
-        config.state_db = Some(db);
-        let result = download_photos_incremental(
-            &Client::new(),
-            &passes,
-            &Arc::new(config),
-            "zone-token-before",
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
+        let result = run_incremental_change_records(
+            db,
+            flagged_incremental_records("HIDDEN_ERR", ("isHidden", 1)),
         )
-        .await
-        .unwrap();
+        .await;
 
         assert!(matches!(
             result.outcome,
@@ -6954,31 +6948,11 @@ mod tests {
     #[tokio::test]
     async fn incremental_untracked_cplmaster_soft_delete_zero_rows_advances_sync_token() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
-        let session = MockPhotosFlow::new()
-            .changes_zone_page(
-                flagged_incremental_records("UNTRACKED_SOFT_DELETE", ("isDeleted", 1)),
-                "zone-token-after",
-                false,
-            )
-            .build();
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: mock_album("Library", session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
-
-        let mut config = test_config();
-        config.state_db = Some(db.clone());
-        let result = download_photos_incremental(
-            &Client::new(),
-            &passes,
-            &Arc::new(config),
-            "zone-token-before",
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
+        let result = run_incremental_change_records(
+            db.clone(),
+            flagged_incremental_records("UNTRACKED_SOFT_DELETE", ("isDeleted", 1)),
         )
-        .await
-        .unwrap();
+        .await;
 
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
@@ -6988,93 +6962,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_cplasset_soft_delete_zero_rows_still_blocks_sync_token() {
+    async fn incremental_untracked_cplasset_soft_delete_zero_rows_advances_sync_token() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
-        let session = MockPhotosFlow::new()
-            .changes_zone_page(
-                vec![soft_deleted_cpl_asset_record(
-                    "asset-UNTRACKED_SOFT_DELETE",
-                    "UNTRACKED_SOFT_DELETE",
-                )],
-                "zone-token-after",
-                false,
-            )
-            .build();
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: mock_album("Library", session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
-
-        let mut config = test_config();
-        config.state_db = Some(db);
-        let result = download_photos_incremental(
-            &Client::new(),
-            &passes,
-            &Arc::new(config),
-            "zone-token-before",
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
+        let result = run_incremental_change_records(
+            db,
+            vec![soft_deleted_cpl_asset_record(
+                "asset-UNTRACKED_SOFT_DELETE",
+                "UNTRACKED_SOFT_DELETE",
+            )],
         )
-        .await
-        .unwrap();
+        .await;
 
-        assert!(matches!(
-            result.outcome,
-            DownloadOutcome::PartialFailure { failed_count: 1 }
-        ));
-        assert_eq!(result.sync_token, None);
-        assert_eq!(result.stats.state_write_failures, 1);
-        assert!(result.stats.sync_token_blocked);
-        assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some(INCREMENTAL_DELETE_ZERO_ROWS_REASON)
-        );
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
     }
 
     #[tokio::test]
-    async fn incremental_hard_delete_zero_rows_blocks_sync_token_for_tracked_asset() {
+    async fn incremental_untracked_cplasset_soft_delete_without_master_ref_advances_sync_token() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let result = run_incremental_change_records(
+            db,
+            vec![soft_deleted_cpl_asset_record_without_master_ref(
+                "asset-UNTRACKED_SOFT_DELETE",
+            )],
+        )
+        .await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
+    }
+
+    #[tokio::test]
+    async fn incremental_cplasset_soft_delete_marks_master_ref_row() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
         db.upsert_seen(&TestAssetRecord::new("TRACKED_MASTER").build())
             .await
             .unwrap();
-        let session = MockPhotosFlow::new()
-            .changes_zone_page(
-                vec![hard_deleted_change_record("asset-TRACKED_MASTER")],
-                "zone-token-after",
-                false,
-            )
-            .build();
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: mock_album("Library", session),
-            exclude_ids: Arc::new(FxHashSet::default()),
-        }];
-
-        let mut config = test_config();
-        config.state_db = Some(db.clone());
-        let result = download_photos_incremental(
-            &Client::new(),
-            &passes,
-            &Arc::new(config),
-            "zone-token-before",
-            DownloadControls::download_hidden(),
-            CancellationToken::new(),
+        let result = run_incremental_change_records(
+            db.clone(),
+            vec![soft_deleted_cpl_asset_record(
+                "asset-TRACKED_MASTER",
+                "TRACKED_MASTER",
+            )],
         )
-        .await
-        .unwrap();
+        .await;
 
-        assert!(matches!(
-            result.outcome,
-            DownloadOutcome::PartialFailure { failed_count: 1 }
-        ));
-        assert_eq!(result.sync_token, None);
-        assert_eq!(result.stats.state_write_failures, 1);
-        assert!(result.stats.sync_token_blocked);
-        assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some(INCREMENTAL_DELETE_ZERO_ROWS_REASON)
-        );
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
+        let pending = db.get_pending().await.unwrap();
+        assert_source_flags(&pending, "TRACKED_MASTER", true, false);
+    }
+
+    #[tokio::test]
+    async fn incremental_cplasset_hidden_marks_master_ref_row() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        db.upsert_seen(&TestAssetRecord::new("TRACKED_HIDDEN_MASTER").build())
+            .await
+            .unwrap();
+        let result = run_incremental_change_records(
+            db.clone(),
+            vec![hidden_cpl_asset_record(
+                "asset-TRACKED_HIDDEN_MASTER",
+                "TRACKED_HIDDEN_MASTER",
+            )],
+        )
+        .await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
+        let pending = db.get_pending().await.unwrap();
+        assert_source_flags(&pending, "TRACKED_HIDDEN_MASTER", false, true);
+    }
+
+    #[tokio::test]
+    async fn incremental_untracked_hidden_zero_rows_advances_sync_token() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let result = run_incremental_change_records(
+            db,
+            flagged_incremental_records("UNTRACKED_HIDDEN", ("isHidden", 1)),
+        )
+        .await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
+    }
+
+    #[tokio::test]
+    async fn incremental_unresolved_hard_delete_zero_rows_advances_sync_token() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        db.upsert_seen(&TestAssetRecord::new("TRACKED_MASTER").build())
+            .await
+            .unwrap();
+        let result = run_incremental_change_records(
+            db.clone(),
+            vec![hard_deleted_change_record("asset-TRACKED_MASTER")],
+        )
+        .await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
         let pending = db.get_pending().await.unwrap();
         assert_source_flags(&pending, "TRACKED_MASTER", false, false);
     }
