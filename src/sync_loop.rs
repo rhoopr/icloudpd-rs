@@ -5716,6 +5716,12 @@ mod tests {
         // CONTRACT: SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE
         // A published file with a failed state write is unsafe to skip on the
         // next incremental cycle, even though the media bytes are on disk.
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
         let config = make_run_cycle_config();
         let inner = make_state_db();
         inner
@@ -5733,36 +5739,18 @@ mod tests {
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
         let master_record_name = "master-state-write-failure";
-        let asset_record_name = format!("asset-{master_record_name}");
-        let body = b"jpegdata";
-        for pending_id in [master_record_name, asset_record_name.as_str()] {
-            inner
-                .upsert_seen(
-                    &crate::test_helpers::TestAssetRecord::new(pending_id)
-                        .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-                        .filename("photo.JPG")
-                        .size(body.len() as u64)
-                        .build(),
-                )
-                .await
-                .expect("seed pending row");
-        }
-        // The fixture's filenameEnc value is intentionally passed through by
-        // the test parser, so mirror the exact derived path rather than the
-        // decoded display name.
-        let preexisting_filename =
-            crate::download::paths::apply_name_id7("cGhvdG8uanBn.JPG", master_record_name);
-        let preexisting_final_path = download_dir
-            .path()
-            .join("2023/11/14")
-            .join(preexisting_filename);
-        std::fs::create_dir_all(
-            preexisting_final_path
-                .parent()
-                .expect("preexisting file parent"),
-        )
-        .expect("create preexisting file parent");
-        std::fs::write(&preexisting_final_path, body).expect("seed preexisting local file");
+        let body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+        Mock::given(method("GET"))
+            .and(path("/photo.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let album = make_full_album_with_session(
             "PrimarySync",
@@ -5772,22 +5760,16 @@ mod tests {
                     "PrimarySync",
                     master_record_name,
                     "zone-tok-after-state-write-failure",
-                    "https://p01.icloud-content.com/photo.jpg",
+                    &format!("{}/photo.jpg", server.uri()),
                     body.len() as u64,
-                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                    &checksum,
                 )),
         );
         let lib_state =
             make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
         let states = vec![&lib_state];
-        let build_download_config = make_run_cycle_download_config_builder_with_options(
-            download_dir.path(),
-            Arc::clone(&db),
-            RunCycleDownloadConfigOptions {
-                file_match_policy: Some(crate::types::FileMatchPolicy::NameId7),
-                ..RunCycleDownloadConfigOptions::default()
-            },
-        );
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
 
         let result = run_cycle(
             &states,
@@ -5802,10 +5784,20 @@ mod tests {
         .await
         .expect("run cycle");
 
+        let final_dir = download_dir.path().join("2023/11/14");
+        let final_paths = std::fs::read_dir(&final_dir)
+            .expect("final directory exists")
+            .map(|entry| entry.expect("final file entry").path())
+            .collect::<Vec<_>>();
         assert_eq!(
-            std::fs::read(&preexisting_final_path).expect("read local media file"),
+            final_paths.len(),
+            1,
+            "expected one final file: {final_paths:?}"
+        );
+        assert_eq!(
+            std::fs::read(&final_paths[0]).expect("read local media file"),
             body,
-            "media bytes must remain present after the state write fails"
+            "media bytes must land before the state write fails"
         );
         assert_eq!(
             result.failed_count, 1,
