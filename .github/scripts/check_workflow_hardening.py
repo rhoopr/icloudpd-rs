@@ -89,6 +89,31 @@ def check_release(errors: list[str]) -> None:
         errors.append("release.yml: missing top-level read-only token permissions")
     if "cargo build --locked --release --target ${{ matrix.target }}" not in text:
         errors.append("release.yml: release builds must use cargo build --locked")
+    if 'curl -fsSL "$BASE/SHA256SUMS.txt"' not in text:
+        errors.append("release.yml: Homebrew updater must download SHA256SUMS.txt fail-fast")
+    if 'curl -fsSL "$BASE/$file"' not in text:
+        errors.append("release.yml: Homebrew updater must download release assets fail-fast")
+    for needle in (
+        'expected_sha=$(awk -v file="$file"',
+        'if [ "$actual_sha" != "$expected_sha" ]; then',
+        'SHAS[$key]="$actual_sha"',
+    ):
+        if needle not in text:
+            errors.append(f"release.yml: Homebrew updater missing checksum guard: {needle}")
+
+
+def check_service_smoke_paths(errors: list[str]) -> None:
+    text = workflow_text("service-smoke.yml")
+    for path in (
+        "src/service/**",
+        "src/commands/service.rs",
+        "src/cli.rs",
+        "src/config.rs",
+        "src/lib.rs",
+        "src/commands/status.rs",
+    ):
+        if f"- '{path}'" not in text:
+            errors.append(f"service-smoke.yml: path filter must include {path}")
 
 
 def check_coverage_comment(errors: list[str]) -> None:
@@ -113,6 +138,7 @@ def main() -> int:
     check_docker_publish(errors)
     check_docker_test(errors)
     check_release(errors)
+    check_service_smoke_paths(errors)
     check_coverage_comment(errors)
     check_windows_stack_link_arg(errors)
 

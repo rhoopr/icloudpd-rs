@@ -24,7 +24,10 @@ on:
   pull_request:
     paths:
       - 'src/service/**'
+      - 'src/commands/service.rs'
       - 'src/cli.rs'
+      - 'src/config.rs'
+      - 'src/lib.rs'
       - 'src/commands/status.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'

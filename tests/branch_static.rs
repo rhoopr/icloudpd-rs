@@ -213,6 +213,63 @@ fn aggregate_ci_depends_on_no_default_feature_gate() {
 }
 
 #[test]
+fn release_homebrew_downloads_fail_fast_and_verify_checksums() {
+    let release = repo_file(".github/workflows/release.yml");
+    let hardening = repo_file(".github/scripts/check_workflow_hardening.py");
+
+    for expected in [
+        r#"curl -fsSL "$BASE/SHA256SUMS.txt" -o /tmp/SHA256SUMS.txt"#,
+        r#"curl -fsSL "$BASE/$file" -o "/tmp/$file""#,
+        r#"expected_sha=$(awk -v file="$file" '$2 == file { print $1 }' /tmp/SHA256SUMS.txt)"#,
+        r#"if [ "$actual_sha" != "$expected_sha" ]; then"#,
+        r#"SHAS[$key]="$actual_sha""#,
+    ] {
+        assert!(
+            release.contains(expected),
+            "release Homebrew update must fail fast and verify checksums: {expected}"
+        );
+    }
+
+    for expected in [
+        r#"curl -fsSL "$BASE/SHA256SUMS.txt""#,
+        r#"curl -fsSL "$BASE/$file""#,
+        r#"expected_sha=$(awk -v file="$file""#,
+        r#"if [ "$actual_sha" != "$expected_sha" ]; then"#,
+        r#"SHAS[$key]="$actual_sha""#,
+    ] {
+        assert!(
+            hardening.contains(expected),
+            "workflow hardening script must pin release invariant: {expected}"
+        );
+    }
+}
+
+#[test]
+fn service_smoke_path_filters_cover_shared_dispatch() {
+    let service_smoke = repo_file(".github/workflows/service-smoke.yml");
+    let hardening = repo_file(".github/scripts/check_workflow_hardening.py");
+
+    for path in [
+        "src/service/**",
+        "src/commands/service.rs",
+        "src/cli.rs",
+        "src/config.rs",
+        "src/lib.rs",
+        "src/commands/status.rs",
+    ] {
+        let expected = format!("- '{path}'");
+        assert!(
+            service_smoke.contains(&expected),
+            "service-smoke path filter must include {path}"
+        );
+        assert!(
+            hardening.contains(path),
+            "workflow hardening script must enforce service-smoke path filter for {path}"
+        );
+    }
+}
+
+#[test]
 fn live_test_recipe_forces_all_features_after_nodefault_phase() {
     let justfile = repo_file("justfile");
     let live_case = justfile

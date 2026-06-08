@@ -212,10 +212,23 @@ jobs:
           )
 
           declare -A SHAS
+          curl -fsSL "$BASE/SHA256SUMS.txt" -o /tmp/SHA256SUMS.txt
           for key in "${!ASSETS[@]}"; do
             file="${ASSETS[$key]}"
-            curl -sL "$BASE/$file" -o "/tmp/$file"
-            SHAS[$key]=$(sha256sum "/tmp/$file" | cut -d' ' -f1)
+            curl -fsSL "$BASE/$file" -o "/tmp/$file"
+            expected_sha=$(awk -v file="$file" '$2 == file { print $1 }' /tmp/SHA256SUMS.txt)
+            if [ -z "$expected_sha" ]; then
+              echo "::error::SHA256SUMS.txt does not list $file"
+              exit 1
+            fi
+            actual_sha=$(sha256sum "/tmp/$file" | cut -d' ' -f1)
+            if [ "$actual_sha" != "$expected_sha" ]; then
+              echo "::error::$file checksum mismatch"
+              echo "expected: $expected_sha"
+              echo "actual:   $actual_sha"
+              exit 1
+            fi
+            SHAS[$key]="$actual_sha"
           done
 
           cat > Formula/kei.rb << FORMULA
