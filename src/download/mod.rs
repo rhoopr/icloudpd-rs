@@ -4406,18 +4406,20 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
                     if let Some(db) = &config.state_db {
                         let deleted_at = event.asset.as_ref().and_then(|a| a.metadata().deleted_at);
+                        let (state_record_name, state_record_type) =
+                            source_state_transition_key(&event);
                         let result = db
                             .mark_soft_deleted_affected(
                                 &config.library,
-                                &event.record_name,
+                                state_record_name,
                                 deleted_at,
                             )
                             .await;
                         record_incremental_state_transition_result(
                             result,
                             IncrementalStateTransition::SoftDelete,
-                            &event.record_name,
-                            event.record_type.as_deref(),
+                            state_record_name,
+                            state_record_type,
                             &mut summary.state_transition_failures,
                             &mut summary.token_unsafe_reason,
                         );
@@ -4427,14 +4429,16 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                     summary.hard_deleted_count += 1;
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
                     if let Some(db) = &config.state_db {
+                        let (state_record_name, state_record_type) =
+                            source_state_transition_key(&event);
                         let result = db
-                            .mark_soft_deleted_affected(&config.library, &event.record_name, None)
+                            .mark_soft_deleted_affected(&config.library, state_record_name, None)
                             .await;
                         record_incremental_state_transition_result(
                             result,
                             IncrementalStateTransition::HardDelete,
-                            &event.record_name,
-                            event.record_type.as_deref(),
+                            state_record_name,
+                            state_record_type,
                             &mut summary.state_transition_failures,
                             &mut summary.token_unsafe_reason,
                         );
@@ -4444,14 +4448,16 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                     summary.hidden_count += 1;
                     tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
                     if let Some(db) = &config.state_db {
+                        let (state_record_name, state_record_type) =
+                            source_state_transition_key(&event);
                         let result = db
-                            .mark_hidden_at_source_affected(&config.library, &event.record_name)
+                            .mark_hidden_at_source_affected(&config.library, state_record_name)
                             .await;
                         record_incremental_state_transition_result(
                             result,
                             IncrementalStateTransition::Hidden,
-                            &event.record_name,
-                            event.record_type.as_deref(),
+                            state_record_name,
+                            state_record_type,
                             &mut summary.state_transition_failures,
                             &mut summary.token_unsafe_reason,
                         );
