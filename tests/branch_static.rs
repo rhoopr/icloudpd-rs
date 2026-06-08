@@ -417,6 +417,26 @@ fn contributor_docs_match_current_gate() {
 }
 
 #[test]
+fn roundtrip_gate_documents_heuristic_limits_and_bypass_rationale() {
+    let gate = repo_file("scripts/check-roundtrip-gate.sh");
+
+    for expected in [
+        "Heuristic diff guard for serializer changes",
+        "intentionally heuristic",
+        "false-positive",
+        "false-negative",
+        "review prompt, not proof that the code is wrong",
+        "written reviewer rationale",
+        "heuristic serializer change detected without a round-trip test edit",
+    ] {
+        assert!(
+            gate.contains(expected),
+            "roundtrip gate must document heuristic behavior and bypass rationale: {expected}"
+        );
+    }
+}
+
+#[test]
 fn bug_report_template_requires_web_access_and_redaction() {
     let bug = repo_file(".github/ISSUE_TEMPLATE/bug_report.yml");
 

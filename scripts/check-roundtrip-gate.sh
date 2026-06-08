@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# Fail when this branch adds/changes a serializer in src/ without a
-# corresponding round-trip test edit. Catches `parse(serialize(x))`-shape
-# bugs that pass per-side review by demanding the property test exist.
+# Heuristic diff guard for serializer changes in src/.
+#
+# Fail when this branch adds/changes a serializer without a corresponding
+# round-trip test edit. Catches `parse(serialize(x))`-shape bugs that pass
+# per-side review by demanding the property test exist.
+#
+# This is intentionally heuristic. It can false-positive on serializer-looking
+# helper functions that have no inverse, and it can false-negative when a
+# serializer changes without adding a new matching line. Treat a failure as a
+# review prompt, not proof that the code is wrong.
 #
 # Triggers on added lines (`^+`, not `^+++`) matching any of:
 #   fn to_raw / fn to_string / fn serialize / fn to_toml / fn to_json
@@ -11,7 +18,7 @@
 #   roundtrip / round_trip / serialize.*parse / parse.*serialize /
 #   to_raw.*from_raw / from_raw.*to_raw
 #
-# Override: KEI_SKIP_ROUNDTRIP_GATE=1 (use only with a written justification).
+# Override: KEI_SKIP_ROUNDTRIP_GATE=1 (use only with a written reviewer rationale).
 
 set -euo pipefail
 
@@ -56,7 +63,7 @@ if [ -n "$ROUNDTRIP_SIGNAL" ]; then
 fi
 
 cat >&2 <<EOF
-roundtrip-gate: serializer change detected without a round-trip test edit.
+roundtrip-gate: heuristic serializer change detected without a round-trip test edit.
 
 Changed serializers (diff vs $MERGE_BASE):
 $(printf '%s\n' "$SERIALIZER_HITS" | sed 's/^/  /')
@@ -66,7 +73,7 @@ inverse) for the type whose serializer changed. Look for an existing
 \`*_roundtrip\` / \`round_trip\` test in tests/ or src/ as a pattern.
 
 If this serializer truly has no inverse and no round-trip property,
-add the test name with a short comment explaining why
+add the test name with a short reviewer rationale explaining why
 (\`fn no_roundtrip_*\`) so the gate sees the signal and the next
 reviewer sees the rationale.
 
