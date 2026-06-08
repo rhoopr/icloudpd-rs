@@ -371,6 +371,21 @@ fn bug_report_template_requires_web_access_and_redaction() {
 }
 
 #[test]
+fn audit_ignores_carry_removal_triggers() {
+    let audit = repo_file(".cargo/audit.toml");
+
+    for expected in [
+        "Remove this ignore once little_exif drops paste",
+        "Remove this ignore once reqwest's QUIC stack no longer pulls rand",
+    ] {
+        assert!(
+            audit.contains(expected),
+            "audit ignore must document removal trigger: {expected}"
+        );
+    }
+}
+
+#[test]
 fn live_test_recipe_forces_all_features_after_nodefault_phase() {
     let justfile = repo_file("justfile");
     let live_case = justfile
