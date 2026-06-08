@@ -263,6 +263,34 @@ fn aggregate_ci_depends_on_no_default_feature_gate() {
 }
 
 #[test]
+fn rust_ci_runs_on_main_push_without_pr_only_coverage() {
+    let ci = repo_file(".github/workflows/ci.yml");
+    let hardening = repo_file(".github/scripts/check_workflow_hardening.py");
+
+    for expected in [
+        "  push:\n    branches: [main]",
+        "if [[ \"$EVENT_NAME\" != \"pull_request\" ]]; then",
+        "github.event_name == 'pull_request' && needs.detect.outputs.code == 'true'",
+    ] {
+        assert!(
+            ci.contains(expected),
+            "CI must run on main pushes while keeping coverage PR-only: {expected}"
+        );
+    }
+
+    for expected in [
+        "push:\\n    branches: [main]",
+        "if [[ \"$EVENT_NAME\" != \"pull_request\" ]]; then",
+        "github.event_name == 'pull_request' && needs.detect.outputs.code == 'true'",
+    ] {
+        assert!(
+            hardening.contains(expected),
+            "workflow hardening must pin the CI push/coverage guard: {expected}"
+        );
+    }
+}
+
+#[test]
 fn release_homebrew_downloads_fail_fast_and_verify_checksums() {
     let release = repo_file(".github/workflows/release.yml");
     let hardening = repo_file(".github/scripts/check_workflow_hardening.py");

@@ -2,6 +2,8 @@ name: Rust CI
 
 on:
   pull_request:
+  push:
+    branches: [main]
 
 # Cancel an in-flight CI run when a new push lands on the same PR.
 # Only the latest commit matters; older runs would just burn minutes.
@@ -24,6 +26,7 @@ jobs:
   # gate on these outputs to skip when irrelevant. Workflow or script
   # changes flip every flag on - those touch CI itself, so re-run everything
   # to validate the change doesn't break unrelated jobs.
+  # Pushes to main run all non-PR-only checks.
   detect:
     name: Detect changes
     runs-on: ubuntu-latest
@@ -37,8 +40,19 @@ jobs:
       - id: filter
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "$EVENT_NAME event -> running all non-PR-only jobs"
+            {
+              echo "code=true"
+              echo "cargo=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           files=$(git diff --name-only "${BASE_SHA}"...HEAD)
           echo "Changed files:"
           printf '  %s\n' $files
@@ -207,7 +221,7 @@ jobs:
   coverage-head:
     name: Coverage (head)
     needs: detect
-    if: needs.detect.outputs.code == 'true'
+    if: github.event_name == 'pull_request' && needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -244,7 +258,7 @@ jobs:
   coverage-base:
     name: Coverage (base)
     needs: detect
-    if: needs.detect.outputs.code == 'true'
+    if: github.event_name == 'pull_request' && needs.detect.outputs.code == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:

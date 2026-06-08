@@ -102,6 +102,17 @@ def check_release(errors: list[str]) -> None:
             errors.append(f"release.yml: Homebrew updater missing checksum guard: {needle}")
 
 
+def check_rust_ci(errors: list[str]) -> None:
+    text = workflow_text("ci.yml")
+    for needle in (
+        "push:\n    branches: [main]",
+        'if [[ "$EVENT_NAME" != "pull_request" ]]; then',
+        "github.event_name == 'pull_request' && needs.detect.outputs.code == 'true'",
+    ):
+        if needle not in text:
+            errors.append(f"ci.yml: missing push/main or PR-only coverage guard: {needle}")
+
+
 def check_service_smoke_paths(errors: list[str]) -> None:
     text = workflow_text("service-smoke.yml")
     for path in (
@@ -138,6 +149,7 @@ def main() -> int:
     check_docker_publish(errors)
     check_docker_test(errors)
     check_release(errors)
+    check_rust_ci(errors)
     check_service_smoke_paths(errors)
     check_coverage_comment(errors)
     check_windows_stack_link_arg(errors)
