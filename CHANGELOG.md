@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `kei doctor` with redacted text and JSON diagnostics for config parsing, local paths, state DB access, session presence, and recent health/report files. (fixes [#588])
+
+### Fixed
+
+- Normal incremental sync now retries known pending or failed asset-version rows with a targeted refresh pass instead of forcing full-library enumeration, and keeps sync-token advancement blocked when retry work is incomplete. (fixes [#506])
+- Published files left behind by a failed state write now keep the sync cycle partial when kei retries from the pending row, so zone and database sync tokens stay blocked until the file is recorded in state. (fixes [#515])
+- Loopback-bound wiremock and metrics tests now return early with an explicit skip line when a restricted sandbox forbids `127.0.0.1` binds, while normal CI hosts still run the tests strictly. (fixes [#479])
+- Added a lightweight `CONTRACT:` marker check for the sync-token advancement gate, with a matching contract test, so future refactors can't drop the safety invariant by accident. (fixes [#580])
+- Extended the lightweight `CONTRACT:` marker coverage to the `.part` publish path so no-overwrite file promotion stays tied to a named regression test. (fixes [#580])
+- `kei status` now shows running sync work and full-enumeration progress markers before completed-run timestamps, so active work doesn't look finished just because a newer pass row completed. (fixes [#530])
+- Incremental and watch syncs now probe a bounded page of downloaded rows for missing or truncated local files, mark drifted rows failed, and force the cycle to retry them through the normal download path. (fixes [#550])
+- Continued typed-error boundary cleanup for CLI parse exits, auth, service retry, sync-loop auth handling, download workers, incremental fallback, and CloudKit library initialization so help/error routing, retry, 2FA, lock-contention, expired-URL, sync-token, and 421 recovery decisions are pinned behind named classifiers. (fixes [#587])
+- CI, release, and contributor-surface hardening now cover the no-default-features aggregate check, Rust CI on pushes to `main`, service-smoke path filters for shared dispatch/config code, Homebrew release downloads that verify `SHA256SUMS.txt`, current local-gate docs, and required iCloud web-access/redaction guidance in issue and PR templates. (fixes [#585])
+- Cargo audit ignores now carry removal triggers, including the `paste` and transient `rand` advisory entries, so future dependency updates have an obvious cleanup point. (fixes [#585])
+- `.github/FUNDING.yml` now keeps only the configured sponsorship platform instead of the unused template placeholders. (fixes [#585])
+- `just full-test` now records the run start time at begin-run, guards begin-run state with the shared full-test lock, reports newer phases consistently in summaries and diffs, and prints local script-tool availability before long runs. (fixes [#583])
+- Added `just lint-scripts` and `just lint-workflows`, wired deterministic script syntax checks into `just gate` and aggregate CI, routed generated Python bytecode out of the repo tree, and kept shellcheck, shfmt, ruff, and actionlint as check-only optional local tooling until they are installed in every gate environment. (fixes [#583], fixes [#585])
+- `just full-test` now fails up front with a clear GNU/Linux userland message when required GNU `find`/`stat` behavior, `flock`, or `timeout` is unavailable. (fixes [#583])
+- The round-trip serializer gate now documents its heuristic limits and requires a reviewer rationale for no-inverse exceptions or emergency bypasses. (fixes [#583])
+- `just full-test` now quotes the configured Docker image consistently in Docker smoke commands, including the default-command smoke that runs through `bash -c`. (fixes [#583])
+
+[#479]: https://github.com/rhoopr/kei/issues/479
+[#506]: https://github.com/rhoopr/kei/issues/506
+[#515]: https://github.com/rhoopr/kei/issues/515
+[#530]: https://github.com/rhoopr/kei/issues/530
+[#550]: https://github.com/rhoopr/kei/issues/550
+[#580]: https://github.com/rhoopr/kei/issues/580
+[#583]: https://github.com/rhoopr/kei/issues/583
+[#585]: https://github.com/rhoopr/kei/issues/585
+[#587]: https://github.com/rhoopr/kei/issues/587
+[#588]: https://github.com/rhoopr/kei/issues/588
+
 ## [0.21.8] - 2026-06-10
 
 ### Fixed

@@ -289,31 +289,43 @@ async fn adopt_pending_on_disk_skip(
     asset: &PhotoAsset,
     ctx: &DownloadContext,
     task_planner: &mut TaskPlanner,
-) -> usize {
+) -> PendingOnDiskAdoptionSummary {
     let Some(db) = state_db else {
-        return 0;
+        return PendingOnDiskAdoptionSummary::default();
     };
     let library = effective_asset_library(asset, config);
     let pending_versions = pending_versions_for_asset(ctx, library, asset);
     let Some(pending_versions) = pending_versions else {
-        return 0;
+        return PendingOnDiskAdoptionSummary::default();
     };
 
-    let mut adopted = 0usize;
+    let mut summary = PendingOnDiskAdoptionSummary::default();
     for derived in derive_expected_paths(asset, config) {
         let version_size = derived.version_size.as_str();
         if !pending_versions.contains(version_size) {
             continue;
         }
-        if adopt_pending_derived_path(db, library, asset, task_planner, &derived)
-            .await
-            .is_some()
-        {
-            adopted += 1;
+        match adopt_pending_derived_path(db, library, asset, task_planner, &derived).await {
+            Some(PendingOnDiskAdoption::Adopted(_)) => {}
+            Some(PendingOnDiskAdoption::StateWriteFailed(_)) => {
+                summary.state_write_failures += 1;
+            }
+            None => {}
         }
     }
 
-    adopted
+    summary
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PendingOnDiskAdoptionSummary {
+    state_write_failures: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingOnDiskAdoption {
+    Adopted(PathBuf),
+    StateWriteFailed(PathBuf),
 }
 
 async fn adopt_pending_on_disk_task(
@@ -323,7 +335,7 @@ async fn adopt_pending_on_disk_task(
     ctx: &DownloadContext,
     task_planner: &mut TaskPlanner,
     task: &DownloadTask,
-) -> Option<PathBuf> {
+) -> Option<PendingOnDiskAdoption> {
     let db = state_db?;
     let library = effective_asset_library(asset, config);
     let pending_versions = pending_versions_for_asset(ctx, library, asset)?;
@@ -335,10 +347,10 @@ async fn adopt_pending_on_disk_task(
         if derived.version_size != task.version_size {
             continue;
         }
-        if let Some(path) =
+        if let Some(adoption) =
             adopt_pending_derived_path(db, library, asset, task_planner, &derived).await
         {
-            return Some(path);
+            return Some(adoption);
         }
     }
 
@@ -351,7 +363,7 @@ async fn adopt_pending_derived_path(
     asset: &PhotoAsset,
     task_planner: &mut TaskPlanner,
     derived: &DerivedPath,
-) -> Option<PathBuf> {
+) -> Option<PendingOnDiskAdoption> {
     let version_size = derived.version_size.as_str();
     let (existing_path, existing_size) = task_planner.existing_path_with_size(&derived.path)?;
     if existing_size != derived.size {
@@ -366,7 +378,7 @@ async fn adopt_pending_derived_path(
             error = %e,
             "Failed to refresh pending asset before adopting on-disk file"
         );
-        return None;
+        return Some(PendingOnDiskAdoption::StateWriteFailed(existing_path));
     }
 
     let local_checksum = match super::file::compute_sha256(&existing_path).await {
@@ -400,7 +412,7 @@ async fn adopt_pending_derived_path(
             error = %e,
             "Failed to mark pending asset downloaded from on-disk file"
         );
-        return None;
+        return Some(PendingOnDiskAdoption::StateWriteFailed(existing_path));
     }
     tracing::info!(
         asset_id = %asset.id(),
@@ -408,7 +420,7 @@ async fn adopt_pending_derived_path(
         path = %existing_path.display(),
         "Resolved pending asset from existing on-disk file"
     );
-    Some(existing_path)
+    Some(PendingOnDiskAdoption::Adopted(existing_path))
 }
 
 fn state_path_size_allows_skip(
@@ -735,6 +747,7 @@ impl StreamRuntime {
 struct StreamProducerMetrics {
     assets_seen: Arc<std::sync::atomic::AtomicU64>,
     enum_errors: Arc<std::sync::atomic::AtomicUsize>,
+    state_write_failures: Arc<std::sync::atomic::AtomicUsize>,
     enumeration_complete: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1074,6 +1087,7 @@ where
     let producer_pb = shared.pb;
     let assets_seen_producer = Arc::clone(&metrics.assets_seen);
     let enum_errors_producer = Arc::clone(&metrics.enum_errors);
+    let state_write_failures_producer = Arc::clone(&metrics.state_write_failures);
     let enumeration_complete_producer = Arc::clone(&metrics.enumeration_complete);
     let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1225,7 +1239,7 @@ where
                             &download_ctx,
                         )
                         .await;
-                        adopt_pending_on_disk_skip(
+                        let adoption = adopt_pending_on_disk_skip(
                             producer_state_db.as_deref(),
                             config,
                             &asset,
@@ -1233,6 +1247,12 @@ where
                             &mut task_planner,
                         )
                         .await;
+                        if adoption.state_write_failures > 0 {
+                            state_write_failures_producer.fetch_add(
+                                adoption.state_write_failures,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         backfill_downloaded_metadata_for_on_disk_skip(
                             producer_state_db.as_deref(),
                             config,
@@ -1321,7 +1341,7 @@ where
                                     }
                                 }
 
-                                if let Some(existing_path) = adopt_pending_on_disk_task(
+                                if let Some(adoption) = adopt_pending_on_disk_task(
                                     producer_state_db.as_deref(),
                                     config,
                                     &asset,
@@ -1332,11 +1352,24 @@ where
                                 .await
                                 {
                                     disposition = disposition.max(AssetDisposition::OnDisk);
-                                    tracing::debug!(
-                                        asset_id = %task.asset_id,
-                                        path = %existing_path.display(),
-                                        "Skipping (pending state adopted existing file)"
-                                    );
+                                    match adoption {
+                                        PendingOnDiskAdoption::Adopted(existing_path) => {
+                                            tracing::debug!(
+                                                asset_id = %task.asset_id,
+                                                path = %existing_path.display(),
+                                                "Skipping (pending state adopted existing file)"
+                                            );
+                                        }
+                                        PendingOnDiskAdoption::StateWriteFailed(existing_path) => {
+                                            state_write_failures_producer
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            tracing::debug!(
+                                                asset_id = %task.asset_id,
+                                                path = %existing_path.display(),
+                                                "Skipping re-download after pending on-disk state write failed"
+                                            );
+                                        }
+                                    }
                                     continue;
                                 }
 
@@ -1899,7 +1932,12 @@ async fn finalize_streaming_download(
     } else {
         StateWriteFlush::default()
     };
-    let state_write_failures = final_state_flush.failures + usize::from(complete_sync_failed);
+    let producer_state_write_failures = metrics
+        .state_write_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let state_write_failures = final_state_flush.failures
+        + producer_state_write_failures
+        + usize::from(complete_sync_failed);
     if consumer.state_write_circuit_error.is_none()
         && state_write_circuit_breaker_tripped(&final_state_flush)
     {

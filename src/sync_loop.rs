@@ -3279,6 +3279,7 @@ mod tests {
         media: config::MediaSelection,
         per_pass_paths: bool,
         recent: Option<u32>,
+        file_match_policy: Option<crate::types::FileMatchPolicy>,
     }
 
     fn media_without_photo_downloads() -> config::MediaSelection {
@@ -3325,6 +3326,9 @@ mod tests {
             config.folder_structure_smart_folders = Arc::from("%Y/%m/%d");
             if options.per_pass_paths {
                 config.folder_structure_albums = Arc::from("{album}");
+            }
+            if let Some(file_match_policy) = options.file_match_policy {
+                config.file_match_policy = file_match_policy;
             }
             config.media = options.media;
             config.recent = options.recent;
@@ -3776,6 +3780,7 @@ mod tests {
         message: &'static str,
         cancel_on_upsert: Option<CancellationToken>,
         replace_download_dir_on_upsert: Option<std::path::PathBuf>,
+        fail_mark_downloaded: bool,
     }
 
     impl std::fmt::Debug for FailingMetadataSetDb {
@@ -3803,6 +3808,7 @@ mod tests {
                 message,
                 cancel_on_upsert: None,
                 replace_download_dir_on_upsert: None,
+                fail_mark_downloaded: false,
             }
         }
 
@@ -3834,6 +3840,11 @@ mod tests {
 
         fn with_download_dir_replaced_on_upsert(mut self, path: std::path::PathBuf) -> Self {
             self.replace_download_dir_on_upsert = Some(path);
+            self
+        }
+
+        fn with_mark_downloaded_failure(mut self) -> Self {
+            self.fail_mark_downloaded = true;
             self
         }
     }
@@ -3881,6 +3892,9 @@ mod tests {
             local_checksum: &str,
             download_checksum: Option<&str>,
         ) -> Result<(), state::error::StateError> {
+            if self.fail_mark_downloaded {
+                return Err(state::error::StateError::LockPoisoned(self.message.into()));
+            }
             self.inner
                 .mark_downloaded(
                     library,
@@ -5437,6 +5451,128 @@ mod tests {
                 .as_deref(),
             Some("zone-tok-prev"),
             "failed zone-token write must leave old token in place for replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cycle_published_file_state_write_failure_blocks_token() {
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(
+                Arc::clone(&inner),
+                "simulated mark_downloaded failure",
+            )
+            .with_mark_downloaded_failure(),
+        );
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let master_record_name = "master-state-write-failure";
+        let asset_record_name = format!("asset-{master_record_name}");
+        let body = b"jpegdata";
+        for pending_id in [master_record_name, asset_record_name.as_str()] {
+            inner
+                .upsert_seen(
+                    &crate::test_helpers::TestAssetRecord::new(pending_id)
+                        .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                        .filename("photo.JPG")
+                        .size(body.len() as u64)
+                        .build(),
+                )
+                .await
+                .expect("seed pending row");
+        }
+        // The fixture's filenameEnc value is intentionally passed through by
+        // the test parser, so mirror the exact derived path rather than the
+        // decoded display name.
+        let preexisting_filename =
+            crate::download::paths::apply_name_id7("cGhvdG8uanBn.JPG", master_record_name);
+        let preexisting_final_path = download_dir
+            .path()
+            .join("2023/11/14")
+            .join(preexisting_filename);
+        std::fs::create_dir_all(
+            preexisting_final_path
+                .parent()
+                .expect("preexisting file parent"),
+        )
+        .expect("create preexisting file parent");
+        std::fs::write(&preexisting_final_path, body).expect("seed preexisting local file");
+
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(full_album_page_with_download(
+                    "PrimarySync",
+                    master_record_name,
+                    "zone-tok-after-state-write-failure",
+                    "https://p01.icloud-content.com/photo.jpg",
+                    body.len() as u64,
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                )),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                file_match_policy: Some(crate::types::FileMatchPolicy::NameId7),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        assert_eq!(
+            std::fs::read(&preexisting_final_path).expect("read local media file"),
+            body,
+            "media bytes must remain present after the state write fails"
+        );
+        assert_eq!(
+            result.failed_count, 1,
+            "state-write failure must make the cycle partial; stats: {:?}",
+            result.stats
+        );
+        assert_eq!(result.stats.state_write_failures, 1);
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "database precheck token must not advance after a state-write failure"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "failed mark_downloaded must leave the old zone token in place for replay"
+        );
+        assert!(
+            inner
+                .get_downloaded_page(0, 10)
+                .await
+                .expect("downloaded rows")
+                .is_empty(),
+            "asset must not be marked fully downloaded when mark_downloaded fails"
         );
     }
 
