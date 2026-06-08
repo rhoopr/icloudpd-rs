@@ -48,4 +48,3 @@ if [[ ${#errors[@]} -gt 0 ]]; then
   } >&2
   exit 64
 fi
-
