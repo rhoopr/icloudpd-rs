@@ -10,6 +10,7 @@ set -euo pipefail
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 runs_dir="${KEI_FULL_TEST_RUNS_DIR:-/tmp/codex/kei/full-test/test-runs}"
 current="$runs_dir/.current.jsonl"
+start_file="$runs_dir/.run-started-at"
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 
 if [[ ! -s "$current" ]]; then
@@ -23,7 +24,11 @@ out="$runs_dir/$ts.json"
 branch=$(git branch --show-current 2>/dev/null || echo "(detached)")
 head=$(git rev-parse --short HEAD 2>/dev/null || echo "(no rev)")
 rustc=$(rustc -V 2>/dev/null || echo "(no rustc)")
-started_at=$(date +%Y-%m-%dT%H:%M:%S)
+if [[ -s "$start_file" ]]; then
+  started_at=$(head -n 1 "$start_file")
+else
+  started_at=$(date +%Y-%m-%dT%H:%M:%S)
+fi
 
 # Run-level metrics. Failures here don't fail the finalize step -- prefer
 # a partial record over a missing one.
@@ -54,5 +59,5 @@ with open(dst, "w") as f:
 PY
 
 # Clear staging + run marker (lets the next /full-test start cleanly).
-rm -f "$current" "$runs_dir/.run-marker"
+rm -f "$current" "$runs_dir/.run-marker" "$start_file"
 echo "$out"

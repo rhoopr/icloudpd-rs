@@ -15,6 +15,9 @@
 #   cookies  Every entry in .test-cookies/ is owned by the current user.
 #            Docker mounts can chown the cookie dir to root; per
 #            feedback_no_sudo.md we don't auto-fix -- we surface it and skip.
+#   tools    Reports optional local script/full-test helpers. Missing optional
+#            tools do not skip live phases, but the report makes local gate
+#            trust gaps visible before a long run starts.
 
 set -u
 
@@ -24,6 +27,21 @@ mkdir -p "$runs_dir"
 flag="$runs_dir/.live-skipped"
 
 reasons=()
+
+report_tool() {
+  local cmd="$1"
+  local label="${2:-$1}"
+  local optional="${3:-0}"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    echo "$label: pass"
+  elif [[ "$optional" == "1" ]]; then
+    echo "$label: optional-missing $cmd not found"
+  else
+    local reason="$cmd not found"
+    echo "$label: skip $reason"
+    reasons+=("$label: $reason")
+  fi
+}
 
 # --- .env present ---------------------------------------------------------
 env_path="$repo_root/.env"
@@ -57,6 +75,13 @@ else
     reasons+=("cookies: $reason")
   fi
 fi
+
+# --- local tooling visibility --------------------------------------------
+report_tool shellcheck shellcheck 1
+report_tool shfmt shfmt 1
+report_tool ruff ruff 1
+report_tool actionlint actionlint 1
+report_tool cargo-bloat cargo-bloat 1
 
 # --- summary + flag -------------------------------------------------------
 if [[ ${#reasons[@]} -gt 0 ]]; then

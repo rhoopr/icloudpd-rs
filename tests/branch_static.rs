@@ -122,6 +122,79 @@ fn full_test_routes_child_tempdirs_to_tmp_codex() {
 }
 
 #[test]
+fn full_test_run_start_metadata_is_stable_until_finalize() {
+    let begin = repo_file("scripts/full-test/begin_run.sh");
+    let finalize = repo_file("scripts/full-test/finalize_run.sh");
+
+    for expected in [
+        "start_file=\"$runs_dir/.run-started-at\"",
+        "lockfile=\"$runs_dir/.lock\"",
+        "flock 9",
+        "if [[ $marker_age -lt 3600 ]]; then",
+        "staging: $current (no records yet)",
+        "date +%Y-%m-%dT%H:%M:%S > \"$start_file\"",
+    ] {
+        assert!(
+            begin.contains(expected),
+            "begin_run must atomically record stable run-start metadata: {expected}"
+        );
+    }
+
+    for expected in [
+        "start_file=\"$runs_dir/.run-started-at\"",
+        "if [[ -s \"$start_file\" ]]; then",
+        "started_at=$(head -n 1 \"$start_file\")",
+        "rm -f \"$current\" \"$runs_dir/.run-marker\" \"$start_file\"",
+    ] {
+        assert!(
+            finalize.contains(expected),
+            "finalize_run must use and clean the stable run-start metadata: {expected}"
+        );
+    }
+}
+
+#[test]
+fn full_test_reports_include_newer_phase_metadata() {
+    let render = repo_file("scripts/full-test/render_summary.py");
+    let diff = repo_file("scripts/full-test/diff_runs.sh");
+
+    for phase in [
+        "release_archive_smoke",
+        "docker_puid_smoke",
+        "live_import_rehearsal",
+        "real_service_lifecycle",
+    ] {
+        assert!(
+            render.contains(phase),
+            "render_summary.py must sort and display newer full-test phase {phase}"
+        );
+        assert!(
+            diff.contains(phase),
+            "diff_runs.sh must assign phase number/test metadata for {phase}"
+        );
+    }
+}
+
+#[test]
+fn full_test_prereqs_report_script_tooling_gaps() {
+    let prereqs = repo_file("scripts/full-test/check_prereqs.sh");
+
+    for expected in [
+        "optional-missing $cmd not found",
+        "report_tool shellcheck shellcheck 1",
+        "report_tool shfmt shfmt 1",
+        "report_tool ruff ruff 1",
+        "report_tool actionlint actionlint 1",
+        "report_tool cargo-bloat cargo-bloat 1",
+    ] {
+        assert!(
+            prereqs.contains(expected),
+            "full-test prereqs must report script/tooling availability: {expected}"
+        );
+    }
+}
+
+#[test]
 fn aggregate_ci_depends_on_no_default_feature_gate() {
     let ci = repo_file(".github/workflows/ci.yml");
     assert!(
