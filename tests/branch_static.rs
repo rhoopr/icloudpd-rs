@@ -6,7 +6,8 @@
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 fn repo_file(path: &str) -> String {
     let mut full = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -15,6 +16,45 @@ fn repo_file(path: &str) -> String {
         .unwrap_or_else(|e| panic!("read {}: {e}", full.display()))
         .replace("\r\n", "\n")
         .replace('\r', "\n")
+}
+
+fn repo_path(path: &str) -> PathBuf {
+    let mut full = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    full.push(path);
+    full
+}
+
+fn rust_files_under(path: &Path, out: &mut Vec<PathBuf>) {
+    for entry in
+        std::fs::read_dir(path).unwrap_or_else(|e| panic!("read dir {}: {e}", path.display()))
+    {
+        let entry = entry.unwrap_or_else(|e| panic!("read dir entry {}: {e}", path.display()));
+        let path = entry.path();
+        if path.is_dir() {
+            rust_files_under(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn production_source(source: &str) -> &str {
+    let source = source
+        .split_once("\n#[cfg(test)]\nmod tests")
+        .map_or(source, |(prod, _)| prod);
+    source
+        .split_once("\n#[cfg(test)]\nmod wiremock_tests")
+        .map_or(source, |(prod, _)| prod)
+}
+
+fn function_name(line: &str) -> Option<String> {
+    let line = line.trim_start();
+    let (_, rest) = line.split_once("fn ")?;
+    let name: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
 }
 
 #[test]
@@ -475,6 +515,80 @@ fn funding_file_contains_only_configured_sponsor_platforms() {
         funding.trim(),
         "ko_fi: rhoopr",
         "FUNDING.yml should not keep unconfigured GitHub template placeholders"
+    );
+}
+
+#[test]
+fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
+    let allowed = [
+        "classify_api_error",
+        "classify_auth_flow_error",
+        "classify_auth_retry_error",
+        "classify_cli_parse_exit",
+        "classify_download_task_error",
+        "classify_exit_error",
+        "classify_incremental_error",
+        "classify_srp_post_error",
+        "classify_sync_auth_error",
+        "is_session_error",
+        "map_library_init_error",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect::<BTreeSet<_>>();
+    let mut files = Vec::new();
+    rust_files_under(&repo_path("src"), &mut files);
+
+    let mut observed = BTreeSet::new();
+    let mut violations = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        let prod = production_source(&source);
+        let mut current_fn: Option<String> = None;
+
+        for (index, line) in prod.lines().enumerate() {
+            if let Some(name) = function_name(line) {
+                current_fn = Some(name);
+            }
+            if line.contains("downcast_ref::<") || line.contains(".downcast::<") {
+                let Some(name) = current_fn.as_deref() else {
+                    violations.push(format!(
+                        "{}:{} downcast outside a function: {}",
+                        path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                            .unwrap_or(path.as_path())
+                            .display(),
+                        index + 1,
+                        line.trim()
+                    ));
+                    continue;
+                };
+                if allowed.contains(name) {
+                    observed.insert(name.to_string());
+                } else {
+                    violations.push(format!(
+                        "{}:{} downcast in {name}: {}",
+                        path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                            .unwrap_or(path.as_path())
+                            .display(),
+                        index + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "production typed-error downcasts must stay in named classifiers or documented owner boundaries:\n{}",
+        violations.join("\n")
+    );
+    assert_eq!(
+        observed, allowed,
+        "classifier inventory changed; update the #587 boundary list deliberately"
     );
 }
 
