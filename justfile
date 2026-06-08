@@ -22,6 +22,7 @@ gate:
     cargo fetch --locked
     cargo audit --deny warnings
     python3 .github/scripts/check_workflow_hardening.py
+    scripts/check-contracts
     typos
     bash scripts/check-roundtrip-gate.sh
 
@@ -64,6 +65,10 @@ full-test:
 # Compact history table for previous `just full-test` runs.
 full-test-history N="10":
     scripts/full-test/history.sh "{{N}}"
+
+# Check lightweight source CONTRACT markers against their contract_ tests.
+check-contracts:
+    scripts/check-contracts
 
 # Fast offline v0.20 patch-release smoke for the May 27 regression set.
 release-smoke:

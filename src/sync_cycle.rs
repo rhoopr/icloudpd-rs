@@ -615,12 +615,13 @@ pub(crate) async fn run_cycle(
             }
         }
 
-        // Store the zone token only after the download engine has returned a
-        // clean result and flushed all batch state writes. `Success` excludes
-        // partial failures; the extra interrupted and shutdown gates below
-        // catch cancellation paths that can still carry a token. A crash
-        // before this metadata write leaves the old token in place, so the
-        // zone replays next cycle instead of skipping unfinalized work.
+        // CONTRACT: SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE - store the zone
+        // token only after the download engine has returned a clean result and
+        // flushed all batch state writes. `Success` excludes partial failures;
+        // the extra interrupted and shutdown gates below catch cancellation
+        // paths that can still carry a token. A crash before this metadata
+        // write leaves the old token in place, so the zone replays next cycle
+        // instead of skipping unfinalized work.
         let should_store_token = should_store_sync_token_for_cycle(
             &sync_result.outcome,
             config.runtime.dry_run,

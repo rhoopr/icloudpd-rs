@@ -5198,18 +5198,19 @@ mod tests {
         assert!(groupings.people.is_empty());
     }
 
-    // `should_store_sync_token` is the single decision gate
-    // protecting the sync-token from being advanced after a partial sync or
-    // a dry run. Both situations would lose change events on the next
-    // incremental cycle ("user data is sacred"). The matrix below pins every
-    // (outcome, dry_run) combination so a future refactor can't relax the
-    // contract without a failing test.
+    // CONTRACT: SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE
+    // `should_store_sync_token` is the single decision gate protecting the
+    // sync-token from being advanced after a partial sync or a dry run. Both
+    // situations would lose change events on the next incremental cycle
+    // ("user data is sacred"). The matrix below pins every (outcome, dry_run)
+    // combination so a future refactor can't relax the contract without a
+    // failing test.
 
     /// A partial download failure MUST NOT advance the stored sync
     /// token. Otherwise the next incremental sync would skip past the
     /// failed assets' change events and never retry them.
     #[test]
-    fn sync_loop_partial_failure_does_not_advance_sync_token() {
+    fn contract_sync_token_advance_requires_clean_cycle_blocks_partial_failure() {
         let outcome = download::DownloadOutcome::PartialFailure { failed_count: 3 };
         assert!(
             !should_store_sync_token(&outcome, false),
@@ -5456,6 +5457,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_cycle_published_file_state_write_failure_blocks_token() {
+        // CONTRACT: SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE
+        // A published file with a failed state write is unsafe to skip on the
+        // next incremental cycle, even though the media bytes are on disk.
         let config = make_run_cycle_config();
         let inner = make_state_db();
         inner

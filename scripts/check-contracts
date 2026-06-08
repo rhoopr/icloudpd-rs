@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Check lightweight data-safety contract markers.
+
+Contract markers are intentionally just comments and tests. A production owner
+comment names the invariant with `CONTRACT: SOME_ID`, and at least one
+`contract_` test name must include the same ID in lower snake case.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+CONTRACT_RE = re.compile(r"\bCONTRACT:\s+([A-Z][A-Z0-9_]+)\b")
+TEST_RE = re.compile(r"(?m)^\s*(?:async\s+)?fn\s+(contract_[a-zA-Z0-9_]+)\s*\(")
+VALID_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def rust_files_under(*roots: str) -> list[Path]:
+    files: list[Path] = []
+    for root in roots:
+        root_path = REPO / root
+        if root_path.exists():
+            files.extend(sorted(root_path.rglob("*.rs")))
+    return files
+
+
+def rel(path: Path) -> str:
+    return str(path.relative_to(REPO))
+
+
+def main() -> int:
+    rust_files = rust_files_under("src", "tests")
+    contract_locations: dict[str, list[str]] = {}
+    contract_tests: dict[str, list[str]] = {}
+    errors: list[str] = []
+
+    file_texts = [(path, path.read_text(encoding="utf-8")) for path in rust_files]
+
+    for path, text in file_texts:
+        for match in CONTRACT_RE.finditer(text):
+            contract_id = match.group(1)
+            if not VALID_ID_RE.match(contract_id):
+                errors.append(f"{rel(path)}: invalid CONTRACT id {contract_id!r}")
+                continue
+            line = text.count("\n", 0, match.start()) + 1
+            contract_locations.setdefault(contract_id, []).append(f"{rel(path)}:{line}")
+
+    for path, text in file_texts:
+        for match in TEST_RE.finditer(text):
+            test_name = match.group(1)
+            for contract_id in contract_locations:
+                normalized_id = contract_id.lower()
+                if normalized_id in test_name:
+                    line = text.count("\n", 0, match.start()) + 1
+                    contract_tests.setdefault(contract_id, []).append(f"{rel(path)}:{line}")
+
+    for contract_id, locations in sorted(contract_locations.items()):
+        normalized_id = contract_id.lower()
+        matched = contract_tests.get(contract_id, [])
+        if not matched:
+            joined = ", ".join(locations)
+            errors.append(
+                f"{contract_id}: missing contract_ test name containing "
+                f"{normalized_id!r} (marker at {joined})"
+            )
+
+    if not contract_locations:
+        errors.append("no CONTRACT markers found")
+
+    if errors:
+        print("contract check failed:", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        return 1
+
+    print(
+        f"contract check passed: {len(contract_locations)} contract id(s), "
+        f"{sum(len(v) for v in contract_tests.values())} matching test(s)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
