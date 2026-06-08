@@ -156,7 +156,7 @@ run_phase docker_multiarch -- just docker multiarch
 # --- Phase 2 (cont.): docker smokes ---------------------------------------
 run_phase docker_version       -- docker run --rm "$KEI_DOCKER_IMAGE" --version
 run_phase docker_help          -- docker run --rm "$KEI_DOCKER_IMAGE" --help
-run_phase docker_default_cmd   -- bash -c "timeout 8 docker run --rm -e ICLOUD_USERNAME=dummy@example.com $KEI_DOCKER_IMAGE; rc=\$?; [[ \$rc -ne 2 ]]"
+run_phase docker_default_cmd   -- bash -c 'timeout 8 docker run --rm -e ICLOUD_USERNAME=dummy@example.com "$KEI_DOCKER_IMAGE"; rc=$?; [[ $rc -ne 2 ]]'
 
 # --- Phase 3: live cargo --------------------------------------------------
 run_live_phase test_live -- env ICLOUD_TEST_COOKIE_DIR="$ICLOUD_TEST_COOKIE_DIR" just test live

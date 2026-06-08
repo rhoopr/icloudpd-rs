@@ -269,6 +269,49 @@ fn full_test_checks_gnu_linux_userland_before_begin_run() {
 }
 
 #[test]
+fn full_test_docker_smokes_quote_configured_image() {
+    let run_all = repo_file("scripts/full-test/run_all.sh");
+    let shell_suites = repo_file("scripts/full-test/run_shell_suites.sh");
+    let docker_puid = repo_file("scripts/full-test/run_docker_puid_smoke.sh");
+    let shell_lib = repo_file("tests/shell/lib.sh");
+
+    for expected in [
+        r#"export KEI_DOCKER_IMAGE="${KEI_DOCKER_IMAGE:-kei:dev}""#,
+        r#"docker run --rm "$KEI_DOCKER_IMAGE" --version"#,
+        r#"docker run --rm "$KEI_DOCKER_IMAGE" --help"#,
+        r#"bash -c 'timeout 8 docker run --rm -e ICLOUD_USERNAME=dummy@example.com "$KEI_DOCKER_IMAGE"; rc=$?; [[ $rc -ne 2 ]]'"#,
+    ] {
+        assert!(
+            run_all.contains(expected),
+            "full-test docker smokes must use the exported, quoted docker image: {expected}"
+        );
+    }
+
+    assert!(
+        !run_all.contains(" $KEI_DOCKER_IMAGE; rc=\\$?"),
+        "full-test docker_default_cmd must not interpolate the image into the bash -c body unquoted"
+    );
+
+    for expected in [
+        r#"image="${KEI_DOCKER_IMAGE:-kei:dev}""#,
+        r#"KEI_DOCKER_IMAGE="$image""#,
+    ] {
+        assert!(
+            shell_suites.contains(expected),
+            "shell suite runner must pass the selected docker image through: {expected}"
+        );
+    }
+    assert!(
+        docker_puid.contains(r#"image="${KEI_DOCKER_IMAGE:-kei:dev}""#),
+        "docker PUID smoke must use the same KEI_DOCKER_IMAGE default as full-test"
+    );
+    assert!(
+        shell_lib.contains(r#"printf '%s' "${KEI_DOCKER_IMAGE:-kei:latest}""#),
+        "standalone shell tests must keep their documented local default"
+    );
+}
+
+#[test]
 fn local_gate_includes_script_and_workflow_lint_recipes() {
     let justfile = repo_file("justfile");
     let ci = repo_file(".github/workflows/ci.yml");
