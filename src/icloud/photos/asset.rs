@@ -356,6 +356,10 @@ fn validate_download_url(raw: &str) -> Result<(), &'static str> {
         return Err("empty URL");
     }
     let parsed = url::Url::parse(raw).map_err(|_e| "malformed URL")?;
+    #[cfg(test)]
+    if parsed.scheme() == "http" && parsed.host_str().is_some_and(is_test_loopback_host) {
+        return Ok(());
+    }
     if parsed.scheme() != "https" {
         return Err("non-https scheme");
     }
@@ -368,6 +372,11 @@ fn validate_download_url(raw: &str) -> Result<(), &'static str> {
         return Err("host not in Apple CDN allowlist");
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn is_test_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "[::1]" | "localhost")
 }
 
 impl PhotoAsset {
@@ -2403,6 +2412,17 @@ mod tests {
             "https://cvws.icloud-content.com/B/foo",
             "https://cvws.icloud-content.com.cn/B/foo",
             "https://something.cdn-apple.com/resource",
+        ] {
+            assert!(super::validate_download_url(u).is_ok(), "expected ok: {u}");
+        }
+    }
+
+    #[test]
+    fn validate_download_url_accepts_loopback_http_for_offline_tests() {
+        for u in [
+            "http://127.0.0.1:12345/photo.jpg",
+            "http://localhost:12345/photo.jpg",
+            "http://[::1]:12345/photo.jpg",
         ] {
             assert!(super::validate_download_url(u).is_ok(), "expected ok: {u}");
         }

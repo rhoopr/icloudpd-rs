@@ -318,6 +318,18 @@ pub struct StatusArgs {
     pub downloaded: bool,
 }
 
+/// Arguments for local diagnostics.
+#[derive(Parser, Debug, Clone)]
+pub struct DoctorArgs {
+    /// Emit a redacted JSON diagnostics report
+    #[arg(long)]
+    pub json: bool,
+
+    /// Include live iCloud checks. The default doctor run is local-only.
+    #[arg(long)]
+    pub live: bool,
+}
+
 /// Arguments for the import-existing command.
 #[derive(Parser, Debug, Clone)]
 pub struct ImportArgs {
@@ -585,6 +597,9 @@ pub enum Command {
     /// Show sync status and database summary
     Status(StatusArgs),
 
+    /// Run redacted local diagnostics for support
+    Doctor(DoctorArgs),
+
     /// Import existing local files into the state database
     ImportExisting(ImportArgs),
 
@@ -847,6 +862,7 @@ fn subcommand_display_name(cmd: &Command) -> &'static str {
         Command::Reset { .. } => "reset",
         Command::Config { .. } => "config",
         Command::Status(_) => "status",
+        Command::Doctor(_) => "doctor",
         Command::ImportExisting(_) => "import-existing",
         Command::Verify(_) => "verify",
         Command::Reconcile(_) => "reconcile",
@@ -1080,6 +1096,7 @@ impl Command {
             Self::Reset { .. }
             | Self::Config { .. }
             | Self::Status(_)
+            | Self::Doctor(_)
             | Self::Verify(_)
             | Self::Reconcile(_)
             | Self::Install(_)

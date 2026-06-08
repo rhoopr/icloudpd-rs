@@ -27,6 +27,7 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "reset",
     "config",
     "status",
+    "doctor",
     "import-existing",
     "verify",
 ];
@@ -141,6 +142,117 @@ fn status_help_succeeds() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--failed"));
+}
+
+#[test]
+fn doctor_help_succeeds() {
+    common::cmd()
+        .args(["doctor", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("--live"));
+}
+
+#[test]
+fn doctor_json_uses_local_config_paths_and_redacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let photos = dir.path().join("photos-doctor-secret@example.com");
+    let data = dir.path().join("data-doctor-secret@example.com");
+    std::fs::create_dir_all(&photos).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let report = dir.path().join("report-doctor-secret@example.com.json");
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "data_dir = {:?}\n\
+             [auth]\n\
+             username = \"doctor-secret@example.com\"\n\
+             [download]\n\
+             directory = {:?}\n\
+             [report]\n\
+             json = {:?}\n",
+            data, photos, report
+        ),
+    )
+    .unwrap();
+
+    let output = common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args(["doctor", "--json", "--config", config.to_str().unwrap()])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("doctor-secret@example.com"),
+        "doctor JSON should redact configured identifiers, stdout:\n{stdout}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["config_path"], config.to_string_lossy().as_ref());
+    assert_eq!(report["checks"][0]["name"], "config_parse");
+    assert_eq!(report["checks"][0]["status"], "ok");
+    let checks = report["checks"].as_array().unwrap();
+    for expected in [
+        "config_parse",
+        "download_dir",
+        "state_db",
+        "session",
+        "health",
+        "report",
+    ] {
+        assert!(
+            checks.iter().any(|check| check["name"] == expected),
+            "doctor JSON missing `{expected}` check: {report:#}"
+        );
+    }
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["name"] == "download_dir" && check["status"] == "ok"),
+        "doctor should probe configured download directory: {report:#}"
+    );
+}
+
+#[test]
+fn doctor_invalid_config_reports_redacted_json_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("invalid.toml");
+    std::fs::write(
+        &config,
+        "[auth]\nusername = \"invalid-doctor@example.com\"\npassword = \"plain-secret\"\nbroken = [\n",
+    )
+    .unwrap();
+
+    let output = common::cmd()
+        .env_remove("ICLOUD_USERNAME")
+        .env_remove("ICLOUD_PASSWORD")
+        .args(["doctor", "--json", "--config", config.to_str().unwrap()])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("invalid-doctor@example.com") && !stdout.contains("plain-secret"),
+        "doctor JSON should redact invalid config snippets, stdout:\n{stdout}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| { check["name"] == "config_parse" && check["status"] == "error" }),
+        "doctor should keep config parse failures in the report: {report:#}"
+    );
 }
 
 #[test]

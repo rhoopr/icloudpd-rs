@@ -507,8 +507,8 @@ fn make_provider_from_auth(
 }
 
 use commands::{
-    run_config_show, run_import_existing, run_list, run_login, run_password, run_reconcile,
-    run_reset_state, run_reset_sync_token, run_status, run_verify,
+    run_config_show, run_doctor, run_import_existing, run_list, run_login, run_password,
+    run_reconcile, run_reset_state, run_reset_sync_token, run_status, run_verify,
 };
 
 /// Get the database path for a given auth config, merging with TOML defaults.
@@ -707,7 +707,13 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let can_auto_create =
         !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
-    let mut toml_config = config::load_toml_config(&config_path, config_required)?;
+    let is_doctor_command = matches!(cli.command, Some(cli::Command::Doctor(_)));
+    let (mut toml_config, toml_config_error) =
+        match config::load_toml_config(&config_path, config_required) {
+            Ok(config) => (config, None),
+            Err(e) if is_doctor_command => (None, Some(e.to_string())),
+            Err(e) => return Err(e),
+        };
 
     // Resolve log level: --log-level > --verbose > TOML > default (info).
     // `--verbose` is a friendlier alias for `--log-level info` and is
@@ -828,6 +834,16 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let (is_one_shot, pw, sync) = match command {
         Command::Status(args) => {
             return run_status(args, &globals, toml_config.as_ref()).await;
+        }
+        Command::Doctor(args) => {
+            return run_doctor(
+                args,
+                &globals,
+                toml_config.as_ref(),
+                &config_path,
+                toml_config_error,
+            )
+            .await;
         }
         Command::Reset { what } => match what {
             cli::ResetCommand::State { yes } => {

@@ -1,4 +1,5 @@
 mod config_cmd;
+mod doctor;
 mod import;
 mod list;
 mod login;
@@ -10,6 +11,7 @@ mod status;
 mod verify;
 
 pub(crate) use config_cmd::run_config_show;
+pub(crate) use doctor::run_doctor;
 pub(crate) use import::run_import_existing;
 pub(crate) use list::run_list;
 pub(crate) use login::run_login;
