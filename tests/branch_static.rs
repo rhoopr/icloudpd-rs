@@ -493,6 +493,50 @@ fn bug_report_template_requires_web_access_and_redaction() {
 }
 
 #[test]
+fn loopback_bound_tests_keep_explicit_skip_gate() {
+    let helper = repo_file("src/test_helpers.rs");
+    let metrics = repo_file("src/metrics.rs");
+    let readme = repo_file("tests/README.md");
+
+    for expected in [
+        "loopback bind is not permitted on this host",
+        "pub(crate) fn skip_if_loopback_bind_blocked",
+        "pub(crate) async fn start_wiremock_or_skip",
+        "macro_rules! start_wiremock_or_skip",
+        "None => return",
+    ] {
+        assert!(
+            helper.contains(expected),
+            "loopback test helper must keep explicit skip support: {expected}"
+        );
+    }
+
+    for expected in [
+        "spawn_server_with_staleness_threshold_does_not_panic_inside_runtime",
+        "spawn_server_serves_metrics_and_healthz_over_http",
+        "skip_if_loopback_bind_blocked",
+    ] {
+        assert!(
+            metrics.contains(expected),
+            "metrics HTTP tests must remain covered by the loopback skip gate: {expected}"
+        );
+    }
+
+    for expected in [
+        "Some offline unit tests bind `127.0.0.1`",
+        "Normal CI hosts still run the",
+        "tests strictly; restricted sandboxes",
+        "explicit skip line instead of a",
+        "false bind failure",
+    ] {
+        assert!(
+            readme.contains(expected),
+            "tests/README.md must document loopback skip semantics: {expected}"
+        );
+    }
+}
+
+#[test]
 fn audit_ignores_carry_removal_triggers() {
     let audit = repo_file(".cargo/audit.toml");
 
