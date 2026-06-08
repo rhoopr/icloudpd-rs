@@ -270,6 +270,55 @@ fn service_smoke_path_filters_cover_shared_dispatch() {
 }
 
 #[test]
+fn contributor_docs_match_current_gate() {
+    let contributing = repo_file("CONTRIBUTING.md");
+    let pr_template = repo_file(".github/pull_request_template.md");
+
+    for expected in [
+        "cargo fmt --all --check",
+        "cargo clippy --all-targets --all-features -- -D warnings",
+        "cargo clippy --all-targets --no-default-features -- -D warnings",
+        "cargo test --all-features",
+        "cargo test --no-default-features",
+        "RUSTDOCFLAGS=\"-Dwarnings\" cargo doc --no-deps --all-features",
+        "cargo audit --deny warnings",
+        "python3 .github/scripts/check_workflow_hardening.py",
+        "scripts/check-contracts",
+        "bash scripts/check-roundtrip-gate.sh",
+    ] {
+        assert!(
+            contributing.contains(expected),
+            "CONTRIBUTING.md must document current gate command: {expected}"
+        );
+    }
+
+    assert!(
+        pr_template.contains("`just gate` passes"),
+        "PR template should ask reviewers for the current local gate"
+    );
+    assert!(
+        !pr_template.contains("cargo test --bin kei --test cli --test behavioral"),
+        "PR template must not keep stale partial test command"
+    );
+}
+
+#[test]
+fn bug_report_template_requires_web_access_and_redaction() {
+    let bug = repo_file(".github/ISSUE_TEMPLATE/bug_report.yml");
+
+    for expected in [
+        "I have confirmed that ADP is disabled",
+        "required: true",
+        "Redact Apple IDs, passwords, session cookies, bearer tokens, webhook URLs",
+    ] {
+        assert!(
+            bug.contains(expected),
+            "bug report template must keep triage and redaction guidance: {expected}"
+        );
+    }
+}
+
+#[test]
 fn live_test_recipe_forces_all_features_after_nodefault_phase() {
     let justfile = repo_file("justfile");
     let live_case = justfile

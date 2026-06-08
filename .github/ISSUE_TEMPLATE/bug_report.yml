@@ -11,8 +11,10 @@ body:
     id: adp-check
     attributes:
       label: Advanced Data Protection
+      description: kei's iCloud web session needs iCloud.com Photos access. Bugs that only reproduce with web access disabled are not actionable here.
       options:
         - label: I have confirmed that ADP is disabled and "Access iCloud Data on the Web" is enabled
+          required: true
 
   - type: textarea
     id: observed
@@ -73,6 +75,6 @@ body:
     id: additional-context
     attributes:
       label: Additional context
-      description: Logs, screenshots, links to your config, or anything else relevant.
+      description: Logs, screenshots, config snippets, or links. Redact Apple IDs, passwords, session cookies, bearer tokens, webhook URLs, and local paths you do not want public.
     validations:
       required: false

@@ -8,6 +8,6 @@
 
 ## Checklist
 
-- [ ] `cargo fmt -- --check` passes
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` passes
-- [ ] `cargo test --bin kei --test cli --test behavioral` passes
+- [ ] `just gate` passes, or the unchecked item is explained in the test plan
+- [ ] Behavior changes include focused tests
+- [ ] CLI, docs, workflow, Docker, systemd, or Homebrew surface changes were checked against their matching files
