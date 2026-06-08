@@ -485,9 +485,7 @@ fn stored_path_matches_current_collision_family(
         return false;
     }
 
-    let Some(current_filename) = derived.path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
+    let current_filename = derived.filename.as_str();
     let Some(stored_filename) = stored_path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -526,8 +524,9 @@ fn state_confirmed_current_path_exists(
 ) -> Option<PathBuf> {
     let stored_path =
         ctx.downloaded_local_path(&task.library, &task.asset_id, task.version_size)?;
+    let derived_paths = derive_expected_paths(asset, config);
 
-    for derived in derive_expected_paths(asset, config) {
+    for derived in &derived_paths {
         if derived.version_size != task.version_size {
             continue;
         }
@@ -550,11 +549,11 @@ fn state_confirmed_current_path_exists(
         }
     }
 
-    for derived in derive_expected_paths(asset, config) {
+    for derived in &derived_paths {
         if derived.version_size != task.version_size {
             continue;
         }
-        if !stored_path_matches_current_collision_family(asset.id(), &derived, stored_path) {
+        if !stored_path_matches_current_collision_family(asset.id(), derived, stored_path) {
             continue;
         }
         let (existing_path, existing_size) = task_planner.existing_path_with_size(stored_path)?;
