@@ -491,6 +491,7 @@ jobs:
       - fmt
       - roundtrip
       - clippy
+      - test_no_default
       - test
       - docs
       - unused-deps

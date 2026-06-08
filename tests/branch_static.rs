@@ -122,6 +122,24 @@ fn full_test_routes_child_tempdirs_to_tmp_codex() {
 }
 
 #[test]
+fn aggregate_ci_depends_on_no_default_feature_gate() {
+    let ci = repo_file(".github/workflows/ci.yml");
+    assert!(
+        ci.contains("  test_no_default:\n"),
+        "CI workflow must keep the no-default-features job"
+    );
+
+    let aggregate = ci
+        .split_once("  ci:\n")
+        .map(|(_, tail)| tail)
+        .expect("CI aggregate job must exist");
+    assert!(
+        aggregate.contains("      - test_no_default\n"),
+        "aggregate CI job must require test_no_default so branch protection sees no-default failures"
+    );
+}
+
+#[test]
 fn live_test_recipe_forces_all_features_after_nodefault_phase() {
     let justfile = repo_file("justfile");
     let live_case = justfile
