@@ -131,6 +131,14 @@ repo's maintainer setup. Override in your environment to point at your
 own account. Cookie dir falls through to the harness default
 (`./.test-cookies`); set `ICLOUD_TEST_COOKIE_DIR` to override.
 
+### Loopback-bound tests
+
+Some offline unit tests bind `127.0.0.1` for wiremock or the metrics HTTP
+server. Those tests probe loopback binding first and return early only when the
+host rejects the bind with a permission error. Normal CI hosts still run the
+tests strictly; restricted sandboxes get an explicit skip line instead of a
+false bind failure.
+
 ### Cross-zone album fixture
 
 `just full-test` skips cross-zone album hydration by default. To enable it,

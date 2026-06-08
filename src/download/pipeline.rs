@@ -4346,9 +4346,9 @@ mod tests {
     async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
         use base64::Engine as _;
         use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let body = b"not media bytes";
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
@@ -4425,9 +4425,9 @@ mod tests {
     async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
         use base64::Engine as _;
         use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, ResponseTemplate};
 
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
         Mock::given(method("GET"))
             .respond_with(

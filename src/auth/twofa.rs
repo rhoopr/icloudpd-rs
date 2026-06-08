@@ -871,7 +871,7 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_push_retries_on_503_then_succeeds() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("PUT"))
             .and(path("/appleauth/auth/verify/trusteddevice/securitycode"))
             .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
@@ -893,7 +893,7 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_push_retries_on_429_with_retry_after_succeeds() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("PUT"))
             .and(path("/appleauth/auth/verify/trusteddevice/securitycode"))
             .respond_with(
@@ -922,7 +922,7 @@ mod tests {
 
     #[tokio::test]
     async fn trigger_push_persistent_429_returns_typed_api_error() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("PUT"))
             .and(path("/appleauth/auth/verify/trusteddevice/securitycode"))
             .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
@@ -950,7 +950,7 @@ mod tests {
     #[tokio::test]
     async fn trigger_push_non_transient_4xx_bails_without_retry() {
         // 400 is not a transient auth status, so no retries should happen.
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("PUT"))
             .and(path("/appleauth/auth/verify/trusteddevice/securitycode"))
             .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
@@ -978,7 +978,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_2fa_code_retries_on_503_then_succeeds() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(path("/appleauth/auth/verify/trusteddevice/securitycode"))
             .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
@@ -1010,7 +1010,7 @@ mod tests {
     async fn submit_2fa_code_wrong_code_response_does_not_retry() {
         // -21669 is Apple's "wrong code" sentinel. It lives in a 4xx body,
         // but the caller returns Ok(false) rather than retrying.
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(path("/appleauth/auth/verify/trusteddevice/securitycode"))
             .respond_with(
@@ -1073,7 +1073,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_2fa_code_persistent_503_returns_typed_api_error() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(path("/appleauth/auth/verify/trusteddevice/securitycode"))
             .respond_with(ResponseTemplate::new(503).set_body_string("down"))

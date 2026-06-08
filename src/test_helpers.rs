@@ -13,6 +13,65 @@ use crate::icloud::photos::session::PhotosSession;
 use crate::icloud::photos::PhotoAsset;
 use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey};
 
+#[cfg(test)]
+fn loopback_bind_unavailable_reason() -> Option<String> {
+    static RESULT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+            match std::net::TcpListener::bind(addr) {
+                Ok(listener) => {
+                    drop(listener);
+                    None
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::PermissionDenied
+                        || e.raw_os_error() == Some(1) =>
+                {
+                    Some(format!("loopback bind is not permitted on this host: {e}"))
+                }
+                Err(e) => panic!("loopback bind probe failed unexpectedly: {e}"),
+            }
+        })
+        .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn skip_if_loopback_bind_blocked(test_name: &str) -> bool {
+    if let Some(reason) = loopback_bind_unavailable_reason() {
+        eprintln!("skipping {test_name}: {reason}");
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn start_wiremock_or_skip(test_name: &str) -> Option<wiremock::MockServer> {
+    if skip_if_loopback_bind_blocked(test_name) {
+        None
+    } else {
+        Some(wiremock::MockServer::start().await)
+    }
+}
+
+#[cfg(test)]
+#[macro_export]
+macro_rules! start_wiremock_or_skip {
+    () => {{
+        match $crate::test_helpers::start_wiremock_or_skip(module_path!()).await {
+            Some(server) => server,
+            None => return,
+        }
+    }};
+    ($test_name:expr) => {{
+        match $crate::test_helpers::start_wiremock_or_skip($test_name).await {
+            Some(server) => server,
+            None => return,
+        }
+    }};
+}
+
 // ── Tracing capture helper ─────────────────────────────────────────
 
 #[cfg(test)]

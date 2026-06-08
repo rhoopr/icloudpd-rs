@@ -1656,7 +1656,7 @@ mod wiremock_tests {
     #[tokio::test]
     async fn diagnostic_stream_round_trip() {
         use futures_util::StreamExt;
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("D1", "IMG_DIAG.JPG", "public.jpeg").orig(
             1234,
             "ck_d1",
@@ -1688,7 +1688,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn matches_single_jpeg_with_default_policy() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("A1", "IMG_0001.JPG", "public.jpeg").orig(
             1234,
             "ck_a1",
@@ -1715,7 +1715,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn unmatched_when_size_differs() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("A2", "IMG_0002.JPG", "public.jpeg").orig(
             5000,
             "ck_a2",
@@ -1742,7 +1742,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn unmatched_when_file_missing() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("A3", "IMG_0003.JPG", "public.jpeg");
         let tmp = TempDir::new().unwrap();
         let dl = tmp.path().join("photos");
@@ -1761,7 +1761,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn name_id7_filename_is_matched() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("REC123", "IMG_4726.HEIC", "public.heic").orig(
             2345,
             "ck_rec123",
@@ -1797,7 +1797,7 @@ mod wiremock_tests {
     /// the inverse of PR #294 (silently matching the wrong layout).
     #[tokio::test]
     async fn default_policy_does_not_match_name_id7_layout() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("REC456", "IMG_5000.HEIC", "public.heic").orig(
             2000,
             "ck_rec456",
@@ -1830,7 +1830,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn live_photo_both_matches_image_and_mov() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("LIVE1", "IMG_0100.HEIC", "public.heic")
             .orig(3000, "ck_live1", "public.heic")
             .live_mov(2000, "ck_live1_mov");
@@ -1861,7 +1861,7 @@ mod wiremock_tests {
     /// nor unmatched moves and no DB rows are written.
     #[tokio::test]
     async fn live_photo_skip_drops_image_and_mov() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("LIVE2", "IMG_0200.HEIC", "public.heic")
             .orig(3000, "ck_live2", "public.heic")
             .live_mov(2000, "ck_live2_mov");
@@ -1898,7 +1898,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn live_photo_video_only_drops_image() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("LIVE3", "IMG_0300.HEIC", "public.heic")
             .orig(3000, "ck_live3", "public.heic")
             .live_mov(2000, "ck_live3_mov");
@@ -1920,7 +1920,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn live_photo_mov_filename_policy_original_preserves_base_name() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("LIVE4", "IMG_0400.HEIC", "public.heic")
             .orig(3000, "ck_live4", "public.heic")
             .live_mov(2000, "ck_live4_mov");
@@ -1949,7 +1949,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn live_photo_mov_filename_policy_suffix_appends_hevc() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("LIVE5", "IMG_0500.HEIC", "public.heic")
             .orig(3000, "ck_live5", "public.heic")
             .live_mov(2000, "ck_live5_mov");
@@ -1982,7 +1982,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn dry_run_counts_matches_without_writing_db() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("DRY1", "IMG_0001.JPG", "public.jpeg").orig(
             1000,
             "ck_dry1",
@@ -2006,7 +2006,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn same_name_same_size_different_content_adopts_without_strict() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("STRICT1", "IMG_0001.JPG", "public.jpeg").orig(
             4,
             "ck_s1",
@@ -2030,7 +2030,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn same_name_same_size_different_content_refuses_with_strict() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("STRICT2", "IMG_0002.JPG", "public.jpeg").orig(
             4,
             "ck_s2",
@@ -2065,7 +2065,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn dry_run_strict_reports_refusal_without_writing_db() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("STRICT3", "IMG_0003.JPG", "public.jpeg").orig(
             4,
             "ck_s3",
@@ -2100,7 +2100,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn http_strict_prefix_verifier_fetches_range_and_accepts_match() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(wm_method("GET"))
             .and(wm_path("/asset"))
             .and(header("Range", "bytes=0-3"))
@@ -2128,8 +2128,8 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn idempotent_re_run_keeps_db_consistent() {
-        let server1 = MockServer::start().await;
-        let server2 = MockServer::start().await;
+        let server1 = crate::start_wiremock_or_skip!();
+        let server2 = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("IDEM1", "IMG_0001.JPG", "public.jpeg").orig(
             1000,
             "ck_idem1",
@@ -2167,7 +2167,7 @@ mod wiremock_tests {
     async fn force_resolution_unchecked_falls_back_when_size_missing() {
         // Asset has only Original; user requests Medium with force_resolution=false
         // (the default fallback policy: pick what exists).
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("FS1", "IMG_0001.JPG", "public.jpeg").orig(
             1000,
             "ck_fs1",
@@ -2191,7 +2191,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn force_resolution_strict_skips_when_size_missing() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("FS2", "IMG_0002.JPG", "public.jpeg").orig(
             1000,
             "ck_fs2",
@@ -2219,7 +2219,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn matches_multiple_assets_in_one_page() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let assets: Vec<WiremockAsset> = (0_u64..5)
             .map(|i| {
                 let rec = format!("M{i}");
@@ -2248,7 +2248,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn flat_folder_structure_no_date_subdirs() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("FLAT1", "IMG_FLAT.JPG", "public.jpeg").orig(
             500,
             "ck_flat1",
@@ -2280,7 +2280,7 @@ mod wiremock_tests {
     /// matching what a user who wants "the actual original RAW" expects.
     #[tokio::test]
     async fn raw_policy_prefer_raw_swaps_to_raw() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("RAW1", "IMG_RAW.JPG", "public.jpeg")
             .orig(2000, "ck_raw1_jpg", "public.jpeg")
             .alt(8000, "ck_raw1_dng", "com.adobe.raw-image");
@@ -2309,7 +2309,7 @@ mod wiremock_tests {
     /// JPEG as primary even though a RAW alternative exists.
     #[tokio::test]
     async fn raw_policy_unchanged_keeps_jpeg_primary() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("RAW2", "IMG_RAW2.JPG", "public.jpeg")
             .orig(2000, "ck_raw2_jpg", "public.jpeg")
             .alt(8000, "ck_raw2_dng", "com.adobe.raw-image");
@@ -2334,7 +2334,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn keep_unicode_preserves_non_ascii_filename() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("UNI1", "Café_München.JPG", "public.jpeg").orig(
             800,
             "ck_uni1",
@@ -2361,7 +2361,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn strip_unicode_drops_non_ascii_filename() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("UNI2", "Café_München.JPG", "public.jpeg").orig(
             800,
             "ck_uni2",
@@ -2397,7 +2397,7 @@ mod wiremock_tests {
     /// becomes 1 and `unmatched` stays 0, failing this test loudly.
     #[tokio::test]
     async fn skip_videos_excludes_movie_assets() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let tmp = TempDir::new().unwrap();
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
@@ -2459,7 +2459,7 @@ mod wiremock_tests {
     async fn no_orphan_pending_row_when_compute_sha256_fails() {
         use std::os::unix::fs::PermissionsExt;
 
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("HASHFAIL", "IMG_HF.JPG", "public.jpeg").orig(
             1234,
             "ck_hf",
@@ -2518,7 +2518,7 @@ mod wiremock_tests {
     /// shape but explicit about why.
     #[tokio::test]
     async fn live_photo_skip_emits_no_path_end_to_end() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let live = WiremockAsset::new("SKIPLIVE", "IMG_SL.HEIC", "public.heic")
             .orig(1000, "ck_sl", "public.heic")
             .live_mov(2000, "ck_sl_mov");
@@ -2565,7 +2565,7 @@ mod wiremock_tests {
     /// this test fails with `matched=1` instead of `matched=0`.
     #[tokio::test]
     async fn is_asset_filtered_blocks_excluded_asset_id() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("EXCL1", "IMG_EX.JPG", "public.jpeg").orig(
             1000,
             "ck_excl1",
@@ -2618,7 +2618,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn skip_photos_excludes_still_assets() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("STILL1", "IMG_S1.JPG", "public.jpeg").orig(
             1000,
             "ck_still1",
@@ -2645,7 +2645,7 @@ mod wiremock_tests {
         // skip_created_before set to mid-2025 drops anything older.
         // The default WiremockAsset asset_date is Jan 14 2025, before
         // the cutoff.
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("OLD1", "IMG_OLD.JPG", "public.jpeg").orig(
             1000,
             "ck_old1",
@@ -2673,7 +2673,7 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn filename_exclude_glob_drops_matching_assets() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("BLOCK1", "IMG_BLOCK.JPG", "public.jpeg").orig(
             1000,
             "ck_block1",
@@ -2717,7 +2717,7 @@ mod wiremock_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn symlink_to_real_file_at_expected_path_matches() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("SYM1", "IMG_SYM.JPG", "public.jpeg").orig(
             1234,
             "ck_sym1",
@@ -2758,7 +2758,7 @@ mod wiremock_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn broken_symlink_at_expected_path_does_not_match() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("BROKEN1", "IMG_BR.JPG", "public.jpeg").orig(
             500,
             "ck_br1",
@@ -2801,7 +2801,7 @@ mod wiremock_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn hardlinked_file_at_expected_path_matches() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("HARD1", "IMG_H1.JPG", "public.jpeg").orig(
             900,
             "ck_h1",
@@ -2841,7 +2841,7 @@ mod wiremock_tests {
     async fn permission_denied_subdir_does_not_abort_scan() {
         use std::os::unix::fs::PermissionsExt;
 
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let blocked = WiremockAsset::new("DENIED1", "IMG_D.JPG", "public.jpeg").orig(
             1000,
             "ck_denied1",
@@ -3036,7 +3036,7 @@ mod wiremock_tests {
             "public.jpeg",
         );
 
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(wm_method("POST"))
             .and(wm_path("/records/query"))
             .respond_with(ScriptedPagesThenError {
@@ -3101,7 +3101,7 @@ mod wiremock_tests {
     /// the U+202F in the expected path; otherwise `remove_unicode_chars`
     /// would strip it before the AM/PM probe could fire.
     async fn assert_ampm_variant_adopted(icloud: &str, on_disk_filename: &str) {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("AMPM_TEST", icloud, "public.png").orig(
             4096,
             "ck_ampm_test",
@@ -3171,7 +3171,7 @@ mod wiremock_tests {
     async fn import_emits_scan_started_marker_with_library_label() {
         let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let tmp = TempDir::new().expect("tempdir");
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("S1", "IMG_SCAN.JPG", "public.jpeg").orig(
             512,
             "ck_s1",
@@ -3223,7 +3223,7 @@ mod wiremock_tests {
     #[tracing_test::traced_test]
     async fn import_skips_scan_started_marker_when_stream_empty() {
         let tmp = TempDir::new().expect("tempdir");
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         stub_records_query(&server, &[]).await;
         let album = album_pointed_at(&server);
         let (stream, panic_rx) = album.photo_stream(None, None, 1);
@@ -3261,7 +3261,7 @@ mod wiremock_tests {
     /// re-pays the SHA-256 cost on every already-imported file (#347).
     #[tokio::test]
     async fn second_pass_skips_rehash_on_unchanged_files() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("REHASH1", "IMG_REH1.JPG", "public.jpeg").orig(
             2048,
             "ck_reh1",
@@ -3306,7 +3306,7 @@ mod wiremock_tests {
     /// content change goes undetected forever once the row is adopted.
     #[tokio::test]
     async fn second_pass_rehashes_when_file_mtime_changes() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         let asset = WiremockAsset::new("REHASH2", "IMG_REH2.JPG", "public.jpeg").orig(
             2048,
             "ck_reh2",

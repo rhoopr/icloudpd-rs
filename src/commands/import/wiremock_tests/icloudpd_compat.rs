@@ -102,7 +102,7 @@ fn item_type_for(filename: &str) -> &'static str {
 /// Three plain JPEGs, two days, default flags.
 #[tokio::test]
 async fn default_layout_skip_existing() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -154,7 +154,7 @@ async fn default_layout_skip_existing() {
 /// state.
 #[tokio::test]
 async fn dedup_size_suffix_collision() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -199,7 +199,7 @@ async fn dedup_size_suffix_collision() {
 /// `apply_name_id7` will encode to the same 7 chars.
 #[tokio::test]
 async fn name_id7_default_layout() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -254,7 +254,7 @@ async fn name_id7_default_layout() {
 /// in the same date folder. Mirrors test_download_live_photos.py.
 #[tokio::test]
 async fn live_photo_default_layout() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -303,7 +303,7 @@ async fn live_photo_default_layout() {
 async fn live_photo_name_id7_layout() {
     use crate::download::paths::apply_name_id7;
 
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -340,7 +340,7 @@ async fn live_photo_name_id7_layout() {
 /// live-photo pairing. Default flags.
 #[tokio::test]
 async fn video_default_layout() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -381,7 +381,7 @@ async fn video_default_layout() {
 /// Mirrors test_folder_structure.py's `none` case.
 #[tokio::test]
 async fn folder_structure_none_flat_layout() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -415,7 +415,7 @@ async fn folder_structure_none_flat_layout() {
 /// `--folder-structure {:%Y}` (year-only) variant.
 #[tokio::test]
 async fn folder_structure_year_only() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -448,7 +448,7 @@ async fn folder_structure_year_only() {
 /// non-ASCII chars and the relative folder is plain ASCII.
 #[tokio::test]
 async fn non_ascii_parent_directory() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("中文").join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -476,7 +476,7 @@ async fn non_ascii_parent_directory() {
 /// same `{:%Y/%m/%d}/<base>.DNG` shape, just with a different extension.
 #[tokio::test]
 async fn raw_dng_default_layout() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -504,7 +504,7 @@ async fn raw_dng_default_layout() {
 /// Both icloudpd and kei apply the same replacement set.
 #[tokio::test]
 async fn invalid_filename_chars_cleaned() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -540,7 +540,7 @@ async fn invalid_filename_chars_cleaned() {
 /// `IMG_中文_7409.MOV` survive verbatim on disk.
 #[tokio::test]
 async fn keep_unicode_filename_preserves_chars() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -574,7 +574,7 @@ async fn keep_unicode_filename_preserves_chars() {
 /// `chars().filter(char::is_ascii)`. Same observable behavior.
 #[tokio::test]
 async fn strip_unicode_filename_drops_non_ascii() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -605,7 +605,7 @@ async fn strip_unicode_filename_drops_non_ascii() {
 /// path-render is consistent.
 #[tokio::test]
 async fn pre_1970_asset_date() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -636,7 +636,7 @@ async fn pre_1970_asset_date() {
 async fn live_photos_id7_multi_asset() {
     use crate::download::paths::apply_name_id7;
 
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -695,7 +695,7 @@ async fn live_photos_id7_multi_asset() {
 /// starts lowercasing, this test catches it.
 #[tokio::test]
 async fn kei_preserves_uppercase_extension_from_icloud() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();
@@ -790,7 +790,7 @@ async fn kei_uses_fingerprint_filename_when_filename_missing() {
 /// pairing.
 #[tokio::test]
 async fn kei_align_raw_unchanged_keeps_dng_extension() {
-    let server = MockServer::start().await;
+    let server = crate::start_wiremock_or_skip!();
     let tmp = TempDir::new().unwrap();
     let dl = tmp.path().join("photos");
     std::fs::create_dir_all(&dl).unwrap();

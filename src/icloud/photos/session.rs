@@ -1078,7 +1078,7 @@ mod tests {
     // ────────────────────────────────────────────────────────────────
 
     use wiremock::matchers::method as wm_method;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, ResponseTemplate};
 
     /// The FIDO failure mode from issue #221: CloudKit returns 401 with
     /// `"no auth method found"` in the JSON body. A real reqwest client
@@ -1087,7 +1087,12 @@ mod tests {
     /// the security-key hint.
     #[tokio::test]
     async fn wiremock_401_preserves_body_in_http_status_error() {
-        let server = MockServer::start().await;
+        if crate::test_helpers::skip_if_loopback_bind_blocked(
+            "wiremock_401_preserves_body_in_http_status_error",
+        ) {
+            return;
+        }
+        let server = crate::start_wiremock_or_skip!();
         let body = r#"{"serverErrorCode":"AUTHENTICATION_FAILED","reason":"no auth method found"}"#;
         Mock::given(wm_method("POST"))
             .respond_with(ResponseTemplate::new(401).set_body_string(body))
@@ -1123,7 +1128,12 @@ mod tests {
     /// to 401 only.
     #[tokio::test]
     async fn wiremock_5xx_preserves_body_in_http_status_error() {
-        let server = MockServer::start().await;
+        if crate::test_helpers::skip_if_loopback_bind_blocked(
+            "wiremock_5xx_preserves_body_in_http_status_error",
+        ) {
+            return;
+        }
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(wm_method("POST"))
             .respond_with(ResponseTemplate::new(503).set_body_string("service unavailable"))
             .mount(&server)
@@ -1148,7 +1158,10 @@ mod tests {
     /// special-case "" vs absent.
     #[tokio::test]
     async fn wiremock_empty_body_stays_none() {
-        let server = MockServer::start().await;
+        if crate::test_helpers::skip_if_loopback_bind_blocked("wiremock_empty_body_stays_none") {
+            return;
+        }
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(wm_method("POST"))
             .respond_with(ResponseTemplate::new(403)) // no body
             .mount(&server)
@@ -1178,7 +1191,12 @@ mod tests {
     /// response and halt enumeration prematurely.
     #[tokio::test]
     async fn wiremock_200_with_truncated_json_returns_error() {
-        let server = MockServer::start().await;
+        if crate::test_helpers::skip_if_loopback_bind_blocked(
+            "wiremock_200_with_truncated_json_returns_error",
+        ) {
+            return;
+        }
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(wm_method("POST"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_string("{\"records\": [{\"incomplete\""),
@@ -1210,7 +1228,12 @@ mod tests {
     /// from "buffered and trimmed".
     #[tokio::test]
     async fn read_bounded_error_body_caps_at_max_plus_grace() {
-        let server = MockServer::start().await;
+        if crate::test_helpers::skip_if_loopback_bind_blocked(
+            "read_bounded_error_body_caps_at_max_plus_grace",
+        ) {
+            return;
+        }
+        let server = crate::start_wiremock_or_skip!();
         let huge = "x".repeat(64 * 1024);
         Mock::given(wm_method("POST"))
             .respond_with(ResponseTemplate::new(500).set_body_string(&huge))
@@ -1239,7 +1262,12 @@ mod tests {
     /// can't blow up the error path.
     #[tokio::test]
     async fn wiremock_oversized_body_is_truncated() {
-        let server = MockServer::start().await;
+        if crate::test_helpers::skip_if_loopback_bind_blocked(
+            "wiremock_oversized_body_is_truncated",
+        ) {
+            return;
+        }
+        let server = crate::start_wiremock_or_skip!();
         let huge = "x".repeat(MAX_PRESERVED_BODY * 3);
         Mock::given(wm_method("POST"))
             .respond_with(ResponseTemplate::new(500).set_body_string(huge))

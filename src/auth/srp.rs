@@ -1409,7 +1409,7 @@ mod tests {
     /// `FidoNotSupported` error with the key names Apple disclosed.
     #[tokio::test]
     async fn srp_wiremock_fsa_challenge_returns_fido_not_supported() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(wm_path("/appleauth/auth/signin/init"))
             .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
@@ -1461,7 +1461,7 @@ mod tests {
     /// future refactor that over-broadens the detection check.
     #[tokio::test]
     async fn srp_wiremock_ordinary_2fa_passes_through() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(wm_path("/appleauth/auth/signin/init"))
             .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
@@ -1499,7 +1499,7 @@ mod tests {
     /// observed.
     #[tokio::test]
     async fn srp_wiremock_key_names_only_returns_fido_not_supported() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(wm_path("/appleauth/auth/signin/init"))
             .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
@@ -1539,7 +1539,7 @@ mod tests {
     /// "FIDO present".
     #[tokio::test]
     async fn srp_wiremock_unparsable_409_falls_through_to_2fa() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(wm_path("/appleauth/auth/signin/init"))
             .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
