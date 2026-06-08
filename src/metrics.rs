@@ -1133,6 +1133,8 @@ mod tests {
             pending,
             failed,
             downloaded_bytes,
+            active_sync_started: None,
+            active_enumeration_zones: Vec::new(),
             last_sync_completed: None,
             last_sync_started: None,
             last_api_total_at_start: None,

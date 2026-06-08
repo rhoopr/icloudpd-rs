@@ -39,16 +39,29 @@ pub(crate) async fn run_status(
     println!("  Failed:     {}", summary.failed);
     println!();
 
-    if let Some(started) = &summary.last_sync_started {
+    if let Some(started) = &summary.active_sync_started {
+        println!(
+            "Sync in progress:   started {}",
+            started.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+    } else if let Some(started) = &summary.last_sync_started {
         println!(
             "Last sync started:   {}",
             started.format("%Y-%m-%d %H:%M:%S UTC")
         );
     }
-    if let Some(completed) = &summary.last_sync_completed {
+    if summary.active_sync_started.is_none() {
+        if let Some(completed) = &summary.last_sync_completed {
+            println!(
+                "Last sync completed: {}",
+                completed.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+        }
+    }
+    if !summary.active_enumeration_zones.is_empty() {
         println!(
-            "Last sync completed: {}",
-            completed.format("%Y-%m-%d %H:%M:%S UTC")
+            "Full enumeration in progress: {}",
+            summary.active_enumeration_zones.join(", ")
         );
     }
     if let Some(api_total) = summary.last_api_total_at_start {

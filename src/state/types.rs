@@ -478,6 +478,10 @@ pub struct SyncSummary {
     pub failed: u64,
     /// Total size in bytes of downloaded assets.
     pub downloaded_bytes: u64,
+    /// Time of the newest sync run that is still marked running.
+    pub active_sync_started: Option<DateTime<Utc>>,
+    /// Zones with a live or uncleared full-enumeration progress marker.
+    pub active_enumeration_zones: Vec<String>,
     /// Time of the last completed sync run (if any).
     pub last_sync_completed: Option<DateTime<Utc>>,
     /// Time of the last sync run start (if any).

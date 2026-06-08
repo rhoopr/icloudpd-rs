@@ -1327,12 +1327,42 @@ impl SqliteStateDb {
                 None => (None, None, None, false, false, None, None, None),
             };
 
+            let active_sync_started: Option<DateTime<Utc>> = conn
+                .query_row(
+                    "SELECT started_at FROM sync_runs \
+                     WHERE status = 'running' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| StateError::query("get_summary", e))?
+                .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
+
+            let mut enum_stmt = conn
+                .prepare(
+                    "SELECT key FROM metadata \
+                     WHERE key LIKE 'enum_in_progress:%' ORDER BY key",
+                )
+                .map_err(|e| StateError::query("get_summary", e))?;
+            let enum_rows = enum_stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| StateError::query("get_summary", e))?;
+            let mut active_enumeration_zones = Vec::new();
+            for row in enum_rows {
+                let key = row.map_err(|e| StateError::query("get_summary", e))?;
+                if let Some(zone) = key.strip_prefix("enum_in_progress:") {
+                    active_enumeration_zones.push(zone.to_string());
+                }
+            }
+
             Ok(SyncSummary {
                 total_assets,
                 downloaded,
                 pending,
                 failed,
                 downloaded_bytes,
+                active_sync_started,
+                active_enumeration_zones,
                 last_sync_completed,
                 last_sync_started,
                 last_api_total_at_start,
@@ -3969,6 +3999,55 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert!(summary.last_sync_started.is_some());
         assert!(summary.last_sync_completed.is_some());
+    }
+
+    #[tokio::test]
+    async fn summary_tracks_running_sync_even_when_latest_row_completed() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let active_start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let active_run_id = db.start_sync_run_at(active_start).await.unwrap();
+        let completed_run_id = db
+            .start_sync_run_at(Utc.timestamp_opt(1_700_000_030, 0).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            completed_run_id > active_run_id,
+            "completed row must be newest by id for this regression"
+        );
+
+        let stats = SyncRunStats {
+            assets_seen: 1,
+            assets_downloaded: 1,
+            assets_failed: 0,
+            enumeration_errors: 0,
+            interrupted: false,
+            ..Default::default()
+        };
+        db.complete_sync_run(completed_run_id, &stats)
+            .await
+            .unwrap();
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.active_sync_started, Some(active_start));
+        assert!(
+            summary.last_sync_completed.is_some(),
+            "latest completed row should still be available for non-active status"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_lists_full_enumeration_progress_markers() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        db.begin_enum_progress("SharedSync-Z").await.unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(
+            summary.active_enumeration_zones,
+            vec!["PrimarySync", "SharedSync-Z"]
+        );
     }
 
     // ── sync_runs status lifecycle ─────────────────────────────────────────

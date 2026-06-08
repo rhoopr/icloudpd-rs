@@ -1533,6 +1533,74 @@ fn status_shows_partial_api_total() {
 }
 
 #[test]
+fn status_prefers_running_sync_over_newer_completed_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(&conn, "a1", "pending", "photo1.jpg", None, None, None);
+    conn.execute(
+        "INSERT INTO sync_runs (started_at, status) VALUES (?1, 'running')",
+        rusqlite::params![1_700_000_000_i64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sync_runs (started_at, completed_at, status) \
+         VALUES (?1, ?2, 'complete')",
+        rusqlite::params![1_700_000_030_i64, 1_700_000_040_i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Sync in progress:   started 2023-11-14 22:13:20 UTC"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Last sync completed:"),
+        "active status must not imply the whole sync completed: {stdout}"
+    );
+    assert!(stdout.contains("Pending:    1"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_shows_full_enumeration_progress_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(&conn, "a1", "pending", "photo1.jpg", None, None, None);
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+        rusqlite::params!["enum_in_progress:PrimarySync", "1700000000"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Full enumeration in progress: PrimarySync"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("Pending:    1"), "stdout: {stdout}");
+}
+
+#[test]
 fn status_failed_shows_error_messages() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
