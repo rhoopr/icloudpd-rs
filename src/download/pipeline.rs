@@ -490,17 +490,33 @@ fn stored_path_matches_current_collision_family(
         return false;
     };
 
-    if stored_filename == current_filename
-        || stored_filename == super::paths::add_dedup_suffix(current_filename, derived.size)
-        || stored_filename == super::paths::insert_suffix(current_filename, asset_id)
+    if filenames_match_ampm_equivalent(stored_filename, current_filename)
+        || filenames_match_ampm_equivalent(
+            stored_filename,
+            &super::paths::add_dedup_suffix(current_filename, derived.size),
+        )
+        || filenames_match_ampm_equivalent(
+            stored_filename,
+            &super::paths::insert_suffix(current_filename, asset_id),
+        )
     {
         return true;
     }
 
     let Some((current_stem, current_ext)) = current_filename.rsplit_once('.') else {
         let prefix = format!("{current_filename}-{asset_id}-");
-        return stored_filename
+        if stored_filename
             .strip_prefix(&prefix)
+            .is_some_and(|ordinal| ordinal.parse::<u64>().is_ok())
+        {
+            return true;
+        }
+        let normalized_prefix = format!(
+            "{}-{asset_id}-",
+            super::paths::normalize_ampm(current_filename)
+        );
+        return super::paths::normalize_ampm(stored_filename)
+            .strip_prefix(&normalized_prefix)
             .is_some_and(|ordinal| ordinal.parse::<u64>().is_ok());
     };
     let Some((stored_stem, stored_ext)) = stored_filename.rsplit_once('.') else {
@@ -510,9 +526,20 @@ fn stored_path_matches_current_collision_family(
         return false;
     }
     let prefix = format!("{current_stem}-{asset_id}-");
-    stored_stem
+    if stored_stem
         .strip_prefix(&prefix)
         .is_some_and(|ordinal| ordinal.parse::<u64>().is_ok())
+    {
+        return true;
+    }
+    let normalized_prefix = format!("{}-{asset_id}-", super::paths::normalize_ampm(current_stem));
+    super::paths::normalize_ampm(stored_stem)
+        .strip_prefix(&normalized_prefix)
+        .is_some_and(|ordinal| ordinal.parse::<u64>().is_ok())
+}
+
+fn filenames_match_ampm_equivalent(a: &str, b: &str) -> bool {
+    a == b || super::paths::normalize_ampm(a) == super::paths::normalize_ampm(b)
 }
 
 fn state_confirmed_current_path_exists(
@@ -3346,10 +3373,7 @@ pub(super) fn log_sync_summary(title: &str, stats: &super::SyncStats) {
             ));
         }
         if stats.skipped.ampm_variant > 0 {
-            reasons.push(format!(
-                "{} live photo variants",
-                stats.skipped.ampm_variant
-            ));
+            reasons.push(format!("{} AM/PM variants", stats.skipped.ampm_variant));
         }
         if stats.skipped.retry_exhausted > 0 {
             reasons.push(format!(
@@ -5937,6 +5961,17 @@ mod tests {
             .build()
     }
 
+    fn suffixed_ampm_collision_asset(id: &str, checksum: &str) -> PhotoAsset {
+        TestPhotoAsset::new(id)
+            .filename("Screenshot 2025-01-14 at 1.40.01\u{202F}PM.PNG")
+            .item_type("public.png")
+            .orig_file_type("public.png")
+            .orig_size(1234)
+            .orig_url("https://p01.icloud-content.com/Screenshot.PNG")
+            .orig_checksum(checksum)
+            .build()
+    }
+
     /// Regression for #594: a downloaded asset stored at an identity-suffixed
     /// collision path must be matched by its recorded state path, not only by
     /// the bare derived path.
@@ -6005,6 +6040,79 @@ mod tests {
             !identity_suffixed_path_for(&bare_path, "SUFFIXED_B-2").exists(),
             "sync must not create an ordinal duplicate for the same asset"
         );
+        let failed = db.get_failed().await.unwrap();
+        assert!(failed.is_empty(), "suffixed file should remain downloaded");
+    }
+
+    /// Same state-path family as #594, with the AM/PM whitespace variant that
+    /// import-existing and normal on-disk probes already treat as equivalent.
+    #[tokio::test]
+    async fn ampm_variant_suffixed_downloaded_file_is_on_disk_skipped() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.keep_unicode_in_filenames = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let asset = suffixed_ampm_collision_asset("AMPM_SUFFIXED_B", "ck_ampm_suffixed_b");
+        let bare_path = crate::download::filter::expected_paths_for(&asset, &config)
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
+        let regular_space_filename = bare_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("test path must have a UTF-8 filename")
+            .replace('\u{202F}', " ");
+        let regular_space_bare_path = bare_path.with_file_name(regular_space_filename);
+        let suffixed_path = identity_suffixed_path_for(&regular_space_bare_path, asset.id());
+        fs::create_dir_all(bare_path.parent().unwrap()).unwrap();
+        fs::write(&suffixed_path, vec![1u8; 1234]).unwrap();
+
+        let record = crate::test_helpers::TestAssetRecord::new("AMPM_SUFFIXED_B")
+            .checksum("ck_ampm_suffixed_b")
+            .filename("Screenshot 2025-01-14 at 1.40.01\u{202F}PM.PNG")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "AMPM_SUFFIXED_B",
+            "original",
+            &suffixed_path,
+            "local_checksum_for_ampm_suffixed_file",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(result.downloaded, 0, "asset must not be re-downloaded");
+        assert_eq!(
+            result.skip_summary.on_disk, 1,
+            "AM/PM-equivalent suffixed file must count as an on-disk skip"
+        );
+        assert!(result.failed.is_empty());
         let failed = db.get_failed().await.unwrap();
         assert!(failed.is_empty(), "suffixed file should remain downloaded");
     }
