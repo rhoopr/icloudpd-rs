@@ -35,6 +35,7 @@
 # Exit code:
 #   0   no failed phases (skips + rate-limited are not failures)
 #   1   first failed phase exits non-zero immediately
+#   64  unsupported local userland (missing GNU-ish helper behavior)
 #   65  another /full-test run is in progress (begin_run refused)
 
 set -euo pipefail
@@ -62,6 +63,9 @@ cleanup_failed_run() {
   exit "$rc"
 }
 trap cleanup_failed_run EXIT
+
+# --- Userland --------------------------------------------------------------
+"$script_dir/check_userland.sh"
 
 # --- Begin -----------------------------------------------------------------
 run_id=$("$script_dir/begin_run.sh") || exit $?

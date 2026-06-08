@@ -195,6 +195,40 @@ fn full_test_prereqs_report_script_tooling_gaps() {
 }
 
 #[test]
+fn full_test_checks_gnu_linux_userland_before_begin_run() {
+    let run_all = repo_file("scripts/full-test/run_all.sh");
+    let check = repo_file("scripts/full-test/check_userland.sh");
+
+    assert!(
+        run_all.contains(r#""$script_dir/check_userland.sh""#),
+        "full-test must check local userland before mutating run state"
+    );
+    let check_pos = run_all
+        .find(r#""$script_dir/check_userland.sh""#)
+        .expect("userland check must be present");
+    let begin_pos = run_all
+        .find(r#"run_id=$("$script_dir/begin_run.sh")"#)
+        .expect("begin_run call must still exist");
+    assert!(
+        check_pos < begin_pos,
+        "userland check must run before begin_run writes markers"
+    );
+
+    for expected in [
+        "find does not support GNU -printf",
+        "stat does not support GNU -c",
+        "timeout command is present but failed a basic smoke test",
+        "full-test: unsupported local userland",
+        "GNU/Linux userland tools",
+    ] {
+        assert!(
+            check.contains(expected),
+            "userland check must explain unsupported local tooling: {expected}"
+        );
+    }
+}
+
+#[test]
 fn local_gate_includes_script_and_workflow_lint_recipes() {
     let justfile = repo_file("justfile");
     let ci = repo_file(".github/workflows/ci.yml");
