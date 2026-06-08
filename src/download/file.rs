@@ -529,6 +529,7 @@ pub(super) async fn rename_part_to_final(
             Ok(())
         }
         Ok(PublishResult::DestinationExists) => {
+            // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
             // Another task won the race — clean up our .part file.
             tracing::debug!(
                 path = %final_path.display(),
@@ -3434,7 +3435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_part_to_final_destination_already_exists() {
+    async fn contract_file_publish_no_overwrite_destination_already_exists() {
         let dir = TempDir::new().unwrap();
         let part = dir.path().join("photo.part");
         let final_path = dir.path().join("photo.jpg");
