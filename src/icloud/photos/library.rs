@@ -36,6 +36,59 @@ use crate::retry::RetryConfig;
 const ROOT_FOLDER: &str = "----Root-Folder----";
 const PROJECT_ROOT_FOLDER: &str = "----Project-Root-Folder----";
 
+/// Map typed CloudKit initialization failures to the library-level iCloud
+/// contract consumed by sync orchestration.
+fn map_library_init_error(error: &anyhow::Error) -> ICloudError {
+    if let Some(ck) = error.downcast_ref::<crate::icloud::photos::session::CloudKitServerError>() {
+        if ck.service_not_activated {
+            return ICloudError::ServiceNotActivated {
+                code: ck.code.to_string(),
+                reason: ck.reason.to_string(),
+            };
+        }
+    }
+    if let Some(http_err) = error.downcast_ref::<crate::icloud::photos::session::HttpStatusError>()
+    {
+        // HTTP 421: HTTP/2 connection routed to the wrong CloudKit
+        // partition. Caller resets the pool and retries.
+        if http_err.status == 421 {
+            return ICloudError::MisdirectedRequest;
+        }
+        // HTTP 401 / 403 both route through SessionExpired so the sync loop
+        // re-auths. 401 is the classic stale-session signal; 403 has many
+        // causes (rate limits, rotated routing cookies, and ADP edge cases not
+        // caught by `i_cdp_enabled` or by CloudKit body errors handled above).
+        // If the 403 truly is persistent ADP, AUTH_ERROR_THRESHOLD in the
+        // download pipeline stops the sync rather than spamming retries.
+        if http_err.status == 401 || http_err.status == 403 {
+            log_fido_security_key_hint(http_err);
+            return ICloudError::SessionExpired {
+                status: http_err.status,
+            };
+        }
+    }
+    ICloudError::Connection(error.to_string())
+}
+
+fn log_fido_security_key_hint(http_err: &crate::icloud::photos::session::HttpStatusError) {
+    if http_err.status != 401 {
+        return;
+    }
+    let Some(body) = http_err.body.as_deref() else {
+        return;
+    };
+    if body.contains("no auth method found") {
+        tracing::warn!(
+            url = %http_err.url,
+            body = %body,
+            "CloudKit 401 'no auth method found' - usually means \
+             FIDO/WebAuthn security keys are on the account (issue \
+             #221). Remove them at Settings > Apple ID & iCloud > \
+             Sign-In & Security > Security Keys."
+        );
+    }
+}
+
 pub struct PhotoLibrary {
     service_endpoint: Arc<str>,
     params: Arc<HashMap<String, Value>>,
@@ -97,58 +150,7 @@ impl PhotoLibrary {
             &retry_config,
         )
         .await
-        .map_err(|e| {
-            if let Some(ck) = e.downcast_ref::<super::session::CloudKitServerError>() {
-                if ck.service_not_activated {
-                    return ICloudError::ServiceNotActivated {
-                        code: ck.code.to_string(),
-                        reason: ck.reason.to_string(),
-                    };
-                }
-            }
-            if let Some(http_err) = e.downcast_ref::<super::session::HttpStatusError>() {
-                // HTTP 421: HTTP/2 connection routed to the wrong CloudKit
-                // partition. Caller resets the pool and retries.
-                if http_err.status == 421 {
-                    return ICloudError::MisdirectedRequest;
-                }
-                // HTTP 401 / 403 both route through SessionExpired so the sync
-                // loop re-auths. 401 is the classic stale-session signal; 403
-                // has many causes (rate limits, rotated routing cookies, and
-                // ADP edge cases not caught by `i_cdp_enabled` or by the
-                // CloudKit body errors handled above). If the 403 truly is
-                // persistent ADP, AUTH_ERROR_THRESHOLD in the download
-                // pipeline stops the sync rather than spamming retries.
-                if http_err.status == 401 || http_err.status == 403 {
-                    // Defense-in-depth for FIDO/security-key accounts: the
-                    // SRP path detects `fsaChallenge` / `keyNames` up front
-                    // and bails with `AuthError::FidoNotSupported`, but if
-                    // Apple drops those fields in some future flow, the
-                    // failure mode is a CloudKit 401 with "no auth method
-                    // found" in the body. Log the hint so a reporter sees
-                    // it even when kei falls into the re-auth loop. See
-                    // issue #221.
-                    if http_err.status == 401 {
-                        if let Some(body) = http_err.body.as_deref() {
-                            if body.contains("no auth method found") {
-                                tracing::warn!(
-                                    url = %http_err.url,
-                                    body = %body,
-                                    "CloudKit 401 'no auth method found' — usually means \
-                                     FIDO/WebAuthn security keys are on the account (issue \
-                                     #221). Remove them at Settings > Apple ID & iCloud > \
-                                     Sign-In & Security > Security Keys."
-                                );
-                            }
-                        }
-                    }
-                    return ICloudError::SessionExpired {
-                        status: http_err.status,
-                    };
-                }
-            }
-            ICloudError::Connection(e.to_string())
-        })?;
+        .map_err(|e| map_library_init_error(&e))?;
 
         let query: super::cloudkit::QueryResponse =
             serde_json::from_value(response).map_err(|e| ICloudError::Connection(e.to_string()))?;
@@ -424,6 +426,72 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn http_status_error(status: u16) -> anyhow::Error {
+        crate::icloud::photos::session::HttpStatusError {
+            status,
+            url: "https://p60-ckdatabasews.icloud.com/database".into(),
+            retry_after: None,
+            body: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn map_library_init_error_maps_service_not_activated_body() {
+        let err: anyhow::Error = crate::icloud::photos::session::CloudKitServerError {
+            code: "ACCESS_DENIED".into(),
+            reason: "private db access disabled".into(),
+            retryable: false,
+            service_not_activated: true,
+        }
+        .into();
+
+        assert!(
+            matches!(
+                map_library_init_error(&err),
+                ICloudError::ServiceNotActivated { .. }
+            ),
+            "service-not-activated CloudKit body should map to user-facing ADP/setup guidance"
+        );
+    }
+
+    #[test]
+    fn map_library_init_error_maps_421_401_and_403_http_statuses() {
+        assert!(
+            matches!(
+                map_library_init_error(&http_status_error(421)),
+                ICloudError::MisdirectedRequest
+            ),
+            "421 should force the SRP/routing recovery path"
+        );
+        assert!(
+            matches!(
+                map_library_init_error(&http_status_error(401)),
+                ICloudError::SessionExpired { status: 401 }
+            ),
+            "401 should invalidate the cached session"
+        );
+        assert!(
+            matches!(
+                map_library_init_error(&http_status_error(403)),
+                ICloudError::SessionExpired { status: 403 }
+            ),
+            "403 should route through bounded reauth rather than ADP guessing"
+        );
+    }
+
+    #[test]
+    fn map_library_init_error_peers_through_context_wrappers() {
+        let err = http_status_error(421).context("initializing photos library");
+        assert!(
+            matches!(
+                map_library_init_error(&err),
+                ICloudError::MisdirectedRequest
+            ),
+            "context-wrapped 421 should keep the typed mapping"
+        );
+    }
 
     /// Minimal stub that satisfies `PhotosSession` for unit tests.
     struct StubSession;

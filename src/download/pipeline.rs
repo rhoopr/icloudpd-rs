@@ -1766,11 +1766,12 @@ async fn consume_stream_download_tasks(
                 }
             }
             Err(e) => {
-                if is_interrupted_download(&e) {
-                    log_interrupted_download(pb, &task, &e);
-                    continue;
-                } else if let Some(download_err) = e.downcast_ref::<DownloadError>() {
-                    if download_err.is_session_expired() {
+                match classify_download_task_error(&e) {
+                    DownloadTaskErrorClass::Interrupted => {
+                        log_interrupted_download(pb, &task, &e);
+                        continue;
+                    }
+                    DownloadTaskErrorClass::SessionExpired => {
                         auth_errors += 1;
                         pb.suspend(|| {
                             tracing::warn!(
@@ -1789,7 +1790,8 @@ async fn consume_stream_download_tasks(
                             });
                             break;
                         }
-                    } else if download_err.is_expired_url() {
+                    }
+                    DownloadTaskErrorClass::ExpiredUrl => {
                         url_expired_abort = true;
                         pb.suspend(|| {
                             tracing::warn!(
@@ -1801,15 +1803,12 @@ async fn consume_stream_download_tasks(
                         });
                         pipeline_shutdown.cancel();
                         continue;
-                    } else {
+                    }
+                    DownloadTaskErrorClass::Other => {
                         pb.suspend(|| {
                             tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
                         });
                     }
-                } else {
-                    pb.suspend(|| {
-                        tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
-                    });
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) =
@@ -2519,37 +2518,35 @@ pub(super) async fn run_download_pass(
                 }
             }
             Err(e) => {
-                if is_interrupted_download(e) {
-                    log_interrupted_download(&pb, &task, e);
-                    pb.inc(1);
-                    continue;
-                }
-                let is_auth = e
-                    .downcast_ref::<DownloadError>()
-                    .is_some_and(DownloadError::is_session_expired);
-                if is_auth {
-                    auth_errors += 1;
-                    pb.suspend(|| {
-                        tracing::warn!(path = %task.download_path.display(), error = %e, "Auth error");
-                    });
-                } else if e
-                    .downcast_ref::<DownloadError>()
-                    .is_some_and(DownloadError::is_expired_url)
-                {
-                    url_expired_abort = true;
-                    pb.suspend(|| {
-                        tracing::warn!(
-                            asset_id = %task.asset_id,
-                            path = %task.download_path.display(),
-                            error = %e,
-                            "Download URL expired; aborting current URL batch"
-                        );
-                    });
-                    pass_shutdown.cancel();
-                } else {
-                    pb.suspend(|| {
-                        tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
-                    });
+                match classify_download_task_error(e) {
+                    DownloadTaskErrorClass::Interrupted => {
+                        log_interrupted_download(&pb, &task, e);
+                        pb.inc(1);
+                        continue;
+                    }
+                    DownloadTaskErrorClass::SessionExpired => {
+                        auth_errors += 1;
+                        pb.suspend(|| {
+                            tracing::warn!(path = %task.download_path.display(), error = %e, "Auth error");
+                        });
+                    }
+                    DownloadTaskErrorClass::ExpiredUrl => {
+                        url_expired_abort = true;
+                        pb.suspend(|| {
+                            tracing::warn!(
+                                asset_id = %task.asset_id,
+                                path = %task.download_path.display(),
+                                error = %e,
+                                "Download URL expired; aborting current URL batch"
+                            );
+                        });
+                        pass_shutdown.cancel();
+                    }
+                    DownloadTaskErrorClass::Other => {
+                        pb.suspend(|| {
+                            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), error = %e, "Download failed");
+                        });
+                    }
                 }
                 if let Some(db) = &state_db {
                     if let Err(e) =
@@ -2639,10 +2636,34 @@ struct DownloadSingleContext<'a> {
     mode: crate::personality::Mode,
 }
 
-fn is_interrupted_download(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<DownloadError>()
-        .is_some_and(DownloadError::is_interrupted)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadTaskErrorClass {
+    Interrupted,
+    SessionExpired,
+    ExpiredUrl,
+    Other,
+}
+
+/// Classify per-task download errors at the worker orchestration boundary.
+///
+/// The stream and cleanup workers share the same behavioral split: interrupted
+/// downloads are drain-only, session expiry contributes to the reauth abort
+/// threshold, expired CDN URLs abort the current URL batch, and ordinary
+/// failures are recorded on the task. The original error is still propagated
+/// to state/logging unchanged.
+fn classify_download_task_error(error: &anyhow::Error) -> DownloadTaskErrorClass {
+    let Some(download_err) = error.downcast_ref::<DownloadError>() else {
+        return DownloadTaskErrorClass::Other;
+    };
+    if download_err.is_interrupted() {
+        DownloadTaskErrorClass::Interrupted
+    } else if download_err.is_session_expired() {
+        DownloadTaskErrorClass::SessionExpired
+    } else if download_err.is_expired_url() {
+        DownloadTaskErrorClass::ExpiredUrl
+    } else {
+        DownloadTaskErrorClass::Other
+    }
 }
 
 fn log_interrupted_download(pb: &ProgressBar, task: &DownloadTask, error: &anyhow::Error) {
@@ -2990,6 +3011,97 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    fn classify_download_task_error_for(err: DownloadError) -> DownloadTaskErrorClass {
+        let err = anyhow::Error::new(err);
+        classify_download_task_error(&err)
+    }
+
+    #[test]
+    fn classify_download_task_error_detects_interrupted_download() {
+        assert_eq!(
+            classify_download_task_error_for(DownloadError::Interrupted {
+                path: "photo.jpg".into(),
+                bytes_written: 12,
+            }),
+            DownloadTaskErrorClass::Interrupted
+        );
+    }
+
+    #[test]
+    fn classify_download_task_error_detects_session_expiry_and_expired_url() {
+        assert_eq!(
+            classify_download_task_error_for(DownloadError::HttpStatus {
+                status: 401,
+                path: "photo.jpg".into(),
+            }),
+            DownloadTaskErrorClass::SessionExpired
+        );
+        assert_eq!(
+            classify_download_task_error_for(DownloadError::HttpStatus {
+                status: 403,
+                path: "photo.jpg".into(),
+            }),
+            DownloadTaskErrorClass::SessionExpired
+        );
+        assert_eq!(
+            classify_download_task_error_for(DownloadError::HttpStatus {
+                status: 410,
+                path: "photo.jpg".into(),
+            }),
+            DownloadTaskErrorClass::ExpiredUrl
+        );
+    }
+
+    #[test]
+    fn classify_download_task_error_treats_ordinary_errors_as_other() {
+        assert_eq!(
+            classify_download_task_error_for(DownloadError::InvalidContent {
+                path: "photo.jpg".into(),
+                reason: "not a photo".into(),
+            }),
+            DownloadTaskErrorClass::Other
+        );
+
+        let plain = anyhow::anyhow!("plain failure");
+        assert_eq!(
+            classify_download_task_error(&plain),
+            DownloadTaskErrorClass::Other
+        );
+    }
+
+    #[test]
+    fn classify_download_task_error_detects_context_wrapped_download_errors() {
+        let interrupted = anyhow::Error::new(DownloadError::Interrupted {
+            path: "photo.jpg".into(),
+            bytes_written: 12,
+        })
+        .context("worker");
+        assert_eq!(
+            classify_download_task_error(&interrupted),
+            DownloadTaskErrorClass::Interrupted
+        );
+
+        let session_expired = anyhow::Error::new(DownloadError::HttpStatus {
+            status: 403,
+            path: "photo.jpg".into(),
+        })
+        .context("worker");
+        assert_eq!(
+            classify_download_task_error(&session_expired),
+            DownloadTaskErrorClass::SessionExpired
+        );
+
+        let expired_url = anyhow::Error::new(DownloadError::HttpStatus {
+            status: 410,
+            path: "photo.jpg".into(),
+        })
+        .context("worker");
+        assert_eq!(
+            classify_download_task_error(&expired_url),
+            DownloadTaskErrorClass::ExpiredUrl
+        );
+    }
 
     // ── batch_forecast_decision unit tests ─────────────────────────────────
 

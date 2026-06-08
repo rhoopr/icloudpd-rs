@@ -679,6 +679,23 @@ pub async fn authenticate_srp(
 /// After the retry budget is exhausted, the last response is returned as
 /// `Ok`; the caller's status-match sees the lingering 429/5xx and produces
 /// the user-facing `AuthError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SrpPostErrorClass {
+    Network,
+    Other,
+}
+
+fn classify_srp_post_error(error: &anyhow::Error) -> SrpPostErrorClass {
+    let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() else {
+        return SrpPostErrorClass::Other;
+    };
+    if reqwest_error.status().is_none() {
+        SrpPostErrorClass::Network
+    } else {
+        SrpPostErrorClass::Other
+    }
+}
+
 async fn srp_post<F>(
     transport: &mut impl SrpTransport,
     step: &'static str,
@@ -721,10 +738,7 @@ where
             }
             Err(e) => {
                 let is_last = attempt + 1 >= total_attempts;
-                let is_network_error = e
-                    .downcast_ref::<reqwest::Error>()
-                    .is_some_and(|r| r.status().is_none());
-                if is_last || !is_network_error {
+                if is_last || classify_srp_post_error(&e) != SrpPostErrorClass::Network {
                     return Err(e);
                 }
                 let delay = AUTH_RETRY_CONFIG.delay_for_retry(attempt);
@@ -923,6 +937,53 @@ mod tests {
             .unwrap_err()
             .downcast::<AuthError>()
             .expect("typed AuthError")
+    }
+
+    fn reqwest_status_error(status: u16) -> anyhow::Error {
+        let response = http::Response::builder()
+            .status(status)
+            .body(Vec::<u8>::new())
+            .expect("response");
+        reqwest::Response::from(response)
+            .error_for_status()
+            .expect_err("status should be an error")
+            .into()
+    }
+
+    #[tokio::test]
+    async fn classify_srp_post_error_detects_statusless_reqwest_error() {
+        let err: anyhow::Error = reqwest::Client::new()
+            .get("http://")
+            .send()
+            .await
+            .expect_err("invalid URL should produce a statusless reqwest error")
+            .into();
+
+        assert_eq!(classify_srp_post_error(&err), SrpPostErrorClass::Network);
+    }
+
+    #[test]
+    fn classify_srp_post_error_treats_status_and_plain_errors_as_other() {
+        let status = reqwest_status_error(503);
+        assert_eq!(classify_srp_post_error(&status), SrpPostErrorClass::Other);
+
+        let plain = anyhow::anyhow!("plain failure");
+        assert_eq!(classify_srp_post_error(&plain), SrpPostErrorClass::Other);
+    }
+
+    #[test]
+    fn classify_srp_post_error_detects_context_wrapped_network_error() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err: anyhow::Error = rt
+            .block_on(reqwest::Client::new().get("http://").send())
+            .expect_err("invalid URL should produce a statusless reqwest error")
+            .into();
+        let err = err.context("SRP init");
+
+        assert_eq!(classify_srp_post_error(&err), SrpPostErrorClass::Network);
     }
 
     /// 401 at /signin/init is not a bad-password signal — Apple hasn't yet

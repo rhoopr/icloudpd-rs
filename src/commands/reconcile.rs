@@ -1,8 +1,8 @@
-//! `kei reconcile` — reconcile the state database with files on disk.
+//! `kei reconcile` - reconcile the state database with files on disk.
 //!
 //! Scans every asset marked `downloaded` in the state database and checks
-//! that its recorded `local_path` still exists. Missing files are marked
-//! as failed with reason `FILE_MISSING_AT_STARTUP` so the next sync
+//! that its recorded `local_path` still exists and is not shorter than the
+//! provider-reported size. Drifted files are marked as failed so the next sync
 //! re-downloads them.
 //!
 //! This guards against:
@@ -31,39 +31,113 @@ use crate::state::{ReportStateStore, VersionSizeKey};
 
 use super::{print_truncation_tail, LISTING_CAP};
 
-/// Stable sentinel written to `assets.last_error` so monitoring tools can
+/// Stable sentinels written to `assets.last_error` so monitoring tools can
 /// key on the reason a row flipped from downloaded back to failed.
-const FILE_MISSING_REASON: &str = "FILE_MISSING_AT_STARTUP";
+pub(crate) const FILE_MISSING_REASON: &str = "FILE_MISSING_AT_STARTUP";
+pub(crate) const FILE_TRUNCATED_REASON: &str = "FILE_TRUNCATED_AT_STARTUP";
 
 const SCAN_PAGE_SIZE: u32 = 1000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalDriftKind {
+    Missing,
+    Truncated {
+        actual_size: u64,
+        expected_size: u64,
+    },
+}
+
+impl LocalDriftKind {
+    pub(crate) const fn reason(self) -> &'static str {
+        match self {
+            Self::Missing => FILE_MISSING_REASON,
+            Self::Truncated { .. } => FILE_TRUNCATED_REASON,
+        }
+    }
+}
+
 #[derive(Debug)]
-pub(crate) struct MissingAsset {
+pub(crate) struct LocalDriftAsset {
     pub(crate) library: Arc<str>,
     pub(crate) id: Box<str>,
     pub(crate) version_size: VersionSizeKey,
     pub(crate) local_path: PathBuf,
+    pub(crate) kind: LocalDriftKind,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ScanCounts {
     pub(crate) present: u64,
     pub(crate) missing: u64,
+    pub(crate) damaged: u64,
     pub(crate) no_path: u64,
+}
+
+pub(crate) async fn classify_local_drift(
+    asset: state::AssetRecord,
+) -> anyhow::Result<(Option<LocalDriftAsset>, bool)> {
+    let state::AssetRecord {
+        library,
+        id,
+        version_size,
+        local_path,
+        size_bytes,
+        ..
+    } = asset;
+
+    let Some(local_path) = local_path else {
+        return Ok((None, true));
+    };
+
+    let metadata = match tokio::fs::metadata(&local_path).await {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((
+                Some(LocalDriftAsset {
+                    library,
+                    id,
+                    version_size,
+                    local_path,
+                    kind: LocalDriftKind::Missing,
+                }),
+                false,
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let actual_size = metadata.len();
+    if size_bytes > 0 && actual_size < size_bytes {
+        return Ok((
+            Some(LocalDriftAsset {
+                library,
+                id,
+                version_size,
+                local_path,
+                kind: LocalDriftKind::Truncated {
+                    actual_size,
+                    expected_size: size_bytes,
+                },
+            }),
+            false,
+        ));
+    }
+
+    Ok((None, false))
 }
 
 /// Reads every page before any mutation so later `mark_failed` calls can't
 /// shift OFFSET pagination and skip rows.
-pub(crate) async fn scan_missing<D>(
+pub(crate) async fn scan_local_drift<D>(
     db: &D,
-    mut report_missing: impl FnMut(&MissingAsset),
+    mut report_drift: impl FnMut(&LocalDriftAsset),
     mut report_no_path: impl FnMut(&str),
-) -> anyhow::Result<(ScanCounts, Vec<MissingAsset>)>
+) -> anyhow::Result<(ScanCounts, Vec<LocalDriftAsset>)>
 where
     D: ReportStateStore + ?Sized,
 {
     let mut counts = ScanCounts::default();
-    let mut missing = Vec::new();
+    let mut drift = Vec::new();
 
     let mut offset = 0u64;
     loop {
@@ -74,38 +148,27 @@ where
         offset += page.len() as u64;
 
         for asset in page {
-            let crate::state::AssetRecord {
-                library,
-                id,
-                version_size,
-                local_path,
-                ..
-            } = asset;
-
-            let Some(local_path) = local_path else {
+            let id = asset.id.clone();
+            let (record, no_path) = classify_local_drift(asset).await?;
+            if no_path {
                 report_no_path(&id);
                 counts.no_path += 1;
                 continue;
-            };
-
-            if tokio::fs::try_exists(&local_path).await.unwrap_or(false) {
+            }
+            let Some(record) = record else {
                 counts.present += 1;
                 continue;
-            }
-
-            let record = MissingAsset {
-                library,
-                id,
-                version_size,
-                local_path,
             };
-            report_missing(&record);
-            counts.missing += 1;
-            missing.push(record);
+            match record.kind {
+                LocalDriftKind::Missing => counts.missing += 1,
+                LocalDriftKind::Truncated { .. } => counts.damaged += 1,
+            }
+            report_drift(&record);
+            drift.push(record);
         }
     }
 
-    Ok((counts, missing))
+    Ok((counts, drift))
 }
 
 pub(crate) async fn run_reconcile(
@@ -126,7 +189,7 @@ pub(crate) async fn run_reconcile(
 
     if args.dry_run {
         println!(
-            "Reconciling {} downloaded assets (dry run — no changes will be written)...",
+            "Reconciling {} downloaded assets (dry run - no changes will be written)...",
             summary.downloaded
         );
     } else {
@@ -138,16 +201,27 @@ pub(crate) async fn run_reconcile(
     // FnMut + FnMut constraint. Single-threaded; Cell is cheap here.
     let printed: Cell<usize> = Cell::new(0);
 
-    let (counts, missing) = scan_missing(
+    let (counts, drifted) = scan_local_drift(
         &db,
         |m| {
             if printed.get() < LISTING_CAP {
-                println!(
-                    "MISSING: {} ({}, {})",
-                    m.local_path.display(),
-                    m.id,
-                    m.version_size.as_str(),
-                );
+                match m.kind {
+                    LocalDriftKind::Missing => println!(
+                        "MISSING: {} ({}, {})",
+                        m.local_path.display(),
+                        m.id,
+                        m.version_size.as_str(),
+                    ),
+                    LocalDriftKind::Truncated {
+                        actual_size,
+                        expected_size,
+                    } => println!(
+                        "TRUNCATED: {} ({}, {}) - {actual_size} < {expected_size} bytes",
+                        m.local_path.display(),
+                        m.id,
+                        m.version_size.as_str(),
+                    ),
+                }
                 printed.set(printed.get() + 1);
             }
         },
@@ -164,7 +238,7 @@ pub(crate) async fn run_reconcile(
         clippy::cast_possible_truncation,
         reason = "scan counts come from pagination over the state DB; well under usize::MAX on supported targets"
     )]
-    let total_issues = (counts.missing + counts.no_path) as usize;
+    let total_issues = (counts.missing + counts.damaged + counts.no_path) as usize;
     if total_issues > printed.get() {
         println!();
         print_truncation_tail(total_issues, printed.get());
@@ -173,14 +247,9 @@ pub(crate) async fn run_reconcile(
     let mut marked_failed = 0u64;
     let mut mark_errors = 0u64;
     if !args.dry_run {
-        for m in &missing {
+        for m in &drifted {
             match db
-                .mark_failed(
-                    &m.library,
-                    &m.id,
-                    m.version_size.as_str(),
-                    FILE_MISSING_REASON,
-                )
+                .mark_failed(&m.library, &m.id, m.version_size.as_str(), m.kind.reason())
                 .await
             {
                 Ok(()) => marked_failed += 1,
@@ -206,18 +275,23 @@ pub(crate) async fn run_reconcile(
     if mark_errors > 0 {
         // Print before "Results:" so stdout-scraping scripts don't see a
         // success-looking summary right before the non-zero exit.
-        println!("FAILED: {mark_errors} state updates errored — see stderr above for details.");
+        println!("FAILED: {mark_errors} state updates errored - see stderr above for details.");
         println!();
     }
     println!("Results:");
     println!("  Present:  {}", counts.present);
     println!("  Missing:  {}", counts.missing);
+    if counts.damaged > 0 {
+        println!("  Damaged:  {}", counts.damaged);
+    }
     if counts.no_path > 0 {
         println!("  No path:  {}", counts.no_path);
     }
     if args.dry_run {
         println!();
-        println!("Dry run — no changes written. Re-run without --dry-run to mark missing assets as failed.");
+        println!(
+            "Dry run - no changes written. Re-run without --dry-run to mark drifted assets as failed."
+        );
     } else {
         println!("  Marked failed: {marked_failed}");
         if mark_errors > 0 {
@@ -226,7 +300,7 @@ pub(crate) async fn run_reconcile(
     }
 
     if mark_errors > 0 {
-        anyhow::bail!("Reconcile found {mark_errors} missing files that could not be marked failed in the state database.");
+        anyhow::bail!("Reconcile found {mark_errors} drifted files that could not be marked failed in the state database.");
     }
 
     Ok(())
@@ -265,7 +339,7 @@ mod tests {
     }
 
     async fn seed_present(db: &SqliteStateDb, id: &str, path: &std::path::Path) {
-        std::fs::write(path, b"x").unwrap();
+        std::fs::write(path, vec![0u8; 100]).unwrap();
         seed_downloaded(db, id, path).await;
     }
 
@@ -277,7 +351,7 @@ mod tests {
         seed_missing(&db, "MISSING_1", &dir.path().join("does_not_exist.jpg")).await;
         seed_present(&db, "PRESENT_1", &dir.path().join("present.jpg")).await;
 
-        let (counts, missing) = scan_missing(&db, |_: &MissingAsset| {}, |_: &str| {})
+        let (counts, missing) = scan_local_drift(&db, |_: &LocalDriftAsset| {}, |_: &str| {})
             .await
             .unwrap();
         assert_eq!(counts.present, 1);
@@ -318,7 +392,7 @@ mod tests {
 
         seed_missing(&db, "MISSING_DRY", &dir.path().join("x.jpg")).await;
 
-        let (counts, missing) = scan_missing(&db, |_: &MissingAsset| {}, |_: &str| {})
+        let (counts, missing) = scan_local_drift(&db, |_: &LocalDriftAsset| {}, |_: &str| {})
             .await
             .unwrap();
         assert_eq!(counts.missing, 1);
@@ -340,7 +414,7 @@ mod tests {
             seed_missing(&db, &id, &dir.path().join(format!("{id}.jpg"))).await;
         }
 
-        let (counts, missing) = scan_missing(&db, |_: &MissingAsset| {}, |_: &str| {})
+        let (counts, missing) = scan_local_drift(&db, |_: &LocalDriftAsset| {}, |_: &str| {})
             .await
             .unwrap();
         assert_eq!(counts.missing as usize, total);
@@ -361,7 +435,7 @@ mod tests {
         assert_eq!(summary.downloaded, 0);
         assert_eq!(summary.failed as usize, total);
 
-        let (counts2, missing2) = scan_missing(&db, |_: &MissingAsset| {}, |_: &str| {})
+        let (counts2, missing2) = scan_local_drift(&db, |_: &LocalDriftAsset| {}, |_: &str| {})
             .await
             .unwrap();
         assert_eq!(counts2.missing, 0);
@@ -388,7 +462,7 @@ mod tests {
             }
         }
 
-        let (counts, missing) = scan_missing(&db, |_: &MissingAsset| {}, |_: &str| {})
+        let (counts, missing) = scan_local_drift(&db, |_: &LocalDriftAsset| {}, |_: &str| {})
             .await
             .unwrap();
         assert_eq!(counts.present, expected_present);
@@ -400,5 +474,45 @@ mod tests {
     fn file_missing_reason_is_stable() {
         // Wire format guarantee for any operator tooling keying on the sentinel.
         assert_eq!(FILE_MISSING_REASON, "FILE_MISSING_AT_STARTUP");
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_truncated_file_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let path = dir.path().join("truncated.jpg");
+        std::fs::write(&path, b"short").unwrap();
+        seed_downloaded(&db, "TRUNCATED_1", &path).await;
+
+        let (counts, drift) = scan_local_drift(&db, |_: &LocalDriftAsset| {}, |_: &str| {})
+            .await
+            .unwrap();
+        assert_eq!(counts.present, 0);
+        assert_eq!(counts.missing, 0);
+        assert_eq!(counts.damaged, 1);
+        assert_eq!(drift.len(), 1);
+        assert_eq!(&*drift[0].id, "TRUNCATED_1");
+        assert!(matches!(
+            drift[0].kind,
+            LocalDriftKind::Truncated {
+                actual_size: 5,
+                expected_size: 100
+            }
+        ));
+
+        for m in &drift {
+            db.mark_failed(&m.library, &m.id, m.version_size.as_str(), m.kind.reason())
+                .await
+                .unwrap();
+        }
+
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].last_error.as_deref(), Some(FILE_TRUNCATED_REASON));
+    }
+
+    #[test]
+    fn file_truncated_reason_is_stable() {
+        assert_eq!(FILE_TRUNCATED_REASON, "FILE_TRUNCATED_AT_STARTUP");
     }
 }

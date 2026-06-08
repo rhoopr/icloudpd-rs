@@ -73,6 +73,31 @@ impl std::fmt::Debug for AuthResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthFlowErrorClass {
+    TransientAppleFailure,
+    MisdirectedRequest,
+    Other,
+}
+
+/// Classify errors that change auth orchestration behavior.
+///
+/// `anyhow::Error` remains the return type so the original error chain is
+/// preserved. This helper only owns local branch decisions for transient auth
+/// guidance and bounded 421 HTTP-pool recovery.
+fn classify_auth_flow_error(err: &anyhow::Error) -> AuthFlowErrorClass {
+    let Some(auth_err) = err.downcast_ref::<AuthError>() else {
+        return AuthFlowErrorClass::Other;
+    };
+    if auth_err.is_transient_apple_failure() {
+        AuthFlowErrorClass::TransientAppleFailure
+    } else if auth_err.is_misdirected_request() {
+        AuthFlowErrorClass::MisdirectedRequest
+    } else {
+        AuthFlowErrorClass::Other
+    }
+}
+
 /// Top-level authentication orchestrator.
 ///
 /// 1. Tries to validate the existing session token.
@@ -202,17 +227,13 @@ async fn authenticate_inner(
                 session.save_validation_cache(&d).await;
                 data = Some(d);
             }
-            Err(e) => {
-                if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_transient_apple_failure)
-                {
+            Err(e) => match classify_auth_flow_error(&e) {
+                AuthFlowErrorClass::TransientAppleFailure => {
                     return Err(e.context(
                         "Apple's authentication service is temporarily failing (HTTP 429/5xx). Wait a few minutes and retry.",
                     ));
                 }
-                if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_misdirected_request)
-                {
+                AuthFlowErrorClass::MisdirectedRequest => {
                     tracing::warn!(
                         error = %e,
                         "validate returned 421 Misdirected Request; resetting HTTP pool \
@@ -220,13 +241,14 @@ async fn authenticate_inner(
                     );
                     session.reset_http_clients()?;
                     pool_reset = true;
-                } else {
+                }
+                AuthFlowErrorClass::Other => {
                     tracing::debug!(
                         error = %e,
                         "Invalid authentication token, will log in from scratch"
                     );
                 }
-            }
+            },
         }
     }
 
@@ -244,18 +266,14 @@ async fn authenticate_inner(
                 tracing::debug!("accountLogin succeeded, skipping SRP");
                 data = Some(d);
             }
-            Err(e) => {
-                if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_transient_apple_failure)
-                {
+            Err(e) => match classify_auth_flow_error(&e) {
+                AuthFlowErrorClass::TransientAppleFailure => {
                     return Err(e.context(
                         "Apple's auth service is returning transient errors (HTTP 429/5xx). \
                          Wait a few minutes and retry",
                     ));
                 }
-                if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_misdirected_request)
-                {
+                AuthFlowErrorClass::MisdirectedRequest => {
                     if pool_reset {
                         tracing::warn!(
                             error = %e,
@@ -269,13 +287,14 @@ async fn authenticate_inner(
                         );
                         session.reset_http_clients()?;
                     }
-                } else {
+                }
+                AuthFlowErrorClass::Other => {
                     tracing::debug!(
                         error = %e,
                         "accountLogin failed, falling back to SRP"
                     );
                 }
-            }
+            },
         }
     }
 
@@ -311,10 +330,7 @@ async fn authenticate_inner(
         // sync_loop init-retry (which matches on ICloudError) would miss.
         let account_data = match twofa::authenticate_with_token(&mut session, endpoints).await {
             Ok(d) => d,
-            Err(e)
-                if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_misdirected_request) =>
-            {
+            Err(e) if classify_auth_flow_error(&e) == AuthFlowErrorClass::MisdirectedRequest => {
                 tracing::warn!(
                     error = %e,
                     "accountLogin returned 421 Misdirected Request after SRP; \
@@ -461,17 +477,13 @@ pub async fn send_2fa_push(
                 session.save_validation_cache(&d).await;
                 data = Some(d);
             }
-            Err(e) => {
-                if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_transient_apple_failure)
-                {
+            Err(e) => match classify_auth_flow_error(&e) {
+                AuthFlowErrorClass::TransientAppleFailure => {
                     return Err(e.context(
                         "Apple's authentication service is temporarily failing (HTTP 429/5xx). Wait a few minutes and retry.",
                     ));
                 }
-                if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_misdirected_request)
-                {
+                AuthFlowErrorClass::MisdirectedRequest => {
                     tracing::warn!(
                         error = %e,
                         "validate returned 421 Misdirected Request; resetting HTTP pool \
@@ -480,7 +492,8 @@ pub async fn send_2fa_push(
                     session.reset_http_clients()?;
                     pool_reset = true;
                 }
-            }
+                AuthFlowErrorClass::Other => {}
+            },
         }
     }
 
@@ -491,24 +504,22 @@ pub async fn send_2fa_push(
             Ok(d) => {
                 data = Some(d);
             }
-            Err(e)
-                if !pool_reset
-                    && e.downcast_ref::<AuthError>()
-                        .is_some_and(AuthError::is_misdirected_request) =>
-            {
-                tracing::warn!(
-                    error = %e,
-                    "accountLogin returned 421 Misdirected Request; resetting HTTP pool \
-                     before SRP"
-                );
-                session.reset_http_clients()?;
-            }
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "accountLogin failed during send_2fa_push, falling back to SRP"
-                );
-            }
+            Err(e) => match classify_auth_flow_error(&e) {
+                AuthFlowErrorClass::MisdirectedRequest if !pool_reset => {
+                    tracing::warn!(
+                        error = %e,
+                        "accountLogin returned 421 Misdirected Request; resetting HTTP pool \
+                         before SRP"
+                    );
+                    session.reset_http_clients()?;
+                }
+                _ => {
+                    tracing::debug!(
+                        error = %e,
+                        "accountLogin failed during send_2fa_push, falling back to SRP"
+                    );
+                }
+            },
         }
     }
 
@@ -531,10 +542,7 @@ pub async fn send_2fa_push(
         .await?;
         let account_data = match twofa::authenticate_with_token(&mut session, &endpoints).await {
             Ok(d) => d,
-            Err(e)
-                if e.downcast_ref::<AuthError>()
-                    .is_some_and(AuthError::is_misdirected_request) =>
-            {
+            Err(e) if classify_auth_flow_error(&e) == AuthFlowErrorClass::MisdirectedRequest => {
                 tracing::warn!(
                     error = %e,
                     "accountLogin returned 421 Misdirected Request after SRP; \
@@ -662,6 +670,69 @@ mod tests {
             service_errors: Vec::new(),
             i_cdp_enabled: false,
         }
+    }
+
+    fn classify_auth_flow_error_for(err: AuthError) -> AuthFlowErrorClass {
+        let err = anyhow::Error::new(err);
+        classify_auth_flow_error(&err)
+    }
+
+    #[test]
+    fn classify_auth_flow_error_detects_421_misdirected_request() {
+        assert_eq!(
+            classify_auth_flow_error_for(AuthError::ApiError {
+                code: 421,
+                message: "misdirected".into(),
+            }),
+            AuthFlowErrorClass::MisdirectedRequest
+        );
+    }
+
+    #[test]
+    fn classify_auth_flow_error_detects_429_and_503_transients() {
+        assert_eq!(
+            classify_auth_flow_error_for(AuthError::ApiError {
+                code: 429,
+                message: "rate limited".into(),
+            }),
+            AuthFlowErrorClass::TransientAppleFailure
+        );
+        assert_eq!(
+            classify_auth_flow_error_for(AuthError::ApiError {
+                code: 503,
+                message: "unavailable".into(),
+            }),
+            AuthFlowErrorClass::TransientAppleFailure
+        );
+    }
+
+    #[test]
+    fn classify_auth_flow_error_treats_non_auth_errors_as_other() {
+        let err = anyhow::anyhow!("plain failure");
+        assert_eq!(classify_auth_flow_error(&err), AuthFlowErrorClass::Other);
+    }
+
+    #[test]
+    fn classify_auth_flow_error_detects_context_wrapped_auth_errors() {
+        let misdirected = anyhow::Error::new(AuthError::ApiError {
+            code: 421,
+            message: "misdirected".into(),
+        })
+        .context("validate token");
+        assert_eq!(
+            classify_auth_flow_error(&misdirected),
+            AuthFlowErrorClass::MisdirectedRequest
+        );
+
+        let transient = anyhow::Error::new(AuthError::ServiceError {
+            code: "http_503".into(),
+            message: "unavailable".into(),
+        })
+        .context("accountLogin");
+        assert_eq!(
+            classify_auth_flow_error(&transient),
+            AuthFlowErrorClass::TransientAppleFailure
+        );
     }
 
     #[test]

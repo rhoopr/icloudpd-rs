@@ -57,6 +57,31 @@ enum WatchPrecheck {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncAuthErrorClass {
+    TwoFactorRequired,
+    LockContention,
+    Other,
+}
+
+/// Classify auth errors at the sync-loop orchestration boundary.
+///
+/// The sync loop uses these classes for distinct behaviors: initial-auth 2FA
+/// wait, mid-cycle reauth 2FA wait vs one-shot return, and lock-reacquire
+/// shutdown messaging. Callers still return the original `anyhow::Error`.
+fn classify_sync_auth_error(err: &anyhow::Error) -> SyncAuthErrorClass {
+    let Some(auth_err) = err.downcast_ref::<auth::error::AuthError>() else {
+        return SyncAuthErrorClass::Other;
+    };
+    if auth_err.is_two_factor_required() {
+        SyncAuthErrorClass::TwoFactorRequired
+    } else if auth_err.is_lock_contention() {
+        SyncAuthErrorClass::LockContention
+    } else {
+        SyncAuthErrorClass::Other
+    }
+}
+
 impl WatchPrecheck {
     fn proceed_all() -> Self {
         Self::Proceed {
@@ -690,10 +715,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     .await
     {
         Ok(result) => result,
-        Err(e)
-            if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
-        {
+        Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
             let msg = format!(
                 "2FA required for {u}. Run: kei login get-code",
                 u = config.auth.username
@@ -1158,7 +1180,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // cheap pre-check before refreshing album plans or running a sync.
         // No-change cycles should cost one CloudKit request, not a full
         // album/pass refresh per selected library.
-        let watch_precheck = if is_watch_mode {
+        let mut watch_precheck = if is_watch_mode {
             check_changes_database(
                 state_db
                     .as_deref()
@@ -1171,6 +1193,19 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         } else {
             WatchPrecheck::proceed_all()
         };
+
+        if !config.runtime.dry_run && !config.runtime.only_print_filenames {
+            if let Some(db) = state_db.as_deref() {
+                let drift = run_bounded_local_drift_probe(db, cycle_index).await;
+                if drift.marked_failed > 0 {
+                    tracing::warn!(
+                        marked_failed = drift.marked_failed,
+                        "Local drift probe found missing or damaged files; forcing this cycle to retry them"
+                    );
+                    watch_precheck = WatchPrecheck::proceed_all();
+                }
+            }
+        }
 
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
             cycle_reporter.report_skipped_watch_cycle(&mut health).await;
@@ -1305,8 +1340,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         continue; // Restart entire cycle
                     }
                     Err(e)
-                        if e.downcast_ref::<auth::error::AuthError>()
-                            .is_some_and(auth::error::AuthError::is_two_factor_required) =>
+                        if classify_sync_auth_error(&e)
+                            == SyncAuthErrorClass::TwoFactorRequired =>
                     {
                         // 2FA is user action, not a failed attempt -- don't
                         // burn reauth_attempts so false wakeups from get-code
@@ -1365,13 +1400,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
         }
 
-        // Periodic local-vs-state reconciliation. Read-only walk that
-        // surfaces missing files via `tracing::warn!`. State rows are NEVER
-        // mutated here -- the manual `kei reconcile` subcommand still owns
-        // the failed-status transition. Long-running daemons drift between
-        // assets.local_path and what's on disk (manual rm, mount glitches,
-        // etc.); a periodic visible signal beats waiting for the next sync
-        // to stumble over the missing files.
+        // Periodic local-vs-state reconciliation. This full-catalog walk is
+        // read-only and surfaces missing or damaged files via `tracing::warn!`.
+        // The bounded pre-cycle probe owns automatic requeue for the rows it
+        // samples; `kei reconcile` remains the explicit full repair command
+        // for operators who want to sweep the whole state DB immediately.
         if is_watch_mode
             && should_reconcile_this_cycle(cycle_index, config.watch.reconcile_every_n_cycles)
         {
@@ -1550,10 +1583,7 @@ async fn reauth_with_srp(
     .await
     {
         Ok(result) => Ok(result),
-        Err(e)
-            if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
-        {
+        Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
             let msg = format!(
                 "2FA required for {u}. Run: kei login get-code",
                 u = config.auth.username
@@ -1579,54 +1609,67 @@ async fn reauth_with_srp(
 }
 
 /// Walk every `downloaded` row in the state DB and warn when the
-/// recorded `local_path` is missing on disk. Read-only — no rows are mutated
-/// (the manual `kei reconcile` CLI still owns the `downloaded -> failed`
-/// transition). Triggered on a fixed cadence by the watch loop; surfaces
-/// long-running drift that the next sync would otherwise re-discover only
-/// after stumbling over the missing files.
+/// recorded `local_path` is missing or shorter than expected. Read-only - no
+/// rows are mutated by this periodic full-catalog walk. Triggered on a fixed
+/// cadence by the watch loop so operators can see drift outside the bounded
+/// pre-cycle probe.
 ///
 /// Errors from the DB scan are logged at `warn!` rather than propagated:
 /// the periodic walk is a diagnostic, not a load-bearing correctness gate,
 /// and a transient SQLite hiccup must not crash the watch daemon.
 async fn run_periodic_reconcile(db: &dyn state::ReportStateStore, cycle_index: u64) {
-    use crate::commands::reconcile::{scan_missing, MissingAsset};
+    use crate::commands::reconcile::{scan_local_drift, LocalDriftAsset, LocalDriftKind};
     tracing::info!(
         cycle_index,
-        "Periodic reconciliation: scanning state DB for missing local files"
+        "Periodic reconciliation: scanning state DB for missing or damaged local files"
     );
     let mut sample_logged = 0usize;
     const SAMPLE_LOG_CAP: usize = 25;
     // Cap per-cycle log spam at SAMPLE_LOG_CAP missing entries; the
     // aggregate count is logged below regardless of how many fired.
-    let report_missing = |m: &MissingAsset| {
+    let report_drift = |m: &LocalDriftAsset| {
         if sample_logged < SAMPLE_LOG_CAP {
-            tracing::warn!(
-                asset_id = %m.id,
-                version_size = m.version_size.as_str(),
-                path = %m.local_path.display(),
-                "Reconcile: state row marks asset downloaded but local file is missing"
-            );
+            match m.kind {
+                LocalDriftKind::Missing => tracing::warn!(
+                    asset_id = %m.id,
+                    version_size = m.version_size.as_str(),
+                    path = %m.local_path.display(),
+                    "Reconcile: state row marks asset downloaded but local file is missing"
+                ),
+                LocalDriftKind::Truncated {
+                    actual_size,
+                    expected_size,
+                } => tracing::warn!(
+                    asset_id = %m.id,
+                    version_size = m.version_size.as_str(),
+                    path = %m.local_path.display(),
+                    actual_size,
+                    expected_size,
+                    "Reconcile: state row marks asset downloaded but local file is smaller than expected"
+                ),
+            }
             sample_logged += 1;
         }
     };
     let report_no_path = |id: &str| {
         tracing::debug!(asset_id = %id, "Reconcile: downloaded row has no local_path recorded");
     };
-    let scan = scan_missing(db, report_missing, report_no_path).await;
+    let scan = scan_local_drift(db, report_drift, report_no_path).await;
     match scan {
-        Ok((counts, missing)) => {
-            if missing.is_empty() && counts.no_path == 0 {
+        Ok((counts, drifted)) => {
+            if drifted.is_empty() && counts.no_path == 0 {
                 tracing::info!(
                     present = counts.present,
-                    "Periodic reconciliation: all downloaded files present on disk"
+                    "Periodic reconciliation: all downloaded files look present on disk"
                 );
             } else {
                 tracing::warn!(
                     present = counts.present,
                     missing = counts.missing,
+                    damaged = counts.damaged,
                     no_path = counts.no_path,
                     sample_logged,
-                    "Periodic reconciliation: drift detected; run `kei reconcile` to mark missing files for re-download"
+                    "Periodic reconciliation: drift detected; run `kei reconcile` to mark local drift for re-download"
                 );
             }
         }
@@ -1634,6 +1677,169 @@ async fn run_periodic_reconcile(db: &dyn state::ReportStateStore, cycle_index: u
             tracing::warn!(error = %e, "Periodic reconciliation scan failed; will retry on next interval");
         }
     }
+}
+
+const LOCAL_DRIFT_PROBE_CURSOR_KEY: &str = "local_drift_probe_offset_v1";
+const LOCAL_DRIFT_PROBE_PAGE_SIZE: u32 = 128;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LocalDriftProbeOutcome {
+    scanned: u64,
+    drifted: u64,
+    marked_failed: u64,
+    mark_errors: u64,
+}
+
+/// Probe a bounded page of downloaded rows for local drift before each sync
+/// cycle. Unlike the opt-in full reconciliation walk, this runs by default
+/// and advances a cursor so watch mode eventually covers the catalog without
+/// turning every quiet incremental cycle into a full filesystem crawl.
+async fn run_bounded_local_drift_probe(
+    db: &dyn download::DownloadStore,
+    cycle_index: u64,
+) -> LocalDriftProbeOutcome {
+    let summary = match db.get_summary().await {
+        Ok(summary) => summary,
+        Err(e) => {
+            tracing::warn!(error = %e, "Local drift probe failed to read state summary");
+            return LocalDriftProbeOutcome::default();
+        }
+    };
+    if summary.downloaded == 0 {
+        return LocalDriftProbeOutcome::default();
+    }
+
+    let start_offset = match db.get_metadata(LOCAL_DRIFT_PROBE_CURSOR_KEY).await {
+        Ok(Some(raw)) => raw.parse::<u64>().unwrap_or(0).min(summary.downloaded),
+        Ok(None) => 0,
+        Err(e) => {
+            tracing::warn!(error = %e, "Local drift probe failed to read cursor");
+            0
+        }
+    };
+
+    let mut page = match db
+        .get_downloaded_page(start_offset, LOCAL_DRIFT_PROBE_PAGE_SIZE)
+        .await
+    {
+        Ok(page) => page,
+        Err(e) => {
+            tracing::warn!(error = %e, "Local drift probe failed to load downloaded page");
+            return LocalDriftProbeOutcome::default();
+        }
+    };
+    let offset = if page.is_empty() && start_offset > 0 {
+        match db.get_downloaded_page(0, LOCAL_DRIFT_PROBE_PAGE_SIZE).await {
+            Ok(first_page) => {
+                page = first_page;
+                0
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Local drift probe failed to wrap cursor");
+                return LocalDriftProbeOutcome::default();
+            }
+        }
+    } else {
+        start_offset
+    };
+
+    let scanned = u64::try_from(page.len()).unwrap_or(u64::MAX);
+    let next_offset = if page.is_empty()
+        || offset.saturating_add(scanned) >= summary.downloaded
+        || scanned < u64::from(LOCAL_DRIFT_PROBE_PAGE_SIZE)
+    {
+        0
+    } else {
+        offset.saturating_add(scanned)
+    };
+    if let Err(e) = db
+        .set_metadata(LOCAL_DRIFT_PROBE_CURSOR_KEY, &next_offset.to_string())
+        .await
+    {
+        tracing::warn!(error = %e, "Local drift probe failed to persist cursor");
+    }
+
+    let mut outcome = LocalDriftProbeOutcome {
+        scanned,
+        ..LocalDriftProbeOutcome::default()
+    };
+    for asset in page {
+        let (drift, no_path) = match crate::commands::reconcile::classify_local_drift(asset).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(error = %e, "Local drift probe failed to inspect a downloaded row");
+                continue;
+            }
+        };
+        if no_path {
+            continue;
+        }
+        let Some(drift) = drift else {
+            continue;
+        };
+        outcome.drifted = outcome.drifted.saturating_add(1);
+        match drift.kind {
+            crate::commands::reconcile::LocalDriftKind::Missing => tracing::warn!(
+                cycle_index,
+                asset_id = %drift.id,
+                version_size = drift.version_size.as_str(),
+                path = %drift.local_path.display(),
+                "Local drift probe found a missing downloaded file"
+            ),
+            crate::commands::reconcile::LocalDriftKind::Truncated {
+                actual_size,
+                expected_size,
+            } => tracing::warn!(
+                cycle_index,
+                asset_id = %drift.id,
+                version_size = drift.version_size.as_str(),
+                path = %drift.local_path.display(),
+                actual_size,
+                expected_size,
+                "Local drift probe found a truncated downloaded file"
+            ),
+        }
+        match db
+            .mark_failed(
+                &drift.library,
+                &drift.id,
+                drift.version_size.as_str(),
+                drift.kind.reason(),
+            )
+            .await
+        {
+            Ok(()) => outcome.marked_failed = outcome.marked_failed.saturating_add(1),
+            Err(e) => {
+                outcome.mark_errors = outcome.mark_errors.saturating_add(1);
+                tracing::warn!(
+                    error = %e,
+                    asset_id = %drift.id,
+                    version_size = drift.version_size.as_str(),
+                    "Local drift probe could not mark drifted file failed"
+                );
+            }
+        }
+    }
+
+    if outcome.drifted > 0 || outcome.mark_errors > 0 {
+        tracing::warn!(
+            cycle_index,
+            scanned = outcome.scanned,
+            drifted = outcome.drifted,
+            marked_failed = outcome.marked_failed,
+            mark_errors = outcome.mark_errors,
+            next_offset,
+            "Local drift probe completed with drift"
+        );
+    } else {
+        tracing::debug!(
+            cycle_index,
+            scanned = outcome.scanned,
+            next_offset,
+            "Local drift probe completed"
+        );
+    }
+    outcome
 }
 
 /// Should this watch cycle run a periodic local-vs-state reconciliation?
@@ -1672,10 +1878,7 @@ pub(crate) fn should_reconcile_this_cycle(cycle_index: u64, every_n: Option<u64>
 /// because the *reauth* branch fires mid-cycle, by which point a one-shot
 /// caller has long since detached and there is no operator to type a code.
 pub(crate) fn should_wait_for_2fa(is_watch_mode: bool, err: &anyhow::Error) -> bool {
-    is_watch_mode
-        && err
-            .downcast_ref::<auth::error::AuthError>()
-            .is_some_and(auth::error::AuthError::is_two_factor_required)
+    is_watch_mode && classify_sync_auth_error(err) == SyncAuthErrorClass::TwoFactorRequired
 }
 
 async fn refresh_needed_library_plans(
@@ -2039,9 +2242,7 @@ async fn reacquire_session_lock_after_idle(
         return Ok(());
     };
 
-    if e.downcast_ref::<auth::error::AuthError>()
-        .is_some_and(auth::error::AuthError::is_lock_contention)
-    {
+    if classify_sync_auth_error(&e) == SyncAuthErrorClass::LockContention {
         tracing::error!(
             error = %e,
             "Another kei process acquired the session lock while watch mode slept; stopping before the next sync cycle"
@@ -2530,6 +2731,61 @@ mod tests {
         // inappropriate SRP cycle.
         let e = anyhow::anyhow!("unrelated top-level error");
         assert!(!is_session_error(&e));
+    }
+
+    fn classify_sync_auth_error_for(err: auth::error::AuthError) -> SyncAuthErrorClass {
+        let err = anyhow::Error::new(err);
+        classify_sync_auth_error(&err)
+    }
+
+    #[test]
+    fn classify_sync_auth_error_detects_two_factor_required() {
+        assert_eq!(
+            classify_sync_auth_error_for(auth::error::AuthError::TwoFactorRequired),
+            SyncAuthErrorClass::TwoFactorRequired
+        );
+    }
+
+    #[test]
+    fn classify_sync_auth_error_detects_lock_contention() {
+        assert_eq!(
+            classify_sync_auth_error_for(auth::error::AuthError::LockContention(
+                "session.lock".into()
+            )),
+            SyncAuthErrorClass::LockContention
+        );
+    }
+
+    #[test]
+    fn classify_sync_auth_error_treats_failed_login_and_plain_anyhow_as_other() {
+        assert_eq!(
+            classify_sync_auth_error_for(auth::error::AuthError::FailedLogin(
+                "bad password".into()
+            )),
+            SyncAuthErrorClass::Other
+        );
+
+        let err = anyhow::anyhow!("plain failure");
+        assert_eq!(classify_sync_auth_error(&err), SyncAuthErrorClass::Other);
+    }
+
+    #[test]
+    fn classify_sync_auth_error_detects_context_wrapped_auth_errors() {
+        let two_factor =
+            anyhow::Error::new(auth::error::AuthError::TwoFactorRequired).context("initial auth");
+        assert_eq!(
+            classify_sync_auth_error(&two_factor),
+            SyncAuthErrorClass::TwoFactorRequired
+        );
+
+        let lock = anyhow::Error::new(auth::error::AuthError::LockContention(
+            "session.lock".into(),
+        ))
+        .context("watch idle reacquire");
+        assert_eq!(
+            classify_sync_auth_error(&lock),
+            SyncAuthErrorClass::LockContention
+        );
     }
 
     #[test]
@@ -6362,6 +6618,73 @@ mod tests {
         }
         // Sentinel still excluded.
         assert!(!should_reconcile_this_cycle(0, Some(1)));
+    }
+
+    async fn seed_downloaded_for_local_drift_probe(
+        db: &state::SqliteStateDb,
+        id: &str,
+        path: &std::path::Path,
+        size: u64,
+    ) {
+        let record = crate::test_helpers::TestAssetRecord::new(id)
+            .checksum(&format!("ck_{id}"))
+            .filename(&format!("{id}.jpg"))
+            .size(size)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            id,
+            "original",
+            path,
+            &format!("ck_{id}"),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_local_drift_probe_marks_missing_file_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = state::SqliteStateDb::open_in_memory().unwrap();
+        let missing_path = dir.path().join("missing.jpg");
+        seed_downloaded_for_local_drift_probe(&db, "MISSING_PROBE", &missing_path, 100).await;
+
+        let outcome = run_bounded_local_drift_probe(&db, 1).await;
+
+        assert_eq!(outcome.scanned, 1);
+        assert_eq!(outcome.drifted, 1);
+        assert_eq!(outcome.marked_failed, 1);
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(&*failed[0].id, "MISSING_PROBE");
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some(crate::commands::reconcile::FILE_MISSING_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_local_drift_probe_marks_truncated_file_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = state::SqliteStateDb::open_in_memory().unwrap();
+        let path = dir.path().join("truncated.jpg");
+        std::fs::write(&path, b"short").unwrap();
+        seed_downloaded_for_local_drift_probe(&db, "TRUNCATED_PROBE", &path, 100).await;
+
+        let outcome = run_bounded_local_drift_probe(&db, 1).await;
+
+        assert_eq!(outcome.scanned, 1);
+        assert_eq!(outcome.drifted, 1);
+        assert_eq!(outcome.marked_failed, 1);
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(&*failed[0].id, "TRUNCATED_PROBE");
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
+        );
     }
 
     // `should_wait_for_2fa` decides whether the reauth-time 2FA

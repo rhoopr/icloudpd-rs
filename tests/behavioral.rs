@@ -3131,7 +3131,7 @@ fn reconcile_subcommand_marks_missing_and_preserves_present() {
     let conn = create_state_db(data_dir.path(), username);
 
     let present_path = photos_dir.path().join("present.jpg");
-    std::fs::write(&present_path, b"x").unwrap();
+    std::fs::write(&present_path, vec![0u8; 1000]).unwrap();
     let missing_path = photos_dir.path().join("gone.jpg");
 
     insert_asset(
@@ -3204,6 +3204,56 @@ fn reconcile_subcommand_marks_missing_and_preserves_present() {
         .unwrap();
     assert_eq!(present_status, "downloaded");
 }
+
+#[test]
+fn reconcile_marks_truncated_file_failed() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let photos_dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(data_dir.path(), username);
+
+    let truncated_path = photos_dir.path().join("truncated.jpg");
+    std::fs::write(&truncated_path, b"short").unwrap();
+    insert_asset(
+        &conn,
+        "TRUNCATED",
+        "downloaded",
+        "truncated.jpg",
+        Some(truncated_path.to_str().unwrap()),
+        None,
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", data_dir.path())
+        .args(["reconcile"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("TRUNCATED:"), "stdout: {stdout}");
+    assert!(stdout.contains("Damaged:  1"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Marked failed: 1"),
+        "one drifted row must be re-queued: {stdout}"
+    );
+
+    let db_name = format!("{}.db", sanitize_username(username));
+    let conn = rusqlite::Connection::open(data_dir.path().join(db_name)).unwrap();
+    let (status, error): (String, String) = conn
+        .query_row(
+            "SELECT status, last_error FROM assets WHERE id = 'TRUNCATED'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    assert_eq!(error, "FILE_TRUNCATED_AT_STARTUP");
+}
+
 #[test]
 fn reconcile_dry_run_reports_but_does_not_mutate() {
     let data_dir = tempfile::tempdir().unwrap();

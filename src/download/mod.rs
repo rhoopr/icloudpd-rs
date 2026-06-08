@@ -140,6 +140,47 @@ impl FullEnumerationReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalErrorClass {
+    TokenFallback,
+    TransientFailure,
+    StaticFallback,
+}
+
+/// Classify incremental-enumeration failures before deciding whether to fall
+/// back to a full records/query pass.
+///
+/// Token errors that CloudKit explicitly marks unsafe fall back to full
+/// enumeration. Auth and transport transients bubble up because a full pass
+/// would likely hit the same service condition. Other static/decode errors
+/// fall back so malformed token responses do not strand the user.
+fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
+    if error
+        .downcast_ref::<SyncTokenError>()
+        .is_some_and(SyncTokenError::should_fallback_to_full)
+    {
+        return IncrementalErrorClass::TokenFallback;
+    }
+    if error
+        .downcast_ref::<crate::auth::error::AuthError>()
+        .is_some()
+        || error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(is_transient_reqwest_error)
+    {
+        return IncrementalErrorClass::TransientFailure;
+    }
+    IncrementalErrorClass::StaticFallback
+}
+
+fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
+    error
+        .status()
+        .is_some_and(|status| status == 429 || status.as_u16() >= 500)
+        || error.is_timeout()
+        || error.is_connect()
+}
+
 /// One-shot runtime behavior for a sync pass.
 ///
 /// Kept outside [`DownloadConfig`] so path/filter/download decisions do not
@@ -3311,26 +3352,9 @@ pub async fn download_photos_with_sync(
                     };
                     match incremental_result {
                         Ok(result) => Ok(result),
-                        Err(e) => {
-                            // Determine whether this error warrants a fallback to full
-                            // enumeration. Token-level errors (invalid, zone not found)
-                            // always trigger fallback. Transient errors (503, network
-                            // timeouts) should NOT — they'd fail again on full enum too.
-                            // Deserialization errors (e.g. Apple returning a different
-                            // JSON shape for an invalid token) are not transient, so
-                            // fall back for those too.
-                            let is_token_error = e
-                                .downcast_ref::<SyncTokenError>()
-                                .is_some_and(SyncTokenError::should_fallback_to_full);
-                            let is_transient =
-                                e.downcast_ref::<crate::auth::error::AuthError>().is_some()
-                                    || e.downcast_ref::<reqwest::Error>().is_some_and(|r| {
-                                        r.status().is_some_and(|s| s == 429 || s.as_u16() >= 500)
-                                            || r.is_timeout()
-                                            || r.is_connect()
-                                    });
-
-                            if is_token_error || !is_transient {
+                        Err(e) => match classify_incremental_error(&e) {
+                            IncrementalErrorClass::TokenFallback
+                            | IncrementalErrorClass::StaticFallback => {
                                 let reason = FullEnumerationReason::OtherStaticReason;
                                 tracing::warn!(
                                     error = %e,
@@ -3346,10 +3370,9 @@ pub async fn download_photos_with_sync(
                                     reason,
                                 )
                                 .await
-                            } else {
-                                Err(e)
                             }
-                        }
+                            IncrementalErrorClass::TransientFailure => Err(e),
+                        },
                     }
                 }
             }
@@ -5127,6 +5150,104 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tokio::time::Duration;
+
+    fn reqwest_status_error(status: u16) -> anyhow::Error {
+        let response = http::Response::builder()
+            .status(status)
+            .body(Vec::<u8>::new())
+            .expect("response");
+        reqwest::Response::from(response)
+            .error_for_status()
+            .expect_err("status should be an error")
+            .into()
+    }
+
+    fn classify_incremental_error_for(error: SyncTokenError) -> IncrementalErrorClass {
+        let error = anyhow::Error::new(error);
+        classify_incremental_error(&error)
+    }
+
+    #[test]
+    fn classify_incremental_error_detects_token_fallback_errors() {
+        assert_eq!(
+            classify_incremental_error_for(SyncTokenError::InvalidToken {
+                reason: "expired".into(),
+            }),
+            IncrementalErrorClass::TokenFallback
+        );
+        assert_eq!(
+            classify_incremental_error_for(SyncTokenError::ZoneNotFound {
+                zone_name: "PrimarySync".into(),
+            }),
+            IncrementalErrorClass::TokenFallback
+        );
+    }
+
+    #[test]
+    fn classify_incremental_error_detects_transient_errors() {
+        let auth_error: anyhow::Error = crate::auth::error::AuthError::ApiError {
+            code: 503,
+            message: "unavailable".into(),
+        }
+        .into();
+        assert_eq!(
+            classify_incremental_error(&auth_error),
+            IncrementalErrorClass::TransientFailure
+        );
+
+        let reqwest_429 = reqwest_status_error(429);
+        assert_eq!(
+            classify_incremental_error(&reqwest_429),
+            IncrementalErrorClass::TransientFailure
+        );
+
+        let reqwest_503 = reqwest_status_error(503);
+        assert_eq!(
+            classify_incremental_error(&reqwest_503),
+            IncrementalErrorClass::TransientFailure
+        );
+    }
+
+    #[test]
+    fn classify_incremental_error_treats_static_and_generic_errors_as_fallback() {
+        assert_eq!(
+            classify_incremental_error_for(SyncTokenError::UnexpectedZoneError {
+                zone_name: "PrimarySync".into(),
+                error_code: "TRY_AGAIN_LATER".into(),
+            }),
+            IncrementalErrorClass::StaticFallback
+        );
+
+        let reqwest_400 = reqwest_status_error(400);
+        assert_eq!(
+            classify_incremental_error(&reqwest_400),
+            IncrementalErrorClass::StaticFallback
+        );
+
+        let generic = anyhow::anyhow!("decode failed");
+        assert_eq!(
+            classify_incremental_error(&generic),
+            IncrementalErrorClass::StaticFallback
+        );
+    }
+
+    #[test]
+    fn classify_incremental_error_detects_context_wrapped_errors() {
+        let token = anyhow::Error::new(SyncTokenError::InvalidToken {
+            reason: "expired".into(),
+        })
+        .context("changes/zone");
+        assert_eq!(
+            classify_incremental_error(&token),
+            IncrementalErrorClass::TokenFallback
+        );
+
+        let transient = reqwest_status_error(503).context("changes/zone");
+        assert_eq!(
+            classify_incremental_error(&transient),
+            IncrementalErrorClass::TransientFailure
+        );
+    }
 
     fn test_config() -> DownloadConfig {
         DownloadConfig::test_default()
