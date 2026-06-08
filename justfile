@@ -21,10 +21,54 @@ gate:
     RUSTDOCFLAGS="-Dwarnings" cargo doc --no-deps --all-features
     cargo fetch --locked
     cargo audit --deny warnings
-    python3 .github/scripts/check_workflow_hardening.py
+    just lint-workflows
+    just lint-scripts
     scripts/check-contracts
     typos
     bash scripts/check-roundtrip-gate.sh
+
+# Check GitHub workflow helpers with the repo hardening guard plus optional
+# actionlint when it is installed locally.
+lint-workflows:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pycache_dir="${PYTHONPYCACHEPREFIX:-/tmp/codex/kei/pycache}"
+    mkdir -p "$pycache_dir"
+    python3 .github/scripts/check_workflow_hardening.py
+    PYTHONPYCACHEPREFIX="$pycache_dir" python3 -m py_compile .github/scripts/*.py
+    if command -v actionlint >/dev/null 2>&1; then
+        actionlint .github/workflows/*.yml
+    else
+        echo "lint-workflows: actionlint not installed; skipping optional workflow syntax lint" >&2
+    fi
+
+# Check local shell and Python helpers. External format/lint tools are
+# check-only and optional locally so missing developer tools don't break the
+# baseline gate.
+lint-scripts:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pycache_dir="${PYTHONPYCACHEPREFIX:-/tmp/codex/kei/pycache}"
+    mkdir -p "$pycache_dir"
+    mapfile -t shell_files < <(find scripts tests/shell docker -maxdepth 3 -type f \( -name '*.sh' -o -name 'entrypoint.sh' -o -name 'check-contracts' \) -print | sort)
+    mapfile -t python_files < <(find scripts .github/scripts -maxdepth 3 -type f -name '*.py' -print | sort)
+    bash -n "${shell_files[@]}"
+    PYTHONPYCACHEPREFIX="$pycache_dir" python3 -m py_compile "${python_files[@]}"
+    if command -v shellcheck >/dev/null 2>&1; then
+        shellcheck "${shell_files[@]}"
+    else
+        echo "lint-scripts: shellcheck not installed; skipping optional shell lint" >&2
+    fi
+    if command -v shfmt >/dev/null 2>&1; then
+        shfmt -d "${shell_files[@]}"
+    else
+        echo "lint-scripts: shfmt not installed; skipping optional shell format check" >&2
+    fi
+    if command -v ruff >/dev/null 2>&1; then
+        ruff check "${python_files[@]}"
+    else
+        echo "lint-scripts: ruff not installed; skipping optional Python lint" >&2
+    fi
 
 # Pre-release battery with phase logs, metrics, Docker smokes, and live smokes.
 # Stops on first failure. Keeps a /tmp/codex/kei/full-test/logs/kei-full-test-*.log only when failing.

@@ -469,6 +469,27 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - run: python3 .github/scripts/check_workflow_hardening.py
+      - run: |
+          mkdir -p /tmp/codex/kei/pycache
+          PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile .github/scripts/*.py
+
+  # Cheap deterministic syntax check for repository helper scripts. Heavier
+  # shellcheck/shfmt/ruff/actionlint checks are exposed through local
+  # `just lint-scripts` / `just lint-workflows` recipes and full-test prereq
+  # reporting, but this job keeps obvious syntax breaks out of protected CI.
+  script-lint:
+    name: Script lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Check shell and Python helper syntax
+        run: |
+          set -euo pipefail
+          mapfile -t shell_files < <(find scripts tests/shell docker -maxdepth 3 -type f \( -name '*.sh' -o -name 'entrypoint.sh' -o -name 'check-contracts' \) -print | sort)
+          mapfile -t python_files < <(find scripts .github/scripts -maxdepth 3 -type f -name '*.py' -print | sort)
+          bash -n "${shell_files[@]}"
+          mkdir -p /tmp/codex/kei/pycache
+          PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile "${python_files[@]}"
 
   # Catches spelling mistakes in code, comments, and documentation
   # Small thing but helps maintain a professional codebase. Always runs
@@ -499,6 +520,7 @@ jobs:
       - coverage
       - security
       - workflow-hardening
+      - script-lint
       - typos
     runs-on: ubuntu-latest
     steps:

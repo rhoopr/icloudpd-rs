@@ -12,8 +12,8 @@ Contributions are welcome. For anything beyond a small fix, open an issue first 
    ```
    This runs the local release-quality gate: formatting, clippy with default
    and no-default features, default and no-default tests, doc lints, lockfile
-   fetch, `cargo audit`, workflow hardening, contract markers, typos, and the
-   serializer round-trip detector. Fail-fast.
+   fetch, `cargo audit`, workflow and script lint, contract markers, typos,
+   and the serializer round-trip detector. Fail-fast.
 
    Without `just` installed, run the raw commands (see `justfile` for the full list):
    ```sh
@@ -26,6 +26,8 @@ Contributions are welcome. For anything beyond a small fix, open an issue first 
    cargo fetch --locked
    cargo audit --deny warnings
    python3 .github/scripts/check_workflow_hardening.py
+   PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile .github/scripts/*.py scripts/full-test/*.py
+   bash -n scripts/check-contracts scripts/check-roundtrip-gate.sh scripts/full-test/*.sh scripts/just/*.sh scripts/notify-synology-photos.sh tests/shell/*.sh docker/entrypoint.sh
    scripts/check-contracts
    typos
    bash scripts/check-roundtrip-gate.sh

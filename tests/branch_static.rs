@@ -195,6 +195,56 @@ fn full_test_prereqs_report_script_tooling_gaps() {
 }
 
 #[test]
+fn local_gate_includes_script_and_workflow_lint_recipes() {
+    let justfile = repo_file("justfile");
+    let ci = repo_file(".github/workflows/ci.yml");
+
+    for expected in [
+        "lint-workflows:",
+        "python3 .github/scripts/check_workflow_hardening.py",
+        "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile .github/scripts/*.py",
+        "actionlint .github/workflows/*.yml",
+        "lint-scripts:",
+        "bash -n \"${shell_files[@]}\"",
+        "PYTHONPYCACHEPREFIX=\"$pycache_dir\" python3 -m py_compile \"${python_files[@]}\"",
+        "shellcheck \"${shell_files[@]}\"",
+        "shfmt -d \"${shell_files[@]}\"",
+        "ruff check \"${python_files[@]}\"",
+    ] {
+        assert!(
+            justfile.contains(expected),
+            "justfile must keep script/workflow lint coverage: {expected}"
+        );
+    }
+
+    let gate = justfile
+        .split_once("gate:\n")
+        .map(|(_, tail)| tail)
+        .and_then(|tail| tail.split_once("\n\n").map(|(gate, _)| gate))
+        .expect("justfile must keep gate recipe");
+    for expected in ["just lint-workflows", "just lint-scripts"] {
+        assert!(gate.contains(expected), "just gate must run {expected}");
+    }
+
+    assert!(
+        ci.contains("  script-lint:\n"),
+        "CI workflow must keep the script-lint job"
+    );
+    assert!(
+        ci.contains("PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile"),
+        "CI script lint must route generated Python bytecode outside the repo tree"
+    );
+    let aggregate = ci
+        .split_once("  ci:\n")
+        .map(|(_, tail)| tail)
+        .expect("CI aggregate job must exist");
+    assert!(
+        aggregate.contains("      - script-lint\n"),
+        "aggregate CI job must require script-lint"
+    );
+}
+
+#[test]
 fn aggregate_ci_depends_on_no_default_feature_gate() {
     let ci = repo_file(".github/workflows/ci.yml");
     assert!(
@@ -283,6 +333,8 @@ fn contributor_docs_match_current_gate() {
         "RUSTDOCFLAGS=\"-Dwarnings\" cargo doc --no-deps --all-features",
         "cargo audit --deny warnings",
         "python3 .github/scripts/check_workflow_hardening.py",
+        "PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile",
+        "bash -n scripts/check-contracts scripts/check-roundtrip-gate.sh",
         "scripts/check-contracts",
         "bash scripts/check-roundtrip-gate.sh",
     ] {
