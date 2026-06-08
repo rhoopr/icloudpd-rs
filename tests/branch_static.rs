@@ -468,6 +468,17 @@ fn audit_ignores_carry_removal_triggers() {
 }
 
 #[test]
+fn funding_file_contains_only_configured_sponsor_platforms() {
+    let funding = repo_file(".github/FUNDING.yml");
+
+    assert_eq!(
+        funding.trim(),
+        "ko_fi: rhoopr",
+        "FUNDING.yml should not keep unconfigured GitHub template placeholders"
+    );
+}
+
+#[test]
 fn live_test_recipe_forces_all_features_after_nodefault_phase() {
     let justfile = repo_file("justfile");
     let live_case = justfile
