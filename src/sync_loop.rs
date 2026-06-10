@@ -4,7 +4,6 @@
 //! The public entry point is [`run_sync`], which handles config resolution,
 //! authentication, the download loop, and watch-mode re-sync.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -172,8 +171,10 @@ impl DbPrecheckScope {
 
         let selected_zones_json = serde_json::to_string(&selected_zones)
             .context("serialize scoped database token selected zones")?;
-        let scope_json = scoped_db_precheck_scope_json(
+        let scope_json = download::sync_coverage_fingerprint_json(
             config,
+            SCOPED_DB_SYNC_TOKEN_PROVIDER,
+            SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION,
             &selected_zones,
             enum_config_hash,
             &download_config_hash,
@@ -202,126 +203,6 @@ impl DbPrecheckScope {
             token: token.to_string(),
         }
     }
-}
-
-fn selector_set_json(set: &BTreeSet<String>) -> serde_json::Value {
-    let values: Vec<&str> = set.iter().map(String::as_str).collect();
-    serde_json::json!(values)
-}
-
-fn album_selector_json(selector: &crate::selection::AlbumSelector) -> serde_json::Value {
-    use crate::selection::AlbumSelector;
-    match selector {
-        AlbumSelector::None => serde_json::json!({"kind": "none"}),
-        AlbumSelector::All { excluded } => {
-            serde_json::json!({"kind": "all", "excluded": selector_set_json(excluded)})
-        }
-        AlbumSelector::Named { included, excluded } => serde_json::json!({
-            "kind": "named",
-            "included": selector_set_json(included),
-            "excluded": selector_set_json(excluded),
-        }),
-    }
-}
-
-fn smart_folder_selector_json(
-    selector: &crate::selection::SmartFolderSelector,
-) -> serde_json::Value {
-    use crate::selection::SmartFolderSelector;
-    match selector {
-        SmartFolderSelector::None => serde_json::json!({"kind": "none"}),
-        SmartFolderSelector::All {
-            include_sensitive,
-            excluded,
-        } => serde_json::json!({
-            "kind": "all",
-            "include_sensitive": include_sensitive,
-            "excluded": selector_set_json(excluded),
-        }),
-        SmartFolderSelector::Named { included, excluded } => serde_json::json!({
-            "kind": "named",
-            "included": selector_set_json(included),
-            "excluded": selector_set_json(excluded),
-        }),
-    }
-}
-
-fn library_selector_json(selector: &crate::selection::LibrarySelector) -> serde_json::Value {
-    serde_json::json!({
-        "primary": selector.primary,
-        "shared_all": selector.shared_all,
-        "named": selector_set_json(&selector.named),
-        "excluded": selector_set_json(&selector.excluded),
-    })
-}
-
-fn scoped_db_precheck_scope_json(
-    config: &config::Config,
-    selected_zones: &[String],
-    enum_config_hash: &str,
-    download_config_hash: &str,
-) -> anyhow::Result<String> {
-    let skip_created_before = config
-        .filters
-        .skip_created_before
-        .map(|d| d.with_timezone(&chrono::Utc).to_rfc3339());
-    let skip_created_after = config
-        .filters
-        .skip_created_after
-        .map(|d| d.with_timezone(&chrono::Utc).to_rfc3339());
-    let mut filename_exclude: Vec<&str> = config
-        .download
-        .filename_exclude
-        .iter()
-        .map(glob::Pattern::as_str)
-        .collect();
-    filename_exclude.sort_unstable();
-    let coverage = if let Some(count) = config.filters.recent {
-        serde_json::json!({
-            "kind": "bounded-recent-count",
-            "count": count,
-            "recent_scope": config.filters.recent_scope,
-        })
-    } else if skip_created_before.is_some() || skip_created_after.is_some() {
-        serde_json::json!({
-            "kind": "bounded-date-window",
-            "skip_created_before": skip_created_before,
-            "skip_created_after": skip_created_after,
-        })
-    } else {
-        serde_json::json!({"kind": "complete"})
-    };
-
-    serde_json::to_string(&serde_json::json!({
-        "provider": SCOPED_DB_SYNC_TOKEN_PROVIDER,
-        "domain": config.auth.domain.as_str(),
-        "shape_version": SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION,
-        "selected_zones": selected_zones,
-        "selection": {
-            "albums": album_selector_json(&config.filters.selection.albums),
-            "albums_explicit": config.filters.selection.albums_explicit,
-            "smart_folders": smart_folder_selector_json(&config.filters.selection.smart_folders),
-            "smart_folders_explicit": config.filters.selection.smart_folders_explicit,
-            "libraries": library_selector_json(&config.filters.selection.libraries),
-            "unfiled": config.filters.selection.unfiled,
-        },
-        "filters": {
-            "media": {
-                "photos": config.filters.media.photos,
-                "videos": config.filters.media.videos,
-                "live_photos": config.filters.media.live_photos,
-            },
-            "filename_exclude": filename_exclude,
-            "skip_created_before": skip_created_before,
-            "skip_created_after": skip_created_after,
-            "recent": config.filters.recent,
-            "recent_scope": config.filters.recent_scope,
-        },
-        "coverage": coverage,
-        "enum_config_hash": enum_config_hash,
-        "download_config_hash": download_config_hash,
-    }))
-    .context("serialize scoped database token scope")
 }
 
 fn hash_scoped_db_precheck_scope(shape_version: i64, scope_json: &str) -> String {

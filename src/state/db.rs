@@ -86,14 +86,14 @@ pub struct AlbumMembershipRecord {
 /// stored alongside the hash so a hash match alone never proves that a
 /// watch-mode no-change skip is safe.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScopedDbSyncToken {
-    pub provider: String,
-    pub account: String,
-    pub shape_version: i64,
-    pub scope_hash: String,
-    pub selected_zones_json: String,
-    pub scope_json: String,
-    pub token: String,
+pub(crate) struct ScopedDbSyncToken {
+    pub(crate) provider: String,
+    pub(crate) account: String,
+    pub(crate) shape_version: i64,
+    pub(crate) scope_hash: String,
+    pub(crate) selected_zones_json: String,
+    pub(crate) scope_json: String,
+    pub(crate) token: String,
 }
 
 /// State operations used by the download producer and finalizer.

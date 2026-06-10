@@ -222,7 +222,7 @@ pub(crate) async fn run_doctor(
     config_path: &Path,
     config_load_error: Option<String>,
 ) -> anyhow::Result<()> {
-    let (username, _, _, cookie_dir) =
+    let (username, _, domain, cookie_dir) =
         config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
     let report_path = toml
         .and_then(|t| t.report.as_ref())
@@ -239,12 +239,7 @@ pub(crate) async fn run_doctor(
     checks.push(check_health(&cookie_dir));
     checks.push(check_report(report_path.as_deref()));
     if args.live {
-        checks.push(DoctorCheck {
-            name: "live",
-            status: CheckStatus::Skipped,
-            message: "`kei doctor --live` is accepted but live diagnostics are not implemented yet"
-                .to_string(),
-        });
+        checks.push(check_live_session(&username, domain.as_str(), &cookie_dir).await);
     }
 
     let report = DoctorReport {
@@ -381,6 +376,56 @@ fn check_session_presence(username: &str, cookie_dir: &Path) -> DoctorCheck {
             "local session or cookie jar is present".to_string()
         } else {
             "no local session or cookie jar found".to_string()
+        },
+    }
+}
+
+async fn check_live_session(username: &str, domain: &str, cookie_dir: &Path) -> DoctorCheck {
+    if auth::session::sanitize_username(username).is_empty() {
+        return DoctorCheck {
+            name: "live_session",
+            status: CheckStatus::Skipped,
+            message: "no username configured, so live session validation was skipped".to_string(),
+        };
+    }
+
+    let endpoints = match auth::endpoints::Endpoints::for_domain(domain) {
+        Ok(endpoints) => endpoints,
+        Err(e) => {
+            return DoctorCheck {
+                name: "live_session",
+                status: CheckStatus::Error,
+                message: format!("could not resolve iCloud auth endpoints: {e}"),
+            };
+        }
+    };
+    let mut session =
+        match auth::session::Session::new(cookie_dir, username, endpoints.home, None).await {
+            Ok(session) => session,
+            Err(e) => {
+                return DoctorCheck {
+                    name: "live_session",
+                    status: CheckStatus::Error,
+                    message: format!("could not open local session for live validation: {e}"),
+                };
+            }
+        };
+
+    match auth::validate_session(&mut session, domain).await {
+        Ok(true) => DoctorCheck {
+            name: "live_session",
+            status: CheckStatus::Ok,
+            message: "saved iCloud session validated".to_string(),
+        },
+        Ok(false) => DoctorCheck {
+            name: "live_session",
+            status: CheckStatus::Warning,
+            message: "saved iCloud session is not currently valid; run `kei login`".to_string(),
+        },
+        Err(e) => DoctorCheck {
+            name: "live_session",
+            status: CheckStatus::Warning,
+            message: format!("live iCloud session validation failed: {e}"),
         },
     }
 }
@@ -544,5 +589,15 @@ mod tests {
         assert_eq!(check.name, "state_db");
         assert_eq!(check.status, CheckStatus::Ok);
         assert!(check.message.contains("0 assets"));
+    }
+
+    #[tokio::test]
+    async fn live_session_check_skips_without_username() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let check = check_live_session("", "com", dir.path()).await;
+
+        assert_eq!(check.name, "live_session");
+        assert_eq!(check.status, CheckStatus::Skipped);
+        assert!(check.message.contains("no username configured"));
     }
 }

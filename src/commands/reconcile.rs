@@ -65,6 +65,25 @@ pub(crate) struct LocalDriftAsset {
     pub(crate) kind: LocalDriftKind,
 }
 
+#[derive(Debug)]
+pub(crate) struct LocalDriftUpdate {
+    pub(crate) library: Arc<str>,
+    pub(crate) id: Box<str>,
+    pub(crate) version_size: VersionSizeKey,
+    pub(crate) kind: LocalDriftKind,
+}
+
+impl From<LocalDriftAsset> for LocalDriftUpdate {
+    fn from(asset: LocalDriftAsset) -> Self {
+        Self {
+            library: asset.library,
+            id: asset.id,
+            version_size: asset.version_size,
+            kind: asset.kind,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ScanCounts {
     pub(crate) present: u64,
@@ -132,12 +151,12 @@ pub(crate) async fn scan_local_drift<D>(
     db: &D,
     mut report_drift: impl FnMut(&LocalDriftAsset),
     mut report_no_path: impl FnMut(&str),
-) -> anyhow::Result<(ScanCounts, Vec<LocalDriftAsset>)>
+) -> anyhow::Result<(ScanCounts, Vec<LocalDriftUpdate>)>
 where
     D: ReportStateStore + ?Sized,
 {
     let mut counts = ScanCounts::default();
-    let mut drift = Vec::new();
+    let mut drift_updates = Vec::new();
 
     let mut offset = 0u64;
     loop {
@@ -148,10 +167,12 @@ where
         offset += page.len() as u64;
 
         for asset in page {
-            let id = asset.id.clone();
+            let no_path_id = asset.local_path.is_none().then(|| asset.id.clone());
             let (record, no_path) = classify_local_drift(asset).await?;
             if no_path {
-                report_no_path(&id);
+                if let Some(id) = no_path_id {
+                    report_no_path(&id);
+                }
                 counts.no_path += 1;
                 continue;
             }
@@ -164,11 +185,11 @@ where
                 LocalDriftKind::Truncated { .. } => counts.damaged += 1,
             }
             report_drift(&record);
-            drift.push(record);
+            drift_updates.push(LocalDriftUpdate::from(record));
         }
     }
 
-    Ok((counts, drift))
+    Ok((counts, drift_updates))
 }
 
 pub(crate) async fn run_reconcile(

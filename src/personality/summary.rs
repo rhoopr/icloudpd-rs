@@ -49,18 +49,18 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 /// doesn't reach into either type directly (keeps the personality module a
 /// leaf).
 #[derive(Debug, Clone)]
-pub struct FinalSummary {
-    pub downloaded: u64,
-    pub skipped_total: u64,
-    pub failed: u64,
-    pub elapsed: Duration,
-    pub library_totals: Option<LibraryTotals>,
+pub(crate) struct FinalSummary {
+    pub(crate) downloaded: u64,
+    pub(crate) skipped_total: u64,
+    pub(crate) failed: u64,
+    pub(crate) elapsed: Duration,
+    pub(crate) library_totals: Option<LibraryTotals>,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct LibraryTotals {
-    pub files: u64,
-    pub bytes: u64,
+pub(crate) struct LibraryTotals {
+    pub(crate) files: u64,
+    pub(crate) bytes: u64,
 }
 
 impl FinalSummary {
