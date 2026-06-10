@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Docker and service-mode 2FA waits now resume when `kei login submit-code` updates only the validation cache or cookie jar. This covers Apple's valid-code HTTP 409 flow where the daemon kept waiting after the code was accepted. (fixes [#598])
+
+[#598]: https://github.com/rhoopr/kei/issues/598
+
 ## [0.21.7] - 2026-06-10
 
 ### Fixed

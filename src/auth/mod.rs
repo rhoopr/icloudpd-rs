@@ -41,6 +41,17 @@ pub fn session_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
     cookie_dir.join(format!("{sanitized}.session"))
 }
 
+/// Path to the validation cache file for a given user.
+pub(crate) fn validation_cache_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
+    let sanitized = session::sanitize_username(apple_id);
+    cookie_dir.join(format!("{sanitized}.cache"))
+}
+
+/// Path to the persisted cookie jar for a given user.
+pub(crate) fn cookiejar_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
+    cookie_dir.join(session::sanitize_username(apple_id))
+}
+
 /// Result of a successful authentication, including the account data payload.
 pub struct AuthResult {
     pub session: Session,

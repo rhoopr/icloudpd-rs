@@ -198,29 +198,60 @@ pub(crate) async fn attempt_reauth(
 /// Interval between polls when waiting for a 2FA code submission.
 const TWO_FA_POLL_SECS: u64 = 5;
 
-/// Wait for `submit-code` to update the session file, with no network traffic.
+/// Wait for `submit-code` to update persisted auth state, with no network traffic.
 ///
-/// Polls the session file's modification time every 5 seconds. When
-/// `submit-code` trusts the session it writes updated cookies/session data,
-/// changing the mtime and breaking the loop.
+/// Polls the session, cookie jar, and validation cache modification times every
+/// 5 seconds. Most Apple 2FA flows update session headers during trust, but the
+/// Extended Device Protection 409 shape can accept the code without changing
+/// the session file. `submit-code` still writes a fresh validation cache after
+/// the trusted accountLogin succeeds, and that is enough to wake the service
+/// loop so it can retry authentication.
 async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
-    let session_path = auth::session_file_path(cookie_dir, username);
-    let initial_mtime = tokio::fs::metadata(&session_path)
-        .await
-        .and_then(|m| m.modified())
-        .ok();
+    wait_for_2fa_submit_with_interval(
+        cookie_dir,
+        username,
+        std::time::Duration::from_secs(TWO_FA_POLL_SECS),
+    )
+    .await;
+}
+
+fn auth_signal_paths(cookie_dir: &Path, username: &str) -> [std::path::PathBuf; 3] {
+    [
+        auth::session_file_path(cookie_dir, username),
+        auth::cookiejar_file_path(cookie_dir, username),
+        auth::validation_cache_file_path(cookie_dir, username),
+    ]
+}
+
+async fn auth_signal_mtimes(paths: &[std::path::PathBuf]) -> Vec<Option<std::time::SystemTime>> {
+    let mut mtimes = Vec::with_capacity(paths.len());
+    for path in paths {
+        mtimes.push(
+            tokio::fs::metadata(path)
+                .await
+                .and_then(|m| m.modified())
+                .ok(),
+        );
+    }
+    mtimes
+}
+
+async fn wait_for_2fa_submit_with_interval(
+    cookie_dir: &Path,
+    username: &str,
+    poll_interval: std::time::Duration,
+) {
+    let signal_paths = auth_signal_paths(cookie_dir, username);
+    let initial_mtimes = auth_signal_mtimes(&signal_paths).await;
 
     tracing::info!("Waiting for 2FA code submission...");
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(TWO_FA_POLL_SECS)).await;
+        tokio::time::sleep(poll_interval).await;
 
-        let current_mtime = tokio::fs::metadata(&session_path)
-            .await
-            .and_then(|m| m.modified())
-            .ok();
-        if current_mtime != initial_mtime {
-            tracing::debug!("Session file updated, retrying authentication");
+        let current_mtimes = auth_signal_mtimes(&signal_paths).await;
+        if current_mtimes != initial_mtimes {
+            tracing::debug!("Auth state updated, retrying authentication");
             break;
         }
     }
@@ -228,11 +259,12 @@ async fn wait_for_2fa_submit(cookie_dir: &Path, username: &str) {
 
 /// Wait for a 2FA code submission, then retry authentication with back-off.
 ///
-/// Polls `wait_for_2fa_submit` in a loop. After each mtime change, retries
-/// the provided `auth_fn` up to 3 times with 5-second back-off to handle
-/// lock contention (submit-code may still be running when mtime changes).
-/// False wakeups from get-code's SRP writes (which change the mtime before
-/// the session is trusted) are handled by looping back to wait.
+/// Polls `wait_for_2fa_submit` in a loop. After each auth-state change,
+/// retries the provided `auth_fn` up to 3 times with 5-second back-off to
+/// handle lock contention (submit-code may still be running when mtime
+/// changes). False wakeups from get-code's SRP writes (which change persisted
+/// auth files before the session is trusted) are handled by looping back to
+/// wait.
 pub(crate) async fn wait_and_retry_2fa<T, F, Fut>(
     cookie_dir: &Path,
     username: &str,
@@ -247,11 +279,7 @@ where
 
         // Invalidate the validation cache so authenticate() actually checks
         // with Apple instead of returning stale cached data from before 2FA.
-        let sanitized: String = username
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        let cache_path = cookie_dir.join(format!("{sanitized}.cache"));
+        let cache_path = auth::validation_cache_file_path(cookie_dir, username);
         if cache_path.exists() {
             if let Err(e) = tokio::fs::remove_file(&cache_path).await {
                 tracing::debug!(error = %e, "Could not remove validation cache");
@@ -1216,6 +1244,56 @@ mod tests {
     use crate::selection::{AlbumSelector, Selection, SmartFolderSelector};
     use crate::test_helpers::MockPhotosSession;
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn wait_for_2fa_submit_wakes_when_validation_cache_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let username = "user@example.com";
+        let cache_path = auth::validation_cache_file_path(dir.path(), username);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(
+                wait_for_2fa_submit_with_interval(
+                    dir.path(),
+                    username,
+                    std::time::Duration::from_millis(10),
+                ),
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    tokio::fs::write(&cache_path, b"{\"validated_at\":1}")
+                        .await
+                        .expect("write cache");
+                }
+            );
+        })
+        .await
+        .expect("validation cache write should wake the 2FA waiter");
+    }
+
+    #[tokio::test]
+    async fn wait_for_2fa_submit_wakes_when_cookiejar_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let username = "user@example.com";
+        let cookiejar_path = auth::cookiejar_file_path(dir.path(), username);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(
+                wait_for_2fa_submit_with_interval(
+                    dir.path(),
+                    username,
+                    std::time::Duration::from_millis(10),
+                ),
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    tokio::fs::write(&cookiejar_path, b"[]")
+                        .await
+                        .expect("write cookie jar");
+                }
+            );
+        })
+        .await
+        .expect("cookie jar write should wake the 2FA waiter");
+    }
 
     /// Build a `PhotoLibrary` stub with a preconfigured mock session.
     fn stub_library(mock: MockPhotosSession) -> PhotoLibrary {
