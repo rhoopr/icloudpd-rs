@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::PhotoAsset;
 use crate::retry::RetryConfig;
-use crate::state::{AssetRecord, SyncRunStats};
+use crate::state::{AssetRecord, SyncRunStats, VersionSizeKey};
 
 use super::error::DownloadError;
 use super::filter::{
