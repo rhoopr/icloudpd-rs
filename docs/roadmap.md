@@ -33,6 +33,8 @@ Candidate work:
   reporting feel solid.
 - Add `kei doctor` or a redacted support bundle once core sync and reporting
   feel solid.
+- Expand `kei doctor` from the first local checks into backup-confidence
+  diagnostics once status and reports can say whether the last run was safe.
 
 Success criteria:
 
@@ -186,6 +188,10 @@ Candidate work:
 - Notification test command.
 - Better webhook and desktop notification setup.
 - Watch-mode 2FA browser page.
+- Expand `kei doctor` into a redacted support bundle covering last-run backup
+  safety, health and report excerpts, state DB summary, service or Docker
+  context, notification and metrics readiness, and optional live session
+  validation.
 - Grafana or Prometheus example docs.
 
 Out of scope:
@@ -197,6 +203,9 @@ Success criteria:
 
 - Headless setups expose clear health and diagnostic signals.
 - Notification setup can be tested on demand.
+- A user can run one command to get a redacted diagnostic summary that explains
+  whether the last run was safe, what is wrong if not, and what to send with a
+  support request.
 
 ### v0.24 - Scale and sync efficiency
 

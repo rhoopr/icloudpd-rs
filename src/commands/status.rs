@@ -38,6 +38,8 @@ pub(crate) async fn run_status(
     println!("  Pending:    {}", summary.pending);
     println!("  Failed:     {}", summary.failed);
     println!();
+    println!("{}", backup_status_line(&summary));
+    println!();
 
     if let Some(started) = &summary.active_sync_started {
         println!(
@@ -111,6 +113,89 @@ pub(crate) async fn run_status(
     }
 
     Ok(())
+}
+
+fn backup_status_line(summary: &state::types::SyncSummary) -> String {
+    if summary.active_sync_started.is_some() {
+        return "Backup status: unsafe - sync is currently in progress".to_string();
+    }
+
+    if summary.last_sync_started.is_none() {
+        return "Backup status: unsafe - no sync has completed yet".to_string();
+    }
+
+    let mut reasons = Vec::new();
+    if summary.last_sync_interrupted
+        || summary
+            .last_sync_status
+            .as_deref()
+            .is_some_and(|status| status == "interrupted")
+    {
+        reasons.push("last sync was interrupted".to_string());
+    } else if summary
+        .last_sync_status
+        .as_deref()
+        .is_some_and(|status| status != "complete")
+    {
+        if let Some(status) = &summary.last_sync_status {
+            reasons.push(format!("last sync status is {status}"));
+        }
+    }
+    if summary.last_sync_completed.is_none() {
+        reasons.push("last sync did not record completion".to_string());
+    }
+    if summary.last_sync_assets_failed > 0 {
+        reasons.push(format!(
+            "{} failed in the last sync",
+            count_phrase(summary.last_sync_assets_failed, "asset")
+        ));
+    }
+    if summary.last_sync_enumeration_errors > 0 {
+        reasons.push(format!(
+            "{} occurred in the last sync",
+            count_phrase(summary.last_sync_enumeration_errors, "enumeration error")
+        ));
+    }
+    if summary.failed > 0 {
+        reasons.push(format!(
+            "{} {}",
+            count_phrase(summary.failed, "failed asset"),
+            remain_verb(summary.failed)
+        ));
+    }
+    if summary.pending > 0 {
+        reasons.push(format!(
+            "{} {}",
+            count_phrase(summary.pending, "pending asset"),
+            remain_verb(summary.pending)
+        ));
+    }
+    if summary.last_inventory_drop_detected {
+        reasons.push("inventory warning is active".to_string());
+    }
+
+    if reasons.is_empty() {
+        "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+            .to_string()
+    } else {
+        format!("Backup status: unsafe - {}", reasons.join("; "))
+    }
+}
+
+fn count_phrase(count: u64, singular: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {singular}s")
+    }
+}
+
+const fn remain_verb(count: u64) -> &'static str {
+    if count == 1 {
+        "remains"
+    } else {
+        "remain"
+    }
 }
 
 /// Prints the `Service:` line at the top of `kei status`. Errors from

@@ -486,6 +486,14 @@ pub struct SyncSummary {
     pub last_sync_completed: Option<DateTime<Utc>>,
     /// Time of the last sync run start (if any).
     pub last_sync_started: Option<DateTime<Utc>>,
+    /// Raw status of the latest sync run.
+    pub last_sync_status: Option<String>,
+    /// Asset failures recorded by the latest sync run.
+    pub last_sync_assets_failed: u64,
+    /// Enumeration errors recorded by the latest sync run.
+    pub last_sync_enumeration_errors: u64,
+    /// Whether the latest sync run was interrupted.
+    pub last_sync_interrupted: bool,
     /// Latest persisted count-only CloudKit inventory total, if the last run
     /// had a reliable full-enumeration snapshot.
     pub last_api_total_at_start: Option<u64>,

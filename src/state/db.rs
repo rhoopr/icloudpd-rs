@@ -1264,6 +1264,10 @@ impl SqliteStateDb {
             type LastSyncRow = (
                 Option<i64>,
                 Option<i64>,
+                Option<String>,
+                i64,
+                i64,
+                i32,
                 Option<i64>,
                 i32,
                 i32,
@@ -1273,8 +1277,9 @@ impl SqliteStateDb {
             );
             let last_sync: Option<LastSyncRow> = conn
                 .query_row(
-                    "SELECT started_at, completed_at, api_total_at_start, \
-                            api_total_at_start_partial, inventory_drop_detected, \
+                    "SELECT started_at, completed_at, \
+                            status, assets_failed, enumeration_errors, interrupted, \
+                            api_total_at_start, api_total_at_start_partial, inventory_drop_detected, \
                             inventory_drop_previous_total, inventory_drop_current_total, \
                             inventory_drop_library \
                      FROM sync_runs ORDER BY id DESC LIMIT 1",
@@ -1289,6 +1294,10 @@ impl SqliteStateDb {
                             row.get(5)?,
                             row.get(6)?,
                             row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                            row.get(11)?,
                         ))
                     },
                 )
@@ -1298,6 +1307,10 @@ impl SqliteStateDb {
             let (
                 last_sync_started,
                 last_sync_completed,
+                last_sync_status,
+                last_sync_assets_failed,
+                last_sync_enumeration_errors,
+                last_sync_interrupted,
                 last_api_total_at_start,
                 last_api_total_at_start_partial,
                 last_inventory_drop_detected,
@@ -1308,6 +1321,10 @@ impl SqliteStateDb {
                 Some((
                     started,
                     completed,
+                    status,
+                    assets_failed,
+                    enumeration_errors,
+                    interrupted,
                     api_total,
                     api_total_partial,
                     drop_detected,
@@ -1317,6 +1334,10 @@ impl SqliteStateDb {
                 )) => (
                     started.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
                     completed.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+                    status,
+                    u64::try_from(assets_failed).unwrap_or(0),
+                    u64::try_from(enumeration_errors).unwrap_or(0),
+                    interrupted != 0,
                     api_total.and_then(|n| u64::try_from(n).ok()),
                     api_total_partial != 0,
                     drop_detected != 0,
@@ -1324,7 +1345,7 @@ impl SqliteStateDb {
                     drop_current.and_then(|n| u64::try_from(n).ok()),
                     drop_library,
                 ),
-                None => (None, None, None, false, false, None, None, None),
+                None => (None, None, None, 0, 0, false, None, false, false, None, None, None),
             };
 
             let active_sync_started: Option<DateTime<Utc>> = conn
@@ -1365,6 +1386,10 @@ impl SqliteStateDb {
                 active_enumeration_zones,
                 last_sync_completed,
                 last_sync_started,
+                last_sync_status,
+                last_sync_assets_failed,
+                last_sync_enumeration_errors,
+                last_sync_interrupted,
                 last_api_total_at_start,
                 last_api_total_at_start_partial,
                 last_inventory_drop_detected,

@@ -1449,6 +1449,89 @@ fn status_shows_counts() {
 }
 
 #[test]
+fn status_shows_safe_backup_summary_after_clean_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "a1",
+        "downloaded",
+        "photo1.jpg",
+        Some("/p/photo1.jpg"),
+        None,
+        None,
+    );
+    conn.execute(
+        "INSERT INTO sync_runs (
+            started_at, completed_at, status, assets_seen, assets_downloaded,
+            assets_failed, interrupted, enumeration_errors
+         ) VALUES (?1, ?2, 'complete', 1, 1, 0, 0, 0)",
+        rusqlite::params![1_700_000_000_i64, 1_700_000_010_i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+        ),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn status_shows_unsafe_backup_summary_with_last_run_reasons() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "a1",
+        "failed",
+        "photo1.jpg",
+        None,
+        Some("timeout"),
+        None,
+    );
+    insert_asset(&conn, "a2", "pending", "photo2.jpg", None, None, None);
+    conn.execute(
+        "INSERT INTO sync_runs (
+            started_at, completed_at, status, assets_seen, assets_downloaded,
+            assets_failed, interrupted, enumeration_errors
+         ) VALUES (?1, ?2, 'complete', 2, 0, 1, 0, 2)",
+        rusqlite::params![1_700_000_000_i64, 1_700_000_010_i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "Backup status: unsafe - 1 asset failed in the last sync; 2 enumeration errors occurred in the last sync; 1 failed asset remains; 1 pending asset remains"
+        ),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
 fn status_shows_api_total_and_inventory_warning() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
