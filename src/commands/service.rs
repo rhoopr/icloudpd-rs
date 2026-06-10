@@ -1244,6 +1244,7 @@ mod tests {
     use crate::selection::{AlbumSelector, Selection, SmartFolderSelector};
     use crate::test_helpers::MockPhotosSession;
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn wait_for_2fa_submit_wakes_when_validation_cache_changes() {
@@ -1251,23 +1252,14 @@ mod tests {
         let username = "user@example.com";
         let cache_path = auth::validation_cache_file_path(dir.path(), username);
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            tokio::join!(
-                wait_for_2fa_submit_with_interval(
-                    dir.path(),
-                    username,
-                    std::time::Duration::from_millis(10),
-                ),
-                async {
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                    tokio::fs::write(&cache_path, b"{\"validated_at\":1}")
-                        .await
-                        .expect("write cache");
-                }
-            );
-        })
-        .await
-        .expect("validation cache write should wake the 2FA waiter");
+        assert_wait_for_2fa_submit_wakes_after_write(
+            dir.path(),
+            username,
+            cache_path,
+            b"{\"validated_at\":1}",
+            "validation cache write",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1276,23 +1268,40 @@ mod tests {
         let username = "user@example.com";
         let cookiejar_path = auth::cookiejar_file_path(dir.path(), username);
 
+        assert_wait_for_2fa_submit_wakes_after_write(
+            dir.path(),
+            username,
+            cookiejar_path,
+            b"[]",
+            "cookie jar write",
+        )
+        .await;
+    }
+
+    async fn assert_wait_for_2fa_submit_wakes_after_write(
+        cookie_dir: &Path,
+        username: &str,
+        signal_path: PathBuf,
+        contents: &'static [u8],
+        context: &'static str,
+    ) {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             tokio::join!(
                 wait_for_2fa_submit_with_interval(
-                    dir.path(),
+                    cookie_dir,
                     username,
                     std::time::Duration::from_millis(10),
                 ),
                 async {
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                    tokio::fs::write(&cookiejar_path, b"[]")
+                    tokio::fs::write(signal_path, contents)
                         .await
-                        .expect("write cookie jar");
+                        .expect(context);
                 }
             );
         })
         .await
-        .expect("cookie jar write should wake the 2FA waiter");
+        .expect("auth state write should wake the 2FA waiter");
     }
 
     /// Build a `PhotoLibrary` stub with a preconfigured mock session.
