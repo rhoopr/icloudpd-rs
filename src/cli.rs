@@ -607,8 +607,8 @@ pub enum Command {
     Verify(VerifyArgs),
 
     /// Reconcile state database with files on disk: mark assets as
-    /// failed when their local file is missing, so the next sync
-    /// re-downloads them.
+    /// failed when their local file is missing or truncated, so the
+    /// next sync re-downloads them.
     Reconcile(ReconcileArgs),
 
     /// Register kei as a system service (launchd on macOS, systemd on

@@ -1354,6 +1354,15 @@ fn kei_reconcile_every_n_cycles_env_var_ignored_by_help() {
         .success();
 }
 
+#[test]
+fn reconcile_help_mentions_truncated_files() {
+    common::cmd()
+        .args(["reconcile", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("missing or truncated"));
+}
+
 // ── config show produces TOML ─────────────────────────────────────────
 
 #[test]
