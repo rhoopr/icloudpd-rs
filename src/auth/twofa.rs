@@ -112,6 +112,17 @@ fn check_apple_service_errors(body: &Value) -> Result<(), AuthError> {
     Ok(())
 }
 
+fn security_code_valid(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|body| {
+            body.get("securityCode")
+                .and_then(|security_code| security_code.get("valid"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
 /// Classify an HTTP error status from an auth endpoint into a typed `AuthError`.
 ///
 /// - 421 → `ServiceError` (Misdirected Request — HTTP/2 routing issue, not auth)
@@ -338,6 +349,12 @@ async fn submit_2fa_code_inner(
         if text.contains("-21669") {
             tracing::error!("Code verification failed: wrong code");
             return Ok(false);
+        }
+        if status.as_u16() == 409 && security_code_valid(&text) {
+            tracing::debug!(
+                "2FA verification returned HTTP 409 after Apple accepted the security code"
+            );
+            return Ok(true);
         }
         return Err(AuthError::ApiError {
             code: status.as_u16(),
@@ -651,6 +668,23 @@ mod tests {
     fn test_check_apple_service_errors_has_error_false_ok() {
         let body = serde_json::json!({"hasError": false});
         assert!(check_apple_service_errors(&body).is_ok());
+    }
+
+    #[test]
+    fn security_code_valid_detects_accepted_code() {
+        let body = r#"{"securityCode":{"code":"123456","valid":true}}"#;
+        assert!(security_code_valid(body));
+    }
+
+    #[test]
+    fn security_code_valid_ignores_rejected_code() {
+        let body = r#"{"securityCode":{"code":"123456","valid":false}}"#;
+        assert!(!security_code_valid(body));
+    }
+
+    #[test]
+    fn security_code_valid_ignores_unrelated_json() {
+        assert!(!security_code_valid(r#"{"valid":true}"#));
     }
 
     #[test]
@@ -1000,6 +1034,41 @@ mod tests {
         .await
         .expect("wrong-code response should be Ok(false), not an error");
         assert!(!ok, "wrong code must return Ok(false)");
+    }
+
+    #[tokio::test]
+    async fn submit_2fa_code_409_with_valid_security_code_succeeds() {
+        // Apple can now return HTTP 409 with X-Apple-Edp even though the body
+        // says the submitted device code was valid. Treat the body-level
+        // acceptance as success so the caller can continue to trust/login.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/appleauth/auth/verify/trusteddevice/securitycode"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .insert_header("X-Apple-Edp", "true")
+                    .set_body_string(
+                        r#"{"securityCode":{"code":"123456","valid":true,"tooManyCodesValidated":false}}"#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, mut session) = session_for(&server).await;
+        let endpoints = Endpoints::for_test_base(&server.uri());
+        let ok = submit_2fa_code_inner(
+            &mut session,
+            &endpoints,
+            "client-id",
+            "com",
+            "123456",
+            &TEST_RETRY,
+        )
+        .await
+        .expect("valid 409 body should be accepted");
+
+        assert!(ok, "valid securityCode body must unblock 2FA");
     }
 
     #[tokio::test]
