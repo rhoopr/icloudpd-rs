@@ -231,7 +231,7 @@ password for future runs.
 | `--log-level` | `--log-level` or `log_level` | `debug`, `info`, `warn`, `error`. |
 | `--only-print-filenames` | `--only-print-filenames` | Per-run flag that prints paths and doesn't download. |
 | `--dry-run` | `--dry-run` | Per-run flag that doesn't modify local state or iCloud. |
-| `--notification-script` | `[notifications].script` | kei sends `KEI_EVENT`, `KEI_MESSAGE`, and `KEI_REPORT_JSON` when a report path is configured. |
+| `--notification-script` | `[notifications].script` | kei sends `KEI_EVENT` and `KEI_MESSAGE`. Breaking in v0.22: per-cycle stat env vars and `KEI_ICLOUD_USERNAME` were replaced by `KEI_REPORT_JSON` when `[report].json` is configured. |
 
 ## Python flags without a kei equivalent
 

@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `kei doctor` with redacted text and JSON diagnostics for config parsing, local paths, state DB access, session presence, and recent health/report files. (fixes [#588])
 
+### Changed
+
+- Notification scripts now get cycle details through `KEI_REPORT_JSON` instead of per-stat environment variables. Scripts still receive `KEI_EVENT` and `KEI_MESSAGE`; scripts that read `KEI_ICLOUD_USERNAME`, `KEI_DOWNLOADED`, `KEI_FAILED`, `KEI_SKIPPED`, or other per-cycle `KEI_*` stats should configure `[report].json` and read that file. This is a breaking change for scripts that used the old notification env vars.
+
 ### Fixed
 
 - Normal incremental sync now retries known pending or failed asset-version rows with a targeted refresh pass instead of forcing full-library enumeration, and keeps sync-token advancement blocked when retry work is incomplete. (fixes [#506])

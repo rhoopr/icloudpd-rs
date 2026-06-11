@@ -1284,7 +1284,7 @@ fn sync_only_print_filenames_emits_names_without_downloading() {
     });
 }
 
-/// --notification-script should be called with ICLOUDPD_EVENT set.
+/// [notifications].script should be called with KEI_EVENT set.
 #[test]
 #[ignore]
 fn sync_notification_script_fires_event() {

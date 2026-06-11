@@ -125,6 +125,45 @@ fn migration_guide_uses_toml_for_durable_sync_settings() {
 }
 
 #[test]
+fn notification_script_docs_call_out_report_json_break() {
+    let changelog = repo_file("CHANGELOG.md");
+    assert!(
+        changelog.contains(
+            "Notification scripts now get cycle details through `KEI_REPORT_JSON` instead of per-stat environment variables."
+        ),
+        "changelog must call out the notification-script env-var break"
+    );
+    assert!(
+        changelog.contains(
+            "This is a breaking change for scripts that used the old notification env vars."
+        ),
+        "changelog must label the notification-script env-var change as breaking"
+    );
+
+    let guide = repo_file("docs/migration-from-icloudpd.md");
+    assert!(
+        guide.contains("kei sends `KEI_EVENT` and `KEI_MESSAGE`. Breaking in v0.22:"),
+        "migration guide must call out the v0.22 notification-script break"
+    );
+    assert!(
+        guide.contains("were replaced by `KEI_REPORT_JSON` when `[report].json` is configured"),
+        "migration guide must point old notification-script env consumers to report JSON"
+    );
+
+    let example_config = repo_file("example.config.toml");
+    assert!(
+        example_config.contains(
+            "receives KEI_EVENT, KEI_MESSAGE, and KEI_REPORT_JSON when [report].json is configured"
+        ),
+        "example config must describe the current notification-script env surface"
+    );
+    assert!(
+        !example_config.contains("KEI_ICLOUD_USERNAME"),
+        "example config must not advertise removed notification-script env vars"
+    );
+}
+
+#[test]
 fn full_test_routes_child_tempdirs_to_tmp_codex() {
     let run_all = repo_file("scripts/full-test/run_all.sh");
     let tmp_assignment = "full_tmp_dir=\"${KEI_FULL_TEST_TMPDIR:-/tmp/codex/kei/full-test/tmp}\"";
