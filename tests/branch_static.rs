@@ -125,41 +125,37 @@ fn migration_guide_uses_toml_for_durable_sync_settings() {
 }
 
 #[test]
-fn notification_script_docs_call_out_report_json_break() {
+fn notification_script_docs_pin_legacy_env_plus_report_json() {
     let changelog = repo_file("CHANGELOG.md");
     assert!(
         changelog.contains(
-            "Notification scripts now get cycle details through `KEI_REPORT_JSON` instead of per-stat environment variables."
+            "Notification scripts keep the existing `KEI_ICLOUD_USERNAME` and per-cycle `KEI_*` stat variables"
         ),
-        "changelog must call out the notification-script env-var break"
+        "changelog must pin the legacy notification-script env contract"
     );
     assert!(
-        changelog.contains(
-            "This is a breaking change for scripts that used the old notification env vars."
-        ),
-        "changelog must label the notification-script env-var change as breaking"
+        changelog.contains("now also receive `KEI_REPORT_JSON` when `[report].json` is configured"),
+        "changelog must call out report JSON as an addition"
     );
 
     let guide = repo_file("docs/migration-from-icloudpd.md");
     assert!(
-        guide.contains("kei sends `KEI_EVENT` and `KEI_MESSAGE`. Breaking in v0.22:"),
-        "migration guide must call out the v0.22 notification-script break"
+        guide.contains("kei sends `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME`"),
+        "migration guide must keep the legacy notification-script username env var"
     );
     assert!(
-        guide.contains("were replaced by `KEI_REPORT_JSON` when `[report].json` is configured"),
-        "migration guide must point old notification-script env consumers to report JSON"
+        guide.contains(
+            "per-cycle `KEI_*` stats, and `KEI_REPORT_JSON` when `[report].json` is configured"
+        ),
+        "migration guide must document legacy stats plus report JSON"
     );
 
     let example_config = repo_file("example.config.toml");
     assert!(
         example_config.contains(
-            "receives KEI_EVENT, KEI_MESSAGE, and KEI_REPORT_JSON when [report].json is configured"
+            "receives KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME, per-cycle KEI_* stats, and KEI_REPORT_JSON when [report].json is configured"
         ),
         "example config must describe the current notification-script env surface"
-    );
-    assert!(
-        !example_config.contains("KEI_ICLOUD_USERNAME"),
-        "example config must not advertise removed notification-script env vars"
     );
 }
 
@@ -170,6 +166,8 @@ fn full_test_routes_child_tempdirs_to_tmp_codex() {
     let tmp_export = "export TMPDIR=\"$full_tmp_dir\"";
     let temp_export = "export TEMP=\"$full_tmp_dir\"";
     let tmp_windows_export = "export TMP=\"$full_tmp_dir\"";
+    let shell_scratch_export =
+        "export KEI_TEST_SCRATCH_DIR=\"${KEI_TEST_SCRATCH_DIR:-$full_tmp_dir/shell}\"";
 
     for expected in [
         tmp_assignment,
@@ -177,6 +175,8 @@ fn full_test_routes_child_tempdirs_to_tmp_codex() {
         tmp_export,
         temp_export,
         tmp_windows_export,
+        shell_scratch_export,
+        "mkdir -p \"$KEI_TEST_SCRATCH_DIR\"",
     ] {
         assert!(
             run_all.contains(expected),
@@ -187,6 +187,9 @@ fn full_test_routes_child_tempdirs_to_tmp_codex() {
     let export_pos = run_all
         .find(tmp_export)
         .expect("full-test must export TMPDIR before live tests");
+    let shell_export_pos = run_all
+        .find(shell_scratch_export)
+        .expect("full-test must export KEI_TEST_SCRATCH_DIR before shell tests");
     let live_pos = run_all
         .find("run_live_phase test_live")
         .expect("full-test live phase must still exist");
@@ -195,8 +198,8 @@ fn full_test_routes_child_tempdirs_to_tmp_codex() {
         .expect("full-test shell phase must still exist");
 
     assert!(
-        export_pos < live_pos && export_pos < shell_pos,
-        "TMPDIR must be set before live cargo and shell phases allocate tempdirs"
+        export_pos < live_pos && export_pos < shell_pos && shell_export_pos < shell_pos,
+        "TMPDIR and KEI_TEST_SCRATCH_DIR must be set before live cargo and shell phases allocate tempdirs"
     );
 }
 

@@ -13,14 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `kei doctor` with redacted text and JSON diagnostics for config parsing, local paths, state DB access, session presence, and recent health/report files. (fixes [#588])
 
-### Changed
-
-- Notification scripts now get cycle details through `KEI_REPORT_JSON` instead of per-stat environment variables. Scripts still receive `KEI_EVENT` and `KEI_MESSAGE`; scripts that read `KEI_ICLOUD_USERNAME`, `KEI_DOWNLOADED`, `KEI_FAILED`, `KEI_SKIPPED`, or other per-cycle `KEI_*` stats should configure `[report].json` and read that file. This is a breaking change for scripts that used the old notification env vars.
-
 ### Fixed
 
 - Normal incremental sync now retries known pending or failed asset-version rows with a targeted refresh pass instead of forcing full-library enumeration, and keeps sync-token advancement blocked when retry work is incomplete. (fixes [#506])
 - Published files left behind by a failed state write now keep the sync cycle partial when kei retries from the pending row, so zone and database sync tokens stay blocked until the file is recorded in state. (fixes [#515])
+- Notification scripts keep the existing `KEI_ICLOUD_USERNAME` and per-cycle `KEI_*` stat variables, and now also receive `KEI_REPORT_JSON` when `[report].json` is configured.
 - Loopback-bound wiremock and metrics tests now return early with an explicit skip line when a restricted sandbox forbids `127.0.0.1` binds, while normal CI hosts still run the tests strictly. (fixes [#479])
 - Added a lightweight `CONTRACT:` marker check for the sync-token advancement gate, with a matching contract test, so future refactors can't drop the safety invariant by accident. (fixes [#580])
 - Extended the lightweight `CONTRACT:` marker coverage to the `.part` publish path so no-overwrite file promotion stays tied to a named regression test. (fixes [#580])

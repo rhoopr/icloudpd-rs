@@ -602,7 +602,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 u = config.auth.username
             );
             tracing::warn!(message = %msg, "2FA required");
-            notifier.notify(notifications::Event::TwoFaRequired, &msg, None);
+            notifier.notify(
+                notifications::Event::TwoFaRequired,
+                &msg,
+                &config.auth.username,
+                None,
+                None,
+            );
 
             wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
                 auth::authenticate_with_mode(
@@ -1110,6 +1116,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             notifier.notify(
                 notifications::Event::SyncStarted,
                 "Sync cycle starting",
+                &config.auth.username,
+                None,
                 None,
             );
 
@@ -1234,7 +1242,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             u = config.auth.username
                         );
                         tracing::warn!(message = %msg, "2FA required");
-                        notifier.notify(notifications::Event::TwoFaRequired, &msg, None);
+                        notifier.notify(
+                            notifications::Event::TwoFaRequired,
+                            &msg,
+                            &config.auth.username,
+                            None,
+                            None,
+                        );
                         if !should_wait_for_2fa(is_watch_mode, &e) {
                             return Err(e);
                         }
@@ -1259,6 +1273,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         notifier.notify(
                             notifications::Event::SessionExpired,
                             &format!("Re-authentication failed: {e}"),
+                            &config.auth.username,
+                            None,
                             None,
                         );
                         return Err(e);
@@ -1470,7 +1486,13 @@ async fn reauth_with_srp(
                 u = config.auth.username
             );
             tracing::warn!(message = %msg, "2FA required");
-            notifier.notify(notifications::Event::TwoFaRequired, &msg, None);
+            notifier.notify(
+                notifications::Event::TwoFaRequired,
+                &msg,
+                &config.auth.username,
+                None,
+                None,
+            );
             wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
                 auth::authenticate_with_mode(
                     &config.auth.cookie_directory,

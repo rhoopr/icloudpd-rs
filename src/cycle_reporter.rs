@@ -334,20 +334,27 @@ where
     }
 
     fn notify_cycle_outcome(&self, input: &CycleFacts<'_>) {
+        let notification_data = notifications::SyncNotificationData::from(input.stats);
         match input.status {
             CycleStatus::Success => self.notifier.notify(
                 notifications::Event::SyncComplete,
                 "Sync completed successfully",
+                &self.run_options.username,
+                Some(&notification_data),
                 self.report_path,
             ),
             CycleStatus::Failed => self.notifier.notify(
                 notifications::Event::SyncFailed,
                 &format!("{} sync failures", input.failed_count),
+                &self.run_options.username,
+                Some(&notification_data),
                 self.report_path,
             ),
             CycleStatus::Interrupted => self.notifier.notify(
                 notifications::Event::SyncFailed,
                 "Sync interrupted",
+                &self.run_options.username,
+                Some(&notification_data),
                 self.report_path,
             ),
             CycleStatus::SessionExpired => {}
@@ -491,7 +498,7 @@ mod tests {
         let script_path = dir.join("notify.sh");
         let output_path = shell_quote(output_path);
         let body = format!(
-            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$KEI_EVENT\" \"$KEI_MESSAGE\" \"${{KEI_REPORT_JSON:-}}\" > {output_path}\n"
+            "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s\\n' \"$KEI_EVENT\" \"$KEI_MESSAGE\" \"$KEI_ICLOUD_USERNAME\" \"${{KEI_DOWNLOADED:-}}\" \"${{KEI_FAILED:-}}\" \"${{KEI_REPORT_JSON:-}}\" > {output_path}\n"
         );
         std::fs::write(&script_path, body).unwrap();
         script_path
@@ -858,9 +865,11 @@ mod tests {
 
             let notification = wait_for_notification_output(&notification_output).await;
             let expected_notification = format!(
-                "{}|{}|{}",
+                "{}|{}|reporter@example.com|{}|{}|{}",
                 case.expected_notification,
                 case.expected_notification_message,
+                case.stats.downloaded,
+                case.stats.failed,
                 report_path.display()
             );
             assert_eq!(

@@ -95,6 +95,8 @@ mkdir -p "$full_tmp_dir"
 export TMPDIR="$full_tmp_dir"
 export TEMP="$full_tmp_dir"
 export TMP="$full_tmp_dir"
+export KEI_TEST_SCRATCH_DIR="${KEI_TEST_SCRATCH_DIR:-$full_tmp_dir/shell}"
+mkdir -p "$KEI_TEST_SCRATCH_DIR"
 
 tp() { "$script_dir/time_phase.sh" "$@"; }
 run_phase() {

@@ -67,7 +67,7 @@ xmp_sidecar = false # requires default xmp feature; writes .xmp sidecars
 reconcile_every_n_cycles = 0 # 0 or unset disables periodic read-only reconcile
 
 [notifications]
-# script = "/config/notify.sh" # default: unset; receives KEI_EVENT, KEI_MESSAGE, and KEI_REPORT_JSON when [report].json is configured
+# script = "/config/notify.sh" # default: unset; receives KEI_EVENT, KEI_MESSAGE, KEI_ICLOUD_USERNAME, per-cycle KEI_* stats, and KEI_REPORT_JSON when [report].json is configured
 
 [report]
 # json = "/config/sync_report.json" # default: unset; latest sync report path
