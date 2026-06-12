@@ -310,8 +310,8 @@ pub struct SyncStats {
     /// These are not hard enumeration failures and do not imply download
     /// failures.
     pub pagination_shortfall_warnings: usize,
-    /// Sum of missing assets reported by tolerated or token-unsafe
-    /// pagination shortfalls.
+    /// Sum of missing assets reported by count side-channel pagination
+    /// shortfalls.
     pub pagination_shortfall_assets: u64,
     /// True when the asset producer stopped before naturally exhausting the
     /// iCloud stream for a reason other than an external interrupt.
@@ -559,9 +559,7 @@ pub(crate) fn sync_token_blocked_bounded_log_message(reason: &str) -> Option<&'s
 
 pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
     match reason {
-        "pagination_shortfall" => {
-            "enumeration counts did not line up safely, so kei blocked token advancement"
-        }
+        "pagination_shortfall" => "enumeration counts did not line up",
         ICLOUD_ALBUM_COUNT_ERROR_REASON => {
             "iCloud returned a missing or malformed album count response"
         }
@@ -4067,15 +4065,16 @@ async fn build_pass_count_plan(
 /// Classification of how the producer-observed asset count compared with the
 /// pre-enumeration API total.
 ///
-/// A positive shortfall is token-unsafe unless the only gap is duplicate asset
-/// IDs already observed from the API stream. CloudKit's count endpoint can
-/// include those duplicate rows, while the producer intentionally counts only
-/// unique assets after duplicate suppression.
+/// A positive shortfall means the count side-channel disagreed with the
+/// producer stream. CloudKit's count endpoint can include duplicate rows or a
+/// broader population than the selected records/query stream, while the
+/// producer intentionally counts only unique assets after duplicate
+/// suppression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaginationShortfall {
     Match,
     DuplicateCompensated { shortfall: u64 },
-    TokenUnsafe { shortfall: u64 },
+    Shortfall { shortfall: u64 },
 }
 
 /// Pure classifier for the pagination-undercount gate. `total` is the
@@ -4100,7 +4099,7 @@ fn classify_pagination_shortfall(
     }
 
     let shortfall = total - raw_seen;
-    PaginationShortfall::TokenUnsafe { shortfall }
+    PaginationShortfall::Shortfall { shortfall }
 }
 
 /// Resolve the zone sync token from every full-enumeration pass that reported
@@ -4484,7 +4483,7 @@ async fn download_photos_full_with_token(
     let mut pagination_shortfall_assets = 0u64;
     let mut pagination_shortfall_warnings = 0usize;
     let count_lookup_failed = len_errors > 0;
-    let pagination_undercount = if !count_lookup_failed
+    if !count_lookup_failed
         && !controls.run_mode.only_print_filenames()
         && !controls.run_mode.is_dry_run()
     {
@@ -4497,7 +4496,7 @@ async fn download_photos_full_with_token(
                 duplicate_asset_ids,
             );
             match decision {
-                PaginationShortfall::Match => false,
+                PaginationShortfall::Match => {}
                 PaginationShortfall::DuplicateCompensated { shortfall } => {
                     tracing::warn!(
                         expected = total,
@@ -4507,9 +4506,8 @@ async fn download_photos_full_with_token(
                         "Enumeration count shortfall was explained by duplicate asset IDs; \
                          continuing sync token capture"
                     );
-                    false
                 }
-                PaginationShortfall::TokenUnsafe { shortfall } => {
+                PaginationShortfall::Shortfall { shortfall } => {
                     pagination_shortfall_assets = shortfall;
                     pagination_shortfall_warnings = 1;
                     tracing::warn!(
@@ -4517,25 +4515,20 @@ async fn download_photos_full_with_token(
                         seen = streaming_result.assets_seen,
                         duplicate_asset_ids,
                         shortfall,
-                        "Enumeration saw fewer assets than expected — blocking sync token \
-                         advancement to force full re-enumeration on next run"
+                        "Enumeration saw fewer assets than the count side-channel reported; \
+                         treating as diagnostic and continuing sync token capture"
                     );
-                    true
                 }
             }
-        } else {
-            false
         }
-    } else {
-        false
-    };
+    }
 
     // Collect the sync token from every album's token receiver and require
     // agreement before advancing. In practice, all passes for a zone should
     // report the same token; disagreement means the full enumeration did not
     // observe one coherent snapshot.
-    // Don't advance the token for read-only operations, or when pagination
-    // was incomplete (would permanently skip missed assets).
+    // Don't advance the token for read-only operations or when the producer
+    // stream was incomplete (would permanently skip missed assets).
     // Do not persist a full-enumeration zone token for count-recent or
     // skip-created-before runs. Those runs intentionally stop before the full
     // pass is drained, so advancing the token would make older, unenumerated
@@ -4543,7 +4536,6 @@ async fn download_photos_full_with_token(
     let token_eligible = config.recent.is_none()
         && config.skip_created_before.is_none()
         && !controls.run_mode.only_print_filenames()
-        && !pagination_undercount
         && streaming_result.enumeration_complete
         && streaming_result.enumeration_errors == 0;
     let mut token_block_reason: Option<&'static str> = None;
@@ -4659,12 +4651,6 @@ async fn download_photos_full_with_token(
                  sync token; recording diagnostic and allowing token advancement"
             );
         }
-    } else if pagination_undercount {
-        stats.sync_token_blocked = true;
-        stats.sync_token_blocked_reason = Some("pagination_shortfall");
-        stats.sync_token_blocked_source = Some(sync_token_blocked_source("pagination_shortfall"));
-        stats.sync_token_blocked_explanation =
-            Some(sync_token_blocked_explanation("pagination_shortfall"));
     } else if (config.recent.is_some() || config.skip_created_before.is_some())
         && !controls.run_mode.only_print_filenames()
         && enumeration_errors == 0
@@ -7328,7 +7314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_enumeration_shortfall_blocks_sync_token() {
+    async fn full_enumeration_shortfall_warns_but_allows_sync_token() {
         let records = mock_photo_records_with_filename("MASTER_SHORTFALL", "shortfall.jpg");
         let session = MockPhotosFlow::new()
             .album_count(2)
@@ -7370,23 +7356,21 @@ mod tests {
         assert_eq!(result.stats.enumeration_errors, 0);
         assert_eq!(result.stats.pagination_shortfall_warnings, 1);
         assert_eq!(result.stats.pagination_shortfall_assets, 1);
-        assert!(result.stats.sync_token_blocked);
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.stats.sync_token_blocked_reason, None);
+        assert_eq!(result.stats.sync_token_blocked_source, None);
+        assert_eq!(result.stats.sync_token_blocked_explanation, None);
+        assert_eq!(result.stats.sync_token_expected_receivers, Some(1));
+        assert_eq!(result.stats.sync_token_receivers_with_token, Some(1));
+        assert_eq!(result.stats.sync_token_receivers_missing, Some(0));
+        assert_eq!(result.stats.sync_token_receivers_blank, Some(0));
+        assert_eq!(result.stats.sync_token_receivers_dropped, Some(0));
+        assert_eq!(result.stats.sync_token_unique_values, Some(1));
         assert_eq!(
-            result.stats.sync_token_blocked_reason,
-            Some("pagination_shortfall")
+            result.sync_token.as_deref(),
+            Some("zone-token"),
+            "count-side-channel shortfall should not block a usable sync token"
         );
-        assert_eq!(result.stats.sync_token_blocked_source, Some("icloud"));
-        assert_eq!(
-            result.stats.sync_token_blocked_explanation,
-            Some(sync_token_blocked_explanation("pagination_shortfall"))
-        );
-        assert_eq!(result.stats.sync_token_expected_receivers, None);
-        assert_eq!(result.stats.sync_token_receivers_with_token, None);
-        assert_eq!(result.stats.sync_token_receivers_missing, None);
-        assert_eq!(result.stats.sync_token_receivers_blank, None);
-        assert_eq!(result.stats.sync_token_receivers_dropped, None);
-        assert_eq!(result.stats.sync_token_unique_values, None);
-        assert_eq!(result.sync_token, None, "token should stay blocked");
     }
 
     #[tokio::test]
@@ -10992,10 +10976,10 @@ mod tests {
             inventory_drop_current_total: Some(95),
             inventory_drop_library: Some("PrimarySync".to_string()),
             sync_token_blocked: true,
-            sync_token_blocked_reason: Some("pagination_shortfall"),
+            sync_token_blocked_reason: Some("icloud_blank_sync_token"),
             sync_token_blocked_source: Some("icloud"),
             sync_token_blocked_explanation: Some(sync_token_blocked_explanation(
-                "pagination_shortfall",
+                "icloud_blank_sync_token",
             )),
             sync_token_blocked_zone: Some("PrimarySync".to_string()),
             sync_token_expected_receivers: Some(3),
@@ -11122,11 +11106,14 @@ mod tests {
             Some("SharedSync-abc".to_string())
         );
         assert!(acc.sync_token_blocked, "sync_token_blocked must OR");
-        assert_eq!(acc.sync_token_blocked_reason, Some("pagination_shortfall"));
+        assert_eq!(
+            acc.sync_token_blocked_reason,
+            Some("icloud_blank_sync_token")
+        );
         assert_eq!(acc.sync_token_blocked_source, Some("icloud"));
         assert_eq!(
             acc.sync_token_blocked_explanation,
-            Some(sync_token_blocked_explanation("pagination_shortfall"))
+            Some(sync_token_blocked_explanation("icloud_blank_sync_token"))
         );
         assert_eq!(acc.sync_token_blocked_zone.as_deref(), Some("PrimarySync"));
         assert_eq!(acc.sync_token_expected_receivers, Some(3));
@@ -12117,71 +12104,64 @@ mod tests {
         );
     }
 
-    /// A 1% undercount is still token-unsafe. Count shortfalls are sometimes
-    /// only operator warnings, but they must not advance full-enumeration
-    /// sync tokens.
+    /// A 1% undercount is a diagnostic signal, not a token blocker.
     #[test]
-    fn classify_pagination_shortfall_one_percent_below_blocks_token() {
+    fn classify_pagination_shortfall_one_percent_below_warns() {
         // 1000 expected, 990 seen -> 1% shortfall, within 5% and <= 100.
         let decision = classify_pagination_shortfall(1000, 990, 0);
         assert_eq!(
             decision,
-            PaginationShortfall::TokenUnsafe { shortfall: 10 },
-            "any positive shortfall must block the sync token"
+            PaginationShortfall::Shortfall { shortfall: 10 },
+            "shortfalls should be reported without classifying the stream as incomplete"
         );
     }
 
-    /// A 4% undercount still blocks token advancement.
+    /// A 4% undercount is still a diagnostic signal.
     #[test]
-    fn classify_pagination_shortfall_four_percent_below_blocks_token() {
+    fn classify_pagination_shortfall_four_percent_below_warns() {
         // 1000 expected, 960 seen -> 4% shortfall, 40 assets.
         let decision = classify_pagination_shortfall(1000, 960, 0);
-        assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 40 });
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 40 });
     }
 
-    /// A 6% undercount exceeds the percent tolerance and blocks token
-    /// advancement.
+    /// A 6% undercount is still reported as diagnostic drift.
     #[test]
-    fn classify_pagination_shortfall_six_percent_below_blocks_token() {
+    fn classify_pagination_shortfall_six_percent_below_warns() {
         // 1000 expected, 940 seen -> 6% shortfall.
         let decision = classify_pagination_shortfall(1000, 940, 0);
-        assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 60 });
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 60 });
     }
 
-    /// Boundary case at the old 5% tolerance still blocks tokens.
+    /// Boundary case at the old 5% tolerance is diagnostic-only too.
     #[test]
-    fn classify_pagination_shortfall_at_old_tolerance_boundary_blocks_token() {
+    fn classify_pagination_shortfall_at_old_tolerance_boundary_warns() {
         let decision = classify_pagination_shortfall(1000, 950, 0);
-        assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 50 });
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 50 });
     }
 
     /// Regression fixture for issue #498: expected=1578, seen=1533
-    /// (shortfall=45, ~2.85%). This can remain a non-fatal warning, but it
-    /// must be token-unsafe.
+    /// (shortfall=45, ~2.85%). This remains a non-fatal warning.
     #[test]
-    fn classify_pagination_shortfall_issue_498_fixture_blocks_token() {
+    fn classify_pagination_shortfall_issue_498_fixture_warns() {
         let decision = classify_pagination_shortfall(1578, 1533, 0);
-        assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 45 });
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 45 });
     }
 
     /// Regression fixture from downstream k8s-gitops mitigation:
     /// expected=31_000, seen=30_959 (shortfall=41, ~0.13%).
     #[test]
-    fn classify_pagination_shortfall_billimek_sharedsync_fixture_blocks_token() {
+    fn classify_pagination_shortfall_billimek_sharedsync_fixture_warns() {
         let decision = classify_pagination_shortfall(31_000, 30_959, 0);
-        assert_eq!(decision, PaginationShortfall::TokenUnsafe { shortfall: 41 });
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 41 });
     }
 
-    /// Large absolute shortfalls remain token-unsafe even if percent gap is
-    /// small.
+    /// Large absolute shortfalls remain diagnostic even if the count gap is
+    /// large.
     #[test]
-    fn classify_pagination_shortfall_large_absolute_gap_blocks_token() {
+    fn classify_pagination_shortfall_large_absolute_gap_warns() {
         // 10_000 expected, 9_890 seen -> 1.1% shortfall, but 110 assets.
         let decision = classify_pagination_shortfall(10_000, 9_890, 0);
-        assert_eq!(
-            decision,
-            PaginationShortfall::TokenUnsafe { shortfall: 110 }
-        );
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 110 });
     }
 
     /// The orphan-part walk must remove .part files older

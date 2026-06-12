@@ -709,8 +709,7 @@ mod tests {
             enumeration_errors: 0,
             pagination_shortfall_warnings: 1,
             pagination_shortfall_assets: 41,
-            sync_token_blocked: true,
-            sync_token_blocked_reason: Some("pagination_shortfall"),
+            sync_token_blocked: false,
             ..SyncStats::default()
         };
         handle.update(&stats, &healthy_status(0)).await;
@@ -733,7 +732,7 @@ mod tests {
             "output:\n{output}"
         );
         assert!(
-            output.contains("kei_sync_token_blocked_cycles_total 1"),
+            output.contains("kei_sync_token_blocked_cycles_total 0"),
             "output:\n{output}"
         );
     }
