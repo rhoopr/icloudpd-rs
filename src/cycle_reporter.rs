@@ -596,11 +596,18 @@ mod tests {
                 ],
             },
             OutcomeCase {
-                name: "warning-only pagination shortfall success",
+                name: "warning-only token-blocked success",
                 stats: SyncStats {
                     assets_seen: 1533,
                     pagination_shortfall_warnings: 1,
                     pagination_shortfall_assets: 45,
+                    sync_token_blocked: true,
+                    sync_token_blocked_reason: Some("pagination_shortfall"),
+                    sync_token_blocked_source: Some("icloud"),
+                    sync_token_blocked_explanation: Some(
+                        crate::download::sync_token_blocked_explanation("pagination_shortfall"),
+                    ),
+                    sync_token_blocked_zone: Some("PrimarySync".to_string()),
                     full_enumeration_reason: Some(
                         crate::download::FullEnumerationReason::RetryFailedRows,
                     ),
@@ -620,7 +627,7 @@ mod tests {
                     "kei_sync_failed_total 0",
                     "kei_sync_enumeration_errors_total 0",
                     "kei_sync_pagination_shortfall_warnings_total 1",
-                    "kei_sync_token_blocked_cycles_total 0",
+                    "kei_sync_token_blocked_cycles_total 1",
                     "kei_sync_full_enumeration_reason_total{reason=\"retry_failed_rows\"} 1",
                 ],
             },
@@ -1043,7 +1050,8 @@ mod tests {
             enumeration_errors: 0,
             pagination_shortfall_warnings: 1,
             pagination_shortfall_assets: 45,
-            sync_token_blocked: false,
+            sync_token_blocked: true,
+            sync_token_blocked_reason: Some("pagination_shortfall"),
             ..SyncStats::default()
         };
 
@@ -1059,8 +1067,11 @@ mod tests {
         assert_eq!(report_json["stats"]["enumeration_errors"], 0);
         assert_eq!(report_json["stats"]["pagination_shortfall_warnings"], 1);
         assert_eq!(report_json["stats"]["pagination_shortfall_assets"], 45);
-        assert_eq!(report_json["stats"]["sync_token_blocked"], false);
-        assert!(report_json["stats"]["sync_token_blocked_reason"].is_null());
+        assert_eq!(report_json["stats"]["sync_token_blocked"], true);
+        assert_eq!(
+            report_json["stats"]["sync_token_blocked_reason"],
+            "pagination_shortfall"
+        );
     }
 
     #[tokio::test]

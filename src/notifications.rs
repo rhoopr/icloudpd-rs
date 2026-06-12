@@ -485,7 +485,7 @@ mod tests {
             skipped: 5,
             bytes_downloaded: 4096,
             skipped_by_state: 4,
-            sync_token_blocked_reason: Some("icloud_blank_sync_token"),
+            sync_token_blocked_reason: Some("pagination_shortfall"),
             ..SyncNotificationData::default()
         };
 
@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(
             output.trim(),
             format!(
-                "{}|icloud@example.com|2|3|5|4096|4|icloud_blank_sync_token",
+                "{}|icloud@example.com|2|3|5|4096|4|pagination_shortfall",
                 report_path.display()
             )
         );
