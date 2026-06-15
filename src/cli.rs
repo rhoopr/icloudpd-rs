@@ -985,23 +985,11 @@ impl std::fmt::Display for ParseCliError {
 impl std::error::Error for ParseCliError {}
 
 fn command_context_from_argv(argv: &[OsString]) -> Option<&str> {
-    const KNOWN_COMMANDS: [&str; 11] = [
-        "sync",
-        "login",
-        "list",
-        "password",
-        "reset",
-        "config",
-        "status",
-        "verify",
-        "import-existing",
-        "reconcile",
-        "service",
-    ];
+    let command = <Cli as clap::CommandFactory>::command();
     argv.iter()
         .skip(1)
         .filter_map(|token| token.to_str())
-        .find(|token| KNOWN_COMMANDS.contains(token))
+        .find(|token| command.find_subcommand(token).is_some())
 }
 
 fn should_append_removed_sync_surface_hint(argv: &[OsString], err: &clap::Error) -> bool {
@@ -1172,6 +1160,61 @@ mod tests {
         let explicit_sync_flags = explicit_top_level_sync_flags(&matches);
         let cli = Cli::from_arg_matches(&matches).map_err(|err| err.to_string())?;
         cli.validate(&explicit_sync_flags)
+    }
+
+    #[test]
+    fn command_context_uses_clap_subcommand_metadata() {
+        let command = <Cli as clap::CommandFactory>::command();
+        for subcommand in command.get_subcommands() {
+            let subcommand_name = subcommand.get_name();
+            let argv = [
+                OsString::from("kei"),
+                OsString::from(subcommand_name),
+                OsString::from("--download-dir"),
+                OsString::from("/photos"),
+            ];
+            assert_eq!(
+                command_context_from_argv(&argv),
+                Some(subcommand_name),
+                "subcommand `{subcommand_name}` should be discovered from clap metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_sync_surface_hint_stays_on_sync_like_commands() {
+        for argv in [
+            &["kei", "--download-dir", "/photos"][..],
+            &["kei", "sync", "--download-dir", "/photos"][..],
+            &["kei", "import-existing", "--download-dir", "/photos"][..],
+            &["kei", "service", "run", "--download-dir", "/photos"][..],
+        ] {
+            let err = parse_cli_with_sources(argv).expect_err("removed flag must fail");
+            assert!(
+                err.rendered()
+                    .contains("v0.20 removed durable sync CLI flags"),
+                "sync-like command should include migration hint: {}",
+                err.rendered()
+            );
+        }
+    }
+
+    #[test]
+    fn removed_sync_surface_hint_skips_other_metadata_commands() {
+        for argv in [
+            &["kei", "doctor", "--download-dir", "/photos"][..],
+            &["kei", "manifest", "--download-dir", "/photos"][..],
+            &["kei", "install", "--download-dir", "/photos"][..],
+            &["kei", "service", "status", "--download-dir", "/photos"][..],
+        ] {
+            let err = parse_cli_with_sources(argv).expect_err("removed flag must fail");
+            assert!(
+                !err.rendered()
+                    .contains("v0.20 removed durable sync CLI flags"),
+                "non-sync command should not include migration hint: {}",
+                err.rendered()
+            );
+        }
     }
 
     // ── RecentLimit parser ──────────────────────────────────────────
