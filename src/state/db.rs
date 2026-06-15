@@ -1,6 +1,6 @@
 //! State database trait and `SQLite` implementation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -480,6 +480,27 @@ pub struct SqliteStateDb {
     path: PathBuf,
 }
 
+/// One row from the read-only local manifest export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestAssetRow {
+    pub(crate) library: String,
+    pub(crate) asset_id: String,
+    pub(crate) version: String,
+    pub(crate) filename: String,
+    pub(crate) local_path: Option<PathBuf>,
+    pub(crate) checksum: String,
+    pub(crate) local_checksum: Option<String>,
+    pub(crate) download_checksum: Option<String>,
+    pub(crate) size_bytes: u64,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) added_at: Option<DateTime<Utc>>,
+    pub(crate) downloaded_at: Option<DateTime<Utc>>,
+    pub(crate) last_seen_at: DateTime<Utc>,
+    pub(crate) media_type: String,
+    pub(crate) status: String,
+    pub(crate) albums: Vec<String>,
+}
+
 impl std::fmt::Debug for SqliteStateDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteStateDb")
@@ -527,6 +548,49 @@ impl SqliteStateDb {
 
             // Run migrations
             schema::migrate(&conn)?;
+
+            Ok::<_, StateError>(conn)
+        })
+        .await??;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path,
+        })
+    }
+
+    /// Open an existing database for read-only inspection.
+    ///
+    /// This intentionally skips migration and WAL setup so diagnostic export
+    /// commands can prove they do not mutate the state DB. Callers should
+    /// check that the file exists before opening so a typo doesn't create a
+    /// fresh empty database.
+    pub(crate) async fn open_read_only(path: &Path) -> Result<Self, StateError> {
+        let path = path.to_path_buf();
+        let path_clone = path.clone();
+        let conn = tokio::task::spawn_blocking(move || {
+            let conn = Connection::open_with_flags(
+                &path_clone,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|e| StateError::Open {
+                path: path_clone.clone(),
+                source: e,
+            })?;
+
+            let version = schema::get_schema_version(&conn)?;
+            if version > schema::SCHEMA_VERSION {
+                return Err(StateError::UnsupportedSchemaVersion {
+                    found: version,
+                    expected: schema::SCHEMA_VERSION,
+                });
+            }
+            if version < schema::SCHEMA_VERSION {
+                return Err(StateError::ReadOnlySchemaTooOld {
+                    found: version,
+                    expected: schema::SCHEMA_VERSION,
+                });
+            }
 
             Ok::<_, StateError>(conn)
         })
@@ -1425,6 +1489,60 @@ impl SqliteStateDb {
                 .map_err(|e| StateError::query("get_downloaded_page", e))?;
 
             Ok(records)
+        })
+        .await
+    }
+
+    pub(crate) async fn get_manifest_assets(&self) -> Result<Vec<ManifestAssetRow>, StateError> {
+        self.with_conn("get_manifest_assets", move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    r"
+                    SELECT
+                        a.library,
+                        a.id,
+                        a.version_size,
+                        a.filename,
+                        a.local_path,
+                        a.checksum,
+                        a.local_checksum,
+                        a.download_checksum,
+                        a.size_bytes,
+                        a.created_at,
+                        a.added_at,
+                        a.downloaded_at,
+                        a.last_seen_at,
+                        a.media_type,
+                        a.status,
+                        aa.album_name
+                    FROM assets a
+                    LEFT JOIN asset_albums aa
+                        ON aa.library = a.library
+                       AND aa.asset_id = a.id
+                    ORDER BY a.library, a.id, a.version_size, aa.album_name
+                    ",
+                )
+                .map_err(|e| StateError::query("get_manifest_assets::prepare", e))?;
+
+            let rows = stmt
+                .query_map([], manifest_joined_row_from_row)
+                .map_err(|e| StateError::query("get_manifest_assets::query", e))?;
+
+            let mut assets: BTreeMap<(String, String, String), ManifestAssetRow> = BTreeMap::new();
+            for row in rows {
+                let joined = row.map_err(|e| StateError::query("get_manifest_assets::row", e))?;
+                let key = (
+                    joined.asset.library.clone(),
+                    joined.asset.asset_id.clone(),
+                    joined.asset.version.clone(),
+                );
+                let asset = assets.entry(key).or_insert(joined.asset);
+                if let Some(album) = joined.album_name {
+                    asset.albums.push(album);
+                }
+            }
+
+            Ok(assets.into_values().collect())
         })
         .await
     }
@@ -3296,6 +3414,62 @@ const ASSET_COLUMNS: &str = "id, version_size, checksum, filename, created_at, \
 #[cfg(test)]
 const ASSET_COLUMN_COUNT: usize = 39;
 
+struct ManifestJoinedRow {
+    asset: ManifestAssetRow,
+    album_name: Option<String>,
+}
+
+fn manifest_joined_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManifestJoinedRow> {
+    let library: String = row.get(0)?;
+    let asset_id: String = row.get(1)?;
+    let version: String = row.get(2)?;
+    let filename: String = row.get(3)?;
+    let local_path: Option<String> = row.get(4)?;
+    let checksum: String = row.get(5)?;
+    let local_checksum: Option<String> = row.get(6)?;
+    let download_checksum: Option<String> = row.get(7)?;
+    let size_bytes: i64 = row.get(8)?;
+    let created_at_ts: i64 = row.get(9)?;
+    let added_at_ts: Option<i64> = row.get(10)?;
+    let downloaded_at_ts: Option<i64> = row.get(11)?;
+    let last_seen_at_ts: i64 = row.get(12)?;
+    let media_type: String = row.get(13)?;
+    let status: String = row.get(14)?;
+    let album_name: Option<String> = row.get(15)?;
+
+    Ok(ManifestJoinedRow {
+        asset: ManifestAssetRow {
+            library,
+            asset_id,
+            version,
+            filename,
+            local_path: local_path.map(PathBuf::from),
+            checksum,
+            local_checksum,
+            download_checksum,
+            size_bytes: u64::try_from(size_bytes).unwrap_or(0),
+            created_at: ts_to_utc(created_at_ts),
+            added_at: optional_ts_to_utc(added_at_ts),
+            downloaded_at: optional_ts_to_utc(downloaded_at_ts),
+            last_seen_at: ts_to_utc(last_seen_at_ts),
+            media_type,
+            status,
+            albums: Vec::new(),
+        },
+        album_name,
+    })
+}
+
+fn ts_to_utc(ts: i64) -> DateTime<Utc> {
+    Utc.timestamp_opt(ts, 0)
+        .single()
+        .unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+fn optional_ts_to_utc(ts: Option<i64>) -> Option<DateTime<Utc>> {
+    ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single())
+}
+
 /// Convert a database row to an `AssetRecord`.
 ///
 /// Returns `rusqlite::Error` on column extraction failures instead of silently
@@ -3378,16 +3552,10 @@ fn row_to_asset_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord>
         last_error,
         local_checksum,
         size_bytes: u64::try_from(size_bytes).unwrap_or(0),
-        created_at: Utc
-            .timestamp_opt(created_at_ts, 0)
-            .single()
-            .unwrap_or(DateTime::UNIX_EPOCH),
-        added_at: added_at_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
-        downloaded_at: downloaded_at_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
-        last_seen_at: Utc
-            .timestamp_opt(last_seen_at_ts, 0)
-            .single()
-            .unwrap_or(DateTime::UNIX_EPOCH),
+        created_at: ts_to_utc(created_at_ts),
+        added_at: optional_ts_to_utc(added_at_ts),
+        downloaded_at: optional_ts_to_utc(downloaded_at_ts),
+        last_seen_at: ts_to_utc(last_seen_at_ts),
         download_attempts: u32::try_from(download_attempts).unwrap_or(u32::MAX),
         version_size: VersionSizeKey::from_str(&version_size_str)
             .unwrap_or(VersionSizeKey::Original),

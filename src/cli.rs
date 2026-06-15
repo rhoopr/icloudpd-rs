@@ -330,6 +330,23 @@ pub struct DoctorArgs {
     pub live: bool,
 }
 
+/// Manifest export format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ManifestFormat {
+    /// Pretty-printed JSON array
+    Json,
+    /// CSV with one row per asset version
+    Csv,
+}
+
+/// Arguments for the manifest command.
+#[derive(Parser, Debug, Clone)]
+pub struct ManifestArgs {
+    /// Output format
+    #[arg(long, value_enum, default_value_t = ManifestFormat::Json)]
+    pub format: ManifestFormat,
+}
+
 /// Arguments for the import-existing command.
 #[derive(Parser, Debug, Clone)]
 pub struct ImportArgs {
@@ -600,6 +617,9 @@ pub enum Command {
     /// Run redacted local diagnostics for support
     Doctor(DoctorArgs),
 
+    /// Export the local state catalog without contacting iCloud
+    Manifest(ManifestArgs),
+
     /// Import existing local files into the state database
     ImportExisting(ImportArgs),
 
@@ -863,6 +883,7 @@ fn subcommand_display_name(cmd: &Command) -> &'static str {
         Command::Config { .. } => "config",
         Command::Status(_) => "status",
         Command::Doctor(_) => "doctor",
+        Command::Manifest(_) => "manifest",
         Command::ImportExisting(_) => "import-existing",
         Command::Verify(_) => "verify",
         Command::Reconcile(_) => "reconcile",
@@ -1097,6 +1118,7 @@ impl Command {
             | Self::Config { .. }
             | Self::Status(_)
             | Self::Doctor(_)
+            | Self::Manifest(_)
             | Self::Verify(_)
             | Self::Reconcile(_)
             | Self::Install(_)

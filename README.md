@@ -152,6 +152,7 @@ Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-iclou
 - [Commands](https://github.com/rhoopr/kei/wiki/Home#commands)
 - [Credentials](https://github.com/rhoopr/kei/wiki/Credentials)
 - [Troubleshooting](https://github.com/rhoopr/kei/wiki/Troubleshooting)
+- [Manifest export](docs/manifest.md)
 - [Product charter](docs/product-charter.md)
 - [Roadmap](docs/roadmap.md)
 

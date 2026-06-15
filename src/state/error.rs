@@ -51,6 +51,11 @@ pub enum StateError {
     #[error("This state database is from a newer kei version (schema {found}); this kei supports schema {expected}")]
     UnsupportedSchemaVersion { found: i32, expected: i32 },
 
+    /// The database schema must be migrated before a read-only command can
+    /// inspect it.
+    #[error("This state database uses schema {found}; schema {expected} is required for this read-only command. Run a normal kei command that updates state first.")]
+    ReadOnlySchemaTooOld { found: i32, expected: i32 },
+
     /// A producer-dispatch invariant was violated — typically a write
     /// path was reached without the corresponding `upsert_seen` having
     /// run first. The asset row didn't exist, so the operation became a

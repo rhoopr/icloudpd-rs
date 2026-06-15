@@ -28,6 +28,7 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "config",
     "status",
     "doctor",
+    "manifest",
     "import-existing",
     "verify",
 ];
@@ -253,6 +254,17 @@ fn doctor_invalid_config_reports_redacted_json_error() {
             .any(|check| { check["name"] == "config_parse" && check["status"] == "error" }),
         "doctor should keep config parse failures in the report: {report:#}"
     );
+}
+
+#[test]
+fn manifest_help_succeeds() {
+    common::cmd()
+        .args(["manifest", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--format"))
+        .stdout(predicate::str::contains("json"))
+        .stdout(predicate::str::contains("csv"));
 }
 
 #[test]

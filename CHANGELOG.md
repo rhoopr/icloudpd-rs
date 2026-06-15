@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Added `kei doctor` with redacted text and JSON diagnostics for config parsing, local paths, state DB access, session presence, and recent health/report files. (fixes [#588])
+- Added `kei manifest --format json|csv` to export the local state catalog without iCloud auth or file writes. The export includes paths, asset IDs, versions, checksums, sizes, dates, libraries, albums, and status. (fixes [#590])
 
 ### Fixed
 
@@ -43,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#585]: https://github.com/rhoopr/kei/issues/585
 [#587]: https://github.com/rhoopr/kei/issues/587
 [#588]: https://github.com/rhoopr/kei/issues/588
+[#590]: https://github.com/rhoopr/kei/issues/590
 
 ## [0.21.8] - 2026-06-10
 
