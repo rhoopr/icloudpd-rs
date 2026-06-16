@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `just full-test` now fails up front with a clear GNU/Linux userland message when required GNU `find`/`stat` behavior, `flock`, or `timeout` is unavailable. (fixes [#583])
 - The round-trip serializer gate now documents its heuristic limits and requires a reviewer rationale for no-inverse exceptions or emergency bypasses. (fixes [#583])
 - `just full-test` now quotes the configured Docker image consistently in Docker smoke commands, including the default-command smoke that runs through `bash -c`. (fixes [#583])
+- Encrypted-file credentials now use `.kei-state` directly. The old `.credential-key` auto-rename path was removed; users who still have that pre-0.6.2 key file must rename it to `.kei-state` manually before using the encrypted-file backend. (fixes [#613])
 
 [#479]: https://github.com/rhoopr/kei/issues/479
 [#506]: https://github.com/rhoopr/kei/issues/506
@@ -45,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#587]: https://github.com/rhoopr/kei/issues/587
 [#588]: https://github.com/rhoopr/kei/issues/588
 [#590]: https://github.com/rhoopr/kei/issues/590
+[#613]: https://github.com/rhoopr/kei/issues/613
 
 ## [0.21.8] - 2026-06-10
 
@@ -1139,7 +1141,7 @@ All deprecated syntax continues to work and prints a one-line warning to stderr.
 
 ### Changed
 
-- **Credential key file renamed** - The encrypted credential key file is renamed from `.credential-key` to `.session-state`. Existing files are migrated silently.
+- **Credential key file renamed** - The encrypted credential key file was renamed from `.credential-key` to `.session-state`. Current releases use `.kei-state` and no longer auto-migrate `.credential-key`; rename it to `.kei-state` manually if you're upgrading from that old file name.
 
 [#166]: https://github.com/rhoopr/kei/issues/166
 

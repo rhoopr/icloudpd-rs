@@ -176,15 +176,7 @@ impl CredentialStore {
     // ── Encrypted file backend ─────────────────────────────────────
 
     fn key_file_path(&self) -> PathBuf {
-        let new_path = self.config_dir.join(".kei-state");
-        // Migrate legacy name silently.
-        if !new_path.exists() {
-            let legacy = self.config_dir.join(".credential-key");
-            if legacy.exists() {
-                let _ = std::fs::rename(&legacy, &new_path);
-            }
-        }
-        new_path
+        self.config_dir.join(".kei-state")
     }
 
     fn credential_file_path(&self) -> PathBuf {
@@ -637,6 +629,37 @@ mod tests {
 
         let key = std::fs::read(store.key_file_path()).unwrap();
         assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn legacy_credential_key_is_not_auto_renamed() {
+        let (_td, dir) = test_dir("legacy_key");
+        let legacy_path = dir.join(".credential-key");
+        std::fs::write(&legacy_path, [7u8; 32]).unwrap();
+
+        let store = CredentialStore::new("user@example.com", &dir);
+        let key_path = store.key_file_path();
+        assert_eq!(key_path, dir.join(".kei-state"));
+        assert!(
+            legacy_path.exists(),
+            "legacy .credential-key must be left for manual user migration"
+        );
+        assert!(
+            !key_path.exists(),
+            ".kei-state must not be created or renamed by path lookup"
+        );
+
+        store.load_or_create_key().unwrap();
+        assert!(
+            legacy_path.exists(),
+            "creating .kei-state must not consume legacy .credential-key"
+        );
+        assert!(key_path.exists());
+        assert_ne!(
+            std::fs::read(key_path).unwrap(),
+            vec![7u8; 32],
+            ".kei-state must not reuse the legacy key bytes automatically"
+        );
     }
 
     #[test]
