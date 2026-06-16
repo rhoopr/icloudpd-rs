@@ -857,7 +857,7 @@ where
             }
             match result {
                 Ok(asset) => {
-                    if is_asset_filtered(&asset, config).is_some() {
+                    if is_asset_filtered(&asset, config.as_ref()).is_some() {
                         continue;
                     }
                     // Fast-skip is path-blind; in `{album}` mode the same
@@ -867,7 +867,7 @@ where
                     // the time this runs, `with_album_name` has expanded
                     // `{album}` out of `folder_structure` entirely.
                     if config.album_name.is_none() {
-                        let candidates = extract_skip_candidates(&asset, config);
+                        let candidates = extract_skip_candidates(&asset, config.as_ref());
                         let library = effective_asset_library(&asset, config);
                         if !candidates.is_empty()
                             && candidates.iter().all(|&(vs, cs)| {
@@ -1230,7 +1230,7 @@ where
                         // interrupted sync is adopted when the matching file
                         // is already on disk; if adoption fails, the touched
                         // flush still lets stuck-pipeline recovery promote it.
-                        let candidates = extract_skip_candidates(&asset, config);
+                        let candidates = extract_skip_candidates(&asset, config.as_ref());
                         metadata_rewrite::tag_if_needed(
                             producer_state_db.as_deref(),
                             config,
@@ -5102,7 +5102,7 @@ mod tests {
         // layer now emits an identity collision task for this same-size file,
         // so the producer must still adopt the pending row before forwarding.
         let asset = carryover_asset();
-        let target_path = crate::download::filter::expected_paths_for(&asset, &config)
+        let target_path = crate::download::filter::expected_paths_for(&asset, config.as_ref())
             .first()
             .expect("test asset must derive an expected path")
             .path
@@ -5219,7 +5219,7 @@ mod tests {
         let config = Arc::new(config);
 
         let asset = existing_asset();
-        let target_path = crate::download::filter::expected_paths_for(&asset, &config)
+        let target_path = crate::download::filter::expected_paths_for(&asset, config.as_ref())
             .first()
             .expect("test asset must derive an expected path")
             .path
@@ -5517,7 +5517,7 @@ mod tests {
         let config = Arc::new(config);
 
         let asset_b = suffixed_collision_asset("SUFFIXED_B", "ck_suffixed_b");
-        let bare_path = crate::download::filter::expected_paths_for(&asset_b, &config)
+        let bare_path = crate::download::filter::expected_paths_for(&asset_b, config.as_ref())
             .first()
             .expect("test asset must derive an expected path")
             .path
@@ -5589,7 +5589,7 @@ mod tests {
         let config = Arc::new(config);
 
         let asset = suffixed_ampm_collision_asset("AMPM_SUFFIXED_B", "ck_ampm_suffixed_b");
-        let bare_path = crate::download::filter::expected_paths_for(&asset, &config)
+        let bare_path = crate::download::filter::expected_paths_for(&asset, config.as_ref())
             .first()
             .expect("test asset must derive an expected path")
             .path
@@ -5661,7 +5661,7 @@ mod tests {
         let config = Arc::new(config);
 
         let asset_b = suffixed_collision_asset("TRUNCATED_SUFFIXED_B", "ck_truncated_suffixed_b");
-        let bare_path = crate::download::filter::expected_paths_for(&asset_b, &config)
+        let bare_path = crate::download::filter::expected_paths_for(&asset_b, config.as_ref())
             .first()
             .expect("test asset must derive an expected path")
             .path
@@ -5736,20 +5736,22 @@ mod tests {
         let new_config = Arc::new(new_config);
 
         let asset = suffixed_collision_asset("OLD_DIR_SUFFIXED_B", "ck_old_dir_suffixed_b");
-        let old_bare_path = crate::download::filter::expected_paths_for(&asset, &old_config)
-            .first()
-            .expect("test asset must derive an old expected path")
-            .path
-            .clone();
+        let old_bare_path =
+            crate::download::filter::expected_paths_for(&asset, old_config.as_ref())
+                .first()
+                .expect("test asset must derive an old expected path")
+                .path
+                .clone();
         let old_suffixed_path = identity_suffixed_path_for(&old_bare_path, asset.id());
         fs::create_dir_all(old_bare_path.parent().unwrap()).unwrap();
         fs::write(&old_suffixed_path, vec![1u8; 1234]).unwrap();
 
-        let new_bare_path = crate::download::filter::expected_paths_for(&asset, &new_config)
-            .first()
-            .expect("test asset must derive a new expected path")
-            .path
-            .clone();
+        let new_bare_path =
+            crate::download::filter::expected_paths_for(&asset, new_config.as_ref())
+                .first()
+                .expect("test asset must derive a new expected path")
+                .path
+                .clone();
         assert!(
             !new_bare_path.exists(),
             "new configured target must be absent"
@@ -5835,11 +5837,12 @@ mod tests {
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
 
-        let target_path = crate::download::filter::expected_paths_for(&existing_asset, &config)
-            .first()
-            .expect("test asset must derive an expected path")
-            .path
-            .clone();
+        let target_path =
+            crate::download::filter::expected_paths_for(&existing_asset, config.as_ref())
+                .first()
+                .expect("test asset must derive an expected path")
+                .path
+                .clone();
         fs::create_dir_all(target_path.parent().unwrap()).unwrap();
         fs::write(&target_path, []).unwrap();
 

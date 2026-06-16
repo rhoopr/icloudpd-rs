@@ -13,7 +13,10 @@ use crate::auth;
 use crate::cli;
 use crate::config;
 use crate::download;
-use crate::download::filter::{expected_paths_for, is_asset_filtered, ExpectedAssetPath};
+use crate::download::filter::{
+    expected_paths_for, is_asset_filtered, ExpectedAssetPath, PathDerivationConfig,
+    PathDerivationSource,
+};
 use crate::download::paths::{normalize_ampm, DirCache};
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
@@ -415,7 +418,7 @@ pub(crate) async fn import_assets<S, D>(
     stream: S,
     panic_rx: tokio::sync::oneshot::Receiver<bool>,
     db: &D,
-    download_config: &download::DownloadConfig,
+    path_config: &(impl PathDerivationSource + ?Sized),
     library_label: &str,
     dir_cache: &mut DirCache,
     options: ImportRunOptions<'_>,
@@ -512,26 +515,25 @@ where
         }
 
         // `expected_paths_for` documents the precondition that callers run
-        // `is_asset_filtered` first to apply content/date filters. Most filter
-        // inputs are inert here (build_import_download_config zeros them out),
-        // but live_photo_mode IS user-configurable, and other filter sources
-        // (TOML defaults, future flag additions) could leak through. Honor the
-        // contract uniformly so the gate stays in one place.
-        if let Some(reason) = is_asset_filtered(&asset, download_config) {
+        // `is_asset_filtered` first to apply content/date filters. Import
+        // carries the same path/filter fields as sync without constructing a
+        // fake download-pipeline config. Honor the contract uniformly so the
+        // gate stays in one place.
+        if let Some(reason) = is_asset_filtered(&asset, path_config) {
             tracing::debug!(id = %asset.id(), ?reason, "Skipping (is_asset_filtered)");
             stats.filtered += 1;
             heartbeat_state.filtered.fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
-        let expected = expected_paths_for(&asset, download_config);
+        let expected = expected_paths_for(&asset, path_config);
         if expected.is_empty() {
             // WARN, not debug: an asset silently dropped here is invisible
             // to operators reconciling the on-disk tree against the report.
             tracing::warn!(
                 id = %asset.id(),
-                live_photo_mode = ?download_config.live_photo_mode,
-                force_resolution = download_config.force_resolution,
+                live_photo_mode = ?path_config.live_photo_mode(),
+                force_resolution = path_config.force_resolution(),
                 "Skipping asset with no expected paths from path-derivation",
             );
             stats.filtered += 1;
@@ -559,7 +561,7 @@ where
             let (expected_path, metadata) = match resolve_match_path(
                 &primary_path,
                 expected_size,
-                download_config.file_match_policy,
+                path_config.file_match_policy(),
                 dir_cache,
             )
             .await
@@ -715,7 +717,7 @@ where
 }
 
 /// This imports existing local files into the state database by:
-/// 1. Building a [`download::DownloadConfig`] from CLI > env > TOML > default,
+/// 1. Building a path-derivation config from CLI > env > TOML > default,
 ///    matching the resolution sync uses, so the path-derivation step (filename
 ///    mapping, name-id7 suffix, size suffix, MOV companions, ...) reproduces
 ///    exactly what sync would have written.
@@ -733,8 +735,8 @@ pub(crate) async fn run_import_existing(
         crate::personality::Mode::Off,
     )?;
     let db_path = super::super::get_db_path(globals, toml)?;
-    let download_config = build_import_download_config(toml)?;
-    let directory = Arc::clone(&download_config.directory);
+    let path_config = build_import_path_config(toml)?;
+    let directory = Arc::clone(&path_config.directory);
     let strict_import = resolve_import_strict(&args, toml);
     let strict_verifier = strict_import.then(HttpStrictImportVerifier::new);
 
@@ -852,7 +854,7 @@ pub(crate) async fn run_import_existing(
             continue;
         }
         tracing::debug!(zone = %zone, "Scanning library");
-        let library_config = download_config.with_library(zone);
+        let library_config = path_config.with_library(zone);
 
         let plan = resolve_passes_for_scope(
             library,
@@ -979,16 +981,13 @@ fn resolve_import_strict(args: &cli::ImportArgs, toml: Option<&config::TomlConfi
             .unwrap_or(false)
 }
 
-/// Resolve a [`download::DownloadConfig`] from import-existing TOML.
+/// Resolve import-existing path/filter settings from TOML.
 ///
 /// Persistent path/media/photo settings are shared with sync through the TOML
-/// config. Fields that don't affect path derivation (state DB handle, retry
-/// config, concurrency, sync mode, ...) are populated with inert defaults:
-/// `import-existing` never instantiates a download pipeline, so those values
-/// are unused.
-fn build_import_download_config(
+/// config. Pipeline-only download settings stay out of this type entirely.
+fn build_import_path_config(
     toml: Option<&config::TomlConfig>,
-) -> anyhow::Result<download::DownloadConfig> {
+) -> anyhow::Result<PathDerivationConfig> {
     let toml_dl = toml.and_then(|t| t.download.as_ref());
 
     let directory_str = toml_dl
@@ -1023,7 +1022,7 @@ fn build_import_download_config(
     )?;
     let media = config::resolve_media_selection(toml.and_then(|t| t.filters.as_ref()), None, None)?;
 
-    let config = download::DownloadConfig::for_path_derivation_only(directory, path_fields, media);
+    let config = PathDerivationConfig::from_path_fields(directory, path_fields, media);
     Ok(config)
 }
 
@@ -2558,10 +2557,10 @@ mod wiremock_tests {
     }
 
     /// Verifies `import_assets` actually invokes `is_asset_filtered`. We
-    /// can't easily flip media selection through `build_import_download_config`,
+    /// can't easily flip media selection through `build_import_path_config`,
     /// but `exclude_asset_ids` is honored by
     /// `is_asset_filtered` and we can set it directly on the test
-    /// `DownloadConfig`. If `import_assets` ever stops calling the gate,
+    /// `PathDerivationSource`. If `import_assets` ever stops calling the gate,
     /// this test fails with `matched=1` instead of `matched=0`.
     #[tokio::test]
     async fn is_asset_filtered_blocks_excluded_asset_id() {
@@ -3357,7 +3356,7 @@ mod wiremock_tests {
 
 #[cfg(test)]
 mod build_config_tests {
-    //! Unit tests for [`build_import_download_config`] -- the
+    //! Unit tests for [`build_import_path_config`] -- the
     //! TOML > default resolution chain for import-existing's path-derivation
     //! settings. Each new TOML field consumed by import-existing needs a row
     //! in this test mod or the resolver is unverified.
@@ -3366,7 +3365,7 @@ mod build_config_tests {
     //! (rather than struct literals) so a regression that reorders
     //! `or_else` arms or flips a default reaches us through the same
     //! parse path that production uses.
-    use super::build_import_download_config;
+    use super::build_import_path_config;
     use crate::cli::{Cli, Command};
     use crate::config::{Config, GlobalArgs, TomlConfig};
     use crate::types::{
@@ -3399,7 +3398,7 @@ mod build_config_tests {
     /// TOML is the only durable import path/photo source in v0.20. This pins
     /// every field that import-existing needs to stay aligned with sync.
     #[test]
-    fn build_import_download_config_uses_toml_path_photo_and_media_settings() {
+    fn build_import_path_config_uses_toml_path_photo_and_media_settings() {
         let toml = toml_with_download(
             r#"
             folder_structure = "%Y/%m"
@@ -3419,7 +3418,7 @@ mod build_config_tests {
             "#,
         );
 
-        let cfg = build_import_download_config(Some(&toml)).unwrap();
+        let cfg = build_import_path_config(Some(&toml)).unwrap();
 
         assert_eq!(cfg.folder_structure, "%Y/%m");
         assert_eq!(cfg.resolution, crate::types::PhotoResolution::Medium);
@@ -3441,9 +3440,9 @@ mod build_config_tests {
     /// Documented defaults still apply when TOML only supplies the required
     /// download directory.
     #[test]
-    fn build_import_download_config_falls_through_to_default() {
+    fn build_import_path_config_falls_through_to_default() {
         let toml = toml_with_download("");
-        let cfg = build_import_download_config(Some(&toml)).unwrap();
+        let cfg = build_import_path_config(Some(&toml)).unwrap();
         assert_eq!(cfg.resolution, crate::types::PhotoResolution::Original);
         assert_eq!(
             cfg.file_match_policy,
@@ -3462,8 +3461,8 @@ mod build_config_tests {
     }
 
     #[test]
-    fn build_import_download_config_empty_directory_bails() {
-        let err = build_import_download_config(None).expect_err("empty directory should bail");
+    fn build_import_path_config_empty_directory_bails() {
+        let err = build_import_path_config(None).expect_err("empty directory should bail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Set [download].directory"),
@@ -3471,7 +3470,7 @@ mod build_config_tests {
         );
     }
 
-    /// Sync's `Config::build` and import's `build_import_download_config`
+    /// Sync's `Config::build` and import's `build_import_path_config`
     /// share `resolve_path_derivation_fields`. For the same TOML inputs the
     /// path-derivation knobs they emit must agree byte-for-byte.
     #[test]
@@ -3494,7 +3493,7 @@ mod build_config_tests {
         "#;
         let toml: TomlConfig = toml::from_str(toml_str).unwrap();
 
-        let import_cfg = build_import_download_config(Some(&toml)).unwrap();
+        let import_cfg = build_import_path_config(Some(&toml)).unwrap();
 
         let sync = SyncArgs::default();
         let globals = GlobalArgs {
@@ -3551,7 +3550,7 @@ mod build_config_tests {
         )
         .unwrap();
         let import_err =
-            build_import_download_config(Some(&toml)).expect_err("import: system dir must reject");
+            build_import_path_config(Some(&toml)).expect_err("import: system dir must reject");
 
         let sync = SyncArgs::default();
         let globals = GlobalArgs {

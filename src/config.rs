@@ -700,7 +700,7 @@ pub(crate) fn expand_tilde(path: &str) -> PathBuf {
 
 /// Reject system directories that should never be used as a download
 /// target. Shared by sync (`Config::build`) and import-existing
-/// (`build_import_download_config`) so both refuse the same set with the
+/// (`build_import_path_config`) so both refuse the same set with the
 /// same error message.
 pub(crate) fn validate_download_dir(path: &Path) -> anyhow::Result<()> {
     const DENIED: &[&str] = &[
@@ -792,7 +792,7 @@ impl PathDerivationCliArgs {
 }
 
 /// Resolved path-derivation fields used by both `Config::build` (sync) and
-/// `build_import_download_config` (import-existing) so the two code paths
+/// `build_import_path_config` (import-existing) so the two code paths
 /// derive identical expected file paths for the same inputs.
 #[derive(Debug)]
 pub(crate) struct PathDerivationFields {

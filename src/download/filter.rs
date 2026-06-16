@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::icloud::photos::types::AssetVersion;
@@ -45,18 +45,296 @@ const GLOB_CASE_INSENSITIVE: glob::MatchOptions = glob::MatchOptions {
     require_literal_leading_dot: false,
 };
 
-type ExtraDeriver = for<'a> fn(
-    &crate::icloud::photos::PhotoAsset,
-    &DownloadConfig,
-    &DerivationContext<'a>,
-    &[Box<str>],
-) -> Option<DerivedPath>;
+pub(crate) trait PathDerivationSource {
+    fn directory(&self) -> &Path;
+    fn folder_structure(&self) -> &str;
+    fn resolution(&self) -> crate::types::PhotoResolution;
+    fn media(&self) -> &crate::config::MediaSelection;
+    fn skip_created_before(&self) -> Option<DateTime<chrono::Utc>>;
+    fn skip_created_after(&self) -> Option<DateTime<chrono::Utc>>;
+    fn live_photo_mode(&self) -> LivePhotoMode;
+    fn live_resolution(&self) -> AssetVersionSize;
+    fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy;
+    fn edited(&self) -> bool;
+    fn alternative(&self) -> bool;
+    fn raw_policy(&self) -> RawPolicy;
+    fn file_match_policy(&self) -> FileMatchPolicy;
+    fn force_resolution(&self) -> bool;
+    fn keep_unicode_in_filenames(&self) -> bool;
+    fn filename_exclude(&self) -> &[glob::Pattern];
+    fn album_name(&self) -> Option<&str>;
+    fn exclude_asset_ids(&self) -> &FxHashSet<String>;
+}
 
-const EXTRA_DERIVERS: [ExtraDeriver; 3] = [
-    derive_edited_extra,
-    derive_alternative_extra,
-    derive_live_edited_extra,
-];
+/// Path/filter settings needed to derive where sync would place an asset.
+///
+/// `import-existing` uses this instead of constructing a mostly inert
+/// [`DownloadConfig`], so path matching cannot accidentally depend on
+/// pipeline-only defaults like retry policy, state DB handles, concurrency,
+/// sync mode, or bandwidth limiters.
+#[derive(Debug, Clone)]
+pub(crate) struct PathDerivationConfig {
+    pub(crate) directory: Arc<Path>,
+    pub(crate) folder_structure: String,
+    pub(crate) folder_structure_albums: Arc<str>,
+    pub(crate) folder_structure_smart_folders: Arc<str>,
+    pub(crate) resolution: crate::types::PhotoResolution,
+    pub(crate) media: crate::config::MediaSelection,
+    pub(crate) skip_created_before: Option<DateTime<chrono::Utc>>,
+    pub(crate) skip_created_after: Option<DateTime<chrono::Utc>>,
+    pub(crate) live_photo_mode: LivePhotoMode,
+    pub(crate) live_resolution: AssetVersionSize,
+    pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
+    pub(crate) edited: bool,
+    pub(crate) alternative: bool,
+    pub(crate) raw_policy: RawPolicy,
+    pub(crate) file_match_policy: FileMatchPolicy,
+    pub(crate) force_resolution: bool,
+    pub(crate) keep_unicode_in_filenames: bool,
+    pub(crate) filename_exclude: Arc<[glob::Pattern]>,
+    pub(crate) album_name: Option<Arc<str>>,
+    pub(crate) library: Arc<str>,
+    pub(crate) exclude_asset_ids: Arc<FxHashSet<String>>,
+}
+
+impl PathDerivationConfig {
+    pub(crate) fn from_path_fields(
+        directory: Arc<Path>,
+        fields: crate::config::PathDerivationFields,
+        media: crate::config::MediaSelection,
+    ) -> Self {
+        Self {
+            directory,
+            folder_structure: fields.folder_structure,
+            folder_structure_albums: Arc::from(fields.folder_structure_albums.as_str()),
+            folder_structure_smart_folders: Arc::from(
+                fields.folder_structure_smart_folders.as_str(),
+            ),
+            resolution: fields.resolution,
+            media,
+            skip_created_before: None,
+            skip_created_after: None,
+            live_photo_mode: fields.live_photo_mode,
+            live_resolution: fields.live_resolution.to_asset_version_size(),
+            live_photo_mov_filename_policy: fields.live_photo_mov_filename_policy,
+            edited: fields.edited,
+            alternative: fields.alternative,
+            raw_policy: fields.raw_policy,
+            file_match_policy: fields.file_match_policy,
+            force_resolution: fields.force_resolution,
+            keep_unicode_in_filenames: fields.keep_unicode_in_filenames,
+            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
+            album_name: None,
+            library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
+            exclude_asset_ids: Arc::new(FxHashSet::default()),
+        }
+    }
+
+    /// Clone this path config for one resolved album/smart-folder/unfiled
+    /// pass, mirroring [`DownloadConfig::with_pass`] without pulling in
+    /// download-pipeline fields.
+    pub(crate) fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
+        let folder_structure = folder_structure_for_pass(
+            &self.folder_structure,
+            &self.folder_structure_albums,
+            &self.folder_structure_smart_folders,
+            &self.library,
+            pass,
+        );
+        Self {
+            album_name: Some(Arc::clone(&pass.album.name)),
+            folder_structure,
+            exclude_asset_ids: Arc::clone(&pass.exclude_ids),
+            ..self.clone()
+        }
+    }
+
+    /// Clone this config with a different CloudKit zone for `{library}` path
+    /// expansion.
+    pub(crate) fn with_library(&self, library: &str) -> Self {
+        Self {
+            library: Arc::from(library),
+            ..self.clone()
+        }
+    }
+}
+
+/// Pick and expand the active template for one album/smart-folder/unfiled
+/// pass. Shared by sync's [`DownloadConfig`] and import's
+/// [`PathDerivationConfig`] so `{album}`, `{smart-folder}`, and `{library}`
+/// expansion cannot drift between matching and downloading.
+pub(super) fn folder_structure_for_pass(
+    folder_structure: &str,
+    folder_structure_albums: &str,
+    folder_structure_smart_folders: &str,
+    library: &str,
+    pass: &crate::commands::AlbumPass,
+) -> String {
+    let template: &str = match pass.kind {
+        crate::commands::PassKind::Album => folder_structure_albums,
+        crate::commands::PassKind::SmartFolder => folder_structure_smart_folders,
+        crate::commands::PassKind::Unfiled => folder_structure,
+    };
+    let name_ref = Some(pass.album.name.as_ref()).filter(|n: &&str| !n.is_empty());
+    let category_expanded = paths::expand_named_token(template, pass.kind.token(), name_ref);
+    // Apply `{library}` last with the path-friendly truncated zone name,
+    // so callers see `SharedSync-A1B2C3D4/...` instead of the full UUID.
+    // The state-DB key still uses the full zone name.
+    let library_for_path = paths::truncate_library_zone(library);
+    paths::expand_named_token(
+        &category_expanded,
+        paths::TOKEN_LIBRARY,
+        Some(library_for_path),
+    )
+}
+
+impl PathDerivationSource for PathDerivationConfig {
+    fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    fn folder_structure(&self) -> &str {
+        &self.folder_structure
+    }
+
+    fn resolution(&self) -> crate::types::PhotoResolution {
+        self.resolution
+    }
+
+    fn media(&self) -> &crate::config::MediaSelection {
+        &self.media
+    }
+
+    fn skip_created_before(&self) -> Option<DateTime<chrono::Utc>> {
+        self.skip_created_before
+    }
+
+    fn skip_created_after(&self) -> Option<DateTime<chrono::Utc>> {
+        self.skip_created_after
+    }
+
+    fn live_photo_mode(&self) -> LivePhotoMode {
+        self.live_photo_mode
+    }
+
+    fn live_resolution(&self) -> AssetVersionSize {
+        self.live_resolution
+    }
+
+    fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy {
+        self.live_photo_mov_filename_policy
+    }
+
+    fn edited(&self) -> bool {
+        self.edited
+    }
+
+    fn alternative(&self) -> bool {
+        self.alternative
+    }
+
+    fn raw_policy(&self) -> RawPolicy {
+        self.raw_policy
+    }
+
+    fn file_match_policy(&self) -> FileMatchPolicy {
+        self.file_match_policy
+    }
+
+    fn force_resolution(&self) -> bool {
+        self.force_resolution
+    }
+
+    fn keep_unicode_in_filenames(&self) -> bool {
+        self.keep_unicode_in_filenames
+    }
+
+    fn filename_exclude(&self) -> &[glob::Pattern] {
+        &self.filename_exclude
+    }
+
+    fn album_name(&self) -> Option<&str> {
+        self.album_name.as_deref()
+    }
+
+    fn exclude_asset_ids(&self) -> &FxHashSet<String> {
+        &self.exclude_asset_ids
+    }
+}
+
+impl PathDerivationSource for DownloadConfig {
+    fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    fn folder_structure(&self) -> &str {
+        &self.folder_structure
+    }
+
+    fn resolution(&self) -> crate::types::PhotoResolution {
+        self.resolution
+    }
+
+    fn media(&self) -> &crate::config::MediaSelection {
+        &self.media
+    }
+
+    fn skip_created_before(&self) -> Option<DateTime<chrono::Utc>> {
+        self.skip_created_before
+    }
+
+    fn skip_created_after(&self) -> Option<DateTime<chrono::Utc>> {
+        self.skip_created_after
+    }
+
+    fn live_photo_mode(&self) -> LivePhotoMode {
+        self.live_photo_mode
+    }
+
+    fn live_resolution(&self) -> AssetVersionSize {
+        self.live_resolution
+    }
+
+    fn live_photo_mov_filename_policy(&self) -> LivePhotoMovFilenamePolicy {
+        self.live_photo_mov_filename_policy
+    }
+
+    fn edited(&self) -> bool {
+        self.edited
+    }
+
+    fn alternative(&self) -> bool {
+        self.alternative
+    }
+
+    fn raw_policy(&self) -> RawPolicy {
+        self.raw_policy
+    }
+
+    fn file_match_policy(&self) -> FileMatchPolicy {
+        self.file_match_policy
+    }
+
+    fn force_resolution(&self) -> bool {
+        self.force_resolution
+    }
+
+    fn keep_unicode_in_filenames(&self) -> bool {
+        self.keep_unicode_in_filenames
+    }
+
+    fn filename_exclude(&self) -> &[glob::Pattern] {
+        &self.filename_exclude
+    }
+
+    fn album_name(&self) -> Option<&str> {
+        self.album_name.as_deref()
+    }
+
+    fn exclude_asset_ids(&self) -> &FxHashSet<String> {
+        &self.exclude_asset_ids
+    }
+}
 
 /// Determine the media type for an asset based on version size and item type.
 pub(crate) fn determine_media_type(
@@ -396,54 +674,54 @@ fn apply_raw_policy(versions: &VersionsMap, policy: RawPolicy) -> VersionsView<'
 /// `filter_asset_to_tasks` to avoid redundant evaluation.
 pub(crate) fn is_asset_filtered(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
 ) -> Option<FilterReason> {
     if !asset.has_valid_id() {
         tracing::warn!("Skipping malformed asset with empty CloudKit recordName");
         return Some(FilterReason::MalformedAsset);
     }
-    if config.exclude_asset_ids.contains(asset.id()) {
+    if config.exclude_asset_ids().contains(asset.id()) {
         tracing::debug!(asset_id = %asset.id(), "Skipping (excluded album asset)");
         return Some(FilterReason::ExcludedAlbum);
     }
-    if asset.is_live_photo() && !config.media.live_photos {
+    if asset.is_live_photo() && !config.media().live_photos {
         tracing::debug!(asset_id = %asset.id(), "Skipping live photo (media filter)");
         return Some(FilterReason::MediaType);
     }
-    if !config.media.videos && asset.item_type() == Some(AssetItemType::Movie) {
+    if !config.media().videos && asset.item_type() == Some(AssetItemType::Movie) {
         tracing::debug!(asset_id = %asset.id(), "Skipping video (media filter)");
         return Some(FilterReason::MediaType);
     }
-    if !config.media.photos
+    if !config.media().photos
         && asset.item_type() == Some(AssetItemType::Image)
         && !asset.is_live_photo()
     {
         tracing::debug!(asset_id = %asset.id(), "Skipping photo (media filter)");
         return Some(FilterReason::MediaType);
     }
-    if config.live_photo_mode == LivePhotoMode::Skip && asset.is_live_photo() {
+    if config.live_photo_mode() == LivePhotoMode::Skip && asset.is_live_photo() {
         tracing::debug!(asset_id = %asset.id(), "Skipping live photo (live_photo_mode=skip)");
         return Some(FilterReason::LivePhoto);
     }
     let created_utc = asset.created();
-    if let Some(before) = &config.skip_created_before {
-        if created_utc < *before {
+    if let Some(before) = config.skip_created_before() {
+        if created_utc < before {
             tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (before date range)");
             return Some(FilterReason::DateRange);
         }
     }
-    if let Some(after) = &config.skip_created_after {
-        if created_utc > *after {
+    if let Some(after) = config.skip_created_after() {
+        if created_utc > after {
             tracing::debug!(asset_id = %asset.id(), date = %created_utc, "Skipping (after date range)");
             return Some(FilterReason::DateRange);
         }
     }
     // Only check filename exclusion when the asset has a real filename.
     // filter_asset_to_tasks separately handles fallback fingerprint filenames.
-    if !config.filename_exclude.is_empty() {
+    if !config.filename_exclude().is_empty() {
         if let Some(filename) = asset.filename() {
             if config
-                .filename_exclude
+                .filename_exclude()
                 .iter()
                 .any(|p| p.matches_with(filename, GLOB_CASE_INSENSITIVE))
             {
@@ -463,7 +741,7 @@ pub(crate) fn is_asset_filtered(
 /// Caller must check [`is_asset_filtered`] first.
 pub(super) fn extract_skip_candidates<'a>(
     asset: &'a crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
 ) -> SmallVec<[(VersionSizeKey, &'a str); 5]> {
     if !asset.has_valid_id() {
         return SmallVec::new();
@@ -630,10 +908,10 @@ pub(super) struct DerivationContext<'a> {
 impl<'a> DerivationContext<'a> {
     pub(super) fn build(
         asset: &'a crate::icloud::photos::PhotoAsset,
-        config: &DownloadConfig,
+        config: &(impl PathDerivationSource + ?Sized),
     ) -> Self {
         let raw = raw_filename(asset);
-        let base_filename: String = if config.keep_unicode_in_filenames {
+        let base_filename: String = if config.keep_unicode_in_filenames() {
             raw.into_owned()
         } else {
             paths::remove_unicode_chars(&raw).into_owned()
@@ -641,7 +919,7 @@ impl<'a> DerivationContext<'a> {
         Self {
             base_filename,
             created_local: asset.created().with_timezone(&Local),
-            versions: apply_raw_policy(asset.versions(), config.raw_policy),
+            versions: apply_raw_policy(asset.versions(), config.raw_policy()),
         }
     }
 
@@ -656,32 +934,32 @@ fn url_seen(version: &AssetVersion, seen_urls: &[&str]) -> bool {
 
 fn select_primary<'a>(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'a>,
 ) -> Option<(&'a AssetVersion, AssetVersionSize)> {
     if matches!(
-        config.live_photo_mode,
+        config.live_photo_mode(),
         LivePhotoMode::Skip | LivePhotoMode::VideoOnly
     ) && asset.is_live_photo()
     {
         return None;
     }
-    let requested = config.resolution.to_asset_version_size()?;
+    let requested = config.resolution().to_asset_version_size()?;
     let get_version = |key: &AssetVersionSize| ctx.get_version(*key);
     version_with_fallback(
         &get_version,
         requested,
         AssetVersionSize::Original,
-        config.force_resolution,
+        config.force_resolution(),
     )
 }
 
 fn select_edited_extra<'a>(
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'a>,
     seen_urls: &[&str],
 ) -> Option<(&'a AssetVersion, AssetVersionSize)> {
-    if !config.edited {
+    if !config.edited() {
         return None;
     }
     let key = AssetVersionSize::Adjusted;
@@ -691,11 +969,12 @@ fn select_edited_extra<'a>(
 
 fn select_live_edited_extra<'a>(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'a>,
     seen_urls: &[&str],
 ) -> Option<(&'a AssetVersion, AssetVersionSize)> {
-    if !config.edited || !asset.is_live_photo() || asset.item_type() != Some(AssetItemType::Image) {
+    if !config.edited() || !asset.is_live_photo() || asset.item_type() != Some(AssetItemType::Image)
+    {
         return None;
     }
     let key = AssetVersionSize::LiveAdjusted;
@@ -705,11 +984,11 @@ fn select_live_edited_extra<'a>(
 
 fn select_alternative_extra<'a>(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'a>,
     seen_urls: &[&str],
 ) -> Option<(&'a AssetVersion, AssetVersionSize)> {
-    if !config.alternative || asset.is_live_photo() {
+    if !config.alternative() || asset.is_live_photo() {
         return None;
     }
     let version = ctx.get_version(AssetVersionSize::Alternative)?;
@@ -718,12 +997,12 @@ fn select_alternative_extra<'a>(
 
 fn select_mov_companion<'a>(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'a>,
     seen_urls: &[&str],
 ) -> Option<(&'a AssetVersion, AssetVersionSize)> {
     if !matches!(
-        config.live_photo_mode,
+        config.live_photo_mode(),
         LivePhotoMode::Both | LivePhotoMode::VideoOnly
     ) {
         return None;
@@ -734,9 +1013,9 @@ fn select_mov_companion<'a>(
     let get_version = |key: &AssetVersionSize| ctx.get_version(*key);
     let selected = version_with_fallback(
         &get_version,
-        config.live_resolution,
+        config.live_resolution(),
         AssetVersionSize::LiveOriginal,
-        config.force_resolution,
+        config.force_resolution(),
     )?;
     (!url_seen(selected.0, seen_urls)).then_some(selected)
 }
@@ -757,22 +1036,26 @@ fn malformed_for_keys(
     })
 }
 
-fn primary_candidate_keys(config: &DownloadConfig) -> SmallVec<[AssetVersionSize; 2]> {
+fn primary_candidate_keys(
+    config: &(impl PathDerivationSource + ?Sized),
+) -> SmallVec<[AssetVersionSize; 2]> {
     let mut keys = SmallVec::new();
-    let Some(requested) = config.resolution.to_asset_version_size() else {
+    let Some(requested) = config.resolution().to_asset_version_size() else {
         return keys;
     };
     keys.push(requested);
-    if !config.force_resolution && requested != AssetVersionSize::Original {
+    if !config.force_resolution() && requested != AssetVersionSize::Original {
         keys.push(AssetVersionSize::Original);
     }
     keys
 }
 
-fn live_candidate_keys(config: &DownloadConfig) -> SmallVec<[AssetVersionSize; 2]> {
+fn live_candidate_keys(
+    config: &(impl PathDerivationSource + ?Sized),
+) -> SmallVec<[AssetVersionSize; 2]> {
     let mut keys = SmallVec::new();
-    keys.push(config.live_resolution);
-    if !config.force_resolution && config.live_resolution != AssetVersionSize::LiveOriginal {
+    keys.push(config.live_resolution());
+    if !config.force_resolution() && config.live_resolution() != AssetVersionSize::LiveOriginal {
         keys.push(AssetVersionSize::LiveOriginal);
     }
     keys
@@ -783,14 +1066,14 @@ fn live_candidate_keys(config: &DownloadConfig) -> SmallVec<[AssetVersionSize; 2
 /// it unusable.
 pub(super) fn malformed_no_task_resource(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
 ) -> Option<MalformedTaskResource> {
     if !derive_expected_paths(asset, config).is_empty() {
         return None;
     }
 
     if !matches!(
-        config.live_photo_mode,
+        config.live_photo_mode(),
         LivePhotoMode::Skip | LivePhotoMode::VideoOnly
     ) || !asset.is_live_photo()
     {
@@ -800,7 +1083,7 @@ pub(super) fn malformed_no_task_resource(
     }
 
     if matches!(
-        config.live_photo_mode,
+        config.live_photo_mode(),
         LivePhotoMode::Both | LivePhotoMode::VideoOnly
     ) && asset.item_type() == Some(AssetItemType::Image)
     {
@@ -817,7 +1100,7 @@ pub(super) fn malformed_no_task_resource(
 /// or no usable version under `force_resolution`).
 pub(super) fn derive_primary(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'_>,
 ) -> Option<DerivedPath> {
     let (version, effective_size) = select_primary(asset, config, ctx)?;
@@ -828,16 +1111,16 @@ pub(super) fn derive_primary(
         AssetVersionSize::Thumb => paths::insert_suffix(&mapped, "thumb"),
         _ => mapped,
     };
-    let filename = match config.file_match_policy {
+    let filename = match config.file_match_policy() {
         FileMatchPolicy::NameId7 => paths::apply_name_id7(&sized, asset.id()),
         FileMatchPolicy::NameSizeDedupWithSuffix => sized,
     };
     let path = paths::local_download_path(
-        &config.directory,
-        &config.folder_structure,
+        config.directory(),
+        config.folder_structure(),
         &ctx.created_local,
         &filename,
-        config.album_name.as_deref(),
+        config.album_name(),
     );
 
     Some(DerivedPath {
@@ -859,7 +1142,7 @@ fn boxed_url_seen(version: &AssetVersion, seen_urls: &[Box<str>]) -> bool {
 
 fn derive_suffixed_extra(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'_>,
     version: &AssetVersion,
     key: AssetVersionSize,
@@ -868,16 +1151,16 @@ fn derive_suffixed_extra(
 ) -> DerivedPath {
     let mapped = mapped_version_filename(asset.id(), &ctx.base_filename, &version.asset_type);
     let suffixed = paths::insert_literal_suffix(&mapped, suffix);
-    let filename = match config.file_match_policy {
+    let filename = match config.file_match_policy() {
         FileMatchPolicy::NameId7 => paths::apply_name_id7(&suffixed, asset.id()),
         FileMatchPolicy::NameSizeDedupWithSuffix => suffixed,
     };
     let path = paths::local_download_path(
-        &config.directory,
-        &config.folder_structure,
+        config.directory(),
+        config.folder_structure(),
         &ctx.created_local,
         &filename,
-        config.album_name.as_deref(),
+        config.album_name(),
     );
     DerivedPath {
         path,
@@ -892,11 +1175,11 @@ fn derive_suffixed_extra(
 
 pub(super) fn derive_edited_extra(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'_>,
     seen_urls: &[Box<str>],
 ) -> Option<DerivedPath> {
-    if !config.edited {
+    if !config.edited() {
         return None;
     }
     let key = AssetVersionSize::Adjusted;
@@ -911,11 +1194,11 @@ pub(super) fn derive_edited_extra(
 
 pub(super) fn derive_alternative_extra(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'_>,
     seen_urls: &[Box<str>],
 ) -> Option<DerivedPath> {
-    if !config.alternative || asset.is_live_photo() {
+    if !config.alternative() || asset.is_live_photo() {
         return None;
     }
     let key = AssetVersionSize::Alternative;
@@ -935,11 +1218,12 @@ pub(super) fn derive_alternative_extra(
 
 pub(super) fn derive_live_edited_extra(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'_>,
     seen_urls: &[Box<str>],
 ) -> Option<DerivedPath> {
-    if !config.edited || !asset.is_live_photo() || asset.item_type() != Some(AssetItemType::Image) {
+    if !config.edited() || !asset.is_live_photo() || asset.item_type() != Some(AssetItemType::Image)
+    {
         return None;
     }
     let key = AssetVersionSize::LiveAdjusted;
@@ -962,13 +1246,13 @@ pub(super) fn derive_live_edited_extra(
 /// any), so a dedup'd primary keeps its MOV paired by filename stem.
 pub(super) fn derive_mov_companion(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
     ctx: &DerivationContext<'_>,
     primary_effective_filename: Option<&str>,
 ) -> Option<DerivedPath> {
     let (live_version, effective_live_size) = select_mov_companion(asset, config, ctx, &[])?;
 
-    let live_base = match config.file_match_policy {
+    let live_base = match config.file_match_policy() {
         FileMatchPolicy::NameId7 => {
             let base = usable_asset_base_filename(asset, ctx);
             paths::apply_name_id7(&base, asset.id())
@@ -978,16 +1262,16 @@ pub(super) fn derive_mov_companion(
             ToString::to_string,
         ),
     };
-    let mov_filename = match config.live_photo_mov_filename_policy {
+    let mov_filename = match config.live_photo_mov_filename_policy() {
         LivePhotoMovFilenamePolicy::Suffix => paths::live_photo_mov_path_suffix(&live_base),
         LivePhotoMovFilenamePolicy::Original => paths::live_photo_mov_path_original(&live_base),
     };
     let mov_path = paths::local_download_path(
-        &config.directory,
-        &config.folder_structure,
+        config.directory(),
+        config.folder_structure(),
         &ctx.created_local,
         &mov_filename,
-        config.album_name.as_deref(),
+        config.album_name(),
     );
 
     Some(DerivedPath {
@@ -1014,7 +1298,7 @@ pub(super) fn derive_mov_companion(
 /// derivation.
 pub(super) fn derive_expected_paths(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
 ) -> SmallVec<[DerivedPath; 5]> {
     if !asset.has_valid_id() {
         return SmallVec::new();
@@ -1029,11 +1313,17 @@ pub(super) fn derive_expected_paths(
         out.push(p);
         primary_index = Some(out.len() - 1);
     }
-    for derive_extra in EXTRA_DERIVERS {
-        if let Some(p) = derive_extra(asset, config, &ctx, &seen_urls) {
-            seen_urls.push(p.url.clone());
-            out.push(p);
-        }
+    if let Some(p) = derive_edited_extra(asset, config, &ctx, &seen_urls) {
+        seen_urls.push(p.url.clone());
+        out.push(p);
+    }
+    if let Some(p) = derive_alternative_extra(asset, config, &ctx, &seen_urls) {
+        seen_urls.push(p.url.clone());
+        out.push(p);
+    }
+    if let Some(p) = derive_live_edited_extra(asset, config, &ctx, &seen_urls) {
+        seen_urls.push(p.url.clone());
+        out.push(p);
     }
     let primary_filename = primary_index
         .and_then(|index| out.get(index))
@@ -1055,7 +1345,7 @@ pub(super) fn derive_expected_paths(
 /// consumes. Thin wrapper over [`derive_expected_paths`].
 pub(crate) fn expected_paths_for(
     asset: &crate::icloud::photos::PhotoAsset,
-    config: &DownloadConfig,
+    config: &(impl PathDerivationSource + ?Sized),
 ) -> SmallVec<[ExpectedAssetPath; 5]> {
     derive_expected_paths(asset, config)
         .into_iter()
@@ -1474,7 +1764,18 @@ pub(super) fn filter_asset_to_tasks(
         }
     }
 
-    for derive_extra in EXTRA_DERIVERS {
+    type SyncExtraDeriver = for<'a> fn(
+        &crate::icloud::photos::PhotoAsset,
+        &DownloadConfig,
+        &DerivationContext<'a>,
+        &[Box<str>],
+    ) -> Option<DerivedPath>;
+    let extra_derivers: [SyncExtraDeriver; 3] = [
+        derive_edited_extra,
+        derive_alternative_extra,
+        derive_live_edited_extra,
+    ];
+    for derive_extra in extra_derivers {
         let Some(d) = derive_extra(asset, config, &ctx, &seen_urls) else {
             continue;
         };
@@ -1984,6 +2285,66 @@ mod tests {
         assert!(
             paths.is_empty(),
             "force_resolution + missing size should yield no paths, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn path_derivation_config_matches_download_config_expected_paths() {
+        let asset = TestPhotoAsset::new("PARITY_1")
+            .filename("über.heic")
+            .live_photo("https://p01.icloud-content.com/live", "live123", 700)
+            .adjusted_version(
+                "https://p01.icloud-content.com/adjusted",
+                "adjusted123",
+                900,
+                "public.heic",
+            )
+            .live_adjusted(
+                "https://p01.icloud-content.com/live-adjusted",
+                "live-adjusted123",
+                650,
+            )
+            .build();
+        let mut sync_config = test_config();
+        sync_config.folder_structure = "{album}/%Y/%m".to_string();
+        sync_config.album_name = Some(Arc::from("Trips"));
+        sync_config.edited = true;
+        sync_config.file_match_policy = FileMatchPolicy::NameId7;
+        sync_config.live_photo_mov_filename_policy = LivePhotoMovFilenamePolicy::Original;
+        sync_config.keep_unicode_in_filenames = true;
+
+        let fields = crate::config::PathDerivationFields {
+            folder_structure: sync_config.folder_structure.clone(),
+            folder_structure_albums: sync_config.folder_structure_albums.to_string(),
+            folder_structure_smart_folders: sync_config.folder_structure_smart_folders.to_string(),
+            resolution: sync_config.resolution,
+            live_photo_mode: sync_config.live_photo_mode,
+            live_resolution: crate::types::LivePhotoResolution::Original,
+            live_photo_mov_filename_policy: sync_config.live_photo_mov_filename_policy,
+            edited: sync_config.edited,
+            alternative: sync_config.alternative,
+            raw_policy: sync_config.raw_policy,
+            file_match_policy: sync_config.file_match_policy,
+            force_resolution: sync_config.force_resolution,
+            keep_unicode_in_filenames: sync_config.keep_unicode_in_filenames,
+        };
+        let mut path_config = PathDerivationConfig::from_path_fields(
+            Arc::clone(&sync_config.directory),
+            fields,
+            sync_config.media,
+        );
+        path_config.album_name = sync_config.album_name.clone();
+
+        let to_tuples = |paths: SmallVec<[ExpectedAssetPath; 5]>| {
+            paths
+                .into_iter()
+                .map(|p| (p.path, p.size, p.checksum, p.url, p.version_size))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            to_tuples(expected_paths_for(&asset, &path_config)),
+            to_tuples(expected_paths_for(&asset, &sync_config)),
+            "import path config must derive the same expected paths as sync config"
         );
     }
 

@@ -1187,63 +1187,6 @@ impl DownloadConfig {
             || self.folder_structure_smart_folders.as_ref() != self.folder_structure.as_str()
     }
 
-    /// Construct a `DownloadConfig` with only the path-derivation fields
-    /// populated. Used by `import-existing`, which calls
-    /// `expected_paths_for` against existing files but never runs the
-    /// download pipeline; the pipeline-only fields (state_db, retry,
-    /// concurrent_downloads, etc.) stay at inert defaults.
-    pub(crate) fn for_path_derivation_only(
-        directory: Arc<Path>,
-        fields: crate::config::PathDerivationFields,
-        media: crate::config::MediaSelection,
-    ) -> Self {
-        Self {
-            directory,
-            folder_structure: fields.folder_structure,
-            folder_structure_albums: Arc::from(fields.folder_structure_albums.as_str()),
-            folder_structure_smart_folders: Arc::from(
-                fields.folder_structure_smart_folders.as_str(),
-            ),
-            library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
-            resolution: fields.resolution,
-            media,
-            skip_created_before: None,
-            skip_created_after: None,
-            set_exif_datetime: false,
-            set_exif_rating: false,
-            set_exif_gps: false,
-            set_exif_description: false,
-            #[cfg(feature = "xmp")]
-            embed_xmp: false,
-            #[cfg(feature = "xmp")]
-            xmp_sidecar: false,
-            concurrent_downloads: 1,
-            recent: None,
-            recent_scope: crate::cli::RecentScope::Global,
-            retry: RetryConfig::default(),
-            live_photo_mode: fields.live_photo_mode,
-            live_resolution: fields.live_resolution.to_asset_version_size(),
-            live_photo_mov_filename_policy: fields.live_photo_mov_filename_policy,
-            edited: fields.edited,
-            alternative: fields.alternative,
-            raw_policy: fields.raw_policy,
-            file_match_policy: fields.file_match_policy,
-            force_resolution: fields.force_resolution,
-            keep_unicode_in_filenames: fields.keep_unicode_in_filenames,
-            filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
-            temp_suffix: Arc::from(".kei-tmp"),
-            state_db: None,
-            retry_only: false,
-            max_download_attempts: 0,
-            sync_mode: SyncMode::Full,
-            enum_config_hash: None,
-            album_name: None,
-            exclude_asset_ids: Arc::new(FxHashSet::default()),
-            asset_groupings: Arc::new(AssetGroupings::default()),
-            bandwidth_limiter: None,
-        }
-    }
-
     /// Clone this config for a single download pass: pick the per-category
     /// template (`folder_structure_albums` for `PassKind::Album`,
     /// `folder_structure_smart_folders` for `PassKind::SmartFolder`,
@@ -1255,37 +1198,17 @@ impl DownloadConfig {
     /// with `--folder-structure "{album}/..."` still produce the same
     /// on-disk tree.
     pub(crate) fn with_pass(&self, pass: &crate::commands::AlbumPass) -> Self {
-        let template: &str = match pass.kind {
-            crate::commands::PassKind::Album => &self.folder_structure_albums,
-            crate::commands::PassKind::SmartFolder => &self.folder_structure_smart_folders,
-            crate::commands::PassKind::Unfiled => &self.folder_structure,
-        };
-        let name = &pass.album.name;
-        let name_ref = Some(name.as_ref()).filter(|n: &&str| !n.is_empty());
-        let category_expanded = paths::expand_named_token(template, pass.kind.token(), name_ref);
-        // Apply `{library}` last with the path-friendly truncated zone name,
-        // so callers see `SharedSync-A1B2C3D4/...` instead of the full UUID.
-        // The state-DB key still uses the full `self.library` string.
-        let library_for_path = paths::truncate_library_zone(&self.library);
-        let folder_structure = paths::expand_named_token(
-            &category_expanded,
-            paths::TOKEN_LIBRARY,
-            Some(library_for_path),
+        let folder_structure = filter::folder_structure_for_pass(
+            &self.folder_structure,
+            &self.folder_structure_albums,
+            &self.folder_structure_smart_folders,
+            &self.library,
+            pass,
         );
         Self {
-            album_name: Some(Arc::clone(name)),
+            album_name: Some(Arc::clone(&pass.album.name)),
             folder_structure,
             exclude_asset_ids: Arc::clone(&pass.exclude_ids),
-            ..self.clone()
-        }
-    }
-
-    /// Clone this config with a different `library`. Import-existing pins
-    /// the per-library zone before calling `with_pass` so `{library}`
-    /// expands to the right path segment for each library iteration.
-    pub(crate) fn with_library(&self, library: &str) -> Self {
-        Self {
-            library: Arc::from(library),
             ..self.clone()
         }
     }
