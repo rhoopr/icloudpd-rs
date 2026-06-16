@@ -41,18 +41,6 @@ pub enum PasswordSource {
     Interactive,
 }
 
-/// Source-kind tag without the attached payload. Copy-safe so callers can
-/// record "where did the password come from" without holding the actual
-/// secret or store reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PasswordSourceKind {
-    Direct,
-    Command,
-    File,
-    Store,
-    Interactive,
-}
-
 /// Shared handle to a password-resolving closure.
 ///
 /// Behind `Arc` so the async call site can refcount-bump a handle
@@ -79,19 +67,6 @@ pub async fn invoke_password_provider(provider: &PasswordProvider) -> Option<Sec
         })
 }
 
-impl PasswordSource {
-    /// Return the source kind, discarding the attached payload.
-    pub const fn kind(&self) -> PasswordSourceKind {
-        match self {
-            Self::Direct(_) => PasswordSourceKind::Direct,
-            Self::Command(_) => PasswordSourceKind::Command,
-            Self::File(_) => PasswordSourceKind::File,
-            Self::Store(_) => PasswordSourceKind::Store,
-            Self::Interactive => PasswordSourceKind::Interactive,
-        }
-    }
-}
-
 /// Decision returned by [`decide_save_password_action`] to the sync loop:
 /// either perform the save, or skip it with a user-visible warning
 /// explaining why `--save-password` was a no-op for this source.
@@ -108,25 +83,25 @@ pub enum SavePasswordAction {
 /// resolved password source. Pure function for testability — the sync loop
 /// wraps this with the actual `store.store()` call and log emission.
 #[must_use]
-pub fn decide_save_password_action(kind: PasswordSourceKind) -> SavePasswordAction {
-    match kind {
-        PasswordSourceKind::Direct => SavePasswordAction::Save,
-        PasswordSourceKind::Interactive => SavePasswordAction::SkipWithWarning(
+pub fn decide_save_password_action(source: &PasswordSource) -> SavePasswordAction {
+    match source {
+        PasswordSource::Direct(_) => SavePasswordAction::Save,
+        PasswordSource::Interactive => SavePasswordAction::SkipWithWarning(
             "--save-password with an interactive password prompt is not supported. \
              Use `kei password set` to save a prompted password to the credential \
              store, then re-run without --save-password.",
         ),
-        PasswordSourceKind::File => SavePasswordAction::SkipWithWarning(
+        PasswordSource::File(_) => SavePasswordAction::SkipWithWarning(
             "--save-password skipped: the password is already persistent in a file \
              (`--password-file` / `[auth] password_file`). Remove --save-password, \
              or use `kei password set` to bootstrap the credential store from the file.",
         ),
-        PasswordSourceKind::Command => SavePasswordAction::SkipWithWarning(
+        PasswordSource::Command(_) => SavePasswordAction::SkipWithWarning(
             "--save-password skipped: the password comes from an external command \
              (`--password-command` / `[auth] password_command`). Remove --save-password \
              to avoid storing a stale copy of a rotating secret.",
         ),
-        PasswordSourceKind::Store => SavePasswordAction::SkipWithWarning(
+        PasswordSource::Store(_) => SavePasswordAction::SkipWithWarning(
             "--save-password skipped: the password is already in the credential store. \
              Remove --save-password from your invocation.",
         ),
@@ -596,42 +571,21 @@ mod tests {
         );
     }
 
-    // ── PasswordSource::kind + decide_save_password_action ──────────
-
-    #[test]
-    fn kind_maps_each_variant() {
-        assert_eq!(
-            PasswordSource::Direct(Arc::new(SecretString::from("x"))).kind(),
-            PasswordSourceKind::Direct
-        );
-        assert_eq!(
-            PasswordSource::Command("echo x".to_string()).kind(),
-            PasswordSourceKind::Command
-        );
-        assert_eq!(
-            PasswordSource::File(PathBuf::from("/x")).kind(),
-            PasswordSourceKind::File
-        );
-        assert_eq!(
-            PasswordSource::Interactive.kind(),
-            PasswordSourceKind::Interactive
-        );
-        // Store variant covered only by source-kind round-trip elsewhere
-        // because constructing a CredentialStore here requires filesystem
-        // setup.
-    }
+    // ── decide_save_password_action ────────────────────────────────
 
     #[test]
     fn decide_save_direct_saves() {
+        let source = PasswordSource::Direct(Arc::new(SecretString::from("x")));
         assert_eq!(
-            decide_save_password_action(PasswordSourceKind::Direct),
+            decide_save_password_action(&source),
             SavePasswordAction::Save
         );
     }
 
     #[test]
     fn decide_save_file_skips_with_bootstrap_hint() {
-        match decide_save_password_action(PasswordSourceKind::File) {
+        let source = PasswordSource::File(PathBuf::from("/x"));
+        match decide_save_password_action(&source) {
             SavePasswordAction::SkipWithWarning(msg) => {
                 assert!(msg.contains("--password-file"), "{msg}");
                 assert!(msg.contains("kei password set"), "{msg}");
@@ -642,7 +596,8 @@ mod tests {
 
     #[test]
     fn decide_save_command_skips_with_rotation_hint() {
-        match decide_save_password_action(PasswordSourceKind::Command) {
+        let source = PasswordSource::Command("echo x".to_string());
+        match decide_save_password_action(&source) {
             SavePasswordAction::SkipWithWarning(msg) => {
                 assert!(msg.contains("--password-command"), "{msg}");
                 assert!(msg.contains("rotating"), "{msg}");
@@ -653,7 +608,9 @@ mod tests {
 
     #[test]
     fn decide_save_store_skips_as_redundant() {
-        match decide_save_password_action(PasswordSourceKind::Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = PasswordSource::Store(CredentialStore::new("user@example.com", dir.path()));
+        match decide_save_password_action(&source) {
             SavePasswordAction::SkipWithWarning(msg) => {
                 assert!(msg.contains("already in the credential store"), "{msg}");
             }
@@ -663,7 +620,8 @@ mod tests {
 
     #[test]
     fn decide_save_interactive_points_at_password_set() {
-        match decide_save_password_action(PasswordSourceKind::Interactive) {
+        let source = PasswordSource::Interactive;
+        match decide_save_password_action(&source) {
             SavePasswordAction::SkipWithWarning(msg) => {
                 assert!(msg.contains("kei password set"), "{msg}");
                 assert!(msg.contains("interactive"), "{msg}");

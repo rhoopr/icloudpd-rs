@@ -578,9 +578,13 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         config.auth.password_file.as_deref(),
         cred_store,
     );
-    // Snapshot the source kind before moving `source` into the provider
-    // closure — used by the --save-password hook after auth succeeds.
-    let password_source_kind = source.kind();
+    // Compute the save-password decision while `source` is still owned here.
+    // The resulting action carries no password payload and survives moving the
+    // source into the provider closure below.
+    let save_password_action = config
+        .auth
+        .save_password
+        .then(|| password::decide_save_password_action(&source));
     let password_provider = make_password_provider(source);
 
     let auth_result = match auth::authenticate_with_mode(
@@ -636,8 +640,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // `Direct` source (CLI flag / env var) persists; File / Command /
     // Store / Interactive each emit a warning explaining why the flag is
     // a no-op for that source.
-    if config.auth.save_password {
-        match password::decide_save_password_action(password_source_kind) {
+    if let Some(action) = save_password_action {
+        match action {
             password::SavePasswordAction::Save => {
                 if let Some(ref pw) = config.auth.password {
                     let store = credential::CredentialStore::new(
