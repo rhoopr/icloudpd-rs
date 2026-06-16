@@ -1064,6 +1064,7 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
 
 /// Subset of application config consumed by the download engine.
 /// Decoupled from CLI parsing so the engine can be tested independently.
+#[derive(Clone)]
 pub(crate) struct DownloadConfig {
     /// Behind `Arc` so per-pass clones (`with_album_name`, `with_pass`,
     /// `with_exclude_ids`) refcount-bump instead of deep-cloning the
@@ -1273,20 +1274,9 @@ impl DownloadConfig {
         );
         Self {
             album_name: Some(Arc::clone(name)),
-            directory: Arc::clone(&self.directory),
             folder_structure,
-            folder_structure_albums: Arc::clone(&self.folder_structure_albums),
-            folder_structure_smart_folders: Arc::clone(&self.folder_structure_smart_folders),
-            filename_exclude: Arc::clone(&self.filename_exclude),
-            temp_suffix: Arc::clone(&self.temp_suffix),
-            state_db: self.state_db.clone(),
-            sync_mode: self.sync_mode.clone(),
-            enum_config_hash: self.enum_config_hash.clone(),
             exclude_asset_ids: Arc::clone(&pass.exclude_ids),
-            asset_groupings: Arc::clone(&self.asset_groupings),
-            bandwidth_limiter: self.bandwidth_limiter.clone(),
-            library: Arc::clone(&self.library),
-            ..*self
+            ..self.clone()
         }
     }
 
@@ -1295,21 +1285,8 @@ impl DownloadConfig {
     /// expands to the right path segment for each library iteration.
     pub(crate) fn with_library(&self, library: &str) -> Self {
         Self {
-            directory: Arc::clone(&self.directory),
-            folder_structure: self.folder_structure.clone(),
-            folder_structure_albums: Arc::clone(&self.folder_structure_albums),
-            folder_structure_smart_folders: Arc::clone(&self.folder_structure_smart_folders),
-            filename_exclude: Arc::clone(&self.filename_exclude),
-            temp_suffix: Arc::clone(&self.temp_suffix),
-            state_db: self.state_db.clone(),
-            sync_mode: self.sync_mode.clone(),
-            enum_config_hash: self.enum_config_hash.clone(),
-            album_name: self.album_name.clone(),
-            exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
-            asset_groupings: Arc::clone(&self.asset_groupings),
-            bandwidth_limiter: self.bandwidth_limiter.clone(),
             library: Arc::from(library),
-            ..*self
+            ..self.clone()
         }
     }
 
@@ -1318,42 +1295,15 @@ impl DownloadConfig {
     /// share a single config but the exclude set is lifted off the plan.
     fn with_exclude_ids(&self, exclude_ids: Arc<FxHashSet<String>>) -> Self {
         Self {
-            directory: Arc::clone(&self.directory),
-            folder_structure: self.folder_structure.clone(),
-            folder_structure_albums: Arc::clone(&self.folder_structure_albums),
-            folder_structure_smart_folders: Arc::clone(&self.folder_structure_smart_folders),
-            filename_exclude: Arc::clone(&self.filename_exclude),
-            temp_suffix: Arc::clone(&self.temp_suffix),
-            state_db: self.state_db.clone(),
-            sync_mode: self.sync_mode.clone(),
-            enum_config_hash: self.enum_config_hash.clone(),
-            album_name: self.album_name.clone(),
             exclude_asset_ids: exclude_ids,
-            asset_groupings: Arc::clone(&self.asset_groupings),
-            bandwidth_limiter: self.bandwidth_limiter.clone(),
-            library: Arc::clone(&self.library),
-            ..*self
+            ..self.clone()
         }
     }
 
     fn with_recent_scope(&self, recent_scope: crate::cli::RecentScope) -> Self {
         Self {
-            directory: Arc::clone(&self.directory),
-            folder_structure: self.folder_structure.clone(),
-            folder_structure_albums: Arc::clone(&self.folder_structure_albums),
-            folder_structure_smart_folders: Arc::clone(&self.folder_structure_smart_folders),
-            filename_exclude: Arc::clone(&self.filename_exclude),
-            temp_suffix: Arc::clone(&self.temp_suffix),
-            state_db: self.state_db.clone(),
-            sync_mode: self.sync_mode.clone(),
-            enum_config_hash: self.enum_config_hash.clone(),
-            album_name: self.album_name.clone(),
-            exclude_asset_ids: Arc::clone(&self.exclude_asset_ids),
-            asset_groupings: Arc::clone(&self.asset_groupings),
-            bandwidth_limiter: self.bandwidth_limiter.clone(),
-            library: Arc::clone(&self.library),
             recent_scope,
-            ..*self
+            ..self.clone()
         }
     }
 }
