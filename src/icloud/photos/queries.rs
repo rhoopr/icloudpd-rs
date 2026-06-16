@@ -218,20 +218,24 @@ pub(crate) const VIDEO_VERSION_LOOKUP: &[(AssetVersionSize, &str, &str)] = &[
 
 pub(crate) fn encode_params(params: &HashMap<String, Value>) -> String {
     use std::borrow::Cow;
-    let mut pairs: Vec<String> = params
+
+    let mut pairs: Vec<(&str, Cow<'_, str>)> = params
         .iter()
         .map(|(k, v)| {
-            let val: Cow<'_, str> = match v {
+            let val = match v {
                 Value::String(s) => Cow::Borrowed(s.as_str()),
                 Value::Bool(b) => Cow::Owned(b.to_string()),
                 Value::Number(n) => Cow::Owned(n.to_string()),
                 other => Cow::Owned(other.to_string()),
             };
-            format!("{}={}", urlencoding::encode(k), urlencoding::encode(&val))
+            (k.as_str(), val)
         })
         .collect();
-    pairs.sort();
-    pairs.join("&")
+    pairs.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
 }
 
 /// Build the request body for `/changes/database`.
@@ -323,7 +327,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("q".to_string(), Value::String("hello world".to_string()));
         let encoded = encode_params(&params);
-        assert_eq!(encoded, "q=hello%20world");
+        assert_eq!(encoded, "q=hello+world");
     }
 
     #[test]

@@ -138,7 +138,6 @@ bitflags = "2"
 url = "2"
 dirs = "6"
 async-trait = "0.1"
-urlencoding = "2"
 memchr = "2"
 
 # SQLite state tracking
