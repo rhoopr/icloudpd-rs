@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The round-trip serializer gate now documents its heuristic limits and requires a reviewer rationale for no-inverse exceptions or emergency bypasses. (fixes [#583])
 - `just full-test` now quotes the configured Docker image consistently in Docker smoke commands, including the default-command smoke that runs through `bash -c`. (fixes [#583])
 - Encrypted-file credentials now use `.kei-state` directly. The old `.credential-key` auto-rename path was removed; users who still have that pre-0.6.2 key file must rename it to `.kei-state` manually before using the encrypted-file backend. (fixes [#613])
+- Startup no longer auto-copies config, cookies, or state from the old `icloudpd-rs` paths. Users with those pre-rename files should copy the needed files into `~/.config/kei` manually. (fixes [#606])
 
 [#479]: https://github.com/rhoopr/kei/issues/479
 [#506]: https://github.com/rhoopr/kei/issues/506
@@ -46,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#587]: https://github.com/rhoopr/kei/issues/587
 [#588]: https://github.com/rhoopr/kei/issues/588
 [#590]: https://github.com/rhoopr/kei/issues/590
+[#606]: https://github.com/rhoopr/kei/issues/606
 [#613]: https://github.com/rhoopr/kei/issues/613
 
 ## [0.21.8] - 2026-06-10

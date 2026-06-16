@@ -990,6 +990,44 @@ fn first_run_auto_config_does_not_overwrite() {
     );
 }
 
+#[test]
+fn legacy_icloudpd_rs_paths_are_not_auto_copied_on_startup() {
+    let home = tempfile::tempdir().unwrap();
+    let old_config = home.path().join(".config/icloudpd-rs/config.toml");
+    let old_cookie_dir = home.path().join(".icloudpd-rs");
+    let config_path = home.path().join("current-config.toml");
+
+    std::fs::create_dir_all(old_config.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&old_cookie_dir).unwrap();
+    std::fs::write(&old_config, "[auth]\nusername = \"legacy@example.com\"\n").unwrap();
+    std::fs::write(old_cookie_dir.join("session.json"), "{}").unwrap();
+    std::fs::write(
+        &config_path,
+        "[auth]\nusername = \"current@example.com\"\n[download]\ndirectory = \"/tmp/codex/kei/photos\"\n",
+    )
+    .unwrap();
+
+    clean_cmd()
+        .env("HOME", home.path())
+        .args(["config", "show", "--config", config_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("current@example.com"))
+        .stdout(predicate::str::contains("legacy@example.com").not());
+
+    assert!(
+        !home.path().join(".config/kei/config.toml").exists(),
+        "startup must not copy legacy icloudpd-rs config into kei paths"
+    );
+    assert!(
+        !home
+            .path()
+            .join(".config/kei/cookies/session.json")
+            .exists(),
+        "startup must not copy legacy icloudpd-rs session files into kei paths"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Config validation: malformed/invalid TOML
 // ═══════════════════════════════════════════════════════════════════════

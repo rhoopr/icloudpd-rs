@@ -37,7 +37,6 @@ mod fs_util;
 mod health;
 mod icloud;
 mod metrics;
-mod migration;
 mod notifications;
 mod password;
 mod personality;
@@ -669,11 +668,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     if let Err(msg) = cli.validate(&explicit_sync_flags) {
         anyhow::bail!("{msg}");
     }
-
-    // Copy legacy icloudpd-rs paths before loading config, so the
-    // copied config.toml is found at the new location. Copy failures are
-    // startup errors; kei doesn't continue against the old paths.
-    migration::migrate_legacy_paths()?;
 
     // Load TOML config early so it can influence log level.
     // If the user explicitly set --config, the file must exist.

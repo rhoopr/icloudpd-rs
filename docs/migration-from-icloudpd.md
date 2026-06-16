@@ -18,6 +18,21 @@ fresh Apple login and 2FA approval. Your local photo files can stay in place.
 
 For containers, use the Docker `:latest` image or pin `:0.20.0`.
 
+## If you're coming from old `icloudpd-rs`
+
+Current kei releases don't auto-copy files from the old `icloudpd-rs` paths at
+startup. If you still have data there, copy only what you need before the first
+run:
+
+```sh
+mkdir -p ~/.config/kei/cookies
+cp ~/.config/icloudpd-rs/config.toml ~/.config/kei/config.toml
+cp ~/.icloudpd-rs/* ~/.config/kei/cookies/
+```
+
+Skip any command whose source path doesn't exist. The old files can stay in
+place until you're sure kei is working.
+
 ## Step 1: import the existing tree
 
 Point kei at the directory that `icloudpd` has been writing to:
