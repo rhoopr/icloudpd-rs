@@ -6,6 +6,7 @@
 //! `provider_data` so that invariant 4 (capture everything available) holds.
 
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 use crate::state::AssetMetadata;
 
@@ -49,7 +50,7 @@ const PROVIDER_DATA_FIELDS: &[&str] = &[
 /// asset record; the master record is consulted as fallback.
 pub fn extract(master_fields: &Value, asset_fields: &Value) -> AssetMetadata {
     let mut meta = AssetMetadata {
-        source: Some(crate::string_interner::intern(SOURCE)),
+        source: Some(Arc::<str>::from(SOURCE)),
         ..AssetMetadata::default()
     };
 

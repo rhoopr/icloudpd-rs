@@ -48,7 +48,6 @@ mod service;
 mod setup;
 mod shutdown;
 mod state;
-mod string_interner;
 mod sync_cycle;
 mod sync_loop;
 mod systemd;

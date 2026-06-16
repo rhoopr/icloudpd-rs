@@ -7,8 +7,8 @@ pub use crate::types::{AssetItemType, AssetVersionSize, ChangeReason};
 /// Uses `Box<str>` instead of `String` for url and checksum
 /// to save 8 bytes per field (16 vs 24 bytes) since these strings are
 /// never mutated after construction.
-/// `asset_type` uses `Arc<str>` so repeated UTI values (e.g. "public.jpeg")
-/// share a single allocation via the global string interner.
+/// `asset_type` uses `Arc<str>` so cloned asset versions can share string
+/// storage without carrying `String` capacity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetVersion {
     pub size: u64,

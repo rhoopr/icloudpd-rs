@@ -162,8 +162,8 @@ impl MediaType {
 #[derive(Debug, Clone, Default)]
 pub struct AssetMetadata {
     /// Source label for this record. Currently "icloud".
-    /// Uses `Arc<str>` so repeated source names share a single allocation
-    /// via the global string interner.
+    /// Uses `Arc<str>` so cloned records can share string storage without
+    /// carrying `String` capacity.
     pub source: Option<Arc<str>>,
     /// Favorite/heart flag from iCloud Photos.
     pub is_favorite: bool,
