@@ -111,28 +111,6 @@ struct CookieEntry {
     cookie: String,
 }
 
-/// Parse legacy tab-separated cookie file format into `CookieEntry` values.
-///
-/// Each line is `URL<TAB>cookie-string`. Comment lines (`#`), blank lines,
-/// and `Set-Cookie3:` headers are skipped. Lines without a tab are ignored.
-fn parse_legacy_cookies(contents: &str) -> Vec<CookieEntry> {
-    contents
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("Set-Cookie3:")
-            {
-                return None;
-            }
-            let (url_str, cookie_str) = trimmed.split_once('\t')?;
-            Some(CookieEntry {
-                url: url_str.to_string(),
-                cookie: cookie_str.to_string(),
-            })
-        })
-        .collect()
-}
-
 /// Atomically write `data` to `path` via a temp file + rename.
 ///
 /// Sets 0o600 permissions on Unix before renaming, so the file is never
@@ -366,44 +344,52 @@ impl Session {
         let cookiejar_path = cookie_dir.join(sanitized);
         if cookiejar_path.is_file() {
             match fs::read_to_string(&cookiejar_path).await {
-                Ok(contents) => {
-                    let now = chrono::Utc::now();
-                    // Try JSON format first, fall back to legacy tab-separated format
-                    let entries =
-                        if let Ok(entries) = serde_json::from_str::<Vec<CookieEntry>>(&contents) {
-                            entries
-                        } else {
-                            parse_legacy_cookies(&contents)
-                        };
-                    for entry in entries {
-                        if is_cookie_expired(&entry.cookie, &now) {
-                            tracing::debug!(url = %entry.url, "Pruning expired cookie");
-                            continue;
+                Ok(contents) => match serde_json::from_str::<Vec<CookieEntry>>(&contents) {
+                    Ok(entries) => {
+                        let now = chrono::Utc::now();
+                        for entry in entries {
+                            if is_cookie_expired(&entry.cookie, &now) {
+                                tracing::debug!(url = %entry.url, "Pruning expired cookie");
+                                continue;
+                            }
+                            if let Ok(url) = entry.url.parse::<url::Url>() {
+                                let cookie_with_domain =
+                                    if let Some(domain) = broad_cookie_domain(url.host_str()) {
+                                        format!("{}; Domain={domain}", entry.cookie)
+                                    } else {
+                                        entry.cookie.clone()
+                                    };
+                                cookie_jar.add_cookie_str(&cookie_with_domain, &url);
+                            }
                         }
-                        if let Ok(url) = entry.url.parse::<url::Url>() {
-                            let cookie_with_domain =
-                                if let Some(domain) = broad_cookie_domain(url.host_str()) {
-                                    format!("{}; Domain={domain}", entry.cookie)
-                                } else {
-                                    entry.cookie.clone()
-                                };
-                            cookie_jar.add_cookie_str(&cookie_with_domain, &url);
-                        }
-                    }
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Err(e) = fs::set_permissions(
-                            &cookiejar_path,
-                            std::fs::Permissions::from_mode(0o600),
-                        )
-                        .await
+                        #[cfg(unix)]
                         {
-                            tracing::warn!(error = %e, "Could not set cookie file permissions");
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Err(e) = fs::set_permissions(
+                                &cookiejar_path,
+                                std::fs::Permissions::from_mode(0o600),
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Could not set cookie file permissions"
+                                );
+                            }
                         }
+                        tracing::debug!(path = %cookiejar_path.display(), "Read cookies");
                     }
-                    tracing::debug!(path = %cookiejar_path.display(), "Read cookies");
-                }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %cookiejar_path.display(),
+                            error = %e,
+                            "Cookiejar file is not valid JSON; removing cookies and validation cache"
+                        );
+                        crate::fs_util::log_remove_async(&cookiejar_path).await;
+                        let cache_path = cookie_dir.join(format!("{sanitized}.cache"));
+                        crate::fs_util::log_remove_async(&cache_path).await;
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(
                         path = %cookiejar_path.display(),
@@ -764,7 +750,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::responses;
+    use crate::auth::{self, responses};
 
     /// Return a unique temp directory for a session test.
     ///
@@ -899,24 +885,83 @@ mod tests {
     #[tokio::test]
     async fn test_expired_cookies_pruned_on_load() {
         let (_td, dir) = test_dir("cookie_prune");
-        let sanitized = sanitize_username("user@test.com");
-        let cookie_path = dir.join(&sanitized);
+        let username = "user@test.com";
+        let cookie_path = auth::cookiejar_file_path(&dir, username);
 
         // Write a cookie file with one expired and one valid cookie
-        let expired =
-            "https://example.com\texpired_cookie=val; Expires=Thu, 01 Jan 2020 00:00:00 GMT"
-                .to_string();
-        let valid = "https://example.com\tvalid_cookie=val; Expires=Thu, 01 Jan 2099 00:00:00 GMT"
-            .to_string();
-        std::fs::write(&cookie_path, format!("{}\n{}", expired, valid)).unwrap();
+        let entries = vec![
+            CookieEntry {
+                url: "https://example.com".to_string(),
+                cookie: "expired_cookie=val; Expires=Thu, 01 Jan 2020 00:00:00 GMT".to_string(),
+            },
+            CookieEntry {
+                url: "https://example.com".to_string(),
+                cookie: "valid_cookie=val; Expires=Thu, 01 Jan 2099 00:00:00 GMT".to_string(),
+            },
+        ];
+        std::fs::write(
+            &cookie_path,
+            serde_json::to_string_pretty(&entries).unwrap(),
+        )
+        .unwrap();
 
-        let session = Session::new(&dir, "user@test.com", "https://example.com", None)
+        let session = Session::new(&dir, username, "https://example.com", None)
             .await
             .unwrap();
 
         // The expired cookie should have been pruned; valid one kept
         // We can't directly inspect the cookie jar, but we can verify the session loaded
         assert!(session.cookiejar_path().exists());
+    }
+
+    #[tokio::test]
+    async fn corrupt_cookiejar_json_is_removed_on_load() {
+        let (_td, dir) = test_dir("cookie_corrupt_json");
+        let username = "user@test.com";
+        let cookie_path = auth::cookiejar_file_path(&dir, username);
+        let cache_path = auth::validation_cache_file_path(&dir, username);
+        std::fs::write(&cookie_path, "not valid json {{{").unwrap();
+        std::fs::write(&cache_path, r#"{"validated_at":1,"account_data":{}}"#).unwrap();
+
+        let session = Session::new(&dir, username, "https://example.com", None)
+            .await
+            .unwrap();
+
+        assert_eq!(session.cookiejar_path(), cookie_path);
+        assert!(
+            !session.cookiejar_path().exists(),
+            "corrupt current-format cookie files should be removed so re-auth can rebuild them"
+        );
+        assert!(
+            !cache_path.exists(),
+            "corrupt cookie files should invalidate the validation cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_tab_separated_cookiejar_is_not_loaded() {
+        let (_td, dir) = test_dir("cookie_legacy_tab");
+        let username = "user@test.com";
+        let cookie_path = auth::cookiejar_file_path(&dir, username);
+        std::fs::write(
+            &cookie_path,
+            "https://example.com\tlegacy_cookie=val; Expires=Thu, 01 Jan 2099 00:00:00 GMT",
+        )
+        .unwrap();
+
+        let session = Session::new(&dir, username, "https://example.com", None)
+            .await
+            .unwrap();
+
+        let url: url::Url = "https://example.com/".parse().unwrap();
+        assert!(
+            session.cookie_jar.cookies(&url).is_none(),
+            "legacy tab-separated cookies must not be loaded"
+        );
+        assert!(
+            !session.cookiejar_path().exists(),
+            "legacy cookie files should follow the corrupt JSON recovery path"
+        );
     }
 
     #[test]
@@ -1082,54 +1127,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(mtime1, mtime2, "File should not have been rewritten");
-    }
-
-    #[test]
-    fn test_parse_legacy_cookies_basic() {
-        let input = "https://example.com\tfoo=bar\nhttps://other.com\tbaz=qux";
-        let entries = parse_legacy_cookies(input);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].url, "https://example.com");
-        assert_eq!(entries[0].cookie, "foo=bar");
-        assert_eq!(entries[1].url, "https://other.com");
-        assert_eq!(entries[1].cookie, "baz=qux");
-    }
-
-    #[test]
-    fn test_parse_legacy_cookies_skips_comments_and_blanks() {
-        let input = "# This is a comment\n\nhttps://example.com\tfoo=bar\n  \n# Another comment";
-        let entries = parse_legacy_cookies(input);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].cookie, "foo=bar");
-    }
-
-    #[test]
-    fn test_parse_legacy_cookies_skips_set_cookie3_header() {
-        let input = "Set-Cookie3: some header\nhttps://example.com\tfoo=bar";
-        let entries = parse_legacy_cookies(input);
-        assert_eq!(entries.len(), 1);
-    }
-
-    #[test]
-    fn test_parse_legacy_cookies_skips_malformed_lines() {
-        let input = "no-tab-here\nhttps://example.com\tfoo=bar\nalso no tab";
-        let entries = parse_legacy_cookies(input);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].url, "https://example.com");
-    }
-
-    #[test]
-    fn test_parse_legacy_cookies_empty_input() {
-        assert!(parse_legacy_cookies("").is_empty());
-    }
-
-    #[test]
-    fn test_parse_legacy_cookies_preserves_cookie_with_tabs() {
-        // Tab in cookie value after the first split
-        let input = "https://example.com\tfoo=bar\textra";
-        let entries = parse_legacy_cookies(input);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].cookie, "foo=bar\textra");
     }
 
     #[tokio::test]
