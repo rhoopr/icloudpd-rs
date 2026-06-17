@@ -3378,7 +3378,7 @@ mod build_config_tests {
         argv.extend(extra.iter().copied());
         let cli = Cli::try_parse_from(argv).expect("clap parse");
         match cli.command {
-            Some(Command::ImportExisting(a)) => a,
+            Command::ImportExisting(a) => a,
             _ => panic!("expected ImportExisting"),
         }
     }

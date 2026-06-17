@@ -215,7 +215,7 @@ pub struct PasswordArgs {
     pub password_command: Option<String>,
 }
 
-/// Arguments for the sync command (also used as default when no subcommand).
+/// Arguments for the sync command.
 #[derive(Parser, Debug, Clone, Default)]
 pub struct SyncArgs {
     /// Limit to recent assets (e.g. `--recent 100`) or use a days window
@@ -271,9 +271,9 @@ pub struct SyncArgs {
 
 /// Runtime-friendly output toggles.
 ///
-/// These are deliberately not global options. They only affect bare `kei`
-/// (the sync alias) and `kei sync`; non-sync subcommands either do no long
-/// running terminal rendering or force friendly mode off.
+/// These are deliberately not global options. They only affect `kei sync`;
+/// non-sync subcommands either do no long running terminal rendering or force
+/// friendly mode off.
 #[derive(Parser, Debug, Clone, Default)]
 pub struct FriendlyArgs {
     /// Use friendly terminal progress and summaries (default on interactive terminals)
@@ -549,7 +549,7 @@ pub enum ServiceAction {
 )]
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
-    /// Download photos from iCloud (the default: running `kei` with no command does this)
+    /// Download photos from iCloud
     Sync {
         #[command(flatten)]
         friendly: FriendlyArgs,
@@ -655,6 +655,8 @@ pub enum Command {
     name = "kei",
     about = "kei: photo sync engine",
     version,
+    subcommand_required = true,
+    arg_required_else_help = true,
     after_help = "Getting started:\n  \
         kei config setup    Generate your config interactively\n  \
         kei sync            Download your photos (runs after setup)\n\n  \
@@ -677,9 +679,6 @@ pub struct Cli {
     #[arg(long, short = 'v', global = true)]
     pub verbose: bool,
 
-    #[command(flatten)]
-    pub friendly: FriendlyArgs,
-
     /// Path to TOML config file
     #[arg(
         long,
@@ -690,40 +689,7 @@ pub struct Cli {
     pub config: String,
 
     #[command(subcommand)]
-    pub command: Option<Command>,
-
-    // ── Backward compat: bare invocation = sync ────────────────────
-    #[command(flatten)]
-    pub password: PasswordArgs,
-
-    #[command(flatten)]
-    pub sync: SyncArgs,
-}
-
-impl SyncArgs {
-    /// Merge top-level (fallback) sync args into self.
-    /// Subcommand values take precedence; top-level fills in gaps.
-    fn merge_from(&mut self, fallback: &Self) {
-        if self.recent.is_none() {
-            self.recent = fallback.recent;
-        }
-        if self.recent_scope.is_none() {
-            self.recent_scope = fallback.recent_scope;
-        }
-        self.dry_run = self.dry_run || fallback.dry_run;
-        self.no_progress_bar = self.no_progress_bar || fallback.no_progress_bar;
-        if self.skip_created_before.is_none() {
-            self.skip_created_before
-                .clone_from(&fallback.skip_created_before);
-        }
-        if self.skip_created_after.is_none() {
-            self.skip_created_after
-                .clone_from(&fallback.skip_created_after);
-        }
-        self.only_print_filenames = self.only_print_filenames || fallback.only_print_filenames;
-        self.save_password = self.save_password || fallback.save_password;
-        self.retry_failed = self.retry_failed || fallback.retry_failed;
-    }
+    pub command: Command,
 }
 
 impl FriendlyArgs {
@@ -738,28 +704,6 @@ impl FriendlyArgs {
             Some(true)
         } else {
             None
-        }
-    }
-
-    fn merge_from(&mut self, fallback: &Self) {
-        if self.request().is_none() {
-            self.friendly = fallback.friendly;
-            self.no_friendly = fallback.no_friendly;
-        }
-    }
-}
-
-impl PasswordArgs {
-    /// Merge top-level (fallback) password args into self.
-    fn merge_from(&mut self, fallback: &Self) {
-        if self.password.is_none() {
-            self.password.clone_from(&fallback.password);
-        }
-        if self.password_file.is_none() {
-            self.password_file.clone_from(&fallback.password_file);
-        }
-        if self.password_command.is_none() {
-            self.password_command.clone_from(&fallback.password_command);
         }
     }
 }
@@ -777,178 +721,15 @@ impl Cli {
     #[must_use]
     pub fn friendly_request(&self) -> Option<bool> {
         match &self.command {
-            None => self.friendly.request(),
-            Some(Command::Sync { friendly, .. }) => {
-                friendly.request().or_else(|| self.friendly.request())
-            }
+            Command::Sync { friendly, .. } => friendly.request(),
             _ => None,
         }
     }
 
-    /// Get the effective command, treating bare invocation as sync.
-    ///
-    /// When a subcommand is present, top-level password/sync args are merged
-    /// as fallbacks so `kei --password X sync` works the same as
-    /// `kei sync --password X`.
+    /// Get the parsed command.
     pub fn effective_command(&self) -> Command {
-        if let Some(cmd) = &self.command {
-            let mut cmd = cmd.clone();
-            cmd.merge_top_level_args(&self.friendly, &self.password, &self.sync);
-            cmd
-        } else {
-            Command::Sync {
-                friendly: self.friendly.clone(),
-                password: self.password.clone(),
-                sync: self.sync.clone(),
-            }
-        }
+        self.command.clone()
     }
-}
-
-impl Cli {
-    /// Validate that sync-only top-level flags are not combined with a
-    /// non-sync subcommand.
-    ///
-    /// `kei` accepts a bare invocation as shorthand for `kei sync`, so flags
-    /// like `--skip-videos` are wired at the top level. clap by itself will
-    /// happily parse `kei --skip-videos status`: the top-level flag is
-    /// consumed and silently dropped because `Status` carries no sync args.
-    /// The user thinks they ran a status check with their flag honoured;
-    /// they actually ran something different from what they typed.
-    ///
-    /// This validator runs after `Cli::parse()` and rejects any such
-    /// combination, naming every offending flag in the error message.
-    /// Bare invocation (no subcommand) and the `sync` subcommand
-    /// legitimately use these flags and pass.
-    pub fn validate(&self, explicit_sync_flags: &[&'static str]) -> Result<(), String> {
-        // Bare invocation = sync alias; flags are valid.
-        let Some(cmd) = &self.command else {
-            return Ok(());
-        };
-        match cmd {
-            // Sync carries sync args directly; top-level merge into it is intended.
-            Command::Sync { .. } => Ok(()),
-            // `service run` also carries SyncArgs and merges top-level runtime
-            // flags, but friendly-mode flags are sync-only because service mode
-            // forces friendly output off.
-            Command::Service {
-                action: ServiceAction::Run(_),
-            } => {
-                let invalid: Vec<&'static str> = explicit_sync_flags
-                    .iter()
-                    .copied()
-                    .filter(|flag| matches!(*flag, "--friendly" | "--no-friendly"))
-                    .collect();
-                if invalid.is_empty() {
-                    Ok(())
-                } else {
-                    Err(service_run_friendly_flags_error(&invalid))
-                }
-            }
-            _ if explicit_sync_flags.is_empty() => Ok(()),
-            _ => Err(sync_only_flags_error(
-                subcommand_display_name(cmd),
-                explicit_sync_flags,
-            )),
-        }
-    }
-}
-
-fn sync_only_flags_error(cmd_name: &str, flags: &[&'static str]) -> String {
-    let flag_list = flags.join(", ");
-    format!(
-        "the following sync-only flag{plural} cannot be combined with `kei {cmd_name}`: {flag_list}\n\
-         bare-kei (no subcommand) is shorthand for `kei sync`; sync-only flags are only valid there or under `kei sync`",
-        plural = if flags.len() == 1 { "" } else { "s" },
-    )
-}
-
-fn service_run_friendly_flags_error(flags: &[&'static str]) -> String {
-    let flag_list = flags.join(", ");
-    format!(
-        "friendly-mode flag{plural} cannot be combined with `kei service run`: {flag_list}\n\
-         service mode always disables friendly output",
-        plural = if flags.len() == 1 { "" } else { "s" },
-    )
-}
-
-/// Human-readable subcommand name for error messages.
-fn subcommand_display_name(cmd: &Command) -> &'static str {
-    match cmd {
-        Command::Sync { .. } => "sync",
-        Command::Login { .. } => "login",
-        Command::List { .. } => "list",
-        Command::Password { .. } => "password",
-        Command::Reset { .. } => "reset",
-        Command::Config { .. } => "config",
-        Command::Status(_) => "status",
-        Command::Doctor(_) => "doctor",
-        Command::Manifest(_) => "manifest",
-        Command::ImportExisting(_) => "import-existing",
-        Command::Verify(_) => "verify",
-        Command::Reconcile(_) => "reconcile",
-        Command::Install(_) => "install",
-        Command::Uninstall(_) => "uninstall",
-        Command::Service { action } => match action {
-            ServiceAction::Run(_) => "service run",
-            ServiceAction::Status => "service status",
-        },
-    }
-}
-
-/// Return the set of sync-only top-level flags that the user actually
-/// provided. An empty Vec means every field is at its `SyncArgs::default()`
-/// value.
-///
-/// Used by [`Cli::validate`] to name every offending flag when the user
-/// combines a non-sync subcommand with bare-kei sync flags. Each branch
-/// corresponds 1:1 to a `SyncArgs` field; when adding a new sync flag,
-/// extend this function so it shows up in the rejection message.
-/// Return the set of sync-only top-level flags that were explicitly
-/// provided on the command line (not via environment variables or
-/// defaults). An empty Vec means no sync flag came from the CLI.
-///
-/// Used by [`Cli::validate`] to name offending flags when the user
-/// combines a non-sync subcommand with bare-kei sync flags. Each branch
-/// corresponds 1:1 to a `SyncArgs` field; when adding a new sync flag,
-/// extend this function so it shows up in the rejection message.
-fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str> {
-    use clap::parser::ValueSource;
-    let mut out = Vec::new();
-    if matches.value_source("recent") == Some(ValueSource::CommandLine) {
-        out.push("--recent");
-    }
-    if matches.value_source("recent_scope") == Some(ValueSource::CommandLine) {
-        out.push("--recent-scope");
-    }
-    if matches.value_source("friendly") == Some(ValueSource::CommandLine) {
-        out.push("--friendly");
-    }
-    if matches.value_source("no_friendly") == Some(ValueSource::CommandLine) {
-        out.push("--no-friendly");
-    }
-    if matches.value_source("dry_run") == Some(ValueSource::CommandLine) {
-        out.push("--dry-run");
-    }
-    if matches.value_source("no_progress_bar") == Some(ValueSource::CommandLine) {
-        out.push("--no-progress-bar");
-    }
-    if matches.value_source("skip_created_before") == Some(ValueSource::CommandLine) {
-        out.push("--skip-created-before");
-    }
-    if matches.value_source("skip_created_after") == Some(ValueSource::CommandLine) {
-        out.push("--skip-created-after");
-    }
-    if matches.value_source("only_print_filenames") == Some(ValueSource::CommandLine) {
-        out.push("--only-print-filenames");
-    }
-    if matches.value_source("save_password") == Some(ValueSource::CommandLine) {
-        out.push("--save-password");
-    }
-    if matches.value_source("retry_failed") == Some(ValueSource::CommandLine) {
-        out.push("--retry-failed");
-    }
-    out
 }
 
 /// Rendered CLI parse failure with a concrete process exit code.
@@ -1016,12 +797,8 @@ fn with_removed_sync_surface_hint(message: String) -> String {
     )
 }
 
-/// Parse CLI arguments and return both the parsed struct and the list of
-/// sync-only flags that were explicitly provided on the command line.
-///
-/// This is the production entry point. It replaces `Cli::parse()` so the
-/// validator can distinguish between CLI-provided and env-provided flags.
-pub fn parse_cli_with_sources<I, T>(itr: I) -> Result<(Cli, Vec<&'static str>), ParseCliError>
+/// Parse CLI arguments and render migration hints for removed sync flags.
+pub fn parse_cli_with_sources<I, T>(itr: I) -> Result<Cli, ParseCliError>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
@@ -1039,43 +816,15 @@ where
             exit_code: err.exit_code(),
             use_stderr: err.use_stderr(),
         })?;
-    let explicit_sync_flags = explicit_top_level_sync_flags(&matches);
     let cli = Cli::from_arg_matches(&matches).map_err(|err| ParseCliError {
         rendered: err.to_string(),
         exit_code: err.exit_code(),
         use_stderr: err.use_stderr(),
     })?;
-    Ok((cli, explicit_sync_flags))
+    Ok(cli)
 }
 
 impl Command {
-    /// Merge top-level CLI password/sync args as fallbacks into the
-    /// subcommand's own args.
-    fn merge_top_level_args(
-        &mut self,
-        top_friendly: &FriendlyArgs,
-        top_password: &PasswordArgs,
-        top_sync: &SyncArgs,
-    ) {
-        // Merge sync args for commands that carry them
-        match self {
-            Self::Sync { friendly, sync, .. } => {
-                friendly.merge_from(top_friendly);
-                sync.merge_from(top_sync);
-            }
-            Self::Service {
-                action: ServiceAction::Run(args),
-            } => {
-                args.sync.merge_from(top_sync);
-            }
-            _ => {}
-        }
-        // Merge password args for commands that carry them
-        if let Some(pw) = self.password_args_mut() {
-            pw.merge_from(top_password);
-        }
-    }
-
     /// Inject the `ICLOUD_PASSWORD` value captured before `Cli::parse()`.
     ///
     /// The env var is removed from the process environment for security
@@ -1147,19 +896,6 @@ mod tests {
         let mut args = vec!["kei"];
         args.extend_from_slice(tail);
         assert_removed_sync_flag(&args);
-    }
-
-    /// Parse argv into a `Cli` and compute the explicit sync flags list.
-    /// Used by validation tests that need to distinguish CLI-provided
-    /// values from env-provided ones.
-    fn parse_and_validate(argv: &[&str]) -> Result<(), String> {
-        let cmd = <Cli as clap::CommandFactory>::command();
-        let matches = cmd
-            .try_get_matches_from(argv)
-            .map_err(|err| err.to_string())?;
-        let explicit_sync_flags = explicit_top_level_sync_flags(&matches);
-        let cli = Cli::from_arg_matches(&matches).map_err(|err| err.to_string())?;
-        cli.validate(&explicit_sync_flags)
     }
 
     #[test]
@@ -1312,7 +1048,7 @@ mod tests {
     #[test]
     fn recent_scope_parses_global_and_per_filter() {
         let cli = parse(&["kei", "sync", "--recent", "100", "--recent-scope", "global"]);
-        let Command::Sync { sync, .. } = cli.command.expect("sync command") else {
+        let Command::Sync { sync, .. } = cli.command else {
             panic!("expected sync command");
         };
         assert_eq!(sync.recent_scope, Some(RecentScope::Global));
@@ -1325,7 +1061,7 @@ mod tests {
             "--recent-scope",
             "per-filter",
         ]);
-        let Command::Sync { sync, .. } = cli.command.expect("sync command") else {
+        let Command::Sync { sync, .. } = cli.command else {
             panic!("expected sync command");
         };
         assert_eq!(sync.recent_scope, Some(RecentScope::PerFilter));
@@ -1351,7 +1087,7 @@ mod tests {
     }
 
     fn base_args() -> Vec<&'static str> {
-        vec!["kei"]
+        vec!["kei", "sync"]
     }
 
     /// Scrub auth-related env vars for the duration of the returned guard so
@@ -1441,16 +1177,19 @@ mod tests {
         assert_eq!(cli.config, "/etc/kei.toml");
     }
 
-    // ── Bare invocation (no subcommand = sync) ────────────────────
+    // ── Explicit subcommand required ──────────────────────────────
 
     #[test]
-    fn test_bare_invocation_without_username() {
+    fn test_no_subcommand_requires_command() {
         let _guard = scrub_auth_env();
-        let cli = Cli::try_parse_from(["kei"]).unwrap();
-        assert!(cli.command.is_none());
+        let err = Cli::try_parse_from(["kei"]).expect_err("missing command must fail");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
     }
     #[test]
-    fn test_backwards_compatibility_no_subcommand() {
+    fn test_no_subcommand_with_sync_flag_rejected() {
         assert_removed_sync_option(&["--download-dir", "/photos"]);
     }
 
@@ -1678,7 +1417,10 @@ mod tests {
         let mut args = base_args();
         args.extend(["--password", "secret123"]);
         let cli = parse(&args);
-        assert_eq!(cli.password.password.as_deref(), Some("secret123"));
+        let Command::Sync { password, .. } = cli.command else {
+            panic!("expected Sync command");
+        };
+        assert_eq!(password.password.as_deref(), Some("secret123"));
     }
 
     #[test]
@@ -1687,10 +1429,10 @@ mod tests {
         let mut args = base_args();
         args.extend(["--password-file", "/run/secrets/pw"]);
         let cli = parse(&args);
-        assert_eq!(
-            cli.password.password_file.as_deref(),
-            Some("/run/secrets/pw")
-        );
+        let Command::Sync { password, .. } = cli.command else {
+            panic!("expected Sync command");
+        };
+        assert_eq!(password.password_file.as_deref(), Some("/run/secrets/pw"));
     }
 
     #[test]
@@ -1699,8 +1441,11 @@ mod tests {
         let mut args = base_args();
         args.extend(["--password-command", "op read 'op://vault/icloud/pw'"]);
         let cli = parse(&args);
+        let Command::Sync { password, .. } = cli.command else {
+            panic!("expected Sync command");
+        };
         assert_eq!(
-            cli.password.password_command.as_deref(),
+            password.password_command.as_deref(),
             Some("op read 'op://vault/icloud/pw'")
         );
     }
@@ -1736,17 +1481,16 @@ mod tests {
         let mut args = base_args();
         args.push("--save-password");
         let cli = parse(&args);
-        assert!(cli.sync.save_password);
+        let Command::Sync { sync, .. } = cli.command else {
+            panic!("expected Sync command");
+        };
+        assert!(sync.save_password);
     }
 
     #[test]
-    fn test_save_password_merges_into_subcommand() {
-        let cli = parse(&["kei", "--save-password", "sync"]);
-        if let Command::Sync { sync, .. } = cli.effective_command() {
-            assert!(sync.save_password);
-        } else {
-            panic!("expected Sync command");
-        }
+    fn test_save_password_top_level_before_subcommand_is_rejected() {
+        let err = Cli::try_parse_from(["kei", "--save-password", "sync"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     // ── Sync args ─────────────────────────────────────────────────
@@ -1872,7 +1616,10 @@ mod tests {
     #[test]
     fn test_unfiled_flag_default_none() {
         let cli = parse(&base_args());
-        assert_eq!(cli.sync.config_overrides.unfiled, None);
+        let Command::Sync { sync, .. } = cli.command else {
+            panic!("expected Sync command");
+        };
+        assert_eq!(sync.config_overrides.unfiled, None);
     }
     #[test]
     fn test_unfiled_flag_bare_true() {
@@ -1926,7 +1673,10 @@ mod tests {
         let mut args = base_args();
         args.push("--no-progress-bar");
         let cli = parse(&args);
-        assert!(cli.sync.no_progress_bar);
+        let Command::Sync { sync, .. } = cli.command else {
+            panic!("expected Sync command");
+        };
+        assert!(sync.no_progress_bar);
     }
     #[test]
     fn test_no_progress_bar_rejects_value() {
@@ -1962,7 +1712,10 @@ mod tests {
     #[test]
     fn test_reconcile_every_n_cycles_default_unset() {
         let cli = parse(&base_args());
-        assert!(cli.sync.config_overrides.reconcile_every_n_cycles.is_none());
+        let Command::Sync { sync, .. } = cli.command else {
+            panic!("expected Sync command");
+        };
+        assert!(sync.config_overrides.reconcile_every_n_cycles.is_none());
     }
 
     // 0 is "off" via TOML (or absence); the CLI flag rejects it so users
@@ -2052,7 +1805,10 @@ mod tests {
         let mut args = base_args();
         args.extend(["--skip-created-before", "2024-01-01"]);
         let cli = parse(&args);
-        assert_eq!(cli.sync.skip_created_before.as_deref(), Some("2024-01-01"));
+        let Command::Sync { sync, .. } = cli.command else {
+            panic!("expected Sync command");
+        };
+        assert_eq!(sync.skip_created_before.as_deref(), Some("2024-01-01"));
     }
 
     #[test]
@@ -2060,7 +1816,10 @@ mod tests {
         let mut args = base_args();
         args.extend(["--skip-created-after", "2025-06-01"]);
         let cli = parse(&args);
-        assert_eq!(cli.sync.skip_created_after.as_deref(), Some("2025-06-01"));
+        let Command::Sync { sync, .. } = cli.command else {
+            panic!("expected Sync command");
+        };
+        assert_eq!(sync.skip_created_after.as_deref(), Some("2025-06-01"));
     }
     #[test]
     fn test_albums_multiple() {
@@ -2070,7 +1829,10 @@ mod tests {
     #[test]
     fn test_albums_empty_by_default() {
         let cli = parse(&base_args());
-        assert!(cli.sync.config_overrides.albums.is_empty());
+        let Command::Sync { sync, .. } = cli.command else {
+            panic!("expected Sync command");
+        };
+        assert!(sync.config_overrides.albums.is_empty());
     }
     #[test]
     fn test_album_all_accepted() {
@@ -2142,13 +1904,13 @@ mod tests {
     #[test]
     fn test_status_subcommand() {
         let cli = Cli::try_parse_from(["kei", "status"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Status(_))));
+        assert!(matches!(cli.command, Command::Status(_)));
     }
 
     #[test]
     fn test_status_with_failed_flag() {
         let cli = Cli::try_parse_from(["kei", "status", "--failed"]).unwrap();
-        if let Some(Command::Status(args)) = cli.command {
+        if let Command::Status(args) = cli.command {
             assert!(args.failed);
             assert!(!args.pending);
             assert!(!args.downloaded);
@@ -2160,7 +1922,7 @@ mod tests {
     #[test]
     fn test_status_with_pending_flag() {
         let cli = Cli::try_parse_from(["kei", "status", "--pending"]).unwrap();
-        if let Some(Command::Status(args)) = cli.command {
+        if let Command::Status(args) = cli.command {
             assert!(!args.failed);
             assert!(args.pending);
             assert!(!args.downloaded);
@@ -2172,7 +1934,7 @@ mod tests {
     #[test]
     fn test_status_with_downloaded_flag() {
         let cli = Cli::try_parse_from(["kei", "status", "--downloaded"]).unwrap();
-        if let Some(Command::Status(args)) = cli.command {
+        if let Command::Status(args) = cli.command {
             assert!(!args.failed);
             assert!(!args.pending);
             assert!(args.downloaded);
@@ -2185,7 +1947,7 @@ mod tests {
     fn test_status_flags_combine() {
         let cli = Cli::try_parse_from(["kei", "status", "--failed", "--pending", "--downloaded"])
             .unwrap();
-        if let Some(Command::Status(args)) = cli.command {
+        if let Command::Status(args) = cli.command {
             assert!(args.failed);
             assert!(args.pending);
             assert!(args.downloaded);
@@ -2201,7 +1963,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["kei", "--config", "/custom/config.toml", "status"]).unwrap();
         assert_eq!(cli.config, "/custom/config.toml");
-        assert!(matches!(cli.command, Some(Command::Status(_))));
+        assert!(matches!(cli.command, Command::Status(_)));
     }
 
     #[test]
@@ -2216,7 +1978,7 @@ mod tests {
     #[test]
     fn test_import_existing_subcommand() {
         let cli = Cli::try_parse_from(["kei", "import-existing"]).unwrap();
-        if let Some(Command::ImportExisting(args)) = cli.command {
+        if let Command::ImportExisting(args) = cli.command {
             assert!(args.recent.is_none());
             assert!(!args.dry_run);
             assert!(!args.strict);
@@ -2230,7 +1992,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["kei", "import-existing", "--library", "SharedSync-ABCD1234"])
                 .unwrap();
-        if let Some(Command::ImportExisting(args)) = cli.command {
+        if let Command::ImportExisting(args) = cli.command {
             assert_eq!(args.libraries, vec!["SharedSync-ABCD1234".to_string()]);
         } else {
             panic!("Expected ImportExisting command");
@@ -2253,7 +2015,7 @@ mod tests {
             "!SharedSync-Photos",
         ])
         .unwrap();
-        let Some(Command::ImportExisting(args)) = cli.command else {
+        let Command::ImportExisting(args) = cli.command else {
             panic!("Expected ImportExisting command");
         };
         assert_eq!(
@@ -2271,7 +2033,7 @@ mod tests {
         args.extend(extra.iter().copied());
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
-            Some(Command::ImportExisting(a)) => a,
+            Command::ImportExisting(a) => a,
             _ => panic!("Expected ImportExisting command"),
         }
     }
@@ -2313,7 +2075,7 @@ mod tests {
             std::env::remove_var("KEI_FORCE_EMPTY");
         }
         match cli.command {
-            Some(Command::ImportExisting(args)) => assert!(args.force_empty),
+            Command::ImportExisting(args) => assert!(args.force_empty),
             _ => panic!("Expected ImportExisting command"),
         }
     }
@@ -2446,7 +2208,7 @@ mod tests {
     #[test]
     fn test_verify_subcommand() {
         let cli = Cli::try_parse_from(["kei", "verify", "--checksums"]).unwrap();
-        if let Some(Command::Verify(args)) = cli.command {
+        if let Command::Verify(args) = cli.command {
             assert!(args.checksums);
         } else {
             panic!("Expected Verify command");
@@ -2456,7 +2218,7 @@ mod tests {
     #[test]
     fn test_reconcile_subcommand() {
         let cli = Cli::try_parse_from(["kei", "reconcile"]).unwrap();
-        if let Some(Command::Reconcile(args)) = cli.command {
+        if let Command::Reconcile(args) = cli.command {
             assert!(!args.dry_run);
         } else {
             panic!("Expected Reconcile command");
@@ -2466,7 +2228,7 @@ mod tests {
     #[test]
     fn test_reconcile_dry_run_flag() {
         let cli = Cli::try_parse_from(["kei", "reconcile", "--dry-run"]).unwrap();
-        if let Some(Command::Reconcile(args)) = cli.command {
+        if let Command::Reconcile(args) = cli.command {
             assert!(args.dry_run);
         } else {
             panic!("Expected Reconcile command");
@@ -2495,24 +2257,22 @@ mod tests {
         assert!(Cli::try_parse_from(args).is_err());
     }
 
-    // ── Cli::validate: bare-kei sync flags + non-sync subcommand ──
+    // ── Clap-owned command boundary ────────────────────────────────
     //
-    // Regression: clap silently consumed a top-level sync flag and ran
-    // whatever subcommand the user named. `kei --skip-videos status`
-    // looked like `kei status`; the user thought their flag was honoured
-    // and saw a different action than they typed.
+    // Sync flags live on `kei sync`, not on the top-level `kei` command. clap
+    // should reject them before another subcommand can silently swallow them.
     #[test]
-    fn validate_rejects_skip_videos_with_status() {
+    fn top_level_rejects_skip_videos_before_status() {
         let err = Cli::try_parse_from(["kei", "--skip-videos=true", "status"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
     #[test]
-    fn validate_rejects_skip_photos_with_list_albums() {
+    fn top_level_rejects_skip_photos_before_list_albums() {
         let err = Cli::try_parse_from(["kei", "--skip-photos=true", "list", "albums"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
     #[test]
-    fn validate_rejects_live_photo_mode_with_reset_state() {
+    fn top_level_rejects_live_photo_mode_before_reset_state() {
         let err = Cli::try_parse_from([
             "kei",
             "--live-photo-mode",
@@ -2526,42 +2286,47 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_value_flag_with_verify() {
-        let err = parse_and_validate(&["kei", "--download-dir", "/photos", "verify"])
-            .expect_err("validation must reject");
+    fn top_level_rejects_value_flag_before_verify() {
+        let err = Cli::try_parse_from(["kei", "--download-dir", "/photos", "verify"])
+            .expect_err("parse must reject");
+        let err = err.to_string();
         assert!(err.contains("--download-dir"), "got: {err}");
     }
 
     #[test]
-    fn validate_rejects_threads_with_reconcile() {
-        let err = parse_and_validate(&["kei", "--threads", "4", "reconcile"])
-            .expect_err("validation must reject");
+    fn top_level_rejects_threads_before_reconcile() {
+        let err = Cli::try_parse_from(["kei", "--threads", "4", "reconcile"])
+            .expect_err("parse must reject");
+        let err = err.to_string();
         assert!(err.contains("--threads"), "got: {err}");
     }
 
     #[test]
-    fn validate_rejects_dry_run_with_status() {
-        let err = parse_and_validate(&["kei", "--dry-run", "status"])
-            .expect_err("validation must reject");
+    fn top_level_rejects_dry_run_before_status() {
+        let err =
+            Cli::try_parse_from(["kei", "--dry-run", "status"]).expect_err("parse must reject");
+        let err = err.to_string();
         assert!(err.contains("--dry-run"), "got: {err}");
     }
 
     #[test]
-    fn validate_rejects_album_with_password_set() {
-        let err = parse_and_validate(&["kei", "--album", "Vacation", "password", "set"])
-            .expect_err("validation must reject");
+    fn top_level_rejects_album_before_password_set() {
+        let err = Cli::try_parse_from(["kei", "--album", "Vacation", "password", "set"])
+            .expect_err("parse must reject");
+        let err = err.to_string();
         assert!(err.contains("--album"), "got: {err}");
     }
 
     #[test]
     fn removed_auth_only_flag_is_rejected() {
-        let err = parse_and_validate(&["kei", "--auth-only", "status"])
-            .expect_err("parse must reject removed flag");
+        let err = Cli::try_parse_from(["kei", "--auth-only", "status"])
+            .expect_err("parse must reject removed flag")
+            .to_string();
         assert!(err.contains("--auth-only"), "got: {err}");
     }
     #[test]
-    fn validate_lists_every_offending_flag() {
-        let err = parse_and_validate(&[
+    fn top_level_rejects_first_offending_sync_flag() {
+        let err = Cli::try_parse_from([
             "kei",
             "--dry-run",
             "--only-print-filenames",
@@ -2569,21 +2334,14 @@ mod tests {
             "100",
             "status",
         ])
-        .expect_err("validation must reject");
+        .expect_err("parse must reject")
+        .to_string();
         assert!(err.contains("--dry-run"), "got: {err}");
-        assert!(err.contains("--only-print-filenames"), "got: {err}");
-        assert!(err.contains("--recent"), "got: {err}");
     }
 
-    // ── Validator must NOT fire on legitimate uses ─────────────────
     #[test]
-    fn validate_allows_bare_kei_with_sync_flags() {
-        parse_and_validate(&["kei", "--friendly", "--recent", "100"])
-            .expect("bare-kei with kept per-run sync flag must validate");
-    }
-    #[test]
-    fn validate_allows_sync_subcommand_with_sync_flags() {
-        parse_and_validate(&[
+    fn sync_subcommand_accepts_sync_flags() {
+        Cli::try_parse_from([
             "kei",
             "sync",
             "--friendly",
@@ -2592,59 +2350,54 @@ mod tests {
             "--skip-created-before",
             "2025-01-01",
         ])
-        .expect("explicit sync subcommand with kept sync flags must validate");
+        .expect("explicit sync subcommand with kept sync flags must parse");
     }
     #[test]
-    fn validate_allows_top_level_sync_flag_then_sync_subcommand() {
-        parse_and_validate(&["kei", "--friendly", "--recent", "100", "sync"])
-            .expect("top-level kept sync flag with sync subcommand must validate");
+    fn top_level_sync_flag_before_sync_subcommand_is_rejected() {
+        let err = Cli::try_parse_from(["kei", "--friendly", "--recent", "100", "sync"])
+            .expect_err("top-level sync flags must not parse before subcommand");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
     #[test]
-    fn validate_allows_retry_failed_with_sync_flag() {
-        parse_and_validate(&["kei", "sync", "--retry-failed", "--recent", "100"])
+    fn retry_failed_with_sync_flag_parses_under_sync() {
+        Cli::try_parse_from(["kei", "sync", "--retry-failed", "--recent", "100"])
             .expect("sync --retry-failed accepts kept per-run sync flags");
     }
 
     #[test]
-    fn validate_allows_kept_global_flags_with_non_sync_subcommand() {
-        parse_and_validate(&["kei", "--log-level", "debug", "status"])
-            .expect("global flags must validate with any subcommand");
+    fn kept_global_flags_parse_before_non_sync_subcommand() {
+        Cli::try_parse_from(["kei", "--log-level", "debug", "status"])
+            .expect("global flags must parse with any subcommand");
     }
 
     #[test]
-    fn validate_allows_status_with_no_top_level_flags() {
-        parse_and_validate(&["kei", "status"]).expect("plain `kei status` must validate");
+    fn status_with_no_top_level_flags_parses() {
+        Cli::try_parse_from(["kei", "status"]).expect("plain `kei status` must parse");
     }
     #[test]
-    fn validate_allows_service_run_with_sync_flags() {
-        parse_and_validate(&["kei", "--recent", "100", "service", "run", "--dry-run"])
-            .expect("service run must accept kept top-level sync flags");
+    fn service_run_accepts_own_sync_flags() {
+        Cli::try_parse_from(["kei", "service", "run", "--recent", "100", "--dry-run"])
+            .expect("service run must accept its own sync flags");
     }
 
     #[test]
-    fn validate_rejects_friendly_with_service_run() {
-        let err = parse_and_validate(&["kei", "--friendly", "service", "run"])
-            .expect_err("service run forces friendly mode off");
+    fn service_run_rejects_friendly_flag() {
+        let err = Cli::try_parse_from(["kei", "service", "run", "--friendly"])
+            .expect_err("service run does not expose friendly mode")
+            .to_string();
         assert!(err.contains("--friendly"), "got: {err}");
-        assert!(
-            err.contains("service mode always disables friendly output"),
-            "got: {err}",
-        );
     }
 
     #[test]
-    fn validate_rejects_service_status_with_sync_flags() {
-        let err = parse_and_validate(&["kei", "--download-dir", "/photos", "service", "status"])
-            .expect_err("validation must reject sync flags with service status");
+    fn service_status_rejects_sync_flags() {
+        let err = Cli::try_parse_from(["kei", "--download-dir", "/photos", "service", "status"])
+            .expect_err("parse must reject sync flags with service status")
+            .to_string();
         assert!(err.contains("--download-dir"), "got: {err}");
     }
 
-    // Parametric coverage so this stays green when new sync-only flags
-    // are added: every flag in this list must (a) be parseable at the
-    // top level, and (b) be rejected when combined with `status`.
-    //
     #[test]
-    fn validate_rejects_each_sync_only_flag_with_status() {
+    fn top_level_rejects_each_sync_only_flag_before_status() {
         let cases: &[(&str, &[&str])] = &[
             ("skip_videos", &["--skip-videos=true"]),
             ("skip_photos", &["--skip-photos=true"]),
@@ -2717,10 +2470,10 @@ mod tests {
             let mut argv: Vec<&str> = vec!["kei"];
             argv.extend_from_slice(args);
             argv.push("status");
-            let result = parse_and_validate(&argv);
+            let result = Cli::try_parse_from(&argv);
             assert!(
                 result.is_err(),
-                "validate() must reject sync-only flag `{name}` ({args:?}) with status; got {result:?}"
+                "clap must reject sync-only flag `{name}` ({args:?}) before status; got {result:?}"
             );
         }
     }
@@ -2740,13 +2493,13 @@ mod tests {
 
     #[test]
     fn friendly_request_some_true_with_friendly() {
-        let cli = parse(&["kei", "--friendly"]);
+        let cli = parse(&["kei", "sync", "--friendly"]);
         assert_eq!(cli.friendly_request(), Some(true));
     }
 
     #[test]
     fn friendly_request_some_false_with_no_friendly() {
-        let cli = parse(&["kei", "--no-friendly", "sync"]);
+        let cli = parse(&["kei", "sync", "--no-friendly"]);
         assert_eq!(cli.friendly_request(), Some(false));
     }
 
@@ -2762,7 +2515,7 @@ mod tests {
 
     #[test]
     fn friendly_request_last_wins_friendly_after_no_friendly() {
-        let cli = parse(&["kei", "--no-friendly", "--friendly"]);
+        let cli = parse(&["kei", "sync", "--no-friendly", "--friendly"]);
         assert_eq!(
             cli.friendly_request(),
             Some(true),

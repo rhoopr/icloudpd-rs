@@ -1379,12 +1379,12 @@ fn sync_pid_file_cleaned_up_after_sync() {
     });
 }
 
-// ── Bare invocation ─────────────────────────────────────────────────────
+// ── Explicit sync invocation ────────────────────────────────────────────
 
-/// Omitting the "sync" subcommand should work identically to `sync`.
+/// The explicit `sync` subcommand should run the sync worker.
 #[test]
 #[ignore]
-fn sync_bare_invocation_works_like_sync() {
+fn sync_explicit_invocation_works() {
     let (username, password, cookie_dir) = common::require_preauth();
 
     common::with_auth_retry(|| {
@@ -1395,6 +1395,7 @@ fn sync_bare_invocation_works_like_sync() {
             .env("ICLOUD_USERNAME", &username)
             .env("KEI_DATA_DIR", &cookie_dir)
             .args([
+                "sync",
                 "--password",
                 &password,
                 "--config",
@@ -1408,7 +1409,7 @@ fn sync_bare_invocation_works_like_sync() {
         let files = common::walkdir(download_dir.path());
         assert!(
             files.len() >= 3,
-            "bare invocation should download all test album files, got {}",
+            "sync invocation should download all test album files, got {}",
             files.len()
         );
         for f in &files {

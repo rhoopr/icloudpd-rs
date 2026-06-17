@@ -703,7 +703,7 @@ fn unfiled_flag_accepts_bare_and_explicit_value() {
     }
 }
 
-// ── Default command (no subcommand = sync) ──────────────────────────────
+// ── Explicit sync command required ──────────────────────────────────────
 
 #[test]
 fn bare_invocation_with_removed_durable_flags_fails() {

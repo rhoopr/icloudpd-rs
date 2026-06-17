@@ -659,15 +659,7 @@ pub fn main_inner() -> ExitCode {
 }
 
 async fn run(env_password: Option<String>) -> anyhow::Result<()> {
-    let (cli, explicit_sync_flags) =
-        cli::parse_cli_with_sources(std::env::args_os()).map_err(|e| anyhow::anyhow!(e))?;
-
-    // Reject `kei --skip-videos status` and friends, where a sync-only
-    // top-level flag is silently swallowed under a non-sync subcommand.
-    // See `Cli::validate` for the full rationale.
-    if let Err(msg) = cli.validate(&explicit_sync_flags) {
-        anyhow::bail!("{msg}");
-    }
+    let cli = cli::parse_cli_with_sources(std::env::args_os()).map_err(|e| anyhow::anyhow!(e))?;
 
     // Load TOML config early so it can influence log level.
     // If the user explicitly set --config, the file must exist.
@@ -700,7 +692,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let can_auto_create =
         !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
-    let is_doctor_command = matches!(cli.command, Some(cli::Command::Doctor(_)));
+    let is_doctor_command = matches!(cli.command, cli::Command::Doctor(_));
     let (mut toml_config, toml_config_error) =
         match config::load_toml_config(&config_path, config_required) {
             Ok(config) => (config, None),
@@ -740,18 +732,14 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // setup wizard's question and the TOML key are opt-out levers; first
     // contact with kei on a plain terminal already gets the friendly UX.
     //
-    // `effective_command()` clones SyncArgs, but it's run once here and once
-    // at dispatch below. The clone cost is one-shot at startup and the only
-    // alternative (threading the resolved command through `run`) ripples
-    // through every callee. Acceptable.
-    let resolved_for_personality = cli.effective_command();
+    let mut command = cli.effective_command();
     let toml_report_json = toml_config
         .as_ref()
         .and_then(|t| t.report.as_ref())
         .and_then(|r| r.json.as_ref())
         .is_some();
     let (cmd_no_progress_bar, cmd_only_print_filenames, cmd_report_json, cmd_service_run) =
-        match &resolved_for_personality {
+        match &command {
             cli::Command::Sync { sync, .. } => (
                 sync.no_progress_bar,
                 sync.only_print_filenames,
@@ -817,8 +805,6 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // bootstrap env allow-list, not public global CLI flags.
     let globals = config::GlobalArgs::from_bootstrap_env();
 
-    // Dispatch based on command
-    let mut command = cli.effective_command();
     // Inject the password captured from env before the runtime started,
     // since we cleared ICLOUD_PASSWORD before Cli::parse() could see it.
     // Must happen before command dispatch so all subcommands (login,
