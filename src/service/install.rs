@@ -14,11 +14,10 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::cli::InstallArgs;
-use crate::service::env::is_in_container;
 use crate::service::plan::{InstallPlan, InstallScope};
 
 pub(crate) async fn run(args: InstallArgs, config_path: &Path) -> Result<()> {
-    if is_in_container() {
+    if crate::service::env::container_supervisor().is_some() {
         tracing::info!(
             "kei install is a no-op inside containers; \
              continue using docker-compose.yml to manage the daemon"

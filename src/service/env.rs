@@ -1,6 +1,6 @@
 //! Cross-platform helpers shared by every service-install backend.
 //!
-//! `is_in_container` lets `kei install` no-op cleanly inside Docker so
+//! `container_supervisor` lets `kei install` no-op cleanly inside Docker so
 //! containerized deployments keep using the existing compose workflow
 //! instead of attempting to register a launchd/systemd/SCM service that
 //! the host would never invoke. `service_identifier` and
@@ -37,15 +37,6 @@ pub(crate) const SERVICE_IDENTIFIER: &str = if cfg!(target_os = "linux") {
 } else {
     "com.rhoopr.kei"
 };
-
-/// Returns `true` when the current process is running inside a container.
-///
-/// Thin wrapper over [`container_supervisor`] for the boolean callers
-/// (`kei install` no-op gate). Returns the same answer as
-/// `container_supervisor().is_some()`.
-pub(crate) fn is_in_container() -> bool {
-    container_supervisor().is_some()
-}
 
 /// Returns the name of the container supervisor when running inside a
 /// container, or `None` on the bare host.

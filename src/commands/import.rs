@@ -7,7 +7,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use futures_util::future::BoxFuture;
 
 use crate::auth;
 use crate::cli;
@@ -93,13 +92,14 @@ pub(crate) enum StrictImportDecision {
     Refused,
 }
 
-pub(crate) trait StrictImportVerifier {
-    fn verify<'a>(
-        &'a self,
-        local_path: &'a Path,
-        cloud_url: &'a str,
+#[async_trait::async_trait]
+pub(crate) trait StrictImportVerifier: Send + Sync {
+    async fn verify(
+        &self,
+        local_path: &Path,
+        cloud_url: &str,
         expected_size: u64,
-    ) -> BoxFuture<'a, anyhow::Result<StrictImportDecision>>;
+    ) -> anyhow::Result<StrictImportDecision>;
 }
 
 #[derive(Clone, Copy, Default)]
@@ -134,19 +134,15 @@ impl HttpStrictImportVerifier {
     }
 }
 
+#[async_trait::async_trait]
 impl StrictImportVerifier for HttpStrictImportVerifier {
-    fn verify<'a>(
-        &'a self,
-        local_path: &'a Path,
-        cloud_url: &'a str,
+    async fn verify(
+        &self,
+        local_path: &Path,
+        cloud_url: &str,
         expected_size: u64,
-    ) -> BoxFuture<'a, anyhow::Result<StrictImportDecision>> {
-        Box::pin(verify_strict_prefix(
-            &self.client,
-            local_path,
-            cloud_url,
-            expected_size,
-        ))
+    ) -> anyhow::Result<StrictImportDecision> {
+        verify_strict_prefix(&self.client, local_path, cloud_url, expected_size).await
     }
 }
 
@@ -1623,28 +1619,27 @@ mod wiremock_tests {
         cloud_prefix: Vec<u8>,
     }
 
+    #[async_trait::async_trait]
     impl StrictImportVerifier for TestStrictVerifier {
-        fn verify<'a>(
-            &'a self,
-            local_path: &'a StdPath,
-            _cloud_url: &'a str,
+        async fn verify(
+            &self,
+            local_path: &StdPath,
+            _cloud_url: &str,
             expected_size: u64,
-        ) -> futures_util::future::BoxFuture<'a, anyhow::Result<StrictImportDecision>> {
-            Box::pin(async move {
-                use tokio::io::AsyncReadExt;
+        ) -> anyhow::Result<StrictImportDecision> {
+            use tokio::io::AsyncReadExt;
 
-                let prefix_len = usize::try_from(expected_size)
-                    .unwrap_or(usize::MAX)
-                    .min(self.cloud_prefix.len());
-                let mut local_prefix = vec![0_u8; prefix_len];
-                let mut file = tokio::fs::File::open(local_path).await?;
-                file.read_exact(&mut local_prefix).await?;
-                if local_prefix == self.cloud_prefix[..prefix_len] {
-                    Ok(StrictImportDecision::Accepted)
-                } else {
-                    Ok(StrictImportDecision::Refused)
-                }
-            })
+            let prefix_len = usize::try_from(expected_size)
+                .unwrap_or(usize::MAX)
+                .min(self.cloud_prefix.len());
+            let mut local_prefix = vec![0_u8; prefix_len];
+            let mut file = tokio::fs::File::open(local_path).await?;
+            file.read_exact(&mut local_prefix).await?;
+            if local_prefix == self.cloud_prefix[..prefix_len] {
+                Ok(StrictImportDecision::Accepted)
+            } else {
+                Ok(StrictImportDecision::Refused)
+            }
         }
     }
 

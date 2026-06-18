@@ -8,10 +8,8 @@
 use anyhow::Result;
 
 use crate::cli::UninstallArgs;
-use crate::service::env::is_in_container;
-
 pub(crate) async fn run(args: UninstallArgs) -> Result<()> {
-    if is_in_container() {
+    if crate::service::env::container_supervisor().is_some() {
         tracing::info!(
             "kei uninstall is a no-op inside containers; \
              stop and remove the docker-compose stack instead"

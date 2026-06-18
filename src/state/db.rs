@@ -424,19 +424,6 @@ pub trait MembershipStore: Send + Sync {
             "selected_album_containers_have_complete_snapshots",
         ))
     }
-    #[allow(
-        dead_code,
-        reason = "live membership lookup is exercised by focused tests and reserved for future album-routing reads"
-    )]
-    async fn get_live_album_memberships_for_asset(
-        &self,
-        _library: &str,
-        _asset_record_name: &str,
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        Err(unsupported_album_membership_api(
-            "get_live_album_memberships_for_asset",
-        ))
-    }
     async fn get_live_selected_album_memberships_for_asset(
         &self,
         _library: &str,
@@ -2590,40 +2577,6 @@ impl SqliteStateDb {
         .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "live membership lookup is exercised by focused tests and reserved for future album-routing reads"
-    )]
-    pub(crate) async fn get_live_album_memberships_for_asset(
-        &self,
-        library: &str,
-        asset_record_name: &str,
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        let library = library.to_owned();
-        let asset_record_name = asset_record_name.to_owned();
-        self.with_conn("get_live_album_memberships_for_asset", move |conn| {
-            let mut stmt = conn
-                .prepare_cached(
-                    "SELECT library, asset_record_name, master_record_name, container_id, \
-                            generation, source \
-                     FROM asset_album_memberships \
-                     WHERE library = ?1 AND asset_record_name = ?2 AND is_deleted = 0 \
-                     ORDER BY container_id",
-                )
-                .map_err(|e| StateError::query("get_live_album_memberships_for_asset", e))?;
-            let rows = stmt
-                .query_map(rusqlite::params![&library, &asset_record_name], |row| {
-                    album_membership_record_from_row(row)
-                })
-                .map_err(|e| StateError::query("get_live_album_memberships_for_asset", e))?;
-            Ok(collect_rows_with_warn(
-                rows,
-                "get_live_album_memberships_for_asset",
-            ))
-        })
-        .await
-    }
-
     pub(crate) async fn get_live_selected_album_memberships_for_asset(
         &self,
         library: &str,
@@ -3418,14 +3371,6 @@ impl MembershipStore for SqliteStateDb {
             container_ids,
         )
         .await
-    }
-
-    async fn get_live_album_memberships_for_asset(
-        &self,
-        library: &str,
-        asset_record_name: &str,
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        SqliteStateDb::get_live_album_memberships_for_asset(self, library, asset_record_name).await
     }
 
     async fn get_live_selected_album_memberships_for_asset(
@@ -7392,11 +7337,19 @@ mod tests {
         }
 
         let primary = db
-            .get_live_album_memberships_for_asset("PrimarySync", "same-asset-record")
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "same-asset-record",
+                &["container-a"],
+            )
             .await
             .unwrap();
         let shared = db
-            .get_live_album_memberships_for_asset("SharedSync-AB", "same-asset-record")
+            .get_live_selected_album_memberships_for_asset(
+                "SharedSync-AB",
+                "same-asset-record",
+                &["container-a"],
+            )
             .await
             .unwrap();
         assert_eq!(primary.len(), 1);
@@ -7430,7 +7383,11 @@ mod tests {
             .unwrap();
         assert!(known, "selected album container should be known");
         let live = db
-            .get_live_album_memberships_for_asset("PrimarySync", "asset-record-a")
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-record-a",
+                &["container-a"],
+            )
             .await
             .unwrap();
         assert_eq!(live.len(), 1);
@@ -7442,7 +7399,11 @@ mod tests {
             .unwrap();
         assert!(known, "delete should still know the album container");
         let live = db
-            .get_live_album_memberships_for_asset("PrimarySync", "asset-record-a")
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-record-a",
+                &["container-a"],
+            )
             .await
             .unwrap();
         assert!(live.is_empty(), "relation delete must hide live membership");

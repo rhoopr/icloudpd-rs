@@ -143,7 +143,10 @@ impl<W: std::io::Write> RedactingWriter<W> {
         let mut consumed = 0usize;
         let mut search_from = 0usize;
         while let Some(search) = self.pending.get(search_from..) {
-            let Some(pos) = memchr::memmem::find(search, pw_bytes) else {
+            let Some(pos) = search
+                .windows(pw_bytes.len())
+                .position(|candidate| candidate == pw_bytes)
+            else {
                 break;
             };
             let match_start = search_from + pos;
@@ -732,7 +735,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // setup wizard's question and the TOML key are opt-out levers; first
     // contact with kei on a plain terminal already gets the friendly UX.
     //
-    let mut command = cli.effective_command();
+    let mut command = cli.command.clone();
     let toml_report_json = toml_config
         .as_ref()
         .and_then(|t| t.report.as_ref())
@@ -1696,7 +1699,7 @@ pub mod __fuzz {
             Some((a, b)) => (a, Some(b)),
             None => (s, None),
         };
-        let _ = paths::expand_album_token(template, album);
+        let _ = paths::expand_named_token(template, paths::TOKEN_ALBUM, album);
 
         for size in [0u64, 1, u64::MAX] {
             let _ = paths::add_dedup_suffix(s, size);

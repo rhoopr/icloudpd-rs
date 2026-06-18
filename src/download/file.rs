@@ -128,34 +128,6 @@ pub(super) struct DownloadLimits<'a> {
     pub shutdown_token: Option<&'a CancellationToken>,
 }
 
-/// Test-only off-mode wrapper. Production calls `download_file_with_mode`
-/// directly; this kept the existing test sites stable when the friendly
-/// retry-pause narration parameter was added.
-#[cfg(test)]
-pub(super) async fn download_file<C: DownloadClient>(
-    client: &C,
-    url: &str,
-    download_path: &Path,
-    checksum: &str,
-    retry_config: &RetryConfig,
-    temp_suffix: &str,
-    opts: DownloadOpts,
-    limits: DownloadLimits<'_>,
-) -> Result<u64, DownloadError> {
-    download_file_with_mode(
-        client,
-        url,
-        download_path,
-        checksum,
-        retry_config,
-        temp_suffix,
-        opts,
-        limits,
-        crate::personality::Mode::Off,
-    )
-    .await
-}
-
 /// Friendly-mode variant of `download_file`. Identical except `mode`
 /// controls retry-pause and retry-recovery narration.
 #[allow(
@@ -2434,7 +2406,7 @@ mod tests {
         let shutdown_token = CancellationToken::new();
 
         let first_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let download = download_file(
+            let download = download_file_with_mode(
                 &client,
                 "http://stub/interrupted.jpg",
                 &download_path,
@@ -2449,6 +2421,7 @@ mod tests {
                     shutdown_token: Some(&shutdown_token),
                     ..Default::default()
                 },
+                crate::personality::Mode::Off,
             );
             let cancel_after_partial = async {
                 client.release_first_chunk();
@@ -2498,7 +2471,7 @@ mod tests {
             "interrupted download must leave the resumable .part bytes"
         );
 
-        download_file(
+        download_file_with_mode(
             &client,
             "http://stub/interrupted.jpg",
             &download_path,
@@ -2510,6 +2483,7 @@ mod tests {
                 expected_size: Some(body.len() as u64),
             },
             DownloadLimits::default(),
+            crate::personality::Mode::Off,
         )
         .await
         .expect("second run should resume and publish");
@@ -2601,7 +2575,7 @@ mod tests {
             base_delay_secs: 0,
             max_delay_secs: 0,
         };
-        let result = download_file(
+        let result = download_file_with_mode(
             &client,
             "http://stub/photo.jpg",
             &download_path,
@@ -2613,6 +2587,7 @@ mod tests {
                 expected_size: None,
             },
             DownloadLimits::default(),
+            crate::personality::Mode::Off,
         )
         .await;
 
@@ -2831,7 +2806,7 @@ mod tests {
                 base_delay_secs: 0,
                 max_delay_secs: 0,
             };
-            let result = download_file(
+            let result = download_file_with_mode(
                 &reqwest::Client::new(),
                 &format!("{}/{filename}", server.uri()),
                 &download_path,
@@ -2843,6 +2818,7 @@ mod tests {
                     expected_size: None,
                 },
                 DownloadLimits::default(),
+                crate::personality::Mode::Off,
             )
             .await;
             (result, download_path, dir)
@@ -2987,7 +2963,7 @@ mod tests {
                 base_delay_secs: 0,
                 max_delay_secs: 0,
             };
-            download_file(
+            download_file_with_mode(
                 &reqwest::Client::new(),
                 &format!("{}/resume.jpg", server.uri()),
                 &download_path,
@@ -2999,6 +2975,7 @@ mod tests {
                     expected_size: None,
                 },
                 DownloadLimits::default(),
+                crate::personality::Mode::Off,
             )
             .await
             .unwrap();
@@ -3043,7 +3020,7 @@ mod tests {
             // Realistic SHA256 of the *full* 8-byte payload — irrelevant
             // here because the size check fires first, but we use a
             // realistic-looking value not "checksum123".
-            let result = download_file(
+            let result = download_file_with_mode(
                 &reqwest::Client::new(),
                 &format!("{}/truncated.jpg", server.uri()),
                 &download_path,
@@ -3055,6 +3032,7 @@ mod tests {
                     expected_size: Some(8),
                 },
                 DownloadLimits::default(),
+                crate::personality::Mode::Off,
             )
             .await;
 
@@ -3127,7 +3105,7 @@ mod tests {
                 base_delay_secs: 0,
                 max_delay_secs: 0,
             };
-            let result = download_file(
+            let result = download_file_with_mode(
                 &reqwest::Client::new(),
                 &format!("{}/orphan.jpg", server.uri()),
                 &download_path,
@@ -3139,6 +3117,7 @@ mod tests {
                     expected_size: None,
                 },
                 DownloadLimits::default(),
+                crate::personality::Mode::Off,
             )
             .await;
 
@@ -3210,7 +3189,7 @@ mod tests {
             // No expected_size + no Range header — production should treat
             // this as a fresh download and TRUNCATE the existing .part.
             // (Resume requires expected_size to be supplied.)
-            download_file(
+            download_file_with_mode(
                 &reqwest::Client::new(),
                 &format!("{}/replace.jpg", server.uri()),
                 &download_path,
@@ -3222,6 +3201,7 @@ mod tests {
                     expected_size: None,
                 },
                 DownloadLimits::default(),
+                crate::personality::Mode::Off,
             )
             .await
             .expect("download should succeed when .part is freshly truncated");
@@ -3284,7 +3264,7 @@ mod tests {
             let limiter = BandwidthLimiter::new(limit);
 
             let start = Instant::now();
-            let bytes = download_file(
+            let bytes = download_file_with_mode(
                 &reqwest::Client::new(),
                 &format!("{}/throttle.bin", server.uri()),
                 &download_path,
@@ -3299,6 +3279,7 @@ mod tests {
                     bandwidth_limiter: Some(&limiter),
                     ..Default::default()
                 },
+                crate::personality::Mode::Off,
             )
             .await
             .expect("throttled download succeeds");

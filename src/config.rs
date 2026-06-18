@@ -2539,7 +2539,7 @@ mod tests {
     // --library, --folder-structure-albums, --folder-structure-smart-folders,
     // --unfiled) had a parse test in tests/cli.rs but no test asserting the
     // *runtime effect* through `Config::build`. The tests below drive every
-    // flag through `Cli::try_parse_from` -> `effective_command()` ->
+    // flag through `Cli::try_parse_from` -> `Cli::command` ->
     // `Config::build` so a regression in the resolution chain surfaces here
     // before anything reaches CloudKit.
 

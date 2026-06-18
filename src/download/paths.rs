@@ -62,14 +62,6 @@ pub(crate) fn expand_named_token(
     format_str.replace(token, &safe_name)
 }
 
-/// Expand the `{album}` token in a folder structure format string. Thin
-/// wrapper around [`expand_named_token`] kept for callers outside the
-/// per-pass renderer (e.g. `local_download_dir`'s legacy single-template
-/// path).
-pub(crate) fn expand_album_token(folder_structure: &str, album_name: Option<&str>) -> String {
-    expand_named_token(folder_structure, "{album}", album_name)
-}
-
 /// Path-friendly form of a CloudKit zone name. Returns the input unchanged
 /// for the primary library (`PrimarySync`) and any non-shared zone, and
 /// truncates `SharedSync-<UUID>` to `SharedSync-<8 chars>` so on-disk
@@ -120,7 +112,7 @@ pub(crate) fn local_download_dir(
         return directory.to_path_buf();
     }
 
-    let expanded = expand_album_token(folder_structure, album_name);
+    let expanded = expand_named_token(folder_structure, TOKEN_ALBUM, album_name);
 
     // Use chrono's strftime for full format token support (%Y, %m, %d, %B, etc.)
     let date_path = created_date.format(&expanded).to_string();
@@ -808,7 +800,7 @@ mod tests {
     /// `{album}` token with a chrono strftime template against a fixed
     /// date must produce the exact `<download-dir>/<album>/<date>` path
     /// the docs promise. The function has unit tests for the empty-album
-    /// branch via `expand_album_token` callers, but no fixed-output
+    /// branch via `expand_named_token` callers, but no fixed-output
     /// assertion against a real (album, date) pair.
     #[test]
     fn local_download_dir_renders_album_with_date_hierarchy() {

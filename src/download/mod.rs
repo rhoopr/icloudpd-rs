@@ -8417,7 +8417,11 @@ mod tests {
             "valid incremental asset should still be recorded for the planned work"
         );
         let memberships = db
-            .get_live_album_memberships_for_asset("PrimarySync", "asset-VALID_ASSET")
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-VALID_ASSET",
+                &["container-a"],
+            )
             .await
             .unwrap();
         assert_eq!(memberships.len(), 1);
@@ -9796,7 +9800,11 @@ mod tests {
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
         let memberships = db
-            .get_live_album_memberships_for_asset("PrimarySync", "asset-record-a")
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-record-a",
+                &["container-a"],
+            )
             .await
             .unwrap();
         assert_eq!(memberships.len(), 1);
@@ -9850,7 +9858,11 @@ mod tests {
 
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         let memberships = db
-            .get_live_album_memberships_for_asset("PrimarySync", "asset-record-a")
+            .get_live_selected_album_memberships_for_asset(
+                "PrimarySync",
+                "asset-record-a",
+                &["container-a"],
+            )
             .await
             .unwrap();
         assert!(memberships.is_empty());

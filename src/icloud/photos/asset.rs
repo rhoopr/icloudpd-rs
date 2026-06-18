@@ -3,7 +3,6 @@ use std::sync::Arc;
 use chrono::{DateTime, TimeZone, Utc};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
-use smallvec::SmallVec;
 
 use super::cloudkit::Record;
 use super::enc;
@@ -14,10 +13,9 @@ use crate::state::AssetMetadata;
 
 /// Type alias for the versions map.
 ///
-/// Uses `SmallVec` with capacity 4 to store versions inline (no heap allocation)
-/// for the common case of <=4 versions per asset. Most assets have 1-3 versions
-/// (original + optional medium/thumb + optional live photo).
-pub type VersionsMap = SmallVec<[(AssetVersionSize, AssetVersion); 4]>;
+/// Most assets have 1-3 versions (original + optional medium/thumb +
+/// optional live photo), so a compact vector keeps the representation simple.
+pub type VersionsMap = Vec<(AssetVersionSize, AssetVersion)>;
 
 /// Malformed resource fields seen while extracting downloadable versions.
 ///
@@ -93,7 +91,7 @@ pub struct AlbumRelationDelta {
 ///
 /// Fields are ordered for optimal memory layout:
 /// - Heap types first (`Arc<str>`, `Option<Box<str>>`)
-/// - `VersionsMap` (`SmallVec` inline storage)
+/// - `VersionsMap`
 /// - f64 primitives
 /// - Small enums last
 ///
@@ -112,7 +110,6 @@ pub struct PhotoAsset {
     // pipeline's metadata-hash comparisons) can share the same
     // allocation via refcount bumps. Immutable after construction.
     asset_metadata: Arc<AssetMetadata>,
-    // SmallVec with inline storage
     versions: VersionsMap,
     malformed_resources: Arc<[MalformedResource]>,
     // f64 primitives
@@ -197,7 +194,7 @@ fn extract_versions(
         PHOTO_VERSION_LOOKUP
     };
 
-    let mut versions = VersionsMap::new();
+    let mut versions = VersionsMap::with_capacity(4);
     let mut malformed_resources = Vec::new();
     for (key, res_field, type_field) in lookup {
         // Asset record has adjusted versions; master has originals.
@@ -1271,9 +1268,8 @@ mod tests {
             "AssetVersion size {} exceeds 64 bytes",
             size_of::<AssetVersion>()
         );
-        // PhotoAsset with SmallVec<[...; 4]> inline storage and Box<str> fields is ~344 bytes.
-        // This is larger than HashMap but avoids heap allocation for common case (<=4 versions).
-        // The trade-off is acceptable since we process assets in streams, not all at once.
+        // PhotoAsset should stay bounded enough for streaming without carrying
+        // unnecessary parser payload.
         assert!(
             size_of::<PhotoAsset>() <= 400,
             "PhotoAsset size {} exceeds 400 bytes",

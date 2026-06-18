@@ -725,11 +725,6 @@ impl Cli {
             _ => None,
         }
     }
-
-    /// Get the parsed command.
-    pub fn effective_command(&self) -> Command {
-        self.command.clone()
-    }
 }
 
 /// Rendered CLI parse failure with a concrete process exit code.
@@ -1199,7 +1194,7 @@ mod tests {
     fn test_login_subcommand() {
         let cli = Cli::try_parse_from(["kei", "login"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Login {
                 subcommand: None,
                 ..
@@ -1211,7 +1206,7 @@ mod tests {
     fn test_login_get_code() {
         let cli = Cli::try_parse_from(["kei", "login", "get-code"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Login {
                 subcommand: Some(LoginCommand::GetCode),
                 ..
@@ -1222,7 +1217,7 @@ mod tests {
     #[test]
     fn test_login_submit_code() {
         let cli = Cli::try_parse_from(["kei", "login", "submit-code", "123456"]).unwrap();
-        match cli.effective_command() {
+        match cli.command {
             Command::Login {
                 subcommand: Some(LoginCommand::SubmitCode { code }),
                 ..
@@ -1235,7 +1230,7 @@ mod tests {
     fn test_list_albums() {
         let cli = Cli::try_parse_from(["kei", "list", "albums"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::List {
                 what: ListCommand::Albums,
                 ..
@@ -1247,7 +1242,7 @@ mod tests {
     fn test_list_libraries() {
         let cli = Cli::try_parse_from(["kei", "list", "libraries"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::List {
                 what: ListCommand::Libraries,
                 ..
@@ -1259,7 +1254,7 @@ mod tests {
     fn test_password_set() {
         let cli = Cli::try_parse_from(["kei", "password", "set"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Password {
                 action: PasswordAction::Set,
                 ..
@@ -1271,7 +1266,7 @@ mod tests {
     fn test_password_clear() {
         let cli = Cli::try_parse_from(["kei", "password", "clear"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Password {
                 action: PasswordAction::Clear,
                 ..
@@ -1283,7 +1278,7 @@ mod tests {
     fn test_password_backend() {
         let cli = Cli::try_parse_from(["kei", "password", "backend"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Password {
                 action: PasswordAction::Backend,
                 ..
@@ -1294,7 +1289,7 @@ mod tests {
     #[test]
     fn test_reset_state() {
         let cli = Cli::try_parse_from(["kei", "reset", "state", "--yes"]).unwrap();
-        match cli.effective_command() {
+        match cli.command {
             Command::Reset {
                 what: ResetCommand::State { yes },
             } => assert!(yes),
@@ -1305,7 +1300,7 @@ mod tests {
     #[test]
     fn install_dry_run_parses_with_user_flag() {
         let cli = Cli::try_parse_from(["kei", "install", "--user", "--dry-run"]).unwrap();
-        let args = match cli.effective_command() {
+        let args = match cli.command {
             Command::Install(a) => a.clone(),
             other => panic!("expected Install, got {other:?}"),
         };
@@ -1326,7 +1321,7 @@ mod tests {
     fn uninstall_purge_parses_to_struct_field() {
         let cli = Cli::try_parse_from(["kei", "uninstall", "--purge"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Uninstall(UninstallArgs { purge: true })
         ));
     }
@@ -1335,7 +1330,7 @@ mod tests {
     fn test_reset_sync_token() {
         let cli = Cli::try_parse_from(["kei", "reset", "sync-token"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Reset {
                 what: ResetCommand::SyncToken { yes: false },
             }
@@ -1346,7 +1341,7 @@ mod tests {
     fn test_reset_sync_token_with_yes() {
         let cli = Cli::try_parse_from(["kei", "reset", "sync-token", "--yes"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Reset {
                 what: ResetCommand::SyncToken { yes: true },
             }
@@ -1357,7 +1352,7 @@ mod tests {
     fn test_reset_sync_token_with_short_y() {
         let cli = Cli::try_parse_from(["kei", "reset", "sync-token", "-y"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Reset {
                 what: ResetCommand::SyncToken { yes: true },
             }
@@ -1368,7 +1363,7 @@ mod tests {
     fn test_config_show() {
         let cli = Cli::try_parse_from(["kei", "config", "show"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Config {
                 action: ConfigAction::Show,
             }
@@ -1379,7 +1374,7 @@ mod tests {
     fn test_config_setup() {
         let cli = Cli::try_parse_from(["kei", "config", "setup"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::Config {
                 action: ConfigAction::Setup { output: None },
             }
@@ -1390,7 +1385,7 @@ mod tests {
     fn test_config_setup_with_output() {
         let cli =
             Cli::try_parse_from(["kei", "config", "setup", "-o", "/tmp/config.toml"]).unwrap();
-        match cli.effective_command() {
+        match cli.command {
             Command::Config {
                 action: ConfigAction::Setup { output },
             } => assert_eq!(output.as_deref(), Some("/tmp/config.toml")),
@@ -1898,7 +1893,7 @@ mod tests {
     #[test]
     fn test_sync_subcommand() {
         let cli = Cli::try_parse_from(["kei", "sync"]).unwrap();
-        assert!(matches!(cli.effective_command(), Command::Sync { .. }));
+        assert!(matches!(cli.command, Command::Sync { .. }));
     }
 
     #[test]
@@ -2110,7 +2105,7 @@ mod tests {
     fn test_list_albums_library_flag() {
         let cli = Cli::try_parse_from(["kei", "list", "--library", "all", "albums"]).unwrap();
         assert!(matches!(
-            cli.effective_command(),
+            cli.command,
             Command::List {
                 ref libraries,
                 what: ListCommand::Albums,
@@ -2135,7 +2130,7 @@ mod tests {
             "albums",
         ])
         .unwrap();
-        match cli.effective_command() {
+        match cli.command {
             Command::List {
                 libraries,
                 what: ListCommand::Albums,
@@ -2163,7 +2158,7 @@ mod tests {
             "albums",
         ])
         .unwrap();
-        match cli.effective_command() {
+        match cli.command {
             Command::List {
                 libraries,
                 what: ListCommand::Albums,
@@ -2193,7 +2188,7 @@ mod tests {
             "libraries",
         ])
         .unwrap();
-        match cli.effective_command() {
+        match cli.command {
             Command::List {
                 libraries,
                 what: ListCommand::Libraries,

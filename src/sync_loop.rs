@@ -4466,16 +4466,6 @@ mod tests {
                 .await
         }
 
-        async fn get_live_album_memberships_for_asset(
-            &self,
-            library: &str,
-            asset_record_name: &str,
-        ) -> Result<Vec<state::db::AlbumMembershipRecord>, state::error::StateError> {
-            self.inner
-                .get_live_album_memberships_for_asset(library, asset_record_name)
-                .await
-        }
-
         async fn get_live_selected_album_memberships_for_asset(
             &self,
             library: &str,

@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 
 use crate::icloud::photos::PhotoAsset;
 use crate::state::{AssetRecord, DownloadStateStore, MembershipStore};
@@ -43,7 +42,7 @@ impl TaskPlanner {
     ) -> AssetTaskPlan {
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
             return AssetTaskPlan {
-                tasks: SmallVec::new(),
+                tasks: Vec::new(),
                 filter_reason: Some(filter_reason),
                 malformed_resource: None,
             };
@@ -93,7 +92,7 @@ impl TaskPlanner {
 /// Result of planning a single asset.
 #[derive(Debug)]
 pub(super) struct AssetTaskPlan {
-    pub(super) tasks: SmallVec<[DownloadTask; 5]>,
+    pub(super) tasks: Vec<DownloadTask>,
     pub(super) filter_reason: Option<FilterReason>,
     pub(super) malformed_resource: Option<MalformedTaskResource>,
 }

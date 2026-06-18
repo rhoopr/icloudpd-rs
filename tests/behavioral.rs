@@ -3690,7 +3690,7 @@ fn removed_legacy_album_errors_even_with_user_set_albums_template() {
 /// `Cli -> Config -> Selection` pipeline. Per-category unit tests in
 /// `selection.rs` cover each parser in isolation, but the binary-level
 /// wiring (clap field name, config-resolver field name, the
-/// `effective_command()` mapping) can drift independently of the
+/// `Cli::command` mapping can drift independently of the
 /// parsers; a regression there lands green for every per-category
 /// test even when the combined flag set bails at startup.
 ///

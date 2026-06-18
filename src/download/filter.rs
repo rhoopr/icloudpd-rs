@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Local};
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 
 use crate::icloud::photos::types::AssetVersion;
 use crate::icloud::photos::VersionsMap;
@@ -742,14 +741,14 @@ pub(crate) fn is_asset_filtered(
 pub(super) fn extract_skip_candidates<'a>(
     asset: &'a crate::icloud::photos::PhotoAsset,
     config: &(impl PathDerivationSource + ?Sized),
-) -> SmallVec<[(VersionSizeKey, &'a str); 5]> {
+) -> Vec<(VersionSizeKey, &'a str)> {
     if !asset.has_valid_id() {
-        return SmallVec::new();
+        return Vec::new();
     }
 
     let ctx = DerivationContext::build(asset, config);
-    let mut result = SmallVec::new();
-    let mut seen_urls = SmallVec::<[&str; 4]>::new();
+    let mut result = Vec::with_capacity(5);
+    let mut seen_urls = Vec::<&str>::with_capacity(4);
 
     if let Some((version, effective_size)) = select_primary(asset, config, &ctx) {
         seen_urls.push(version.url.as_ref());
@@ -1036,10 +1035,8 @@ fn malformed_for_keys(
     })
 }
 
-fn primary_candidate_keys(
-    config: &(impl PathDerivationSource + ?Sized),
-) -> SmallVec<[AssetVersionSize; 2]> {
-    let mut keys = SmallVec::new();
+fn primary_candidate_keys(config: &(impl PathDerivationSource + ?Sized)) -> Vec<AssetVersionSize> {
+    let mut keys = Vec::with_capacity(2);
     let Some(requested) = config.resolution().to_asset_version_size() else {
         return keys;
     };
@@ -1050,10 +1047,8 @@ fn primary_candidate_keys(
     keys
 }
 
-fn live_candidate_keys(
-    config: &(impl PathDerivationSource + ?Sized),
-) -> SmallVec<[AssetVersionSize; 2]> {
-    let mut keys = SmallVec::new();
+fn live_candidate_keys(config: &(impl PathDerivationSource + ?Sized)) -> Vec<AssetVersionSize> {
+    let mut keys = Vec::with_capacity(2);
     keys.push(config.live_resolution());
     if !config.force_resolution() && config.live_resolution() != AssetVersionSize::LiveOriginal {
         keys.push(AssetVersionSize::LiveOriginal);
@@ -1299,14 +1294,14 @@ pub(super) fn derive_mov_companion(
 pub(super) fn derive_expected_paths(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &(impl PathDerivationSource + ?Sized),
-) -> SmallVec<[DerivedPath; 5]> {
+) -> Vec<DerivedPath> {
     if !asset.has_valid_id() {
-        return SmallVec::new();
+        return Vec::new();
     }
 
     let ctx = DerivationContext::build(asset, config);
-    let mut out = SmallVec::<[DerivedPath; 5]>::new();
-    let mut seen_urls = SmallVec::<[Box<str>; 4]>::new();
+    let mut out = Vec::<DerivedPath>::with_capacity(5);
+    let mut seen_urls = Vec::<Box<str>>::with_capacity(4);
     let mut primary_index: Option<usize> = None;
     if let Some(p) = derive_primary(asset, config, &ctx) {
         seen_urls.push(p.url.clone());
@@ -1346,7 +1341,7 @@ pub(super) fn derive_expected_paths(
 pub(crate) fn expected_paths_for(
     asset: &crate::icloud::photos::PhotoAsset,
     config: &(impl PathDerivationSource + ?Sized),
-) -> SmallVec<[ExpectedAssetPath; 5]> {
+) -> Vec<ExpectedAssetPath> {
     derive_expected_paths(asset, config)
         .into_iter()
         .map(|d| ExpectedAssetPath {
@@ -1498,7 +1493,7 @@ fn first_available_collision_path(
     preferred: CollisionFilenameKind,
     make_filename: impl Fn(CollisionFilenameKind) -> String,
 ) -> PathBuf {
-    let mut tried = SmallVec::<[Box<str>; 4]>::new();
+    let mut tried = Vec::<Box<str>>::with_capacity(4);
 
     for kind in [preferred, CollisionFilenameKind::AssetIdentity] {
         if let Some(path) = available_collision_path(ctx, &make_filename, kind, &mut tried) {
@@ -1524,7 +1519,7 @@ fn available_collision_path(
     ctx: &mut ResolveContext<'_>,
     make_filename: &impl Fn(CollisionFilenameKind) -> String,
     kind: CollisionFilenameKind,
-    tried: &mut SmallVec<[Box<str>; 4]>,
+    tried: &mut Vec<Box<str>>,
 ) -> Option<PathBuf> {
     let filename = make_filename(kind);
     let path = collision_path_for_filename(ctx, &filename);
@@ -1663,9 +1658,9 @@ pub(super) fn filter_asset_to_tasks(
     config: &DownloadConfig,
     claimed_paths: &mut FxHashMap<NormalizedPath, u64>,
     dir_cache: &mut paths::DirCache,
-) -> SmallVec<[DownloadTask; 5]> {
+) -> Vec<DownloadTask> {
     if !asset.has_valid_id() {
-        return SmallVec::new();
+        return Vec::new();
     }
 
     // Sync-only fingerprint-fallback exclusion: when `asset.filename()` is
@@ -1689,15 +1684,15 @@ pub(super) fn filter_asset_to_tasks(
                 filename = %fp,
                 "Skipping (filename_exclude match on fallback)"
             );
-            return SmallVec::new();
+            return Vec::new();
         }
     }
 
     let ctx = DerivationContext::build(asset, config);
     let payload = build_payload(asset, config);
-    let mut tasks = SmallVec::new();
+    let mut tasks = Vec::with_capacity(5);
     let mut effective_primary_filename: Option<String> = None;
-    let mut seen_urls = SmallVec::<[Box<str>; 4]>::new();
+    let mut seen_urls = Vec::<Box<str>>::with_capacity(4);
     let task_library: Arc<str> = asset
         .source_zone()
         .map(Arc::from)
@@ -1914,10 +1909,7 @@ mod tests {
 
     /// Helper that calls filter_asset_to_tasks with a fresh claimed_paths map.
     /// Use this for simple tests that don't need to track paths across calls.
-    fn filter_asset_fresh(
-        asset: &PhotoAsset,
-        config: &DownloadConfig,
-    ) -> SmallVec<[DownloadTask; 5]> {
+    fn filter_asset_fresh(asset: &PhotoAsset, config: &DownloadConfig) -> Vec<DownloadTask> {
         let mut claimed_paths = FxHashMap::default();
         let mut dir_cache = paths::DirCache::new();
         filter_asset_to_tasks(asset, config, &mut claimed_paths, &mut dir_cache)
@@ -2335,7 +2327,7 @@ mod tests {
         );
         path_config.album_name = sync_config.album_name.clone();
 
-        let to_tuples = |paths: SmallVec<[ExpectedAssetPath; 5]>| {
+        let to_tuples = |paths: Vec<ExpectedAssetPath>| {
             paths
                 .into_iter()
                 .map(|p| (p.path, p.size, p.checksum, p.url, p.version_size))
