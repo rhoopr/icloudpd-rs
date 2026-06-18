@@ -1205,6 +1205,22 @@ where
                     }
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(db) = &producer_state_db {
+                        let library = effective_asset_library(&asset, config);
+                        if let Err(e) =
+                            planner::upsert_asset_master_mapping(db.as_ref(), library, &asset).await
+                        {
+                            state_write_failures_producer
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                asset_id = %asset.id(),
+                                asset_record_name = %asset.asset_record_name(),
+                                library,
+                                error = %e,
+                                "Failed to record asset/master mapping"
+                            );
+                        }
+                    }
 
                     let plan = task_planner.plan_asset(&asset, config).await;
                     if let Some(reason) = plan.filter_reason {

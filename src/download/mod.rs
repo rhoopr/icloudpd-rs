@@ -29,6 +29,7 @@ pub(crate) use filter::determine_media_type;
 pub(crate) use filter::AssetGroupings;
 use filter::DownloadTask;
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -505,6 +506,8 @@ const UNPARSABLE_RELATION_DELTA_REASON: &str = "unparsable_relation_delta";
 const UNKNOWN_ALBUM_RELATION_CONTAINER_REASON: &str = "unknown_album_relation_container";
 const UNKNOWN_ALBUM_RELATION_ASSET_REASON: &str = "unknown_album_relation_asset";
 const ALBUM_DELTA_STATE_WRITE_FAILED_REASON: &str = "album_delta_state_write_failed";
+const ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON: &str =
+    "asset_master_mapping_state_write_failed";
 const INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON: &str = "incremental_delete_state_write_failed";
 const INCREMENTAL_DELETE_ZERO_ROWS_REASON: &str = "incremental_delete_no_matching_state";
 const INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON: &str = "incremental_hidden_state_write_failed";
@@ -520,6 +523,7 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
     match reason {
         ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON
         | ALBUM_DELTA_STATE_WRITE_FAILED_REASON
+        | ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON
         | DATE_BOUNDED_FULL_ENUMERATION_REASON
         | INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON
         | INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON
@@ -597,6 +601,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
             "an album relation referenced an asset kei cannot hydrate for album routing yet"
         }
         ALBUM_DELTA_STATE_WRITE_FAILED_REASON => "kei could not persist album delta state safely",
+        ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON => {
+            "kei could not persist asset-to-master mapping state safely"
+        }
         INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON => {
             "kei could not persist an incremental source-delete safely"
         }
@@ -3050,11 +3057,17 @@ impl IncrementalStateTransition {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SourceStateTransitionKey<'a> {
-    record_name: &'a str,
+    record_name: Cow<'a, str>,
     record_type: Option<&'a str>,
     unresolved_identity: bool,
+}
+
+impl SourceStateTransitionKey<'_> {
+    fn record_name(&self) -> &str {
+        self.record_name.as_ref()
+    }
 }
 
 fn record_incremental_state_transition_result(
@@ -3073,7 +3086,7 @@ fn record_incremental_state_transition_result(
             *state_transition_failures += 1;
             token_unsafe_reason.get_or_insert(INCREMENTAL_DELETE_ZERO_ROWS_REASON);
             tracing::warn!(
-                record_name = state_key.record_name,
+                record_name = state_key.record_name(),
                 record_type = state_key.record_type,
                 transition = transition.label(),
                 "Unresolved hard-delete event did not match local state; blocking sync token advancement"
@@ -3081,7 +3094,7 @@ fn record_incremental_state_transition_result(
         }
         Ok(_) => {
             tracing::debug!(
-                record_name = state_key.record_name,
+                record_name = state_key.record_name(),
                 record_type = state_key.record_type,
                 transition = transition.label(),
                 "Incremental source-state transition was already absent from state DB"
@@ -3091,7 +3104,7 @@ fn record_incremental_state_transition_result(
             *state_transition_failures += 1;
             token_unsafe_reason.get_or_insert(transition.write_failed_reason());
             tracing::warn!(
-                record_name = state_key.record_name,
+                record_name = state_key.record_name(),
                 error = %e,
                 transition = transition.label(),
                 "Failed to record incremental source-state transition in state DB"
@@ -3104,23 +3117,53 @@ fn source_state_transition_key(event: &ChangeEvent) -> SourceStateTransitionKey<
     if matches!(event.record_type.as_deref(), Some("CPLAsset")) {
         if let Some(master_record_name) = event.master_record_name.as_deref() {
             return SourceStateTransitionKey {
-                record_name: master_record_name,
+                record_name: Cow::Borrowed(master_record_name),
                 record_type: Some("CPLMaster"),
                 unresolved_identity: false,
             };
         }
         return SourceStateTransitionKey {
-            record_name: &event.record_name,
+            record_name: Cow::Borrowed(&event.record_name),
             record_type: event.record_type.as_deref(),
             unresolved_identity: true,
         };
     }
 
     SourceStateTransitionKey {
-        record_name: &event.record_name,
+        record_name: Cow::Borrowed(&event.record_name),
         record_type: event.record_type.as_deref(),
         unresolved_identity: event.record_type.is_none(),
     }
+}
+
+async fn hard_delete_state_transition_key<'a>(
+    event: &'a ChangeEvent,
+    config: &DownloadConfig,
+    db: &dyn DownloadStore,
+) -> std::result::Result<SourceStateTransitionKey<'a>, crate::state::error::StateError> {
+    let fallback = source_state_transition_key(event);
+    if !fallback.unresolved_identity {
+        return Ok(fallback);
+    }
+
+    let Some(master_record_name) = db
+        .get_master_record_name_for_asset(&config.library, &event.record_name)
+        .await?
+    else {
+        return Ok(fallback);
+    };
+
+    tracing::debug!(
+        asset_record_name = %event.record_name,
+        master_record_name = %master_record_name,
+        library = %config.library,
+        "Resolved hard-delete asset tombstone through asset/master mapping"
+    );
+    Ok(SourceStateTransitionKey {
+        record_name: Cow::Owned(master_record_name),
+        record_type: Some("CPLMaster"),
+        unresolved_identity: false,
+    })
 }
 
 fn clear_zone_token_block_from_targeted_backfill_stats(stats: &mut SyncStats) {
@@ -4632,6 +4675,28 @@ impl IncrementalDeltaSummary {
         }
     }
 
+    async fn persist_asset_mapping(&mut self, event: &ChangeEvent, config: &DownloadConfig) {
+        let Some(asset) = &event.asset else {
+            return;
+        };
+        let Some(db) = &config.state_db else {
+            return;
+        };
+        let library = asset.source_zone().unwrap_or(&config.library);
+        if let Err(e) = planner::upsert_asset_master_mapping(db.as_ref(), library, asset).await {
+            self.state_transition_failures += 1;
+            self.token_unsafe_reason
+                .get_or_insert(ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON);
+            tracing::warn!(
+                asset_id = %asset.id(),
+                asset_record_name = %asset.asset_record_name(),
+                library,
+                error = %e,
+                "Failed to record asset/master mapping from incremental delta"
+            );
+        }
+    }
+
     fn record_created(&mut self) {
         self.created_count += 1;
     }
@@ -4648,7 +4713,7 @@ impl IncrementalDeltaSummary {
                     let result = db
                         .mark_soft_deleted_affected(
                             &config.library,
-                            state_key.record_name,
+                            state_key.record_name(),
                             deleted_at,
                         )
                         .await;
@@ -4665,9 +4730,23 @@ impl IncrementalDeltaSummary {
                 self.hard_deleted_count += 1;
                 tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
                 if let Some(db) = &config.state_db {
-                    let state_key = source_state_transition_key(event);
+                    let state_key =
+                        match hard_delete_state_transition_key(event, config, db.as_ref()).await {
+                            Ok(state_key) => state_key,
+                            Err(e) => {
+                                self.state_transition_failures += 1;
+                                self.token_unsafe_reason
+                                    .get_or_insert(INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON);
+                                tracing::warn!(
+                                    record_name = %event.record_name,
+                                    error = %e,
+                                    "Failed to resolve hard-delete asset/master mapping"
+                                );
+                                return;
+                            }
+                        };
                     let result = db
-                        .mark_soft_deleted_affected(&config.library, state_key.record_name, None)
+                        .mark_soft_deleted_affected(&config.library, state_key.record_name(), None)
                         .await;
                     record_incremental_state_transition_result(
                         result,
@@ -4684,7 +4763,7 @@ impl IncrementalDeltaSummary {
                 if let Some(db) = &config.state_db {
                     let state_key = source_state_transition_key(event);
                     let result = db
-                        .mark_hidden_at_source_affected(&config.library, state_key.record_name)
+                        .mark_hidden_at_source_affected(&config.library, state_key.record_name())
                         .await;
                     record_incremental_state_transition_result(
                         result,
@@ -4901,6 +4980,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             let event = result?;
             summary.observe_event(&event);
             IncrementalDeltaSummary::remember_asset_mapping(&event, &mut asset_to_master);
+            summary.persist_asset_mapping(&event, &config).await;
 
             if event.album.is_some() {
                 album_events.push(event);
@@ -5116,6 +5196,7 @@ async fn download_photos_incremental_collecting(
     let mut asset_to_master: FxHashMap<String, String> = FxHashMap::default();
     for event in &change_events {
         IncrementalDeltaSummary::remember_asset_mapping(event, &mut asset_to_master);
+        delta_summary.persist_asset_mapping(event, config).await;
     }
     let planned_album_containers: FxHashMap<&str, &str> = passes
         .iter()
@@ -8116,6 +8197,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_change_persists_asset_master_mapping() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let result = run_incremental_change_records(
+            db.clone(),
+            flagged_incremental_records("MAPPED_MASTER", ("isDeleted", 1)),
+        )
+        .await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-MAPPED_MASTER")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("MAPPED_MASTER")
+        );
+    }
+
+    #[tokio::test]
     async fn incremental_untracked_hidden_zero_rows_advances_sync_token() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
         let result = run_incremental_change_records(
@@ -8155,6 +8255,62 @@ mod tests {
         );
         let pending = db.get_pending().await.unwrap();
         assert_source_flags(&pending, "TRACKED_MASTER", false, false);
+    }
+
+    #[tokio::test]
+    async fn incremental_hard_delete_uses_library_scoped_asset_master_mapping() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        db.upsert_seen(
+            &TestAssetRecord::new("PRIMARY_MASTER")
+                .library("PrimarySync")
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.upsert_seen(
+            &TestAssetRecord::new("SHARED_MASTER")
+                .library("SharedSync-AAAA")
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-SAME", "PRIMARY_MASTER")
+            .await
+            .unwrap();
+        db.upsert_asset_master_mapping("SharedSync-AAAA", "asset-SAME", "SHARED_MASTER")
+            .await
+            .unwrap();
+
+        let result = run_incremental_change_records(
+            db.clone(),
+            vec![hard_deleted_change_record("asset-SAME")],
+        )
+        .await;
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
+
+        let pending = db.get_pending().await.unwrap();
+        let primary = pending
+            .iter()
+            .find(|record| record.library.as_ref() == "PrimarySync")
+            .expect("primary row");
+        let shared = pending
+            .iter()
+            .find(|record| record.library.as_ref() == "SharedSync-AAAA")
+            .expect("shared row");
+        assert_eq!(primary.id.as_ref(), "PRIMARY_MASTER");
+        assert!(
+            primary.metadata.is_deleted,
+            "PrimarySync mapping should resolve and mark the master row deleted"
+        );
+        assert_eq!(shared.id.as_ref(), "SHARED_MASTER");
+        assert!(
+            !shared.metadata.is_deleted,
+            "same CPLAsset record name in another library must stay isolated"
+        );
     }
 
     #[tokio::test]

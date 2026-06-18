@@ -116,6 +116,8 @@ pub(super) async fn upsert_seen_for_task<D>(
 where
     D: DownloadStateStore + ?Sized,
 {
+    upsert_asset_master_mapping(db, &task.library, asset).await?;
+
     let media_type = determine_media_type(task.version_size, asset);
     let record = AssetRecord::new_pending(
         Arc::clone(&task.library),
@@ -134,6 +136,20 @@ where
     )
     .with_metadata_arc(asset.metadata_arc());
     db.upsert_seen(&record).await
+}
+
+/// Persist the durable CloudKit identifier bridge used to resolve future
+/// `CPLAsset` hard-delete tombstones back to the `CPLMaster` keyed state row.
+pub(super) async fn upsert_asset_master_mapping<D>(
+    db: &D,
+    library: &str,
+    asset: &PhotoAsset,
+) -> Result<(), crate::state::error::StateError>
+where
+    D: DownloadStateStore + ?Sized,
+{
+    db.upsert_asset_master_mapping(library, asset.asset_record_name(), asset.id())
+        .await
 }
 
 /// Record an asset's membership in the current concrete album/smart-folder
@@ -411,6 +427,13 @@ mod tests {
         let pending = db.get_pending().await.unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id.as_ref(), "STATEFUL");
+        assert_eq!(
+            db.get_master_record_name_for_asset(&pass_config.library, asset.asset_record_name())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("STATEFUL")
+        );
         let albums = db.get_all_asset_albums(&pass_config.library).await.unwrap();
         assert_eq!(albums, vec![("STATEFUL".to_string(), "Family".to_string())]);
     }
@@ -441,6 +464,13 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].library.as_ref(), "SharedSync-abc");
         assert_eq!(pending[0].id.as_ref(), "CROSS_ZONE");
+        assert_eq!(
+            db.get_master_record_name_for_asset("SharedSync-abc", asset.asset_record_name())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("CROSS_ZONE")
+        );
         assert!(
             db.get_all_asset_albums(&pass_config.library)
                 .await

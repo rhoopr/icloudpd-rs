@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StateError;
 
 /// Current schema version. Increment when making schema changes.
-pub(crate) const SCHEMA_VERSION: i32 = 14;
+pub(crate) const SCHEMA_VERSION: i32 = 15;
 
 /// Schema DDL for version 1.
 const SCHEMA_V1: &str = r"
@@ -404,6 +404,24 @@ CREATE TABLE IF NOT EXISTS scoped_db_sync_tokens (
 );
 ";
 
+/// V15 durable CPLAsset -> CPLMaster mapping.
+///
+/// CloudKit hard-delete tombstones can arrive with only a `recordName` and no
+/// `recordType` or fields. The download state is keyed by `CPLMaster`, so keep
+/// the last observed `CPLAsset.recordName` bridge per library.
+const SCHEMA_V15: &str = r"
+CREATE TABLE IF NOT EXISTS asset_master_mappings (
+    library TEXT NOT NULL,
+    asset_record_name TEXT NOT NULL,
+    master_record_name TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (library, asset_record_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_master_mappings_master
+    ON asset_master_mappings (library, master_record_name);
+";
+
 /// Apply migration for a specific version.
 ///
 /// `start_version` is the schema version the DB carried when `migrate()`
@@ -555,6 +573,7 @@ fn migrate_to_version(
             }
         }
         14 => conn.execute_batch(SCHEMA_V14)?,
+        15 => conn.execute_batch(SCHEMA_V15)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1719,5 +1738,48 @@ mod tests {
                 "v14 must create scoped_db_sync_tokens.{column}",
             );
         }
+    }
+
+    #[test]
+    fn test_v15_creates_asset_master_mappings_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        set_schema_version(&conn, 1).unwrap();
+        migrate(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name = 'asset_master_mappings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "v15 must create asset_master_mappings");
+
+        for column in [
+            "library",
+            "asset_record_name",
+            "master_record_name",
+            "updated_at",
+        ] {
+            assert!(
+                column_exists(&conn, "asset_master_mappings", column).unwrap(),
+                "v15 must create asset_master_mappings.{column}",
+            );
+        }
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name = 'idx_asset_master_mappings_master'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 1,
+            "v15 must create idx_asset_master_mappings_master"
+        );
     }
 }

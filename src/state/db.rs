@@ -164,6 +164,21 @@ pub trait DownloadStateStore: Send + Sync {
         library: &str,
         asset_ids: &[&str],
     ) -> Result<(), StateError>;
+    async fn upsert_asset_master_mapping(
+        &self,
+        _library: &str,
+        _asset_record_name: &str,
+        _master_record_name: &str,
+    ) -> Result<(), StateError> {
+        Ok(())
+    }
+    async fn get_master_record_name_for_asset(
+        &self,
+        _library: &str,
+        _asset_record_name: &str,
+    ) -> Result<Option<String>, StateError> {
+        Ok(None)
+    }
     /// Persist a provider tombstone without changing local download state.
     ///
     /// A row can legitimately be both `status = 'downloaded'` and
@@ -2654,6 +2669,52 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn upsert_asset_master_mapping(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+        master_record_name: &str,
+    ) -> Result<(), StateError> {
+        let library = library.to_owned();
+        let asset_record_name = asset_record_name.to_owned();
+        let master_record_name = master_record_name.to_owned();
+        self.with_conn("upsert_asset_master_mapping", move |conn| {
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO asset_master_mappings \
+                    (library, asset_record_name, master_record_name, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(library, asset_record_name) DO UPDATE SET \
+                    master_record_name = excluded.master_record_name, \
+                    updated_at = excluded.updated_at",
+                rusqlite::params![library, asset_record_name, master_record_name, now],
+            )
+            .map_err(|e| StateError::query("upsert_asset_master_mapping", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn get_master_record_name_for_asset(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+    ) -> Result<Option<String>, StateError> {
+        let library = library.to_owned();
+        let asset_record_name = asset_record_name.to_owned();
+        self.with_conn("get_master_record_name_for_asset", move |conn| {
+            conn.query_row(
+                "SELECT master_record_name FROM asset_master_mappings \
+                 WHERE library = ?1 AND asset_record_name = ?2",
+                rusqlite::params![library, asset_record_name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| StateError::query("get_master_record_name_for_asset", e))
+        })
+        .await
+    }
+
     pub(crate) async fn mark_soft_deleted(
         &self,
         library: &str,
@@ -2972,6 +3033,29 @@ impl DownloadStateStore for SqliteStateDb {
         asset_ids: &[&str],
     ) -> Result<(), StateError> {
         SqliteStateDb::touch_last_seen_many(self, library, asset_ids).await
+    }
+
+    async fn upsert_asset_master_mapping(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+        master_record_name: &str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::upsert_asset_master_mapping(
+            self,
+            library,
+            asset_record_name,
+            master_record_name,
+        )
+        .await
+    }
+
+    async fn get_master_record_name_for_asset(
+        &self,
+        library: &str,
+        asset_record_name: &str,
+    ) -> Result<Option<String>, StateError> {
+        SqliteStateDb::get_master_record_name_for_asset(self, library, asset_record_name).await
     }
 
     async fn mark_soft_deleted(
@@ -3573,6 +3657,39 @@ mod tests {
 
     fn test_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[tokio::test]
+    async fn asset_master_mapping_is_library_scoped() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        db.upsert_asset_master_mapping("PrimarySync", "asset-a", "master-primary")
+            .await
+            .unwrap();
+        db.upsert_asset_master_mapping("SharedSync-AAAA", "asset-a", "master-shared")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-a")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("master-primary")
+        );
+        assert_eq!(
+            db.get_master_record_name_for_asset("SharedSync-AAAA", "asset-a")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("master-shared")
+        );
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "missing")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[derive(Debug)]
