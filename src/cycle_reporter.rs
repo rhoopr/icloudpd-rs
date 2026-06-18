@@ -609,7 +609,7 @@ mod tests {
                     ),
                     sync_token_blocked_zone: Some("PrimarySync".to_string()),
                     full_enumeration_reason: Some(
-                        crate::download::FullEnumerationReason::RetryFailedRows,
+                        crate::download::FullEnumerationReason::NoStoredToken,
                     ),
                     ..SyncStats::default()
                 },
@@ -628,7 +628,7 @@ mod tests {
                     "kei_sync_enumeration_errors_total 0",
                     "kei_sync_pagination_shortfall_warnings_total 1",
                     "kei_sync_token_blocked_cycles_total 1",
-                    "kei_sync_full_enumeration_reason_total{reason=\"retry_failed_rows\"} 1",
+                    "kei_sync_full_enumeration_reason_total{reason=\"no_stored_token\"} 1",
                 ],
             },
             OutcomeCase {

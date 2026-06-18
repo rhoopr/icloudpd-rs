@@ -104,31 +104,11 @@ impl<T> DownloadStore for T where
 #[serde(rename_all = "snake_case")]
 pub enum FullEnumerationReason {
     NoStoredToken,
-    #[allow(
-        dead_code,
-        reason = "kept as a stable report vocabulary value for older fallback reports"
-    )]
-    RetryFailedRows,
-    #[allow(
-        dead_code,
-        reason = "kept as a stable report vocabulary value for older fallback reports"
-    )]
-    PendingRows,
     MetadataBackfill,
-    #[allow(
-        dead_code,
-        reason = "kept as a stable report vocabulary value for older path-template fallback reports"
-    )]
-    PathTemplateRequiresFullEnumeration,
     AlbumRelationHydrationIncomplete,
     EnumConfigHashDrift,
     DownloadConfigHashDrift,
     ExplicitRetryFailed,
-    #[allow(
-        dead_code,
-        reason = "reserved report vocabulary for a future durable token-blocked marker"
-    )]
-    TokenBlockedPreviously,
     OtherStaticReason,
 }
 
@@ -136,15 +116,11 @@ impl FullEnumerationReason {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::NoStoredToken => "no_stored_token",
-            Self::RetryFailedRows => "retry_failed_rows",
-            Self::PendingRows => "pending_rows",
             Self::MetadataBackfill => "metadata_backfill",
-            Self::PathTemplateRequiresFullEnumeration => "path_template_requires_full_enumeration",
             Self::AlbumRelationHydrationIncomplete => ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON,
             Self::EnumConfigHashDrift => "enum_config_hash_drift",
             Self::DownloadConfigHashDrift => "download_config_hash_drift",
             Self::ExplicitRetryFailed => "explicit_retry_failed",
-            Self::TokenBlockedPreviously => "token_blocked_previously",
             Self::OtherStaticReason => "other_static_reason",
         }
     }
@@ -2738,50 +2714,6 @@ async fn build_pending_retry_download_tasks(
         unmatched: pending_targets.len(),
         requested,
     })
-}
-
-/// Eagerly enumerate all albums and build a complete task list.
-///
-/// Used only by the Phase 2 cleanup pass — re-contacts the API so each call
-/// yields fresh CDN URLs that haven't expired during a long download session.
-#[allow(
-    dead_code,
-    reason = "kept for focused tests and future non-selective tooling"
-)]
-async fn build_download_tasks(
-    passes: &[crate::commands::AlbumPass],
-    config: &DownloadConfig,
-    shutdown_token: CancellationToken,
-) -> Result<Vec<DownloadTask>> {
-    let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
-    let pass_results: Vec<Result<(usize, Vec<_>)>> = stream::iter(passes.iter().enumerate())
-        .take_while(|_| std::future::ready(!shutdown_token.is_cancelled()))
-        .map(|(i, pass)| async move { pass.album.photos(config.recent).await.map(|a| (i, a)) })
-        .buffer_unordered(config.concurrent_downloads)
-        .collect()
-        .await;
-
-    let mut tasks: Vec<DownloadTask> = Vec::new();
-    let mut task_planner = planner::TaskPlanner::new();
-    for pass_result in pass_results {
-        let (pass_index, assets) = pass_result?;
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "pass_index comes from enumerate() over `passes`; pass_configs is \
-                      built 1:1 from the same slice"
-        )]
-        let pass_config = &pass_configs[pass_index];
-
-        for asset in &assets {
-            let plan = task_planner.plan_asset(asset, pass_config).await;
-            if plan.filter_reason.is_some() {
-                continue;
-            }
-            tasks.extend(plan.tasks);
-        }
-    }
-
-    Ok(tasks)
 }
 
 /// Re-enumerate iCloud and rebuild only the failed tasks with fresh CDN URLs.
@@ -11211,7 +11143,7 @@ mod tests {
             sync_token_receivers_blank: Some(0),
             sync_token_receivers_dropped: Some(0),
             sync_token_unique_values: Some(1),
-            full_enumeration_reason: Some(FullEnumerationReason::RetryFailedRows),
+            full_enumeration_reason: Some(FullEnumerationReason::NoStoredToken),
             elapsed_secs: 1.5,
             interrupted: false,
             rate_limited: 7,
@@ -11266,7 +11198,7 @@ mod tests {
             sync_token_receivers_blank: Some(0),
             sync_token_receivers_dropped: Some(0),
             sync_token_unique_values: Some(1),
-            full_enumeration_reason: Some(FullEnumerationReason::PendingRows),
+            full_enumeration_reason: Some(FullEnumerationReason::MetadataBackfill),
             elapsed_secs: 0.75,
             interrupted: true,
             rate_limited: 3,
@@ -11347,7 +11279,7 @@ mod tests {
         assert_eq!(acc.sync_token_unique_values, Some(1));
         assert_eq!(
             acc.full_enumeration_reason,
-            Some(FullEnumerationReason::RetryFailedRows)
+            Some(FullEnumerationReason::NoStoredToken)
         );
         assert!(
             (acc.elapsed_secs - 2.25).abs() < 1e-9,
