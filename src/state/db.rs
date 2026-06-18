@@ -2731,13 +2731,23 @@ impl SqliteStateDb {
                     .execute(
                         "INSERT OR IGNORE INTO asset_master_mappings \
                         (library, asset_record_name, master_record_name, updated_at) \
-                     SELECT library, asset_record_name, MIN(master_record_name), ?1 \
-                     FROM asset_album_memberships \
-                     WHERE asset_record_name <> '' \
-                       AND master_record_name IS NOT NULL \
-                       AND master_record_name <> '' \
-                     GROUP BY library, asset_record_name \
-                     HAVING COUNT(DISTINCT master_record_name) = 1",
+                     SELECT \
+                        membership.library, \
+                        membership.asset_record_name, \
+                        MIN(membership.master_record_name), \
+                        ?1 \
+                     FROM asset_album_memberships AS membership \
+                     WHERE membership.asset_record_name <> '' \
+                       AND membership.master_record_name IS NOT NULL \
+                       AND membership.master_record_name <> '' \
+                       AND NOT EXISTS ( \
+                           SELECT 1 \
+                           FROM asset_master_mappings AS mapping \
+                           WHERE mapping.library = membership.library \
+                             AND mapping.asset_record_name = membership.asset_record_name \
+                       ) \
+                     GROUP BY membership.library, membership.asset_record_name \
+                     HAVING COUNT(DISTINCT membership.master_record_name) = 1",
                         rusqlite::params![now],
                     )
                     .map_err(|e| {
