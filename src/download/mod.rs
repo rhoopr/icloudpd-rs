@@ -3166,6 +3166,27 @@ async fn hard_delete_state_transition_key<'a>(
     })
 }
 
+async fn backfill_asset_master_mappings_from_album_history(db: &dyn DownloadStore) {
+    match db
+        .backfill_asset_master_mappings_from_album_memberships()
+        .await
+    {
+        Ok(0) => {}
+        Ok(inserted) => {
+            tracing::info!(
+                inserted,
+                "Backfilled asset/master mappings from album membership history"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to backfill asset/master mappings from album membership history"
+            );
+        }
+    }
+}
+
 fn clear_zone_token_block_from_targeted_backfill_stats(stats: &mut SyncStats) {
     stats.sync_token_blocked = false;
     stats.sync_token_blocked_reason = None;
@@ -3653,6 +3674,11 @@ pub async fn download_photos_with_sync(
 ) -> Result<SyncResult> {
     let sync_started_at = chrono::Utc::now().timestamp();
     cleanup_orphan_part_files(&config).await;
+    if matches!(config.sync_mode, SyncMode::Incremental { .. }) {
+        if let Some(db) = &config.state_db {
+            backfill_asset_master_mappings_from_album_history(db.as_ref()).await;
+        }
+    }
 
     // Give every non-downloaded asset a fresh start this sync:
     // failed -> pending (with attempts reset), and stale attempt counts on
@@ -8311,6 +8337,97 @@ mod tests {
             !shared.metadata.is_deleted,
             "same CPLAsset record name in another library must stay isolated"
         );
+    }
+
+    #[tokio::test]
+    async fn incremental_hard_delete_recovers_mapping_from_album_history() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        db.upsert_seen(
+            &TestAssetRecord::new("TRACKED_MASTER")
+                .library("PrimarySync")
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "TRACKED_MASTER",
+            VersionSizeKey::Original.as_str(),
+            std::path::Path::new("/tmp/codex/kei/tests/tracked-master.jpg"),
+            "seeded-local-sha256",
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert_album_container("PrimarySync", "container-a", "Vacation", "album")
+            .await
+            .unwrap();
+        db.upsert_album_membership_delta(
+            "PrimarySync",
+            "container-a",
+            "asset-TRACKED_MASTER",
+            Some("TRACKED_MASTER"),
+            "icloud",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-TRACKED_MASTER")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(
+                vec![hard_deleted_change_record("asset-TRACKED_MASTER")],
+                "zone-token-after",
+                false,
+            )
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("Library", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut config = test_config();
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-before".to_string(),
+        };
+        config.state_db = Some(db.clone());
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-TRACKED_MASTER")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("TRACKED_MASTER")
+        );
+        let is_deleted: i64 = db
+            .acquire_lock("test")
+            .unwrap()
+            .query_row(
+                "SELECT is_deleted FROM assets \
+                 WHERE library = 'PrimarySync' AND id = 'TRACKED_MASTER'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(is_deleted, 1);
     }
 
     #[tokio::test]

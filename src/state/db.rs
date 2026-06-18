@@ -179,6 +179,11 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<Option<String>, StateError> {
         Ok(None)
     }
+    async fn backfill_asset_master_mappings_from_album_memberships(
+        &self,
+    ) -> Result<u64, StateError> {
+        Ok(0)
+    }
     /// Persist a provider tombstone without changing local download state.
     ///
     /// A row can legitimately be both `status = 'downloaded'` and
@@ -2715,6 +2720,38 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn backfill_asset_master_mappings_from_album_memberships(
+        &self,
+    ) -> Result<u64, StateError> {
+        self.with_conn(
+            "backfill_asset_master_mappings_from_album_memberships",
+            move |conn| {
+                let now = Utc::now().timestamp();
+                let inserted = conn
+                    .execute(
+                        "INSERT OR IGNORE INTO asset_master_mappings \
+                        (library, asset_record_name, master_record_name, updated_at) \
+                     SELECT library, asset_record_name, MIN(master_record_name), ?1 \
+                     FROM asset_album_memberships \
+                     WHERE asset_record_name <> '' \
+                       AND master_record_name IS NOT NULL \
+                       AND master_record_name <> '' \
+                     GROUP BY library, asset_record_name \
+                     HAVING COUNT(DISTINCT master_record_name) = 1",
+                        rusqlite::params![now],
+                    )
+                    .map_err(|e| {
+                        StateError::query(
+                            "backfill_asset_master_mappings_from_album_memberships",
+                            e,
+                        )
+                    })?;
+                Ok(inserted as u64)
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn mark_soft_deleted(
         &self,
         library: &str,
@@ -3056,6 +3093,12 @@ impl DownloadStateStore for SqliteStateDb {
         asset_record_name: &str,
     ) -> Result<Option<String>, StateError> {
         SqliteStateDb::get_master_record_name_for_asset(self, library, asset_record_name).await
+    }
+
+    async fn backfill_asset_master_mappings_from_album_memberships(
+        &self,
+    ) -> Result<u64, StateError> {
+        SqliteStateDb::backfill_asset_master_mappings_from_album_memberships(self).await
     }
 
     async fn mark_soft_deleted(
@@ -3689,6 +3732,90 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_master_mapping_backfill_uses_unambiguous_album_history() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        for (library, container) in [
+            ("PrimarySync", "album-a"),
+            ("PrimarySync", "album-b"),
+            ("SharedSync-AAAA", "album-a"),
+        ] {
+            db.upsert_album_container(library, container, "Album", "album")
+                .await
+                .unwrap();
+        }
+
+        for (library, container, asset, master) in [
+            ("PrimarySync", "album-a", "asset-a", Some("master-a")),
+            ("PrimarySync", "album-b", "asset-a", Some("master-a")),
+            (
+                "SharedSync-AAAA",
+                "album-a",
+                "asset-a",
+                Some("master-shared"),
+            ),
+            (
+                "PrimarySync",
+                "album-a",
+                "asset-ambiguous",
+                Some("master-one"),
+            ),
+            (
+                "PrimarySync",
+                "album-b",
+                "asset-ambiguous",
+                Some("master-two"),
+            ),
+            ("PrimarySync", "album-a", "asset-missing", None),
+        ] {
+            db.upsert_album_membership_delta(library, container, asset, master, "icloud")
+                .await
+                .unwrap();
+        }
+        db.mark_album_membership_deleted("PrimarySync", "album-b", "asset-a")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.backfill_asset_master_mappings_from_album_memberships()
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-a")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("master-a")
+        );
+        assert_eq!(
+            db.get_master_record_name_for_asset("SharedSync-AAAA", "asset-a")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("master-shared")
+        );
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-ambiguous")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-missing")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.backfill_asset_master_mappings_from_album_memberships()
+                .await
+                .unwrap(),
+            0
         );
     }
 

@@ -420,6 +420,24 @@ CREATE TABLE IF NOT EXISTS asset_master_mappings (
 
 CREATE INDEX IF NOT EXISTS idx_asset_master_mappings_master
     ON asset_master_mappings (library, master_record_name);
+
+INSERT OR IGNORE INTO asset_master_mappings (
+    library,
+    asset_record_name,
+    master_record_name,
+    updated_at
+)
+SELECT
+    library,
+    asset_record_name,
+    MIN(master_record_name),
+    CAST(strftime('%s', 'now') AS INTEGER)
+FROM asset_album_memberships
+WHERE asset_record_name <> ''
+  AND master_record_name IS NOT NULL
+  AND master_record_name <> ''
+GROUP BY library, asset_record_name
+HAVING COUNT(DISTINCT master_record_name) = 1;
 ";
 
 /// Apply migration for a specific version.
@@ -1780,6 +1798,66 @@ mod tests {
         assert_eq!(
             exists, 1,
             "v15 must create idx_asset_master_mappings_master"
+        );
+    }
+
+    #[test]
+    fn test_v15_backfills_unambiguous_album_membership_mappings() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=14 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+
+        conn.execute_batch(
+            "
+            INSERT INTO asset_album_memberships (
+                library,
+                asset_record_name,
+                master_record_name,
+                container_id,
+                generation,
+                is_deleted,
+                source,
+                updated_at
+            ) VALUES
+                ('PrimarySync', 'asset-a', 'master-a', 'album-1', 1, 0, 'icloud', 1),
+                ('PrimarySync', 'asset-a', 'master-a', 'album-2', 1, 1, 'icloud', 1),
+                ('SharedSync-AAAA', 'asset-a', 'master-shared', 'album-1', 1, 0, 'icloud', 1),
+                ('PrimarySync', 'asset-ambiguous', 'master-one', 'album-1', 1, 0, 'icloud', 1),
+                ('PrimarySync', 'asset-ambiguous', 'master-two', 'album-2', 1, 0, 'icloud', 1),
+                ('PrimarySync', 'asset-null', NULL, 'album-1', 1, 0, 'icloud', 1);
+            ",
+        )
+        .unwrap();
+        set_schema_version(&conn, 14).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let mappings: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT library, asset_record_name, master_record_name \
+                 FROM asset_master_mappings \
+                 ORDER BY library, asset_record_name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            mappings,
+            vec![
+                (
+                    "PrimarySync".to_string(),
+                    "asset-a".to_string(),
+                    "master-a".to_string()
+                ),
+                (
+                    "SharedSync-AAAA".to_string(),
+                    "asset-a".to_string(),
+                    "master-shared".to_string()
+                ),
+            ]
         );
     }
 }
