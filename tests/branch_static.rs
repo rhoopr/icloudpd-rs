@@ -74,6 +74,35 @@ fn docker_packaging_defaults_to_service_run() {
     );
 
     let entrypoint = repo_file("docker/entrypoint.sh");
+    let whitelist = entrypoint
+        .lines()
+        .find(|line| line.contains("sync|login|list|password"))
+        .expect("entrypoint must keep an explicit kei subcommand whitelist");
+    for subcommand in [
+        "sync",
+        "login",
+        "list",
+        "password",
+        "reset",
+        "config",
+        "status",
+        "doctor",
+        "manifest",
+        "verify",
+        "reconcile",
+        "import-existing",
+        "install",
+        "uninstall",
+        "service",
+        "help",
+    ] {
+        assert!(
+            whitelist
+                .split(['|', ')', ' ', '\t'])
+                .any(|token| token == subcommand),
+            "entrypoint whitelist must include the kei `{subcommand}` subcommand"
+        );
+    }
     let service_index = entrypoint
         .find("|service)")
         .or_else(|| entrypoint.find("|service|"))

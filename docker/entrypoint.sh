@@ -16,7 +16,7 @@ elif [ "${1#-}" != "$1" ]; then
     set -- kei "$@"
 else
     case "$1" in
-        sync|login|list|password|reset|config|status|verify|import-existing|reconcile|service)
+        sync|login|list|password|reset|config|status|doctor|manifest|verify|reconcile|import-existing|install|uninstall|service|help)
             set -- kei "$@"
             ;;
         *)
