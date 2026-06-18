@@ -2646,7 +2646,7 @@ fn take_matching_retry_tasks<I>(
 #[derive(Debug, Default)]
 struct PendingRetryPlan {
     tasks: Vec<DownloadTask>,
-    unmatched: usize,
+    unmatched_targets: Vec<PendingRetryTarget>,
     requested: usize,
 }
 
@@ -2711,9 +2711,62 @@ async fn build_pending_retry_download_tasks(
 
     Ok(PendingRetryPlan {
         tasks,
-        unmatched: pending_targets.len(),
+        unmatched_targets: pending_targets.into_iter().collect(),
         requested,
     })
+}
+
+async fn prune_unmatched_pending_retry_targets(
+    config: &DownloadConfig,
+    shutdown_token: &CancellationToken,
+    unmatched_targets: &[PendingRetryTarget],
+) -> usize {
+    if unmatched_targets.is_empty()
+        || config.recent.is_some()
+        || config.skip_created_before.is_some()
+        || shutdown_token.is_cancelled()
+    {
+        return 0;
+    }
+
+    let Some(db) = &config.state_db else {
+        return 0;
+    };
+
+    let asset_versions: Vec<(String, String)> = unmatched_targets
+        .iter()
+        .map(|target| {
+            (
+                target.asset_id.to_string(),
+                target.version_size.as_str().to_string(),
+            )
+        })
+        .collect();
+    match db
+        .prune_pending_asset_versions(&config.library, &asset_versions)
+        .await
+    {
+        Ok(pruned) => {
+            if pruned > 0 {
+                tracing::warn!(
+                    count = pruned,
+                    library = %config.library,
+                    diagnostic = "targeted_retry_stale_pending_pruned",
+                    "Pruned pending state rows absent from targeted retry enumeration"
+                );
+            }
+            usize::try_from(pruned).unwrap_or(usize::MAX)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                library = %config.library,
+                diagnostic = PENDING_RETRY_UNMATCHED_REASON,
+                "Failed to prune pending rows absent from targeted retry enumeration"
+            );
+            0
+        }
+    }
 }
 
 /// Re-enumerate iCloud and rebuild only the failed tasks with fresh CDN URLs.
@@ -3372,14 +3425,16 @@ async fn run_pending_retry_pass(
     let plan = build_pending_retry_download_tasks(passes, config, shutdown_token.clone()).await?;
     let PendingRetryPlan {
         tasks,
-        unmatched,
+        unmatched_targets,
         requested,
     } = plan;
+    let unmatched = unmatched_targets.len();
 
     if requested == 0 {
         return Ok(pending_retry_no_download_result(
             &started,
             &shutdown_token,
+            0,
             0,
             0,
         ));
@@ -3405,6 +3460,7 @@ async fn run_pending_retry_pass(
             &shutdown_token,
             unmatched,
             0,
+            0,
         ));
     }
 
@@ -3414,15 +3470,20 @@ async fn run_pending_retry_pass(
             &shutdown_token,
             unmatched,
             tasks.len(),
+            0,
         ));
     }
 
     if tasks.is_empty() {
+        let pruned =
+            prune_unmatched_pending_retry_targets(config, &shutdown_token, &unmatched_targets)
+                .await;
         return Ok(pending_retry_no_download_result(
             &started,
             &shutdown_token,
             unmatched,
             0,
+            pruned,
         ));
     }
 
@@ -3447,10 +3508,14 @@ async fn run_pending_retry_pass(
             tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Targeted retry failed");
         }
     }
+    let pruned =
+        prune_unmatched_pending_retry_targets(config, &shutdown_token, &unmatched_targets).await;
+    let remaining_unmatched = unmatched.saturating_sub(pruned);
 
     let mut stats = SyncStats {
         downloaded: task_count - failed,
         failed,
+        stale_pending_pruned: pruned as u64,
         bytes_downloaded: pass_result.bytes_downloaded,
         disk_bytes_written: pass_result.disk_bytes_written,
         exif_failures: pass_result.exif_failures,
@@ -3465,7 +3530,7 @@ async fn run_pending_retry_pass(
         recap: pass_result.recap.clone(),
         ..SyncStats::default()
     };
-    if unmatched > 0 {
+    if remaining_unmatched > 0 {
         block_sync_token_for_incremental_delta(&mut stats, PENDING_RETRY_UNMATCHED_REASON);
     }
 
@@ -3481,7 +3546,7 @@ async fn run_pending_retry_pass(
     }
 
     let failed_count =
-        failed + unmatched + pass_result.exif_failures + pass_result.state_write_failures;
+        failed + remaining_unmatched + pass_result.exif_failures + pass_result.state_write_failures;
     Ok(SyncResult {
         outcome: if failed_count > 0 {
             DownloadOutcome::PartialFailure { failed_count }
@@ -3499,20 +3564,23 @@ fn pending_retry_no_download_result(
     shutdown_token: &CancellationToken,
     unmatched: usize,
     downloaded: usize,
+    pruned: usize,
 ) -> SyncResult {
+    let remaining_unmatched = unmatched.saturating_sub(pruned);
     let mut stats = SyncStats {
         downloaded,
+        stale_pending_pruned: pruned as u64,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: shutdown_token.is_cancelled(),
         ..SyncStats::default()
     };
-    if unmatched > 0 {
+    if remaining_unmatched > 0 {
         block_sync_token_for_incremental_delta(&mut stats, PENDING_RETRY_UNMATCHED_REASON);
     }
     SyncResult {
-        outcome: if unmatched > 0 {
+        outcome: if remaining_unmatched > 0 {
             DownloadOutcome::PartialFailure {
-                failed_count: unmatched,
+                failed_count: remaining_unmatched,
             }
         } else {
             DownloadOutcome::Success
@@ -9278,6 +9346,57 @@ mod tests {
             result.stats.sync_token_blocked_reason,
             Some(PENDING_RETRY_UNMATCHED_REASON)
         );
+    }
+
+    #[tokio::test]
+    async fn incremental_with_unmatched_pending_rows_prunes_after_targeted_retry() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = crate::test_helpers::TestAssetRecord::new("PENDING_DELETED_UPSTREAM")
+            .filename("pending-deleted-upstream.jpg")
+            .checksum("ck_pending_deleted_upstream")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(Vec::new(), "zone-token-next", false)
+            .empty_query_page(Some("ignored-query-token"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("unmatched pending rows should be pruned after targeted retry");
+
+        assert!(
+            !result.full_enumeration_ran,
+            "targeted retry pruning should not force full enumeration"
+        );
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(result.stats.stale_pending_pruned, 1);
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.pending, 0);
+        assert!(db.get_pending().await.expect("pending page").is_empty());
     }
 
     #[tokio::test]

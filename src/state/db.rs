@@ -148,6 +148,13 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<u64, StateError> {
         Ok(0)
     }
+    async fn prune_pending_asset_versions(
+        &self,
+        _library: &str,
+        _asset_versions: &[(String, String)],
+    ) -> Result<u64, StateError> {
+        Ok(0)
+    }
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError>;
     async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError>;
     async fn get_downloaded_checksums(
@@ -1834,6 +1841,45 @@ impl SqliteStateDb {
         .await
     }
 
+    pub(crate) async fn prune_pending_asset_versions(
+        &self,
+        library: &str,
+        asset_versions: &[(String, String)],
+    ) -> Result<u64, StateError> {
+        if asset_versions.is_empty() {
+            return Ok(0);
+        }
+        let library = library.to_string();
+        let asset_versions = asset_versions.to_vec();
+        self.with_conn_mut("prune_pending_asset_versions", move |conn| {
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("prune_pending_asset_versions::begin", e))?;
+            let pruned = {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "DELETE FROM assets \
+                         WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
+                           AND status = 'pending'",
+                    )
+                    .map_err(|e| StateError::query("prune_pending_asset_versions::prepare", e))?;
+                let mut pruned = 0u64;
+                for (asset_id, version_size) in &asset_versions {
+                    pruned += stmt
+                        .execute(rusqlite::params![&library, asset_id, version_size])
+                        .map_err(|e| {
+                            StateError::query("prune_pending_asset_versions::execute", e)
+                        })? as u64;
+                }
+                pruned
+            };
+            tx.commit()
+                .map_err(|e| StateError::query("prune_pending_asset_versions::commit", e))?;
+            Ok(pruned)
+        })
+        .await
+    }
+
     pub(crate) async fn get_downloaded_ids(
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError> {
@@ -3001,6 +3047,14 @@ impl DownloadStateStore for SqliteStateDb {
         seen_since: i64,
     ) -> Result<u64, StateError> {
         SqliteStateDb::prune_stale_pending_not_seen_since(self, library, seen_since).await
+    }
+
+    async fn prune_pending_asset_versions(
+        &self,
+        library: &str,
+        asset_versions: &[(String, String)],
+    ) -> Result<u64, StateError> {
+        SqliteStateDb::prune_pending_asset_versions(self, library, asset_versions).await
     }
 
     async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
