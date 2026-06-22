@@ -891,8 +891,8 @@ fn digits_before(hay: &str, marker: &str) -> Option<u64> {
     hay[start..idx].parse().ok()
 }
 
-/// Import-then-sync default flags. The strongest invariant: zero
-/// downloads after import.
+/// Import then sync the fixture's single library-wide pass. The strongest
+/// invariant: zero downloads after import.
 #[test]
 #[ignore]
 fn roundtrip_default_layout_sync_skips_after_import() {
@@ -902,7 +902,7 @@ fn roundtrip_default_layout_sync_skips_after_import() {
     common::with_auth_retry(|| {
         let test_data = tempdir().unwrap();
         let recent = ROUNDTRIP_RECENT.to_string();
-        let toml_path = write_kei_toml(test_data.path(), download_dir, "");
+        let toml_path = write_kei_toml(test_data.path(), download_dir, FIXTURE_FILTERS_TOML);
 
         let import = import_cmd(
             &username,
@@ -928,8 +928,13 @@ fn roundtrip_default_layout_sync_skips_after_import() {
         // (every asset rejected before the download phase) and >0 when
         // sync emits a per-asset skip tally; both are valid no-download
         // outcomes for the round-trip.
-        let (downloaded, _skipped) =
-            run_sync_against_fixture(&username, &password, download_dir, test_data.path(), "");
+        let (downloaded, _skipped) = run_sync_against_fixture(
+            &username,
+            &password,
+            download_dir,
+            test_data.path(),
+            FIXTURE_FILTERS_TOML,
+        );
         assert_eq!(
             downloaded, 0,
             "sync re-downloaded {downloaded} files after import-existing populated state DB; \
@@ -1010,7 +1015,8 @@ fn roundtrip_skip_videos_sync_skips_imported_photos() {
         // import-existing doesn't expose media selection as a flag. Use TOML
         // to force it.
         let test_data = tempdir().unwrap();
-        let media_filter_toml = "[filters]\nmedia = [\"photos\", \"live-photos\"]\n";
+        let media_filter_toml =
+            "[filters]\nalbums = [\"none\"]\nunfiled = true\nmedia = [\"photos\", \"live-photos\"]\n";
         let toml_path = write_kei_toml(test_data.path(), download_dir, media_filter_toml);
 
         let recent = ROUNDTRIP_RECENT.to_string();
