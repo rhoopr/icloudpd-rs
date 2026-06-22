@@ -317,6 +317,39 @@ pub(crate) fn insert_suffix(path: &str, suffix: &str) -> String {
     }
 }
 
+/// Return true when `candidate` is `base` with this asset id appended before
+/// the extension, optionally followed by kei's stable collision ordinal.
+///
+/// For example, `IMG_0001-A.MOV` and `IMG_0001-A-2.MOV` are both identity
+/// collision names in the family rooted at `IMG_0001.MOV` for asset `A`.
+pub(crate) fn filename_matches_identity_collision(
+    base: &str,
+    asset_id: &str,
+    candidate: &str,
+) -> bool {
+    if candidate == insert_suffix(base, asset_id) {
+        return true;
+    }
+
+    let Some((base_stem, base_ext)) = base.rsplit_once('.') else {
+        let prefix = format!("{base}-{asset_id}-");
+        return candidate
+            .strip_prefix(&prefix)
+            .is_some_and(|ordinal| ordinal.parse::<u64>().is_ok());
+    };
+    let Some((candidate_stem, candidate_ext)) = candidate.rsplit_once('.') else {
+        return false;
+    };
+    if candidate_ext != base_ext {
+        return false;
+    }
+
+    let prefix = format!("{base_stem}-{asset_id}-");
+    candidate_stem
+        .strip_prefix(&prefix)
+        .is_some_and(|ordinal| ordinal.parse::<u64>().is_ok())
+}
+
 /// Add a literal suffix before the file extension.
 ///
 /// Unlike [`insert_suffix`], this does not add a hyphen. Use it for suffixes
@@ -877,6 +910,35 @@ mod tests {
         );
         assert_eq!(insert_suffix("photo", "123"), "photo-123");
         assert_eq!(insert_suffix("a.b.mov", "id"), "a.b-id.mov");
+    }
+
+    #[test]
+    fn test_filename_matches_identity_collision() {
+        assert!(filename_matches_identity_collision(
+            "IMG_0001.MOV",
+            "ASSET",
+            "IMG_0001-ASSET.MOV"
+        ));
+        assert!(filename_matches_identity_collision(
+            "IMG_0001.MOV",
+            "ASSET",
+            "IMG_0001-ASSET-2.MOV"
+        ));
+        assert!(filename_matches_identity_collision(
+            "photo",
+            "ASSET",
+            "photo-ASSET-3"
+        ));
+        assert!(!filename_matches_identity_collision(
+            "IMG_0001.MOV",
+            "ASSET",
+            "IMG_0001-OTHER-2.MOV"
+        ));
+        assert!(!filename_matches_identity_collision(
+            "IMG_0001.MOV",
+            "ASSET",
+            "IMG_0001-ASSET-x.MOV"
+        ));
     }
 
     #[test]

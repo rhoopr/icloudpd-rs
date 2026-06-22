@@ -41,6 +41,19 @@ impl VersionSizeKey {
         }
     }
 
+    /// Return true for the still/video version that owns the local filename stem.
+    pub(crate) const fn is_primary_media(self) -> bool {
+        matches!(self, Self::Original | Self::Medium | Self::Thumb)
+    }
+
+    /// Return true for Live Photo motion versions derived from the primary stem.
+    pub(crate) const fn is_live_photo_motion(self) -> bool {
+        matches!(
+            self,
+            Self::LiveOriginal | Self::LiveMedium | Self::LiveThumb
+        )
+    }
+
     /// Parse from the string stored in the database.
     pub fn from_str(s: &str) -> Option<Self> {
         match s {

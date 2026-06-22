@@ -3,7 +3,7 @@
     reason = "CLI subcommand whose primary purpose is to print import-existing progress to stdout"
 )]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -20,9 +20,9 @@ use crate::download::paths::{normalize_ampm, DirCache};
 use crate::icloud::photos::PhotoAsset;
 use crate::retry;
 use crate::state;
-use crate::state::ImportStateStore;
+use crate::state::{ImportStateStore, VersionSizeKey};
 use crate::systemd::SystemdNotifier;
-use crate::types::FileMatchPolicy;
+use crate::types::{FileMatchPolicy, LivePhotoMovFilenamePolicy};
 
 use super::service::{
     build_collection_context, collection_libraries, init_photos_service, pass_scope_for_zone,
@@ -340,62 +340,164 @@ fn log_progress_milestone(library_label: &str, matched: u64, show_progress: bool
 }
 
 /// Find the on-disk path that satisfies the expected size: primary, then
-/// the dedup-collision shape under `NameSizeDedupWithSuffix`, then an
-/// AM/PM whitespace sibling. macOS screenshots use NARROW NO-BREAK SPACE
+/// collision-family shapes under `NameSizeDedupWithSuffix`, then AM/PM
+/// whitespace siblings. macOS screenshots use NARROW NO-BREAK SPACE
 /// (`\u{202F}`) before AM/PM; trees synced through other tools may have
 /// normalized to a regular space (or vice versa).
 async fn resolve_match_path(
-    primary: &Path,
-    expected_size: u64,
-    policy: FileMatchPolicy,
+    candidate: &ImportPathCandidate<'_>,
+    all_expected: &[ExpectedAssetPath],
+    asset_id: &str,
+    path_config: &(impl PathDerivationSource + ?Sized),
     dir_cache: &mut DirCache,
-) -> Option<(std::path::PathBuf, std::fs::Metadata)> {
-    if let Ok(m) = tokio::fs::metadata(primary).await {
-        if m.len() == expected_size {
-            return Some((primary.to_path_buf(), m));
+) -> Option<(PathBuf, std::fs::Metadata)> {
+    let mut candidates = import_match_candidates(candidate, all_expected, asset_id, path_config);
+    candidates.sort();
+    candidates.dedup();
+
+    for path in &candidates {
+        if let Some(found) =
+            match_exact_or_ampm_variant(path, candidate.expected_size, dir_cache).await
+        {
+            return Some(found);
         }
     }
-    if policy == FileMatchPolicy::NameSizeDedupWithSuffix {
-        let parent = primary.parent().unwrap_or(Path::new(""));
-        let Some(fname) = primary.file_name().and_then(|f| f.to_str()) else {
-            tracing::debug!(
-                path = %primary.display(),
-                "Skipping dedup-suffix fallback: filename is not valid UTF-8",
-            );
-            return None;
-        };
-        let suffixed_fname = download::paths::add_dedup_suffix(fname, expected_size);
-        let suffixed = parent.join(suffixed_fname);
-        if let Ok(m) = tokio::fs::metadata(&suffixed).await {
-            if m.len() == expected_size {
-                return Some((suffixed, m));
+
+    if path_config.file_match_policy() == FileMatchPolicy::NameSizeDedupWithSuffix {
+        for path in candidates {
+            if let Some(found) =
+                find_identity_ordinal_sibling(&path, asset_id, candidate.expected_size).await
+            {
+                return Some(found);
             }
         }
     }
-    // Cheap pre-check: only pay for the dir read if the filename actually
-    // has an AM/PM whitespace token to vary. `normalize_ampm` is idempotent
-    // on filenames that have no such token, so the inequality below is the
-    // exact condition under which `find_ampm_variant` could return Some.
-    let needs_probe = primary
+
+    None
+}
+
+struct ImportPathCandidate<'a> {
+    path: &'a Path,
+    expected_size: u64,
+    version_size: VersionSizeKey,
+}
+
+fn import_match_candidates(
+    candidate: &ImportPathCandidate<'_>,
+    all_expected: &[ExpectedAssetPath],
+    asset_id: &str,
+    path_config: &(impl PathDerivationSource + ?Sized),
+) -> Vec<PathBuf> {
+    let mut candidates = vec![candidate.path.to_path_buf()];
+    if path_config.file_match_policy() != FileMatchPolicy::NameSizeDedupWithSuffix {
+        return candidates;
+    }
+
+    let Some(parent) = candidate.path.parent() else {
+        return candidates;
+    };
+    let Some(fname) = candidate.path.file_name().and_then(|f| f.to_str()) else {
+        tracing::debug!(
+            path = %candidate.path.display(),
+            "Skipping collision-family fallback: filename is not valid UTF-8",
+        );
+        return candidates;
+    };
+
+    candidates.push(parent.join(download::paths::add_dedup_suffix(
+        fname,
+        candidate.expected_size,
+    )));
+    candidates.push(parent.join(download::paths::insert_suffix(fname, asset_id)));
+
+    if candidate.version_size.is_live_photo_motion() {
+        if let Some(primary) = primary_expected_path(all_expected) {
+            if let Some(primary_fname) = primary.path.file_name().and_then(|f| f.to_str()) {
+                let primary_collision_filenames = [
+                    download::paths::add_dedup_suffix(primary_fname, primary.size),
+                    download::paths::insert_suffix(primary_fname, asset_id),
+                ];
+                for primary_filename in primary_collision_filenames {
+                    let mov_filename = match path_config.live_photo_mov_filename_policy() {
+                        LivePhotoMovFilenamePolicy::Suffix => {
+                            download::paths::live_photo_mov_path_suffix(&primary_filename)
+                        }
+                        LivePhotoMovFilenamePolicy::Original => {
+                            download::paths::live_photo_mov_path_original(&primary_filename)
+                        }
+                    };
+                    candidates.push(parent.join(&mov_filename));
+                    candidates
+                        .push(parent.join(download::paths::insert_suffix(&mov_filename, asset_id)));
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+fn primary_expected_path(expected: &[ExpectedAssetPath]) -> Option<&ExpectedAssetPath> {
+    expected
+        .iter()
+        .find(|path| path.version_size.is_primary_media())
+}
+
+async fn match_exact_or_ampm_variant(
+    path: &Path,
+    expected_size: u64,
+    dir_cache: &mut DirCache,
+) -> Option<(PathBuf, std::fs::Metadata)> {
+    if let Ok(m) = tokio::fs::metadata(path).await {
+        if m.len() == expected_size {
+            return Some((path.to_path_buf(), m));
+        }
+    }
+
+    let needs_probe = path
         .file_name()
         .and_then(|f| f.to_str())
         .is_some_and(|f| normalize_ampm(f) != f);
     if !needs_probe {
         return None;
     }
-    let parent = primary.parent()?;
+    let parent = path.parent()?;
     dir_cache.ensure_dir_async(parent).await;
-    let variant = dir_cache.find_ampm_variant(primary)?;
+    let variant = dir_cache.find_ampm_variant(path)?;
     if dir_cache.file_size(&variant) != Some(expected_size) {
         return None;
     }
     let m = tokio::fs::metadata(&variant).await.ok()?;
     tracing::info!(
-        primary = %primary.display(),
+        primary = %path.display(),
         variant = %variant.display(),
         "Matched AM/PM whitespace variant on disk",
     );
     Some((variant, m))
+}
+
+async fn find_identity_ordinal_sibling(
+    base_path: &Path,
+    asset_id: &str,
+    expected_size: u64,
+) -> Option<(PathBuf, std::fs::Metadata)> {
+    let parent = base_path.parent()?;
+    let base = base_path.file_name()?.to_str()?;
+    let mut entries = tokio::fs::read_dir(parent).await.ok()?;
+    while let Some(entry) = entries.next_entry().await.ok()? {
+        let candidate_name = entry.file_name();
+        let Some(candidate_name) = candidate_name.to_str() else {
+            continue;
+        };
+        if !download::paths::filename_matches_identity_collision(base, asset_id, candidate_name) {
+            continue;
+        }
+        let metadata = entry.metadata().await.ok()?;
+        if metadata.len() == expected_size {
+            return Some((entry.path(), metadata));
+        }
+    }
+    None
 }
 
 /// Run the import-existing matching loop over a stream of `PhotoAsset`s.
@@ -537,14 +639,16 @@ where
             continue;
         }
 
-        for ExpectedAssetPath {
-            path: primary_path,
-            size: expected_size,
-            checksum,
-            url,
-            version_size,
-        } in expected
-        {
+        for expected_path in &expected {
+            let ExpectedAssetPath {
+                path: primary_path,
+                size: expected_size,
+                checksum,
+                url,
+                version_size,
+            } = expected_path;
+            let expected_size = *expected_size;
+            let version_size = *version_size;
             // For `NameSizeDedupWithSuffix`, when two iCloud assets share
             // a filename, icloudpd renames the second's download to
             // `<stem>-<size><ext>` (it stat's the existing file at
@@ -554,21 +658,22 @@ where
             // unmatched on import even though it's what kei would also
             // have written under the same collision. Try the suffix
             // shape as a fallback.
-            let (expected_path, metadata) = match resolve_match_path(
-                &primary_path,
+            let candidate = ImportPathCandidate {
+                path: primary_path,
                 expected_size,
-                path_config.file_match_policy(),
-                dir_cache,
-            )
-            .await
-            {
-                Some(found) => found,
-                None => {
-                    stats.unmatched += 1;
-                    heartbeat_state.unmatched.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
+                version_size,
             };
+            let (expected_path, metadata) =
+                match resolve_match_path(&candidate, &expected, asset.id(), path_config, dir_cache)
+                    .await
+                {
+                    Some(found) => found,
+                    None => {
+                        stats.unmatched += 1;
+                        heartbeat_state.unmatched.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
 
             if let Some(verifier) = options.strict_verifier {
                 match verifier
@@ -1910,6 +2015,62 @@ mod wiremock_tests {
         assert_eq!(stats.matched, 1);
         let rows = all_downloaded(db.as_ref()).await;
         assert!(rows[0].filename.ends_with(".MOV"));
+    }
+
+    #[tokio::test]
+    async fn import_matches_live_photo_motion_from_size_suffixed_primary_stem() {
+        let server = crate::start_wiremock_or_skip!();
+        let asset = WiremockAsset::new("LIVE6", "IMG_0600.HEIC", "public.heic")
+            .orig(3000, "ck_live6", "public.heic")
+            .live_mov(2000, "ck_live6_mov");
+        let tmp = TempDir::new().unwrap();
+        let dl = tmp.path().join("photos");
+        std::fs::create_dir_all(&dl).unwrap();
+        let config = base_config(&dl);
+
+        let expected = expected_paths_for(&asset.to_photo_asset(), &config);
+        let primary = expected
+            .iter()
+            .find(|e| e.version_size == VersionSizeKey::Original)
+            .expect("primary path");
+        let mov = expected
+            .iter()
+            .find(|e| e.version_size == VersionSizeKey::LiveOriginal)
+            .expect("MOV path");
+        let primary_name = primary.path.file_name().and_then(|f| f.to_str()).unwrap();
+        let primary_collision =
+            primary
+                .path
+                .with_file_name(crate::download::paths::add_dedup_suffix(
+                    primary_name,
+                    primary.size,
+                ));
+        let mov_collision_base = crate::download::paths::live_photo_mov_path_suffix(
+            primary_collision
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap(),
+        );
+        let mov_collision = mov
+            .path
+            .with_file_name(crate::download::paths::insert_suffix(
+                &mov_collision_base,
+                "LIVE6-2",
+            ));
+        stage_file(&primary_collision, primary.size);
+        stage_file(&mov_collision, mov.size);
+
+        let db = open_db(&tmp).await;
+        let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
+
+        assert_eq!(stats.matched, 2);
+        let rows = all_downloaded(db.as_ref()).await;
+        assert!(rows
+            .iter()
+            .any(|r| r.filename.as_ref() == "IMG_0600-3000.HEIC"));
+        assert!(rows
+            .iter()
+            .any(|r| r.filename.as_ref() == "IMG_0600-3000_HEVC-LIVE6-2.MOV"));
     }
 
     #[tokio::test]

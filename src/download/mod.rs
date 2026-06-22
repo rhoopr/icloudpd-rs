@@ -1389,6 +1389,10 @@ struct DownloadContext {
     /// the expected file is already on disk instead of promoting them back to
     /// failed after the producer skips the duplicate path.
     pending_ids: LibraryAssetVersionSet,
+    /// Nested map: `library` -> `asset_id` -> (`version_size` -> filename)
+    /// for pending rows. Pending on-disk adoption uses this to avoid adopting
+    /// a same-name/same-size collision that belongs to a different asset.
+    pending_filenames: LibraryAssetVersionValueMap,
     /// All asset IDs known to the state DB (any status). Used in retry-only mode
     /// to skip new assets that were never synced. Library-blind: a known ID
     /// is "known" regardless of which zone it belongs to.
@@ -1548,15 +1552,23 @@ impl DownloadContext {
         }
 
         let mut pending_ids: LibraryAssetVersionSet = FxHashMap::default();
+        let mut pending_filenames: LibraryAssetVersionValueMap = FxHashMap::default();
         for record in pending {
             let lib = intern_id(&mut interner, record.library.to_string());
             let id = intern_id(&mut interner, record.id.to_string());
+            let version_size: Box<str> = record.version_size.as_str().into();
             pending_ids
+                .entry(Arc::clone(&lib))
+                .or_default()
+                .entry(Arc::clone(&id))
+                .or_default()
+                .insert(version_size.clone());
+            pending_filenames
                 .entry(lib)
                 .or_default()
                 .entry(id)
                 .or_default()
-                .insert(record.version_size.as_str().into());
+                .insert(version_size, record.filename.to_string().into_boxed_str());
         }
 
         let known_ids: FxHashSet<Arc<str>> = known_ids
@@ -1578,6 +1590,7 @@ impl DownloadContext {
             downloaded_metadata_hashes,
             metadata_retry_markers,
             pending_ids,
+            pending_filenames,
             known_ids,
             attempt_counts,
             downloaded_without_metadata_hash,
